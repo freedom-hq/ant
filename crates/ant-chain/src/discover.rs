@@ -51,8 +51,9 @@ const INITIAL_SCAN_CHUNK: u64 = 50_000_000;
 
 /// One decoded `eth_getLogs` entry. Richer than [`crate::tx::EventLog`]
 /// (which is receipt-shaped): the scan needs the originating tx hash
-/// (to fetch the `BatchCreated` event) and block number (to prefer the
-/// most-recent chequebook on a tie).
+/// (to match a `Transfer` against the `BatchCreated` logs mined in the
+/// same block) and block number (to aim that per-block query, and to
+/// prefer the most-recent chequebook on a tie).
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub address: [u8; 20],
@@ -96,16 +97,9 @@ impl ChainClient {
                 "topics": topics,
             }],
         });
-        let v: serde_json::Value = self
-            .http()
-            .post(self.url())
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = v.get("error") {
-            return Err(RpcError::Rpc(err.to_string()));
+        let v = self.rpc(&body).await?;
+        if let Some(err) = crate::rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
         }
         let arr = v
             .get("result")
@@ -164,8 +158,19 @@ impl ChainClient {
 /// Discover every postage batch owned by `node_eoa` that is still
 /// funded. Reuses the xBZZ `Transfer(from = node_eoa)` scan: batch
 /// buys / top-ups pull BZZ via `transferFrom`, emitting a `Transfer`
-/// whose `to` is the `PostageStamp` contract; the originating tx's
-/// receipt carries the `BatchCreated` event with the batch id.
+/// whose `to` is the `PostageStamp` contract.
+///
+/// For each block that scan hits, a **single-block `eth_getLogs`** for
+/// `BatchCreated` on the `PostageStamp` contract recovers the batch ids,
+/// matched back to the `Transfer` by `transactionHash` (issue #77). This
+/// deliberately does *not* use `eth_getTransactionReceipt`: verified
+/// backends (Myotis) serve receipts near head only, so a receipt hop
+/// returns `null` for any older batch and silently loses it — while the
+/// log index they *do* carry covers exactly this query. It is also
+/// cheaper against a plain RPC (one request per hit block instead of one
+/// per hit transaction). `BatchCreated.owner` is not an indexed topic,
+/// so an owner-filtered query cannot replace the `Transfer` scan itself;
+/// the per-batch owner check below still does that job.
 pub async fn discover_owned_batches(
     client: &ChainClient,
     postage_contract: &str,
@@ -185,25 +190,32 @@ pub async fn discover_owned_batches(
         .scan_logs(xbzz_token, &topics, from_block, to_block)
         .await?;
 
-    // Transactions whose Transfer landed in the PostageStamp contract.
-    let mut tx_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+    // Transactions whose Transfer landed in the PostageStamp contract,
+    // grouped by the block they were mined in — one `eth_getLogs` per
+    // block covers every hit transaction in it.
+    let mut hits: BTreeMap<u64, BTreeSet<[u8; 32]>> = BTreeMap::new();
     for log in &logs {
         if log.topics.len() >= 3 && address_from_topic(&log.topics[2]) == postage_addr {
-            tx_hashes.insert(log.tx_hash);
+            hits.entry(log.block_number)
+                .or_default()
+                .insert(log.tx_hash);
         }
     }
 
-    // Pull the BatchCreated batch ids out of each receipt.
+    // Pull the BatchCreated batch ids out of each hit block's logs and
+    // keep the ones emitted by our own transactions.
     let bc_topic = batch_created_event_topic();
+    let bc_topics = json!([format!("0x{}", hex::encode(bc_topic))]);
     let mut batch_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
-    for tx in &tx_hashes {
-        let receipt = match client.eth_get_transaction_receipt(tx).await {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(e) => return Err(e),
-        };
-        for log in &receipt.logs {
-            if log.address == postage_addr && log.topics.first() == Some(&bc_topic) {
+    for (block, tx_hashes) in &hits {
+        let created = client
+            .eth_get_logs(postage_contract, &bc_topics, *block, *block)
+            .await?;
+        for log in &created {
+            if log.address == postage_addr
+                && log.topics.first() == Some(&bc_topic)
+                && tx_hashes.contains(&log.tx_hash)
+            {
                 if let Some(id) = log.topics.get(1) {
                     batch_ids.insert(*id);
                 }
@@ -350,11 +362,17 @@ fn parse_log_entry(v: &serde_json::Value) -> Result<LogEntry, RpcError> {
         &mut tx_hash,
     )
     .map_err(|e| RpcError::Decode(format!("transactionHash: {e}")))?;
+    // Hard error rather than a 0 default: both callers key off this —
+    // the batch scan issues its single-block `BatchCreated` query at
+    // exactly this height, and the chequebook scan orders candidates by
+    // it. Defaulting a missing/unparseable height to 0 would quietly
+    // drop the batch (query block 0, find nothing) instead of surfacing
+    // a malformed log.
     let block_number = v
         .get("blockNumber")
         .and_then(|b| b.as_str())
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(0);
+        .ok_or_else(|| RpcError::Decode("log missing blockNumber".into()))?;
     Ok(LogEntry {
         address,
         topics,
@@ -428,7 +446,9 @@ fn last_word_u128(ret: &[u8]) -> Result<u128, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::ChainTransport;
     use sha3::{Digest, Keccak256};
+    use std::sync::Mutex;
 
     #[test]
     fn transfer_topic_matches_keccak() {
@@ -473,5 +493,185 @@ mod tests {
         let mut bal = [0u8; 32];
         bal[28..32].copy_from_slice(&0x3a21_096fu32.to_be_bytes());
         assert_eq!(last_word_u128(&bal).unwrap(), 0x3a21_096f);
+    }
+
+    /// A log entry with no `blockNumber` is unusable by both scans (the
+    /// batch scan aims a per-block query at it, the chequebook scan
+    /// orders by it), so it must be a decode error rather than a
+    /// silently-dropped batch at block 0.
+    #[test]
+    fn log_without_block_number_is_a_decode_error() {
+        let v = json!({
+            "address": "0x45a1502382541cd610cc9068e88727426b696293",
+            "topics": [],
+            "data": "0x",
+            "transactionHash": format!("0x{}", "11".repeat(32)),
+        });
+        let err = parse_log_entry(&v).unwrap_err().to_string();
+        assert!(err.contains("blockNumber"), "got {err}");
+    }
+
+    // --- batch-discovery query plan (issue #77) ---
+
+    const NODE_EOA: [u8; 20] = [0xa1; 20];
+    /// Block the node's `Transfer` into `PostageStamp` was mined in.
+    const HIT_BLOCK: u64 = 0x1dd_8ac8;
+    const OUR_TX: [u8; 32] = [0x77; 32];
+    const OTHER_TX: [u8; 32] = [0x99; 32];
+    const OUR_BATCH: [u8; 32] = [0xbb; 32];
+    const OTHER_BATCH: [u8; 32] = [0xcc; 32];
+
+    /// Scripted chain backend, plugged in through the host-transport
+    /// seam so the query plan is observable: every method ant issues is
+    /// recorded, and anything unscripted is a hard failure rather than a
+    /// fall-through to a real RPC.
+    #[derive(Default)]
+    struct ScriptedChain {
+        seen: Mutex<Vec<String>>,
+        get_logs_params: Mutex<Vec<serde_json::Value>>,
+    }
+
+    fn word_hex(bytes: &[u8]) -> String {
+        let mut w = [0u8; 32];
+        w[32 - bytes.len()..].copy_from_slice(bytes);
+        format!("0x{}", hex::encode(w))
+    }
+
+    fn log_json(
+        address: &str,
+        topics: &[String],
+        tx_hash: &[u8; 32],
+        block: u64,
+    ) -> serde_json::Value {
+        json!({
+            "address": address,
+            "topics": topics,
+            "data": "0x",
+            "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+            "blockNumber": format!("0x{block:x}"),
+        })
+    }
+
+    impl ScriptedChain {
+        fn result(&self, method: &str, params: &serde_json::Value) -> serde_json::Value {
+            match method {
+                "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
+                "eth_getLogs" => {
+                    self.get_logs_params.lock().unwrap().push(params[0].clone());
+                    let filter = &params[0];
+                    let address = filter["address"].as_str().unwrap().to_ascii_lowercase();
+                    if address == crate::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() {
+                        // The xBZZ Transfer(from = node EOA) scan: one
+                        // hit, paying the PostageStamp contract.
+                        return json!([log_json(
+                            crate::GNOSIS_BZZ_TOKEN,
+                            &[
+                                format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
+                                word_hex(&NODE_EOA),
+                                word_hex(&parse_addr(crate::GNOSIS_POSTAGE_STAMP).unwrap()),
+                            ],
+                            &OUR_TX,
+                            HIT_BLOCK,
+                        )]);
+                    }
+                    assert_eq!(address, crate::GNOSIS_POSTAGE_STAMP.to_ascii_lowercase());
+                    // Single-block BatchCreated query: our batch plus a
+                    // stranger's, mined in the same block.
+                    let bc = format!("0x{}", hex::encode(batch_created_event_topic()));
+                    json!([
+                        log_json(
+                            crate::GNOSIS_POSTAGE_STAMP,
+                            &[bc.clone(), word_hex(&OUR_BATCH)],
+                            &OUR_TX,
+                            HIT_BLOCK,
+                        ),
+                        log_json(
+                            crate::GNOSIS_POSTAGE_STAMP,
+                            &[bc, word_hex(&OTHER_BATCH)],
+                            &OTHER_TX,
+                            HIT_BLOCK,
+                        ),
+                    ])
+                }
+                "eth_call" => {
+                    let data = params[0]["data"].as_str().unwrap();
+                    let word = match &data[0..10] {
+                        "0x2182ddb1" => word_hex(&NODE_EOA), // batchOwner
+                        "0x44beae8e" => word_hex(&[17]),     // batchDepth
+                        "0x32ac57dd" => word_hex(&[16]),     // bucketDepth
+                        "0xd968f44b" => word_hex(&[1]),      // immutableFlag
+                        "0xd71ba7c4" => word_hex(&[42]),     // remainingBalance
+                        other => panic!("unscripted eth_call selector {other}"),
+                    };
+                    json!(word)
+                }
+                other => panic!("unscripted method {other} — the query plan changed"),
+            }
+        }
+    }
+
+    impl ChainTransport for ScriptedChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let method = req["method"].as_str().unwrap().to_string();
+            let result = self.result(&method, &req["params"]);
+            self.seen.lock().unwrap().push(method);
+            Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
+        }
+    }
+
+    /// Batch discovery recovers the batch id from a **single-block
+    /// `eth_getLogs` for `BatchCreated`** matched by `transactionHash`,
+    /// and never asks for a transaction receipt — verified backends
+    /// serve receipts near head only, so the old receipt hop lost every
+    /// older batch (issue #77).
+    #[tokio::test]
+    async fn batch_discovery_uses_logs_not_receipts() {
+        let script = std::sync::Arc::new(ScriptedChain::default());
+        // An unroutable URL: any fall-through would fail the discovery
+        // instead of silently answering from a real RPC.
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+
+        let found = discover_owned_batches(
+            &client,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(found.len(), 1, "exactly our batch, not the stranger's");
+        assert_eq!(found[0].batch_id, OUR_BATCH);
+        assert_eq!(found[0].depth, 17);
+        assert_eq!(found[0].bucket_depth, 16);
+        assert!(found[0].immutable);
+        assert_eq!(found[0].remaining_balance, 42);
+
+        let seen = script.seen.lock().unwrap().clone();
+        assert!(
+            !seen.iter().any(|m| m == "eth_getTransactionReceipt"),
+            "the receipt hop must be gone: {seen:?}",
+        );
+
+        // The BatchCreated query is scoped to the single block the
+        // Transfer landed in, and filtered on the event topic.
+        let params = script.get_logs_params.lock().unwrap().clone();
+        let bc = params
+            .iter()
+            .find(|p| {
+                p["address"]
+                    .as_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case(crate::GNOSIS_POSTAGE_STAMP)
+            })
+            .expect("a BatchCreated query on the PostageStamp contract");
+        assert_eq!(bc["fromBlock"], format!("0x{HIT_BLOCK:x}"));
+        assert_eq!(bc["toBlock"], format!("0x{HIT_BLOCK:x}"));
+        assert_eq!(
+            bc["topics"],
+            json!([format!("0x{}", hex::encode(batch_created_event_topic()))]),
+        );
     }
 }

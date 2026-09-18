@@ -47,6 +47,12 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (`antd`) parity. Only honoured when the crate is built with the
 /// `chain` feature; ignored otherwise.
 ///
+/// The gateway's chain wiring is captured **here, once**. A host that
+/// serves chain reads itself must therefore call
+/// [`crate::ant_set_chain_transport`] *before* this; installing one
+/// later only affects the per-call `ant_storage_*` / `ant_settlement_*`
+/// paths until the gateway is stopped and started again.
+///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
 /// (free with [`crate::ant_free_string`]). Idempotent: a second call
@@ -192,7 +198,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                     None
                 }
             };
-            ant_gateway::chainreader::build(
+            ant_gateway::chainreader::build_with_transport(
                 gnosis_rpc,
                 // No read-only fallback on mobile: chain reads stay gated
                 // on the host-supplied `gnosis_rpc` (this branch only runs
@@ -205,6 +211,12 @@ pub unsafe extern "C" fn ant_start_gateway(
                 chequebook,
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
+                // Host-provided chain transport (issue #77), if the app
+                // installed one with `ant_set_chain_transport` before
+                // starting the gateway. `None` — the default — leaves
+                // `/wallet`, `/stamps`, `/chainstate` and `/chequebook`
+                // reading the `gnosis_rpc` URL exactly as before.
+                handle.host_chain_transport(),
             )
         } else {
             None

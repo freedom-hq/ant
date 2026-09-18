@@ -22,6 +22,7 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 pub mod bench;
+mod chain_transport;
 mod drive;
 mod gateway;
 #[cfg(feature = "jni")]
@@ -33,6 +34,10 @@ mod stream;
 // entry points at the crate root so workspace Rust callers (and tests)
 // can reference them by path, the same way `ant_init` is reachable.
 // The `#[no_mangle]` symbols are unaffected — this only adds Rust paths.
+pub use chain_transport::{
+    ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
+    ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
+};
 pub use gateway::{ant_start_gateway, ant_stop_gateway};
 
 use ant_control::{
@@ -178,6 +183,35 @@ pub struct AntHandle {
     /// run at a time — two concurrent runs would each measure the
     /// other's upload contention rather than the network's.
     bench: Mutex<Option<Arc<bench::BenchRun>>>,
+    /// Host-provided JSON-RPC transport for chain reads/writes (issue
+    /// #77), installed by [`ant_set_chain_transport`]. `None` — the
+    /// default — means every chain request goes to the configured
+    /// `gnosis_rpc` URL, exactly as before.
+    #[cfg(feature = "chain")]
+    chain_transport: Mutex<Option<Arc<chain_transport::HostChainTransport>>>,
+}
+
+/// Chain wiring shared by the storage / settlement calls and the
+/// in-process gateway.
+#[cfg(feature = "chain")]
+impl AntHandle {
+    /// The host transport currently installed on this handle, if any.
+    pub(crate) fn host_chain_transport(&self) -> Option<ant_chain::SharedChainTransport> {
+        // Poison-tolerant: a panic elsewhere must not wedge chain reads.
+        self.chain_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|t| t as ant_chain::SharedChainTransport)
+    }
+
+    /// A [`ant_chain::ChainClient`] for `rpc`, routed through the host
+    /// transport when one is installed. **Every** chain client this
+    /// crate builds must come from here, so a host that plugs in a
+    /// verified source is not bypassed by one forgotten call site.
+    pub(crate) fn chain_client(&self, rpc: impl Into<String>) -> ant_chain::ChainClient {
+        ant_chain::ChainClient::new(rpc).with_transport(self.host_chain_transport())
+    }
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -880,6 +914,8 @@ fn init_inner(
         data_dir: data_dir.to_path_buf(),
         gateway_task: Mutex::new(None),
         bench: Mutex::new(None),
+        #[cfg(feature = "chain")]
+        chain_transport: Mutex::new(None),
     })
 }
 
@@ -3666,6 +3702,8 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             gateway_task: Mutex::new(None),
             bench: Mutex::new(None),
+            #[cfg(feature = "chain")]
+            chain_transport: Mutex::new(None),
         }
     }
 

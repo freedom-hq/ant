@@ -481,7 +481,7 @@ pub(crate) fn storage_connect_batch(
     let secret = h.signing_secret;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let chain = ant_chain::ChainClient::new(rpc);
+        let chain = h.chain_client(rpc);
         let meta =
             ant_chain::fetch_postage_batch_meta(&chain, ant_chain::GNOSIS_POSTAGE_STAMP, &batch_id)
                 .await
@@ -521,7 +521,7 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
     let secret = h.signing_secret;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let chain = ant_chain::ChainClient::new(rpc);
+        let chain = h.chain_client(rpc);
         let found = ant_chain::discover::discover_owned_batches(
             &chain,
             ant_chain::GNOSIS_POSTAGE_STAMP,
@@ -705,7 +705,7 @@ pub(crate) fn storage_quote(
     let eth = h.eth;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let price = client
             .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
             .await
@@ -782,7 +782,7 @@ pub(crate) fn storage_topup_quote(
     let eth = h.eth;
     h.runtime.block_on(async move {
         let view = connected_plan(&cmd_tx).await?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let price = client
             .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
             .await
@@ -873,7 +873,7 @@ pub(crate) fn storage_topup_xdai(
         let batch_id = parse_batch_id(&view.batch_id)?;
         let depth = view.batch_depth;
 
-        let client = ant_chain::ChainClient::new(tx_rpc);
+        let client = h.chain_client(tx_rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -985,7 +985,7 @@ pub(crate) fn storage_validity(h: &AntHandle, rpc: String) -> Result<String, Dri
             });
         }
         let batch_id = parse_batch_id(&view.batch_id)?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         // Price per chunk per block; clamp to 1 so a transient zero read
         // doesn't blow the division up into a bogus eternity.
         let price = client
@@ -1076,7 +1076,7 @@ pub(crate) fn storage_buy(
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -1149,7 +1149,7 @@ pub(crate) fn storage_buy_xdai(
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -1511,7 +1511,7 @@ pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, D
         let Some(cb) = persisted_chequebook(&data_dir, &owner) else {
             return to_json(&SettlementDeposit::none());
         };
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let deposited = chequebook_deposit_plur(&client, &cb).await?;
         settlement_deposit_json(&client, &owner, &cb, deposited).await
     })
@@ -1541,7 +1541,7 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
                 "no chequebook for this account yet — connect or buy a storage plan first".into(),
             )
         })?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let deposited = chequebook_deposit_plur(&client, &cb).await?;
         let short = deposit::shortfall(deposited);
         if short == 0 {
@@ -1669,7 +1669,7 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
     let data_dir = h.data_dir.clone();
 
     h.runtime.block_on(async move {
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("derive node wallet: {e}")))?;
 

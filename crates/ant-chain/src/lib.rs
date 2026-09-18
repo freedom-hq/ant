@@ -14,15 +14,19 @@ pub mod chequebook_store;
 /// from the node EOA. RPC-driven, so it needs the `chain-rpc` feature.
 #[cfg(feature = "chain-rpc")]
 pub mod discover;
+/// The pluggable JSON-RPC transport seam (issue #77): a host can serve
+/// ant's chain requests from its own verified source, with the
+/// configured RPC URL as the built-in default and fallback.
+pub mod transport;
 pub mod tx;
 
 #[cfg(feature = "chain-rpc")]
-use serde::Deserialize;
-#[cfg(feature = "chain-rpc")]
 use serde_json::json;
 #[cfg(feature = "chain-rpc")]
-use std::{borrow::Cow, fmt::Write};
+use std::fmt::Write;
 use thiserror::Error;
+
+pub use transport::{ChainTransport, SharedChainTransport, RETRYABLE_ERROR_CODE};
 
 #[derive(Debug, Error)]
 pub enum RpcError {
@@ -35,17 +39,38 @@ pub enum RpcError {
     Decode(String),
 }
 
+/// The JSON-RPC `error` member of `v`, if it carries one. A literal
+/// `"error": null` (some backends always emit the key) is not an error.
 #[cfg(feature = "chain-rpc")]
-#[derive(Deserialize)]
-struct RpcResp<'a> {
-    result: Option<Cow<'a, str>>,
-    error: Option<RpcErr>,
+fn rpc_error(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    v.get("error").filter(|e| !e.is_null())
 }
 
+/// `error.message` only — the terse shape most read helpers surface.
 #[cfg(feature = "chain-rpc")]
-#[derive(Deserialize)]
-struct RpcErr {
-    message: Option<String>,
+fn rpc_error_message(v: &serde_json::Value) -> Option<String> {
+    rpc_error(v).map(|e| {
+        e.get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown RPC error")
+            .to_string()
+    })
+}
+
+/// The whole `error` object as JSON — used where the caller needs the
+/// `data` field too (revert reasons, range-limit hints).
+#[cfg(feature = "chain-rpc")]
+fn rpc_error_json(v: &serde_json::Value) -> Option<String> {
+    rpc_error(v).map(std::string::ToString::to_string)
+}
+
+/// The `result` member as a string, or the crate's standard
+/// "missing result" error.
+#[cfg(feature = "chain-rpc")]
+fn rpc_result_str(v: &serde_json::Value) -> Result<&str, RpcError> {
+    v.get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RpcError::Rpc("missing result".to_string()))
 }
 
 /// Mainnet postage stamp contract on Gnosis (Swarm docs / bee defaults).
@@ -74,6 +99,10 @@ pub const CREATE2_DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 pub struct ChainClient {
     url: String,
     http: reqwest::Client,
+    /// Optional host-provided transport (issue #77). `None` — the
+    /// default — means every request goes straight to [`Self::url`],
+    /// which is what ant has always done.
+    transport: Option<SharedChainTransport>,
 }
 
 #[cfg(feature = "chain-rpc")]
@@ -85,20 +114,73 @@ impl ChainClient {
                 .user_agent("ant-chain/1")
                 .build()
                 .expect("reqwest client"),
+            transport: None,
         }
     }
 
-    /// Underlying reqwest client. Crate-private — exposed to the
-    /// `tx` submodule so its write-side helpers can reuse the same
-    /// pooled connection without each handler instantiating its own
-    /// client.
-    pub(crate) const fn http(&self) -> &reqwest::Client {
-        &self.http
+    /// Install (or clear, with `None`) a host-provided JSON-RPC
+    /// transport. The host gets first refusal on every request this
+    /// client issues; a can't-serve answer falls through to
+    /// [`Self::url`] exactly as if no transport were installed. See
+    /// [`transport`] for the full contract.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Option<SharedChainTransport>) -> Self {
+        self.transport = transport;
+        self
     }
 
-    /// Configured RPC endpoint URL. Crate-private; see [`Self::http`].
-    pub(crate) fn url(&self) -> &str {
-        &self.url
+    /// Issue one JSON-RPC request and return the parsed response body.
+    ///
+    /// **This is the single seam every chain request in this crate goes
+    /// through** (issue #77). With no host transport installed it is the
+    /// plain `POST <url>` path, byte for byte what ant did before. With
+    /// one installed the host answers first, and a can't-serve reply —
+    /// `None`, or a retryable [`RETRYABLE_ERROR_CODE`] carrying the
+    /// backend's covered window — falls through to the URL here rather
+    /// than reaching the caller (an empty result would silently truncate
+    /// batch discovery).
+    pub(crate) async fn rpc(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        if let Some(t) = self.transport.clone() {
+            match Self::ask_host(t, body.to_string()).await {
+                Ok(v) => return Ok(v),
+                Err(reason) => tracing::debug!(
+                    target: "ant-chain",
+                    method = body.get("method").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                    reason,
+                    "host chain transport can't serve; falling back to the configured RPC URL",
+                ),
+            }
+        }
+        Ok(self
+            .http
+            .post(&self.url)
+            .json(body)
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Run the host transport on the runtime's blocking pool (the
+    /// callback is documented as blocking-OK) and classify its answer.
+    /// `Err(reason)` means can't-serve.
+    async fn ask_host(
+        transport: SharedChainTransport,
+        request: String,
+    ) -> Result<serde_json::Value, &'static str> {
+        match tokio::task::spawn_blocking(move || transport.serve(&request)).await {
+            // A panicking host must not take the node down with it —
+            // treat it like any other can't-serve and use the URL.
+            Err(_) => Err("host transport panicked"),
+            Ok(None) => Err("host returned NULL"),
+            Ok(Some(raw)) => match transport::classify(&raw) {
+                transport::HostAnswer::Served(v) => Ok(v),
+                transport::HostAnswer::CantServe(reason) => Err(reason),
+            },
+        }
     }
 
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<Vec<u8>, RpcError> {
@@ -112,25 +194,11 @@ impl ChainClient {
             ]
         });
 
-        let v: RpcResp<'_> = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if let Some(e) = v.error {
-            return Err(RpcError::Rpc(
-                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
-            ));
+        let v = self.rpc(&body).await?;
+        if let Some(msg) = rpc_error_message(&v) {
+            return Err(RpcError::Rpc(msg));
         }
-
-        let result = v
-            .result
-            .ok_or_else(|| RpcError::Rpc("missing result".to_string()))?;
-        decode_hex_prefixed_bytes(result.as_ref()).map_err(|e| RpcError::Decode(e.to_string()))
+        decode_hex_prefixed_bytes(rpc_result_str(&v)?).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
     /// `eth_call` with an explicit `from` address — required for any
@@ -163,22 +231,11 @@ impl ChainClient {
             ],
         });
 
-        let v: serde_json::Value = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = v.get("error") {
-            return Err(RpcError::Rpc(err.to_string()));
+        let v = self.rpc(&body).await?;
+        if let Some(err) = rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
         }
-        let result = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
-        decode_hex_prefixed_bytes(result).map_err(|e| RpcError::Decode(e.to_string()))
+        decode_hex_prefixed_bytes(rpc_result_str(&v)?).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
     /// Native xDAI balance for `addr` (lower 128 bits — that's
@@ -190,23 +247,12 @@ impl ChainClient {
             "method": "eth_getBalance",
             "params": [format!("0x{}", hex::encode(addr)), "latest"],
         });
-        let v: RpcResp<'_> = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(e) = v.error {
-            return Err(RpcError::Rpc(
-                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
-            ));
+        let v = self.rpc(&body).await?;
+        if let Some(msg) = rpc_error_message(&v) {
+            return Err(RpcError::Rpc(msg));
         }
-        let s = v
-            .result
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
-        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let s = rpc_result_str(&v)?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
         let s = if s.is_empty() { "0" } else { s };
         let n = u128::from_str_radix(s, 16)
             .map_err(|e| RpcError::Decode(format!("eth_getBalance hex: {e}")))?;
@@ -238,23 +284,12 @@ impl ChainClient {
             "method": "eth_blockNumber",
             "params": [],
         });
-        let v: RpcResp<'_> = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(e) = v.error {
-            return Err(RpcError::Rpc(
-                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
-            ));
+        let v = self.rpc(&body).await?;
+        if let Some(msg) = rpc_error_message(&v) {
+            return Err(RpcError::Rpc(msg));
         }
-        let s = v
-            .result
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
-        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let s = rpc_result_str(&v)?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
         let s = if s.is_empty() { "0" } else { s };
         u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(format!("eth_blockNumber: {e}")))
     }
@@ -290,23 +325,11 @@ impl ChainClient {
             "method": "eth_getCode",
             "params": [addr, "latest"],
         });
-        let v: RpcResp<'_> = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(e) = v.error {
-            return Err(RpcError::Rpc(
-                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
-            ));
+        let v = self.rpc(&body).await?;
+        if let Some(msg) = rpc_error_message(&v) {
+            return Err(RpcError::Rpc(msg));
         }
-        let s = v
-            .result
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
-        decode_hex_prefixed_bytes(s.as_ref()).map_err(|e| RpcError::Decode(e.to_string()))
+        decode_hex_prefixed_bytes(rpc_result_str(&v)?).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
     /// Read a Uniswap-V3-style pool's `slot0()` and return the raw
@@ -419,4 +442,271 @@ fn abi_word_tail_u256_as_u64(ret: &[u8]) -> Result<u64, RpcError> {
 fn abi_word_last_u128_be(ret: &[u8]) -> Result<u128, RpcError> {
     let w = padded_last_word(ret)?;
     Ok(u128::from_be_bytes(w[16..32].try_into().unwrap()))
+}
+
+/// Transport-seam tests (issue #77). Each case pits a host transport
+/// against a stub JSON-RPC server standing in for the configured
+/// `gnosis_rpc` URL, so "did this request fall through?" is an
+/// observable fact (the stub's hit counter) rather than an inference.
+#[cfg(all(test, feature = "chain-rpc"))]
+mod transport_seam_tests {
+    use super::*;
+    use crate::transport::ChainTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A stub for the configured RPC URL: answers every request with
+    /// `response` and counts how many it served.
+    struct StubRpc {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl StubRpc {
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn spawn_stub(response: &'static str) -> StubRpc {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    // Drain headers + body so the client never sees a
+                    // reset while it is still writing.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    let body_at = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..body_at]).to_lowercase();
+                    let len: usize = head
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|s| s.split("\r\n").next())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < body_at + len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len(),
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        StubRpc { url, hits }
+    }
+
+    /// Host transport with a canned reply, recording the methods asked
+    /// of it. `reply` of `None` is the FFI `NULL` (can't-serve).
+    struct Host {
+        reply: Option<String>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Host {
+        fn new(reply: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                reply: reply.map(ToString::to_string),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    impl ChainTransport for Host {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let v: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            self.seen
+                .lock()
+                .unwrap()
+                .push(v["method"].as_str().unwrap().to_string());
+            self.reply.clone()
+        }
+    }
+
+    const STUB_BLOCK: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x2222"}"#;
+
+    /// One real `eth_getLogs` entry, as the configured URL would answer.
+    const STUB_LOGS: &str = r#"{"jsonrpc":"2.0","id":1,"result":[{
+        "address":"0xdbf3ea6f5bee45c02255b2c26a16f300502f68da",
+        "topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+        "data":"0x",
+        "transactionHash":"0x1111111111111111111111111111111111111111111111111111111111111111",
+        "blockNumber":"0x1e"}]}"#;
+
+    /// (a) The host serves the request: ant uses its answer and never
+    /// touches the configured URL.
+    #[tokio::test]
+    async fn host_serves_the_request() {
+        let stub = spawn_stub(STUB_BLOCK).await;
+        let host = Host::new(Some(r#"{"jsonrpc":"2.0","id":1,"result":"0x1111"}"#));
+        let client = ChainClient::new(&stub.url).with_transport(Some(host.clone()));
+
+        assert_eq!(client.eth_block_number().await.unwrap(), 0x1111);
+        assert_eq!(host.calls(), 1);
+        assert_eq!(
+            stub.hits(),
+            0,
+            "URL must not be contacted when the host serves"
+        );
+    }
+
+    /// (b) The host returns NULL ("can't serve"): the request falls
+    /// through to the configured URL exactly as today.
+    #[tokio::test]
+    async fn null_falls_back_to_the_url() {
+        let stub = spawn_stub(STUB_BLOCK).await;
+        let host = Host::new(None);
+        let client = ChainClient::new(&stub.url).with_transport(Some(host.clone()));
+
+        assert_eq!(client.eth_block_number().await.unwrap(), 0x2222);
+        assert_eq!(host.calls(), 1);
+        assert_eq!(stub.hits(), 1);
+    }
+
+    /// (c) The host returns the retryable `-32000` carrying its covered
+    /// window: that is can't-serve-*yet*, so the request falls through —
+    /// and must never reach the caller as an empty result, which would
+    /// silently truncate batch discovery.
+    #[tokio::test]
+    async fn retryable_minus_32000_falls_back_not_empty() {
+        let stub = spawn_stub(STUB_LOGS).await;
+        let host = Host::new(Some(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,
+                "message":"log index has not backfilled this range",
+                "data":{"coveredFrom":"0x1dd8ac8","coveredTo":"0x1f4a3b0"}}}"#,
+        ));
+        let client = ChainClient::new(&stub.url).with_transport(Some(host.clone()));
+
+        let logs = client
+            .eth_get_logs(GNOSIS_BZZ_TOKEN, &json!([]), 0, 100)
+            .await
+            .expect("-32000 must not surface as an error either");
+        assert_eq!(logs.len(), 1, "-32000 must not surface as an empty result");
+        assert_eq!(logs[0].block_number, 30);
+        assert_eq!(host.calls(), 1);
+        assert_eq!(stub.hits(), 1);
+    }
+
+    /// A host error that is *not* `-32000` is a genuine answer and is
+    /// surfaced to the caller instead of being retried on the URL.
+    #[tokio::test]
+    async fn other_host_errors_are_surfaced() {
+        let stub = spawn_stub(STUB_BLOCK).await;
+        let host = Host::new(Some(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#,
+        ));
+        let client = ChainClient::new(&stub.url).with_transport(Some(host));
+
+        let err = client.eth_block_number().await.unwrap_err().to_string();
+        assert!(err.contains("execution reverted"), "got {err}");
+        assert_eq!(stub.hits(), 0);
+    }
+
+    /// (d) No transport set: byte-for-byte today's behaviour — one
+    /// request, straight to the configured URL.
+    #[tokio::test]
+    async fn no_transport_is_todays_behaviour() {
+        let stub = spawn_stub(STUB_BLOCK).await;
+        let client = ChainClient::new(&stub.url);
+
+        assert_eq!(client.eth_block_number().await.unwrap(), 0x2222);
+        assert_eq!(stub.hits(), 1);
+    }
+
+    /// A host that panics must not take the node down, and must not
+    /// lose the request either — it degrades to the URL path.
+    #[tokio::test]
+    async fn panicking_host_falls_back() {
+        struct Panicky;
+        impl ChainTransport for Panicky {
+            fn serve(&self, _request_json: &str) -> Option<String> {
+                panic!("host transport blew up");
+            }
+        }
+        let stub = spawn_stub(STUB_BLOCK).await;
+        let client = ChainClient::new(&stub.url).with_transport(Some(Arc::new(Panicky)));
+
+        assert_eq!(client.eth_block_number().await.unwrap(), 0x2222);
+        assert_eq!(stub.hits(), 1);
+    }
+
+    /// Every request shape ant issues routes through the seam — the
+    /// point of "transport, not policy". A host that serves everything
+    /// leaves the configured URL untouched.
+    #[tokio::test]
+    async fn every_request_routes_through_the_seam() {
+        let stub = spawn_stub(STUB_BLOCK).await;
+        // `0x…20 zero bytes` works as a result for every read below:
+        // hex bytes for eth_call / eth_getCode, a hex number elsewhere.
+        let host = Host::new(Some(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":"0x{}"}}"#,
+            "00".repeat(32)
+        )));
+        let client = ChainClient::new(&stub.url).with_transport(Some(host.clone()));
+
+        client.eth_call(GNOSIS_BZZ_TOKEN, "0x").await.unwrap();
+        client
+            .eth_call_from(&[1u8; 20], &[2u8; 20], &[])
+            .await
+            .unwrap();
+        client.eth_get_balance_lower128(&[1u8; 20]).await.unwrap();
+        client.eth_block_number().await.unwrap();
+        client.eth_get_code(GNOSIS_BZZ_TOKEN).await.unwrap();
+        client
+            .eth_get_transaction_count_pending(&[1u8; 20])
+            .await
+            .unwrap();
+        client.eth_send_raw_transaction(&[0u8; 8]).await.unwrap();
+        client
+            .eth_get_transaction_receipt(&[3u8; 32])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *host.seen.lock().unwrap(),
+            vec![
+                "eth_call",
+                "eth_call",
+                "eth_getBalance",
+                "eth_blockNumber",
+                "eth_getCode",
+                "eth_getTransactionCount",
+                "eth_sendRawTransaction",
+                "eth_getTransactionReceipt",
+            ],
+        );
+        assert_eq!(stub.hits(), 0);
+    }
 }
