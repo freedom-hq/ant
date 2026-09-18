@@ -223,21 +223,26 @@ pub async fn discover_owned_batches(
         }
     }
 
-    // Verify each candidate against current chain state.
+    // Verify each candidate against current chain state. A read that
+    // *failed* is not a confirmed negative: swallowing it (skip on a meta
+    // error, `unwrap_or(0)` on the balance) would reclassify an RPC /
+    // host-backend hiccup as "not ours" / "drained" and hand back a
+    // silently truncated list that a restore flow takes as authoritative.
+    // Only a chain answer we could actually read may drop a candidate;
+    // anything else fails the whole scan, which every caller already
+    // handles (antd logs and starts without rediscovery, the FFI surfaces
+    // the error).
     let mut out = Vec::new();
     for id in &batch_ids {
-        let Ok(meta) = crate::fetch_postage_batch_meta(client, postage_contract, id).await else {
-            continue;
-        };
+        let meta = crate::fetch_postage_batch_meta(client, postage_contract, id).await?;
         if meta.batch_owner_eth != *node_eoa {
             continue;
         }
         let remaining = client
             .postage_remaining_balance(postage_contract, id)
-            .await
-            .unwrap_or(0);
+            .await?;
         if remaining == 0 {
-            continue; // expired / drained
+            continue; // confirmed expired / drained
         }
         out.push(DiscoveredBatch {
             batch_id: *id,
@@ -529,6 +534,9 @@ mod tests {
     struct ScriptedChain {
         seen: Mutex<Vec<String>>,
         get_logs_params: Mutex<Vec<serde_json::Value>>,
+        /// When set, the `eth_call` carrying this selector answers with a
+        /// JSON-RPC error instead of a value — a transient read failure.
+        fail_selector: Option<&'static str>,
     }
 
     fn word_hex(bytes: &[u8]) -> String {
@@ -614,6 +622,23 @@ mod tests {
         fn serve(&self, request_json: &str) -> Option<String> {
             let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
             let method = req["method"].as_str().unwrap().to_string();
+            if let Some(sel) = self.fail_selector {
+                let data = req["params"][0]["data"].as_str().unwrap_or_default();
+                if method == "eth_call" && data.starts_with(sel) {
+                    self.seen.lock().unwrap().push(method);
+                    return Some(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            // Not the retryable -32000 (that means "I
+                            // don't cover this" and falls back to the
+                            // URL) — an authoritative backend failure.
+                            "error": {"code": -32603, "message": "backend unavailable"},
+                        })
+                        .to_string(),
+                    );
+                }
+            }
             let result = self.result(&method, &req["params"]);
             self.seen.lock().unwrap().push(method);
             Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
@@ -673,5 +698,45 @@ mod tests {
             bc["topics"],
             json!([format!("0x{}", hex::encode(batch_created_event_topic()))]),
         );
+    }
+
+    async fn discover_with_failing_call(
+        selector: &'static str,
+    ) -> Result<Vec<DiscoveredBatch>, RpcError> {
+        let script = std::sync::Arc::new(ScriptedChain {
+            fail_selector: Some(selector),
+            ..ScriptedChain::default()
+        });
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script));
+        discover_owned_batches(
+            &client,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+    }
+
+    /// A failed `remainingBalance` read is not a drained batch: the scan
+    /// must fail loudly rather than reclassify an RPC / host-backend
+    /// hiccup as "expired" and hand a restore flow a list missing a
+    /// funded batch.
+    #[tokio::test]
+    async fn failed_balance_read_is_not_a_drained_batch() {
+        let err = discover_with_failing_call("0xd71ba7c4")
+            .await
+            .expect_err("a failed balance read must not read as remaining = 0");
+        assert!(err.to_string().contains("backend unavailable"), "got {err}");
+    }
+
+    /// Same for the per-batch meta read: an unreadable `batchOwner` is
+    /// not "someone else's batch".
+    #[tokio::test]
+    async fn failed_meta_read_is_not_a_foreign_batch() {
+        let err = discover_with_failing_call("0x2182ddb1")
+            .await
+            .expect_err("a failed owner read must not read as not-ours");
+        assert!(err.to_string().contains("backend unavailable"), "got {err}");
     }
 }
