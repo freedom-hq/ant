@@ -51,7 +51,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// serves chain reads itself must therefore call
 /// [`crate::ant_set_chain_transport`] *before* this; installing one
 /// later only affects the per-call `ant_storage_*` / `ant_settlement_*`
-/// paths until the gateway is stopped and started again.
+/// paths until the gateway is stopped and started again. What is
+/// captured is the handle's transport *slot*, though, so replacing or
+/// clearing a transport that was installed before the start does reach
+/// this gateway immediately — a cleared one falls back to `gnosis_rpc`
+/// rather than calling a `host_ctx` the host has been told it may free.
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`

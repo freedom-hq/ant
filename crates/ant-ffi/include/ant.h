@@ -775,13 +775,23 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * threads, so `host_ctx` must be safe to use from any thread.
  *
  * Lifetime: `transport` must stay callable and `host_ctx` valid until
- * the transport is replaced/cleared or ant_shutdown is called.
+ * the transport is replaced/cleared or ant_shutdown is called. Both of
+ * those drain before they return: no thread is inside the old callback
+ * once ant_set_chain_transport / ant_shutdown returns, and none can
+ * enter it again (chain requests fall back to gnosis_rpc), so freeing
+ * host_ctx right after the call is safe — including while a gateway is
+ * running. Two consequences: a callback that never returns wedges the
+ * replacing call, and calling ant_set_chain_transport from *inside* the
+ * callback deadlocks.
  *
  * Ordering: effective immediately for ant_storage_* / ant_settlement_* /
  * ant_deploy_chequebook, which build a chain client per call. The
  * in-process gateway captures its chain wiring at ant_start_gateway, so
- * install the transport before starting it (or restart the gateway with
- * ant_stop_gateway + ant_start_gateway to pick up a later change).
+ * a transport installed while no transport was installed at its start
+ * is only guaranteed to reach it after a restart (ant_stop_gateway +
+ * ant_start_gateway) — install it first. Replacing or clearing a
+ * transport the gateway did start with takes effect in it immediately,
+ * per Lifetime above.
  *
  * Returns ANT_CHAIN_TRANSPORT_OK (0) on success,
  * ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) if `handle` is NULL, or
@@ -868,6 +878,10 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
 /*
  * Shut the embedded node down and free the handle. After this
  * returns, `handle` must not be used again.
+ *
+ * Clears any host chain transport first and waits for an in-flight
+ * callback to return (see ant_set_chain_transport), so the host_ctx
+ * handed to it may be freed once this returns.
  */
 void ant_shutdown(AntHandle *handle);
 

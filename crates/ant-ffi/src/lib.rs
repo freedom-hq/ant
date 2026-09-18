@@ -184,25 +184,36 @@ pub struct AntHandle {
     /// other's upload contention rather than the network's.
     bench: Mutex<Option<Arc<bench::BenchRun>>>,
     /// Host-provided JSON-RPC transport for chain reads/writes (issue
-    /// #77), installed by [`ant_set_chain_transport`]. `None` — the
-    /// default — means every chain request goes to the configured
+    /// #77), installed by [`ant_set_chain_transport`]. Empty by default,
+    /// which means every chain request goes to the configured
     /// `gnosis_rpc` URL, exactly as before.
+    ///
+    /// The slot itself lives for the whole life of the handle and every
+    /// chain client shares this one `Arc` — a clear/replace therefore
+    /// reaches clients built earlier (notably the gateway's, captured
+    /// once at [`ant_start_gateway`]) instead of leaving them calling a
+    /// `host_ctx` the host has since freed.
     #[cfg(feature = "chain")]
-    chain_transport: Mutex<Option<Arc<chain_transport::HostChainTransport>>>,
+    chain_transport: Arc<chain_transport::HostChainTransport>,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
 /// in-process gateway.
 #[cfg(feature = "chain")]
 impl AntHandle {
-    /// The host transport currently installed on this handle, if any.
+    /// The handle's transport slot, if a host transport is installed
+    /// right now.
+    ///
+    /// What is handed out is the *slot*, not a snapshot of the callback:
+    /// a later [`ant_set_chain_transport`] retargets (or empties) it for
+    /// every holder, so a long-lived client — the gateway's — can never
+    /// call a `host_ctx` the host was told it may free. An empty slot
+    /// stays `None` so the common no-transport build keeps the plain
+    /// `POST <url>` path with no per-request detour.
     pub(crate) fn host_chain_transport(&self) -> Option<ant_chain::SharedChainTransport> {
-        // Poison-tolerant: a panic elsewhere must not wedge chain reads.
         self.chain_transport
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .map(|t| t as ant_chain::SharedChainTransport)
+            .is_installed()
+            .then(|| self.chain_transport.clone() as ant_chain::SharedChainTransport)
     }
 
     /// A [`ant_chain::ChainClient`] for `rpc`, routed through the host
@@ -915,7 +926,7 @@ fn init_inner(
         gateway_task: Mutex::new(None),
         bench: Mutex::new(None),
         #[cfg(feature = "chain")]
-        chain_transport: Mutex::new(None),
+        chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
     })
 }
 
@@ -2852,6 +2863,10 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
 /// both copies for the next switch to abort on in
 /// `move_account_entries`.
 ///
+/// A host chain transport ([`ant_set_chain_transport`]) is cleared and
+/// drained first, so no callback is running — and none can start — once
+/// this returns, and the host may free its `host_ctx`.
+///
 /// # Safety
 ///
 /// `handle` must have come from [`ant_init`]. Null is a no-op.
@@ -2862,6 +2877,13 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
             return;
         }
         let handle = Box::from_raw(handle);
+        // Drain the host chain transport first: `ant.h` lets the host
+        // free `host_ctx` once `ant_shutdown` returns, and
+        // `shutdown_timeout` below leaks (rather than joins) a blocking
+        // thread that outruns the grace — so clear the slot and wait for
+        // any in-flight callback here, where the wait is unconditional.
+        #[cfg(feature = "chain")]
+        handle.chain_transport.set(None, std::ptr::null_mut());
         // Cancels every spawned task (including the node loop) at its
         // next await point and joins the worker / blocking threads. The
         // timeout keeps a task wedged in a syscall (a dial holding a
@@ -3703,7 +3725,7 @@ mod tests {
             gateway_task: Mutex::new(None),
             bench: Mutex::new(None),
             #[cfg(feature = "chain")]
-            chain_transport: Mutex::new(None),
+            chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         }
     }
 
