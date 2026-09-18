@@ -1262,7 +1262,12 @@ pub(crate) fn storage_buy_xdai(
 /// Best-effort: never fails the surrounding storage purchase. A thin
 /// wallet (no spare xDAI for the one-time deploy, no spare xBZZ for the
 /// deposit) or flaky RPC just logs a warning; settlement enables — and
-/// the deposit lands — on the next buy or app launch.
+/// the deposit lands — the next time one of this function's callers
+/// runs: a storage buy, a plan connect, or a plan discover (an explicit
+/// [`deploy_chequebook`] / [`settlement_topup_xdai`] also lands the
+/// deposit). **Not** on a bare app launch: `ant_init` only re-wires
+/// settlement from the persisted `chequebook.json` record and never
+/// reaches this path, so nothing here is retried there.
 /// The node wallet both pays gas and is the issuer, so no external key
 /// is ever introduced.
 #[cfg(feature = "chain")]
@@ -1781,16 +1786,20 @@ async fn resolve_or_deploy_chequebook(
             // through would deploy and fund a second chequebook on chain
             // state we could not read, burning gas and stranding the
             // existing chequebook's deposit. Skip chequebook setup for
-            // this run instead: starting without settlement is
-            // recoverable (the next start rescans), a stranded deposit is
-            // not. The cost of the trade is real and deliberate — a node
-            // whose chain reads keep failing starts without a chequebook
-            // rather than deploying one.
+            // this run instead: staying without settlement is
+            // recoverable — the next buy / plan connect / discover (or an
+            // explicit deploy) rescans — a stranded deposit is not.
+            // Unlike `antd`, nothing rescans at app start here: `ant_init`
+            // only reloads the persisted `chequebook.json`, so the retry
+            // is bound to those user actions. The cost of the trade is
+            // real and deliberate — a node whose chain reads keep failing
+            // runs without a chequebook rather than deploying one.
             tracing::warn!(
                 target: "ant-ffi",
-                "chequebook rediscovery scan failed: {e}; network settlement stays OFF for this \
-                 run — not deploying a chequebook on chain state we could not read (a later \
-                 start retries the scan)",
+                "chequebook rediscovery scan failed: {e}; network settlement stays OFF — not \
+                 deploying a chequebook on chain state we could not read (the next buy, plan \
+                 connect, discover or explicit deploy retries the scan; relaunching the app on \
+                 its own does not)",
             );
             return Err(DriveError::Op(format!(
                 "chequebook rediscovery scan failed, so we cannot tell whether this account \
