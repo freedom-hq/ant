@@ -769,6 +769,19 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * Any other JSON-RPC error (an eth_call revert, say) is a genuine answer
  * and is passed through to the caller.
  *
+ * WARNING — emit -32000 ONLY for a coverage gap, never as a generic
+ * failure code. geth and Nethermind use -32000 as a catch-all for
+ * genuine, non-retryable failures too: "nonce too low", "already known",
+ * "insufficient funds for gas * price + value", "replacement transaction
+ * underpriced", and on some backends "execution reverted". A host whose
+ * verified ladder bottoms out at an RPC quorum and forwards backend
+ * replies verbatim therefore reclassifies every one of those as
+ * can't-serve, and ant replays the request against gnosis_rpc: for
+ * eth_sendRawTransaction that is a SECOND BROADCAST of an
+ * already-signed transaction, and the caller then sees the fallback
+ * URL's error instead of the real one. Map any failure that is not a
+ * coverage gap to a different error code, or answer authoritatively.
+ *
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a
  * nested event loop). It may be invoked concurrently from several such

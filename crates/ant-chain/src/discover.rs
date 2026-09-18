@@ -261,6 +261,10 @@ pub async fn discover_owned_batches(
 /// Each candidate is verified with `factory.deployedContracts(to)` and
 /// `to.issuer() == node_eoa`. On more than one match the most-recently
 /// funded chequebook wins.
+///
+/// `Ok(None)` is authoritative — "every candidate was read, none is
+/// ours". A failed read is an `Err`, never an `Ok(None)`: callers treat
+/// the empty answer as licence to deploy a new chequebook.
 pub async fn discover_owned_chequebook(
     client: &ChainClient,
     factory: &[u8; 20],
@@ -299,6 +303,14 @@ pub async fn discover_owned_chequebook(
     let mut ordered: Vec<([u8; 20], u64)> = candidates.into_iter().collect();
     ordered.sort_by_key(|c| std::cmp::Reverse(c.1));
 
+    // Same rule as the batch scan above: a read that *failed* is not a
+    // confirmed negative. Swallowing it (`Err(_) => continue`) turns an
+    // RPC / host-backend hiccup into "this EOA owns no chequebook", and
+    // the caller acts on that by deploying *and funding* a second one —
+    // burning gas and stranding the first chequebook's deposit on the
+    // strength of chain state we could not read. Only an answer we
+    // actually read may drop a candidate; anything else fails the whole
+    // scan.
     let factory_hex = format!("0x{}", hex::encode(factory));
     for (cb, _block) in ordered {
         let cb_hex = format!("0x{}", hex::encode(cb));
@@ -307,21 +319,19 @@ pub async fn discover_owned_chequebook(
             "0x{}",
             hex::encode(factory_deployed_contracts_calldata(&cb))
         );
-        let deployed = match client.eth_call(&factory_hex, &dc_data).await {
-            Ok(ret) => last_word_nonzero(&ret),
-            Err(_) => continue,
-        };
+        let deployed = last_word_nonzero(&client.eth_call(&factory_hex, &dc_data).await?);
         if !deployed {
-            continue;
+            continue; // the factory says it never deployed this address
         }
         // cb.issuer() -> address
         let iss_data = format!("0x{}", hex::encode(chequebook_issuer_selector()));
-        let issuer = match client.eth_call(&cb_hex, &iss_data).await {
-            Ok(ret) if ret.len() >= 32 => {
-                address_from_topic(ret[ret.len() - 32..].try_into().unwrap())
-            }
-            _ => continue,
+        let ret = client.eth_call(&cb_hex, &iss_data).await?;
+        // A short return is an answer we read: the address has no
+        // `issuer()` to report, so it is not our chequebook.
+        let Some(word) = ret.len().checked_sub(32).and_then(|off| ret.get(off..)) else {
+            continue;
         };
+        let issuer = address_from_topic(word.try_into().unwrap());
         if &issuer == node_eoa {
             return Ok(Some(cb));
         }
@@ -737,6 +747,135 @@ mod tests {
         let err = discover_with_failing_call("0x2182ddb1")
             .await
             .expect_err("a failed owner read must not read as not-ours");
+        assert!(err.to_string().contains("backend unavailable"), "got {err}");
+    }
+
+    // --- chequebook discovery: a failed read is not "no chequebook" ---
+
+    /// The one chequebook the node EOA funded, and so the only `to`
+    /// address the scan below has to verify.
+    const OUR_CHEQUEBOOK: [u8; 20] = [0xcb; 20];
+
+    fn selector_hex(sel: &[u8]) -> String {
+        format!("0x{}", hex::encode(&sel[0..4]))
+    }
+
+    fn deployed_contracts_selector() -> String {
+        selector_hex(&factory_deployed_contracts_calldata(&OUR_CHEQUEBOOK))
+    }
+
+    fn issuer_selector() -> String {
+        selector_hex(&chequebook_issuer_selector())
+    }
+
+    /// Scripted backend for the chequebook scan: one xBZZ `Transfer`
+    /// from the node EOA into `OUR_CHEQUEBOOK`, which then verifies as
+    /// factory-deployed and issued by the node EOA — unless the
+    /// `eth_call` carrying `fail_selector` answers with a transient
+    /// backend error instead.
+    struct ScriptedChequebookChain {
+        seen: Mutex<Vec<String>>,
+        fail_selector: Option<String>,
+    }
+
+    impl ChainTransport for ScriptedChequebookChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let method = req["method"].as_str().unwrap().to_string();
+            self.seen.lock().unwrap().push(method.clone());
+            let result = match method.as_str() {
+                "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
+                "eth_getLogs" => json!([log_json(
+                    crate::GNOSIS_BZZ_TOKEN,
+                    &[
+                        format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
+                        word_hex(&NODE_EOA),
+                        word_hex(&OUR_CHEQUEBOOK),
+                    ],
+                    &OUR_TX,
+                    HIT_BLOCK,
+                )]),
+                "eth_call" => {
+                    let data = req["params"][0]["data"].as_str().unwrap();
+                    if self
+                        .fail_selector
+                        .as_ref()
+                        .is_some_and(|sel| data.starts_with(sel.as_str()))
+                    {
+                        return Some(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req["id"],
+                                // Deliberately not the retryable -32000:
+                                // that means "I don't cover this" and
+                                // falls back to the URL.
+                                "error": {"code": -32603, "message": "backend unavailable"},
+                            })
+                            .to_string(),
+                        );
+                    }
+                    if data.starts_with(&deployed_contracts_selector()) {
+                        json!(word_hex(&[1])) // factory deployed it
+                    } else if data.starts_with(&issuer_selector()) {
+                        json!(word_hex(&NODE_EOA))
+                    } else {
+                        panic!("unscripted eth_call data {data}")
+                    }
+                }
+                other => panic!("unscripted method {other} — the query plan changed"),
+            };
+            Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
+        }
+    }
+
+    async fn discover_chequebook_with_failing_call(
+        fail_selector: Option<String>,
+    ) -> Result<Option<[u8; 20]>, RpcError> {
+        let script = std::sync::Arc::new(ScriptedChequebookChain {
+            seen: Mutex::new(Vec::new()),
+            fail_selector,
+        });
+        // An unroutable URL: any fall-through would fail the scan rather
+        // than quietly answer from a real RPC.
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script));
+        discover_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+    }
+
+    /// With every read answered, the scan finds the chequebook — the
+    /// control for the two failure tests below.
+    #[tokio::test]
+    async fn chequebook_scan_finds_the_node_owned_chequebook() {
+        let found = discover_chequebook_with_failing_call(None).await.unwrap();
+        assert_eq!(found, Some(OUR_CHEQUEBOOK));
+    }
+
+    /// A failed `deployedContracts` read is not "the factory never
+    /// deployed this": `Ok(None)` here reads as "this EOA owns no
+    /// chequebook", which the FFI acts on by deploying *and funding* a
+    /// second one.
+    #[tokio::test]
+    async fn failed_deployed_contracts_read_is_not_a_missing_chequebook() {
+        let err = discover_chequebook_with_failing_call(Some(deployed_contracts_selector()))
+            .await
+            .expect_err("a failed deployedContracts read must not read as not-deployed");
+        assert!(err.to_string().contains("backend unavailable"), "got {err}");
+    }
+
+    /// Same for the `issuer()` read: unreadable is not "someone else's
+    /// chequebook".
+    #[tokio::test]
+    async fn failed_issuer_read_is_not_a_foreign_chequebook() {
+        let err = discover_chequebook_with_failing_call(Some(issuer_selector()))
+            .await
+            .expect_err("a failed issuer read must not read as not-ours");
         assert!(err.to_string().contains("backend unavailable"), "got {err}");
     }
 }

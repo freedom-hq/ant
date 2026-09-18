@@ -47,9 +47,10 @@ pub const ANT_CHAIN_TRANSPORT_UNSUPPORTED: c_int = -2;
 /// The host's opaque context pointer.
 ///
 /// Opaque to ant: never dereferenced, only handed back to the callback.
-/// The `Send`/`Sync` promise is the host's — documented in `ant.h` as
-/// "the callback may be invoked from any thread, one request at a time
-/// per call but possibly concurrently".
+/// The `Send`/`Sync` promise is the host's: `ant.h`'s threading section
+/// requires `host_ctx` to be safe to use from any thread, because the
+/// callback runs on ant's blocking pool and may be invoked concurrently
+/// from several of those threads.
 #[cfg(feature = "chain")]
 struct HostCtx(*mut c_void);
 
@@ -187,6 +188,16 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// It is never surfaced to callers as an empty result — that would
 /// silently truncate postage-batch discovery. Any other `error` is
 /// treated as a genuine answer and returned to the caller.
+///
+/// **Emit -32000 only for a coverage gap.** geth and Nethermind also use
+/// it as a catch-all for genuine failures (`nonce too low`, `already
+/// known`, `insufficient funds …`, `replacement transaction
+/// underpriced`, `execution reverted`), so a host forwarding backend
+/// replies verbatim turns those into can't-serve and ant replays them
+/// against `gnosis_rpc` — for `eth_sendRawTransaction` that is a second
+/// broadcast of an already-signed transaction, and the caller sees the
+/// fallback URL's error instead of the real one. Map any non-coverage
+/// failure to a different code, or answer authoritatively.
 ///
 /// Pass `NULL` for `transport` to clear a previously-installed one.
 /// `host_ctx` is opaque and simply handed back on every call.

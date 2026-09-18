@@ -30,6 +30,22 @@
 //!
 //! Any other JSON-RPC `error` member is a genuine answer (an `eth_call`
 //! revert, say) and is surfaced to the caller unchanged.
+//!
+//! # `-32000` is for coverage gaps only
+//!
+//! **A host must emit `-32000` only when its index cannot cover the
+//! request** — never as a generic failure code. geth and Nethermind use
+//! `-32000` as a catch-all for genuine, non-retryable failures as well:
+//! `nonce too low`, `already known`, `insufficient funds for gas * price
+//! + value`, `replacement transaction underpriced`, and on some backends
+//! `execution reverted`. A host whose verified ladder bottoms out at an
+//! RPC-quorum stage and forwards backend replies verbatim therefore
+//! turns every one of those into can't-serve, and ant replays the
+//! request against the configured URL: for `eth_sendRawTransaction` that
+//! is a *second broadcast* of an already-signed transaction, and the
+//! caller then sees the fallback URL's error instead of the real one.
+//! Map any failure that is not a coverage gap to a different error code,
+//! or answer authoritatively.
 
 use std::sync::Arc;
 
@@ -38,6 +54,12 @@ use std::sync::Arc;
 /// covered block window in the error's `data`; ant does not parse that
 /// window (it has no use for it — it simply falls back), it only needs
 /// to know the answer is *not* an authoritative empty result.
+///
+/// Reserved for that one meaning: a host that also emits `-32000` for
+/// genuine failures (as geth and Nethermind do for `nonce too low`,
+/// `already known`, `insufficient funds …`, `replacement transaction
+/// underpriced`, `execution reverted`) makes ant replay those requests
+/// against the configured URL — see the [module docs](self).
 pub const RETRYABLE_ERROR_CODE: i64 = -32000;
 
 /// A host-provided JSON-RPC transport.
@@ -51,6 +73,14 @@ pub const RETRYABLE_ERROR_CODE: i64 = -32000;
 /// signal can't-serve — see the [module docs](self). Implementations
 /// must not panic; a panic is caught and treated as can't-serve, but it
 /// costs a fallback round trip.
+///
+/// An implementation that wraps other backends must not pass their
+/// `-32000` errors through: here that code means "coverage gap, try
+/// elsewhere" and nothing else, while geth/Nethermind also use it for
+/// genuine failures (`nonce too low`, `already known`, `insufficient
+/// funds …`, `execution reverted`). Forwarding those verbatim gets the
+/// request replayed against the configured URL — a second broadcast for
+/// `eth_sendRawTransaction`. Re-code them, or answer authoritatively.
 pub trait ChainTransport: Send + Sync + 'static {
     /// Answer a single JSON-RPC request. `request_json` is a complete
     /// request object (`{"jsonrpc":"2.0","id":…,"method":…,"params":…}`).
