@@ -13,6 +13,11 @@
  *   * `char*`          msg  owned by ant, freed by `ant_free_string`.
  *
  * None of the pointers may be passed to `free(3)` directly.
+ *
+ * The one pointer that travels the other way is the JSON-RPC response
+ * body an `ant_chain_transport` callback returns: the host `malloc`s
+ * it, ant takes ownership and releases it with `free(3)`. See
+ * `ant_set_chain_transport`.
  */
 
 #ifndef ANT_FFI_H
@@ -705,6 +710,9 @@ void ant_free_string(char *ptr);
  * and /stamps postage state (desktop `antd` parity). Honoured only when
  * the library is built with the `chain` feature; ignored otherwise.
  *
+ * The gateway's chain wiring is captured here, once. A host serving
+ * chain reads itself must call ant_set_chain_transport BEFORE this.
+ *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
@@ -722,6 +730,91 @@ bool ant_start_gateway(const AntHandle *handle,
  * was running (or `handle` is NULL). Safe to call repeatedly.
  */
 bool ant_stop_gateway(const AntHandle *handle);
+
+/*
+ * Host-provided JSON-RPC transport for ant's Gnosis chain access.
+ *
+ * `request_json` is a complete, NUL-terminated JSON-RPC request body
+ * ({"jsonrpc":"2.0","id":…,"method":…,"params":…}) owned by ant and
+ * valid only for the duration of the call — copy it if you need it
+ * longer. `host_ctx` is the pointer handed to ant_set_chain_transport,
+ * passed back untouched.
+ *
+ * Return a malloc(3)'d, NUL-terminated JSON-RPC response body: ant
+ * takes ownership and releases it with free(3). Return NULL for
+ * "can't serve" — ant then falls back to the configured gnosis_rpc URL
+ * exactly as if no transport were installed.
+ */
+typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
+
+/* ant_set_chain_transport return codes. */
+#define ANT_CHAIN_TRANSPORT_OK           0  /* installed (or cleared)   */
+#define ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) /* handle was NULL         */
+#define ANT_CHAIN_TRANSPORT_UNSUPPORTED (-2) /* built without `chain`   */
+
+/*
+ * Install (or, with transport == NULL, clear) a host-provided JSON-RPC
+ * transport for every chain request this handle makes: eth_call,
+ * eth_getBalance, eth_getLogs, eth_getTransactionReceipt,
+ * eth_sendRawTransaction, eth_getTransactionCount, eth_blockNumber,
+ * eth_getCode. Ant keeps issuing exactly the requests it issues without
+ * a transport — the transport only decides where they are answered.
+ *
+ * Can't-serve, both of which fall back to the configured gnosis_rpc URL:
+ *   * a NULL return from the callback; and
+ *   * a JSON-RPC error with code -32000 — the retryable "my index does
+ *     not cover this range yet" shape, carrying the covered block window
+ *     in error.data. Ant never surfaces that as an empty result, which
+ *     would silently truncate postage-batch discovery.
+ * Any other JSON-RPC error (an eth_call revert, say) is a genuine answer
+ * and is passed through to the caller.
+ *
+ * WARNING — emit -32000 ONLY for a coverage gap, never as a generic
+ * failure code. geth and Nethermind use -32000 as a catch-all for
+ * genuine, non-retryable failures too: "nonce too low", "already known",
+ * "insufficient funds for gas * price + value", "replacement transaction
+ * underpriced", and on some backends "execution reverted". A host whose
+ * verified ladder bottoms out at an RPC quorum and forwards backend
+ * replies verbatim therefore reclassifies every one of those as
+ * can't-serve, and ant replays the request against gnosis_rpc: for
+ * eth_sendRawTransaction that is a SECOND BROADCAST of an
+ * already-signed transaction, and the caller then sees the fallback
+ * URL's error instead of the real one. Map any failure that is not a
+ * coverage gap to a different error code, or answer authoritatively.
+ *
+ * Threading: the callback runs on ant's runtime blocking pool, so
+ * blocking inside it is fine and expected (verified reads, locks, a
+ * nested event loop). It may be invoked concurrently from several such
+ * threads, so `host_ctx` must be safe to use from any thread.
+ *
+ * Lifetime: `transport` must stay callable and `host_ctx` valid until
+ * the transport is replaced/cleared or ant_shutdown is called. Both of
+ * those drain before they return: no thread is inside the old callback
+ * once ant_set_chain_transport / ant_shutdown returns, and none can
+ * enter it again (chain requests fall back to gnosis_rpc), so freeing
+ * host_ctx right after the call is safe — including while a gateway is
+ * running. Two consequences: a callback that never returns wedges the
+ * replacing call, and calling ant_set_chain_transport from *inside* the
+ * callback deadlocks.
+ *
+ * Ordering: effective immediately for ant_storage_* / ant_settlement_* /
+ * ant_deploy_chequebook, which build a chain client per call. The
+ * in-process gateway captures its chain wiring at ant_start_gateway, so
+ * a transport installed while no transport was installed at its start
+ * is only guaranteed to reach it after a restart (ant_stop_gateway +
+ * ant_start_gateway) — install it first. Replacing or clearing a
+ * transport the gateway did start with takes effect in it immediately,
+ * per Lifetime above.
+ *
+ * Returns ANT_CHAIN_TRANSPORT_OK (0) on success,
+ * ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) if `handle` is NULL, or
+ * ANT_CHAIN_TRANSPORT_UNSUPPORTED (-2) when this build has no chain
+ * support at all (built without the `chain` feature — no chain request
+ * exists to route, and nothing was installed).
+ */
+int ant_set_chain_transport(AntHandle *handle,
+                            ant_chain_transport transport,
+                            void *host_ctx);
 
 /*
  * Start the AntStream publisher throughput benchmark (issue #67 stage 1)
@@ -798,6 +891,10 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
 /*
  * Shut the embedded node down and free the handle. After this
  * returns, `handle` must not be used again.
+ *
+ * Clears any host chain transport first and waits for an in-flight
+ * callback to return (see ant_set_chain_transport), so the host_ctx
+ * handed to it may be freed once this returns.
  */
 void ant_shutdown(AntHandle *handle);
 

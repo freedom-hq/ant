@@ -235,6 +235,35 @@ pub fn build(
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
 ) -> Option<Arc<ChainContext>> {
+    build_with_transport(
+        rpc_url,
+        read_fallback_rpc_url,
+        postage_contract,
+        wallet_eth,
+        chequebook,
+        chain_id,
+        wallet_secret,
+        None,
+    )
+}
+
+/// [`build`], but with a host-provided chain transport (issue #77)
+/// installed on the reader *and* the writer. The host gets first
+/// refusal on every JSON-RPC request the gateway's chain surfaces
+/// issue; a can't-serve answer falls through to the URLs above exactly
+/// as it would without a transport. `None` is identical to [`build`].
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_transport(
+    rpc_url: Option<String>,
+    read_fallback_rpc_url: Option<String>,
+    postage_contract: String,
+    wallet_eth: [u8; 20],
+    chequebook: Option<[u8; 20]>,
+    chain_id: u64,
+    wallet_secret: Option<[u8; 32]>,
+    transport: Option<ant_chain::SharedChainTransport>,
+) -> Option<Arc<ChainContext>> {
     // Treat blank strings as unset so an empty env/config value behaves
     // like an absent one.
     let write_rpc = rpc_url.filter(|s| !s.trim().is_empty());
@@ -244,7 +273,7 @@ pub fn build(
     // keeps its bee zero-stubs.
     let read_rpc = write_rpc.clone().or(read_fallback)?;
     let reader = AntChainReader {
-        client: ChainClient::new(read_rpc),
+        client: ChainClient::new(read_rpc).with_transport(transport.clone()),
         postage_contract: postage_contract.clone(),
         bzz_token: GNOSIS_BZZ_TOKEN.to_string(),
     };
@@ -263,7 +292,7 @@ pub fn build(
             match (wallet, postage, bzz) {
                 (Some(wallet), Some(postage), Some(bzz)) => Some(Arc::new(AntChainWriter {
                     wallet,
-                    client: ChainClient::new(rpc),
+                    client: ChainClient::new(rpc).with_transport(transport),
                     postage_contract: postage,
                     bzz_token: bzz,
                     owner: wallet_eth,
