@@ -1130,8 +1130,30 @@ impl SwarmState {
         if !stale {
             return;
         }
-        let fresh = crate::underlay::LocalSubnets::from_interfaces();
-        self.set_local_subnets(fresh);
+        match crate::underlay::LocalSubnets::from_interfaces() {
+            Some(fresh) => self.set_local_subnets(fresh),
+            // A failed interface read is not "no networks": keep trusting
+            // the previous snapshot for another TTL rather than purging the
+            // caches and rejecting every same-LAN underlay (then purging
+            // again once the next read succeeds).
+            None => self.interfaces_unreadable(),
+        }
+    }
+
+    /// Enumerating the host's interfaces failed. With a previous snapshot,
+    /// keep it (re-stamped, so the read is retried after another TTL rather
+    /// than on every dial). With none yet, fall back to an empty set — no
+    /// private underlay is admitted, the safe direction — and since nothing
+    /// private was cached against it, the change on the next good read
+    /// purges nothing.
+    fn interfaces_unreadable(&mut self) {
+        match self.local_subnets.as_mut() {
+            Some((at, _)) => *at = Instant::now(),
+            None => {
+                self.local_subnets =
+                    Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+            }
+        }
     }
 
     /// Install a new subnet snapshot, purging cached private underlays if
@@ -1140,7 +1162,7 @@ impl SwarmState {
         let changed = self
             .local_subnets
             .as_ref()
-            .is_some_and(|(_, old)| *old != fresh);
+            .is_some_and(|(_, old)| !old.same_networks(&fresh));
         self.local_subnets = Some((Instant::now(), fresh));
         if changed {
             self.purge_private_underlays();
@@ -7951,6 +7973,37 @@ mod tests {
         let same = state.local_subnets.as_ref().unwrap().1.clone();
         state.set_local_subnets(same);
         assert!(state.known_dialable.contains_key(&lan_only));
+
+        // R2-M1: a rotated temporary IPv6 address is not a network move.
+        let mut rotated = vec![("192.168.1.33".parse().unwrap(), 24)];
+        rotated.push(("2a01:4f8:1:2:cafe::1".parse().unwrap(), 64));
+        state.set_local_subnets(crate::underlay::LocalSubnets::from_nets(rotated));
+        assert!(state.known_dialable.contains_key(&lan_only));
+
+        // R2-M2: a failed interface read keeps the previous snapshot (and
+        // the cached same-LAN underlays) instead of acting as "no networks".
+        let before = state.local_subnets.as_ref().unwrap().1.clone();
+        state.local_subnets.as_mut().unwrap().0 =
+            Instant::now().checked_sub(LOCAL_SUBNETS_TTL).unwrap();
+        state.interfaces_unreadable();
+        let (at, kept) = state.local_subnets.as_ref().unwrap();
+        assert!(kept.same_networks(&before));
+        assert!(at.elapsed() < LOCAL_SUBNETS_TTL);
+        assert!(state.known_dialable.contains_key(&lan_only));
+        let cached = state.known_dialable[&lan_only].clone();
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()]),
+        );
+        // … and with no snapshot yet it falls back to the safe empty set.
+        state.local_subnets = None;
+        state.interfaces_unreadable();
+        assert!(state
+            .local_subnets
+            .as_ref()
+            .unwrap()
+            .1
+            .same_networks(&crate::underlay::LocalSubnets::default()));
     }
 
     /// Dead-underlay backoff (issue #88): repeated dial failures double the

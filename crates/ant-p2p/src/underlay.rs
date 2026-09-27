@@ -250,40 +250,73 @@ pub(crate) fn is_globally_routable_ip(ip: IpAddr) -> bool {
 /// `192.168.1.0/24` and a bee node on the same Wi-Fi advertising
 /// `192.168.1.20`. Traffic to a directly-attached subnet never leaves the
 /// local network, so it can't look like a scan to an upstream provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LocalSubnets {
     nets: Vec<(IpAddr, u8)>,
 }
 
 impl LocalSubnets {
-    /// Snapshot the host's interfaces. An enumeration failure yields an
-    /// empty set, i.e. private underlays are dropped — the safe direction.
-    pub(crate) fn from_interfaces() -> Self {
-        let nets = match if_addrs::get_if_addrs() {
-            Ok(ifs) => ifs
-                .into_iter()
-                .filter(|i| !i.is_loopback())
-                .map(|i| match i.addr {
-                    if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
-                    if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), a.prefixlen),
-                })
-                .collect(),
+    /// Snapshot the host's interfaces. `None` when enumeration failed —
+    /// deliberately distinct from an empty set ("no private networks"),
+    /// because the swarm loop purges its cached same-LAN underlays when
+    /// the snapshot changes and a failed read is not a network move.
+    pub(crate) fn from_interfaces() -> Option<Self> {
+        match if_addrs::get_if_addrs() {
+            Ok(ifs) => Some(Self::from_nets(
+                ifs.into_iter()
+                    .filter(|i| !i.is_loopback())
+                    .map(|i| match i.addr {
+                        if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
+                        if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), a.prefixlen),
+                    })
+                    .collect(),
+            )),
             Err(e) => {
                 tracing::debug!(target: "ant_p2p", "enumerate local interfaces: {e}");
-                Vec::new()
+                None
             }
-        };
-        Self::from_nets(nets)
+        }
     }
 
-    /// Build from `(interface address, prefix length)` pairs. Sorted and
-    /// deduped so two snapshots of the same interfaces compare equal —
-    /// the swarm loop uses a changed snapshot as its "we moved networks"
-    /// signal.
+    /// Build from `(interface address, prefix length)` pairs.
     pub(crate) fn from_nets(mut nets: Vec<(IpAddr, u8)>) -> Self {
         nets.sort_unstable();
         nets.dedup();
         Self { nets }
+    }
+
+    /// Do two snapshots describe the same attached networks, as far as
+    /// same-LAN dialing is concerned? This is the swarm loop's "we moved
+    /// networks" signal, so it only looks at what can change a
+    /// [`filter_dialable_underlays`] verdict — the [`IpScope::Private`]
+    /// subnets — and ignores interface churn that isn't a move:
+    ///
+    /// * global / link-local addresses are dropped (they never decide
+    ///   whether a private underlay is kept), so rotating an RFC 4941
+    ///   temporary global IPv6 address is not a change;
+    /// * private IPv6 subnets compare by network prefix, not host address,
+    ///   so a temporary ULA address rotating inside the same `/64` isn't
+    ///   either;
+    /// * private IPv4 subnets compare by host address *and* prefix: a new
+    ///   DHCP lease inside the same `192.168.1.0/24` is the best available
+    ///   hint that this may be a different LAN reusing the numbering.
+    pub(crate) fn same_networks(&self, other: &Self) -> bool {
+        self.network_key() == other.network_key()
+    }
+
+    fn network_key(&self) -> Vec<(IpAddr, u8)> {
+        let mut key: Vec<(IpAddr, u8)> = self
+            .nets
+            .iter()
+            .filter(|&&(ip, _)| ip_scope(ip) == IpScope::Private)
+            .map(|&(ip, prefix)| match ip.to_canonical() {
+                IpAddr::V4(v4) => (IpAddr::V4(v4), prefix),
+                IpAddr::V6(v6) => (IpAddr::V6(mask_v6(v6, prefix)), prefix),
+            })
+            .collect();
+        key.sort_unstable();
+        key.dedup();
+        key
     }
 
     /// Is `ip` inside one of the attached subnets? IPv4-mapped IPv6
@@ -297,6 +330,13 @@ impl LocalSubnets {
             _ => false,
         })
     }
+}
+
+/// `ip` with every bit past the first `prefix` cleared.
+fn mask_v6(ip: Ipv6Addr, prefix: u8) -> Ipv6Addr {
+    let bits = u32::from(prefix.min(128));
+    let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+    Ipv6Addr::from(u128::from(ip) & mask)
 }
 
 /// Compare the first `prefix` bits of two equal-length octet strings. A
@@ -569,12 +609,56 @@ mod tests {
 
     #[test]
     fn local_subnets_snapshot_equality_ignores_order() {
-        let a = LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24), (ip("fd00::7"), 64)]);
-        let b = LocalSubnets::from_nets(vec![(ip("fd00::7"), 64), (ip("192.168.1.7"), 24)]);
-        assert_eq!(a, b);
+        let home = LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24), (ip("fd00::7"), 64)]);
+        let reordered = LocalSubnets::from_nets(vec![(ip("fd00::7"), 64), (ip("192.168.1.7"), 24)]);
+        assert!(home.same_networks(&reordered));
         // Same subnet, new lease → a different snapshot.
-        let c = LocalSubnets::from_nets(vec![(ip("192.168.1.8"), 24), (ip("fd00::7"), 64)]);
-        assert_ne!(a, c);
+        let new_lease = LocalSubnets::from_nets(vec![(ip("192.168.1.8"), 24), (ip("fd00::7"), 64)]);
+        assert!(!home.same_networks(&new_lease));
+        // Moving off the private IPv6 network is a change.
+        let v4_only = LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24)]);
+        assert!(!home.same_networks(&v4_only));
+        let other_ula =
+            LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24), (ip("fd00:1::7"), 64)]);
+        assert!(!home.same_networks(&other_ula));
+    }
+
+    /// R2-M1: IPv6 privacy-address rotation (RFC 4941) is not a network
+    /// move — neither a new temporary global address nor a new temporary
+    /// ULA address inside the same /64.
+    #[test]
+    fn local_subnets_ignore_ipv6_temporary_address_rotation() {
+        let before = LocalSubnets::from_nets(vec![
+            (ip("192.168.1.7"), 24),
+            (ip("fd12:3456:789a:1::aaaa"), 64),
+            (ip("2a01:4f8:1:2::1111"), 64),
+            (ip("2a01:4f8:1:2:dead:beef:1:2"), 64),
+            (ip("fe80::1234"), 64),
+        ]);
+        let after = LocalSubnets::from_nets(vec![
+            (ip("192.168.1.7"), 24),
+            (ip("fd12:3456:789a:1::bbbb"), 64),
+            (ip("2a01:4f8:1:2::1111"), 64),
+            (ip("2a01:4f8:1:2:cafe:f00d:3:4"), 64),
+            (ip("fe80::5678"), 64),
+        ]);
+        assert!(before.same_networks(&after));
+        // A whole new global prefix (different ISP) with the same private
+        // LAN is still not a move as far as private underlays go.
+        let new_isp = LocalSubnets::from_nets(vec![
+            (ip("192.168.1.7"), 24),
+            (ip("fd12:3456:789a:1::aaaa"), 64),
+            (ip("2001:470:1::1"), 64),
+        ]);
+        assert!(before.same_networks(&new_isp));
+        assert_eq!(
+            mask_v6("fd12::ffff".parse().unwrap(), 0),
+            Ipv6Addr::UNSPECIFIED
+        );
+        assert_eq!(
+            mask_v6("fd12::ffff".parse().unwrap(), 128),
+            "fd12::ffff".parse::<Ipv6Addr>().unwrap(),
+        );
     }
 
     #[test]
