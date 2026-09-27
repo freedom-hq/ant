@@ -11,7 +11,7 @@
 
 use libp2p::core::multiaddr::Protocol;
 use libp2p::multiaddr::{Error as MultiaddrError, Multiaddr};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use unsigned_varint::decode::Error as VarintError;
 
 const UNDERLAY_LIST_PREFIX: u8 = 0x99;
@@ -148,6 +148,187 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     (octets[0] & 0xfe) == 0xfc
 }
 
+/// Reachability class of an IP address, from the point of view of a node
+/// somewhere else on the internet. Shared by the "is our observed address
+/// worth advertising" check and the "may we dial this peer underlay"
+/// filter, so both agree on what "unroutable" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpScope {
+    /// Publicly routable.
+    Global,
+    /// Belongs to *some* private network: RFC1918, IPv4 link-local
+    /// (`169.254/16`), CGNAT (`100.64/10`), IPv6 ULA (`fc00::/7`).
+    /// Only reachable from a host attached to that same network.
+    Private,
+    /// Never meaningful as a remote peer's address: loopback, unspecified,
+    /// `0/8`, broadcast, multicast, documentation ranges, and IPv6
+    /// link-local (`fe80::/10` — undialable without the zone id, which
+    /// multiaddrs don't carry).
+    Local,
+}
+
+/// Classify `ip`. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is classified as the
+/// embedded IPv4 address.
+pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
+    match ip {
+        IpAddr::V4(v4) => ipv4_scope(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ipv4_scope(v4);
+            }
+            let seg0 = v6.segments()[0];
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local
+                || (seg0 & 0xffc0) == 0xfe80
+                // 2001:db8::/32 documentation
+                || (seg0 == 0x2001 && v6.segments()[1] == 0x0db8)
+            {
+                IpScope::Local
+            } else if is_private_ipv6(v6) {
+                IpScope::Private
+            } else {
+                IpScope::Global
+            }
+        }
+    }
+}
+
+fn ipv4_scope(ip: Ipv4Addr) -> IpScope {
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        // 0.0.0.0/8 "this network"
+        || ip.octets()[0] == 0
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+    {
+        IpScope::Local
+    } else if is_private_ipv4(ip) || is_cgnat_ipv4(ip) {
+        IpScope::Private
+    } else {
+        IpScope::Global
+    }
+}
+
+/// `100.64.0.0/10` shared address space (RFC 6598, carrier-grade NAT).
+fn is_cgnat_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+/// True when `ip` is reachable from anywhere on the internet.
+pub(crate) fn is_globally_routable_ip(ip: IpAddr) -> bool {
+    ip_scope(ip) == IpScope::Global
+}
+
+/// The IP subnets this host is directly attached to (non-loopback
+/// interfaces). A peer underlay in [`IpScope::Private`] space is only worth
+/// dialing when it falls inside one of these — e.g. phone on
+/// `192.168.1.0/24` and a bee node on the same Wi-Fi advertising
+/// `192.168.1.20`. Traffic to a directly-attached subnet never leaves the
+/// local network, so it can't look like a scan to an upstream provider.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocalSubnets {
+    nets: Vec<(IpAddr, u8)>,
+}
+
+impl LocalSubnets {
+    /// Snapshot the host's interfaces. An enumeration failure yields an
+    /// empty set, i.e. private underlays are dropped — the safe direction.
+    pub(crate) fn from_interfaces() -> Self {
+        let nets = match if_addrs::get_if_addrs() {
+            Ok(ifs) => ifs
+                .into_iter()
+                .filter(|i| !i.is_loopback())
+                .map(|i| match i.addr {
+                    if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
+                    if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), a.prefixlen),
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(target: "ant_p2p", "enumerate local interfaces: {e}");
+                Vec::new()
+            }
+        };
+        Self { nets }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_nets(nets: Vec<(IpAddr, u8)>) -> Self {
+        Self { nets }
+    }
+
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
+        self.nets.iter().any(|&(net, prefix)| match (net, ip) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => prefix_match(&n.octets(), &a.octets(), prefix),
+            (IpAddr::V6(n), IpAddr::V6(a)) => prefix_match(&n.octets(), &a.octets(), prefix),
+            _ => false,
+        })
+    }
+}
+
+/// Compare the first `prefix` bits of two equal-length octet strings. A
+/// zero prefix (a default-route-sized "subnet") never matches: it would
+/// admit every private address.
+fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
+    let prefix = usize::from(prefix);
+    if prefix == 0 || prefix > a.len() * 8 {
+        return false;
+    }
+    let full = prefix / 8;
+    if a[..full] != b[..full] {
+        return false;
+    }
+    let rem = prefix % 8;
+    if rem == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - rem);
+    (a[full] & mask) == (b[full] & mask)
+}
+
+/// Keep only the peer underlays that are worth dialing from this host.
+///
+/// A peer's private / loopback / link-local underlays describe *its own*
+/// network: from anywhere else they are unreachable or, worse, hit an
+/// unrelated host on ours. Dialing them en masse (bee nodes in
+/// Docker/Kubernetes advertise their pod addresses) looks like a network
+/// scan to a hosting provider (issue #88). So an address survives when every
+/// IP component is globally routable, or is [`IpScope::Private`] and inside
+/// one of `local`'s subnets (same-LAN peer). Addresses without an IP
+/// component (`/dns4/…`) pass through. `allow_private` disables the filter
+/// entirely, for dev/test networks that live on one private network or
+/// loopback.
+pub(crate) fn filter_dialable_underlays(
+    addrs: &[Multiaddr],
+    local: &LocalSubnets,
+    allow_private: bool,
+) -> Vec<Multiaddr> {
+    if allow_private {
+        return addrs.to_vec();
+    }
+    addrs
+        .iter()
+        .filter(|addr| {
+            addr.iter().all(|p| {
+                let ip = match p {
+                    Protocol::Ip4(ip) => IpAddr::V4(ip),
+                    Protocol::Ip6(ip) => IpAddr::V6(ip),
+                    _ => return true,
+                };
+                match ip_scope(ip) {
+                    IpScope::Global => true,
+                    IpScope::Private => local.contains(ip),
+                    IpScope::Local => false,
+                }
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Single-address backward-compatible encoding uses raw multiaddr bytes.
 ///
 /// Returns the serialized form unconditionally; the cap checks live in
@@ -239,6 +420,105 @@ mod tests {
         assert!(underlay_score(&private) < underlay_score(&loopback));
         assert!(underlay_score(&public) < underlay_score(&ipv6));
         assert!(underlay_score(&public) < underlay_score(&wss));
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn ip_scope_classifies_unroutable_ranges() {
+        for g in ["1.2.3.4", "8.8.8.8", "2a01:4f8::1", "::ffff:1.2.3.4"] {
+            assert_eq!(ip_scope(ip(g)), IpScope::Global, "{g}");
+        }
+        for p in [
+            "10.233.1.2",
+            "172.17.0.3",
+            "192.168.1.20",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "fd00::1",
+            "fc00::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert_eq!(ip_scope(ip(p)), IpScope::Private, "{p}");
+        }
+        for l in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "224.0.0.1",
+            "192.0.2.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "febf::1",
+            "ff02::1",
+            "2001:db8::1",
+        ] {
+            assert_eq!(ip_scope(ip(l)), IpScope::Local, "{l}");
+        }
+        // Just outside CGNAT / link-local on either side.
+        assert_eq!(ip_scope(ip("100.63.255.255")), IpScope::Global);
+        assert_eq!(ip_scope(ip("100.128.0.0")), IpScope::Global);
+    }
+
+    #[test]
+    fn local_subnets_prefix_match() {
+        let local = LocalSubnets::from_nets(vec![
+            (ip("192.168.1.7"), 24),
+            (ip("10.0.2.15"), 20),
+            (ip("fd12:3456::7"), 64),
+            (ip("100.101.102.103"), 32),
+            (ip("172.16.0.1"), 0),
+        ]);
+        assert!(local.contains(ip("192.168.1.20")));
+        assert!(!local.contains(ip("192.168.2.20")));
+        assert!(local.contains(ip("10.0.15.255")));
+        assert!(!local.contains(ip("10.0.16.0")));
+        assert!(local.contains(ip("fd12:3456::99")));
+        assert!(!local.contains(ip("fd12:3457::99")));
+        assert!(local.contains(ip("100.101.102.103")));
+        assert!(!local.contains(ip("100.101.102.104")));
+        // A /0 "subnet" must not admit everything.
+        assert!(!local.contains(ip("172.17.0.3")));
+        // Families never cross-match.
+        assert!(!local.contains(ip("::ffff:192.168.1.20")));
+    }
+
+    #[test]
+    fn filter_drops_foreign_private_underlays_keeps_same_lan() {
+        let local = LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24)]);
+        let addrs = vec![
+            ma("/ip4/10.233.64.12/tcp/1634/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC"),
+            ma("/ip4/172.17.0.3/tcp/1634"),
+            ma("/ip4/127.0.0.1/tcp/1634"),
+            ma("/ip4/100.64.3.4/tcp/1634"),
+            ma("/ip6/fe80::1/tcp/1634"),
+            ma("/ip6/fd00::5/tcp/1634"),
+            ma("/ip6/::1/tcp/1634"),
+            ma("/ip4/192.168.1.20/tcp/1634"),
+            ma("/ip4/1.2.3.4/tcp/1634"),
+            ma("/ip6/2a01:4f8::1/tcp/1634"),
+            ma("/dns4/node.example.org/tcp/1634"),
+        ];
+        let kept = filter_dialable_underlays(&addrs, &local, false);
+        assert_eq!(
+            kept,
+            vec![
+                ma("/ip4/192.168.1.20/tcp/1634"),
+                ma("/ip4/1.2.3.4/tcp/1634"),
+                ma("/ip6/2a01:4f8::1/tcp/1634"),
+                ma("/dns4/node.example.org/tcp/1634"),
+            ],
+        );
+        // Off the LAN, the same-subnet address goes too.
+        let kept = filter_dialable_underlays(&addrs, &LocalSubnets::default(), false);
+        assert!(!kept.contains(&ma("/ip4/192.168.1.20/tcp/1634")));
+        // Escape hatch keeps everything.
+        assert_eq!(filter_dialable_underlays(&addrs, &local, true), addrs);
     }
 
     #[test]

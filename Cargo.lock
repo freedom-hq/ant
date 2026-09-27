@@ -247,6 +247,7 @@ dependencies = [
  "futures",
  "hex",
  "hickory-resolver",
+ "if-addrs",
  "k256",
  "libp2p",
  "libp2p-stream",
