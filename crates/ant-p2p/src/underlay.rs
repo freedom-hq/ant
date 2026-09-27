@@ -245,8 +245,9 @@ pub(crate) fn is_globally_routable_ip(ip: IpAddr) -> bool {
 }
 
 /// The IP subnets this host is directly attached to (interfaces that are
-/// up, non-loopback and not a host-internal virtual bridge). A peer underlay in [`IpScope::Private`] space is only worth
-/// dialing when it falls inside one of these — e.g. phone on
+/// up, non-loopback and not a host-internal virtual bridge). A peer
+/// underlay in [`IpScope::Private`] space is only worth dialing when it
+/// falls inside one of these — e.g. phone on
 /// `192.168.1.0/24` and a bee node on the same Wi-Fi advertising
 /// `192.168.1.20`. Traffic to a directly-attached subnet never leaves the
 /// local network, so it can't look like a scan to an upstream provider.
@@ -352,40 +353,57 @@ impl LocalSubnets {
 }
 
 /// Interface-name prefixes of host-internal virtual networks: container
-/// bridges and veth pairs (Docker, Podman, k8s CNIs), hypervisor host-only
-/// / NAT networks (`virbr*`, `vboxnet*`, `vmnet*`, Hyper-V/WSL). Their subnets
+/// bridges and veth pairs (Docker, Podman, k8s CNIs) and hypervisor
+/// host-only / NAT networks (`virbr*`, `vboxnet*`, `vmnet*`). Their subnets
 /// are routed to a local bridge, so they never make a remote peer's private
-/// address reachable. Matched case-insensitively (Windows names Hyper-V
-/// adapters `vEthernet (…)`). VPN tunnels (`tun*`, `utun*`, `wg*`,
-/// `tailscale*`) are deliberately *not* listed: those do reach real remote
-/// private networks.
+/// address reachable. Matched case-insensitively. VPN tunnels (`tun*`,
+/// `utun*`, `wg*`, `tailscale*`) are deliberately *not* listed: those do
+/// reach real remote private networks.
+///
+/// Two families are too broad to match by prefix and are handled in
+/// [`is_virtual_interface`] instead: Docker user-defined networks
+/// (`br-<12 hex>` — a bare `br-` would also catch `OpenWrt`'s real LAN bridge
+/// `br-lan`) and Hyper-V/WSL (`vEthernet (…)` — a Hyper-V *External*
+/// switch is also `vEthernet (<name>)` and carries the host's real LAN
+/// address).
 const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
-    "docker",
-    "br-",
-    "veth",
-    "cni",
-    "flannel",
-    "cali",
-    "cilium",
-    "weave",
-    "kube-",
-    "virbr",
-    "vboxnet",
-    "vmnet",
-    "podman",
-    "lxcbr",
-    "lxdbr",
-    "vethernet",
+    "docker", "veth", "cni", "flannel", "cali", "cilium", "weave", "kube-", "virbr", "vboxnet",
+    "vmnet", "podman", "lxcbr", "lxdbr",
 ];
 
-/// Is `name` one of [`VIRTUAL_INTERFACE_PREFIXES`]? A naming heuristic —
-/// it catches the common defaults on Linux, macOS and Windows; anything it
+/// Hyper-V adapters that are always host-internal: the built-in NAT
+/// `Default Switch`, WSL 2's switch (`WSL`, `WSL (Hyper-V firewall)`) and
+/// Docker Desktop's `nat` network. Other `vEthernet (…)` adapters are
+/// user-named switches — possibly an External switch bridged onto the
+/// real LAN — so they are left in.
+const HYPERV_INTERNAL_PREFIXES: &[&str] = &[
+    "vEthernet (Default Switch)",
+    "vEthernet (WSL",
+    "vEthernet (nat)",
+];
+
+/// Is `name` a host-internal virtual network? A naming heuristic — it
+/// catches the common defaults on Linux, macOS and Windows; anything it
 /// misses can be worked around with `allow_private_dials`.
 pub(crate) fn is_virtual_interface(name: &str) -> bool {
-    VIRTUAL_INTERFACE_PREFIXES.iter().any(|p| {
+    let has_prefix = |p: &str| {
         name.get(..p.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(p))
-    })
+    };
+    // Hyper-V names are decided by the allowlist alone: the generic `veth`
+    // prefix would otherwise swallow every `vEthernet (…)`, External
+    // switches included.
+    if has_prefix("vEthernet") {
+        return HYPERV_INTERNAL_PREFIXES.iter().any(|p| has_prefix(p));
+    }
+    VIRTUAL_INTERFACE_PREFIXES.iter().any(|p| has_prefix(p)) || is_docker_network_bridge(name)
+}
+
+/// Docker names a user-defined network's bridge `br-` followed by the
+/// first 12 hex characters of the network id (`br-68148f6025cd`).
+fn is_docker_network_bridge(name: &str) -> bool {
+    name.strip_prefix("br-")
+        .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// `ip` with every bit past the first `prefix` cleared.
@@ -720,6 +738,17 @@ mod tests {
         }
         assert!(local.contains(ip("10.0.0.9")));
 
+        // Real LAN bridges that share a naming family with virtual ones:
+        // OpenWrt's `br-lan`, a Hyper-V External switch.
+        for lan in ["br-lan", "vEthernet (External)"] {
+            let local = LocalSubnets::from_interface_list(vec![
+                iface(lan, true, "192.168.1.7", 24),
+                iface("br-68148f6025cd", true, "172.18.0.1", 16),
+            ]);
+            assert!(local.contains(ip("192.168.1.20")), "{lan}");
+            assert!(!local.contains(ip("172.18.0.2")), "{lan}");
+        }
+
         // A real interface that is down doesn't count either.
         let down = LocalSubnets::from_interface_list(vec![iface("en0", false, "192.168.1.7", 24)]);
         assert!(!down.contains(ip("192.168.1.20")));
@@ -740,6 +769,8 @@ mod tests {
             "podman1",
             "vEthernet (Default Switch)",
             "VETHERNET (WSL)",
+            "vEthernet (WSL (Hyper-V firewall))",
+            "vEthernet (nat)",
         ] {
             assert!(is_virtual_interface(v), "{v}");
         }
@@ -757,6 +788,16 @@ mod tests {
             "tailscale0",
             "bridge0",
             "br0",
+            // OpenWrt's LAN bridge, and near-misses of Docker's `br-<12 hex>`.
+            "br-lan",
+            "br-wan",
+            "br-68148f6025c",
+            "br-68148f6025cdx",
+            "br-68148f6025cg",
+            // A Hyper-V External switch bridges the physical NIC and
+            // carries the host's real LAN address.
+            "vEthernet (External)",
+            "vEthernet (Intel(R) Wi-Fi 6 AX201 160MHz Virtual Switch)",
             "",
         ] {
             assert!(!is_virtual_interface(real), "{real}");
