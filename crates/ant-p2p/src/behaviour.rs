@@ -1093,26 +1093,88 @@ impl SwarmState {
 
     /// Filter a peer's advertised underlays down to the ones worth dialing
     /// from here — see [`crate::underlay::filter_dialable_underlays`].
+    ///
+    /// Called both when a hint is enqueued *and* again right before every
+    /// hint-driven dial: a same-LAN private underlay admitted on the home
+    /// Wi-Fi must not be dialed after the host moved to cellular.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
         if self.allow_private_dials {
             return addrs.to_vec();
         }
-        let stale = self
-            .local_subnets
-            .as_ref()
-            .is_none_or(|(at, _)| at.elapsed() >= LOCAL_SUBNETS_TTL);
-        if stale {
-            self.local_subnets = Some((
-                Instant::now(),
-                crate::underlay::LocalSubnets::from_interfaces(),
-            ));
-        }
+        self.refresh_local_subnets();
         let local = self
             .local_subnets
             .as_ref()
             .map(|(_, l)| l)
             .expect("refreshed above");
         crate::underlay::filter_dialable_underlays(addrs, local, false)
+    }
+
+    /// Re-read the host's subnets once the cached snapshot is older than
+    /// [`LOCAL_SUBNETS_TTL`]. When they changed (Wi-Fi ↔ cellular, a new
+    /// LAN, a DHCP lease with a different address), every private underlay
+    /// cached in `known_dialable` / `hint_queue` was admitted against the
+    /// *old* network — possibly a different LAN that happens to use the
+    /// same `192.168.1.0/24` numbering — so drop them all. Hive gossip
+    /// re-teaches the ones that are same-LAN on the new network, and they
+    /// get filtered against the new snapshot on the way in.
+    ///
+    /// Residual gap: hopping between two LANs with identical numbering
+    /// *and* an identical local address within one TTL is not detectable
+    /// from interface data alone.
+    fn refresh_local_subnets(&mut self) {
+        let stale = self
+            .local_subnets
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= LOCAL_SUBNETS_TTL);
+        if !stale {
+            return;
+        }
+        let fresh = crate::underlay::LocalSubnets::from_interfaces();
+        self.set_local_subnets(fresh);
+    }
+
+    /// Install a new subnet snapshot, purging cached private underlays if
+    /// it differs from the previous one. See [`Self::refresh_local_subnets`].
+    fn set_local_subnets(&mut self, fresh: crate::underlay::LocalSubnets) {
+        let changed = self
+            .local_subnets
+            .as_ref()
+            .is_some_and(|(_, old)| *old != fresh);
+        self.local_subnets = Some((Instant::now(), fresh));
+        if changed {
+            self.purge_private_underlays();
+        }
+    }
+
+    /// Strip every private-scope underlay from the cached dial book and
+    /// queue, dropping hints left with nothing to dial.
+    fn purge_private_underlays(&mut self) {
+        let strip = |hint: &mut sinks::PeerHint| {
+            hint.addrs.retain(|a| !crate::underlay::has_private_ip(a));
+            !hint.addrs.is_empty()
+        };
+        let before = self.known_dialable.len() + self.hint_queue.len();
+        self.known_dialable.retain(|_, hint| strip(hint));
+        self.hint_queue.retain_mut(strip);
+        let dropped = before - (self.known_dialable.len() + self.hint_queue.len());
+        debug!(
+            target: "ant_p2p",
+            dropped,
+            "local networks changed; dropped cached private underlays",
+        );
+    }
+
+    /// Re-filter a cached hint's underlays against the *current* networks
+    /// right before dialing it. Returns `None` (and forgets the peer's
+    /// cached dial info) when nothing dialable is left.
+    fn addrs_for_dial(&mut self, hint: &sinks::PeerHint) -> Option<Vec<Multiaddr>> {
+        let addrs = self.dialable_underlays(&hint.addrs);
+        if addrs.is_empty() {
+            self.known_dialable.remove(&hint.peer_id);
+            return None;
+        }
+        Some(addrs)
     }
 
     /// Is a hint-driven dial to `peer` currently suppressed by
@@ -1150,9 +1212,11 @@ impl SwarmState {
         // own network (Docker/Kubernetes pod IPs, RFC1918, loopback, …)
         // before the hint can reach any dial path — `fill_pipeline_from_hints`,
         // `dial_toward_target` and bin balancing all dial `hint.addrs`
-        // verbatim. A peer with nothing dialable left is not queued at all;
-        // an empty address list would otherwise let libp2p fall back to
-        // identify's cached (unfiltered) listen addrs.
+        // (each re-filters against the current networks right before
+        // dialing, see `addrs_for_dial`). A peer with nothing dialable left
+        // is not queued at all: `DialOpts::peer_id(..).addresses(vec![])`
+        // does not extend the list through the behaviour, so the dial would
+        // only fail with `NoAddresses` and burn a pipeline slot.
         let advertised = hint.addrs.len();
         hint.addrs = self.dialable_underlays(&hint.addrs);
         if hint.addrs.is_empty() {
@@ -6313,8 +6377,11 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
         if swarm.is_connected(&hint.peer_id) {
             continue;
         }
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            continue;
+        };
         let opts = DialOpts::peer_id(hint.peer_id)
-            .addresses(hint.addrs.clone())
+            .addresses(addrs.clone())
             .build();
         let peer_id = hint.peer_id;
         match swarm.dial(opts) {
@@ -6322,14 +6389,14 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
                 state.failed.retain(|f| f.peer != peer_id);
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 dialed += 1;
                 debug!(
                     target: "ant_p2p",
                     peer = %peer_id,
-                    addrs = hint.addrs.len(),
+                    addrs = addrs.len(),
                     "dialing hive hint",
                 );
             }
@@ -6405,15 +6472,16 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
         if swarm.is_connected(&peer_id) {
             continue;
         }
-        let opts = DialOpts::peer_id(peer_id)
-            .addresses(hint.addrs.clone())
-            .build();
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            continue;
+        };
+        let opts = DialOpts::peer_id(peer_id).addresses(addrs.clone()).build();
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
                 state.failed.retain(|f| f.peer != peer_id);
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 debug!(
@@ -6647,14 +6715,15 @@ fn maybe_balance_bins(
         if swarm.is_connected(&peer_id) {
             continue;
         }
-        let opts = DialOpts::peer_id(peer_id)
-            .addresses(hint.addrs.clone())
-            .build();
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            continue;
+        };
+        let opts = DialOpts::peer_id(peer_id).addresses(addrs.clone()).build();
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 debug!(target: "ant_p2p", peer = %peer_id, bin, "dialing for bin balance");
@@ -7806,6 +7875,82 @@ mod tests {
         hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
         state.enqueue_hint(hint, local);
         assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// A same-LAN private underlay admitted on one network must not be
+    /// dialed after the host's networks change (Wi-Fi → cellular, or a
+    /// different LAN reusing the same numbering): the dial-time re-filter
+    /// drops it, and a changed subnet snapshot purges it from the caches.
+    #[tokio::test]
+    async fn network_change_drops_cached_private_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let home =
+            crate::underlay::LocalSubnets::from_nets(vec![("192.168.1.7".parse().unwrap(), 24)]);
+        state.local_subnets = Some((Instant::now(), home.clone()));
+        let local = PeerId::random();
+
+        let lan_only = PeerId::random();
+        let mut hint = hint_in_bin(lan_only, 0x80, 1);
+        hint.addrs = vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()];
+        state.enqueue_hint(hint, local);
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x40, 2);
+        hint.addrs = vec![
+            "/ip4/192.168.1.21/tcp/1634".parse().unwrap(),
+            "/ip4/1.2.3.4/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 2);
+        assert!(state.known_dialable.contains_key(&lan_only));
+
+        // Dial-time re-filter: moved to cellular (no private subnet), the
+        // cached LAN address is no longer offered to the dialer, even
+        // before any purge ran.
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let cached = state.known_dialable[&lan_only].clone();
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        assert!(!state.known_dialable.contains_key(&lan_only));
+        let cached = state.known_dialable[&mixed].clone();
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()]),
+        );
+
+        // Snapshot change purges the caches: a different LAN with the
+        // same 192.168.1.0/24 numbering (new lease) must not inherit the
+        // old LAN's addresses.
+        state.local_subnets = Some((Instant::now(), home));
+        state.set_local_subnets(crate::underlay::LocalSubnets::from_nets(vec![(
+            "192.168.1.33".parse().unwrap(),
+            24,
+        )]));
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].peer_id, mixed);
+        assert_eq!(
+            state.hint_queue[0].addrs,
+            vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+        assert_eq!(
+            state.known_dialable[&mixed].addrs,
+            vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+
+        // An unchanged snapshot purges nothing.
+        let mut hint = hint_in_bin(lan_only, 0x80, 1);
+        hint.addrs = vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()];
+        state.seen_hints.clear();
+        state.enqueue_hint(hint, local);
+        let same = state.local_subnets.as_ref().unwrap().1.clone();
+        state.set_local_subnets(same);
+        assert!(state.known_dialable.contains_key(&lan_only));
     }
 
     /// Dead-underlay backoff (issue #88): repeated dial failures double the
