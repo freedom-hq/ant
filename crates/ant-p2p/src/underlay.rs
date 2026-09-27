@@ -253,7 +253,15 @@ pub(crate) fn is_globally_routable_ip(ip: IpAddr) -> bool {
 /// local network, so it can't look like a scan to an upstream provider.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalSubnets {
+    /// Subnets of interfaces that are up — what [`Self::contains`] matches.
     nets: Vec<(IpAddr, u8)>,
+    /// Subnets of every candidate interface, up *or* down — what
+    /// [`Self::same_networks`] compares. Kept separate so a transient
+    /// carrier drop (Wi-Fi reassociation clearing `IFF_RUNNING` while the
+    /// address stays configured) stops same-LAN dials for its duration
+    /// without reading as a network move that purges the cached same-LAN
+    /// underlays.
+    attached: Vec<(IpAddr, u8)>,
 }
 
 impl LocalSubnets {
@@ -285,24 +293,38 @@ impl LocalSubnets {
     /// carries a `172.17.0.1/16`-style address, but that subnet is this
     /// host's container network — a peer advertising `172.17.0.5` is in
     /// *its* container network, not ours (issue #92).
+    ///
+    /// A down (not `IFF_RUNNING`) interface's address is still remembered
+    /// for change detection, though: see the `attached` field.
     pub(crate) fn from_interface_list(
         ifs: impl IntoIterator<Item = (String, bool, IpAddr, u8)>,
     ) -> Self {
-        Self::from_nets(
-            ifs.into_iter()
-                .filter(|(name, up, ip, _)| {
-                    *up && !ip.to_canonical().is_loopback() && !is_virtual_interface(name)
-                })
-                .map(|(_, _, ip, prefix)| (ip, prefix))
-                .collect(),
-        )
+        let mut nets = Vec::new();
+        let mut attached = Vec::new();
+        for (name, up, ip, prefix) in ifs {
+            if ip.to_canonical().is_loopback() || is_virtual_interface(&name) {
+                continue;
+            }
+            attached.push((ip, prefix));
+            if up {
+                nets.push((ip, prefix));
+            }
+        }
+        Self::build(nets, attached)
     }
 
-    /// Build from `(interface address, prefix length)` pairs.
-    pub(crate) fn from_nets(mut nets: Vec<(IpAddr, u8)>) -> Self {
-        nets.sort_unstable();
-        nets.dedup();
-        Self { nets }
+    /// Build from `(interface address, prefix length)` pairs, all up.
+    #[cfg(test)]
+    pub(crate) fn from_nets(nets: Vec<(IpAddr, u8)>) -> Self {
+        Self::build(nets.clone(), nets)
+    }
+
+    fn build(mut nets: Vec<(IpAddr, u8)>, mut attached: Vec<(IpAddr, u8)>) -> Self {
+        for v in [&mut nets, &mut attached] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        Self { nets, attached }
     }
 
     /// Do two snapshots describe the same attached networks, as far as
@@ -319,14 +341,17 @@ impl LocalSubnets {
     ///   either;
     /// * private IPv4 subnets compare by host address *and* prefix: a new
     ///   DHCP lease inside the same `192.168.1.0/24` is the best available
-    ///   hint that this may be a different LAN reusing the numbering.
+    ///   hint that this may be a different LAN reusing the numbering;
+    /// * an interface's up/down state is ignored — a carrier flap that keeps
+    ///   the address is not a move (a real move changes or drops the
+    ///   address, which is still caught).
     pub(crate) fn same_networks(&self, other: &Self) -> bool {
         self.network_key() == other.network_key()
     }
 
     fn network_key(&self) -> Vec<(IpAddr, u8)> {
         let mut key: Vec<(IpAddr, u8)> = self
-            .nets
+            .attached
             .iter()
             .filter(|&&(ip, _)| ip_scope(ip) == IpScope::Private)
             .map(|&(ip, prefix)| match ip.to_canonical() {
@@ -752,6 +777,36 @@ mod tests {
         // A real interface that is down doesn't count either.
         let down = LocalSubnets::from_interface_list(vec![iface("en0", false, "192.168.1.7", 24)]);
         assert!(!down.contains(ip("192.168.1.20")));
+    }
+
+    /// A carrier drop that keeps the address (Wi-Fi reassociation clearing
+    /// `IFF_RUNNING`) stops same-LAN matching while it lasts but is not a
+    /// network change; losing or changing the address still is.
+    #[test]
+    fn local_subnets_carrier_flap_is_not_a_network_change() {
+        let up = LocalSubnets::from_interface_list(vec![
+            iface("wlan0", true, "192.168.1.7", 24),
+            iface("docker0", true, "172.17.0.1", 16),
+        ]);
+        let flapped = LocalSubnets::from_interface_list(vec![
+            iface("wlan0", false, "192.168.1.7", 24),
+            iface("docker0", false, "172.17.0.1", 16),
+        ]);
+        assert!(up.contains(ip("192.168.1.20")));
+        assert!(!flapped.contains(ip("192.168.1.20")));
+        assert!(up.same_networks(&flapped));
+        assert!(flapped.same_networks(&up));
+
+        let gone =
+            LocalSubnets::from_interface_list(vec![iface("docker0", true, "172.17.0.1", 16)]);
+        assert!(!up.same_networks(&gone));
+        let new_lease =
+            LocalSubnets::from_interface_list(vec![iface("wlan0", false, "192.168.1.8", 24)]);
+        assert!(!up.same_networks(&new_lease));
+        // A virtual bridge appearing or disappearing is never a move.
+        let no_docker =
+            LocalSubnets::from_interface_list(vec![iface("wlan0", true, "192.168.1.7", 24)]);
+        assert!(up.same_networks(&no_docker));
     }
 
     #[test]
