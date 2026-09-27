@@ -1170,7 +1170,11 @@ impl SwarmState {
     }
 
     /// Strip every private-scope underlay from the cached dial book and
-    /// queue, dropping hints left with nothing to dial.
+    /// queue, dropping hints left with nothing to dial. A queued hint that
+    /// is dropped also leaves `seen_hints`, so gossip can re-queue the peer
+    /// once it is reachable again (e.g. back on the same LAN) — otherwise
+    /// the dedup would keep it out of `fill_pipeline_from_hints` until a
+    /// `force_resume` / re-warm clears the whole set.
     fn purge_private_underlays(&mut self) {
         let strip = |hint: &mut sinks::PeerHint| {
             hint.addrs.retain(|a| !crate::underlay::has_private_ip(a));
@@ -1178,7 +1182,14 @@ impl SwarmState {
         };
         let before = self.known_dialable.len() + self.hint_queue.len();
         self.known_dialable.retain(|_, hint| strip(hint));
-        self.hint_queue.retain_mut(strip);
+        let seen_hints = &mut self.seen_hints;
+        self.hint_queue.retain_mut(|hint| {
+            let keep = strip(hint);
+            if !keep {
+                seen_hints.remove(&hint.peer_id);
+            }
+            keep
+        });
         let dropped = before - (self.known_dialable.len() + self.hint_queue.len());
         debug!(
             target: "ant_p2p",
@@ -6400,6 +6411,11 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
             continue;
         }
         let Some(addrs) = state.addrs_for_dial(&hint) else {
+            // Nothing dialable on the current networks (e.g. a same-LAN
+            // hint after moving to cellular, before the snapshot purge
+            // ran): forget the dedup so gossip can re-queue the peer once
+            // it is reachable again.
+            state.seen_hints.remove(&hint.peer_id);
             continue;
         };
         let opts = DialOpts::peer_id(hint.peer_id)
@@ -7964,12 +7980,18 @@ mod tests {
             state.known_dialable[&mixed].addrs,
             vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
         );
+        // R3-M1: the purged private-only hint left `seen_hints` with the
+        // queue, so gossip re-queues it once it is same-LAN again; the
+        // surviving mixed hint keeps its dedup entry.
+        assert!(!state.seen_hints.contains(&lan_only));
+        assert!(state.seen_hints.contains(&mixed));
 
         // An unchanged snapshot purges nothing.
         let mut hint = hint_in_bin(lan_only, 0x80, 1);
         hint.addrs = vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()];
-        state.seen_hints.clear();
         state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 2);
+        assert_eq!(state.hint_queue[1].peer_id, lan_only);
         let same = state.local_subnets.as_ref().unwrap().1.clone();
         state.set_local_subnets(same);
         assert!(state.known_dialable.contains_key(&lan_only));
