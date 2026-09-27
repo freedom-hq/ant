@@ -1232,6 +1232,65 @@ impl SwarmState {
         entry.until = Instant::now() + delay;
     }
 
+    /// Are we cut off ourselves? With no connected bzz peer at all, an
+    /// outbound dial failure says more about our own link (no network,
+    /// Wi-Fi ↔ cellular handover, the OS suspending sockets) than about
+    /// the remote peer, so it must not be charged to that peer.
+    fn own_connectivity_down(&self) -> bool {
+        self.bzz_peers.is_empty()
+    }
+
+    /// Clear the hint dedup and re-queue every peerstore entry. With
+    /// `clear_backoff`, also forget those peers' [`DialBackoff`] so the
+    /// re-warm actually redials them now instead of skipping every
+    /// known-good peer until its (up to [`DIAL_BACKOFF_MAX`]) window
+    /// expires. Returns the number of hints re-queued.
+    fn rewarm_from_peerstore(
+        &mut self,
+        peerstore: &PeerStore,
+        local_peer_id: PeerId,
+        clear_backoff: bool,
+    ) -> usize {
+        // Clear the dedup so peers we've connected to before can re-enter
+        // the queue; `enqueue_hint` still filters currently-live peers, so
+        // a wholesale clear doesn't disturb surviving connections.
+        self.seen_hints.clear();
+        let warm = peerstore.warm_hints();
+        let warmed = warm.len();
+        for hint in warm {
+            if clear_backoff {
+                self.dial_backoff.remove(&hint.peer_id);
+            }
+            self.enqueue_hint(hint, local_peer_id);
+        }
+        warmed
+    }
+
+    /// Pop the next queued hint worth dialing, skipping peers that are
+    /// already live / mid-pipeline / backed off. A backed-off peer is
+    /// dropped from the queue *and* from `seen_hints`: keeping it queued
+    /// would either spin the fill loop on it or need a second, time-ordered
+    /// queue, whereas forgetting the dedup lets the next hive gossip (or a
+    /// re-warm) re-queue it, and `enqueue_hint` → this check simply drops it
+    /// again until the backoff has expired. The peer's dial info stays in
+    /// `known_dialable` either way.
+    fn pop_dialable_hint(&mut self) -> Option<sinks::PeerHint> {
+        while let Some(hint) = self.hint_queue.pop_front() {
+            if self.bzz_peers.contains(&hint.peer_id)
+                || self.pending.contains_key(&hint.peer_id)
+                || self.dialing.contains(&hint.peer_id)
+            {
+                continue;
+            }
+            if self.dial_backed_off(&hint.peer_id) {
+                self.seen_hints.remove(&hint.peer_id);
+                continue;
+            }
+            return Some(hint);
+        }
+        None
+    }
+
     fn enqueue_hint(&mut self, mut hint: sinks::PeerHint, local_peer_id: PeerId) {
         // Record the overlay in the known-peer book *before* the
         // dial-dedup early-returns below: every hive advert counts
@@ -1293,6 +1352,42 @@ impl SwarmState {
         }
         self.hint_queue.push_back(hint);
     }
+}
+
+/// Book-keeping for an `OutgoingConnectionError` on `peer`.
+///
+/// While our own connectivity is down (no connected bzz peer, see
+/// [`SwarmState::own_connectivity_down`]) the failure is not charged to the
+/// peer at all: neither the in-memory [`DialBackoff`] nor the peerstore's
+/// consecutive-failure count moves. Both would otherwise punish every peer
+/// we try during a local outage — the backoff by keeping known-good peers
+/// undialed for up to [`DIAL_BACKOFF_MAX`] once the link is back, and the
+/// peerstore (worse, and permanent) by evicting them after `MAX_FAIL_COUNT`
+/// failures, which empties exactly the list the post-outage re-warm dials
+/// from. The cost is that a genuinely dead peer tried during a cold start
+/// is only charged once some other peer has connected.
+fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p: PeerId) {
+    // `dial_started` is set by the two paths that *we* drive
+    // (bootstrap_dial, fill_pipeline_from_hints). Any other
+    // outbound dial — e.g. a libp2p-internal redial or a stray
+    // address book attempt — would otherwise pollute the
+    // pipeline with `Failed` rows the operator never asked for.
+    let was_tracked = state.dial_started.remove(&p).is_some();
+    state.dialing.remove(&p);
+    state.dial_hint_addr.remove(&p);
+    if was_tracked {
+        record_swarm_failure(state, p);
+    }
+    if state.own_connectivity_down() {
+        return;
+    }
+    if was_tracked {
+        state.note_dial_failure(p);
+    }
+    // Stored entries that go dud get evicted after
+    // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
+    // already noops for unknown peers.
+    peerstore.record_failure(&p);
 }
 
 fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
@@ -6397,16 +6492,9 @@ fn derive_filename_from_path(path: &str) -> Option<String> {
 fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState) {
     let mut dialed = 0usize;
     while dialed < HINT_DIAL_BATCH && state.pipeline_size() < state.target_peers {
-        let Some(hint) = state.hint_queue.pop_front() else {
+        let Some(hint) = state.pop_dialable_hint() else {
             break;
         };
-        if state.bzz_peers.contains(&hint.peer_id)
-            || state.pending.contains_key(&hint.peer_id)
-            || state.dialing.contains(&hint.peer_id)
-            || state.dial_backed_off(&hint.peer_id)
-        {
-            continue;
-        }
         if swarm.is_connected(&hint.peer_id) {
             continue;
         }
@@ -6573,13 +6661,11 @@ fn maybe_top_up_peers(
     // Clear the dedup so peers we've previously connected to (and lost) can
     // re-enter the queue. `enqueue_hint` still filters out peers that are
     // currently `bzz_peers` / `pending` / `dialing`, so a wholesale clear is
-    // safe — surviving connections aren't disturbed.
-    state.seen_hints.clear();
-    let warm = peerstore.warm_hints();
-    let warmed = warm.len();
-    for hint in warm {
-        state.enqueue_hint(hint, local_peer_id);
-    }
+    // safe — surviving connections aren't disturbed. After a full collapse
+    // (no bzz peer left) the backoffs were most likely earned while our own
+    // link was failing, so forget them for the peers being re-warmed.
+    let collapsed = state.bzz_peers.is_empty();
+    let warmed = state.rewarm_from_peerstore(peerstore, local_peer_id, collapsed);
     info!(
         target: "ant_p2p",
         peer_set_size = before,
@@ -6625,15 +6711,10 @@ fn force_resume(
     local_peer_id: PeerId,
     bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
 ) -> usize {
-    // Clear the dedup so peers we've connected to before can re-enter the
-    // queue; `enqueue_hint` still filters currently-live peers, so a
-    // wholesale clear doesn't disturb surviving connections.
-    state.seen_hints.clear();
-    let warm = peerstore.warm_hints();
-    let warmed = warm.len();
-    for hint in warm {
-        state.enqueue_hint(hint, local_peer_id);
-    }
+    // Re-queue the peerstore and forget those peers' dial backoff: an
+    // explicit resume after an outage must redial known-good peers now,
+    // not after backoffs earned while our own link was down expire.
+    let warmed = state.rewarm_from_peerstore(peerstore, local_peer_id, true);
     // Unpark the automatic guards: reset the bootstrap backoff and rewind
     // both cadence clocks so the loop-top maintenance can re-fire
     // immediately if this resume doesn't fully recover the set on its own.
@@ -6970,22 +7051,7 @@ fn handle_swarm_event(
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             if let Some(p) = peer_id {
-                // `dial_started` is set by the two paths that *we* drive
-                // (bootstrap_dial, fill_pipeline_from_hints). Any other
-                // outbound dial — e.g. a libp2p-internal redial or a stray
-                // address book attempt — would otherwise pollute the
-                // pipeline with `Failed` rows the operator never asked for.
-                let was_tracked = state.dial_started.remove(&p).is_some();
-                state.dialing.remove(&p);
-                state.dial_hint_addr.remove(&p);
-                if was_tracked {
-                    record_swarm_failure(state, p);
-                    state.note_dial_failure(p);
-                }
-                // Stored entries that go dud get evicted after
-                // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
-                // already noops for unknown peers.
-                peerstore.record_failure(&p);
+                note_outgoing_dial_error(state, peerstore, p);
             }
             // Bootnode dial failures are noisy during rotation; demote to
             // debug once we're past the cold start (peer set > 0).
@@ -8058,6 +8124,169 @@ mod tests {
         // An expired backoff no longer suppresses dials.
         state.dial_backoff.get_mut(&peer).unwrap().until = Instant::now();
         assert!(!state.dial_backed_off(&peer));
+    }
+
+    fn backoff_test_state() -> SwarmState {
+        SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        )
+    }
+
+    /// A real on-disk peerstore holding `peers` as known-good entries.
+    fn peerstore_with(dir: &std::path::Path, peers: &[PeerId]) -> PeerStore {
+        let mut store = PeerStore::load(dir.join("peers.json"));
+        for (i, p) in peers.iter().enumerate() {
+            store.record_success(
+                *p,
+                vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
+                [i as u8 + 1; 32],
+                0,
+                None,
+            );
+        }
+        store
+    }
+
+    /// Drive a tracked dial to `peer` failing through the same handler the
+    /// `OutgoingConnectionError` arm calls (backoff + peerstore).
+    fn fail_tracked_dial(state: &mut SwarmState, peerstore: &mut PeerStore, peer: PeerId) {
+        state.dialing.insert(peer);
+        state.dial_started.insert(peer, Instant::now());
+        note_outgoing_dial_error(state, peerstore, peer);
+    }
+
+    /// An explicit Resume after an outage must redial the peerstore's
+    /// known-good peers now, not skip them until backoffs earned during
+    /// the outage expire; the automatic top-up does the same only after a
+    /// full collapse. Backoffs of peers not being re-warmed are untouched.
+    #[tokio::test]
+    async fn rewarm_clears_backoff_for_rewarmed_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (known, stranger, live) = (pid(), pid(), pid());
+        let mut peerstore = peerstore_with(dir.path(), &[known]);
+        let local = pid();
+        let (tx, _rx) = mpsc::channel::<Multiaddr>(8);
+
+        // Backoff earned while connected (so the handler does charge it).
+        let mut state = backoff_test_state();
+        state.bzz_peers.insert(live);
+        fail_tracked_dial(&mut state, &mut peerstore, known);
+        fail_tracked_dial(&mut state, &mut peerstore, stranger);
+        assert!(state.dial_backed_off(&known) && state.dial_backed_off(&stranger));
+
+        // force_resume: known-good peer redialable and first out of the queue.
+        let mut backoff = MAX_BACKOFF;
+        let (mut last_bootstrap_at, mut last_top_up_at) = (Instant::now(), Instant::now());
+        let warmed = force_resume(
+            &[],
+            &mut state,
+            &peerstore,
+            &mut backoff,
+            &mut last_bootstrap_at,
+            &mut last_top_up_at,
+            local,
+            &tx,
+        );
+        assert_eq!(warmed, 1);
+        assert!(!state.dial_backed_off(&known));
+        assert!(
+            state.dial_backed_off(&stranger),
+            "only re-warmed peers are cleared"
+        );
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(known));
+
+        // maybe_top_up_peers below the floor but with a surviving peer:
+        // not a collapse, so backoffs stand and the hint is not dialed.
+        fail_tracked_dial(&mut state, &mut peerstore, known);
+        assert!(state.dial_backed_off(&known));
+        let mut last_top_up_at = Instant::now().checked_sub(PEER_TOP_UP_INTERVAL).unwrap();
+        maybe_top_up_peers(&[], &mut state, &peerstore, &mut last_top_up_at, local, &tx);
+        assert!(state.dial_backed_off(&known));
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), None);
+
+        // Full collapse: the re-warm clears the known-good peer's backoff.
+        state.bzz_peers.clear();
+        let mut last_top_up_at = Instant::now().checked_sub(PEER_TOP_UP_INTERVAL).unwrap();
+        maybe_top_up_peers(&[], &mut state, &peerstore, &mut last_top_up_at, local, &tx);
+        assert!(!state.dial_backed_off(&known));
+        assert!(state.dial_backed_off(&stranger));
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(known));
+    }
+
+    /// With no connected bzz peer our own link is the likely culprit, so a
+    /// dial failure must neither back the peer off nor count toward its
+    /// peerstore eviction — otherwise a local outage (no network, handover,
+    /// suspend) would back off, and eventually evict, every known-good peer.
+    #[test]
+    fn dial_failures_not_charged_while_own_connectivity_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = pid();
+        let mut peerstore = peerstore_with(dir.path(), &[peer]);
+        let mut state = backoff_test_state();
+
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, peer);
+        }
+        assert!(!state.dial_backed_off(&peer));
+        assert!(
+            peerstore.contains(&peer),
+            "outage must not evict known-good peers"
+        );
+        assert!(state.dialing.is_empty() && state.dial_started.is_empty());
+        assert!(
+            state.failed.iter().any(|f| f.peer == peer),
+            "the failed dial still shows in the pipeline"
+        );
+
+        // Connected again: failures are charged to the peer as before.
+        state.bzz_peers.insert(pid());
+        fail_tracked_dial(&mut state, &mut peerstore, peer);
+        assert!(state.dial_backed_off(&peer));
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, peer);
+        }
+        assert!(
+            !peerstore.contains(&peer),
+            "a genuinely dead peer is still evicted"
+        );
+    }
+
+    /// A backed-off hint popped by the fill loop must not be discarded
+    /// while its peer stays in `seen_hints` (which would keep gossip from
+    /// ever re-queueing it): it leaves the dedup, gossip re-queues it, and
+    /// it is dialed once the backoff has expired.
+    #[test]
+    fn backed_off_hint_leaves_dedup_for_requeue() {
+        let mut state = backoff_test_state();
+        state.bzz_peers.insert(pid());
+        let mut peerstore = PeerStore::disabled();
+        let local = pid();
+        let (dead, good) = (pid(), pid());
+        fail_tracked_dial(&mut state, &mut peerstore, dead);
+        assert!(state.dial_backed_off(&dead));
+
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        state.enqueue_hint(hint_in_bin(good, 0x40, 2), local);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(good));
+        assert!(state.hint_queue.is_empty());
+        assert!(!state.seen_hints.contains(&dead));
+        assert!(state.seen_hints.contains(&good));
+
+        // Gossip re-queues it; still backed off, so dropped again.
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), None);
+
+        // Backoff expired: the next gossip round gets it dialed.
+        state.dial_backoff.get_mut(&dead).unwrap().until = Instant::now();
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(dead));
     }
 
     /// `force_resume` is the post-suspension recovery lever, so its whole
