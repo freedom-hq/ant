@@ -1253,6 +1253,10 @@ mod tests {
         }
 
         let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
+        // `open()` returns before the writer's backfill scan fills
+        // `total_bytes`; any writer round-trip is queued behind that scan,
+        // so awaiting one makes the `used_bytes()` read below race-free.
+        cache.list_pins().await.unwrap();
         assert_eq!(cache.used_bytes(), wire.len() as u64);
         let got = cache.get(addr).await.unwrap();
         assert_eq!(got, Some(wire));
