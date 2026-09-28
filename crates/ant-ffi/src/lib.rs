@@ -3234,19 +3234,46 @@ fn secp256k1_keypair_from_signing_secret(
 // The proper mobile artefact (PLAN.md § 11) replaces both with a
 // `set_log_sink` callback so the host owns sink lifecycle; the smoke
 // tests don't need that yet.
+//
+// The subscriber is process-global and the first `try_init` wins, so a
+// host that links ant-ffi together with another Rust library that also
+// wants a `tracing` layer (freedom-mobile-ffi: ant + freedom-ipfs, whose
+// retrieval-progress recorder is a layer) must install ONE subscriber
+// carrying both before `ant_init` runs. [`log_layer`] is ant's half of
+// that: the same filter + writer as below, as a composable layer with
+// its filter scoped to itself, so it can't hide events from the other
+// layers. `install_log_subscriber` then finds the slot taken and leaves
+// it alone.
 // ---------------------------------------------------------------------------
+
+/// ant-ffi's log output as a `tracing` layer: `ANT_LOG` / `RUST_LOG`
+/// (default `info`), formatted to logcat under the tag `ant-ffi` on
+/// Android and to stderr elsewhere. The filter is per-layer, so events
+/// it drops still reach any other layer on the same subscriber.
+///
+/// For hosts that own the global subscriber (see the note above);
+/// `ant_init` installs this on its own when nothing else has.
+#[must_use]
+pub fn log_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::Layer;
+    let filter = std::env::var("ANT_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
+    tracing_subscriber::fmt::layer()
+        .with_writer(default_log_writer())
+        .with_filter(tracing_subscriber::EnvFilter::new(filter))
+}
 
 fn install_log_subscriber() {
     use std::sync::Once;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let filter = std::env::var("ANT_LOG")
-            .or_else(|_| std::env::var("RUST_LOG"))
-            .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(default_log_writer())
-            .try_init();
+        let _ = tracing_subscriber::registry().with(log_layer()).try_init();
     });
 }
 
@@ -3325,6 +3352,31 @@ mod android_log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `log_layer`'s filter must stay scoped to itself: a host composing
+    /// it with another layer (freedom-ipfs's progress recorder) needs
+    /// that layer to see events ant's log level drops.
+    #[test]
+    fn log_layer_filter_does_not_hide_events_from_other_layers() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(log_layer())
+            .with(Count(seen.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "log_layer_test", phase = "probe", "below ant's log level");
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn parse_reference_accepts_bare_hex() {
