@@ -1,6 +1,6 @@
 [package]
 name = "ant-retrieval"
-version = "0.5.46"
+version = "0.5.47"
 edition.workspace = true
 license.workspace = true
 
