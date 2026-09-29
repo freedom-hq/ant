@@ -101,6 +101,131 @@ pub trait ChainWriter: Send + Sync {
     /// Fund the chequebook by transferring `amount` xBZZ into it.
     /// Returns the 32-byte transaction hash.
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String>;
+
+    // xDAI-only storage funding (`/v0/storage/*`, `/v0/settlement/deposit`):
+    // the node swaps the xBZZ it lacks itself, so a user only ever sends
+    // it plain xDAI. `ant_chain::funding` implements these for both
+    // `antd` and `ant-ffi`. Defaulted to [`FundingFailure::Unsupported`]
+    // (`501`) so test fakes and other embedders needn't implement them.
+
+    /// Price a new plan of `depth` lasting `days`, including the
+    /// chequebook deposit the purchase funds.
+    async fn quote_plan(&self, _depth: u8, _days: u64) -> Result<StorageQuoteView, FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+    /// Price extending `batch_id` by `days`, or with `new_depth`,
+    /// resizing it while keeping its expiry plus `days`.
+    async fn quote_extend(
+        &self,
+        _batch_id: [u8; 32],
+        _new_depth: Option<u8>,
+        _days: u64,
+    ) -> Result<StorageQuoteView, FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+    /// Buy a plan, swapping xDAI for the xBZZ it and the deposit need.
+    /// Returns the new batch id; the route registers it.
+    async fn buy_with_xdai(
+        &self,
+        _depth: u8,
+        _amount_per_chunk: u128,
+        _immutable: bool,
+    ) -> Result<[u8; 32], FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+    /// Extend (and with `new_depth`, resize) `batch_id`, swapping xDAI
+    /// for the xBZZ it needs. Returns the batch's depth afterwards.
+    async fn extend_with_xdai(
+        &self,
+        _batch_id: [u8; 32],
+        _new_depth: Option<u8>,
+        _amount_per_chunk: u128,
+    ) -> Result<u8, FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+    /// The chequebook's settlement deposit and what topping it up takes.
+    async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+    /// Top the chequebook's deposit up to its target, swapping xDAI for
+    /// the xBZZ it needs. Returns the status afterwards.
+    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
+}
+
+/// Why an xDAI storage-funding call failed, so the route answers with
+/// the right status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingFailure {
+    /// The writer can't fund storage with xDAI. → `501`.
+    Unsupported,
+    /// Bad input, or the wallet is short of xDAI. The message is written
+    /// for users. → `400`.
+    Rejected(String),
+    /// The batch isn't on chain. → `404`.
+    NotFound(String),
+    /// A chain read or transaction failed. → `502`.
+    Chain(String),
+}
+
+/// What paying with xDAI takes (`ant_chain::funding::Funding`). PLUR
+/// for xBZZ, wei for xDAI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FundingView {
+    pub wallet_bzz: u128,
+    pub wallet_xdai: u128,
+    pub bzz_to_acquire: u128,
+    pub swap_input_wei: u128,
+    pub gas_reserve_wei: u128,
+    pub xdai_required_wei: u128,
+    pub xdai_to_send_wei: u128,
+    pub sufficient: bool,
+}
+
+/// The price of a new plan, an extension or a resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageQuoteView {
+    /// The plan's depth: the new depth for a resize.
+    pub depth: u8,
+    pub days: u64,
+    /// Per-chunk balance the transaction pays. Clients pass it back
+    /// unchanged to buy or extend.
+    pub amount_per_chunk: u128,
+    pub plan_cost_plur: u128,
+    /// The chequebook deposit bought along with a new plan.
+    pub deposit_due_plur: u128,
+    pub funding: FundingView,
+}
+
+/// The chequebook's settlement deposit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepositView {
+    /// `None` while the node has no chequebook yet.
+    pub chequebook: Option<[u8; 20]>,
+    /// Whether the node keeps the deposit topped up itself.
+    pub managed: bool,
+    pub deposited_plur: u128,
+    pub target_plur: u128,
+    pub shortfall_plur: u128,
+    /// All zero when nothing is missing.
+    pub funding: FundingView,
+}
+
+/// Lets one on-chain write run at a time on a node. The write routes
+/// answer `409` while another one runs instead of queueing, so a client
+/// retrying a slow buy can't buy twice. (`ant-chain` also serialises
+/// the transactions themselves per key, which covers the node's
+/// background settlement as well.)
+#[derive(Debug, Clone, Default)]
+pub struct WriteGate(std::sync::Arc<tokio::sync::Mutex<()>>);
+
+impl WriteGate {
+    /// Hold the gate for one write; `None` while another write holds it.
+    #[must_use]
+    pub fn try_begin(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.0.clone().try_lock_owned().ok()
+    }
 }
 
 /// The node's chequebook address, as the gateway reports and funds it.
@@ -150,6 +275,9 @@ pub struct ChainContext {
     /// Signer for the on-chain write endpoints. `None` → those endpoints
     /// return `501`.
     pub writer: Option<std::sync::Arc<dyn ChainWriter>>,
+    /// One on-chain write at a time: the write routes answer `409`
+    /// while another runs.
+    pub writes: WriteGate,
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
@@ -447,22 +575,39 @@ where
     }
 }
 
-/// Resolve the writer or produce the bee-shaped `501` used when no
-/// funded wallet is configured.
+/// The chain context and its writer, or the chain-init `503`, or the
+/// bee-shaped `501` used when no funded wallet is configured.
 #[allow(clippy::result_large_err)]
-fn writer(handle: &GatewayHandle) -> Result<std::sync::Arc<dyn ChainWriter>, Response> {
+fn writer(
+    handle: &GatewayHandle,
+) -> Result<
+    (
+        std::sync::Arc<ChainContext>,
+        std::sync::Arc<dyn ChainWriter>,
+    ),
+    Response,
+> {
     if handle.chain_state().is_none() {
         return Err(crate::error::chain_initializing());
     }
     handle
         .chain()
-        .and_then(|c| c.writer.clone())
+        .and_then(|c| c.writer.clone().map(|w| (c, w)))
         .ok_or_else(|| {
             json_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "on-chain writes require a configured wallet key + RPC endpoint",
             )
         })
+}
+
+/// The `409` a write route answers while another write holds the
+/// [`WriteGate`].
+fn busy() -> Response {
+    json_error(
+        StatusCode::CONFLICT,
+        "another on-chain operation of this node is in progress; retry when it finishes",
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -564,6 +709,9 @@ pub async fn buy_stamp(
         Ok(a) => a,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer"),
     };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
+    };
     // Mirror bee's `CreateBatch` pre-submit guards so an obviously-bad buy
     // fails the bee way (a `400`) instead of falling through to a reverted
     // transaction surfaced as `502` (issue #5). bee requires `depth` to
@@ -591,12 +739,24 @@ pub async fn buy_stamp(
         Ok(id) => id,
         Err(r) => return r,
     };
-    // Register the issuer with the running node *before* returning 201,
-    // so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
-    // finds a usable batch without a restart. We construct the issuer
-    // from the known buy params (depth, bucket_depth=16, immutable) and
-    // never chain-read the batch back — Gnosis indexing lags the receipt.
-    if let Err(r) = register_batch(&handle, batch_id, depth, immutable).await {
+    bought(&handle, batch_id, depth, immutable).await
+}
+
+/// Finish a buy: register the batch, fire the after-buy hook, answer
+/// `201 {batchID}`. Shared by `POST /stamps` and `POST /v0/storage/buy`.
+///
+/// The issuer is registered with the running node *before* the `201`,
+/// so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
+/// finds a usable batch without a restart. It's built from the known
+/// buy params (depth, `bucket_depth` = 16, immutable); the batch is never
+/// read back from chain, because Gnosis indexing lags the receipt.
+async fn bought(
+    handle: &GatewayHandle,
+    batch_id: [u8; 32],
+    depth: u8,
+    immutable: bool,
+) -> Response {
+    if let Err(r) = register_batch(handle, batch_id, depth, immutable).await {
         return r;
     }
     if let Some(hook) = &handle.on_batch_bought {
@@ -617,9 +777,12 @@ pub async fn topup_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, amount)): Path<(String, String)>,
 ) -> Response {
-    let w = match writer(&handle) {
-        Ok(w) => w,
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
         Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
     };
     let batch_id = match parse_batch_id(&id) {
         Ok(b) => b,
@@ -641,9 +804,12 @@ pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
 ) -> Response {
-    let w = match writer(&handle) {
-        Ok(w) => w,
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
         Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
     };
     let batch_id = match parse_batch_id(&id) {
         Ok(b) => b,
@@ -669,9 +835,12 @@ pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let w = match writer(&handle) {
-        Ok(w) => w,
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
         Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
     };
     let amount: u128 = match q.get("amount").map(|a| a.parse()) {
         Some(Ok(a)) => a,
@@ -696,4 +865,332 @@ pub async fn chequebook_deposit(
         }),
     )
         .into_response()
+}
+
+// --- xDAI storage funding (`/v0/storage/*`, `/v0/settlement/deposit`) ---
+//
+// Ant-specific routes, namespaced under `/v0/` like `/v0/manifest`. They
+// price and pay for storage from the node wallet's plain xDAI: the node
+// swaps whatever xBZZ it lacks itself (`ant_chain::funding`). Amounts
+// are decimal strings, PLUR for xBZZ and wei for xDAI.
+
+/// Bound on a quote or deposit read: several RPC reads (price, pool,
+/// balances, chequebook), so longer than one [`CHAIN_RPC_TIMEOUT`].
+const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on an xDAI-funded write: up to four transactions (swap,
+/// approve, `createBatch` or `topUp`, `increaseDepth`), each waiting up
+/// to 60 s, possibly queued behind a transaction the node is already
+/// sending.
+const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(5);
+
+async fn funding_call<F, T>(limit: Duration, timed_out: &str, fut: F) -> Result<T, Response>
+where
+    F: std::future::Future<Output = Result<T, FundingFailure>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(FundingFailure::Unsupported)) => Err(json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "this node can't fund storage with xDAI",
+        )),
+        Ok(Err(FundingFailure::Rejected(m))) => Err(json_error(StatusCode::BAD_REQUEST, m)),
+        Ok(Err(FundingFailure::NotFound(m))) => Err(json_error(StatusCode::NOT_FOUND, m)),
+        Ok(Err(FundingFailure::Chain(m))) => Err(json_error(StatusCode::BAD_GATEWAY, m)),
+        Err(_) => Err(json_error(StatusCode::GATEWAY_TIMEOUT, timed_out)),
+    }
+}
+
+/// `?name=` parsed as `T`, `None` when absent.
+#[allow(clippy::result_large_err)]
+fn param<T: std::str::FromStr>(
+    q: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<T>, Response> {
+    q.get(name)
+        .map(|v| {
+            v.trim()
+                .parse()
+                .map_err(|_| json_error(StatusCode::BAD_REQUEST, format!("invalid ?{name}=")))
+        })
+        .transpose()
+}
+
+#[allow(clippy::result_large_err)]
+fn required<T: std::str::FromStr>(q: &HashMap<String, String>, name: &str) -> Result<T, Response> {
+    param(q, name)?.ok_or_else(|| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("missing required ?{name}= query param"),
+        )
+    })
+}
+
+/// A boolean flag given as `true`/`false`/`1`/`0`.
+#[allow(clippy::result_large_err)]
+fn flag(value: Option<&str>, name: &str, default: bool) -> Result<bool, Response> {
+    match value.map(str::trim) {
+        None => Ok(default),
+        Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => Ok(false),
+        Some(_) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be true or false"),
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn valid_depth(depth: u8) -> Result<u8, Response> {
+    if depth <= POSTAGE_BUCKET_DEPTH {
+        return Err(json_error(StatusCode::BAD_REQUEST, "invalid depth"));
+    }
+    Ok(depth)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingBody {
+    wallet_address: String,
+    wallet_bzz_plur: String,
+    wallet_xdai_wei: String,
+    bzz_to_acquire_plur: String,
+    swap_input_wei: String,
+    gas_reserve_wei: String,
+    xdai_required_wei: String,
+    xdai_to_send_wei: String,
+    sufficient_funds: bool,
+}
+
+impl FundingBody {
+    fn of(wallet: [u8; 20], f: &FundingView) -> Self {
+        Self {
+            wallet_address: format!("0x{}", hex::encode(wallet)),
+            wallet_bzz_plur: f.wallet_bzz.to_string(),
+            wallet_xdai_wei: f.wallet_xdai.to_string(),
+            bzz_to_acquire_plur: f.bzz_to_acquire.to_string(),
+            swap_input_wei: f.swap_input_wei.to_string(),
+            gas_reserve_wei: f.gas_reserve_wei.to_string(),
+            xdai_required_wei: f.xdai_required_wei.to_string(),
+            xdai_to_send_wei: f.xdai_to_send_wei.to_string(),
+            sufficient_funds: f.sufficient,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteBody {
+    depth: u8,
+    days: u64,
+    amount_per_chunk: String,
+    plan_cost_plur: String,
+    settlement_deposit_plur: String,
+    #[serde(flatten)]
+    funding: FundingBody,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DepositBody {
+    chequebook: Option<String>,
+    managed: bool,
+    deposit_plur: String,
+    target_plur: String,
+    shortfall_plur: String,
+    needs_top_up: bool,
+    #[serde(flatten)]
+    funding: FundingBody,
+}
+
+fn deposit_response(wallet: [u8; 20], d: &DepositView) -> Response {
+    Json(DepositBody {
+        chequebook: d.chequebook.map(|cb| format!("0x{}", hex::encode(cb))),
+        managed: d.managed,
+        deposit_plur: d.deposited_plur.to_string(),
+        target_plur: d.target_plur.to_string(),
+        shortfall_plur: d.shortfall_plur.to_string(),
+        needs_top_up: d.shortfall_plur > 0,
+        funding: FundingBody::of(wallet, &d.funding),
+    })
+    .into_response()
+}
+
+/// `GET /v0/storage/quote?depth=&days=` prices a new plan;
+/// `?batchId=&days=` prices extending a batch by `days`, and
+/// `?batchId=&days=&depth=` resizing it to `depth` while keeping its
+/// expiry plus `days` (which may be 0). No transaction is sent, and the
+/// write gate isn't taken: a quote is answered during a buy too.
+pub async fn storage_quote(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let quote = async {
+        let days: u64 = required(&q, "days")?;
+        let depth = param::<u8>(&q, "depth")?.map(valid_depth).transpose()?;
+        let batch_id = q.get("batchId").map(|id| parse_batch_id(id)).transpose()?;
+        let fut = async {
+            match (batch_id, depth) {
+                (Some(id), new_depth) => w.quote_extend(id, new_depth, days).await,
+                (None, Some(depth)) => w.quote_plan(depth, days).await,
+                (None, None) => Err(FundingFailure::Rejected(
+                    "missing required ?depth= (new plan) or ?batchId= (extend)".into(),
+                )),
+            }
+        };
+        if days == 0 && (batch_id.is_none() || depth.is_none()) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "days must be at least 1 (0 only when resizing)",
+            ));
+        }
+        funding_call(FUNDING_READ_TIMEOUT, "chain rpc request timed out", fut).await
+    };
+    match quote.await {
+        Ok(v) => Json(QuoteBody {
+            depth: v.depth,
+            days: v.days,
+            amount_per_chunk: v.amount_per_chunk.to_string(),
+            plan_cost_plur: v.plan_cost_plur.to_string(),
+            settlement_deposit_plur: v.deposit_due_plur.to_string(),
+            funding: FundingBody::of(chain.wallet_eth, &v.funding),
+        })
+        .into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /v0/storage/buy?depth=&amountPerChunk=&immutable=` buys a plan
+/// paid from the node wallet's xDAI (swapping for the xBZZ it and the
+/// chequebook deposit need), registers it, and runs the same after-buy
+/// settlement as `POST /stamps`. `immutable` defaults to `true`, like
+/// bee. `amountPerChunk` comes from the matching quote.
+pub async fn storage_buy(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let params = (|| {
+        let depth = valid_depth(required(&q, "depth")?)?;
+        let amount: u128 = required(&q, "amountPerChunk")?;
+        let immutable = flag(q.get("immutable").map(String::as_str), "immutable", true)?;
+        Ok::<_, Response>((depth, amount, immutable))
+    })();
+    let (depth, amount, immutable) = match params {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
+    };
+    let batch_id = match funding_call(
+        FUNDING_TX_TIMEOUT,
+        "chain transaction timed out",
+        w.buy_with_xdai(depth, amount, immutable),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    bought(&handle, batch_id, depth, immutable).await
+}
+
+/// `POST /v0/storage/extend?batchId=&amountPerChunk=[&depth=]` tops a
+/// batch up paid from the node wallet's xDAI; with `depth`, then resizes
+/// it and re-registers it at the new depth. `amountPerChunk` comes from
+/// the matching quote (same `depth`).
+pub async fn storage_extend(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let params = (|| {
+        let batch_id = parse_batch_id(q.get("batchId").map_or("", String::as_str))?;
+        let amount: u128 = required(&q, "amountPerChunk")?;
+        let new_depth = param::<u8>(&q, "depth")?.map(valid_depth).transpose()?;
+        Ok::<_, Response>((batch_id, amount, new_depth))
+    })();
+    let (batch_id, amount, new_depth) = match params {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
+    };
+    let depth = match funding_call(
+        FUNDING_TX_TIMEOUT,
+        "chain transaction timed out",
+        w.extend_with_xdai(batch_id, new_depth, amount),
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    if new_depth.is_some() {
+        // Bump the live issuer's depth so uploads use the new capacity
+        // (`immutable` is ignored for an existing issuer, see
+        // `dilute_stamp`).
+        if let Err(r) = register_batch(&handle, batch_id, depth, false).await {
+            return r;
+        }
+    }
+    Json(BatchIdBody {
+        batch_id: hex::encode(batch_id),
+    })
+    .into_response()
+}
+
+/// `GET /v0/settlement/deposit`: the chequebook's settlement deposit and
+/// what topping it up to its target takes, priced in xDAI. No
+/// transaction is sent.
+pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    match funding_call(
+        FUNDING_READ_TIMEOUT,
+        "chain rpc request timed out",
+        w.deposit_status(),
+    )
+    .await
+    {
+        Ok(d) => deposit_response(chain.wallet_eth, &d),
+        Err(r) => r,
+    }
+}
+
+/// `POST /v0/settlement/deposit` tops the chequebook's deposit up to
+/// its target, paid from the node wallet's xDAI. A no-op when it's
+/// already there. Returns the status afterwards.
+pub async fn settlement_fund_deposit(State(handle): State<GatewayHandle>) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
+    };
+    match funding_call(
+        FUNDING_TX_TIMEOUT,
+        "chain transaction timed out",
+        w.fund_deposit_with_xdai(),
+    )
+    .await
+    {
+        Ok(d) => deposit_response(chain.wallet_eth, &d),
+        Err(r) => r,
+    }
 }

@@ -99,6 +99,16 @@ pub fn build(handle: GatewayHandle) -> Router {
         // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
         // chequebook. `501` without a funded wallet key.
         .route("/chequebook/deposit", post(chain::chequebook_deposit))
+        // Ant-specific xDAI storage funding: price and pay for storage
+        // from the node wallet's plain xDAI (the node swaps for xBZZ
+        // itself). Namespaced under `/v0/` like `/v0/manifest`.
+        .route("/v0/storage/quote", get(chain::storage_quote))
+        .route("/v0/storage/buy", post(chain::storage_buy))
+        .route("/v0/storage/extend", post(chain::storage_extend))
+        .route(
+            "/v0/settlement/deposit",
+            get(chain::settlement_deposit).post(chain::settlement_fund_deposit),
+        )
         // Upload-progress tags (PLAN.md J.2.4 / C3). `POST /tags`
         // creates a tag; `GET /tags` lists them; `GET /tags/{uid}`
         // polls one; `DELETE` drops it; `PATCH` marks the "done split"

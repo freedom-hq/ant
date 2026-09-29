@@ -8,7 +8,8 @@
 //! entry points call them.
 //!
 //! This test lists every free `pub fn` in those modules and checks that
-//! each one is referenced by both `crates/antd/src/main.rs` and
+//! each one is referenced by both `antd` (its `main.rs`, and the
+//! gateway's chain writer its HTTP routes run through) and
 //! `crates/ant-ffi/src/*.rs`. Comments and `#[cfg(test)]` modules don't
 //! count. A helper referenced by neither is fine: it's a building block
 //! for another helper. A helper referenced by exactly one entry point
@@ -30,11 +31,23 @@ const ORCHESTRATION_MODULES: &[(&str, &str)] = &[
         "crates/ant-chain/src/chequebook_store.rs",
         include_str!("../../ant-chain/src/chequebook_store.rs"),
     ),
+    (
+        "crates/ant-chain/src/funding.rs",
+        include_str!("../../ant-chain/src/funding.rs"),
+    ),
 ];
 
-/// `antd`'s orchestration lives in `main.rs`. If it moves to another
-/// module, add that module here.
-const ANTD_SOURCES: &[&str] = &[include_str!("../../antd/src/main.rs")];
+/// `antd`'s orchestration lives in `main.rs`, plus the gateway's chain
+/// writer, which its storage and chequebook HTTP routes run through. If
+/// it moves to another module, add that module here.
+///
+/// `ant-ffi`'s gateway (`ant_start_gateway`) runs through the same
+/// writer, so a helper only the writer calls counts as `antd`-only here:
+/// `ant-ffi`'s C API should call it too.
+const ANTD_SOURCES: &[&str] = &[
+    include_str!("../../antd/src/main.rs"),
+    include_str!("../../ant-gateway/src/chainreader.rs"),
+];
 
 /// Every `ant-ffi` source file except this one.
 const FFI_SOURCES: &[&str] = &[
@@ -50,7 +63,12 @@ const FFI_SOURCES: &[&str] = &[
 
 /// Orchestration helpers deliberately used by only one entry point:
 /// `(helper, the side that uses it, why the other side doesn't)`.
-const ONE_SIDED: &[(&str, Side, &str)] = &[];
+const ONE_SIDED: &[(&str, Side, &str)] = &[(
+    "top_up_batch",
+    Side::Antd,
+    "bee's `PATCH /stamps/topup` pays from the wallet's xBZZ; the C API only extends with \
+     xDAI, through `extend_with_xdai`, which calls it",
+)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {

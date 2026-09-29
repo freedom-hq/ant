@@ -10,7 +10,11 @@
 
 use std::sync::Arc;
 
-use crate::{ChainContext, ChainReader, ChainWriter, ChequebookSlot};
+use crate::{
+    ChainContext, ChainReader, ChainWriter, ChequebookSlot, DepositView, FundingFailure,
+    FundingView, StorageQuoteView, WriteGate,
+};
+use ant_chain::funding::{self, DepositPolicy, FundingError, Payer};
 use ant_chain::tx::Wallet;
 use ant_chain::{ChainClient, GNOSIS_BZZ_TOKEN};
 use anyhow::{anyhow, Result};
@@ -88,30 +92,111 @@ impl ChainReader for AntChainReader {
     }
 }
 
-/// Default postage bucket depth (bee's constant). A batch's `depth` must
-/// exceed it; we pass it verbatim to `createBatch`.
-const POSTAGE_BUCKET_DEPTH: u8 = 16;
-
 /// `ant-chain::Wallet`-backed [`ChainWriter`] for the on-chain postage /
-/// chequebook write endpoints (PLAN.md J.5 B2/B3, D3).
+/// chequebook write endpoints (PLAN.md J.5 B2/B3, D3) and the xDAI
+/// storage funding routes. Both run through `ant_chain::funding`, the
+/// same helpers `ant-ffi`'s C API calls.
 ///
-/// NOTE: these submit real Gnosis transactions and have not been
-/// validated against live mainnet in this build — only the calldata /
-/// amount math (covered by `ant-chain`'s unit tests) and the
-/// request-plumbing (covered by the gateway's fake-writer tests). Live
-/// validation is the remaining step before relying on them.
+/// The node wallet pays, owns the batches it buys (the key `antd` signs
+/// stamps with), and issues the chequebook's cheques.
 struct AntChainWriter {
     wallet: Wallet,
     client: ChainClient,
     postage_contract: [u8; 20],
     bzz_token: [u8; 20],
-    /// Batch owner baked into `createBatch`. For stamps issued after a
-    /// buy to be accepted, this must match the key `antd` signs stamps
-    /// with — by default the node wallet itself.
-    owner: [u8; 20],
     /// Shared with the [`ChainContext`], so a chequebook resolved after
     /// startup can be deposited into without a restart.
     chequebook: ChequebookSlot,
+    /// The chequebook deposit the embedder keeps, or `None` when it
+    /// doesn't manage one (`antd --no-auto-chequebook` or a manual
+    /// `--chequebook`): a plan is then priced and bought alone.
+    deposit_target: Option<u128>,
+}
+
+impl AntChainWriter {
+    fn payer(&self) -> Payer<'_> {
+        Payer {
+            client: &self.client,
+            wallet: &self.wallet,
+            postage: self.postage_contract,
+        }
+    }
+
+    fn deposit_policy(&self) -> DepositPolicy {
+        match self.deposit_target {
+            Some(target) => DepositPolicy::Managed {
+                chequebook: self.chequebook.get(),
+                target,
+            },
+            None => DepositPolicy::Unmanaged,
+        }
+    }
+
+    /// A batch's current depth, read from chain.
+    async fn batch_depth(&self, batch_id: &[u8; 32]) -> Result<u8, FundingFailure> {
+        let postage_hex = format!("0x{}", hex::encode(self.postage_contract));
+        let meta = ant_chain::fetch_postage_batch_meta(&self.client, &postage_hex, batch_id)
+            .await
+            .map_err(|e| FundingFailure::Chain(format!("read batch: {e}")))?;
+        if meta.batch_owner_eth == [0u8; 20] {
+            return Err(FundingFailure::NotFound("batch not found on chain".into()));
+        }
+        Ok(meta.depth)
+    }
+
+    fn deposit_view(&self, status: Option<&funding::DepositStatus>) -> DepositView {
+        let target = self
+            .deposit_target
+            .unwrap_or(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR);
+        DepositView {
+            chequebook: status.map(|s| s.chequebook),
+            managed: self.deposit_target.is_some(),
+            deposited_plur: status.map_or(0, |s| s.deposited_plur),
+            target_plur: status.map_or(target, |s| s.target_plur),
+            shortfall_plur: status.map_or(0, |s| s.shortfall_plur),
+            funding: status.map_or_else(FundingView::default, |s| funding_view(&s.funding)),
+        }
+    }
+
+    fn deposit_target_or_default(&self) -> u128 {
+        self.deposit_target
+            .unwrap_or(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR)
+    }
+}
+
+fn funding_view(f: &funding::Funding) -> FundingView {
+    FundingView {
+        wallet_bzz: f.wallet_bzz,
+        wallet_xdai: f.wallet_xdai,
+        bzz_to_acquire: f.bzz_to_acquire,
+        swap_input_wei: f.swap_input_wei,
+        gas_reserve_wei: f.gas_reserve_wei,
+        xdai_required_wei: f.xdai_required_wei,
+        xdai_to_send_wei: f.xdai_to_send_wei,
+        sufficient: f.sufficient,
+    }
+}
+
+fn quote_view(q: &funding::PlanQuote) -> StorageQuoteView {
+    StorageQuoteView {
+        depth: q.depth,
+        days: q.days,
+        amount_per_chunk: q.amount_per_chunk,
+        plan_cost_plur: q.plan_cost_plur,
+        deposit_due_plur: q.deposit_due_plur,
+        funding: funding_view(&q.funding),
+    }
+}
+
+/// Bad input and a short wallet are the caller's to fix (`400`, with
+/// the message the apps show); anything else is the chain's (`502`).
+fn failure(e: FundingError) -> FundingFailure {
+    match e {
+        FundingError::Invalid(_) | FundingError::InsufficientXdai { .. } => {
+            FundingFailure::Rejected(e.to_string())
+        }
+        _ => FundingFailure::Chain(e.to_string()),
+    }
 }
 
 #[async_trait]
@@ -122,31 +207,9 @@ impl ChainWriter for AntChainWriter {
         depth: u8,
         immutable: bool,
     ) -> Result<[u8; 32], String> {
-        // Total cost to approve = amount-per-chunk × 2^depth.
-        let total = U256::from(amount_per_chunk)
-            .checked_mul(U256::one() << u32::from(depth))
-            .ok_or_else(|| "amount × 2^depth overflows u256".to_string())?;
-        self.wallet
-            .approve_bzz(&self.client, &self.bzz_token, &self.postage_contract, total)
+        funding::buy_batch(&self.payer(), amount_per_chunk, depth, immutable)
             .await
-            .map_err(|e| format!("approve: {e}"))?;
-        let nonce = ant_crypto::random_overlay_nonce();
-        let receipt = self
-            .wallet
-            .create_batch(
-                &self.client,
-                &self.postage_contract,
-                &self.owner,
-                U256::from(amount_per_chunk),
-                depth,
-                POSTAGE_BUCKET_DEPTH,
-                &nonce,
-                immutable,
-            )
-            .await
-            .map_err(|e| format!("createBatch: {e}"))?;
-        ant_chain::tx::extract_created_batch_id(&receipt)
-            .ok_or_else(|| "createBatch receipt had no BatchCreated event".to_string())
+            .map_err(|e| e.to_string())
     }
 
     async fn topup_batch(&self, batch_id: [u8; 32], amount_per_chunk: u128) -> Result<(), String> {
@@ -158,23 +221,9 @@ impl ChainWriter for AntChainWriter {
         let meta = ant_chain::fetch_postage_batch_meta(&self.client, &postage_hex, &batch_id)
             .await
             .map_err(|e| format!("read batch depth: {e}"))?;
-        let total = U256::from(amount_per_chunk)
-            .checked_mul(U256::one() << u32::from(meta.depth))
-            .ok_or_else(|| "amount × 2^depth overflows u256".to_string())?;
-        self.wallet
-            .approve_bzz(&self.client, &self.bzz_token, &self.postage_contract, total)
+        funding::top_up_batch(&self.payer(), &batch_id, meta.depth, amount_per_chunk)
             .await
-            .map_err(|e| format!("approve: {e}"))?;
-        self.wallet
-            .top_up(
-                &self.client,
-                &self.postage_contract,
-                &batch_id,
-                U256::from(amount_per_chunk),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("topUp: {e}"))
+            .map_err(|e| e.to_string())
     }
 
     async fn dilute_batch(&self, batch_id: [u8; 32], new_depth: u8) -> Result<(), String> {
@@ -196,6 +245,79 @@ impl ChainWriter for AntChainWriter {
             .await
             .map_err(|e| format!("deposit transfer: {e}"))?;
         Ok(receipt.tx_hash)
+    }
+
+    async fn quote_plan(&self, depth: u8, days: u64) -> Result<StorageQuoteView, FundingFailure> {
+        funding::quote_plan(&self.payer(), self.deposit_policy(), depth, days)
+            .await
+            .map(|q| quote_view(&q))
+            .map_err(failure)
+    }
+
+    async fn quote_extend(
+        &self,
+        batch_id: [u8; 32],
+        new_depth: Option<u8>,
+        days: u64,
+    ) -> Result<StorageQuoteView, FundingFailure> {
+        let depth = self.batch_depth(&batch_id).await?;
+        funding::quote_extend(&self.payer(), &batch_id, depth, new_depth, days)
+            .await
+            .map(|q| quote_view(&q))
+            .map_err(failure)
+    }
+
+    async fn buy_with_xdai(
+        &self,
+        depth: u8,
+        amount_per_chunk: u128,
+        immutable: bool,
+    ) -> Result<[u8; 32], FundingFailure> {
+        funding::buy_plan_with_xdai(
+            &self.payer(),
+            self.deposit_policy(),
+            depth,
+            amount_per_chunk,
+            immutable,
+        )
+        .await
+        .map_err(failure)
+    }
+
+    async fn extend_with_xdai(
+        &self,
+        batch_id: [u8; 32],
+        new_depth: Option<u8>,
+        amount_per_chunk: u128,
+    ) -> Result<u8, FundingFailure> {
+        let depth = self.batch_depth(&batch_id).await?;
+        funding::extend_with_xdai(&self.payer(), &batch_id, depth, new_depth, amount_per_chunk)
+            .await
+            .map_err(failure)?;
+        Ok(new_depth.unwrap_or(depth))
+    }
+
+    async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+        let Some(cb) = self.chequebook.get() else {
+            return Ok(self.deposit_view(None));
+        };
+        let status = funding::deposit_status(&self.payer(), &cb, self.deposit_target_or_default())
+            .await
+            .map_err(failure)?;
+        Ok(self.deposit_view(Some(&status)))
+    }
+
+    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+        let cb = self.chequebook.get().ok_or_else(|| {
+            FundingFailure::Rejected(
+                "this node has no chequebook yet; buying storage creates one".into(),
+            )
+        })?;
+        let status =
+            funding::fund_deposit_with_xdai(&self.payer(), &cb, self.deposit_target_or_default())
+                .await
+                .map_err(failure)?;
+        Ok(self.deposit_view(Some(&status)))
     }
 }
 
@@ -228,7 +350,11 @@ fn parse_addr(s: &str) -> Result<[u8; 20]> {
 ///   operator's explicit `rpc_url` plus a funded `wallet_secret` — never
 ///   the shared public fallback. Absent either, the write endpoints
 ///   degrade to `501`.
+///
+/// `deposit_target` is the chequebook deposit the embedder keeps (see
+/// `/v0/storage/quote`), or `None` when it doesn't manage one.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     rpc_url: Option<String>,
     read_fallback_rpc_url: Option<String>,
@@ -237,6 +363,7 @@ pub fn build(
     chequebook: Option<[u8; 20]>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
+    deposit_target: Option<u128>,
 ) -> Option<Arc<ChainContext>> {
     build_with_transport(
         rpc_url,
@@ -246,6 +373,7 @@ pub fn build(
         chequebook,
         chain_id,
         wallet_secret,
+        deposit_target,
         None,
     )
 }
@@ -265,6 +393,7 @@ pub fn build_with_transport(
     chequebook: Option<[u8; 20]>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
+    deposit_target: Option<u128>,
     transport: Option<ant_chain::SharedChainTransport>,
 ) -> Option<Arc<ChainContext>> {
     // Treat blank strings as unset so an empty env/config value behaves
@@ -299,8 +428,8 @@ pub fn build_with_transport(
                     client: ChainClient::new(rpc).with_transport(transport),
                     postage_contract: postage,
                     bzz_token: bzz,
-                    owner: wallet_eth,
                     chequebook: chequebook.clone(),
+                    deposit_target,
                 })
                     as Arc<dyn ChainWriter>),
                 _ => None,
@@ -315,6 +444,7 @@ pub fn build_with_transport(
         chequebook,
         chain_id,
         writer,
+        writes: WriteGate::default(),
     }))
 }
 
@@ -335,7 +465,8 @@ mod tests {
             [0; 20],
             None,
             100,
-            Some(SECRET)
+            Some(SECRET),
+            None,
         )
         .is_none());
         // Blank strings count as unset.
@@ -347,6 +478,7 @@ mod tests {
             None,
             100,
             Some(SECRET),
+            None,
         )
         .is_none());
     }
@@ -362,6 +494,7 @@ mod tests {
             None,
             100,
             Some(SECRET),
+            None,
         )
         .expect("reader built from fallback");
         // Reads are available (so /stamps can compute a real batchTTL)...
@@ -379,6 +512,7 @@ mod tests {
             None,
             100,
             Some(SECRET),
+            None,
         )
         .expect("context built");
         assert!(ctx.writer.is_some());
@@ -393,6 +527,7 @@ mod tests {
             [0xAB; 20],
             None,
             100,
+            None,
             None,
         )
         .expect("context built");

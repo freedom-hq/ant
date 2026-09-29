@@ -235,6 +235,9 @@ pub unsafe extern "C" fn ant_start_gateway(
                 chequebook,
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
+                // The storage flows keep the chequebook at the shared
+                // 0.001 xBZZ deposit, so `/v0/storage/quote` prices it in.
+                Some(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR),
                 // Host-provided chain transport (issue #77), if the app
                 // installed one with `ant_set_chain_transport` before
                 // starting the gateway. `None` — the default — leaves

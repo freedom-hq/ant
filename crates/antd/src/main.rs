@@ -841,6 +841,7 @@ async fn main() -> Result<()> {
             chequebook_addr,
             ant_chain::tx::GNOSIS_CHAIN_ID,
             Some(signing_secret),
+            managed_deposit_target(&opt),
         )
     };
 
@@ -2116,6 +2117,16 @@ fn manual_chequebook(opt: &Opt) -> Option<String> {
         .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The chequebook deposit antd keeps topped up itself, so a
+/// `/v0/storage/quote` prices it into a new plan and the xDAI buy
+/// acquires it: `--chequebook-deposit-plur`, unless the operator runs a
+/// manual `--chequebook` or opted out of automatic chequebook spending
+/// with `--no-auto-chequebook`.
+fn managed_deposit_target(opt: &Opt) -> Option<u128> {
+    (!opt.no_auto_chequebook && manual_chequebook(opt).is_none())
+        .then_some(opt.chequebook_deposit_plur)
 }
 
 /// Where outbound SWAP settlement stands, for [`SettlementOnBuy`].
