@@ -2268,6 +2268,13 @@ async fn settlement_topup_xdai_for(
             return Err(DriveError::Op(format!("{reason}; not depositing into it")));
         }
     }
+    // Deposit read, balance read, swap and deposit transfer all under
+    // the account's wallet tx lock (see [`wallet_tx_lock`]). The
+    // shortfall must be read *after* taking the lock: an after-buy
+    // [`fund_chequebook_best_effort`] (or a second tap) holding it may
+    // be depositing that very shortfall right now, and a value read
+    // before we waited would send it a second time.
+    let _tx = wallet_tx_lock(&owner).lock_owned().await;
     let deposited = chequebook_deposit_plur(client, &cb).await?;
     let short = deposit::shortfall(deposited);
     if short == 0 {
@@ -2276,9 +2283,6 @@ async fn settlement_topup_xdai_for(
 
     let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
         .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
-    // Balance read, swap and deposit transfer under the account's wallet
-    // tx lock (see [`wallet_tx_lock`]).
-    let _tx = wallet_tx_lock(&owner).lock_owned().await;
     let have_bzz = client
         .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
         .await
@@ -4554,6 +4558,49 @@ mod chain_tests {
         assert_eq!(script.seen("eth_sendRawTransaction"), 0);
         assert!(node.lock().unwrap().disabled.is_empty());
         assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R3-M1 (round 3 of #99): the top-up reads the deposit shortfall
+    /// only once it holds the wallet tx lock. While an after-buy
+    /// deposit (or any other spend) holds the lock, only the chequebook
+    /// checks may run — reading the deposit then would transfer a stale
+    /// shortfall once the lock is released, double-funding it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_reads_the_shortfall_under_the_wallet_tx_lock() {
+        const CB: [u8; 20] = [0xd9; 20];
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-topup-lock");
+        persist(&dir, CB, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(CB, (true, eth));
+        script.balances.insert(CB, 0);
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, _node) = fake_node();
+
+        let held = super::wallet_tx_lock(&eth).lock_owned().await;
+        let task = {
+            let (script, dir) = (script.clone(), dir.clone());
+            tokio::spawn(async move {
+                super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            script.seen("eth_call"),
+            2,
+            "only the factory + issuer checks run before the lock; the deposit read waits",
+        );
+        drop(held);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("top-up proceeds once the lock is released")
+            .unwrap();
+        // The script refuses the transfer; what matters is that the
+        // deposit was read after the lock was taken.
+        assert!(res.is_err());
+        assert!(script.seen("eth_call") > 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
