@@ -429,7 +429,9 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
  * out, then collapses into pushsync timeouts — so the Storage tab reads
  * this to detect that and offer ant_storage_settlement_topup.
  * `enabled=false` (zeroed, needs_top_up=false) when this account has no
- * chequebook yet; buying/connecting a plan deploys one, funded. Reads
+ * chequebook yet (buying/connecting a plan deploys one, funded), or when
+ * this process's chain check disqualified its chequebook (settlement is
+ * off for it, as ant_storage_settlement_status reports). Reads
  * chain (a few light eth_calls) — for an explicit refresh, not every
  * status poll. Requires the `chain` cargo feature.
  */
@@ -444,7 +446,8 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * deposit to the chequebook. The explicit top-up path — a chequebook's
  * deposit is only read at deploy time, so an already-deployed one can be
  * funded no other way. Idempotent (a chequebook at the target is a
- * no-op); errors when this account has no chequebook yet. Returns the
+ * no-op); errors when this account has no chequebook yet or its
+ * chequebook failed the chain check (never funds that one). Returns the
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.

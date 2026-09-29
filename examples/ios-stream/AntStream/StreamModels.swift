@@ -72,7 +72,8 @@ struct SettlementInfo: Codable, Equatable {
 /// here and offers a top-up.
 struct SettlementDeposit: Codable, Equatable {
     /// False when this account has no chequebook yet — nothing to top up
-    /// (buying or connecting a plan deploys one, funded).
+    /// (buying or connecting a plan deploys one, funded) — or when its
+    /// chequebook failed the chain check and settlement is off for it.
     let enabled: Bool
     let chequebook: String?
     /// xBZZ behind the chequebook right now, and the deposit we aim for.

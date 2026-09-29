@@ -1928,6 +1928,11 @@ async fn quote_deposit_shortfall(
     let Some(cb) = persisted_chequebook(data_dir, owner) else {
         return deposit::TARGET_PLUR;
     };
+    // A disqualified chequebook is neither funded nor replaced by a buy
+    // (see `setup_settlement`), so there's no deposit to price in.
+    if lock_disqualified().contains(&cb) {
+        return 0;
+    }
     match chequebook_deposit_plur(client, &cb).await {
         Ok(have) => deposit::shortfall(have),
         Err(e) => {
@@ -2015,20 +2020,36 @@ async fn fund_chequebook_best_effort(
 /// "xdai_to_send_display","sufficient_funds"}`. `enabled=false` (with
 /// zeroed fields) when this account has no chequebook yet — there is
 /// nothing to top up then; buying or connecting a plan deploys one,
-/// funded. Two or three light `eth_call`s, so it belongs on an explicit
+/// funded — or when its chequebook was disqualified (see
+/// [`settlement_deposit_for`]). Two or three light `eth_call`s, so it belongs on an explicit
 /// refresh, not on every status poll.
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
     h.runtime.block_on(async move {
-        let Some(cb) = persisted_chequebook(&data_dir, &owner) else {
-            return to_json(&SettlementDeposit::none());
-        };
-        let client = h.chain_client(rpc);
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        settlement_deposit_json(&client, &owner, &cb, deposited).await
+        settlement_deposit_for(&h.chain_client(rpc), &data_dir, &owner).await
     })
+}
+
+/// [`settlement_deposit`]'s body, against an explicit chain client. A
+/// chequebook this process's chain check disqualified reads as "none",
+/// the same answer [`settlement_status`] gives: its settlement is off,
+/// so the card must not offer to top it up.
+#[cfg(feature = "chain")]
+async fn settlement_deposit_for(
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: &[u8; 20],
+) -> Result<String, DriveError> {
+    let Some(cb) = persisted_chequebook(data_dir, owner) else {
+        return to_json(&SettlementDeposit::none());
+    };
+    if lock_disqualified().contains(&cb) {
+        return to_json(&SettlementDeposit::none());
+    }
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    settlement_deposit_json(client, owner, &cb, deposited).await
 }
 
 /// Fund the node's chequebook up to [`deposit::TARGET_PLUR`], funding
@@ -2048,71 +2069,90 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
     let owner = h.eth;
     let secret = h.signing_secret;
     h.runtime.block_on(async move {
-        use primitive_types::U256;
-
-        let cb = persisted_chequebook(&data_dir, &owner).ok_or_else(|| {
-            DriveError::Op(
-                "no chequebook for this account yet — connect or buy a storage plan first".into(),
-            )
-        })?;
-        let client = h.chain_client(rpc);
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        let short = deposit::shortfall(deposited);
-        if short == 0 {
-            return settlement_deposit_json(&client, &owner, &cb, deposited).await;
-        }
-
-        let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
-            .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
-        let have_bzz = client
-            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
-            .await
-            .unwrap_or(0);
-        let to_acquire = short.saturating_sub(have_bzz);
-        if to_acquire > 0 {
-            let xdai = client
-                .eth_get_balance_lower128(&owner)
-                .await
-                .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
-            let swap_input = buffered_swap_input(&client, to_acquire).await?;
-            let required = swap_input.saturating_add(GAS_RESERVE_WEI);
-            if xdai < required {
-                return Err(DriveError::Op(format!(
-                    "not enough xDAI: send {} more xDAI to your account, then try again",
-                    format_native(required - xdai)
-                )));
-            }
-            let helper = wallet
-                .ensure_swap_helper(&client)
-                .await
-                .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
-            wallet
-                .swap_xdai_for_bzz(
-                    &client,
-                    &helper,
-                    &owner,
-                    U256::from(swap_input),
-                    U256::from(to_acquire),
-                )
-                .await
-                .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
-        }
-
-        wallet
-            .erc20_transfer(
-                &client,
-                &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
-                &cb,
-                U256::from(short),
-            )
-            .await
-            .map_err(|e| DriveError::Op(format!("deposit into chequebook: {e}")))?;
-
-        // Re-read rather than assuming: the card should show what the
-        // chain says the deposit is now, not what we intended it to be.
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        settlement_deposit_json(&client, &owner, &cb, deposited).await
+        settlement_topup_xdai_for(&h.chain_client(rpc), &data_dir, owner, secret).await
     })
+}
+
+/// [`settlement_topup_xdai`]'s body, against an explicit chain client.
+/// Refuses a chequebook this process's chain check disqualified: peers
+/// drop its cheques, so a deposit would only strand xBZZ in it.
+#[cfg(feature = "chain")]
+async fn settlement_topup_xdai_for(
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: [u8; 20],
+    secret: [u8; 32],
+) -> Result<String, DriveError> {
+    use primitive_types::U256;
+
+    let cb = persisted_chequebook(data_dir, &owner).ok_or_else(|| {
+        DriveError::Op(
+            "no chequebook for this account yet — connect or buy a storage plan first".into(),
+        )
+    })?;
+    if lock_disqualified().contains(&cb) {
+        return Err(DriveError::Op(format!(
+            "chequebook 0x{} failed its on-chain checks, so settlement is off for it; \
+             not depositing into it",
+            hex::encode(cb),
+        )));
+    }
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    let short = deposit::shortfall(deposited);
+    if short == 0 {
+        return settlement_deposit_json(client, &owner, &cb, deposited).await;
+    }
+
+    let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
+        .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
+    let have_bzz = client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
+        .await
+        .unwrap_or(0);
+    let to_acquire = short.saturating_sub(have_bzz);
+    if to_acquire > 0 {
+        let xdai = client
+            .eth_get_balance_lower128(&owner)
+            .await
+            .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
+        let swap_input = buffered_swap_input(client, to_acquire).await?;
+        let required = swap_input.saturating_add(GAS_RESERVE_WEI);
+        if xdai < required {
+            return Err(DriveError::Op(format!(
+                "not enough xDAI: send {} more xDAI to your account, then try again",
+                format_native(required - xdai)
+            )));
+        }
+        let helper = wallet
+            .ensure_swap_helper(client)
+            .await
+            .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
+        wallet
+            .swap_xdai_for_bzz(
+                client,
+                &helper,
+                &owner,
+                U256::from(swap_input),
+                U256::from(to_acquire),
+            )
+            .await
+            .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
+    }
+
+    wallet
+        .erc20_transfer(
+            client,
+            &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
+            &cb,
+            U256::from(short),
+        )
+        .await
+        .map_err(|e| DriveError::Op(format!("deposit into chequebook: {e}")))?;
+
+    // Re-read rather than assuming: the card should show what the
+    // chain says the deposit is now, not what we intended it to be.
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    settlement_deposit_json(client, &owner, &cb, deposited).await
 }
 
 /// Render the settlement-deposit card payload for a known chequebook,
@@ -2250,8 +2290,9 @@ struct ResolvedChequebook {
 /// error), or [`Resolution::Disqualified`] when the persisted one fails
 /// its chain checks. A rediscovery scan that *failed* is an error, never
 /// a fall-through to the deploy: only an authoritative "this account
-/// owns no chequebook" may trigger one — and not even that when the
-/// persisted record was unreadable (see step 1). Call it through [`setup_settlement`], which holds
+/// owns no chequebook" may trigger one — and when the persisted record
+/// was unreadable, only once the record's own bytes name no chequebook
+/// of ours (see step 2). Call it through [`setup_settlement`], which holds
 /// the lock that keeps two callers from both deploying.
 /// The persist / rediscover / deploy mechanics are shared with `antd` via
 /// [`ant_chain::chequebook_store`]; only the resolution *order* (no
@@ -2281,7 +2322,8 @@ async fn resolve_or_deploy_chequebook(
     //    the chequebook it pointed at if that one holds xBZZ, and rewrites
     //    the record. But the scan can't see a deposit-0 chequebook (every
     //    install before #73), so its "none" doesn't prove there's no
-    //    chequebook behind the record: step 2 refuses to deploy then.
+    //    chequebook behind the record: step 2 then recovers the address
+    //    from the record's bytes before it will deploy.
     let (persisted, record_unreadable) = match chequebook_store::load_persisted_chequebook_for(
         &persist_path,
         &node_eth,
@@ -2373,18 +2415,64 @@ async fn resolve_or_deploy_chequebook(
         }
         // Authoritative "this EOA owns no funded chequebook" — the only
         // answer that may fall through to the deploy below.
-        Ok(None) if !may_deploy => return Ok(Resolution::NoneYet),
-        // ...unless the record we couldn't read may name a deposit-0
-        // chequebook the scan can't see. Deploying then would pay for a
-        // duplicate; the user fixes or removes the file instead.
-        Ok(None) if record_unreadable => {
-            return Err(DriveError::Op(format!(
-                "{} is unreadable and no funded chequebook was found on-chain; it may name an \
-                 unfunded one, so not deploying a second — fix or remove the file",
-                persist_path.display(),
-            )));
+        //
+        // An unreadable record may still name a deposit-0 chequebook the
+        // funded-only scan can't see. Recover it from the file's bytes
+        // when they still hold its address (the common truncated / half-
+        // written case) and it checks out on-chain as ours. When they
+        // don't, the file is moved aside rather than left to block every
+        // deploy: a mobile user can't reach it to fix or remove it, and
+        // whatever it named holds no deposit (the scan would have found
+        // one), so a second chequebook costs only deploy gas.
+        Ok(None) => {
+            if record_unreadable {
+                match salvage_unreadable_record(client, &persist_path, &node_eth).await {
+                    Salvage::Found(cb) => {
+                        if let Err(e) = chequebook_store::persist_chequebook(
+                            &persist_path,
+                            &ChequebookFile::rediscovered(&cb, &node_eth),
+                        ) {
+                            tracing::warn!(target: "ant-ffi", "rewrite chequebook association: {e}");
+                        }
+                        tracing::info!(
+                            target: "ant-ffi",
+                            chequebook = %format!("0x{}", hex::encode(cb)),
+                            "recovered our chequebook from the unreadable association; adopting it",
+                        );
+                        return Ok(Resolution::Use(ResolvedChequebook {
+                            address: cb,
+                            deployed: false,
+                        }));
+                    }
+                    Salvage::Unknown(e) if may_deploy => {
+                        return Err(DriveError::Op(format!(
+                            "{} is unreadable and checking the chequebook it names failed ({e}); \
+                             not deploying a second one on chain state we could not read",
+                            persist_path.display(),
+                        )));
+                    }
+                    Salvage::Unknown(_) | Salvage::Nothing => {}
+                }
+            }
+            if !may_deploy {
+                return Ok(Resolution::NoneYet);
+            }
+            if record_unreadable {
+                let parked = persist_path.with_extension("json.unreadable");
+                std::fs::rename(&persist_path, &parked).map_err(|e| {
+                    DriveError::Op(format!(
+                        "move unreadable {} aside: {e}",
+                        persist_path.display()
+                    ))
+                })?;
+                tracing::warn!(
+                    target: "ant-ffi",
+                    parked = %parked.display(),
+                    "the unreadable chequebook association names no chequebook of ours; \
+                     moved it aside and deploying a fresh one",
+                );
+            }
         }
-        Ok(None) => {}
         Err(e) => {
             // A scan that *failed* is not "no chequebook exists". Falling
             // through would deploy and fund a second chequebook on chain
@@ -2441,16 +2529,103 @@ async fn resolve_or_deploy_chequebook(
     }
 }
 
+/// What an unreadable `chequebook.json` still tells us, per
+/// [`salvage_unreadable_record`].
+#[cfg(feature = "chain")]
+enum Salvage {
+    /// An address in the file is a factory-registered chequebook issued
+    /// by this account.
+    Found([u8; 20]),
+    /// A candidate's checks couldn't be read, so it may be ours.
+    Unknown(String),
+    /// No candidate address, or the chain positively rejected each one.
+    Nothing,
+}
+
+/// Look for our chequebook's address in the raw bytes of an unreadable
+/// record (every `0x` + 40-hex run other than `owner`, i.e. the
+/// `chequebook` field when it survived) and confirm it on-chain: only a
+/// positively registered chequebook whose `issuer()` is `owner` counts.
+/// Unlike [`ChequebookChecks::verdict`], a failed read isn't a pass here —
+/// the bytes are untrusted, so it yields [`Salvage::Unknown`].
+#[cfg(feature = "chain")]
+async fn salvage_unreadable_record(
+    client: &ant_chain::ChainClient,
+    persist_path: &std::path::Path,
+    owner: &[u8; 20],
+) -> Salvage {
+    use ant_chain::chequebook_store::{check_chequebook, IssuerRead};
+
+    // A file we can't even read (I/O error) isn't known to be garbage.
+    let bytes = match std::fs::read(persist_path) {
+        Ok(b) => b,
+        Err(e) => return Salvage::Unknown(format!("read {}: {e}", persist_path.display())),
+    };
+    let mut unknown = None;
+    for cb in addresses_in(&bytes) {
+        if cb == *owner {
+            continue;
+        }
+        let checks = check_chequebook(client, &cb, IssuerRead::UnlessUnregistered).await;
+        match (&checks.registered, &checks.issuer) {
+            (Ok(true), Some(Ok(issuer))) if issuer == owner => return Salvage::Found(cb),
+            // A "no" from the chain: not ours.
+            (Ok(false), _) => {}
+            (_, Some(Ok(issuer))) if issuer != owner => {}
+            // Registered unknown, or issuer unread: may still be ours.
+            (Err(e), _) | (_, Some(Err(e))) => unknown = Some(e.to_string()),
+            (Ok(true), _) => unknown = Some("issuer() not read".into()),
+        }
+    }
+    unknown.map_or(Salvage::Nothing, Salvage::Unknown)
+}
+
+/// Every distinct `0x`-prefixed 40-hex-digit run in `bytes` (a longer
+/// run, like a tx hash, doesn't count).
+#[cfg(feature = "chain")]
+fn addresses_in(bytes: &[u8]) -> Vec<[u8; 20]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'0' && bytes[i + 1].eq_ignore_ascii_case(&b'x') {
+            let run = bytes[i + 2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            let mut a = [0u8; 20];
+            if run == 40
+                && hex::decode_to_slice(&bytes[i + 2..i + 42], &mut a).is_ok()
+                && !out.contains(&a)
+            {
+                out.push(a);
+            }
+            i += 2 + run;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// How long after our own deploy (the record's write time) a factory
+/// "not registered" may still be a lagging backend. A load-balanced RPC
+/// trails by seconds to a few minutes, not for good.
+#[cfg(feature = "chain")]
+const DEPLOY_LAG_GRACE: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// Whether a factory "not registered" answer for the persisted `cb` may
 /// just be a backend that hasn't seen our deploy yet (a load-balanced
 /// RPC trails by a few blocks; the host's launch-time
 /// `ant_deploy_chequebook` is followed within seconds by the gateway
 /// start's check). Only for a chequebook we deployed ourselves — the
-/// record carries its deploy tx: `true` when that tx's receipt isn't
+/// record carries its deploy tx — and only within [`DEPLOY_LAG_GRACE`]
+/// of the record being written: `true` then when that tx's receipt isn't
 /// visible or can't be read (unconfirmed, not "no"), or shows the
 /// factory deploying `cb` (registered by construction). A visible
 /// receipt without that deploy lets the "not registered" stand, as does
-/// a record without a deploy tx (a rediscovered chequebook).
+/// a record without a deploy tx (a rediscovered chequebook) or one older
+/// than the grace (a backend doesn't lag for that long; a record whose
+/// deploy tx isn't on this chain would otherwise pass as "lag" forever).
 #[cfg(feature = "chain")]
 async fn not_registered_may_be_lag(
     client: &ant_chain::ChainClient,
@@ -2459,6 +2634,16 @@ async fn not_registered_may_be_lag(
 ) -> bool {
     use ant_chain::chequebook::{GNOSIS_CHEQUEBOOK_FACTORY, SIMPLE_SWAP_DEPLOYED_TOPIC};
 
+    // An unreadable mtime, or one in the future (clock change), counts as
+    // outside the grace: the factory's "no" is a real answer.
+    let recent = std::fs::metadata(persist_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < DEPLOY_LAG_GRACE);
+    if !recent {
+        return false;
+    }
     let Some(deploy_tx) = std::fs::read(persist_path)
         .ok()
         .and_then(|b| {
@@ -3307,6 +3492,11 @@ mod chain_tests {
                 let registered = self.chequebooks.get(&addr).is_some_and(|c| c.0);
                 return Some(json!(word_hex(&[u8::from(registered)])));
             }
+            if to == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() && sel == "0x70a08231" {
+                // balanceOf: every account holds the full deposit target,
+                // so an adopted chequebook needs no top-up.
+                return Some(json!(format!("0x{:064x}", super::deposit::TARGET_PLUR)));
+            }
             hex::decode_to_slice(to.trim_start_matches("0x"), &mut addr).unwrap();
             let (_, issuer) = self.chequebooks.get(&addr)?;
             Some(json!(word_hex(issuer)))
@@ -3779,6 +3969,34 @@ mod chain_tests {
         assert!(node.lock().unwrap().disabled.is_empty());
         assert_eq!(script.seen("eth_getTransactionReceipt"), 1);
 
+        // R2-M2: the same record long after the deploy: a backend
+        // doesn't lag that far behind, so the factory's "no" stands.
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("chequebook.json"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - super::DEPLOY_LAG_GRACE * 2)
+            .unwrap();
+        let err = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect_err("past the grace, an unregistered chequebook is disqualified");
+        assert!(err.to_string().contains("not registered"), "got {err}");
+        assert_eq!(node.lock().unwrap().disabled, vec![FRESH]);
+        assert_eq!(
+            script.seen("eth_getTransactionReceipt"),
+            1,
+            "no receipt read"
+        );
+        super::lock_disqualified().remove(&FRESH);
+
         // A rediscovered record has no deploy tx to vouch for it: the
         // factory's "no" stands.
         persist(&dir, FRESH, eth);
@@ -3794,22 +4012,102 @@ mod chain_tests {
         .await
         .expect_err("no deploy tx, so the factory answer stands");
         assert!(err.to_string().contains("not registered"), "got {err}");
-        assert_eq!(node.lock().unwrap().disabled, vec![FRESH]);
+        assert_eq!(node.lock().unwrap().disabled, vec![FRESH, FRESH]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// R1-M3: an unreadable record may name a deposit-0 chequebook the
-    /// funded-only rediscovery scan can't see, so a spending caller that
-    /// finds nothing on-chain refuses to deploy a possible duplicate.
+    /// R1-M3 / R2-M3: an unreadable record may name a deposit-0
+    /// chequebook the funded-only rediscovery scan can't see. When its
+    /// bytes still hold that address and the chain confirms it's ours,
+    /// it's adopted (no deploy) and the record rewritten.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unreadable_record_with_nothing_found_does_not_deploy() {
+    async fn unreadable_record_is_salvaged_from_its_bytes() {
+        const UNFUNDED: [u8; 20] = [0xd3; 20];
+        let (wallet, eth) = node_wallet();
+        for may_spend in [false, true] {
+            let dir = scratch(&format!("cb-corrupt-salvage-{may_spend}"));
+            // Half-written: the address survived, the JSON didn't.
+            std::fs::write(
+                dir.join("chequebook.json"),
+                format!(
+                    "{{\"chequebook\":\"0x{}\",\"issuer\":\"0x{}\",\"sa",
+                    hex::encode(UNFUNDED),
+                    hex::encode(eth)
+                ),
+            )
+            .unwrap();
+            let mut script = ChainScript::new(eth);
+            script.chequebooks.insert(UNFUNDED, (true, eth));
+            let script = std::sync::Arc::new(script);
+            let (cmd_tx, node) = fake_node();
+
+            let got = super::setup_settlement(
+                &cmd_tx,
+                &client(&script),
+                &wallet,
+                &dir,
+                NODE_KEY,
+                eth,
+                may_spend,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(got, Some(UNFUNDED));
+            assert_eq!(node.lock().unwrap().enabled, vec![UNFUNDED]);
+            assert_eq!(
+                ant_chain::chequebook_store::load_persisted_chequebook_for(
+                    &dir.join("chequebook.json"),
+                    &eth
+                )
+                .unwrap(),
+                Some(UNFUNDED),
+                "record rewritten",
+            );
+            assert!(!dir.join("chequebook.json.unreadable").exists());
+            assert_eq!(script.seen("eth_getBalance"), 0, "no deploy pre-flight");
+            assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// R2-M3: an unreadable record that names no chequebook of ours is
+    /// moved aside instead of blocking every deploy for good (a mobile
+    /// user can't reach the file to fix it); adopt-only leaves it alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_record_naming_nothing_is_parked_before_a_deploy() {
+        const FOREIGN: [u8; 20] = [0xd4; 20];
         let (wallet, eth) = node_wallet();
         let dir = scratch("cb-corrupt-none");
-        std::fs::write(dir.join("chequebook.json"), b"{ truncated").unwrap();
-        let script = std::sync::Arc::new(ChainScript::new(eth));
+        let record = dir.join("chequebook.json");
+        std::fs::write(
+            &record,
+            format!("{{ \"chequebook\": \"0x{}\", trunc", hex::encode(FOREIGN)),
+        )
+        .unwrap();
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(FOREIGN, (true, [0x5e; 20]));
+        let script = std::sync::Arc::new(script);
         let (cmd_tx, node) = fake_node();
 
-        let err = super::setup_settlement(
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, None);
+        assert!(record.exists(), "adopt-only doesn't touch the record");
+        assert_eq!(script.seen("eth_getBalance"), 0);
+
+        // A spending caller moves it aside and goes on to deploy (which
+        // the script refuses — the deploy pre-flight is what we look for).
+        let _ = super::setup_settlement(
             &cmd_tx,
             &client(&script),
             &wallet,
@@ -3818,17 +4116,63 @@ mod chain_tests {
             eth,
             true,
         )
-        .await
-        .expect_err("no deploy behind an unreadable record");
-        assert!(err.to_string().contains("unreadable"), "got {err}");
+        .await;
         assert!(node.lock().unwrap().enabled.is_empty());
-        for spend in [
-            "eth_getBalance",
-            "eth_getTransactionCount",
-            "eth_sendRawTransaction",
-        ] {
-            assert_eq!(script.seen(spend), 0, "{spend} must not be called");
-        }
+        assert!(!record.exists());
+        assert!(dir.join("chequebook.json.unreadable").exists());
+        assert!(script.seen("eth_getBalance") > 0, "deploy attempted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-M3: the salvage only trusts addresses the chain confirms, and
+    /// skips longer hex runs (tx hashes, salts).
+    #[test]
+    fn addresses_in_finds_only_address_runs() {
+        let a = [0xabu8; 20];
+        let text = format!(
+            "x0x{} 0x{} 0X{} 0x{}",
+            hex::encode(a),
+            hex::encode([0x11u8; 32]),
+            hex::encode(a),
+            &hex::encode(a)[..39],
+        );
+        assert_eq!(super::addresses_in(text.as_bytes()), vec![a]);
+    }
+
+    /// R2-M1: a chequebook the chain check disqualified reads as "none"
+    /// on the deposit card (like `settlement_status`) and is never
+    /// funded by the top-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disqualified_chequebook_is_neither_shown_nor_funded() {
+        const BAD: [u8; 20] = [0xd5; 20];
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-dq-topup");
+        persist(&dir, BAD, eth);
+        let script = std::sync::Arc::new(ChainScript::new(eth));
+        super::lock_disqualified().insert(BAD);
+
+        let card = super::settlement_deposit_for(&client(&script), &dir, &eth)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["enabled"], false);
+        assert_eq!(card["needs_top_up"], false);
+        let err = super::settlement_topup_xdai_for(&client(&script), &dir, eth, NODE_KEY)
+            .await
+            .expect_err("no deposit into a disqualified chequebook");
+        assert!(
+            err.to_string().contains("failed its on-chain checks"),
+            "got {err}"
+        );
+        assert_eq!(
+            super::quote_deposit_shortfall(&client(&script), &dir, &eth).await,
+            0
+        );
+        assert!(
+            script.seen.lock().unwrap().is_empty(),
+            "no chain call at all"
+        );
+        super::lock_disqualified().remove(&BAD);
         std::fs::remove_dir_all(&dir).ok();
     }
 

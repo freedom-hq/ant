@@ -2150,7 +2150,9 @@ pub unsafe extern "C" fn ant_storage_settlement_status(
 /// collapses into pushsync timeouts, so the Storage tab reads this to
 /// detect that state and offer a top-up ([`ant_storage_settlement_topup`]).
 /// `enabled=false` (zeroed, `needs_top_up=false`) when this account has
-/// no chequebook yet; buying or connecting a plan deploys one, funded.
+/// no chequebook yet (buying or connecting a plan deploys one, funded),
+/// or when this process's chain check disqualified its chequebook
+/// (settlement is off for it, as [`ant_storage_settlement_status`] says).
 ///
 /// Reads chain (two or three light `eth_call`s), so call it on an
 /// explicit refresh rather than every status poll. Requires the `chain`
@@ -2197,7 +2199,8 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// funded no other way.
 ///
 /// Idempotent: a chequebook already at the target is a no-op. Errors when
-/// this account has no chequebook yet. Returns the refreshed
+/// this account has no chequebook yet, or its chequebook failed the
+/// chain check (a deposit there would back cheques peers drop). Returns the refreshed
 /// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
 /// and spends real funds** and **blocks** until they confirm, so the app
 /// gates it behind explicit confirmation. Requires the `chain` build
