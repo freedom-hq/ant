@@ -89,19 +89,24 @@ const COVERING_PEERS: usize = 5;
 /// accepts them (bee's cap is
 /// 1..=[`ant_crypto::pss::MAX_TARGET_LEN`] bytes and ant mirrors it),
 /// but a trojan that agrees with the target on only 8 bits is pushed
-/// to whichever neighbourhood is closest to its *mined* address. With mainnet storage depth `d ≈ 9-11 > 8` it lands in the
-/// target's depth-`d` neighbourhood only by chance, with probability
-/// `2^-(d-8)` (≈ 1/2 at `d = 9`, 1/4 at `d = 10`, 1/8 at `d = 11`) —
-/// so a 1-byte sender gets unreliable, lossy delivery, not none. When it
-/// does land there — agreeing with the target past bit `b_p` of a
-/// covering peer `p` — it sits at exactly bin `b_p` on `p` (the same
-/// deterministic argument as the `b_p < L` regime below), and bin `b_p`
-/// is pulled anyway for the 3-byte case whenever `b_p < 24`, i.e. on
-/// every realistic covering peer — so ant still receives that lucky
-/// fraction of 1-byte messages at no extra cost. What is *not* done is
-/// pull the `8 + Geom(1/2)` bins a `b_p >= 8` peer would file the
-/// remaining 1-byte trojans under: covering `L = 8` would make every PSS
-/// subscription pull bins `8..=11` from each covering peer, and at
+/// to whichever neighbourhood is closest to its *mined* address. With
+/// mainnet storage depth `d ≈ 9-11 > 8` it lands in the target's
+/// depth-`d` neighbourhood only by chance, with probability
+/// `2^-(d-8)` (≈ 1/2 at `d = 9`, 1/4 at `d = 10`, 1/8 at `d = 11`).
+/// Landing there is not enough to be received, though: a trojan `c`
+/// sits at bin `b_p` on a covering peer `p` only if it agrees with the
+/// target *past* bit `b_p` (`PO(c, target) > b_p`, the same
+/// deterministic argument as the `b_p < L` regime below), and bin
+/// `b_p` is pulled anyway for the 3-byte case whenever `b_p < 24`. One
+/// with `d <= PO(c, target) <= b_p` is stored in the neighbourhood but
+/// filed under bin `PO(c, target)` (or deeper) on `p`, which is not
+/// pulled. So ant receives only about `2^-(b_p-7)` of 1-byte messages
+/// (`b_p` of the shallowest covering peer; ≈ 1/64 at `b_p = 13`) —
+/// lossy at best, and well below the `2^-(d-8)` that reach the
+/// neighbourhood. What is *not* done is pull the `8 + Geom(1/2)` bins
+/// a `b_p >= 8` peer would file the remaining 1-byte trojans under:
+/// covering `L = 8` would make every PSS subscription pull bins
+/// `8..=11` from each covering peer, and at
 /// `d ≈ 10` those are the storer's *fullest* reserve bins (≈ 75-90 % of
 /// its ingest vs ≈ 2-25 % for bin `b_p`), all of which `want()`
 /// downloads and trial-unwraps — a many-fold bandwidth cost on a light
@@ -763,8 +768,9 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
         // The sender's prefix length is unknown to us: cover every
         // deliverable length (2- and 3-byte targets; see
         // PSS_MINED_PREFIX_BITS for why 1-byte is excluded — the
-        // 1-byte trojans that do land in the neighbourhood sit at
-        // `b_p`, which the L = 24 pass below adds for any b_p < 24).
+        // 1-byte trojans that agree with the target past bit b_p sit
+        // at `b_p`, which the L = 24 pass below adds for any b_p < 24;
+        // shallower ones are not received).
         for l in PSS_MINED_PREFIX_BITS {
             if b_p < l {
                 // Deterministic regime: PO(c, p) = b_p exactly.
