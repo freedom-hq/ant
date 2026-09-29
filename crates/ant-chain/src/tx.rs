@@ -813,6 +813,10 @@ impl Wallet {
     /// Like [`Self::send_signed`] but attaches native xDAI `value` — used
     /// for the swap helper, which is `payable` and wraps the attached
     /// xDAI into WXDAI before swapping.
+    ///
+    /// Holds [`sender_lock`] for this address from the nonce read until
+    /// the receipt, so every transaction this process signs with one key
+    /// goes out one after the other.
     async fn send_signed_value(
         &self,
         client: &ChainClient,
@@ -821,6 +825,8 @@ impl Wallet {
         gas_limit: u64,
         value: U256,
     ) -> Result<TxReceipt, TxError> {
+        let lock = sender_lock(&self.address);
+        let _one_at_a_time = lock.lock().await;
         let nonce = client
             .eth_get_transaction_count_pending(&self.address)
             .await?;
@@ -876,6 +882,35 @@ impl Wallet {
         self.send_signed_value(client, *helper, data, SWAP_HELPER_SWAP_GAS, value)
             .await
     }
+}
+
+/// The lock every transaction signed by `address` holds from its nonce
+/// read until its receipt.
+///
+/// The nonce comes from `eth_getTransactionCount(…, "pending")`. Two
+/// transactions from one key sent concurrently can read the same value,
+/// and the second is then rejected or replaces the first. That happened
+/// when a stamp buy overlapped a chequebook deposit, or a second buy.
+/// `antd` and `ant-ffi` both send from the node key through several
+/// independent paths (gateway routes, after-buy settlement, the C API),
+/// so the lock is process-wide and keyed by address rather than held by
+/// one `Wallet` value. Waiting for the receipt, not just the broadcast,
+/// also keeps a load-balanced RPC whose nodes disagree about the pending
+/// count from handing out a nonce twice.
+#[cfg(feature = "chain-rpc")]
+fn sender_lock(address: &[u8; 20]) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    type Locks = Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    LOCKS
+        .get_or_init(Locks::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(*address)
+        .or_default()
+        .clone()
 }
 
 #[cfg(any(feature = "chain-rpc", test))]
@@ -1077,5 +1112,82 @@ mod tests {
             }],
         };
         assert_eq!(extract_created_batch_id(&receipt), Some(want_batch));
+    }
+
+    /// Two transactions from one key started at the same moment go out
+    /// one after the other: the second reads its nonce only after the
+    /// first is mined. Without [`sender_lock`] both read the same pending
+    /// nonce, which is how a stamp buy and a chequebook deposit collided.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_key_sends_one_transaction_at_a_time() {
+        use crate::ChainTransport;
+        use std::sync::{Arc, Mutex};
+
+        /// Scripted chain: the pending nonce is the number of mined
+        /// transactions, and each one is mined on its second receipt
+        /// poll, so an unserialised sender has time to read a stale
+        /// nonce.
+        #[derive(Default)]
+        struct Chain {
+            events: Mutex<Vec<String>>,
+            mined: Mutex<u64>,
+            sent: Mutex<u64>,
+            polls: Mutex<std::collections::HashMap<String, u32>>,
+        }
+
+        impl ChainTransport for Chain {
+            fn serve(&self, request_json: &str) -> Option<String> {
+                let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+                let id = req["id"].clone();
+                let result = match req["method"].as_str().unwrap() {
+                    "eth_getTransactionCount" => {
+                        let nonce = *self.mined.lock().unwrap();
+                        self.events.lock().unwrap().push(format!("nonce {nonce}"));
+                        json!(format!("0x{nonce:x}"))
+                    }
+                    "eth_sendRawTransaction" => {
+                        let mut sent = self.sent.lock().unwrap();
+                        *sent += 1;
+                        self.events.lock().unwrap().push("send".into());
+                        json!(format!("0x{:064x}", *sent))
+                    }
+                    "eth_getTransactionReceipt" => {
+                        let hash = req["params"][0].as_str().unwrap().to_string();
+                        let mut polls = self.polls.lock().unwrap();
+                        let n = polls.entry(hash).or_default();
+                        *n += 1;
+                        if *n < 2 {
+                            serde_json::Value::Null
+                        } else {
+                            *self.mined.lock().unwrap() += 1;
+                            self.events.lock().unwrap().push("mined".into());
+                            json!({"status": "0x1", "blockNumber": "0x1", "logs": []})
+                        }
+                    }
+                    other => panic!("unscripted method {other}"),
+                };
+                Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+            }
+        }
+
+        let chain = Arc::new(Chain::default());
+        // An unroutable URL: a fall-through would fail loudly.
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let a = Wallet::new([9u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        let b = Wallet::new([9u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        let (ra, rb) = tokio::join!(
+            a.approve_bzz(&client, &[1u8; 20], &[2u8; 20], U256::one()),
+            b.erc20_transfer(&client, &[1u8; 20], &[3u8; 20], U256::one()),
+        );
+        ra.unwrap();
+        rb.unwrap();
+
+        let events = chain.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            ["nonce 0", "send", "mined", "nonce 1", "send", "mined"],
+            "the second transaction must read its nonce after the first is mined",
+        );
     }
 }
