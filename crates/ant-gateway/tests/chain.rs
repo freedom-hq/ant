@@ -809,3 +809,55 @@ async fn v0_routes_501_without_funding_support() {
         }
     }
 }
+
+/// `POST /stamps` buys an immutable batch unless told otherwise, like
+/// bee, and reads bee-js's `immutable` header as well as the query.
+#[tokio::test]
+async fn buy_stamp_is_immutable_unless_the_header_or_query_says_not() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let buy = |uri: &'static str, header: Option<&'static str>| {
+        let router = router.clone();
+        async move {
+            let mut request = Request::builder().method(Method::POST).uri(uri);
+            if let Some(value) = header {
+                request = request.header("immutable", value);
+            }
+            send(router, request.body(Body::empty()).unwrap())
+                .await
+                .status()
+        }
+    };
+    assert_eq!(buy("/stamps/1000000/20", None).await, StatusCode::CREATED);
+    assert_eq!(
+        buy("/stamps/1000000/20", Some("false")).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        buy("/stamps/1000000/20", Some("true")).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        buy("/stamps/1000000/20?immutable=false", None).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        buy("/stamps/1000000/20?immutable=true", Some("false")).await,
+        StatusCode::CREATED,
+        "the query wins over the header"
+    );
+    assert_eq!(
+        buy("/stamps/1000000/20", Some("maybe")).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        writer.calls(),
+        [
+            "buy_batch(1000000, 20, immutable=true)",
+            "buy_batch(1000000, 20, immutable=false)",
+            "buy_batch(1000000, 20, immutable=true)",
+            "buy_batch(1000000, 20, immutable=false)",
+            "buy_batch(1000000, 20, immutable=true)",
+        ]
+    );
+}

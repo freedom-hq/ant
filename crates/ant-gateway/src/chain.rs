@@ -683,12 +683,14 @@ struct TxHashBody {
 
 /// `POST /stamps/{amount}/{depth}`. Buys a postage batch on-chain
 /// (`approve` → `createBatch`) and returns its `batchID` (PLAN.md B2).
-/// `amount` is the per-chunk balance (PLUR); `?immutable=true` makes the
-/// batch immutable. Freedom then polls `GET /stamps/{id}` for `usable`.
+/// `amount` is the per-chunk balance (PLUR). The batch is immutable
+/// unless the `immutable` header (bee-js) or `?immutable=` query says
+/// `false`. Freedom then polls `GET /stamps/{id}` for `usable`.
 pub async fn buy_stamp(
     State(handle): State<GatewayHandle>,
     Path((amount, depth)): Path<(String, u8)>,
     Query(q): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let Some(chain) = handle.chain() else {
         if handle.chain_state().is_none() {
@@ -732,9 +734,21 @@ pub async fn buy_stamp(
     if total_cost.is_none_or(|cost| balance < cost) {
         return json_error(StatusCode::BAD_REQUEST, "out of funds");
     }
-    let immutable = q
-        .get("immutable")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    // bee-js sends the flag as an `immutable` header; antd used to read
+    // only the query, so every bee-js buy came out mutable. Honour both
+    // (the query wins when both are set) and default to immutable, like
+    // bee: a full mutable batch silently overwrites its oldest chunks,
+    // where a full immutable one fails the upload and can be resized.
+    let immutable = match flag(
+        q.get("immutable")
+            .map(String::as_str)
+            .or_else(|| headers.get("immutable").and_then(|v| v.to_str().ok())),
+        "immutable",
+        true,
+    ) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let batch_id = match guarded_tx(w.buy_batch(amount, depth, immutable)).await {
         Ok(id) => id,
         Err(r) => return r,
