@@ -305,12 +305,28 @@ fn validate_depth(depth: u8) -> Result<(), FundingError> {
 
 // --- chain-backed helpers ---
 
+/// The node wallet's xBZZ for a **quote**: `0` when it can't be read,
+/// so a flaky RPC over-quotes (asks for the swap the wallet may not
+/// need) rather than under-quotes. Nothing is spent on this figure; the
+/// paying paths use [`wallet_bzz_for_spend`].
 async fn wallet_bzz(payer: &Payer<'_>) -> u128 {
+    wallet_bzz_for_spend(payer).await.unwrap_or(0)
+}
+
+/// The node wallet's xBZZ for sizing a **swap**. A failed read is an
+/// error, not `0`: after a partial failure (the swap landed, the buy
+/// didn't) the wallet already holds the xBZZ, and reading "none" on an
+/// RPC hiccup would swap for it again, or refuse with a bogus "send N
+/// more xDAI".
+async fn wallet_bzz_for_spend(payer: &Payer<'_>) -> Result<u128, FundingError> {
     payer
         .client
         .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, payer.owner())
         .await
-        .unwrap_or(0)
+        .map_err(|e| FundingError::Read {
+            what: "read xBZZ balance",
+            message: e.to_string(),
+        })
 }
 
 async fn wallet_xdai(payer: &Payer<'_>) -> u128 {
@@ -569,7 +585,7 @@ pub async fn buy_plan_with_xdai(
     validate_depth(depth)?;
     let plan = checked_cost(amount_per_chunk, depth, "plan")?;
     let deposit = deposit_due(payer, policy).await;
-    let to_acquire = bzz_to_acquire(plan, deposit, wallet_bzz(payer).await);
+    let to_acquire = bzz_to_acquire(plan, deposit, wallet_bzz_for_spend(payer).await?);
     acquire_bzz(payer, to_acquire).await?;
     buy_batch(payer, amount_per_chunk, depth, immutable).await
 }
@@ -589,7 +605,11 @@ pub async fn extend_with_xdai(
         resize_delta(depth, new_depth)?;
     }
     let cost = checked_cost(amount_per_chunk, depth, "top-up")?;
-    acquire_bzz(payer, cost.saturating_sub(wallet_bzz(payer).await)).await?;
+    acquire_bzz(
+        payer,
+        cost.saturating_sub(wallet_bzz_for_spend(payer).await?),
+    )
+    .await?;
     top_up_batch(payer, batch_id, depth, amount_per_chunk).await?;
     if let Some(new_depth) = new_depth {
         payer
@@ -765,7 +785,7 @@ pub async fn fund_deposit_with_xdai(
     if short == 0 {
         return status_for(payer, chequebook, deposited, target).await;
     }
-    let to_acquire = short.saturating_sub(wallet_bzz(payer).await);
+    let to_acquire = short.saturating_sub(wallet_bzz_for_spend(payer).await?);
     if to_acquire > 0 {
         verify_for_deposit(payer, chequebook).await?;
         acquire_bzz(payer, to_acquire).await?;
@@ -947,6 +967,8 @@ mod tests {
         chequebook_bzz: u128,
         registered: bool,
         issuer: [u8; 20],
+        /// The node wallet's `balanceOf` read fails (an RPC hiccup).
+        wallet_bzz_unreadable: bool,
         sent: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -960,6 +982,16 @@ mod tests {
             let word = |v: u128| format!("0x{v:064x}");
             let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
             let id = req["id"].clone();
+            if self.wallet_bzz_unreadable && req["method"] == "eth_call" {
+                let data = req["params"][0]["data"].as_str().unwrap();
+                if data.starts_with("0x70a08231") && data[34..74] != hex::encode(CHEQUEBOOK) {
+                    return Some(
+                        json!({"jsonrpc": "2.0", "id": id,
+                               "error": {"code": -32603, "message": "upstream hiccup"}})
+                        .to_string(),
+                    );
+                }
+            }
             let result = match req["method"].as_str().unwrap() {
                 "eth_call" => {
                     let data = req["params"][0]["data"].as_str().unwrap();
@@ -1170,5 +1202,81 @@ mod tests {
         .await;
         assert!(!result.unwrap().needs_top_up());
         assert!(sent.is_empty());
+    }
+
+    /// R1-F3: every paying path sizes its swap from the wallet's xBZZ. A
+    /// failed read of it fails the operation before anything is sent,
+    /// rather than reading as "no xBZZ" and swapping again for xBZZ a
+    /// partial earlier attempt already bought.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_xbzz_balance_sends_nothing() {
+        let plan = plan_cost_plur(amount_per_chunk_for(24_000, 30), 20).unwrap();
+        let chain = || {
+            std::sync::Arc::new(ScriptedChain {
+                wallet_bzz: plan + TARGET,
+                wallet_xdai: WEI_PER_XDAI,
+                registered: true,
+                issuer: node_eth(),
+                wallet_bzz_unreadable: true,
+                ..ScriptedChain::default()
+            })
+        };
+        let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let amount = amount_per_chunk_for(24_000, 30);
+
+        let c = chain();
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
+        let payer = Payer::gnosis(&client, &wallet);
+        let policy = DepositPolicy::Managed {
+            chequebook: None,
+            target: TARGET,
+        };
+        let r = buy_plan_with_xdai(&payer, policy, 20, amount, true).await;
+        assert!(matches!(r, Err(FundingError::Read { .. })), "buy: {r:?}");
+        assert!(c.sent.lock().unwrap().is_empty(), "buy sent something");
+
+        let c = chain();
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
+        let payer = Payer::gnosis(&client, &wallet);
+        let r = extend_with_xdai(&payer, &BATCH, 20, None, amount).await;
+        assert!(matches!(r, Err(FundingError::Read { .. })), "extend: {r:?}");
+        assert!(c.sent.lock().unwrap().is_empty(), "extend sent something");
+
+        let c = chain();
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
+        let payer = Payer::gnosis(&client, &wallet);
+        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET).await;
+        assert!(
+            matches!(r, Err(FundingError::Read { .. })),
+            "deposit: {r:?}"
+        );
+        assert!(c.sent.lock().unwrap().is_empty(), "deposit sent something");
+    }
+
+    /// R1-M1 (refuted): a resize priced from `remaining` at quote time and
+    /// executed later, once the batch has paid out `elapsed` per chunk,
+    /// still leaves at least `remaining_now + add` per chunk after
+    /// `increaseDepth`: the batch's expiry *as of execution* plus the
+    /// extra days. The quote's top-up grows with `remaining`, so a
+    /// balance that decayed since only makes it more than enough.
+    #[test]
+    fn a_resize_executed_after_its_quote_still_keeps_the_expiry() {
+        let price = 24_000u128;
+        let add = amount_per_chunk_for(price, 7);
+        for delta in 1..=4u8 {
+            for remaining_q in [0, price * 17_280, price * 17_280 * 90] {
+                let amount = resize_top_up_per_chunk(remaining_q, add, delta).unwrap();
+                for elapsed in [0, price * 100, remaining_q / 2, remaining_q] {
+                    let Some(remaining_now) = remaining_q.checked_sub(elapsed) else {
+                        continue;
+                    };
+                    let after = (remaining_now + amount) >> delta;
+                    assert!(
+                        after >= remaining_now + add,
+                        "delta {delta}, remaining {remaining_q}, elapsed {elapsed}"
+                    );
+                }
+            }
+        }
     }
 }

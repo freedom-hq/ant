@@ -142,15 +142,17 @@ impl AntChainWriter {
         }
     }
 
-    /// A batch's current depth, read from chain.
-    async fn batch_depth(&self, batch_id: &[u8; 32]) -> Result<u8, FundingFailure> {
+    /// A batch's current depth, read from chain. With `resize`, the
+    /// batch must also be the node wallet's: `increaseDepth` is
+    /// owner-only, so resizing anyone else's batch would pay the swap
+    /// and the `topUp` and then revert. A plain extension (`topUp`) is
+    /// open to any payer, so it isn't checked.
+    async fn batch_depth(&self, batch_id: &[u8; 32], resize: bool) -> Result<u8, FundingFailure> {
         let postage_hex = format!("0x{}", hex::encode(self.postage_contract));
         let meta = ant_chain::fetch_postage_batch_meta(&self.client, &postage_hex, batch_id)
             .await
             .map_err(|e| FundingFailure::Chain(format!("read batch: {e}")))?;
-        if meta.batch_owner_eth == [0u8; 20] {
-            return Err(FundingFailure::NotFound("batch not found on chain".into()));
-        }
+        check_batch_owner(meta.batch_owner_eth, self.wallet.address(), resize)?;
         Ok(meta.depth)
     }
 
@@ -172,6 +174,22 @@ impl AntChainWriter {
         self.deposit_target
             .unwrap_or(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR)
     }
+}
+
+/// The owner rule [`AntChainWriter::batch_depth`] applies: a zero owner
+/// is a batch the contract doesn't have; a resize needs `node` to own it.
+fn check_batch_owner(owner: [u8; 20], node: &[u8; 20], resize: bool) -> Result<(), FundingFailure> {
+    if owner == [0u8; 20] {
+        return Err(FundingFailure::NotFound("batch not found on chain".into()));
+    }
+    if resize && &owner != node {
+        return Err(FundingFailure::Rejected(format!(
+            "batch is owned by 0x{}, not this node (0x{}); only its owner can resize it",
+            hex::encode(owner),
+            hex::encode(node),
+        )));
+    }
+    Ok(())
 }
 
 fn funding_view(f: &funding::Funding) -> FundingView {
@@ -283,7 +301,7 @@ impl ChainWriter for AntChainWriter {
         new_depth: Option<u8>,
         days: u64,
     ) -> Result<StorageQuoteView, FundingFailure> {
-        let depth = self.batch_depth(&batch_id).await?;
+        let depth = self.batch_depth(&batch_id, new_depth.is_some()).await?;
         funding::quote_extend(&self.payer(), &batch_id, depth, new_depth, days)
             .await
             .map(|q| quote_view(&q))
@@ -313,7 +331,7 @@ impl ChainWriter for AntChainWriter {
         new_depth: Option<u8>,
         amount_per_chunk: u128,
     ) -> Result<u8, FundingFailure> {
-        let depth = self.batch_depth(&batch_id).await?;
+        let depth = self.batch_depth(&batch_id, new_depth.is_some()).await?;
         funding::extend_with_xdai(&self.payer(), &batch_id, depth, new_depth, amount_per_chunk)
             .await
             .map_err(failure)?;
@@ -612,5 +630,26 @@ mod tests {
         slot.set(CB);
         assert_eq!(slot.refused(), None);
         assert_eq!(ctx.chequebook.get(), Some(CB));
+    }
+
+    /// R1-M2: a resize (owner-only `increaseDepth`) is refused up front
+    /// for a batch the node wallet doesn't own, before any swap or
+    /// `topUp` is paid; a plain extension of it is still allowed.
+    #[test]
+    fn only_the_owner_may_resize() {
+        let node = [0xaa; 20];
+        let other = [0xbb; 20];
+        assert!(check_batch_owner(node, &node, true).is_ok());
+        assert!(check_batch_owner(other, &node, false).is_ok());
+        assert!(matches!(
+            check_batch_owner(other, &node, true),
+            Err(FundingFailure::Rejected(m)) if m.contains("only its owner can resize")
+        ));
+        for resize in [false, true] {
+            assert!(matches!(
+                check_batch_owner([0; 20], &node, resize),
+                Err(FundingFailure::NotFound(_))
+            ));
+        }
     }
 }

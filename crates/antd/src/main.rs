@@ -782,10 +782,7 @@ async fn main() -> Result<()> {
     // the config (when present and factory-verified) is what pushsync
     // signs cheques with. Without any of these, sustained pushsync
     // uploads stall after a few hundred chunks per peer.
-    let ResolvedChequebook {
-        address: chequebook_addr,
-        pushsync: pushsync_swap_cfg,
-    } = resolve_chequebook(
+    let resolved = resolve_chequebook(
         &opt,
         &data_dir,
         signing_secret,
@@ -794,6 +791,11 @@ async fn main() -> Result<()> {
         &settlement_on_buy.wallet,
     )
     .await?;
+    let startup_refused = resolved.refused();
+    let ResolvedChequebook {
+        address: chequebook_addr,
+        pushsync: pushsync_swap_cfg,
+    } = resolved;
 
     if pushsync_swap_cfg.is_some() {
         tracing::info!(
@@ -859,7 +861,7 @@ async fn main() -> Result<()> {
     // Arm the after-buy settlement with the startup outcome and the
     // gateway's chequebook slot, before `POST /stamps` goes live below.
     settlement_on_buy
-        .arm(startup_settlement, chain_ctx.as_deref())
+        .arm(startup_settlement, startup_refused, chain_ctx.as_deref())
         .await;
     // Top up an adopted chequebook's deposit in the background: it waits
     // on a transfer receipt, and the chain state below must not.
@@ -1740,6 +1742,18 @@ struct ResolvedChequebook {
     pushsync: Option<ant_p2p::PushsyncSwapConfig>,
 }
 
+impl ResolvedChequebook {
+    /// The chequebook the resolution found but the startup chain check
+    /// disqualified: every path that yields an address builds the swap
+    /// config unless [`verify_then_build_swap`] said no. The gateway
+    /// records it as refused ([`ant_gateway::ChequebookSlot::refuse`]),
+    /// so a buy neither prices in nor swaps for a deposit that would
+    /// never be made.
+    fn refused(&self) -> Option<[u8; 20]> {
+        self.address.filter(|_| self.pushsync.is_none())
+    }
+}
+
 /// Resolve the chequebook for outbound SWAP settlement, in priority
 /// order:
 ///
@@ -2342,11 +2356,35 @@ struct SettlementOnBuy {
 impl SettlementOnBuy {
     /// Record the startup outcome and the gateway's chequebook slot.
     /// Called once, before `POST /stamps` can fire the hook.
-    async fn arm(&self, state: Settlement, chain: Option<&ant_gateway::ChainContext>) {
+    ///
+    /// `refused` is the chequebook the startup check disqualified
+    /// ([`ResolvedChequebook::refused`]): the slot records it as refused,
+    /// as [`Self::disable`] does for one disqualified later, so
+    /// `/v0/storage/*` prices and buys the plan alone instead of swapping
+    /// xDAI for a deposit no path will make.
+    async fn arm(
+        &self,
+        state: Settlement,
+        refused: Option<[u8; 20]>,
+        chain: Option<&ant_gateway::ChainContext>,
+    ) {
         *self.state.lock().await = state;
         if let Some(chain) = chain {
             let _ = self.gateway_chequebook.set(chain.chequebook.clone());
             let _ = self.wallet.tx_lock.set(chain.tx_lock.clone());
+        }
+        if let Some(chequebook) = refused {
+            self.refuse_in_gateway(chequebook);
+        }
+    }
+
+    /// Mark `chequebook` refused in the gateway's slot, if the slot still
+    /// holds it.
+    fn refuse_in_gateway(&self, chequebook: [u8; 20]) {
+        if let Some(slot) = self.gateway_chequebook.get() {
+            if slot.get() == Some(chequebook) {
+                slot.refuse(chequebook);
+            }
         }
     }
 
@@ -2433,11 +2471,7 @@ impl SettlementOnBuy {
                 _ => {}
             }
         }
-        if let Some(slot) = self.gateway_chequebook.get() {
-            if slot.get() == Some(chequebook) {
-                slot.refuse(chequebook);
-            }
-        }
+        self.refuse_in_gateway(chequebook);
     }
 
     /// The gateway's refused-chequebook hook: `POST /v0/settlement/deposit`
@@ -2497,13 +2531,7 @@ impl SettlementOnBuy {
                 self.disable(chequebook).await;
                 *state = Settlement::Off;
             }
-            _ => {
-                if let Some(slot) = self.gateway_chequebook.get() {
-                    if slot.get() == Some(chequebook) {
-                        slot.refuse(chequebook);
-                    }
-                }
-            }
+            _ => self.refuse_in_gateway(chequebook),
         }
         true
     }
@@ -2531,6 +2559,11 @@ impl SettlementOnBuy {
                 return None;
             }
         };
+        // A chequebook the check disqualified again: keep the gateway
+        // from pricing in a deposit for it (as at startup).
+        if let Some(chequebook) = resolved.refused() {
+            self.refuse_in_gateway(chequebook);
+        }
         // `resolve_chequebook` already logged why when there's none.
         let cfg = resolved.pushsync?;
         if let Settlement::Managed(chequebook) = Settlement::of(&self.opt, Some(&cfg)) {
@@ -2907,5 +2940,32 @@ mod tests {
         assert!(matches!(*this.state.lock().await, Settlement::Managed(c) if c == CB));
         assert_eq!(slot.get(), Some(CB));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M3: a chequebook the startup check disqualified is recorded as
+    /// refused in the gateway slot, so `/v0/storage/buy` stops pricing in
+    /// (and swapping for) a deposit that no path would make.
+    #[tokio::test]
+    async fn a_startup_disqualified_chequebook_is_refused_in_the_gateway() {
+        const CB: [u8; 20] = [0xcd; 20];
+        let disqualified = ResolvedChequebook {
+            address: Some(CB),
+            pushsync: None,
+        };
+        assert_eq!(disqualified.refused(), Some(CB));
+        let none = ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        };
+        assert_eq!(none.refused(), None);
+
+        let dir = std::env::temp_dir().join(format!("antd-startup-refused-{}", std::process::id()));
+        let (this, _node) = settlement_for_test(None, dir);
+        let slot = ant_gateway::ChequebookSlot::new(Some(CB));
+        let _ = this.gateway_chequebook.set(slot.clone());
+        this.arm(Settlement::Off, disqualified.refused(), None)
+            .await;
+        assert_eq!(slot.get(), None);
+        assert_eq!(slot.refused(), Some(CB));
     }
 }
