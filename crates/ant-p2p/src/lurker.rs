@@ -76,7 +76,7 @@ const HISTORY_FLOOR: u64 = 1;
 /// per covering PSS (peer, bin) — every peer in the covering set during
 /// the request's [`MAILBOX_SETTLE`] window, so storers that connect after
 /// the first pass are included, and a sweep that ended early is retried
-/// within that window — from this far behind the peer's cursor up to the
+/// (see [`Campaign`]) — from this far behind the peer's cursor up to the
 /// cursor, recovering messages sent while the receiver was offline. Live
 /// pullers never use it — they always tail from the cursor — so peer
 /// churn past the settle window doesn't re-sweep.
@@ -123,6 +123,18 @@ const MAX_CAMPAIGNS: usize = 4;
 /// its reserve (nothing to wait for) — indistinguishable from here, so
 /// retry a little, then end loudly.
 const SWEEP_STALL_RETRIES: u32 = 2;
+/// Attempts a campaign makes at one (peer, bin) sweep before writing it
+/// off: a sweep that ended early (stream error, stall) is retried up to
+/// this many times in total, so a peer whose window tail is really gone
+/// can't be re-swept forever.
+const SWEEP_MAX_ATTEMPTS: u32 = 3;
+/// How long after a failed sweep is reported the campaign still retries
+/// it — even past [`MAILBOX_SETTLE`], since a stall can start late in the
+/// window and only be reported after it closed (3 × `SYNC_ROUND_TIMEOUT`
+/// later). The failure wakes the driver, so the retry normally starts
+/// within a pass; this only bounds how long a peer that stopped covering
+/// keeps a closed campaign alive.
+const SWEEP_RETRY_GRACE: Duration = Duration::from_mins(1);
 /// Number of closest connected peers to pull from concurrently. A
 /// freshly-pushed chunk lands on the storer(s) nearest its address and
 /// replicates outward; pulling several covering peers catches it
@@ -295,8 +307,10 @@ impl Drop for AbortOnDrop {
 /// later-connecting storer is swept too. A campaign that hasn't reached
 /// any peer yet stays open indefinitely (nothing was recovered, so the
 /// request is still pending). A (peer, bin) sweep that ends early (stream
-/// error, stall) is un-marked and retried while the campaign is open and
-/// the peer still covers. A campaign none of whose tickets is still held
+/// error, stall) wakes the driver and is retried (up to
+/// [`SWEEP_MAX_ATTEMPTS`] in total) while the peer still covers — for
+/// [`SWEEP_RETRY_GRACE`] after the failure, even if the settle window
+/// closed meanwhile. A campaign none of whose tickets is still held
 /// by an attached subscriber (`WatchState::history_held`) is cancelled —
 /// its sweeps aborted — since its output would be routed to nobody.
 struct Campaign {
@@ -309,20 +323,54 @@ struct Campaign {
     swept: HashSet<(PeerId, u8)>,
     /// (peer, bin)s whose sweep ended early, reported by the sweep task;
     /// [`Mailbox::prune`] un-marks them in `swept` so they're retried.
-    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
+    /// Replaced (never shared) when the campaign restarts, so a sweep of
+    /// the previous incarnation can't un-mark the restarted one's keys.
+    failed: Arc<SweepFailures>,
+    /// Failed (peer, bin)s awaiting a retry, with the deadline past which
+    /// the retry is dropped. Claimable even once the campaign closed.
+    retry: HashMap<(PeerId, u8), tokio::time::Instant>,
+    /// Sweeps started per (peer, bin), bounding retries.
+    attempts: HashMap<(PeerId, u8), u32>,
     /// `None` until the first (peer, bin) is swept; then when the
     /// campaign stops picking up newly-covering peers.
     open_until: Option<tokio::time::Instant>,
     tasks: Vec<AbortOnDrop>,
 }
 
+/// Where a campaign's sweep tasks report a (peer, bin) that ended early,
+/// plus the driver's wake-up so the retry needn't wait for the next
+/// `RE_RESIDE_INTERVAL` tick.
+struct SweepFailures {
+    keys: Mutex<Vec<(PeerId, u8)>>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl SweepFailures {
+    fn new(wake: &Arc<tokio::sync::Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            keys: Mutex::new(Vec::new()),
+            wake: Arc::clone(wake),
+        })
+    }
+
+    fn report(&self, key: (PeerId, u8)) {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key);
+        self.wake.notify_one();
+    }
+}
+
 impl Campaign {
-    fn new(tickets: std::ops::RangeInclusive<u64>) -> Self {
+    fn new(tickets: std::ops::RangeInclusive<u64>, wake: &Arc<tokio::sync::Notify>) -> Self {
         Self {
             tickets,
             seen: Arc::new(Mutex::new(Seen::new())),
             swept: HashSet::new(),
-            failed: Arc::new(Mutex::new(Vec::new())),
+            failed: SweepFailures::new(wake),
+            retry: HashMap::new(),
+            attempts: HashMap::new(),
             open_until: None,
             tasks: Vec::new(),
         }
@@ -330,6 +378,13 @@ impl Campaign {
 
     fn is_open(&self, now: tokio::time::Instant) -> bool {
         self.open_until.is_none_or(|t| now < t)
+    }
+
+    /// Whether this campaign should sweep `key` now: not swept yet, and
+    /// either the campaign is open or a failed sweep's retry is pending.
+    fn needs(&self, key: &(PeerId, u8), now: tokio::time::Instant) -> bool {
+        !self.swept.contains(key)
+            && (self.is_open(now) || self.retry.get(key).is_some_and(|d| now < *d))
     }
 
     /// Whether any subscriber holding one of this campaign's tickets is
@@ -345,7 +400,7 @@ struct SweepJob {
     bin: u8,
     tickets: std::ops::RangeInclusive<u64>,
     seen: Arc<Mutex<Seen>>,
-    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
+    failed: Arc<SweepFailures>,
 }
 
 /// The driver's mailbox bookkeeping: which tickets have a campaign, and
@@ -355,6 +410,9 @@ struct Mailbox {
     /// Highest ticket that already has a campaign.
     served_seq: u64,
     campaigns: Vec<Campaign>,
+    /// Signalled by a sweep that ended early, so the driver retries it
+    /// on the next pass instead of the next fallback tick.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl Mailbox {
@@ -364,7 +422,11 @@ impl Mailbox {
     /// requester gets every covering peer swept for it, including the
     /// ones an earlier campaign already swept. Past [`MAX_CAMPAIGNS`]
     /// the newest campaign is widened and restarted instead (its
-    /// earlier requesters may see a repeat — at-least-once).
+    /// earlier requesters may see a repeat — at-least-once). A restart
+    /// aborts the old incarnation's sweeps (the restarted campaign
+    /// re-sweeps everything for the same, widened ticket range) and gets
+    /// a fresh failure channel, so a stale sweep can't un-mark a key the
+    /// restarted campaign already swept.
     fn admit(&mut self, history_seq: u64) {
         if history_seq <= self.served_seq {
             return;
@@ -380,9 +442,15 @@ impl Mailbox {
                 c.tickets = *c.tickets.start()..=history_seq;
                 c.seen = Arc::new(Mutex::new(Seen::new()));
                 c.swept.clear();
+                c.failed = SweepFailures::new(&self.wake);
+                c.retry.clear();
+                c.attempts.clear();
+                c.tasks.clear(); // AbortOnDrop aborts the stale sweeps
                 c.open_until = None;
             }
-            _ => self.campaigns.push(Campaign::new(first..=history_seq)),
+            _ => self
+                .campaigns
+                .push(Campaign::new(first..=history_seq, &self.wake)),
         }
     }
 
@@ -395,43 +463,58 @@ impl Mailbox {
         before - self.campaigns.len()
     }
 
-    /// Un-mark (peer, bin)s whose sweep ended early, so an open campaign
-    /// retries them, and forget campaigns that are closed and whose
-    /// sweeps all ended.
+    /// Un-mark (peer, bin)s whose sweep ended early so the campaign
+    /// retries them (within [`SWEEP_RETRY_GRACE`], up to
+    /// [`SWEEP_MAX_ATTEMPTS`]), and forget campaigns that are closed,
+    /// have no retry pending and whose sweeps all ended.
     fn prune(&mut self, now: tokio::time::Instant) {
         for c in &mut self.campaigns {
             c.tasks.retain(|t| !t.is_finished());
-            for key in c
+            let failed: Vec<(PeerId, u8)> = c
                 .failed
+                .keys
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .drain(..)
-            {
+                .collect();
+            for key in failed {
+                if c.attempts.get(&key).copied().unwrap_or(0) >= SWEEP_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        target: "ant_p2p::lurker",
+                        peer = %key.0, bin = key.1, tickets = ?c.tickets,
+                        "mailbox sweep of this (peer, bin) failed {SWEEP_MAX_ATTEMPTS} times; giving up on it",
+                    );
+                    continue;
+                }
                 c.swept.remove(&key);
+                c.retry.insert(key, now + SWEEP_RETRY_GRACE);
             }
+            c.retry.retain(|_, deadline| now < *deadline);
         }
         self.campaigns
-            .retain(|c| c.is_open(now) || !c.tasks.is_empty());
+            .retain(|c| c.is_open(now) || !c.tasks.is_empty() || !c.retry.is_empty());
     }
 
-    /// Whether any open campaign still needs one of `bins` on `peer`.
+    /// Whether any campaign still needs one of `bins` on `peer`.
     fn wants(&self, peer: PeerId, bins: &[u8], now: tokio::time::Instant) -> bool {
         self.campaigns
             .iter()
-            .any(|c| c.is_open(now) && bins.iter().any(|b| !c.swept.contains(&(peer, *b))))
+            .any(|c| bins.iter().any(|b| c.needs(&(peer, *b), now)))
     }
 
-    /// Claim every (peer, bin) of `bins` an open campaign hasn't swept
-    /// yet — `peer` answered with cursors, so the driver sweeps them
-    /// now — and start the settle window of a campaign's first sweep.
+    /// Claim every (peer, bin) of `bins` a campaign still needs (see
+    /// [`Campaign::needs`]) — `peer` answered with cursors, so the driver
+    /// sweeps them now — and start the settle window of a campaign's
+    /// first sweep.
     fn claim(&mut self, peer: PeerId, bins: &[u8], now: tokio::time::Instant) -> Vec<SweepJob> {
         let mut jobs = Vec::new();
         for (i, c) in self.campaigns.iter_mut().enumerate() {
-            if !c.is_open(now) {
-                continue;
-            }
             for &bin in bins {
-                if c.swept.insert((peer, bin)) {
+                let key = (peer, bin);
+                if c.needs(&key, now) {
+                    c.swept.insert(key);
+                    c.retry.remove(&key);
+                    *c.attempts.entry(key).or_insert(0) += 1;
                     c.open_until.get_or_insert(now + MAILBOX_SETTLE);
                     jobs.push(SweepJob {
                         campaign: i,
@@ -895,6 +978,7 @@ pub async fn run(
         // Wait for connectivity to change (top up new closer peers right
         // away) or the fallback tick. The pullers keep running
         // throughout — no gap.
+        let sweep_failed = Arc::clone(&mailbox.wake);
         tokio::select! {
             () = out.closed() => break,
             changed = peers.changed() => {
@@ -908,6 +992,8 @@ pub async fn run(
             // 30s tick), or every requester of a campaign left (stop its
             // sweeps now).
             () = mailbox_update_pending(&watch, mailbox.served_seq, mailbox.ticket_ranges()) => {}
+            // A sweep ended early: retry it now, not on the next tick.
+            () = sweep_failed.notified() => {}
         }
     }
     // `active` drops here; AbortOnDrop retires every remaining puller.
@@ -1157,9 +1243,9 @@ async fn mailbox_update_pending(
 /// pullers' positions, readiness, or dedup set. A stream error, or
 /// [`SWEEP_STALL_RETRIES`] + 1 consecutive round timeouts short of `to`,
 /// ends the sweep early with a warning naming the unswept binIDs and
-/// reports the (peer, bin) in `failed`, so the campaign re-sweeps it if
-/// it's still open and the peer still covers (the campaign's `seen`
-/// dedups what this attempt already delivered).
+/// reports the (peer, bin) in `failed` (waking the driver), so the
+/// campaign re-sweeps it while the peer still covers — see [`Campaign`]
+/// (the campaign's `seen` dedups what this attempt already delivered).
 #[allow(clippy::too_many_arguments)]
 async fn sweep_bin(
     mut control: Control,
@@ -1171,14 +1257,9 @@ async fn sweep_bin(
     seen: Arc<Mutex<Seen>>,
     out: mpsc::Sender<Delivery>,
     tickets: std::ops::RangeInclusive<u64>,
-    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
+    failed: Arc<SweepFailures>,
 ) {
-    let report_failed = || {
-        failed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((peer_id, bin));
-    };
+    let report_failed = || failed.report((peer_id, bin));
     let mut start = from;
     let mut stalls: u32 = 0;
     while start <= to {
@@ -1199,7 +1280,7 @@ async fn sweep_bin(
                 tracing::warn!(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, unswept_from = start, unswept_to = to, error = %e,
-                    "mailbox sweep round failed; ending sweep of this (peer, bin) early (retried while the campaign is open)",
+                    "mailbox sweep round failed; ending sweep of this (peer, bin) early (retried while the peer still covers)",
                 );
                 report_failed();
                 return;
@@ -1214,7 +1295,7 @@ async fn sweep_bin(
                     tracing::warn!(
                         target: "ant_p2p::lurker",
                         peer = %peer_id, bin, unswept_from = start, unswept_to = to,
-                        "mailbox sweep stalled mid-window; ending sweep of this (peer, bin) early (retried while the campaign is open)",
+                        "mailbox sweep stalled mid-window; ending sweep of this (peer, bin) early (retried while the peer still covers)",
                     );
                     report_failed();
                     return;
@@ -1672,7 +1753,7 @@ mod tests {
         let jobs = mb.claim(storer, &[13, 16], t0);
         assert_eq!(jobs.len(), 2);
         // Bin 13's sweep failed mid-window; bin 16's completed.
-        jobs[0].failed.lock().unwrap().push((storer, jobs[0].bin));
+        jobs[0].failed.report((storer, jobs[0].bin));
         let t1 = t0 + Duration::from_secs(30);
         mb.prune(t1);
         assert!(mb.wants(storer, &[13, 16], t1));
@@ -1684,12 +1765,106 @@ mod tests {
         // The settle window still runs from the first sweep, not the retry.
         assert_eq!(mb.campaigns[0].open_until, Some(t0 + MAILBOX_SETTLE));
 
-        // A failure reported after the window closed is not retried.
-        retry[0].failed.lock().unwrap().push((storer, 13));
-        let t2 = t0 + MAILBOX_SETTLE + Duration::from_secs(1);
+        // Third attempt fails too: the attempt budget is spent.
+        retry[0].failed.report((storer, 13));
+        let t2 = t1 + Duration::from_secs(10);
         mb.prune(t2);
-        assert!(!mb.wants(storer, &[13], t2));
-        assert!(mb.claim(storer, &[13], t2).is_empty());
+        let third = mb.claim(storer, &[13], t2);
+        assert_eq!(third.len(), 1);
+        third[0].failed.report((storer, 13));
+        let t3 = t2 + Duration::from_secs(10);
+        mb.prune(t3);
+        assert!(!mb.wants(storer, &[13], t3));
+        assert!(mb.claim(storer, &[13], t3).is_empty());
+    }
+
+    /// R4-M2: a stall that starts late in the settle window is reported
+    /// only after the window closed (3 × `SYNC_ROUND_TIMEOUT` later). The
+    /// report wakes the driver, and the campaign still retries it — the
+    /// single storer's offline message isn't lost to timing. A retry for
+    /// a peer that no longer covers expires after `SWEEP_RETRY_GRACE` and
+    /// the closed campaign is forgotten.
+    #[tokio::test]
+    async fn mailbox_failure_reported_after_the_window_is_still_retried() {
+        let storer = PeerId::random();
+        let t0 = tokio::time::Instant::now();
+        let mut mb = Mailbox::default();
+        mb.admit(1);
+        assert_eq!(mb.claim(PeerId::random(), &[9], t0).len(), 1);
+        // The storer is swept 70s in; its sweep stalls for 60s.
+        let t1 = t0 + Duration::from_secs(70);
+        let jobs = mb.claim(storer, &[13], t1);
+        assert_eq!(jobs.len(), 1);
+        let t2 = t0 + Duration::from_secs(130);
+        assert!(t2 > t0 + MAILBOX_SETTLE);
+        jobs[0].failed.report((storer, 13));
+        // The driver is woken (not left for the 30s fallback tick).
+        tokio::time::timeout(Duration::from_millis(100), mb.wake.notified())
+            .await
+            .expect("a failed sweep wakes the driver");
+        mb.prune(t2);
+        assert_eq!(mb.campaigns.len(), 1, "a pending retry keeps the campaign");
+        // A brand-new peer still isn't swept — the window is closed.
+        assert!(!mb.wants(PeerId::random(), &[13], t2));
+        assert!(mb.wants(storer, &[13], t2));
+        let retry = mb.claim(storer, &[13], t2);
+        assert_eq!(retry.len(), 1);
+        assert!(Arc::ptr_eq(&retry[0].seen, &jobs[0].seen));
+
+        // The retry fails again, but the storer has stopped covering:
+        // past the grace the retry is dropped and the campaign forgotten.
+        retry[0].failed.report((storer, 13));
+        let t3 = t2 + Duration::from_secs(5);
+        mb.prune(t3);
+        assert!(mb.wants(storer, &[13], t3));
+        let t4 = t3 + SWEEP_RETRY_GRACE;
+        mb.prune(t4);
+        assert!(!mb.wants(storer, &[13], t4));
+        assert!(mb.campaigns.is_empty());
+    }
+
+    /// R4-M1: restarting the newest campaign at `MAX_CAMPAIGNS` aborts the
+    /// old incarnation's sweeps and gives it a fresh failure channel, so
+    /// a stale sweep's failure can't un-mark a key the restarted campaign
+    /// already swept (which would sweep it a third time).
+    #[tokio::test]
+    async fn mailbox_restart_at_cap_drops_stale_sweeps_and_failures() {
+        let p = PeerId::random();
+        let t0 = tokio::time::Instant::now();
+        let mut mb = Mailbox::default();
+        for seq in 1..=(MAX_CAMPAIGNS as u64) {
+            mb.admit(seq);
+            assert_eq!(mb.claim(p, &[9], t0).len(), 1);
+        }
+        let last = MAX_CAMPAIGNS - 1;
+        let stale = mb.claim(p, &[9], t0);
+        assert!(stale.is_empty());
+        let stale_failed = Arc::clone(&mb.campaigns[last].failed);
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        mb.attach(
+            last,
+            AbortOnDrop(tokio::spawn(async move {
+                let _alive = alive_tx;
+                std::future::pending::<()>().await;
+            })),
+        );
+
+        mb.admit(MAX_CAMPAIGNS as u64 + 1); // at cap → restart the newest
+        tokio::time::timeout(Duration::from_secs(1), alive_rx)
+            .await
+            .expect("the old incarnation's sweep is aborted")
+            .unwrap_err();
+        let jobs = mb.claim(p, &[9], t0);
+        assert_eq!(jobs.len(), 1);
+        assert!(!Arc::ptr_eq(&jobs[0].failed, &stale_failed));
+
+        // A stale sweep (already past its abort point) reports failure:
+        // the restarted campaign's key stays swept.
+        stale_failed.report((p, 9));
+        let t1 = t0 + Duration::from_secs(5);
+        mb.prune(t1);
+        assert!(!mb.wants(p, &[9], t1));
+        assert!(mb.claim(p, &[9], t1).is_empty());
     }
 
     /// A campaign that couldn't reach any peer yet stays pending (no

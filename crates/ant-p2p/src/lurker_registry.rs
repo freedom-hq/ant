@@ -58,8 +58,15 @@ const MAX_UNION_WATCH: usize = 256;
 /// Per-subscriber fan-out buffer. A subscriber this far behind sheds.
 const SUBSCRIBER_BUFFER: usize = 64;
 /// How often the dispatcher sweeps for subscribers that left silently
-/// (receiver dropped with no message ever flowing to notice it by).
-const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
+/// (receiver dropped with no message ever flowing to notice it by). It
+/// bounds how long a departed subscriber's mailbox ticket stays in the
+/// union's `history_held` — i.e. how long an orphaned campaign keeps
+/// sweeping for nobody (plus the lurker's own `MAILBOX_POLL`) — and how
+/// long a quiet lurker outlives its last subscriber. Each tick rebuilds
+/// the union from at most `MAX_SUBSCRIBERS_PER_TARGET` small watches —
+/// cheap. (A departure `subscribe` pruned itself while attaching is
+/// also folded in here: that path doesn't rebuild the union.)
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The union watch a registry lurker follows, shared so the registry
 /// can grow/shrink it as subscribers come and go.
@@ -168,8 +175,8 @@ impl Registry {
                 // Count only live subscribers toward the cap: the
                 // dispatcher's prune runs every PRUNE_INTERVAL, so
                 // without this a burst of connect/disconnect could hold
-                // slots for dead receivers for up to 10s and refuse a
-                // legitimate attach.
+                // slots for dead receivers until the next tick and refuse
+                // a legitimate attach.
                 subs.retain(|s| !s.tx.is_closed());
                 if subs.len() >= MAX_SUBSCRIBERS_PER_TARGET {
                     return None;
@@ -803,6 +810,45 @@ mod tests {
             .unwrap();
         assert_eq!(recv(&mut rx_live).await, pss_msg(topic, b"y"));
         wait_for(|| shared.read().unwrap().history_held.is_empty()).await;
+    }
+
+    /// R4-M3: on a quiet topic (no delivery to trigger a rebuild) a
+    /// departed history subscriber's ticket still leaves the union within
+    /// about a `PRUNE_INTERVAL`, so the lurker cancels the orphaned campaign
+    /// promptly instead of sweeping for nobody for ~10s.
+    #[tokio::test]
+    async fn departed_ticket_leaves_the_union_without_any_delivery() {
+        let reg = Registry::new();
+        let target = [5u8; 32];
+        let topic = [0x72; 32];
+        let mut shared_probe = None;
+        let mut feed_keepalive: Option<mpsc::Sender<Delivery>> = None;
+        let _rx_live = reg
+            .subscribe(target, pss_watch(topic, false), |w, out_tx| {
+                shared_probe = Some(Arc::clone(&w));
+                let (feed_tx, mut feed_rx) = mpsc::channel::<Delivery>(1);
+                feed_keepalive = Some(feed_tx);
+                tokio::spawn(async move {
+                    while let Some(d) = feed_rx.recv().await {
+                        if out_tx.send(d).await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .unwrap();
+        let shared = shared_probe.unwrap();
+        let rx_h = reg
+            .subscribe(target, pss_watch(topic, true), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_held, BTreeSet::from([1]));
+
+        let left = std::time::Instant::now();
+        drop(rx_h);
+        wait_for(|| shared.read().unwrap().history_held.is_empty()).await;
+        assert!(left.elapsed() <= PRUNE_INTERVAL + Duration::from_millis(500));
     }
 
     async fn wait_for(cond: impl Fn() -> bool) {

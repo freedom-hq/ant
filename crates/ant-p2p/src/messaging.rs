@@ -49,8 +49,9 @@ pub struct WatchState {
     /// **including peers that join the covering set within
     /// `lurker::MAILBOX_SETTLE` of its first sweep** (the neighborhood's
     /// storers typically connect seconds after a cold subscribe), and
-    /// re-sweeps a (peer, bin) whose sweep ended early while that window
-    /// is open. Past the window, peer churn only starts live pullers
+    /// re-sweeps (a bounded number of times) a (peer, bin) whose sweep
+    /// ended early, even if that failure is reported just after the window
+    /// closed. Past the window, peer churn only starts live pullers
     /// (they always tail from the cursor), never another backlog sweep.
     /// A campaign whose ticket holders have all unsubscribed is
     /// cancelled (see [`Self::history_held`]). The swept messages go only
