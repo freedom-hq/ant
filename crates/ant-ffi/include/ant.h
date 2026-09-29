@@ -710,13 +710,22 @@ void ant_free_string(char *ptr);
  * and /stamps postage state (desktop `antd` parity). Honoured only when
  * the library is built with the `chain` feature; ignored otherwise.
  *
+ * A `gnosis_rpc` also triggers, in the background, the on-chain check of
+ * the postage batches ant_init reloaded from postage/<id>.bin: batches the
+ * chain reports as missing, expired (remainingBalance 0) or owned by
+ * another key are unregistered (files stay on disk). A batch whose read
+ * fails stays registered and is re-checked by the next call with a
+ * `gnosis_rpc` — including one that finds the gateway already running.
+ *
  * The gateway's chain wiring is captured here, once. A host serving
  * chain reads itself must call ant_set_chain_transport BEFORE this.
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
- * one is live is a no-op success. Run off the main thread.
+ * one is live is a success that leaves the gateway untouched (it only
+ * retries the pending persisted-batch check above). Run off the main
+ * thread.
  */
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,

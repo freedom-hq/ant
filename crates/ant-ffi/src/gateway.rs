@@ -54,7 +54,10 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// never created) or owned by another key are unregistered — no longer
 /// listed by `GET /stamps`, no longer stampable — with a `WARN` naming
 /// the batch id; their files stay on disk. A batch whose read fails
-/// stays registered and is re-checked on the next start.
+/// stays registered and is re-checked by the next call with a
+/// `gnosis_rpc` — including an idempotent one that finds the gateway
+/// already running, so a host may simply re-call this (e.g. on
+/// foreground) to retry.
 ///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
@@ -147,6 +150,13 @@ pub unsafe extern "C" fn ant_start_gateway(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            // Still retry the persisted-batch check: a pass whose RPC
+            // read failed left batches pending, and re-calling start
+            // (e.g. on foreground) is how a host asks for that retry.
+            #[cfg(feature = "chain")]
+            if let Some(rpc) = gnosis_rpc {
+                spawn_persisted_issuer_check(handle, rpc);
+            }
             return true;
         }
         // A finished task (bind error / aborted) is cleared so a retry
@@ -289,19 +299,29 @@ pub unsafe extern "C" fn ant_start_gateway(
         // startup — otherwise `/stamps` keeps offering a dead batch until
         // a peer rejects the first push. Off the caller's thread so the
         // gateway start never waits on the RPC; batches whose read fails
-        // stay registered and are retried on the next start.
+        // stay registered and are retried by the next call with an RPC.
         #[cfg(feature = "chain")]
         if let Some(rpc) = gnosis_rpc {
-            let chain = handle.chain_client(rpc);
-            let persisted = Arc::clone(&handle.persisted_issuers);
-            handle.runtime.spawn(async move {
-                persisted
-                    .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
-                    .await;
-            });
+            spawn_persisted_issuer_check(handle, rpc);
         }
         true
     }
+}
+
+/// Run [`crate::drive::PersistedIssuers::verify_on_chain`] in the
+/// background against `rpc` (or the host transport, via
+/// `chain_client`). Passes are serialized inside `verify_on_chain`, and
+/// one with nothing pending issues no reads, so calling this on every
+/// `ant_start_gateway` is cheap.
+#[cfg(feature = "chain")]
+fn spawn_persisted_issuer_check(handle: &AntHandle, rpc: String) {
+    let chain = handle.chain_client(rpc);
+    let persisted = Arc::clone(&handle.persisted_issuers);
+    handle.runtime.spawn(async move {
+        persisted
+            .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await;
+    });
 }
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].

@@ -118,8 +118,8 @@ impl StampEntry {
         })
     }
 
-    /// The chain confirms this batch does not exist — expired (the
-    /// contract evicts it) or never created. Report it the way bee does
+    /// The chain confirms this batch does not exist — never created, or
+    /// expired and since evicted (`expireLimited`). Report it the way bee does
     /// a batch missing from its batchstore (`exists: false`,
     /// `batchTTL: -1`) and not `usable`, so a client learns it is dead
     /// from the listing rather than from a peer rejecting its first
@@ -130,6 +130,16 @@ impl StampEntry {
         self.exists = false;
         self.usable = false;
         self.batch_ttl = -1;
+    }
+
+    /// Still on chain but `remainingBalance` reads `0`: expired, just
+    /// not evicted yet (the contract keeps `batchOwner` until someone
+    /// calls `expireLimited`). Storers already reject its stamps and it
+    /// can't be topped up, so it is not `usable`; bee reports such a
+    /// batch with `batchTTL: 0` while it still `exists`.
+    fn mark_expired(&mut self) {
+        self.usable = false;
+        self.batch_ttl = 0;
     }
 }
 
@@ -222,8 +232,10 @@ const STAMPS_ENRICH_TIMEOUT: Duration = Duration::from_secs(8);
 ///
 /// A batch whose balance read fails *and* whose `batchOwner` reads as
 /// the zero address is one the chain doesn't hold: it is marked
-/// [`StampEntry::mark_not_on_chain`]. Any other failure keeps the
-/// placeholders — an RPC hiccup must not make a funded batch look dead.
+/// [`StampEntry::mark_not_on_chain`]. A balance that reads `0` is an
+/// expired batch ([`StampEntry::mark_expired`]). Any other failure keeps
+/// the placeholders — an RPC hiccup must not make a funded batch look
+/// dead.
 async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
     let Some(chain) = handle.chain() else {
         return;
@@ -249,11 +261,12 @@ async fn enrich_entries(stamps: &mut [StampEntry], reader: &dyn crate::ChainRead
         let Ok(remaining) = reader.batch_remaining_balance(id).await else {
             // `remainingBalance` reverts for a batch the contract no
             // longer holds; confirm with the owner view before calling
-            // it dead.
+            // it dead. One `batchOwner` call, not the four-view
+            // `batch_meta`: this runs under the shared enrichment timeout.
             if reader
-                .batch_meta(id)
+                .batch_owner(id)
                 .await
-                .is_ok_and(|meta| meta.owner == [0u8; 20])
+                .is_ok_and(|owner| owner == [0u8; 20])
             {
                 entry.mark_not_on_chain();
             }
@@ -262,6 +275,9 @@ async fn enrich_entries(stamps: &mut [StampEntry], reader: &dyn crate::ChainRead
         // Normalised per-chunk balance bee reports as `amount`.
         entry.amount = remaining.saturating_add(total_out).to_string();
         entry.batch_ttl = batch_ttl_secs(remaining, price);
+        if remaining == 0 {
+            entry.mark_expired();
+        }
     }
 }
 
@@ -504,10 +520,16 @@ mod tests {
     const LIVE: [u8; 32] = [0x11; 32];
     const GONE: [u8; 32] = [0x22; 32];
     const FLAKY: [u8; 32] = [0x33; 32];
+    const EXPIRED: [u8; 32] = [0x44; 32];
 
     /// `LIVE` is funded; `GONE` is not on chain (`remainingBalance`
-    /// reverts, zero owner); `FLAKY`'s reads all fail.
-    struct Chain;
+    /// reverts, zero owner); `FLAKY`'s reads all fail; `EXPIRED` is
+    /// still owned but drained (`remainingBalance` 0). Counts
+    /// `batch_meta` calls, which enrichment must not need.
+    #[derive(Default)]
+    struct Chain {
+        meta_calls: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl crate::ChainReader for Chain {
@@ -532,20 +554,21 @@ mod tests {
         async fn batch_remaining_balance(&self, id: [u8; 32]) -> Result<u128, String> {
             match id {
                 LIVE => Ok(1_000),
+                EXPIRED => Ok(0),
                 GONE => Err("execution reverted: 0x4ee9bc0f".into()),
                 _ => Err("backend unavailable".into()),
             }
         }
-        async fn batch_meta(&self, id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
+        async fn batch_owner(&self, id: [u8; 32]) -> Result<[u8; 20], String> {
             match id {
-                GONE => Ok(crate::BatchMetaView {
-                    owner: [0u8; 20],
-                    depth: 0,
-                    bucket_depth: 0,
-                    immutable: false,
-                }),
+                GONE => Ok([0u8; 20]),
                 _ => Err("backend unavailable".into()),
             }
+        }
+        async fn batch_meta(&self, _id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
+            self.meta_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("batch_meta is four eth_calls; enrichment must not use it".into())
         }
     }
 
@@ -567,9 +590,15 @@ mod tests {
     /// the optimistic placeholders.
     #[tokio::test]
     async fn batch_missing_on_chain_is_not_usable() {
-        let mut stamps = [entry(LIVE), entry(GONE), entry(FLAKY)];
-        enrich_entries(&mut stamps, &Chain).await;
-        let [live, gone, flaky] = &stamps;
+        let chain = Chain::default();
+        let mut stamps = [entry(LIVE), entry(GONE), entry(FLAKY), entry(EXPIRED)];
+        enrich_entries(&mut stamps, &chain).await;
+        let [live, gone, flaky, expired] = &stamps;
+        assert_eq!(
+            chain.meta_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the gone-check reads only batchOwner",
+        );
 
         assert!(live.usable && live.exists);
         assert_eq!(live.amount, "1007");
@@ -584,5 +613,12 @@ mod tests {
             "a failed read is not a dead batch"
         );
         assert_eq!(flaky.batch_ttl, PLACEHOLDER_BATCH_TTL_SECS);
+
+        assert!(
+            !expired.usable,
+            "an expired (drained, not yet evicted) batch is not usable"
+        );
+        assert!(expired.exists, "still on chain until evicted");
+        assert_eq!(expired.batch_ttl, 0);
     }
 }

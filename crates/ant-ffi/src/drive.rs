@@ -126,6 +126,12 @@ pub(crate) fn reload_persisted_issuers(
 pub(crate) struct PersistedIssuers {
     upload: std::sync::Arc<ant_p2p::UploadRuntime>,
     unverified: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
+    /// Serializes [`Self::verify_on_chain`] passes: every
+    /// `ant_start_gateway` call with an RPC spawns one (including the
+    /// idempotent "already running" path), so a host re-calling it on
+    /// foreground can overlap a pass still in flight. The second waits
+    /// and then only sees what the first left pending.
+    pass: tokio::sync::Mutex<()>,
 }
 
 #[cfg(feature = "chain")]
@@ -145,14 +151,17 @@ impl PersistedIssuers {
         Self {
             upload,
             unverified: std::sync::Mutex::new(unverified),
+            pass: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
-    /// and **unregister** the ones it disowns — `NotFound` (expired or
-    /// never created) and `ForeignOwner` — with a loud warning. An RPC
-    /// read error keeps the batch registered (unconfirmed ≠ dead) and
-    /// leaves it pending, so the next gateway start retries it. The
+    /// and **unregister** the ones it disowns — `NotFound` (evicted or
+    /// never created), `Expired` (still ours but `remainingBalance` 0)
+    /// and `ForeignOwner` — with a loud warning. An RPC read error keeps
+    /// the batch registered (unconfirmed ≠ dead) and leaves it pending,
+    /// so the next `ant_start_gateway` call with an RPC retries it —
+    /// including one that finds the gateway already running. The
     /// `.bin` / `.stamps` files stay on disk, as in `antd`: a later
     /// re-buy or re-sync recovers them, and the logged id lets the user
     /// clean up.
@@ -163,6 +172,7 @@ impl PersistedIssuers {
     ) {
         use ant_chain::discover::PersistedBatchVerdict;
 
+        let _pass = self.pass.lock().await;
         let pending: Vec<[u8; 32]> = self.lock_unverified().iter().copied().collect();
         let our_owner = self.upload.batch_owner;
         for id in pending {
@@ -185,6 +195,15 @@ impl PersistedIssuers {
                         batch,
                         store = %self.store_path(&id).display(),
                         "persisted batch NOT FOUND on-chain (expired or never created) — unregistering it; uploads with it would be rejected by every storer",
+                    );
+                }
+                PersistedBatchVerdict::Expired => {
+                    self.unregister(&id);
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        batch,
+                        store = %self.store_path(&id).display(),
+                        "persisted batch has EXPIRED on-chain (remainingBalance 0) — unregistering it; uploads with it would be rejected by every storer",
                     );
                 }
                 PersistedBatchVerdict::ForeignOwner(on_chain_owner) => {
@@ -2402,9 +2421,11 @@ mod chain_tests {
 
     /// Per-batch `PostageStamp` views for the persisted-issuer check:
     /// `Some(owner)` is the on-chain `batchOwner` (zero = not found),
-    /// `None` a failed read. Records which batches were asked about.
+    /// `None` a failed read. `remainingBalance` is `1` unless the batch
+    /// is in `drained` (then `0`). Records which batches were asked about.
     struct OwnerScript {
         owners: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 20]>>>,
+        drained: std::collections::HashSet<[u8; 32]>,
         queried: Mutex<Vec<[u8; 32]>>,
     }
 
@@ -2431,6 +2452,7 @@ mod chain_tests {
                 ("0x44beae8e", _) => word_hex(&[20]),          // batchDepth
                 ("0x32ac57dd", _) => word_hex(&[16]),          // bucketDepth
                 ("0xd968f44b", _) => word_hex(&[0]),           // immutableFlag
+                ("0xd71ba7c4", _) => word_hex(&[u8::from(!self.drained.contains(&id))]), // remainingBalance
                 (other, _) => panic!("unscripted selector {other}"),
             };
             Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
@@ -2439,6 +2461,82 @@ mod chain_tests {
 
     fn store(postage: &std::path::Path, id: [u8; 32]) -> std::path::PathBuf {
         postage.join(format!("{}.bin", hex::encode(id)))
+    }
+
+    /// Overlapping passes (a host re-calling `ant_start_gateway` while
+    /// the previous check is still in flight) are serialized: the
+    /// second one only sees what the first left pending, so each batch
+    /// is asked about once and unregistered once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_passes_query_each_batch_once() {
+        use super::PersistedIssuers;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        struct SlowGone(Mutex<Vec<[u8; 32]>>);
+        impl ChainTransport for SlowGone {
+            fn serve(&self, request_json: &str) -> Option<String> {
+                let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+                let data = req["params"][0]["data"].as_str().unwrap();
+                assert_eq!(&data[0..10], "0x2182ddb1", "only batchOwner expected");
+                let mut id = [0u8; 32];
+                hex::decode_to_slice(&data[10..74], &mut id).unwrap();
+                self.0.lock().unwrap().push(id);
+                // Slow enough that the second pass starts mid-flight.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Some(
+                    json!({"jsonrpc": "2.0", "id": req["id"], "result": word_hex(&[0])})
+                        .to_string(),
+                )
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("ant-overlapping-passes-{}", std::process::id()));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let ids = [[0xa1; 32], [0xa2; 32]];
+        let issuers: HashMap<_, _> = ids
+            .iter()
+            .map(|&id| {
+                let iss =
+                    ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
+                        .unwrap();
+                (id, iss)
+            })
+            .collect();
+        let upload = Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(issuers),
+            stamp_key: [1u8; 32],
+            batch_owner: [0x0a; 20],
+            postage_dir: postage.clone(),
+        });
+        let persisted = Arc::new(PersistedIssuers::new(Arc::clone(&upload)));
+        let script = Arc::new(SlowGone(Mutex::new(Vec::new())));
+
+        let passes: Vec<_> = (0..2)
+            .map(|_| {
+                let persisted = Arc::clone(&persisted);
+                let client = ChainClient::new("http://127.0.0.1:1")
+                    .with_transport(Some(script.clone() as Arc<dyn ChainTransport>));
+                tokio::spawn(async move {
+                    persisted
+                        .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                        .await;
+                })
+            })
+            .collect();
+        for pass in passes {
+            pass.await.unwrap();
+        }
+
+        let mut queried = script.0.lock().unwrap().clone();
+        queried.sort_unstable();
+        assert_eq!(queried, ids.to_vec(), "each batch is asked about once");
+        assert!(upload.issuers.lock().unwrap().is_empty());
+        assert!(persisted.unverified().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The phantom-batch fix for `ant-ffi`: once an RPC is known, a
@@ -2458,12 +2556,14 @@ mod chain_tests {
         let foreign = [0x33; 32];
         let unreadable = [0x44; 32];
         let bought = [0x55; 32];
+        // Expired but not yet evicted: still ours, balance 0.
+        let expired = [0x66; 32];
 
         let dir =
             std::env::temp_dir().join(format!("ant-persisted-issuers-{}", std::process::id()));
         let postage = dir.join("postage");
         std::fs::create_dir_all(&postage).unwrap();
-        for id in [live, dead, foreign, unreadable] {
+        for id in [live, dead, foreign, unreadable, expired] {
             drop(
                 ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
                     .unwrap(),
@@ -2490,7 +2590,9 @@ mod chain_tests {
                 (dead, Some([0u8; 20])),
                 (foreign, Some([0x5e; 20])),
                 (unreadable, None),
+                (expired, Some(ours)),
             ])),
+            drained: std::collections::HashSet::from([expired]),
             queried: Mutex::new(Vec::new()),
         });
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
@@ -2503,14 +2605,14 @@ mod chain_tests {
         assert_eq!(
             registered(),
             BTreeSet::from([live, unreadable, bought]),
-            "dead + foreign batches must be unregistered, the rest kept",
+            "dead + expired + foreign batches must be unregistered, the rest kept",
         );
         assert_eq!(
             persisted.unverified(),
             vec![unreadable],
             "only the batch whose read failed is still pending",
         );
-        for id in [dead, foreign] {
+        for id in [dead, foreign, expired] {
             assert!(store(&postage, id).exists(), "the store stays on disk");
         }
         assert!(

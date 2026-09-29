@@ -375,17 +375,11 @@ pub async fn fetch_postage_batch_meta(
     postage_contract: &str,
     batch_id: &[u8; 32],
 ) -> Result<PostageBatchMeta, RpcError> {
-    let sel_owner = encode_word32_call("2182ddb1", batch_id);
     let sel_depth = encode_word32_call("44beae8e", batch_id);
     let sel_buck = encode_word32_call("32ac57dd", batch_id);
     let sel_imm = encode_word32_call("d968f44b", batch_id);
 
-    let owner_bytes = client.eth_call(postage_contract, &sel_owner).await?;
-    last_word_eth_address(&owner_bytes)?;
-
-    let mut batch_owner_eth = [0u8; 20];
-    let w = padded_last_word(&owner_bytes)?;
-    batch_owner_eth.copy_from_slice(&w[12..32]);
+    let batch_owner_eth = fetch_postage_batch_owner(client, postage_contract, batch_id).await?;
 
     let d = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_depth).await?)?;
     let b = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_buck).await?)?;
@@ -397,6 +391,23 @@ pub async fn fetch_postage_batch_meta(
         immutable: im != 0,
         batch_owner_eth,
     })
+}
+
+/// `PostageStamp.batchOwner(bytes32)` alone — one `eth_call`, for
+/// callers that only need to tell "not on chain" (zero address) apart
+/// without paying for the other three [`fetch_postage_batch_meta`] views.
+#[cfg(feature = "chain-rpc")]
+pub async fn fetch_postage_batch_owner(
+    client: &ChainClient,
+    postage_contract: &str,
+    batch_id: &[u8; 32],
+) -> Result<[u8; 20], RpcError> {
+    let sel_owner = encode_word32_call("2182ddb1", batch_id);
+    let owner_bytes = client.eth_call(postage_contract, &sel_owner).await?;
+    last_word_eth_address(&owner_bytes)?;
+    let mut owner = [0u8; 20];
+    owner.copy_from_slice(&padded_last_word(&owner_bytes)?[12..32]);
+    Ok(owner)
 }
 
 #[cfg(feature = "chain-rpc")]
