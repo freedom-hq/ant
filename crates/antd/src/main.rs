@@ -729,6 +729,11 @@ async fn main() -> Result<()> {
             // ACT publisher identity = the node's swarm key, exactly
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
+            // Not wired yet: antd resolves (or auto-deploys) its
+            // chequebook once, at startup. Whether a gateway buy may
+            // deploy one at runtime is an open question (see
+            // docs/ffi-parity-audit.md, F3).
+            on_batch_bought: None,
         };
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };

@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router, status_router_with_chain,
+    status_router_with_chain_and_hook,
 };
 use serde_json::Value;
 
@@ -264,6 +265,40 @@ async fn buy_stamp_returns_batch_id() {
     let (status, json) = req(router, Method::POST, "/stamps/1000000/20?immutable=true").await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(json["batchID"], hex::encode([0x7E; 32]));
+}
+
+/// A recording after-buy hook plus the batch ids it was called with.
+fn recording_hook() -> (
+    ant_gateway::BatchBoughtHook,
+    Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let hook: ant_gateway::BatchBoughtHook = Arc::new(move |id| sink.lock().unwrap().push(id));
+    (hook, seen)
+}
+
+/// The embedder hook (ant-ffi: switch settlement on) runs once the
+/// bought batch is registered, with the new batch id.
+#[tokio::test]
+async fn buy_stamp_calls_the_after_buy_hook() {
+    let (hook, seen) = recording_hook();
+    let router =
+        status_router_with_chain_and_hook(snapshot_with_one_peer(), chain_ctx_rw(None), Some(hook));
+    let (status, _) = req(router, Method::POST, "/stamps/1000000/20").await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(*seen.lock().unwrap(), vec![[0x7E; 32]]);
+}
+
+/// A buy that is refused (nothing bought) must not trigger it.
+#[tokio::test]
+async fn refused_buy_does_not_call_the_after_buy_hook() {
+    let (hook, seen) = recording_hook();
+    let router =
+        status_router_with_chain_and_hook(snapshot_with_one_peer(), chain_ctx_rw(None), Some(hook));
+    let (status, _) = req(router, Method::POST, "/stamps/1000/16").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

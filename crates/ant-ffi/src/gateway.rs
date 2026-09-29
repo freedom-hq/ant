@@ -274,6 +274,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             // ACT publisher identity: the node signing key, like bee's
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),
+            on_batch_bought: None,
         };
 
         let task = handle.runtime.spawn(async move {

@@ -210,6 +210,7 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
     };
     build_router(handle)
 }
@@ -221,6 +222,16 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
 pub fn status_router_with_chain(
     snapshot: StatusSnapshot,
     chain: std::sync::Arc<ChainContext>,
+) -> Router {
+    status_router_with_chain_and_hook(snapshot, chain, None)
+}
+
+/// [`status_router_with_chain`] with an embedder after-buy hook, for the
+/// tests that check `POST /stamps` calls it.
+pub fn status_router_with_chain_and_hook(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -253,6 +264,7 @@ pub fn status_router_with_chain(
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought,
     };
     build_router(handle)
 }
@@ -279,6 +291,7 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
     };
     build_router(handle)
 }
@@ -320,6 +333,7 @@ pub fn handle_with_fixture_node() -> Router {
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
     };
     build_router(handle)
 }
@@ -1008,6 +1022,7 @@ where
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
     };
     build_router(handle)
 }
