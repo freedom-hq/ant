@@ -324,6 +324,7 @@ pub fn build_with_transport(
         chequebook,
         chain_id,
         writer,
+        tx_lock: crate::WalletTxLock::default(),
     }))
 }
 

@@ -162,6 +162,18 @@ impl From<Option<[u8; 20]>> for ChequebookSlot {
     }
 }
 
+/// Serializes every transaction sent from the node wallet.
+///
+/// The wallet fetches its nonce as "pending count" per tx, so two
+/// senders interleaving (a second `POST /stamps` while the first is
+/// still confirming, or the embedder topping up the chequebook in the
+/// background after a buy) race for the same nonce, and a transfer can
+/// drain the xBZZ a buy's balance guard just counted. The write
+/// endpoints hold it from their pre-checks through the last receipt;
+/// an embedder that sends from the same wallet outside the gateway
+/// clones it from [`ChainContext::tx_lock`] and holds it the same way.
+pub type WalletTxLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
 /// Everything the chain-backed endpoints need beyond the reader: the
 /// wallet address whose balances `/wallet` reports, the chequebook
 /// address (if one is deployed), the chain id bee-js branches on, and
@@ -174,6 +186,8 @@ pub struct ChainContext {
     /// Signer for the on-chain write endpoints. `None` → those endpoints
     /// return `501`.
     pub writer: Option<std::sync::Arc<dyn ChainWriter>>,
+    /// Held across every wallet transaction; see [`WalletTxLock`].
+    pub tx_lock: WalletTxLock,
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
@@ -473,14 +487,18 @@ where
 
 /// Resolve the writer or produce the bee-shaped `501` used when no
 /// funded wallet is configured.
+/// Also returns the wallet's [`WalletTxLock`], which the caller holds
+/// across its transaction.
 #[allow(clippy::result_large_err)]
-fn writer(handle: &GatewayHandle) -> Result<std::sync::Arc<dyn ChainWriter>, Response> {
+fn writer(
+    handle: &GatewayHandle,
+) -> Result<(std::sync::Arc<dyn ChainWriter>, WalletTxLock), Response> {
     if handle.chain_state().is_none() {
         return Err(crate::error::chain_initializing());
     }
     handle
         .chain()
-        .and_then(|c| c.writer.clone())
+        .and_then(|c| Some((c.writer.clone()?, c.tx_lock.clone())))
         .ok_or_else(|| {
             json_error(
                 StatusCode::NOT_IMPLEMENTED,
@@ -599,6 +617,10 @@ pub async fn buy_stamp(
     let total_cost = 1u128
         .checked_shl(u32::from(depth))
         .and_then(|factor| amount.checked_mul(factor));
+    // Held from the balance guard through the buy's last receipt, so a
+    // background top-up can't spend the xBZZ counted here or take the
+    // buy's nonce.
+    let tx = chain.tx_lock.lock().await;
     let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -615,6 +637,7 @@ pub async fn buy_stamp(
         Ok(id) => id,
         Err(r) => return r,
     };
+    drop(tx);
     // Register the issuer with the running node *before* returning 201,
     // so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
     // finds a usable batch without a restart. We construct the issuer
@@ -641,7 +664,7 @@ pub async fn topup_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, amount)): Path<(String, String)>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -653,6 +676,7 @@ pub async fn topup_stamp(
         Ok(a) => a,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer"),
     };
+    let _tx = tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.topup_batch(batch_id, amount)).await {
         return r;
     }
@@ -665,7 +689,7 @@ pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -673,9 +697,11 @@ pub async fn dilute_stamp(
         Ok(b) => b,
         Err(r) => return r,
     };
+    let tx = tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
     }
+    drop(tx);
     // Bump the live issuer's depth so subsequent uploads use the larger
     // capacity. `immutable` is irrelevant for an existing issuer (the
     // register handler only updates depth when the batch is already
@@ -693,7 +719,7 @@ pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -709,6 +735,7 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    let _tx = tx_lock.lock().await;
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,
         Err(r) => return r,

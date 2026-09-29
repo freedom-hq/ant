@@ -2423,7 +2423,7 @@ async fn check_persisted_chequebook(
         chequebook_store::check_chequebook(client, cb, IssuerRead::UnlessUnregistered).await;
     let mut verdict = checks.verdict(node_eth);
     if verdict == ChequebookVerdict::NotRegistered
-        && not_registered_may_be_lag(client, persist_path, cb).await
+        && chequebook_store::not_registered_may_be_lag(client, persist_path, cb).await
     {
         tracing::warn!(
             target: "ant-ffi",
@@ -2799,66 +2799,6 @@ fn addresses_in(bytes: &[u8]) -> Vec<[u8; 20]> {
         }
     }
     out
-}
-
-/// How long after our own deploy (the record's write time) a factory
-/// "not registered" may still be a lagging backend. A load-balanced RPC
-/// trails by seconds to a few minutes, not for good.
-#[cfg(feature = "chain")]
-const DEPLOY_LAG_GRACE: std::time::Duration = std::time::Duration::from_mins(10);
-
-/// Whether a factory "not registered" answer for the persisted `cb` may
-/// just be a backend that hasn't seen our deploy yet (a load-balanced
-/// RPC trails by a few blocks; the host's launch-time
-/// `ant_deploy_chequebook` is followed within seconds by the gateway
-/// start's check). Only for a chequebook we deployed ourselves — the
-/// record carries its deploy tx — and only within [`DEPLOY_LAG_GRACE`]
-/// of the record being written: `true` then when that tx's receipt isn't
-/// visible or can't be read (unconfirmed, not "no"), or shows the
-/// factory deploying `cb` (registered by construction). A visible
-/// receipt without that deploy lets the "not registered" stand, as does
-/// a record without a deploy tx (a rediscovered chequebook) or one older
-/// than the grace (a backend doesn't lag for that long; a record whose
-/// deploy tx isn't on this chain would otherwise pass as "lag" forever).
-#[cfg(feature = "chain")]
-async fn not_registered_may_be_lag(
-    client: &ant_chain::ChainClient,
-    persist_path: &std::path::Path,
-    cb: &[u8; 20],
-) -> bool {
-    use ant_chain::chequebook::{GNOSIS_CHEQUEBOOK_FACTORY, SIMPLE_SWAP_DEPLOYED_TOPIC};
-
-    // An unreadable mtime, or one in the future (clock change), counts as
-    // outside the grace: the factory's "no" is a real answer.
-    let recent = std::fs::metadata(persist_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < DEPLOY_LAG_GRACE);
-    if !recent {
-        return false;
-    }
-    let Some(deploy_tx) = std::fs::read(persist_path)
-        .ok()
-        .and_then(|b| {
-            serde_json::from_slice::<ant_chain::chequebook_store::ChequebookFile>(&b).ok()
-        })
-        .and_then(|f| {
-            let mut tx = [0u8; 32];
-            hex::decode_to_slice(f.deploy_tx.trim_start_matches("0x"), &mut tx).ok()?;
-            Some(tx)
-        })
-    else {
-        return false;
-    };
-    match client.eth_get_transaction_receipt(&deploy_tx).await {
-        Ok(Some(receipt)) => receipt.logs.iter().any(|l| {
-            l.address == GNOSIS_CHEQUEBOOK_FACTORY
-                && l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC)
-                && l.data.get(12..32) == Some(cb.as_slice())
-        }),
-        Ok(None) | Err(_) => true,
-    }
 }
 
 /// Map a shared-chequebook-store error into the drive op error.
@@ -4213,7 +4153,9 @@ mod chain_tests {
             .write(true)
             .open(dir.join("chequebook.json"))
             .unwrap()
-            .set_modified(std::time::SystemTime::now() - super::DEPLOY_LAG_GRACE * 2)
+            .set_modified(
+                std::time::SystemTime::now() - ant_chain::chequebook_store::DEPLOY_LAG_GRACE * 2,
+            )
             .unwrap();
         let err = super::setup_settlement(
             &cmd_tx,
