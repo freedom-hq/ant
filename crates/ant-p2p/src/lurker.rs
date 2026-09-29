@@ -86,10 +86,10 @@ const COVERING_PEERS: usize = 5;
 /// trojan sits at `b_p` or `24 + Geom`).
 ///
 /// **1-byte targets (`L = 8`) are deliberately not covered.** The API
-/// accepts them (bee's cap is 1..=[`ant_crypto::pss::MAX_TARGET_LEN`] bytes and ant
-/// mirrors it), but a trojan that agrees with the target on only 8 bits
-/// is pushed to whichever neighbourhood is closest to its *mined*
-/// address. With mainnet storage depth `d ≈ 9-11 > 8` it lands in the
+/// accepts them (bee's cap is
+/// 1..=[`ant_crypto::pss::MAX_TARGET_LEN`] bytes and ant mirrors it),
+/// but a trojan that agrees with the target on only 8 bits is pushed
+/// to whichever neighbourhood is closest to its *mined* address. With mainnet storage depth `d ≈ 9-11 > 8` it lands in the
 /// target's depth-`d` neighbourhood only by chance, with probability
 /// `2^-(d-8)` (≈ 1/2 at `d = 9`, 1/4 at `d = 10`, 1/8 at `d = 11`) —
 /// so a 1-byte sender gets unreliable, lossy delivery, not none. When it
@@ -125,9 +125,10 @@ const COVERING_PEERS: usize = 5;
 ///
 /// `L` must exceed the storage depth `d` for the target's neighbourhood
 /// to reliably keep the trojan (below `d` it does so only with
-/// probability `2^-(d-L)`) — why `L = 8` is excluded above. Beyond that the sender picks `L` freely (via its target
-/// length); the receiver does not need to agree on one, since it covers
-/// every listed `L`.
+/// probability `2^-(d-L)`) — why `L = 8` is excluded above. Beyond
+/// that the sender picks `L` freely (via its target length); the
+/// receiver does not need to agree on one, since it covers every
+/// listed `L`.
 ///
 /// **Why senders should use 16, not 24.** A deeper prefix concentrates
 /// a trojan into a smaller slice of the reserve (`~2^(reserve-(L-d))`),
@@ -149,8 +150,8 @@ const COVERING_PEERS: usize = 5;
 /// receiver-efficiency one; tracked in the SWIP messaging extension's
 /// "PSS mining depth" section.)
 const PSS_MINED_PREFIX_BITS: [u8; 2] = [16, 24];
-/// Deeper bins pulled past bin `L` (each of [`PSS_MINED_PREFIX_BITS`]) in the
-/// `b_p >= L` regime, covering the geometric tail of `PO(c, p) =
+/// Deeper bins pulled past bin `L` (each of [`PSS_MINED_PREFIX_BITS`])
+/// in the `b_p >= L` regime, covering the geometric tail of `PO(c, p) =
 /// L + Geom(1/2)`: a window of 3 captures 15/16 of the mass per peer,
 /// and the [`COVERING_PEERS`]-way redundancy covers the rest. Unused in
 /// the `b_p < L` regime, where the bin is exact.
