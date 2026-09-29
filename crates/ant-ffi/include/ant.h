@@ -409,7 +409,10 @@ char *ant_storage_status(const AntHandle *handle, char **out_err);
  *   {"enabled":bool,"chequebook":"0x…"|null}
  * `enabled=true` once a chequebook is deployed, which is what lets
  * uploads actually propagate (bee charges the uploader per pushed chunk
- * and freezes out a node that can't pay). Builds without the `chain`
+ * and freezes out a node that can't pay). A persisted chequebook that a
+ * chain check (gateway start, buy, deploy) found unusable — not
+ * registered with the factory, or issued by another key — reports
+ * `enabled=false`: settlement is switched off for it. Builds without the `chain`
  * feature always report {"enabled":false,"chequebook":null}.
  */
 char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);

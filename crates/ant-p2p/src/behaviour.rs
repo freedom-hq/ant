@@ -3451,6 +3451,30 @@ fn handle_control_command(
                 ),
             });
         }
+        ControlCommand::DisablePushsyncSwap { chequebook, ack } => {
+            let running = state
+                .pushsync_swap
+                .as_ref()
+                .is_some_and(|s| s.chequebook() == chequebook);
+            let message = if running {
+                state.pushsync_swap = None;
+                warn!(
+                    target: "ant_p2p::pushsync_swap",
+                    chequebook = %hex::encode(chequebook),
+                    "outbound SWAP settlement disabled at runtime — chequebook failed its chain checks",
+                );
+                format!(
+                    "outbound SWAP settlement disabled (chequebook 0x{})",
+                    hex::encode(chequebook),
+                )
+            } else {
+                format!(
+                    "outbound SWAP settlement was not running on chequebook 0x{}",
+                    hex::encode(chequebook),
+                )
+            };
+            let _ = ack.send(ControlAck::Ok { message });
+        }
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);
         }
@@ -9033,6 +9057,73 @@ mod tests {
             }
             other => panic!("expected the latest cached update to resolve, got {other:?}"),
         }
+    }
+
+    /// `DisablePushsyncSwap` switches off settlement running on the named
+    /// chequebook — the path `ant-ffi` takes when the chain disqualifies
+    /// the chequebook `ant_init` enabled unchecked — and leaves a service
+    /// on any other chequebook alone.
+    #[tokio::test]
+    async fn disable_pushsync_swap_only_stops_the_named_chequebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (bad, other) = ([0xbau8; 20], [0x0cu8; 20]);
+        let mut send = |state: &mut SwarmState, cmd| {
+            handle_control_command(state, &mut peerstore, &control, None, 0, cmd);
+        };
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::EnablePushsyncSwap {
+                chequebook: bad,
+                swap_secret: [3u8; 32],
+                chain_id: 100,
+                outbound_ledger_path: dir.path().join("out.json").to_string_lossy().into(),
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert_eq!(
+            state.pushsync_swap.as_ref().map(|s| s.chequebook()),
+            Some(bad)
+        );
+
+        // A disable naming another chequebook is a no-op.
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: other,
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert_eq!(
+            state.pushsync_swap.as_ref().map(|s| s.chequebook()),
+            Some(bad)
+        );
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: bad,
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert!(state.pushsync_swap.is_none(), "settlement is off again");
     }
 
     /// `PostageList` reports a registration age only for batches the node

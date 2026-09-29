@@ -345,6 +345,17 @@ pub enum ControlCommand {
         outbound_ledger_path: String,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Switch outbound SWAP settlement off again, if (and only if) it is
+    /// currently running on `chequebook`. Sent by `ant-ffi` when a
+    /// chain check disqualifies the chequebook that `ant_init` enabled
+    /// unchecked from the persisted record (no RPC at init): signing
+    /// cheques every peer drops is worse than pseudosettle alone. A
+    /// service on a different chequebook (a concurrent enable won) is
+    /// left alone; acks `Ok` either way.
+    DisablePushsyncSwap {
+        chequebook: [u8; 20],
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Create a new upload job. The node loop forwards to its
     /// `UploadManager`, which writes the persistent manifest, spawns
     /// the driver task, and acks with the assigned job id.

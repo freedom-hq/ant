@@ -862,10 +862,14 @@ fn init_inner(
     // storage — so it stays disabled here and gets installed at runtime
     // by the storage-buy flow once a chequebook exists (see
     // `drive::ensure_settlement`). Without an RPC at init we can't run
-    // the factory-registration check; the chequebook was factory-built
-    // when we deployed it, so building unconditionally matches antd's
-    // no-RPC manual path. Gated on `chain`: a download-only build never
-    // uploads, so it never needs (or can deploy) a chequebook.
+    // the factory-registration / `issuer()` checks, so it's enabled
+    // unchecked here (antd's no-RPC manual path does the same). The
+    // checks run once the host supplies an RPC: `ant_start_gateway`'s
+    // chain init (and every buy / connect / deploy) goes through
+    // `drive::setup_settlement`, which switches settlement back *off*
+    // (`DisablePushsyncSwap`) if the chain disqualifies this chequebook.
+    // Gated on `chain`: a download-only build never uploads, so it never
+    // needs (or can deploy) a chequebook.
     #[cfg(feature = "chain")]
     let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook_for(
         &data_dir.join("chequebook.json"),
@@ -2102,7 +2106,9 @@ pub unsafe extern "C" fn ant_storage_status(
 /// Outbound-settlement status as JSON `{"enabled":bool,"chequebook":…}`.
 /// `enabled` is `true` once a chequebook is deployed, which is what lets
 /// uploads actually propagate (bee charges the uploader per pushed chunk
-/// and freezes out a node that can't pay). The Storage tab reads this to
+/// and freezes out a node that can't pay). A persisted chequebook a
+/// chain check found unusable reports `false`: settlement is switched
+/// off for it (see `drive::setup_settlement`). The Storage tab reads this to
 /// warn when a connected plan still won't upload reliably. On a build
 /// without `chain` support settlement is never available, so this
 /// reports `{"enabled":false,"chequebook":null}`.
@@ -2889,21 +2895,30 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
         if handle.is_null() {
             return;
         }
-        let handle = Box::from_raw(handle);
-        // Drain the host chain transport first: `ant.h` lets the host
-        // free `host_ctx` once `ant_shutdown` returns, and
-        // `shutdown_timeout` below leaks (rather than joins) a blocking
-        // thread that outruns the grace — so clear the slot and wait for
-        // any in-flight callback here, where the wait is unconditional.
-        #[cfg(feature = "chain")]
-        handle.chain_transport.set(None, std::ptr::null_mut());
-        // Cancels every spawned task (including the node loop) at its
-        // next await point and joins the worker / blocking threads. The
-        // timeout keeps a task wedged in a syscall (a dial holding a
-        // socket open) from hanging the host for good; it leaks the
-        // thread rather than the wait.
-        handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
+        shutdown_handle(Box::from_raw(handle));
     }
+}
+
+/// The one shutdown sequence behind [`ant_shutdown`] and the JNI
+/// `nativeShutdown`. It joins the runtime (bounded by
+/// [`SHUTDOWN_GRACE`]) rather than returning while tasks still run, so
+/// everything dropped with the node loop — the peerstore's final flush
+/// of `peers.json`, upload checkpoints — lands before a host can
+/// re-init a node over the same data dir.
+pub(crate) fn shutdown_handle(handle: Box<AntHandle>) {
+    // Drain the host chain transport first: `ant.h` lets the host
+    // free `host_ctx` once `ant_shutdown` returns, and
+    // `shutdown_timeout` below leaks (rather than joins) a blocking
+    // thread that outruns the grace — so clear the slot and wait for
+    // any in-flight callback here, where the wait is unconditional.
+    #[cfg(feature = "chain")]
+    handle.chain_transport.set(None, std::ptr::null_mut());
+    // Cancels every spawned task (including the node loop) at its
+    // next await point and joins the worker / blocking threads. The
+    // timeout keeps a task wedged in a syscall (a dial holding a
+    // socket open) from hanging the host for good; it leaks the
+    // thread rather than the wait.
+    handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
 }
 
 // ---------------------------------------------------------------------------

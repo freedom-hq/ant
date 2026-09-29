@@ -860,6 +860,11 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "settlement enable ignored (test fixture)".into(),
             });
         }
+        ControlCommand::DisablePushsyncSwap { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "settlement disable ignored (test fixture)".into(),
+            });
+        }
         // Read-back propagation check. The fixture has a single source
         // (the `DirFetcher`), so report `sources = 1` when the chunk is
         // present and `0` otherwise, matching the production JSON shape.

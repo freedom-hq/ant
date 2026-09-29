@@ -2033,11 +2033,39 @@ async fn verify_then_build_swap(
 ) -> Option<ant_p2p::PushsyncSwapConfig> {
     if let Some(rpc) = rpc_url {
         let client = ant_chain::ChainClient::new(rpc);
+        // Issuer-match check (Fix 4). bee accepts a cheque only when its
+        // signer matches the chequebook's on-chain `issuer()`; a node
+        // whose cheque-signing key differs emits cheques every peer
+        // silently drops, leaving uploads on pseudosettle credit only.
+        // Verify it before enabling outbound SWAP rather than discover
+        // it as a settlement stall under load. Derived up front so the
+        // `issuer()` read is skipped when there's nothing to compare.
+        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
+            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    error = %e,
+                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
+                );
+                None
+            }
+        };
         // Both reads come from the shared helper `ant-ffi` uses too; the
         // arms below report each check separately and apply the same
         // rule as `ChequebookChecks::verdict` ("no" disqualifies, a
         // failed read is skipped), plus `--chequebook-allow-unverified`.
-        let checks = ant_chain::chequebook_store::check_chequebook(&client, &chequebook).await;
+        // `issuer()` is only read when its answer is reported: not
+        // without a signing EOA, and not after a factory "no" that
+        // already disables settlement (with the override on, both
+        // checks are still reported).
+        let issuer_read = match (swap_eoa, allow_unverified) {
+            (None, _) => ant_chain::chequebook_store::IssuerRead::Never,
+            (Some(_), true) => ant_chain::chequebook_store::IssuerRead::Always,
+            (Some(_), false) => ant_chain::chequebook_store::IssuerRead::UnlessUnregistered,
+        };
+        let checks =
+            ant_chain::chequebook_store::check_chequebook(&client, &chequebook, issuer_read).await;
         match &checks.registered {
             Ok(true) => tracing::info!(
                 target: "antd",
@@ -2069,25 +2097,8 @@ async fn verify_then_build_swap(
             ),
         }
 
-        // Issuer-match check (Fix 4). bee accepts a cheque only when its
-        // signer matches the chequebook's on-chain `issuer()`; a node
-        // whose cheque-signing key differs emits cheques every peer
-        // silently drops, leaving uploads on pseudosettle credit only.
-        // Verify it before enabling outbound SWAP rather than discover
-        // it as a settlement stall under load.
-        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
-            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
-            Err(e) => {
-                tracing::warn!(
-                    target: "antd",
-                    error = %e,
-                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
-                );
-                None
-            }
-        };
-        if let Some(swap_eoa) = swap_eoa {
-            match checks.issuer {
+        if let (Some(swap_eoa), Some(issuer)) = (swap_eoa, checks.issuer) {
+            match issuer {
                 Ok(issuer) if issuer == swap_eoa => tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(chequebook)),

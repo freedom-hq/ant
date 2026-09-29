@@ -236,8 +236,26 @@ pub struct ChequebookChecks {
     /// every cheque drawn on it.
     pub registered: Result<bool, ChequebookError>,
     /// [`read_chequebook_issuer`]: bee only accepts cheques signed by
-    /// this EOA.
-    pub issuer: Result<[u8; 20], ChequebookError>,
+    /// this EOA. `None` when [`check_chequebook`]'s [`IssuerRead`]
+    /// policy skipped the read (nothing to compare against, or the
+    /// factory check already disqualified the chequebook).
+    pub issuer: Option<Result<[u8; 20], ChequebookError>>,
+}
+
+/// When [`check_chequebook`] reads `issuer()` — each read is an RPC
+/// round-trip, so skip it when its answer can't change the outcome.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuerRead {
+    /// Don't read it (e.g. no signing EOA to compare it with).
+    Never,
+    /// Read it unless the factory already answered "not registered",
+    /// which disqualifies the chequebook on its own.
+    UnlessUnregistered,
+    /// Always read it (a caller that reports every check even when one
+    /// has already failed, like `antd` under
+    /// `--chequebook-allow-unverified`).
+    Always,
 }
 
 /// Whether a node signing with a given key may use a chequebook, per
@@ -266,26 +284,35 @@ impl ChequebookChecks {
             return ChequebookVerdict::NotRegistered;
         }
         match self.issuer {
-            Ok(issuer) if issuer != *signer => ChequebookVerdict::IssuerMismatch(issuer),
+            Some(Ok(issuer)) if issuer != *signer => ChequebookVerdict::IssuerMismatch(issuer),
             _ => ChequebookVerdict::Usable,
         }
     }
 }
 
-/// Run both chequebook checks against the chain: factory registration
-/// and `issuer()`. Shared by `antd` (every chequebook it adopts at
-/// startup) and `ant-ffi` (a persisted chequebook before enabling
-/// settlement), so the two can't disagree on what makes a chequebook
-/// unusable.
+/// Run the chequebook checks against the chain: factory registration,
+/// then `issuer()` as `issuer_read` allows. Shared by `antd` (every
+/// chequebook it adopts at startup) and `ant-ffi` (a persisted
+/// chequebook before enabling settlement), so the two can't disagree on
+/// what makes a chequebook unusable.
 #[cfg(feature = "chain-rpc")]
 pub async fn check_chequebook(
     client: &crate::ChainClient,
     chequebook: &[u8; 20],
+    issuer_read: IssuerRead,
 ) -> ChequebookChecks {
-    ChequebookChecks {
-        registered: verify_chequebook_with_factory(client, chequebook).await,
-        issuer: read_chequebook_issuer(client, chequebook).await,
-    }
+    let registered = verify_chequebook_with_factory(client, chequebook).await;
+    let read_issuer = match issuer_read {
+        IssuerRead::Never => false,
+        IssuerRead::UnlessUnregistered => !matches!(registered, Ok(false)),
+        IssuerRead::Always => true,
+    };
+    let issuer = if read_issuer {
+        Some(read_chequebook_issuer(client, chequebook).await)
+    } else {
+        None
+    };
+    ChequebookChecks { registered, issuer }
 }
 
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
@@ -480,7 +507,10 @@ mod tests {
     fn chequebook_verdict_disqualifies_only_on_a_read_no() {
         let signer = [0x0au8; 20];
         let failed = || ChequebookError::Chain("backend unavailable".into());
-        let checks = |registered, issuer| ChequebookChecks { registered, issuer };
+        let checks = |registered, issuer| ChequebookChecks {
+            registered,
+            issuer: Some(issuer),
+        };
 
         assert_eq!(
             checks(Ok(true), Ok(signer)).verdict(&signer),
@@ -511,6 +541,19 @@ mod tests {
         assert_eq!(
             checks(Err(failed()), Err(failed())).verdict(&signer),
             ChequebookVerdict::Usable
+        );
+        // An issuer read that was skipped is not a mismatch.
+        let skipped = |registered| ChequebookChecks {
+            registered,
+            issuer: None,
+        };
+        assert_eq!(
+            skipped(Ok(true)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            skipped(Ok(false)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
         );
     }
 }
