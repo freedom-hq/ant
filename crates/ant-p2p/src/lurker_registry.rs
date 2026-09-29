@@ -137,11 +137,15 @@ impl Registry {
     where
         F: FnOnce(SharedWatch, mpsc::Sender<Delivery>) -> JoinHandle<()>,
     {
-        // Callers don't pick tickets; only a history request gets one.
-        watch.history_seq = if watch.history && !watch.pss_topics.is_empty() {
-            self.history_tickets.fetch_add(1, Ordering::Relaxed) + 1
-        } else {
-            0
+        // Callers don't pick tickets; only an *admitted* history request
+        // gets one (issued below, once every cap check has passed, so a
+        // refused subscribe doesn't burn one).
+        watch.history_seq = 0;
+        let wants_ticket = watch.history && !watch.pss_topics.is_empty();
+        let issue_ticket = |w: &mut WatchState| {
+            if wants_ticket {
+                w.history_seq = self.history_tickets.fetch_add(1, Ordering::Relaxed) + 1;
+            }
         };
         // Reject an over-large single watch outright (before any lock
         // work) — one subscription can't monopolize the union budget.
@@ -180,6 +184,11 @@ impl Registry {
                 if watch_len(&probe) > MAX_UNION_WATCH {
                     return None;
                 }
+                // Admitted. Stamp the ticket under the union's write lock
+                // (and the entries lock), so the union never advertises a
+                // ticket whose subscriber isn't about to be pushed.
+                issue_ticket(&mut watch);
+                probe.history_seq = probe.history_seq.max(watch.history_seq);
                 *union = probe;
             }
             entry
@@ -193,6 +202,7 @@ impl Registry {
         if entries.len() >= MAX_LURKER_NEIGHBORHOODS {
             return None;
         }
+        issue_ticket(&mut watch);
 
         // First subscriber: spawn the lurker on the union watch (== this
         // watch, for now) and the dispatcher that fans its output out.
@@ -562,6 +572,56 @@ mod tests {
                 async {}
             ))
             .is_none());
+    }
+
+    /// R2-M2: a history subscribe refused by a cap doesn't burn a ticket
+    /// — the next admitted one still gets ticket 1.
+    #[tokio::test]
+    async fn refused_history_subscribes_issue_no_ticket() {
+        let reg = Registry::new();
+        let topic = [0x42; 32];
+        let mut shared = None;
+        let _keep = reg
+            .subscribe([0u8; 32], gsoc_watch([1; 32]), |w, _tx| {
+                shared = Some(w);
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        let shared = shared.unwrap();
+        for i in 1..MAX_LURKER_NEIGHBORHOODS {
+            let mut t = [0u8; 32];
+            t[0] = u8::try_from(i).unwrap();
+            assert!(reg
+                .subscribe(t, gsoc_watch([1; 32]), |_w, _tx| tokio::spawn(async {}))
+                .is_some());
+        }
+        // Refused: neighborhood cap (new target) …
+        assert!(reg
+            .subscribe([0xff; 32], pss_watch(topic, true), |_w, _tx| tokio::spawn(
+                async {}
+            ))
+            .is_none());
+        // … and union-watch cap (attach overflowing the union).
+        let mut over = pss_watch(topic, true);
+        over.gsoc_addresses = (0..MAX_UNION_WATCH as u32)
+            .map(|i| {
+                let mut a = [0u8; 32];
+                a[..4].copy_from_slice(&i.to_be_bytes());
+                a
+            })
+            .collect();
+        assert!(reg
+            .subscribe([0u8; 32], over, |_w, _tx| tokio::spawn(async {}))
+            .is_none());
+        assert_eq!(shared.read().unwrap().history_seq, 0);
+        assert_eq!(reg.history_tickets.load(Ordering::Relaxed), 0);
+        // Admitted: gets the first ticket.
+        let _h = reg
+            .subscribe([0u8; 32], pss_watch(topic, true), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_seq, 1);
     }
 
     async fn recv(rx: &mut mpsc::Receiver<DecodedMessage>) -> DecodedMessage {
