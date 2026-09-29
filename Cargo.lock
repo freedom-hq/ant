@@ -269,6 +269,7 @@ name = "ant-postage"
 version = "0.5.47"
 dependencies = [
  "ant-crypto",
+ "fs4",
  "hex",
  "k256",
  "rmp-serde",
