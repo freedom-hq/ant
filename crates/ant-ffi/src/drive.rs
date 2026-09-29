@@ -863,11 +863,11 @@ const PLUR_PER_BZZ: u128 = 10_000_000_000_000_000;
 #[cfg_attr(not(feature = "chain"), allow(dead_code))]
 pub(crate) mod deposit {
     /// Target xBZZ deposit behind the node's chequebook, in PLUR:
-    /// **0.001 xBZZ**. Grounded in the #67 benchmark, where that deposit
-    /// backed 65 K+ cheques with huge margin (~300× one soak's measured
-    /// settlement demand). Small enough not to compete with the postage
-    /// batch the user came to buy, and not spent money either — an
-    /// unspent deposit stays withdrawable by the issuer.
+    /// **0.001 xBZZ**, the same default `antd` uses. It is
+    /// `ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`
+    /// (rationale there). It's restated here because this sizing math
+    /// also compiles without the `chain` feature, where `ant-chain`
+    /// isn't linked; a `chain` test pins the two together.
     pub(crate) const TARGET_PLUR: u128 = super::PLUR_PER_BZZ / 1_000;
 
     /// xBZZ (PLUR) a chequebook already holding `deposited_plur` still
@@ -1747,52 +1747,26 @@ async fn fund_chequebook_best_effort(
     node_eth: &[u8; 20],
     chequebook: &[u8; 20],
 ) {
-    use primitive_types::U256;
+    use ant_chain::chequebook_store::{top_up_chequebook, TopUp};
 
-    let have = match chequebook_deposit_plur(client, chequebook).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(target: "ant-ffi", "settlement deposit left as-is: {e}");
-            return;
-        }
-    };
-    let short = deposit::shortfall(have);
-    if short == 0 {
-        return;
-    }
-    let wallet_bzz = client
-        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, node_eth)
-        .await
-        .unwrap_or(0);
-    let amount = short.min(wallet_bzz);
-    if amount == 0 {
-        tracing::warn!(
+    match top_up_chequebook(client, wallet, node_eth, chequebook, deposit::TARGET_PLUR).await {
+        Ok(TopUp::NotNeeded) => {}
+        Ok(TopUp::Funded { amount, tx }) => tracing::info!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            deposit_plur = amount,
+            tx = %format!("0x{}", hex::encode(tx)),
+            "funded the chequebook so its cheques are backed",
+        ),
+        Ok(TopUp::WalletEmpty { .. }) => tracing::warn!(
             target: "ant-ffi",
             chequebook = %format!("0x{}", hex::encode(chequebook)),
             "chequebook holds no settlement deposit and the wallet has no spare xBZZ; \
              uploads will stall once peers stop extending credit — top it up from the Storage tab",
-        );
-        return;
-    }
-    match wallet
-        .erc20_transfer(
-            client,
-            &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
-            chequebook,
-            U256::from(amount),
-        )
-        .await
-    {
-        Ok(r) => tracing::info!(
-            target: "ant-ffi",
-            chequebook = %format!("0x{}", hex::encode(chequebook)),
-            deposit_plur = amount,
-            tx = %format!("0x{}", hex::encode(r.tx_hash)),
-            "funded the chequebook so its cheques are backed",
         ),
         Err(e) => tracing::warn!(
             target: "ant-ffi",
-            "settlement deposit transfer failed; the chequebook still works but backs no cheque: {e}",
+            "settlement deposit left as-is; the chequebook still works but may back no cheque: {e}",
         ),
     }
 }
@@ -3167,5 +3141,15 @@ mod chain_tests {
         assert_eq!(script.seen("eth_getLogs"), scans, "no rescan on restart");
         assert_eq!(node.lock().unwrap().registered, vec![lost]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ant-ffi's deposit target is the shared default `antd` uses; see
+    /// `deposit::TARGET_PLUR` for why it's restated.
+    #[test]
+    fn deposit_target_is_the_shared_default() {
+        assert_eq!(
+            super::deposit::TARGET_PLUR,
+            ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR
+        );
     }
 }

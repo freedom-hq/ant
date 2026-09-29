@@ -17,6 +17,17 @@
 
 use std::path::Path;
 
+/// Target xBZZ deposit behind a node's chequebook, in PLUR (1 xBZZ =
+/// 1e16 PLUR): **0.001 xBZZ**, the one default for `antd` and `ant-ffi`.
+/// It is grounded in the #67 benchmark, where that deposit backed 65 K+
+/// cheques with a wide margin (~300× one soak's measured settlement
+/// demand). That is small enough not to compete with the postage the
+/// user came to buy, and it isn't spent money: an unspent deposit stays
+/// withdrawable by the issuer. A fresh deploy is funded up to it, and
+/// an adopted chequebook is topped back up to it
+/// ([`top_up_chequebook`]).
+pub const DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR: u128 = 10_000_000_000_000;
+
 /// On-disk record of the chequebook a node auto-deployed (or
 /// rediscovered) for outbound settlement, persisted at
 /// `<data-dir>/chequebook.json`. Written once on first deploy and
@@ -272,6 +283,71 @@ impl ChequebookChecks {
     }
 }
 
+/// What [`top_up_chequebook`] did.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopUp {
+    /// The chequebook already holds at least the target.
+    NotNeeded,
+    /// Moved `amount` PLUR from the wallet into the chequebook.
+    Funded { amount: u128, tx: [u8; 32] },
+    /// The chequebook is `shortfall` PLUR short, and the wallet holds no
+    /// xBZZ to give.
+    WalletEmpty { shortfall: u128 },
+}
+
+/// Top `chequebook`'s xBZZ deposit up to `target_plur` from the node
+/// wallet. The transfer is capped to what the wallet holds: a thin
+/// wallet gives a partial deposit rather than a failed transfer (some
+/// backing beats none). It never withdraws, so a chequebook at or above
+/// the target is left alone.
+///
+/// A chequebook that backs nothing only publishes until the peers'
+/// payment tolerance runs out, then stalls (#73). Adopted chequebooks
+/// (persisted, or rediscovered on-chain) can be sitting at zero, so both
+/// `antd` and `ant-ffi` top them up with this before relying on them.
+#[cfg(feature = "chain-rpc")]
+pub async fn top_up_chequebook(
+    client: &crate::ChainClient,
+    wallet: &crate::tx::Wallet,
+    node_eth: &[u8; 20],
+    chequebook: &[u8; 20],
+    target_plur: u128,
+) -> Result<TopUp, ChequebookError> {
+    use crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES;
+    use primitive_types::U256;
+
+    let have = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, chequebook)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read chequebook deposit: {e}")))?;
+    let shortfall = target_plur.saturating_sub(have);
+    if shortfall == 0 {
+        return Ok(TopUp::NotNeeded);
+    }
+    let wallet_bzz = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, node_eth)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read wallet xBZZ: {e}")))?;
+    let amount = shortfall.min(wallet_bzz);
+    if amount == 0 {
+        return Ok(TopUp::WalletEmpty { shortfall });
+    }
+    let receipt = wallet
+        .erc20_transfer(
+            client,
+            &GNOSIS_BZZ_TOKEN_BYTES,
+            chequebook,
+            U256::from(amount),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("deposit transfer: {e}")))?;
+    Ok(TopUp::Funded {
+        amount,
+        tx: receipt.tx_hash,
+    })
+}
+
 /// Run both chequebook checks against the chain: factory registration
 /// and `issuer()`. Shared by `antd` (every chequebook it adopts at
 /// startup) and `ant-ffi` (a persisted chequebook before enabling
@@ -511,6 +587,118 @@ mod tests {
         assert_eq!(
             checks(Err(failed()), Err(failed())).verdict(&signer),
             ChequebookVerdict::Usable
+        );
+    }
+
+    /// A scripted xBZZ `balanceOf` backend for the top-up decisions;
+    /// anything else (a transfer) answers an error and is counted.
+    #[cfg(feature = "chain-rpc")]
+    struct Balances {
+        of: std::collections::HashMap<[u8; 20], u128>,
+        other_calls: std::sync::Mutex<usize>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for Balances {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let data = req["params"][0]["data"].as_str().unwrap_or_default();
+            if req["method"] == "eth_call" && data.starts_with("0x70a08231") {
+                let mut owner = [0u8; 20];
+                hex::decode_to_slice(&data[34..74], &mut owner).unwrap();
+                let Some(bal) = self.of.get(&owner) else {
+                    return Some(
+                        serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                            "error": {"code": -32603, "message": "backend unavailable"}})
+                        .to_string(),
+                    );
+                };
+                return Some(
+                    serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                        "result": format!("0x{bal:064x}")})
+                    .to_string(),
+                );
+            }
+            *self.other_calls.lock().unwrap() += 1;
+            Some(
+                serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                    "error": {"code": -32603, "message": "scripted: no transfer here"}})
+                .to_string(),
+            )
+        }
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    async fn top_up_with(of: &[([u8; 20], u128)]) -> (Result<TopUp, ChequebookError>, usize) {
+        let script = std::sync::Arc::new(Balances {
+            of: of.iter().copied().collect(),
+            other_calls: std::sync::Mutex::new(0),
+        });
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+        let wallet = crate::tx::Wallet::new([7u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let result = top_up_chequebook(
+            &client,
+            &wallet,
+            &WALLET,
+            &CHEQUEBOOK,
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+        )
+        .await;
+        let others = *script.other_calls.lock().unwrap();
+        (result, others)
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    const WALLET: [u8; 20] = [0x0a; 20];
+    #[cfg(feature = "chain-rpc")]
+    const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
+
+    /// At or above the target: nothing moves, never a withdrawal.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_leaves_a_funded_chequebook_alone() {
+        for have in [
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+            100 * DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+        ] {
+            let (result, others) = top_up_with(&[(CHEQUEBOOK, have), (WALLET, u128::MAX)]).await;
+            assert_eq!(result.unwrap(), TopUp::NotNeeded);
+            assert_eq!(others, 0, "no transfer");
+        }
+    }
+
+    /// Short, but the wallet has no xBZZ: report the shortfall, no transfer.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_reports_an_empty_wallet() {
+        let have = DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR / 4;
+        let (result, others) = top_up_with(&[(CHEQUEBOOK, have), (WALLET, 0)]).await;
+        assert_eq!(
+            result.unwrap(),
+            TopUp::WalletEmpty {
+                shortfall: DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR - have
+            }
+        );
+        assert_eq!(others, 0, "no transfer");
+    }
+
+    /// A deposit that can't be read is an error, not "empty": the caller
+    /// must not treat it as a shortfall and send money.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_fails_on_an_unreadable_deposit() {
+        let (result, others) = top_up_with(&[(WALLET, u128::MAX)]).await;
+        assert!(result.is_err());
+        assert_eq!(others, 0, "no transfer");
+    }
+
+    #[test]
+    fn default_deposit_is_one_thousandth_of_a_bzz() {
+        // 1 xBZZ = 1e16 PLUR (16 decimals, not 18).
+        assert_eq!(
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR * 1_000,
+            10_000_000_000_000_000
         );
     }
 }
