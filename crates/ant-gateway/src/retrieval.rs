@@ -905,7 +905,11 @@ pub async fn upload_pss(
     }
 
     // Parse targets: comma-separated hex prefixes, all the same length,
-    // 1..=3 bytes each (bee's API cap).
+    // 1..=3 bytes each (bee's API cap). 1-byte targets are accepted for
+    // bee compatibility but are effectively undeliverable on mainnet (an
+    // 8-bit prefix is shallower than storage depth, so the trojan is not
+    // stored in the target's neighbourhood) and ant's lurker does not pull
+    // for them — see `PSS_MINED_PREFIX_BITS` in ant-p2p's lurker.
     let mut targets: Vec<Vec<u8>> = Vec::new();
     for t in targets_str.split(',') {
         let t = t.trim();

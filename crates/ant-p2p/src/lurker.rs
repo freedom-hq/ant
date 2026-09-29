@@ -23,7 +23,6 @@ use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
 use crate::routing::{proximity, Overlay};
 use ant_crypto::keccak256;
-use ant_crypto::pss::MAX_TARGET_LEN;
 use libp2p::PeerId;
 use libp2p_stream::Control;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -76,18 +75,29 @@ const PULL_BACKLOG: u64 = 8;
 /// regardless of which one got (or replicated) it first — the difference
 /// between reliable and flaky reception on a light node.
 const COVERING_PEERS: usize = 5;
-/// The PSS mined-prefix lengths `L`, in bits, a receiver must cover:
-/// one per target length `/pss/send` accepts (1..=[`MAX_TARGET_LEN`]
-/// bytes, bee's API cap — ant's `upload_pss` accepts the same). The
-/// receiver cannot tell which length a sender mined to, so
-/// [`covering_bins`] takes the union of every `L`'s bins. 2-byte
-/// targets (`L = 16`) are the de-facto practice and what ant's own
-/// gateway demos use, but a 3-byte sender (`L = 24`) is equally valid
-/// and must not be silently dropped by a deep covering peer (the
+/// The PSS mined-prefix lengths `L`, in bits, a receiver covers: one
+/// per *deliverable* target length `/pss/send` accepts — 2-byte
+/// (`L = 16`) and 3-byte (`L = 24`) targets. The receiver cannot tell
+/// which length a sender mined to, so [`covering_bins`] takes the union
+/// of every listed `L`'s bins. 2-byte targets are the de-facto practice
+/// and what ant's own gateway demos use, but a 3-byte sender is equally
+/// valid and must not be silently dropped by a deep covering peer (the
 /// `b_p >= 16` regime would otherwise pull only `16..=19` while the
-/// trojan sits at `b_p` or `24 + Geom`). `L = 8` is below mainnet
-/// storage depth so it is best-effort at most, but its bins are below
-/// the peers' storage radius and cost only an empty cursor probe.
+/// trojan sits at `b_p` or `24 + Geom`).
+///
+/// **1-byte targets (`L = 8`) are deliberately not covered.** The API
+/// accepts them (bee's cap is 1..=[`ant_crypto::pss::MAX_TARGET_LEN`] bytes and ant
+/// mirrors it), but a trojan that agrees with the target on only 8 bits
+/// is pushed to whichever neighbourhood is closest to its *mined*
+/// address, which with mainnet storage depth `d ≈ 9-11 > 8` is almost
+/// never the target's — so no covering storer holds it and no
+/// receiver (bee or ant) can reliably get it. Covering `L = 8` anyway
+/// would make every PSS subscription pull bins `8..=11` from each
+/// covering peer: at `d ≈ 10` those are the storer's *fullest* reserve
+/// bins (≈ 75-90 % of its ingest vs ≈ 2-25 % for bin `b_p`), all of
+/// which `want()` downloads and trial-unwraps — a many-fold bandwidth
+/// cost on a light node to catch messages that essentially never land
+/// there. Senders wanting delivery must use ≥ 2-byte targets.
 ///
 /// Correction due to Viktor Trón: which bin a trojan `c` occupies on a
 /// covering peer `p` depends on how `b_p = PO(p, target)` compares to
@@ -103,37 +113,32 @@ const COVERING_PEERS: usize = 5;
 ///   it; the correct base is `L`, with a small deeper window for the
 ///   geometric tail (each +1 bin halves the missed mass).
 ///
-/// `L` must exceed the storage depth `d` or no storer keeps the trojan
-/// at all — one reason this is a network convention (sender and receiver
-/// MUST agree), not a per-sender free choice.
+/// `L` must exceed the storage depth `d` or no storer in the target's
+/// neighbourhood keeps the trojan at all — why `L = 8` is excluded
+/// above. Beyond that the sender picks `L` freely (via its target
+/// length); the receiver does not need to agree on one, since it covers
+/// every listed `L`.
 ///
-/// **Why 16 and not 24.** A deeper prefix concentrates a trojan into a
-/// smaller slice of the reserve (`~2^(reserve-(L-d))`), which in
-/// principle cuts a *deeply-resident* receiver's candidate traffic and
-/// shrinks the mailbox backlog. But that benefit needs covering peers at
-/// `b_p >= L`: a light node's covering peers sit at `b_p ≈ 9-14`, so for
-/// them `covering_bins` pulls bin `b_p` **regardless of `L`** (the
-/// `b_p < L` regime). Measured on mainnet: at both `L=16` and `L=24` the
+/// **Why senders should use 16, not 24.** A deeper prefix concentrates
+/// a trojan into a smaller slice of the reserve (`~2^(reserve-(L-d))`),
+/// which in principle cuts a *deeply-resident* receiver's candidate
+/// traffic and shrinks the mailbox backlog. But that benefit needs
+/// covering peers at `b_p >= L`: a light node's covering peers sit at
+/// `b_p ≈ 9-14`, below both listed `L`, so for them `covering_bins`
+/// pulls exactly bin `b_p` and nothing else (the `b_p < L` regime for
+/// every `L`). Measured on mainnet: at both `L=16` and `L=24` the
 /// receiver pulls the same bins and downloads the same candidates — the
 /// deeper prefix buys a light-node receiver nothing. It only *costs*: `L`
 /// bits is `~2^L` mine hashes, so `L=24` is ~256× the sender work
 /// (seconds on a phone, and it trips the send timeout), and PSS already
 /// carries an economic spam gate via the postage stamp every send burns.
-/// So senders should keep `L=16` (the receive side still covers every
-/// accepted length, above): cheap to mine (mobile-friendly), identical receive
-/// at light-node residency. (A deeper prefix as a network-wide anti-spam
+/// So senders should keep `L=16` (the receive side still covers `L=24`,
+/// above): cheap to mine (mobile-friendly), identical receive at
+/// light-node residency. (A deeper prefix as a network-wide anti-spam
 /// proof-of-work is a protocol-incentive question, not a
 /// receiver-efficiency one; tracked in the SWIP messaging extension's
 /// "PSS mining depth" section.)
-const PSS_MINED_PREFIX_BITS: [u8; MAX_TARGET_LEN] = {
-    let mut l = [0u8; MAX_TARGET_LEN];
-    let mut i = 0;
-    while i < MAX_TARGET_LEN {
-        l[i] = 8 * (i as u8 + 1);
-        i += 1;
-    }
-    l
-};
+const PSS_MINED_PREFIX_BITS: [u8; 2] = [16, 24];
 /// Deeper bins pulled past bin `L` (each of [`PSS_MINED_PREFIX_BITS`]) in the
 /// `b_p >= L` regime, covering the geometric tail of `PO(c, p) =
 /// L + Geom(1/2)`: a window of 3 captures 15/16 of the mass per peer,
@@ -727,7 +732,7 @@ async fn pull_bin(
 /// - **GSOC**: the watch target *is* the chunk address, so
 ///   `PO(chunk, peer) = b_p` exactly — one bin.
 /// - **PSS**: two regimes by the trie geometry (see
-///   [`PSS_MINED_PREFIX_BITS`]), evaluated for *every* accepted mined
+///   [`PSS_MINED_PREFIX_BITS`]), evaluated for *every* covered mined
 ///   prefix length `L` (the sender's choice is invisible to us) and
 ///   unioned: a peer shallower than `L` holds the trojan at exactly
 ///   `b_p`; a peer at or deeper than `L` holds it around bin `L`
@@ -745,7 +750,8 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
     }
     if want_pss {
         // The sender's prefix length is unknown to us: cover every
-        // length `/pss/send` accepts.
+        // deliverable length (2- and 3-byte targets; see
+        // PSS_MINED_PREFIX_BITS for why 1-byte is excluded).
         for l in PSS_MINED_PREFIX_BITS {
             if b_p < l {
                 // Deterministic regime: PO(c, p) = b_p exactly.
@@ -879,25 +885,33 @@ mod tests {
         v
     }
 
-    /// Accepted prefix lengths are exactly the 1..=3-byte targets
-    /// `/pss/send` takes.
+    /// Covered prefix lengths are the 2- and 3-byte targets `/pss/send`
+    /// takes; 1-byte (`L = 8`, below storage depth) is deliberately
+    /// excluded — pulling bins 8..=11 costs a light node most of each
+    /// storer's reserve ingest (R2-F1 on PR #54). The deepest covered
+    /// `L` must track the API's max target length.
     #[test]
-    fn pss_prefix_lengths_match_accepted_targets() {
-        assert_eq!(PSS_MINED_PREFIX_BITS, [8, 16, 24]);
+    fn pss_prefix_lengths_cover_deliverable_targets_only() {
+        assert_eq!(PSS_MINED_PREFIX_BITS, [16, 24]);
+        assert_eq!(
+            PSS_MINED_PREFIX_BITS.iter().max().copied(),
+            Some(8 * ant_crypto::pss::MAX_TARGET_LEN as u8)
+        );
     }
 
     /// Viktor Trón's correction, deterministic regime: a covering peer
-    /// SHALLOWER than every mined prefix (`b_p < 8`) holds the trojan at
+    /// SHALLOWER than every mined prefix (`b_p < 16`) holds the trojan at
     /// exactly bin `b_p` — the old `b_p..=b_p+3` window pulled three
     /// bins that cannot contain it.
     #[test]
     fn pss_bins_shallow_peer_is_exact() {
         assert_eq!(covering_bins(0, false, true), vec![0]);
         assert_eq!(covering_bins(7, false, true), vec![7]);
-        // Light-node residency (b_p 9..=15): exact bin for L=16/24,
-        // plus the L=8 window (below storage radius → empty, cheap).
-        assert_eq!(covering_bins(11, false, true), sorted(vec![8, 9, 10, 11]));
-        assert_eq!(covering_bins(15, false, true), vec![8, 9, 10, 11, 15]);
+        // Light-node residency (b_p 8..=15): exactly bin b_p — no extra
+        // bins (in particular not the full reserve bins 8..=11).
+        assert_eq!(covering_bins(9, false, true), vec![9]);
+        assert_eq!(covering_bins(11, false, true), vec![11]);
+        assert_eq!(covering_bins(15, false, true), vec![15]);
     }
 
     /// Geometric regime: a covering peer AT or DEEPER than a mined
@@ -915,14 +929,11 @@ mod tests {
             }
         }
         // b_p = 20: 2-byte trojans at 16..=19, 3-byte ones exactly at 20.
-        assert_eq!(
-            covering_bins(20, false, true),
-            vec![8, 9, 10, 11, 16, 17, 18, 19, 20]
-        );
+        assert_eq!(covering_bins(20, false, true), vec![16, 17, 18, 19, 20]);
         // Very deep peer (co-resident rendezvous node): every window.
         assert_eq!(
             covering_bins(30, false, true),
-            vec![8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27]
+            vec![16, 17, 18, 19, 24, 25, 26, 27]
         );
     }
 
@@ -979,10 +990,10 @@ mod tests {
     fn mixed_watch_takes_the_union_of_both_kinds() {
         // Deep peer: GSOC bin 26 lands inside the L=24 window.
         let bins = covering_bins(26, true, true);
-        assert_eq!(bins.len(), 12);
+        assert_eq!(bins.len(), 8);
         assert!(bins.contains(&26));
         // b_p = 20: GSOC and the L=24 exact bin coincide.
-        assert_eq!(covering_bins(20, true, true).len(), 9);
+        assert_eq!(covering_bins(20, true, true).len(), 5);
         // Shallow peer: both kinds want exactly b_p — deduplicated.
         assert_eq!(covering_bins(5, true, true), vec![5]);
     }
