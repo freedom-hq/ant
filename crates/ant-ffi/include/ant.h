@@ -714,7 +714,7 @@ void ant_free_string(char *ptr);
  * the postage batches ant_init reloaded from postage/<id>.bin: batches the
  * chain reports as missing, expired (remainingBalance 0) or owned by
  * another key are unregistered (files stay on disk). "Missing" must be
- * read twice, five minutes apart, before it counts (an RPC backend may
+ * read twice, 45 seconds apart, before it counts (an RPC backend may
  * not have seen a just-bought batch's creation yet); the first such read
  * only schedules a background re-check. A batch whose read fails stays
  * registered and is re-checked by the next call with a `gnosis_rpc` —

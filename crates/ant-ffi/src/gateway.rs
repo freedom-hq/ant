@@ -54,7 +54,7 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// never created), expired (`remainingBalance` 0) or owned by another
 /// key are unregistered — no longer listed by `GET /stamps`, no longer
 /// stampable — with a `WARN` naming the batch id; their files stay on
-/// disk. "Missing" must be read twice, five minutes apart, before it
+/// disk. "Missing" must be read twice, 45 seconds apart, before it
 /// counts: a batch bought just before a relaunch can read as missing
 /// on an RPC backend that hasn't seen its creation block yet, so the
 /// first such read only schedules a background re-check (the batch

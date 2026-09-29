@@ -146,10 +146,15 @@ pub(crate) struct PersistedIssuers {
 
 /// How long a persisted batch's first `NotFound` read must stand before
 /// a second one unregisters it — see
-/// [`PersistedIssuers::not_found_since`]. Matches `ant-gateway`'s
-/// `FRESH_BATCH_GRACE`.
+/// [`PersistedIssuers::not_found_since`]. A lagging load-balanced
+/// backend trails by a few blocks (5 s each on Gnosis), so 45 s covers
+/// it. Deliberately much shorter than `ant-gateway`'s five-minute
+/// `FRESH_BATCH_GRACE`: the suspect clock lives only in memory, so a
+/// grace longer than a typical mobile session (an iOS app foregrounded
+/// for a couple of minutes, then suspended or killed) would restart on
+/// every launch and never let a dead batch be unregistered.
 #[cfg(feature = "chain")]
-const PERSISTED_NOT_FOUND_GRACE: Duration = Duration::from_secs(300);
+const PERSISTED_NOT_FOUND_GRACE: Duration = Duration::from_secs(45);
 
 #[cfg(feature = "chain")]
 impl PersistedIssuers {
@@ -2531,6 +2536,18 @@ mod chain_tests {
 
     fn store(postage: &std::path::Path, id: [u8; 32]) -> std::path::PathBuf {
         postage.join(format!("{}.bin", hex::encode(id)))
+    }
+
+    /// The persisted-batch `NotFound` grace must fit inside a short
+    /// mobile session: its suspect clock is in-memory only, so a grace
+    /// longer than a foreground stint restarts on every launch and a
+    /// dead batch is never unregistered. It must still cover a backend
+    /// lagging a few Gnosis blocks.
+    #[test]
+    fn persisted_not_found_grace_fits_a_short_session() {
+        let grace = super::PERSISTED_NOT_FOUND_GRACE;
+        assert!(grace >= std::time::Duration::from_secs(30), "{grace:?}");
+        assert!(grace <= std::time::Duration::from_secs(60), "{grace:?}");
     }
 
     /// A lagging RPC backend (a batch bought just before a relaunch,
