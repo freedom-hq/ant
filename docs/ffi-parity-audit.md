@@ -96,9 +96,9 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 **Done in the follow-up (`feat/antd-settlement-parity`, stacked on the catch-up):**
 
 - **F3 (antd):** antd wires `on_batch_bought`. After a gateway buy, while settlement is still off, it re-runs its startup chequebook resolution (honouring `--no-auto-chequebook` and the manual flags) and enables settlement at runtime.
-  - Known gap: `/chequebook/address` and `/chequebook/balance` show the new chequebook only after a restart.
 - **Deposit size:** one default, `chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR` = 0.001 xBZZ. antd's default drops from 0.1 (`--chequebook-deposit-plur` still overrides it).
-- **Deposit top-up:** antd now tops an adopted chequebook back up to the target at startup and after a buy, through the shared `top_up_chequebook` that ant-ffi uses too. Before this, antd never topped up.
+- **Deposit top-up:** antd now tops an antd-managed chequebook back up to the target at startup and after every gateway buy, through the shared `top_up_chequebook` that ant-ffi uses on every buy too. Before this, antd never topped up. This matters for Freedom's setup order (xDAI, light mode, then xBZZ): the chequebook is deployed before the wallet holds any xBZZ, so it starts at zero.
+- **Live chequebook address:** `ant_gateway::ChequebookSlot` is shared by the chain context and the writer. A chequebook set up after startup (a buy-triggered deploy, or ant-ffi's gateway-start adoption) shows in `/chequebook/*` and `/wallet`, and can receive `POST /chequebook/deposit`, without a restart, in both entry points.
 
 **Deferred:**
 

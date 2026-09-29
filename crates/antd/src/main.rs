@@ -25,7 +25,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -303,8 +302,8 @@ struct Opt {
 
     /// Target xBZZ deposit behind the node's chequebook, in PLUR
     /// (1 BZZ = 1e16 PLUR). A freshly deployed chequebook is funded
-    /// with it, and an adopted one (reloaded from disk or rediscovered
-    /// on-chain) is topped back up to it. Never withdrawn from; capped
+    /// with it, and an antd-managed one is topped back up to it at
+    /// startup and after each `POST /stamps` buy. Never withdrawn from; capped
     /// to the node wallet's xBZZ, so a thin wallet gives a smaller (or
     /// zero) deposit rather than a failed transfer. Default 0.001 xBZZ,
     /// shared with `ant-ffi`
@@ -718,8 +717,8 @@ async fn main() -> Result<()> {
         signing_secret,
         eth,
         commands: cmd_tx.clone(),
-        enabled: AtomicBool::new(false),
-        resolving: tokio::sync::Mutex::new(()),
+        state: tokio::sync::Mutex::new(Settlement::Off),
+        gateway_chequebook: std::sync::OnceLock::new(),
     });
     let gateway_task = if opt.no_http_api {
         None
@@ -799,9 +798,7 @@ async fn main() -> Result<()> {
              --chequebook + --swap-key (CHEQUEBOOK_ADDRESS + WALLET_PRIVATE_KEY)",
         );
     }
-    settlement_on_buy
-        .enabled
-        .store(pushsync_swap_cfg.is_some(), Ordering::Release);
+    let startup_settlement = Settlement::of(&opt, pushsync_swap_cfg.as_ref());
 
     // Hand the chain-derived inputs to the already-running swarm loop.
     // Capacity-1 channel and a single send: this never blocks. A send
@@ -846,6 +843,15 @@ async fn main() -> Result<()> {
             Some(signing_secret),
         )
     };
+
+    // Arm the after-buy settlement with the startup outcome and the
+    // gateway's chequebook slot, before `POST /stamps` goes live below.
+    settlement_on_buy
+        .arm(
+            startup_settlement,
+            chain_ctx.as_ref().map(|c| c.chequebook.clone()),
+        )
+        .await;
 
     // Install the chain-derived wiring into the already-serving
     // gateway: `/node`, `/wallet`, `/chequebook/*`, `/stamps` writes
@@ -1739,19 +1745,8 @@ async fn resolve_chequebook(
     node_eth: [u8; 20],
     light_mode: bool,
 ) -> Result<ResolvedChequebook> {
-    let rpc_url = opt
-        .gnosis_rpc_url
-        .clone()
-        .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let manual_cb = opt
-        .chequebook
-        .clone()
-        .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let rpc_url = configured_rpc_url(opt);
+    let manual_cb = manual_chequebook(opt);
     let manual_key = opt
         .swap_key
         .clone()
@@ -2105,52 +2100,126 @@ async fn top_up_adopted_chequebook(
     }
 }
 
+/// The operator's `--gnosis-rpc-url` (or `GNOSIS_RPC_URL`), if set.
+fn configured_rpc_url(opt: &Opt) -> Option<String> {
+    opt.gnosis_rpc_url
+        .clone()
+        .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The operator-supplied `--chequebook` (or `CHEQUEBOOK_ADDRESS`), if set.
+fn manual_chequebook(opt: &Opt) -> Option<String> {
+    opt.chequebook
+        .clone()
+        .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Where outbound SWAP settlement stands, for [`SettlementOnBuy`].
+#[derive(Debug, Clone, Copy)]
+enum Settlement {
+    /// Not configured: a buy re-runs the startup chequebook resolution.
+    Off,
+    /// Running on a chequebook antd manages (persisted, rediscovered or
+    /// auto-deployed): a buy keeps its deposit topped up.
+    Managed([u8; 20]),
+    /// Running on an operator-supplied `--chequebook`: funding it is the
+    /// operator's call.
+    Manual,
+}
+
+impl Settlement {
+    fn of(opt: &Opt, pushsync: Option<&ant_p2p::PushsyncSwapConfig>) -> Self {
+        match pushsync {
+            None => Self::Off,
+            Some(_) if manual_chequebook(opt).is_some() => Self::Manual,
+            Some(cfg) => Self::Managed(cfg.chequebook),
+        }
+    }
+}
+
 /// Outbound SWAP settlement after a gateway stamp buy, as `ant-ffi`
-/// does. antd resolves its chequebook once at startup, so a node whose
-/// wallet was still unfunded then (Freedom's first run) had no
-/// settlement until restart, and its uploads stalled after ~20K chunks.
-/// After each `POST /stamps` buy, while settlement is still off, this
-/// re-runs the same startup resolution (`resolve_chequebook`: manual
-/// flags, persisted, rediscovered, auto-deploy under
-/// `--no-auto-chequebook`'s control) and switches settlement on in the
-/// running node. Only what the next restart would have done anyway,
-/// done now.
+/// does. antd resolves its chequebook once at startup, and each
+/// `POST /stamps` buy then does the following:
 ///
-/// Known gap: the gateway's chain context is built once at startup, so
-/// `/chequebook/address` and `/chequebook/balance` report the new
-/// chequebook only after a restart. Settlement itself is live at once.
+/// - **Settlement off** (e.g. the wallet was still unfunded at startup:
+///   Freedom's first run): re-run the same startup resolution
+///   (`resolve_chequebook`: manual flags; persisted, then rediscovered,
+///   then auto-deploy under `--no-auto-chequebook`'s control) and switch
+///   settlement on in the running node. That is only what the next
+///   restart would have done, done now.
+/// - **Settlement on an antd-managed chequebook**: top its deposit up
+///   to the target, as `ant-ffi` does on every buy. A chequebook
+///   deployed while the wallet held no xBZZ yet starts at zero; Freedom's
+///   setup order (xDAI, light mode, then xBZZ) does exactly that. It
+///   would otherwise stay empty until the next restart, and uploads
+///   stall once peers stop extending credit.
+/// - **Settlement on a `--chequebook`**: nothing; it's the operator's.
+///
+/// A chequebook set up here is also written to the gateway's chequebook
+/// slot, so `/chequebook/*`, `/wallet` and `POST /chequebook/deposit`
+/// see it without a restart.
 struct SettlementOnBuy {
     opt: Opt,
     data_dir: PathBuf,
     signing_secret: [u8; SECP256K1_SECRET_LEN],
     eth: [u8; 20],
     commands: mpsc::Sender<ControlCommand>,
-    /// Outbound settlement is configured (at startup or by a buy), so
-    /// later buys have nothing to do.
-    enabled: AtomicBool,
-    /// One resolution at a time, so two quick buys can't both deploy.
-    resolving: tokio::sync::Mutex<()>,
+    /// Held for the whole resolution or top-up, so two quick buys can't
+    /// both deploy (or both top up).
+    state: tokio::sync::Mutex<Settlement>,
+    /// The gateway chain context's chequebook slot, once built.
+    gateway_chequebook: std::sync::OnceLock<ant_gateway::ChequebookSlot>,
 }
 
 impl SettlementOnBuy {
-    /// The gateway hook: a cheap flag check, then the resolution runs
-    /// on its own task so the buy response doesn't wait for it.
+    /// Record the startup outcome and the gateway's chequebook slot.
+    /// Called once, before `POST /stamps` can fire the hook.
+    async fn arm(&self, state: Settlement, slot: Option<ant_gateway::ChequebookSlot>) {
+        *self.state.lock().await = state;
+        if let Some(slot) = slot {
+            let _ = self.gateway_chequebook.set(slot);
+        }
+    }
+
+    /// The gateway hook: the work runs on its own task, so the buy
+    /// response doesn't wait for it.
     fn hook(self: &Arc<Self>) -> ant_gateway::BatchBoughtHook {
         let this = Arc::clone(self);
         Arc::new(move |_batch_id| {
-            if this.enabled.load(Ordering::Acquire) {
-                return;
-            }
             let this = Arc::clone(&this);
             tokio::spawn(async move { this.run().await });
         })
     }
 
     async fn run(&self) {
-        let _one_at_a_time = self.resolving.lock().await;
-        if self.enabled.load(Ordering::Acquire) {
-            return;
+        let mut state = self.state.lock().await;
+        match *state {
+            Settlement::Manual => {}
+            Settlement::Managed(chequebook) => {
+                top_up_adopted_chequebook(
+                    &self.opt,
+                    configured_rpc_url(&self.opt).as_deref(),
+                    self.signing_secret,
+                    &self.eth,
+                    chequebook,
+                )
+                .await;
+            }
+            Settlement::Off => {
+                if let Some(now) = self.enable().await {
+                    *state = now;
+                }
+            }
         }
+    }
+
+    /// Re-run the startup resolution and, when it yields a chequebook,
+    /// switch settlement on in the running node. Returns the new state.
+    async fn enable(&self) -> Option<Settlement> {
         let resolved = match resolve_chequebook(
             &self.opt,
             &self.data_dir,
@@ -2166,13 +2235,11 @@ impl SettlementOnBuy {
                     target: "antd",
                     "could not set up outbound SWAP settlement after a stamp buy: {e:#}",
                 );
-                return;
+                return None;
             }
         };
         // `resolve_chequebook` already logged why when there's none.
-        let Some(cfg) = resolved.pushsync else {
-            return;
-        };
+        let cfg = resolved.pushsync?;
         let (ack_tx, ack_rx) = oneshot::channel();
         let cmd = ControlCommand::EnablePushsyncSwap {
             chequebook: cfg.chequebook,
@@ -2181,23 +2248,27 @@ impl SettlementOnBuy {
             outbound_ledger_path: cfg.outbound_ledger_path.to_string_lossy().into_owned(),
             ack: ack_tx,
         };
-        if self.commands.send(cmd).await.is_err() {
-            return;
-        }
+        self.commands.send(cmd).await.ok()?;
         match ack_rx.await {
             Ok(ControlAck::Ok { .. }) => {
-                self.enabled.store(true, Ordering::Release);
+                if let Some(slot) = self.gateway_chequebook.get() {
+                    slot.set(cfg.chequebook);
+                }
                 tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
                     "outbound SWAP settlement enabled after a stamp buy — pushsync will emit cheques",
                 );
+                Some(Settlement::of(&self.opt, Some(&cfg)))
             }
-            Ok(ControlAck::Error { message }) => tracing::warn!(
-                target: "antd",
-                "enable outbound SWAP settlement: {message}",
-            ),
-            _ => {}
+            Ok(ControlAck::Error { message }) => {
+                tracing::warn!(
+                    target: "antd",
+                    "enable outbound SWAP settlement: {message}",
+                );
+                None
+            }
+            _ => None,
         }
     }
 }
