@@ -392,6 +392,19 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Final flush when the store goes away. The swarm loop owns the store,
+/// and neither shutdown path returns through the loop: `antd` on
+/// SIGTERM returns from `main` and drops the runtime, and `ant_shutdown`
+/// cancels the runtime's tasks. Both drop the loop's future, and with it
+/// the store, so this is the one point both reach. Without it, up to a
+/// flush interval (30 s) of peer state was lost on every shutdown.
+/// A no-op when nothing changed or the store is disabled.
+impl Drop for PeerStore {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +536,36 @@ mod tests {
         store.flush();
         assert!(path.exists());
         assert_eq!(PeerStore::load(path).len(), 1);
+    }
+
+    #[test]
+    fn drop_flushes_unsaved_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let peer = fake_peer(9);
+        {
+            let mut store = PeerStore::load(path.clone());
+            store.record_success(peer, vec![fake_addr(1635)], [0x12; 32], 0, None);
+            // No explicit flush: the loop's timer hasn't fired yet when
+            // the node shuts down.
+        }
+        assert!(
+            PeerStore::load(path).contains(&peer),
+            "dropping the store must persist it"
+        );
+    }
+
+    #[test]
+    fn drop_after_clear_does_not_resurrect_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        {
+            let mut store = PeerStore::load(path.clone());
+            store.record_success(fake_peer(4), vec![fake_addr(1)], [0x34; 32], 0, None);
+            store.flush();
+            store.clear();
+        }
+        assert!(!path.exists(), "a reset must survive the final flush");
     }
 
     #[test]
