@@ -45,6 +45,22 @@
     everywhere. The test stubs only fail under `--all-targets`, which is
     precisely why step 2 is whole-workspace-all-targets and per-crate
     checks miss them.
+- **One orchestration, two sequencers.** `antd` and `ant-ffi` are two
+ entry points over the same node. Any startup or chain-init decision
+ both need (what counts as a dead batch, when a chequebook is usable or
+ may be deployed, …) is a named `pub` helper in a shared orchestration
+ module, today `ant_chain::discover` and `ant_chain::chequebook_store`.
+ `crates/antd/src/main.rs` and `crates/ant-ffi/src/` only *sequence*
+ those helpers; they don't re-implement the decision. A fix to such a
+ decision goes into the helper so both entry points get it. The #49
+ phantom-batch fix shipped in `antd` only for exactly this reason.
+   - `docs/ffi-parity-audit.md` is the reference matrix of every
+    orchestration step, runtime behaviour and config knob on both sides.
+    Update it when you add or change one.
+   - The `parity_guard` test in `ant-ffi` (runs in gate step 5) fails when
+    a helper in those modules is used by only one entry point. If that's
+    deliberate, add it to `ONE_SIDED` there with the reason; otherwise
+    call it from the other side too.
 - Bump the patch version (`x.y.Z` → `x.y.Z+1`) of every workspace
  crate whose Cargo.toml declares one — currently `antd`, `antctl`,
  `antop`, `ant-chain`, `ant-control`, `ant-crypto`, `ant-ffi`,

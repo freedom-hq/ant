@@ -28,6 +28,8 @@ mod gateway;
 #[cfg(feature = "jni")]
 mod jni;
 mod manifest;
+#[cfg(test)]
+mod parity_guard;
 mod stream;
 
 // The gateway FFI lives in a private submodule; re-export its C-ABI
