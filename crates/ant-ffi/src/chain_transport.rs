@@ -443,14 +443,14 @@ mod tests {
             gateway_task: std::sync::Mutex::new(None),
             bench: std::sync::Mutex::new(None),
             chain_transport: std::sync::Arc::new(HostChainTransport::new()),
-            persisted_issuers: std::sync::Arc::new(crate::drive::PersistedIssuers::new(
-                std::sync::Arc::new(ant_p2p::UploadRuntime {
+            chain_init: std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(
+                ant_p2p::UploadRuntime {
                     issuers: std::sync::Mutex::new(std::collections::HashMap::new()),
                     stamp_key: [0u8; 32],
                     batch_owner: [0u8; 20],
                     postage_dir: std::path::PathBuf::from("/nonexistent/postage"),
-                }),
-            )),
+                },
+            ))),
         };
         (handle, (cmd_rx, status_tx))
     }

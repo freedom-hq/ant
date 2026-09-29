@@ -195,11 +195,11 @@ pub struct AntHandle {
     /// `host_ctx` the host has since freed.
     #[cfg(feature = "chain")]
     chain_transport: Arc<chain_transport::HostChainTransport>,
-    /// Postage batches reloaded from disk at init that the chain has not
-    /// confirmed yet (init has no RPC). [`ant_start_gateway`] checks
-    /// them once it has one and unregisters the ones the chain disowns.
+    /// The chain-derived startup work `ant_init` can't do without an
+    /// RPC: confirm reloaded batches, rediscover owned ones, adopt the
+    /// chequebook. [`ant_start_gateway`] runs it once it has an RPC.
     #[cfg(feature = "chain")]
-    persisted_issuers: Arc<drive::PersistedIssuers>,
+    chain_init: Arc<drive::ChainInit>,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
@@ -813,7 +813,7 @@ fn init_inner(
         postage_dir: postage_dir.clone(),
     });
     #[cfg(feature = "chain")]
-    let persisted_issuers = Arc::new(drive::PersistedIssuers::new(Arc::clone(&upload_runtime)));
+    let chain_init = Arc::new(drive::ChainInit::new(Arc::clone(&upload_runtime)));
     let upload_manager = UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), None)
         .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?
         // Read the live status watch so the automatic post-upload heal can
@@ -937,7 +937,7 @@ fn init_inner(
         #[cfg(feature = "chain")]
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
-        persisted_issuers,
+        chain_init,
     })
 }
 
@@ -3790,7 +3790,7 @@ mod tests {
             #[cfg(feature = "chain")]
             chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
             #[cfg(feature = "chain")]
-            persisted_issuers: Arc::new(drive::PersistedIssuers::new(Arc::new(UploadRuntime {
+            chain_init: Arc::new(drive::ChainInit::new(Arc::new(UploadRuntime {
                 issuers: Mutex::new(std::collections::HashMap::new()),
                 stamp_key: [0u8; SECP256K1_SECRET_LEN],
                 batch_owner: [0u8; 20],

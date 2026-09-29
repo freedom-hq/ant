@@ -47,14 +47,25 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (`antd`) parity. Only honoured when the crate is built with the
 /// `chain` feature; ignored otherwise.
 ///
-/// A `gnosis_rpc` also triggers the on-chain check of the postage
-/// batches [`crate::ant_init`] reloaded from `postage/*.bin` (it had no
-/// RPC to do it itself). It runs in the background right after the
-/// gateway starts: batches the chain reports as missing (expired or
-/// never created) or owned by another key are unregistered — no longer
-/// listed by `GET /stamps`, no longer stampable — with a `WARN` naming
-/// the batch id; their files stay on disk. A batch whose read fails
-/// stays registered and is re-checked on the next start.
+/// A `gnosis_rpc` also triggers the chain-derived startup work
+/// [`crate::ant_init`] can't do without an RPC (`drive::ChainInit`,
+/// the counterpart of `antd`'s startup chain block). It runs in the
+/// background right after the gateway starts:
+///
+/// 1. Reloaded `postage/*.bin` batches the chain reports as missing
+///    (expired or never created) or owned by another key are
+///    unregistered, with a `WARN` naming the batch id. They're no longer
+///    listed by `GET /stamps` and can't be stamped with; their files
+///    stay on disk. A batch whose read fails stays registered and is
+///    re-checked on the next start.
+/// 2. Funded batches the account owns on-chain but not on disk
+///    (reinstall, restore from key) are registered.
+/// 3. The persisted or on-chain chequebook is adopted and outbound
+///    settlement switched on. Nothing is deployed or funded.
+///
+/// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
+/// sure settlement is on afterwards, deploying and funding a chequebook
+/// if the account has none, as `ant_storage_buy` does.
 ///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
@@ -237,6 +248,18 @@ pub unsafe extern "C" fn ant_start_gateway(
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
 
+        // One chain client, routed through the host transport like every
+        // client this crate builds, for the background chain init and
+        // the after-buy hook below.
+        #[cfg(feature = "chain")]
+        let chain_client = gnosis_rpc.clone().map(|rpc| handle.chain_client(rpc));
+        #[cfg(feature = "chain")]
+        let on_batch_bought = chain_client
+            .clone()
+            .map(|client| after_buy_hook(handle, client));
+        #[cfg(not(feature = "chain"))]
+        let on_batch_bought = None;
+
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
             api_version: Arc::new(BEE_API_VERSION.to_string()),
@@ -274,7 +297,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             // ACT publisher identity: the node signing key, like bee's
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),
-            on_batch_bought: None,
+            on_batch_bought,
         };
 
         let task = handle.runtime.spawn(async move {
@@ -284,25 +307,48 @@ pub unsafe extern "C" fn ant_start_gateway(
         });
         *slot = Some(task);
 
-        // First point an RPC is known: confirm the postage batches
-        // `ant_init` reloaded from disk and unregister the ones the chain
-        // disowns (expired / never created / foreign), as `antd` does at
-        // startup — otherwise `/stamps` keeps offering a dead batch until
-        // a peer rejects the first push. Off the caller's thread so the
-        // gateway start never waits on the RPC; batches whose read fails
-        // stay registered and are retried on the next start.
+        // First point an RPC is known: run the chain-derived startup
+        // work `ant_init` couldn't (see the doc comment above). Off the
+        // caller's thread so the gateway start never waits on the RPC.
         #[cfg(feature = "chain")]
-        if let Some(rpc) = gnosis_rpc {
-            let chain = handle.chain_client(rpc);
-            let persisted = Arc::clone(&handle.persisted_issuers);
+        if let Some(chain) = chain_client {
+            let init = Arc::clone(&handle.chain_init);
+            let cmd_tx = handle.cmd_tx.clone();
+            let data_dir = handle.data_dir.clone();
+            let secret = handle.signing_secret;
             handle.runtime.spawn(async move {
-                persisted
-                    .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
-                    .await;
+                init.run(&chain, &cmd_tx, &data_dir, secret).await;
             });
         }
         true
     }
+}
+
+/// The gateway's after-buy hook: once `POST /stamps` has bought and
+/// registered a batch, make sure outbound settlement is on, resolving,
+/// deploying or funding the chequebook exactly as `ant_storage_buy`
+/// does. Without it, the first batch bought through the gateway in a
+/// fresh install's session uploads without paying peers until the next
+/// launch. Spawned so the buy response doesn't wait on it. The
+/// chequebook setup lock serialises it against a concurrent
+/// `ant_deploy_chequebook` or chain init.
+#[cfg(feature = "chain")]
+fn after_buy_hook(
+    handle: &AntHandle,
+    client: ant_chain::ChainClient,
+) -> ant_gateway::BatchBoughtHook {
+    let rt = handle.runtime.handle().clone();
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let secret = handle.signing_secret;
+    let eth = handle.eth;
+    Arc::new(move |_batch_id| {
+        let (client, cmd_tx, data_dir) = (client.clone(), cmd_tx.clone(), data_dir.clone());
+        rt.spawn(async move {
+            crate::drive::ensure_settlement_best_effort(&cmd_tx, &client, secret, &data_dir, eth)
+                .await;
+        });
+    })
 }
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
