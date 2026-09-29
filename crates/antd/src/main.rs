@@ -659,6 +659,10 @@ async fn main() -> Result<()> {
     let (late_chain_tx, late_chain_rx) = mpsc::channel::<ant_node::LateChainInit>(1);
     let mut node_task = tokio::spawn(run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
+            // `--network-id` / config `network-id`: the overlay logged and
+            // reported above was derived from it, so the swarm must use the
+            // same value or its handshake overlay won't match.
+            .with_network_id(opt.network_id)
             .with_status(status_tx)
             .with_process_start(process_start)
             .with_external_addrs(external_addrs)
