@@ -4586,12 +4586,30 @@ mod chain_tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait (bounded, not a fixed sleep) for the two pre-lock
+        // chequebook checks, so a slow runner can't fail this spuriously.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while script.seen("eth_call") < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the chequebook checks never ran"
+            );
+            assert!(
+                !task.is_finished(),
+                "top-up finished while the lock was held"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Give a deposit read that wrongly skipped the lock time to show
+        // up. A slow runner can only make this pass vacuously, never fail
+        // correct code.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             script.seen("eth_call"),
             2,
             "only the factory + issuer checks run before the lock; the deposit read waits",
         );
+        assert!(!task.is_finished(), "the top-up is parked on the lock");
         drop(held);
         let res = tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
