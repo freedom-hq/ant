@@ -718,6 +718,7 @@ async fn main() -> Result<()> {
         eth,
         commands: cmd_tx.clone(),
         state: tokio::sync::Mutex::new(Settlement::Off),
+        pending: RunCoalescer::default(),
         gateway_chequebook: std::sync::OnceLock::new(),
         wallet: WalletCoord::default(),
     });
@@ -1891,9 +1892,11 @@ async fn resolve_chequebook(
     //    the association so future starts skip the scan) rather than
     //    deploying a fresh one and stranding the old balance.
     //    A scan that already answered "none" in this process isn't
-    //    repeated: only our own deploy (persisted, so step 2 finds it)
-    //    can change that answer, and each scan reads the whole log
-    //    history since the xBZZ deploy block.
+    //    repeated: only our own deploy can change that answer, and each
+    //    scan reads the whole log history since the xBZZ deploy block.
+    //    A deploy that succeeded is persisted (step 2 finds it); one that
+    //    failed may still have landed with no record, so it re-arms the
+    //    scan (`WalletCoord::note_deploy_attempt`).
     let scan_rpc = resolve_logs_rpc(opt).filter(|_| {
         !wallet
             .no_owned_chequebook
@@ -2031,6 +2034,7 @@ async fn resolve_chequebook(
         )
         .await
     };
+    wallet.note_deploy_attempt(&deployed);
     match deployed {
         Ok(cb) => {
             // Freshly factory-deployed, so it's registered by construction
@@ -2199,16 +2203,61 @@ struct WalletCoord {
     /// so there is nothing to coordinate with.
     tx_lock: std::sync::OnceLock<ant_gateway::WalletTxLock>,
     /// A rediscovery scan answered authoritatively "this EOA owns no
-    /// chequebook": later resolutions skip the scan.
+    /// chequebook": later resolutions skip the scan. Cleared by any
+    /// deploy attempt that may have reached the chain (see
+    /// [`Self::note_deploy_attempt`]).
     no_owned_chequebook: std::sync::atomic::AtomicBool,
 }
 
 impl WalletCoord {
+    /// Forget the remembered "no chequebook" answer after an auto-deploy
+    /// attempt, unless it provably never sent a transaction.
+    ///
+    /// The answer only stays true while nothing was deployed. A
+    /// successful deploy is persisted (step 2 finds it), but a failed
+    /// one can still have broadcast the deploy: a receipt wait that
+    /// timed out, an RPC error while polling for the receipt, or a
+    /// `chequebook.json` write that failed after the deploy mined. The
+    /// chequebook then exists on-chain with no record, and only the
+    /// rediscovery scan can find it; skipping the scan would deploy a
+    /// second one. The one error known to be raised before any
+    /// transaction is the gas pre-check's `InsufficientGas`, so that
+    /// alone keeps the answer (a wallet still waiting for xDAI doesn't
+    /// rescan the log history on every buy).
+    fn note_deploy_attempt(
+        &self,
+        outcome: &std::result::Result<[u8; 20], ant_chain::chequebook_store::ChequebookError>,
+    ) {
+        use ant_chain::chequebook_store::ChequebookError;
+        if !matches!(outcome, Err(ChequebookError::InsufficientGas { .. })) {
+            self.no_owned_chequebook
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     async fn tx_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         match self.tx_lock.get() {
             Some(lock) => Some(Arc::clone(lock).lock_owned().await),
             None => None,
         }
+    }
+}
+
+/// At most one queued run behind the one in progress, for
+/// [`SettlementOnBuy::hook`].
+#[derive(Default)]
+struct RunCoalescer(std::sync::atomic::AtomicBool);
+
+impl RunCoalescer {
+    /// A buy wants a run. `true`: spawn one; `false`: a run is already
+    /// queued and hasn't started yet, so it covers this buy too.
+    fn request(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The queued run got the state lock and starts its work.
+    fn started(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2269,6 +2318,9 @@ struct SettlementOnBuy {
     /// Held for the whole resolution or top-up, so two quick buys can't
     /// both deploy (or both top up).
     state: tokio::sync::Mutex<Settlement>,
+    /// Coalesces after-buy runs: at most one waits behind the one in
+    /// progress (see [`Self::hook`]).
+    pending: RunCoalescer,
     /// The gateway chain context's chequebook slot, once built.
     gateway_chequebook: std::sync::OnceLock<ant_gateway::ChequebookSlot>,
     /// Shared with the startup resolution.
@@ -2315,9 +2367,17 @@ impl SettlementOnBuy {
 
     /// The gateway hook: the work runs on its own task, so the buy
     /// response doesn't wait for it.
+    ///
+    /// A run can hold the state lock for a transfer receipt (up to a
+    /// minute) or a log scan. Buys that land meanwhile don't each queue
+    /// their own run: one run waits behind the current one and covers
+    /// them all, since each run re-reads the chain from scratch.
     fn hook(self: &Arc<Self>) -> ant_gateway::BatchBoughtHook {
         let this = Arc::clone(self);
         Arc::new(move |_batch_id| {
+            if !this.pending.request() {
+                return;
+            }
             let this = Arc::clone(&this);
             tokio::spawn(async move { this.run().await });
         })
@@ -2325,6 +2385,9 @@ impl SettlementOnBuy {
 
     async fn run(&self) {
         let mut state = self.state.lock().await;
+        // From here on a new buy needs a new run: this one may already
+        // have read the balances that buy changed.
+        self.pending.started();
         match *state {
             Settlement::Manual => {}
             Settlement::Managed(chequebook) => {
@@ -2619,4 +2682,63 @@ fn secp256k1_keypair_from_signing_secret(secret: &[u8; SECP256K1_SECRET_LEN]) ->
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let kp = identity::secp256k1::Keypair::from(sk);
     Ok(Keypair::from(kp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ant_chain::chequebook_store::ChequebookError;
+    use std::sync::atomic::Ordering;
+
+    fn coord_after_none_scan() -> WalletCoord {
+        let coord = WalletCoord::default();
+        coord.no_owned_chequebook.store(true, Ordering::Relaxed);
+        coord
+    }
+
+    /// R2-F1: a deploy that failed after it may have broadcast must
+    /// re-enable the rediscovery scan, or the next resolution deploys a
+    /// second chequebook next to the orphaned first one.
+    #[test]
+    fn failed_deploy_that_may_have_broadcast_rearms_the_scan() {
+        for err in [
+            ChequebookError::Chain("factory.deploySimpleSwap: receipt timeout".into()),
+            ChequebookError::NoDeployLog("ab".into()),
+            ChequebookError::Write("chequebook.json".into(), std::io::Error::other("disk full")),
+        ] {
+            let coord = coord_after_none_scan();
+            coord.note_deploy_attempt(&Err(err));
+            assert!(!coord.no_owned_chequebook.load(Ordering::Relaxed));
+        }
+        let coord = coord_after_none_scan();
+        coord.note_deploy_attempt(&Ok([1u8; 20]));
+        assert!(!coord.no_owned_chequebook.load(Ordering::Relaxed));
+    }
+
+    /// The gas pre-check fails before any transaction, so the "none"
+    /// answer still holds and buys keep skipping the log scan.
+    #[test]
+    fn insufficient_gas_keeps_the_none_answer() {
+        let coord = coord_after_none_scan();
+        coord.note_deploy_attempt(&Err(ChequebookError::InsufficientGas {
+            wallet: String::new(),
+            have: "0".into(),
+            need: "1".into(),
+        }));
+        assert!(coord.no_owned_chequebook.load(Ordering::Relaxed));
+    }
+
+    /// R2-M2: buys during a run queue exactly one follow-up.
+    #[test]
+    fn run_coalescer_queues_one_follow_up() {
+        let c = RunCoalescer::default();
+        assert!(c.request(), "first buy spawns a run");
+        assert!(!c.request(), "a buy before it starts is covered by it");
+        c.started();
+        assert!(c.request(), "a buy during the run queues one follow-up");
+        assert!(!c.request());
+        assert!(!c.request());
+        c.started();
+        assert!(c.request());
+    }
 }

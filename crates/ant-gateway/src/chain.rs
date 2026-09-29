@@ -171,7 +171,10 @@ impl From<Option<[u8; 20]>> for ChequebookSlot {
 /// drain the xBZZ a buy's balance guard just counted. The write
 /// endpoints hold it from their pre-checks through the last receipt;
 /// an embedder that sends from the same wallet outside the gateway
-/// clones it from [`ChainContext::tx_lock`] and holds it the same way.
+/// clones it from [`ChainContext::tx_lock`] (antd) or passes its own to
+/// [`crate::chainreader::build_with_transport`] (ant-ffi, which rebuilds
+/// the context on every gateway start) and holds it the same way. It
+/// only serializes senders that share the one lock.
 pub type WalletTxLock = std::sync::Arc<tokio::sync::Mutex<()>>;
 
 /// Everything the chain-backed endpoints need beyond the reader: the

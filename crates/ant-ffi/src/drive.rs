@@ -1315,6 +1315,10 @@ pub(crate) fn storage_topup_xdai(
             .checked_mul(1u128 << depth)
             .ok_or_else(|| DriveError::Op("top-up cost overflows".into()))?;
 
+        // Swap, approve and top-up under the account's wallet tx lock
+        // (see [`wallet_tx_lock`]).
+        let _tx = wallet_tx_lock(&owner).lock_owned().await;
+
         // 1) Cover the xBZZ shortfall by swapping xDAI, if any — the
         //    same flow as storage_buy_xdai.
         let have_bzz = client
@@ -1519,6 +1523,10 @@ pub(crate) fn storage_buy(
             .checked_mul(U256::one() << u32::from(depth))
             .ok_or_else(|| DriveError::Op("plan cost overflows".into()))?;
 
+        // Approve and createBatch under the account's wallet tx lock (see
+        // [`wallet_tx_lock`]); released before the settlement step below,
+        // which takes it itself.
+        let tx = wallet_tx_lock(&owner).lock_owned().await;
         wallet
             .approve_bzz(&client, &bzz, &postage, total)
             .await
@@ -1539,6 +1547,7 @@ pub(crate) fn storage_buy(
             .map_err(|e| DriveError::Op(format!("buy storage: {e}")))?;
         let batch_id = ant_chain::tx::extract_created_batch_id(&receipt)
             .ok_or_else(|| DriveError::Op("storage purchase receipt had no batch".into()))?;
+        drop(tx);
         register_batch(&cmd_tx, batch_id, depth, POSTAGE_BUCKET_DEPTH, immutable).await?;
         // Now that the wallet is funded and a batch exists, make sure
         // outbound settlement is on so the upload actually reaches the
@@ -1590,6 +1599,11 @@ pub(crate) fn storage_buy_xdai(
         let total_plur = amount
             .checked_mul(1u128 << depth)
             .ok_or_else(|| DriveError::Op("plan cost overflows".into()))?;
+
+        // Balance read, swap, approve and createBatch under the account's
+        // wallet tx lock (see [`wallet_tx_lock`]); released before the
+        // settlement step below, which takes it itself.
+        let tx = wallet_tx_lock(&owner).lock_owned().await;
 
         // 1) Top up xBZZ by swapping xDAI for the shortfall, if any. The
         //    shortfall covers the plan *and* the settlement deposit the
@@ -1657,6 +1671,7 @@ pub(crate) fn storage_buy_xdai(
             .map_err(|e| DriveError::Op(format!("buy storage: {e}")))?;
         let batch_id = ant_chain::tx::extract_created_batch_id(&receipt)
             .ok_or_else(|| DriveError::Op("storage purchase receipt had no batch".into()))?;
+        drop(tx);
         register_batch(&cmd_tx, batch_id, depth, POSTAGE_BUCKET_DEPTH, immutable).await?;
         // Now that the wallet is funded and a batch exists, make sure
         // outbound settlement is on so the upload actually reaches the
@@ -1810,6 +1825,35 @@ pub(crate) async fn setup_settlement(
     }
     enable_settlement(cmd_tx, resolved.address, swap_secret, data_dir).await;
     Ok(Some(resolved.address))
+}
+
+/// One [`ant_gateway::WalletTxLock`] per node account, process-wide.
+///
+/// Every transaction ant-ffi sends from the node wallet holds it: the
+/// storage buy / top-up / xDAI-swap flows, the chequebook deploy, and
+/// the deposit transfers (including the gateway's spawned after-buy
+/// settlement task). The in-process gateway's `ChainContext` gets the
+/// same lock (see [`crate::gateway`]), so a `POST /stamps` can't race
+/// that background deposit for a pending nonce, or for the xBZZ its
+/// balance guard just counted. Keyed by account because the wallet
+/// (and its nonce sequence) is; process-wide because gateways are
+/// rebuilt on every start and more than one handle can drive the same
+/// account.
+///
+/// Not reentrant: hold it around the transaction steps only, never
+/// across a call into another path that takes it (e.g. drop it before
+/// [`ensure_settlement`]).
+#[cfg(feature = "chain")]
+pub(crate) fn wallet_tx_lock(owner: &[u8; 20]) -> ant_gateway::WalletTxLock {
+    static LOCKS: std::sync::Mutex<
+        std::collections::BTreeMap<[u8; 20], ant_gateway::WalletTxLock>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(*owner)
+        .or_default()
+        .clone()
 }
 
 /// `(owner, chequebook)` pairs the last chain check in this process
@@ -2067,7 +2111,11 @@ async fn fund_chequebook_best_effort(
 ) -> Option<String> {
     use ant_chain::chequebook_store::{top_up_chequebook, TopUp};
 
-    match top_up_chequebook(client, wallet, node_eth, chequebook, deposit::TARGET_PLUR).await {
+    let funded = {
+        let _tx = wallet_tx_lock(node_eth).lock_owned().await;
+        top_up_chequebook(client, wallet, node_eth, chequebook, deposit::TARGET_PLUR).await
+    };
+    match funded {
         Ok(TopUp::Refused(_)) => {
             match check_persisted_chequebook(
                 client,
@@ -2228,6 +2276,9 @@ async fn settlement_topup_xdai_for(
 
     let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
         .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
+    // Balance read, swap and deposit transfer under the account's wallet
+    // tx lock (see [`wallet_tx_lock`]).
+    let _tx = wallet_tx_lock(&owner).lock_owned().await;
     let have_bzz = client
         .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
         .await
@@ -2680,15 +2731,18 @@ async fn resolve_or_deploy_chequebook(
     //    the wallet's xBZZ balance (a thin wallet gets a smaller deposit
     //    rather than a failed transfer). Insufficient gas is a soft skip
     //    — settlement turns on once the wallet has a little more xDAI.
-    match chequebook_store::auto_deploy_chequebook(
-        client,
-        wallet,
-        &node_eth,
-        deposit::TARGET_PLUR,
-        &persist_path,
-    )
-    .await
-    {
+    let deployed = {
+        let _tx = wallet_tx_lock(&node_eth).lock_owned().await;
+        chequebook_store::auto_deploy_chequebook(
+            client,
+            wallet,
+            &node_eth,
+            deposit::TARGET_PLUR,
+            &persist_path,
+        )
+        .await
+    };
+    match deployed {
         Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
             address: cb,
             deployed: true,
@@ -3101,6 +3155,88 @@ mod chain_tests {
     use ant_chain::{ChainClient, ChainTransport};
     use serde_json::json;
     use std::sync::Mutex;
+
+    /// Records every method and fails it: enough to see whether a path
+    /// touched the chain at all.
+    struct FailingChain {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ChainTransport for FailingChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            self.seen
+                .lock()
+                .unwrap()
+                .push(req["method"].as_str().unwrap().to_string());
+            Some(
+                json!({"jsonrpc": "2.0", "id": req["id"],
+                       "error": {"code": -32603, "message": "scripted failure"}})
+                .to_string(),
+            )
+        }
+    }
+
+    /// R2-M1: the gateway's `ChainContext` and ant-ffi's own spend paths
+    /// share one wallet tx lock per account, so the after-buy deposit
+    /// top-up can't start its balance reads and transfer while a
+    /// `POST /stamps` (which holds the context's lock) is mid-buy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deposit_top_up_waits_for_the_gateway_wallet_tx_lock() {
+        let wallet = ant_chain::tx::Wallet::new([0x5a; 32], crate::GNOSIS_CHAIN_ID).unwrap();
+        let node_eth = *wallet.address();
+        let lock = super::wallet_tx_lock(&node_eth);
+        assert!(std::sync::Arc::ptr_eq(
+            &lock,
+            &super::wallet_tx_lock(&node_eth)
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &lock,
+            &super::wallet_tx_lock(&[0x11; 20])
+        ));
+
+        let ctx = ant_gateway::chainreader::build_with_transport(
+            Some("http://127.0.0.1:1".into()),
+            None,
+            ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),
+            node_eth,
+            None,
+            crate::GNOSIS_CHAIN_ID,
+            Some([0x5a; 32]),
+            None,
+            lock.clone(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&ctx.tx_lock, &lock));
+
+        let script = std::sync::Arc::new(FailingChain {
+            seen: Mutex::new(Vec::new()),
+        });
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+        let dir = std::env::temp_dir().join(format!("ant-txlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A gateway buy in flight.
+        let buy = ctx.tx_lock.clone().lock_owned().await;
+        let task = {
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                super::fund_chequebook_best_effort(&client, &wallet, &dir, &node_eth, &[0xcb; 20])
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            script.seen.lock().unwrap().is_empty(),
+            "the top-up touched the chain while the buy held the lock",
+        );
+        drop(buy);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("top-up finishes once the buy releases the lock");
+        assert!(!script.seen.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A `to` address the node EOA once funded — the single candidate
     /// the rediscovery scan has to verify.

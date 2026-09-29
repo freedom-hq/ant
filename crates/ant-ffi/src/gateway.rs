@@ -270,6 +270,11 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // `/wallet`, `/stamps`, `/chainstate` and `/chequebook`
                 // reading the `gnosis_rpc` URL exactly as before.
                 handle.host_chain_transport(),
+                // The account's process-wide wallet tx lock, which the
+                // drive flows and the after-buy settlement task below
+                // hold too: a `POST /stamps` can't race their deposit
+                // transfer or deploy for a nonce or for xBZZ.
+                crate::drive::wallet_tx_lock(&handle.eth),
             )
         } else {
             None

@@ -253,6 +253,7 @@ pub fn build(
         chain_id,
         wallet_secret,
         None,
+        crate::WalletTxLock::default(),
     )
 }
 
@@ -264,6 +265,11 @@ pub fn build(
 ///
 /// `chequebook` may be an embedder-owned [`ChequebookSlot`] (cloning
 /// shares it), so the embedder can update the address after startup.
+///
+/// `tx_lock` becomes [`ChainContext::tx_lock`]. An embedder that also
+/// sends from the node wallet outside the gateway, and rebuilds the
+/// gateway (each start builds a fresh context), passes the one lock its
+/// own transactions hold, so every context it builds shares it.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_with_transport(
@@ -275,6 +281,7 @@ pub fn build_with_transport(
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
     transport: Option<ant_chain::SharedChainTransport>,
+    tx_lock: crate::WalletTxLock,
 ) -> Option<Arc<ChainContext>> {
     // Treat blank strings as unset so an empty env/config value behaves
     // like an absent one.
@@ -324,7 +331,7 @@ pub fn build_with_transport(
         chequebook,
         chain_id,
         writer,
-        tx_lock: crate::WalletTxLock::default(),
+        tx_lock,
     }))
 }
 
