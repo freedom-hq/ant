@@ -132,7 +132,24 @@ pub(crate) struct PersistedIssuers {
     /// foreground can overlap a pass still in flight. The second waits
     /// and then only sees what the first left pending.
     pass: tokio::sync::Mutex<()>,
+    /// Batches a read reported `NotFound` for, and when it first did.
+    /// One such read isn't believed on its own: a batch bought seconds
+    /// before an app relaunch was confirmed by one RPC backend, and a
+    /// load-balanced sibling that hasn't seen the `BatchCreated` block
+    /// yet reads `batchOwner` as zero for it — the same signature as a
+    /// dead batch. It is unregistered only when a read at least
+    /// [`Self::not_found_grace`] later still says so (the rule
+    /// `ant-gateway`'s `/stamps` applies to a just-registered batch).
+    not_found_since: std::sync::Mutex<HashMap<[u8; 32], tokio::time::Instant>>,
+    not_found_grace: Duration,
 }
+
+/// How long a persisted batch's first `NotFound` read must stand before
+/// a second one unregisters it — see
+/// [`PersistedIssuers::not_found_since`]. Matches `ant-gateway`'s
+/// `FRESH_BATCH_GRACE`.
+#[cfg(feature = "chain")]
+const PERSISTED_NOT_FOUND_GRACE: Duration = Duration::from_secs(300);
 
 #[cfg(feature = "chain")]
 impl PersistedIssuers {
@@ -141,6 +158,13 @@ impl PersistedIssuers {
     /// only batches that came from disk are checked (a batch bought this
     /// session was just confirmed by its own buy).
     pub(crate) fn new(upload: std::sync::Arc<ant_p2p::UploadRuntime>) -> Self {
+        Self::with_not_found_grace(upload, PERSISTED_NOT_FOUND_GRACE)
+    }
+
+    pub(crate) fn with_not_found_grace(
+        upload: std::sync::Arc<ant_p2p::UploadRuntime>,
+        not_found_grace: Duration,
+    ) -> Self {
         let unverified = upload
             .issuers
             .lock()
@@ -152,6 +176,8 @@ impl PersistedIssuers {
             upload,
             unverified: std::sync::Mutex::new(unverified),
             pass: tokio::sync::Mutex::new(()),
+            not_found_since: std::sync::Mutex::new(HashMap::new()),
+            not_found_grace,
         }
     }
 
@@ -165,14 +191,35 @@ impl PersistedIssuers {
     /// `.bin` / `.stamps` files stay on disk, as in `antd`: a later
     /// re-buy or re-sync recovers them, and the logged id lets the user
     /// clean up.
+    ///
+    /// A first `NotFound` only marks the batch suspect (it stays
+    /// registered and pending — see [`Self::not_found_since`]); this
+    /// call then waits out the grace window and reads it once more,
+    /// unregistering it only if that read agrees. A suspect whose
+    /// re-read fails stays pending for the next `ant_start_gateway`.
     pub(crate) async fn verify_on_chain(
         &self,
         chain: &ant_chain::ChainClient,
         postage_contract: &str,
     ) {
+        if let Some(recheck_at) = self.verify_pass(chain, postage_contract).await {
+            tokio::time::sleep_until(recheck_at).await;
+            self.verify_pass(chain, postage_contract).await;
+        }
+    }
+
+    /// One serialized sweep over the pending batches. Returns when the
+    /// last `NotFound` suspect it left pending becomes due for its
+    /// confirming re-read, if any.
+    async fn verify_pass(
+        &self,
+        chain: &ant_chain::ChainClient,
+        postage_contract: &str,
+    ) -> Option<tokio::time::Instant> {
         use ant_chain::discover::PersistedBatchVerdict;
 
         let _pass = self.pass.lock().await;
+        let mut recheck_at: Option<tokio::time::Instant> = None;
         let pending: Vec<[u8; 32]> = self.lock_unverified().iter().copied().collect();
         let our_owner = self.upload.batch_owner;
         for id in pending {
@@ -189,6 +236,19 @@ impl PersistedIssuers {
                     tracing::debug!(target: "ant-ffi", batch, "persisted batch confirmed on-chain");
                 }
                 PersistedBatchVerdict::NotFound => {
+                    let now = tokio::time::Instant::now();
+                    let due = *self.lock_not_found_since().entry(id).or_insert(now)
+                        + self.not_found_grace;
+                    if now < due {
+                        tracing::info!(
+                            target: "ant-ffi",
+                            batch,
+                            "persisted batch reads as not on-chain — re-checking in {}s before unregistering (an RPC backend may not have seen its creation yet)",
+                            (due - now).as_secs(),
+                        );
+                        recheck_at = Some(recheck_at.map_or(due, |at| at.max(due)));
+                        continue;
+                    }
                     self.unregister(&id);
                     tracing::warn!(
                         target: "ant-ffi",
@@ -226,7 +286,9 @@ impl PersistedIssuers {
                 }
             }
             self.lock_unverified().remove(&id);
+            self.lock_not_found_since().remove(&id);
         }
+        recheck_at
     }
 
     /// Drop `id` from the live registry the node loop stamps from. The
@@ -249,6 +311,14 @@ impl PersistedIssuers {
 
     fn lock_unverified(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<[u8; 32]>> {
         self.unverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_not_found_since(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], tokio::time::Instant>> {
+        self.not_found_since
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -2463,6 +2533,99 @@ mod chain_tests {
         postage.join(format!("{}.bin", hex::encode(id)))
     }
 
+    /// A lagging RPC backend (a batch bought just before a relaunch,
+    /// read on a load-balanced sibling that hasn't seen `BatchCreated`
+    /// yet) reads `batchOwner` as zero. One such read must not
+    /// unregister the batch: it stays registered while the pass waits
+    /// out the grace window, and survives if the re-read finds it. A
+    /// batch still missing on the re-read is unregistered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_found_is_rechecked_after_grace_before_unregistering() {
+        use super::PersistedIssuers;
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let ours = [0x0a; 20];
+        let lagging = [0x71; 32];
+        let gone = [0x72; 32];
+
+        let dir = std::env::temp_dir().join(format!("ant-not-found-grace-{}", std::process::id()));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let issuers: HashMap<_, _> = [lagging, gone]
+            .iter()
+            .map(|&id| {
+                let iss =
+                    ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
+                        .unwrap();
+                (id, iss)
+            })
+            .collect();
+        let upload = Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(issuers),
+            stamp_key: [1u8; 32],
+            batch_owner: ours,
+            postage_dir: postage.clone(),
+        });
+        let grace = Duration::from_millis(400);
+        let persisted = Arc::new(PersistedIssuers::with_not_found_grace(
+            Arc::clone(&upload),
+            grace,
+        ));
+        let script = Arc::new(OwnerScript {
+            owners: Mutex::new(HashMap::from([
+                (lagging, Some([0u8; 20])),
+                (gone, Some([0u8; 20])),
+            ])),
+            drained: std::collections::HashSet::new(),
+            queried: Mutex::new(Vec::new()),
+        });
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+        let registered =
+            || -> BTreeSet<[u8; 32]> { upload.issuers.lock().unwrap().keys().copied().collect() };
+
+        let pass = {
+            let persisted = Arc::clone(&persisted);
+            tokio::spawn(async move {
+                persisted
+                    .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                    .await;
+            })
+        };
+        // First sweep done, pass now waiting out the grace window.
+        tokio::time::sleep(grace / 2).await;
+        assert!(!pass.is_finished(), "the pass waits to re-check");
+        assert_eq!(
+            registered(),
+            BTreeSet::from([lagging, gone]),
+            "one NotFound read unregisters nothing",
+        );
+        assert_eq!(persisted.unverified(), vec![lagging, gone]);
+        // The lagging backend catches up before the re-read.
+        script.owners.lock().unwrap().insert(lagging, Some(ours));
+
+        tokio::time::timeout(grace * 10, pass)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered(),
+            BTreeSet::from([lagging]),
+            "the batch found on re-read is kept; the one still missing is dropped",
+        );
+        assert!(persisted.unverified().is_empty());
+        assert!(persisted.lock_not_found_since().is_empty());
+        let queried = script.queried.lock().unwrap().clone();
+        assert_eq!(
+            queried.iter().filter(|id| **id == gone).count(),
+            2,
+            "a missing batch is read twice before it is unregistered",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Overlapping passes (a host re-calling `ant_start_gateway` while
     /// the previous check is still in flight) are serialized: the
     /// second one only sees what the first left pending, so each batch
@@ -2511,7 +2674,12 @@ mod chain_tests {
             batch_owner: [0x0a; 20],
             postage_dir: postage.clone(),
         });
-        let persisted = Arc::new(PersistedIssuers::new(Arc::clone(&upload)));
+        // Grace 0: a single `NotFound` read is believed (the grace
+        // re-check has its own test).
+        let persisted = Arc::new(PersistedIssuers::with_not_found_grace(
+            Arc::clone(&upload),
+            std::time::Duration::ZERO,
+        ));
         let script = Arc::new(SlowGone(Mutex::new(Vec::new())));
 
         let passes: Vec<_> = (0..2)
@@ -2576,7 +2744,8 @@ mod chain_tests {
             batch_owner: ours,
             postage_dir: postage.clone(),
         });
-        let persisted = PersistedIssuers::new(Arc::clone(&upload));
+        let persisted =
+            PersistedIssuers::with_not_found_grace(Arc::clone(&upload), std::time::Duration::ZERO);
         // Registered after the reload, as a runtime buy would be.
         upload.issuers.lock().unwrap().insert(
             bought,

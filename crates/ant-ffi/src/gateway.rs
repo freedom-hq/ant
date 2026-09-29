@@ -50,10 +50,15 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// A `gnosis_rpc` also triggers the on-chain check of the postage
 /// batches [`crate::ant_init`] reloaded from `postage/*.bin` (it had no
 /// RPC to do it itself). It runs in the background right after the
-/// gateway starts: batches the chain reports as missing (expired or
-/// never created) or owned by another key are unregistered — no longer
-/// listed by `GET /stamps`, no longer stampable — with a `WARN` naming
-/// the batch id; their files stay on disk. A batch whose read fails
+/// gateway starts: batches the chain reports as missing (evicted or
+/// never created), expired (`remainingBalance` 0) or owned by another
+/// key are unregistered — no longer listed by `GET /stamps`, no longer
+/// stampable — with a `WARN` naming the batch id; their files stay on
+/// disk. "Missing" must be read twice, five minutes apart, before it
+/// counts: a batch bought just before a relaunch can read as missing
+/// on an RPC backend that hasn't seen its creation block yet, so the
+/// first such read only schedules a background re-check (the batch
+/// stays registered meanwhile). A batch whose read fails
 /// stays registered and is re-checked by the next call with a
 /// `gnosis_rpc` — including an idempotent one that finds the gateway
 /// already running, so a host may simply re-call this (e.g. on

@@ -138,11 +138,6 @@ impl StampEntry {
         self.batch_ttl = -1;
     }
 
-    /// Still on chain but `remainingBalance` reads `0`: expired, just
-    /// not evicted yet (the contract keeps `batchOwner` until someone
-    /// calls `expireLimited`). Storers already reject its stamps and it
-    /// can't be topped up, so it is not `usable`; bee reports such a
-    /// batch with `batchTTL: 0` while it still `exists`.
     /// Whether a "not on chain" read may be believed for this batch.
     /// A batch the node registered at runtime (just bought / connected)
     /// is exempt for [`FRESH_BATCH_GRACE`]: the buy was confirmed by
@@ -156,6 +151,11 @@ impl StampEntry {
             .is_none_or(|age| age >= FRESH_BATCH_GRACE.as_secs())
     }
 
+    /// Still on chain but `remainingBalance` reads `0`: expired, just
+    /// not evicted yet (the contract keeps `batchOwner` until someone
+    /// calls `expireLimited`). Storers already reject its stamps and it
+    /// can't be topped up, so it is not `usable`; bee reports such a
+    /// batch with `batchTTL: 0` while it still `exists`.
     fn mark_expired(&mut self) {
         self.usable = false;
         self.batch_ttl = 0;

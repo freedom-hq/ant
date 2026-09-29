@@ -661,9 +661,13 @@ mod tests {
             batch_owner: [0x0a; 20],
             postage_dir: postage,
         });
-        handle.persisted_issuers = std::sync::Arc::new(crate::drive::PersistedIssuers::new(
-            std::sync::Arc::clone(&upload),
-        ));
+        // Grace 0: one "gone" read is believed, so the retry itself is
+        // what this observes (the grace re-check has its own test).
+        handle.persisted_issuers =
+            std::sync::Arc::new(crate::drive::PersistedIssuers::with_not_found_grace(
+                std::sync::Arc::clone(&upload),
+                std::time::Duration::ZERO,
+            ));
         // A gateway that is already up: the start takes its early return.
         *handle.gateway_task.lock().unwrap() =
             Some(handle.runtime.spawn(std::future::pending::<()>()));

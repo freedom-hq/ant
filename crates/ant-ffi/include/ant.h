@@ -713,9 +713,12 @@ void ant_free_string(char *ptr);
  * A `gnosis_rpc` also triggers, in the background, the on-chain check of
  * the postage batches ant_init reloaded from postage/<id>.bin: batches the
  * chain reports as missing, expired (remainingBalance 0) or owned by
- * another key are unregistered (files stay on disk). A batch whose read
- * fails stays registered and is re-checked by the next call with a
- * `gnosis_rpc` — including one that finds the gateway already running.
+ * another key are unregistered (files stay on disk). "Missing" must be
+ * read twice, five minutes apart, before it counts (an RPC backend may
+ * not have seen a just-bought batch's creation yet); the first such read
+ * only schedules a background re-check. A batch whose read fails stays
+ * registered and is re-checked by the next call with a `gnosis_rpc` —
+ * including one that finds the gateway already running.
  *
  * The gateway's chain wiring is captured here, once. A host serving
  * chain reads itself must call ant_set_chain_transport BEFORE this.
