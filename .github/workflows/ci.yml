@@ -91,6 +91,14 @@ jobs:
         # we'll add when the bee Docker image stops drifting.
         run: cargo test --workspace --lib
 
+      - name: cargo test (ant-ffi with chain feature, lib only)
+        # The workspace test run above never enables `ant-ffi`'s
+        # default-off `chain` feature, so its chain-gated unit tests
+        # (chain transport, chequebook rediscovery, persisted-issuer
+        # verification) are compiled by the clippy step but never run
+        # without this step.
+        run: cargo test -p ant-ffi --features chain --lib
+
   # -------------------------------------------------------------------
   # Android cross-compile smoke. Confirms `crates/ant-ffi/src/jni.rs`
   # links against the NDK and produces a `libant_ffi.so` that has the
