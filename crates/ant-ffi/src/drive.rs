@@ -134,10 +134,46 @@ pub(crate) struct ChainInit {
     upload: std::sync::Arc<ant_p2p::UploadRuntime>,
     /// Reloaded batches not yet confirmed on-chain.
     unverified: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
-    /// Set once an owned-batch rediscovery scan has completed, so a
-    /// gateway restart in the same process doesn't rescan.
-    batches_rediscovered: std::sync::atomic::AtomicBool,
+    /// Holds `true` once an owned-batch rediscovery scan has completed,
+    /// so a gateway restart in the same process doesn't rescan. Held
+    /// across the scan, so two overlapping runs (an idempotent
+    /// `ant_start_gateway` re-call while the first run is in flight)
+    /// don't both scan and double-register the same batch: the second
+    /// waits and then sees the flag.
+    batches_rediscovered: tokio::sync::Mutex<bool>,
+    /// Set once settlement has been switched on for an adopted
+    /// chequebook, so a later run (every idempotent `ant_start_gateway`
+    /// re-call spawns one) doesn't re-resolve it over RPC.
+    settlement_on: std::sync::atomic::AtomicBool,
+    /// Serializes [`Self::verify_pass`] sweeps: every
+    /// `ant_start_gateway` call with an RPC spawns one (including the
+    /// idempotent "already running" path), so a host re-calling it on
+    /// foreground can overlap a pass still in flight. The second waits
+    /// and then only sees what the first left pending.
+    pass: tokio::sync::Mutex<()>,
+    /// Batches a read reported `NotFound` for, and when it first did.
+    /// One such read isn't believed on its own: a batch bought seconds
+    /// before an app relaunch was confirmed by one RPC backend, and a
+    /// load-balanced sibling that hasn't seen the `BatchCreated` block
+    /// yet reads `batchOwner` as zero for it — the same signature as a
+    /// dead batch. It is unregistered only when a read at least
+    /// [`Self::not_found_grace`] later still says so (the rule
+    /// `ant-gateway`'s `/stamps` applies to a just-registered batch).
+    not_found_since: std::sync::Mutex<HashMap<[u8; 32], tokio::time::Instant>>,
+    not_found_grace: Duration,
 }
+
+/// How long a persisted batch's first `NotFound` read must stand before
+/// a second one unregisters it — see
+/// [`ChainInit::not_found_since`]. A lagging load-balanced
+/// backend trails by a few blocks (5 s each on Gnosis), so 45 s covers
+/// it. Deliberately much shorter than `ant-gateway`'s five-minute
+/// `FRESH_BATCH_GRACE`: the suspect clock lives only in memory, so a
+/// grace longer than a typical mobile session (an iOS app foregrounded
+/// for a couple of minutes, then suspended or killed) would restart on
+/// every launch and never let a dead batch be unregistered.
+#[cfg(feature = "chain")]
+const PERSISTED_NOT_FOUND_GRACE: Duration = Duration::from_secs(45);
 
 #[cfg(feature = "chain")]
 impl ChainInit {
@@ -146,6 +182,13 @@ impl ChainInit {
     /// only batches that came from disk are checked (a batch bought this
     /// session was just confirmed by its own buy).
     pub(crate) fn new(upload: std::sync::Arc<ant_p2p::UploadRuntime>) -> Self {
+        Self::with_not_found_grace(upload, PERSISTED_NOT_FOUND_GRACE)
+    }
+
+    pub(crate) fn with_not_found_grace(
+        upload: std::sync::Arc<ant_p2p::UploadRuntime>,
+        not_found_grace: Duration,
+    ) -> Self {
         let unverified = upload
             .issuers
             .lock()
@@ -156,15 +199,27 @@ impl ChainInit {
         Self {
             upload,
             unverified: std::sync::Mutex::new(unverified),
-            batches_rediscovered: std::sync::atomic::AtomicBool::new(false),
+            batches_rediscovered: tokio::sync::Mutex::new(false),
+            settlement_on: std::sync::atomic::AtomicBool::new(false),
+            pass: tokio::sync::Mutex::new(()),
+            not_found_since: std::sync::Mutex::new(HashMap::new()),
+            not_found_grace,
         }
     }
 
     /// Run the chain init: the ant-ffi equivalent of `antd`'s startup
     /// chain block. Each step is best-effort and independent; a failed
-    /// step logs and is retried on the next gateway start.
+    /// step logs and is retried by the next `ant_start_gateway` call
+    /// with an RPC — including an idempotent one that finds the gateway
+    /// already running, which spawns this again. Overlapping runs are
+    /// safe: step 1 is serialized per sweep, step 2 holds its own lock
+    /// across the scan, step 3 takes the process-wide chequebook setup
+    /// lock.
     ///
-    /// 1. Unregister reloaded batches the chain disowns (#49).
+    /// 1. Unregister reloaded batches the chain disowns (#49). A first
+    ///    `NotFound` read only marks the batch suspect; it is re-read
+    ///    once the grace window has passed, after steps 2 and 3, so the
+    ///    wait never delays them.
     /// 2. Register batches this account owns on-chain but not on disk.
     /// 3. Adopt the persisted or on-chain chequebook and switch outbound
     ///    settlement on. Nothing is deployed or funded here: both spend
@@ -177,29 +232,53 @@ impl ChainInit {
         data_dir: &std::path::Path,
         swap_secret: [u8; 32],
     ) {
-        self.verify_persisted(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+        let recheck_at = self
+            .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         self.rediscover_owned(chain, cmd_tx).await;
+        self.adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
+            .await;
+        if let Some(recheck_at) = recheck_at {
+            tokio::time::sleep_until(recheck_at).await;
+            self.verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+                .await;
+        }
+    }
+
+    /// Step 3 of [`Self::run`]: adopt the chequebook without spending,
+    /// once per handle.
+    async fn adopt_settlement(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+        swap_secret: [u8; 32],
+    ) {
+        use std::sync::atomic::Ordering;
+
+        if self.settlement_on.load(Ordering::Acquire) {
+            return;
+        }
         let node_eth = self.upload.batch_owner;
         match ant_chain::tx::Wallet::new(swap_secret, GNOSIS_CHAIN_ID) {
-            Ok(wallet) => {
-                if let Err(e) = setup_settlement(
-                    cmd_tx,
-                    chain,
-                    &wallet,
-                    data_dir,
-                    swap_secret,
-                    node_eth,
-                    false,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "ant-ffi",
-                        "could not adopt a chequebook for network settlement: {e}",
-                    );
-                }
-            }
+            Ok(wallet) => match setup_settlement(
+                cmd_tx,
+                chain,
+                &wallet,
+                data_dir,
+                swap_secret,
+                node_eth,
+                false,
+            )
+            .await
+            {
+                Ok(Some(_)) => self.settlement_on.store(true, Ordering::Release),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    target: "ant-ffi",
+                    "could not adopt a chequebook for network settlement: {e}",
+                ),
+            },
             Err(e) => tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}"),
         }
     }
@@ -214,9 +293,8 @@ impl ChainInit {
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
     ) {
-        use std::sync::atomic::Ordering;
-
-        if self.batches_rediscovered.load(Ordering::Acquire) {
+        let mut rediscovered = self.batches_rediscovered.lock().await;
+        if *rediscovered {
             return;
         }
         let found = match ant_chain::discover::discover_owned_batches(
@@ -264,20 +342,48 @@ impl ChainInit {
                 ),
             }
         }
-        self.batches_rediscovered.store(true, Ordering::Release);
+        *rediscovered = true;
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
-    /// and **unregister** the ones it disowns — `NotFound` (expired or
-    /// never created) and `ForeignOwner` — with a loud warning. An RPC
-    /// read error keeps the batch registered (unconfirmed ≠ dead) and
-    /// leaves it pending, so the next gateway start retries it. The
+    /// and **unregister** the ones it disowns — `NotFound` (evicted or
+    /// never created), `Expired` (still ours but `remainingBalance` 0)
+    /// and `ForeignOwner` — with a loud warning. An RPC read error keeps
+    /// the batch registered (unconfirmed ≠ dead) and leaves it pending,
+    /// so the next `ant_start_gateway` call with an RPC retries it —
+    /// including one that finds the gateway already running. The
     /// `.bin` / `.stamps` files stay on disk, as in `antd`: a later
     /// re-buy or re-sync recovers them, and the logged id lets the user
     /// clean up.
+    ///
+    /// A first `NotFound` only marks the batch suspect (it stays
+    /// registered and pending — see [`Self::not_found_since`]); this
+    /// call then waits out the grace window and reads it once more,
+    /// unregistering it only if that read agrees. A suspect whose
+    /// re-read fails stays pending for the next `ant_start_gateway`.
+    /// [`Self::run`] does the same, but runs its other steps before
+    /// waiting out the grace.
+    #[cfg(test)]
     async fn verify_persisted(&self, chain: &ant_chain::ChainClient, postage_contract: &str) {
+        if let Some(recheck_at) = self.verify_pass(chain, postage_contract).await {
+            tokio::time::sleep_until(recheck_at).await;
+            self.verify_pass(chain, postage_contract).await;
+        }
+    }
+
+    /// One serialized sweep over the pending batches (the `pass` lock is
+    /// held only for the sweep, never across the grace wait). Returns
+    /// when the last `NotFound` suspect it left pending becomes due for
+    /// its confirming re-read, if any.
+    async fn verify_pass(
+        &self,
+        chain: &ant_chain::ChainClient,
+        postage_contract: &str,
+    ) -> Option<tokio::time::Instant> {
         use ant_chain::discover::PersistedBatchVerdict;
 
+        let _pass = self.pass.lock().await;
+        let mut recheck_at: Option<tokio::time::Instant> = None;
         let pending: Vec<[u8; 32]> = self.lock_unverified().iter().copied().collect();
         let our_owner = self.upload.batch_owner;
         for id in pending {
@@ -294,12 +400,34 @@ impl ChainInit {
                     tracing::debug!(target: "ant-ffi", batch, "persisted batch confirmed on-chain");
                 }
                 PersistedBatchVerdict::NotFound => {
+                    let now = tokio::time::Instant::now();
+                    let due = *self.lock_not_found_since().entry(id).or_insert(now)
+                        + self.not_found_grace;
+                    if now < due {
+                        tracing::info!(
+                            target: "ant-ffi",
+                            batch,
+                            "persisted batch reads as not on-chain — re-checking in {}s before unregistering (an RPC backend may not have seen its creation yet)",
+                            (due - now).as_secs(),
+                        );
+                        recheck_at = Some(recheck_at.map_or(due, |at| at.max(due)));
+                        continue;
+                    }
                     self.unregister(&id);
                     tracing::warn!(
                         target: "ant-ffi",
                         batch,
                         store = %self.store_path(&id).display(),
                         "persisted batch NOT FOUND on-chain (expired or never created) — unregistering it; uploads with it would be rejected by every storer",
+                    );
+                }
+                PersistedBatchVerdict::Expired => {
+                    self.unregister(&id);
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        batch,
+                        store = %self.store_path(&id).display(),
+                        "persisted batch has EXPIRED on-chain (remainingBalance 0) — unregistering it; uploads with it would be rejected by every storer",
                     );
                 }
                 PersistedBatchVerdict::ForeignOwner(on_chain_owner) => {
@@ -322,7 +450,9 @@ impl ChainInit {
                 }
             }
             self.lock_unverified().remove(&id);
+            self.lock_not_found_since().remove(&id);
         }
+        recheck_at
     }
 
     /// Drop `id` from the live registry the node loop stamps from. The
@@ -345,6 +475,14 @@ impl ChainInit {
 
     fn lock_unverified(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<[u8; 32]>> {
         self.unverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_not_found_since(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], tokio::time::Instant>> {
+        self.not_found_since
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -2612,9 +2750,11 @@ mod chain_tests {
 
     /// Per-batch `PostageStamp` views for the persisted-issuer check:
     /// `Some(owner)` is the on-chain `batchOwner` (zero = not found),
-    /// `None` a failed read. Records which batches were asked about.
+    /// `None` a failed read. `remainingBalance` is `1` unless the batch
+    /// is in `drained` (then `0`). Records which batches were asked about.
     struct OwnerScript {
         owners: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 20]>>>,
+        drained: std::collections::HashSet<[u8; 32]>,
         queried: Mutex<Vec<[u8; 32]>>,
     }
 
@@ -2641,6 +2781,7 @@ mod chain_tests {
                 ("0x44beae8e", _) => word_hex(&[20]),          // batchDepth
                 ("0x32ac57dd", _) => word_hex(&[16]),          // bucketDepth
                 ("0xd968f44b", _) => word_hex(&[0]),           // immutableFlag
+                ("0xd71ba7c4", _) => word_hex(&[u8::from(!self.drained.contains(&id))]), // remainingBalance
                 (other, _) => panic!("unscripted selector {other}"),
             };
             Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
@@ -2649,6 +2790,189 @@ mod chain_tests {
 
     fn store(postage: &std::path::Path, id: [u8; 32]) -> std::path::PathBuf {
         postage.join(format!("{}.bin", hex::encode(id)))
+    }
+
+    /// The persisted-batch `NotFound` grace must fit inside a short
+    /// mobile session: its suspect clock is in-memory only, so a grace
+    /// longer than a foreground stint restarts on every launch and a
+    /// dead batch is never unregistered. It must still cover a backend
+    /// lagging a few Gnosis blocks.
+    #[test]
+    fn persisted_not_found_grace_fits_a_short_session() {
+        let grace = super::PERSISTED_NOT_FOUND_GRACE;
+        assert!(grace >= std::time::Duration::from_secs(30), "{grace:?}");
+        assert!(grace <= std::time::Duration::from_secs(60), "{grace:?}");
+    }
+
+    /// A lagging RPC backend (a batch bought just before a relaunch,
+    /// read on a load-balanced sibling that hasn't seen `BatchCreated`
+    /// yet) reads `batchOwner` as zero. One such read must not
+    /// unregister the batch: it stays registered while the pass waits
+    /// out the grace window, and survives if the re-read finds it. A
+    /// batch still missing on the re-read is unregistered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_found_is_rechecked_after_grace_before_unregistering() {
+        use super::ChainInit;
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let ours = [0x0a; 20];
+        let lagging = [0x71; 32];
+        let gone = [0x72; 32];
+
+        let dir = std::env::temp_dir().join(format!("ant-not-found-grace-{}", std::process::id()));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let issuers: HashMap<_, _> = [lagging, gone]
+            .iter()
+            .map(|&id| {
+                let iss =
+                    ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
+                        .unwrap();
+                (id, iss)
+            })
+            .collect();
+        let upload = Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(issuers),
+            stamp_key: [1u8; 32],
+            batch_owner: ours,
+            postage_dir: postage.clone(),
+        });
+        let grace = Duration::from_millis(400);
+        let persisted = Arc::new(ChainInit::with_not_found_grace(Arc::clone(&upload), grace));
+        let script = Arc::new(OwnerScript {
+            owners: Mutex::new(HashMap::from([
+                (lagging, Some([0u8; 20])),
+                (gone, Some([0u8; 20])),
+            ])),
+            drained: std::collections::HashSet::new(),
+            queried: Mutex::new(Vec::new()),
+        });
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+        let registered =
+            || -> BTreeSet<[u8; 32]> { upload.issuers.lock().unwrap().keys().copied().collect() };
+
+        let pass = {
+            let persisted = Arc::clone(&persisted);
+            tokio::spawn(async move {
+                persisted
+                    .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                    .await;
+            })
+        };
+        // First sweep done, pass now waiting out the grace window.
+        tokio::time::sleep(grace / 2).await;
+        assert!(!pass.is_finished(), "the pass waits to re-check");
+        assert_eq!(
+            registered(),
+            BTreeSet::from([lagging, gone]),
+            "one NotFound read unregisters nothing",
+        );
+        assert_eq!(persisted.unverified(), vec![lagging, gone]);
+        // The lagging backend catches up before the re-read.
+        script.owners.lock().unwrap().insert(lagging, Some(ours));
+
+        tokio::time::timeout(grace * 10, pass)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered(),
+            BTreeSet::from([lagging]),
+            "the batch found on re-read is kept; the one still missing is dropped",
+        );
+        assert!(persisted.unverified().is_empty());
+        assert!(persisted.lock_not_found_since().is_empty());
+        let queried = script.queried.lock().unwrap().clone();
+        assert_eq!(
+            queried.iter().filter(|id| **id == gone).count(),
+            2,
+            "a missing batch is read twice before it is unregistered",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Overlapping passes (a host re-calling `ant_start_gateway` while
+    /// the previous check is still in flight) are serialized: the
+    /// second one only sees what the first left pending, so each batch
+    /// is asked about once and unregistered once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_passes_query_each_batch_once() {
+        use super::ChainInit;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        struct SlowGone(Mutex<Vec<[u8; 32]>>);
+        impl ChainTransport for SlowGone {
+            fn serve(&self, request_json: &str) -> Option<String> {
+                let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+                let data = req["params"][0]["data"].as_str().unwrap();
+                assert_eq!(&data[0..10], "0x2182ddb1", "only batchOwner expected");
+                let mut id = [0u8; 32];
+                hex::decode_to_slice(&data[10..74], &mut id).unwrap();
+                self.0.lock().unwrap().push(id);
+                // Slow enough that the second pass starts mid-flight.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Some(
+                    json!({"jsonrpc": "2.0", "id": req["id"], "result": word_hex(&[0])})
+                        .to_string(),
+                )
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("ant-overlapping-passes-{}", std::process::id()));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let ids = [[0xa1; 32], [0xa2; 32]];
+        let issuers: HashMap<_, _> = ids
+            .iter()
+            .map(|&id| {
+                let iss =
+                    ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
+                        .unwrap();
+                (id, iss)
+            })
+            .collect();
+        let upload = Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(issuers),
+            stamp_key: [1u8; 32],
+            batch_owner: [0x0a; 20],
+            postage_dir: postage.clone(),
+        });
+        // Grace 0: a single `NotFound` read is believed (the grace
+        // re-check has its own test).
+        let persisted = Arc::new(ChainInit::with_not_found_grace(
+            Arc::clone(&upload),
+            std::time::Duration::ZERO,
+        ));
+        let script = Arc::new(SlowGone(Mutex::new(Vec::new())));
+
+        let passes: Vec<_> = (0..2)
+            .map(|_| {
+                let persisted = Arc::clone(&persisted);
+                let client = ChainClient::new("http://127.0.0.1:1")
+                    .with_transport(Some(script.clone() as Arc<dyn ChainTransport>));
+                tokio::spawn(async move {
+                    persisted
+                        .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                        .await;
+                })
+            })
+            .collect();
+        for pass in passes {
+            pass.await.unwrap();
+        }
+
+        let mut queried = script.0.lock().unwrap().clone();
+        queried.sort_unstable();
+        assert_eq!(queried, ids.to_vec(), "each batch is asked about once");
+        assert!(upload.issuers.lock().unwrap().is_empty());
+        assert!(persisted.unverified().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The phantom-batch fix for `ant-ffi`: once an RPC is known, a
@@ -2668,12 +2992,14 @@ mod chain_tests {
         let foreign = [0x33; 32];
         let unreadable = [0x44; 32];
         let bought = [0x55; 32];
+        // Expired but not yet evicted: still ours, balance 0.
+        let expired = [0x66; 32];
 
         let dir =
             std::env::temp_dir().join(format!("ant-persisted-issuers-{}", std::process::id()));
         let postage = dir.join("postage");
         std::fs::create_dir_all(&postage).unwrap();
-        for id in [live, dead, foreign, unreadable] {
+        for id in [live, dead, foreign, unreadable, expired] {
             drop(
                 ant_postage::StampIssuer::open_or_new(store(&postage, id), id, 20, 16, false)
                     .unwrap(),
@@ -2686,7 +3012,8 @@ mod chain_tests {
             batch_owner: ours,
             postage_dir: postage.clone(),
         });
-        let persisted = ChainInit::new(Arc::clone(&upload));
+        let persisted =
+            ChainInit::with_not_found_grace(Arc::clone(&upload), std::time::Duration::ZERO);
         // Registered after the reload, as a runtime buy would be.
         upload.issuers.lock().unwrap().insert(
             bought,
@@ -2700,7 +3027,9 @@ mod chain_tests {
                 (dead, Some([0u8; 20])),
                 (foreign, Some([0x5e; 20])),
                 (unreadable, None),
+                (expired, Some(ours)),
             ])),
+            drained: std::collections::HashSet::from([expired]),
             queried: Mutex::new(Vec::new()),
         });
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
@@ -2713,14 +3042,14 @@ mod chain_tests {
         assert_eq!(
             registered(),
             BTreeSet::from([live, unreadable, bought]),
-            "dead + foreign batches must be unregistered, the rest kept",
+            "dead + expired + foreign batches must be unregistered, the rest kept",
         );
         assert_eq!(
             persisted.unverified(),
             vec![unreadable],
             "only the batch whose read failed is still pending",
         );
-        for id in [dead, foreign] {
+        for id in [dead, foreign, expired] {
             assert!(store(&postage, id).exists(), "the store stays on disk");
         }
         assert!(
@@ -3159,13 +3488,85 @@ mod chain_tests {
             );
         }
 
-        // A gateway restart: the batch scan doesn't run again. The
-        // chequebook is persisted now, so settlement is re-enabled from
-        // the record without a scan either.
+        // A gateway restart: the batch scan doesn't run again, and
+        // settlement, already on, isn't set up a second time.
         let scans = script.seen("eth_getLogs");
         init.run(&client(&script), &cmd_tx, &dir, NODE_KEY).await;
         assert_eq!(script.seen("eth_getLogs"), scans, "no rescan on restart");
         assert_eq!(node.lock().unwrap().registered, vec![lost]);
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two overlapping chain-init runs (an idempotent `ant_start_gateway`
+    /// re-call while the first run is still in flight) scan for batches
+    /// once and register a rediscovered batch once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_chain_init_runs_rediscover_once() {
+        let (_, eth) = node_wallet();
+        let dir = scratch("chain-init-overlap");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let lost = [0xa2u8; 32];
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: eth,
+            postage_dir: postage,
+        });
+        let init = std::sync::Arc::new(super::ChainInit::new(std::sync::Arc::clone(&upload)));
+
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((postage_addr, [0x02; 32]));
+        script.transfers.push((CANDIDATE, [0x03; 32]));
+        script.created.push((lost, [0x02; 32]));
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        // One run alone, for the scan count to compare against.
+        let solo_dir = scratch("chain-init-solo");
+        let solo_script = std::sync::Arc::new({
+            let mut s = ChainScript::new(eth);
+            s.transfers.push((postage_addr, [0x02; 32]));
+            s.transfers.push((CANDIDATE, [0x03; 32]));
+            s.created.push((lost, [0x02; 32]));
+            s.chequebooks.insert(CANDIDATE, (true, eth));
+            s
+        });
+        let (solo_tx, _solo_node) = fake_node();
+        super::ChainInit::new(std::sync::Arc::clone(&upload))
+            .run(&client(&solo_script), &solo_tx, &solo_dir, NODE_KEY)
+            .await;
+        let one_scan = solo_script.seen("eth_getLogs");
+
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                let (init, chain, cmd_tx, dir) = (
+                    std::sync::Arc::clone(&init),
+                    client(&script),
+                    cmd_tx.clone(),
+                    dir.clone(),
+                );
+                tokio::spawn(async move { init.run(&chain, &cmd_tx, &dir, NODE_KEY).await })
+            })
+            .collect();
+        for run in runs {
+            run.await.unwrap();
+        }
+
+        assert_eq!(script.seen("eth_getLogs"), one_scan, "one scan, not two");
+        assert_eq!(
+            node.lock().unwrap().registered,
+            vec![lost],
+            "registered once"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&solo_dir).ok();
     }
 }

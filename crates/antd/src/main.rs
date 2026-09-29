@@ -1403,7 +1403,7 @@ async fn build_upload_runtime(
                             // Phantom-batch guard (2026-07-12): a
                             // persisted issuer proves only that WE once
                             // held the batch — not that the chain still
-                            // does (expiry evicts it; a failed/foreign-
+                            // does (it may have expired; a failed/foreign-
                             // chain buy never registered it). Storer
                             // peers validate every stamp against their
                             // chain-synced batchstore, so an
@@ -1434,6 +1434,15 @@ async fn build_upload_runtime(
                                             batch = %format!("0x{}", hex::encode(id)),
                                             store = %path.display(),
                                             "persisted batch NOT FOUND on-chain (expired or never created) — not registering it; uploads with it would be rejected by every storer",
+                                        );
+                                        continue;
+                                    }
+                                    PersistedBatchVerdict::Expired => {
+                                        tracing::warn!(
+                                            target: "antd",
+                                            batch = %format!("0x{}", hex::encode(id)),
+                                            store = %path.display(),
+                                            "persisted batch has EXPIRED on-chain (remainingBalance 0) — not registering it; uploads with it would be rejected by every storer",
                                         );
                                         continue;
                                     }

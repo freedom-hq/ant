@@ -53,15 +53,26 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// background right after the gateway starts:
 ///
 /// 1. Reloaded `postage/*.bin` batches the chain reports as missing
-///    (expired or never created) or owned by another key are
-///    unregistered, with a `WARN` naming the batch id. They're no longer
-///    listed by `GET /stamps` and can't be stamped with; their files
-///    stay on disk. A batch whose read fails stays registered and is
-///    re-checked on the next start.
+///    (evicted or never created), expired (`remainingBalance` 0) or
+///    owned by another key are unregistered, with a `WARN` naming the
+///    batch id. They're no longer listed by `GET /stamps` and can't be
+///    stamped with; their files stay on disk. "Missing" must be read
+///    twice, 45 seconds apart, before it counts: a batch bought just
+///    before a relaunch can read as missing on an RPC backend that
+///    hasn't seen its creation block yet, so the first such read only
+///    schedules a background re-check (the batch stays registered
+///    meanwhile, and steps 2 and 3 don't wait for it).
 /// 2. Funded batches the account owns on-chain but not on disk
 ///    (reinstall, restore from key) are registered.
 /// 3. The persisted or on-chain chequebook is adopted and outbound
 ///    settlement switched on. Nothing is deployed or funded.
+///
+/// A step that fails (a batch whose read fails stays registered, a
+/// failed rediscovery scan, a chequebook that couldn't be resolved) is
+/// retried by the next call with a `gnosis_rpc` — including an
+/// idempotent one that finds the gateway already running, so a host may
+/// simply re-call this (e.g. on foreground) to retry. Steps that already
+/// succeeded are not repeated.
 ///
 /// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
 /// sure settlement is on afterwards, deploying and funding a chequebook
@@ -158,6 +169,15 @@ pub unsafe extern "C" fn ant_start_gateway(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            // Still retry the chain init: a run whose RPC reads failed
+            // left work pending (unconfirmed batches, a failed
+            // rediscovery scan, no chequebook adopted), and re-calling
+            // start (e.g. on foreground) is how a host asks for that
+            // retry.
+            #[cfg(feature = "chain")]
+            if let Some(rpc) = gnosis_rpc {
+                spawn_chain_init(handle, handle.chain_client(rpc));
+            }
             return true;
         }
         // A finished task (bind error / aborted) is cleared so a retry
@@ -309,16 +329,11 @@ pub unsafe extern "C" fn ant_start_gateway(
 
         // First point an RPC is known: run the chain-derived startup
         // work `ant_init` couldn't (see the doc comment above). Off the
-        // caller's thread so the gateway start never waits on the RPC.
+        // caller's thread so the gateway start never waits on the RPC;
+        // failed steps are retried by the next call with an RPC.
         #[cfg(feature = "chain")]
         if let Some(chain) = chain_client {
-            let init = Arc::clone(&handle.chain_init);
-            let cmd_tx = handle.cmd_tx.clone();
-            let data_dir = handle.data_dir.clone();
-            let secret = handle.signing_secret;
-            handle.runtime.spawn(async move {
-                init.run(&chain, &cmd_tx, &data_dir, secret).await;
-            });
+            spawn_chain_init(handle, chain);
         }
         true
     }
@@ -349,6 +364,21 @@ fn after_buy_hook(
                 .await;
         });
     })
+}
+
+/// Run [`crate::drive::ChainInit::run`] in the background against
+/// `chain`. Overlapping runs are safe (see `ChainInit::run`), and one
+/// with nothing left to do issues no reads, so calling this on every
+/// `ant_start_gateway` is cheap.
+#[cfg(feature = "chain")]
+fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
+    let init = Arc::clone(&handle.chain_init);
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let secret = handle.signing_secret;
+    handle.runtime.spawn(async move {
+        init.run(&chain, &cmd_tx, &data_dir, secret).await;
+    });
 }
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
