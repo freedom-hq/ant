@@ -63,6 +63,14 @@ pub trait ChainReader: Send + Sync {
     async fn batch_meta(&self, _batch_id: [u8; 32]) -> Result<BatchMetaView, String> {
         Err("batch_meta unsupported".to_string())
     }
+    /// `PostageStamp.batchOwner` alone — the single view `/stamps` needs
+    /// to confirm a batch is gone (zero owner) after its balance read
+    /// fails. Defaults to [`Self::batch_meta`]'s owner; real readers
+    /// override it with one call instead of `batch_meta`'s four, so the
+    /// check doesn't eat the shared enrichment timeout.
+    async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
+        self.batch_meta(batch_id).await.map(|meta| meta.owner)
+    }
 }
 
 /// On-chain views of one postage batch, read directly from the
@@ -135,6 +143,22 @@ impl ChequebookSlot {
             .0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chequebook);
+    }
+
+    /// Forget the chequebook: the node no longer settles with one (e.g.
+    /// the chain check disqualified it), so `/chequebook/*` reports none
+    /// and `POST /chequebook/deposit` has nothing to fund.
+    pub fn clear(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+impl From<Option<[u8; 20]>> for ChequebookSlot {
+    fn from(chequebook: Option<[u8; 20]>) -> Self {
+        Self::new(chequebook)
     }
 }
 

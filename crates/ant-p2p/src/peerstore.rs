@@ -398,6 +398,10 @@ fn unix_now() -> u64 {
 /// cancels the runtime's tasks. Both drop the loop's future, and with it
 /// the store, so this is the one point both reach. Without it, up to a
 /// flush interval (30 s) of peer state was lost on every shutdown.
+/// It runs wherever the loop's future is dropped: `ant-ffi`'s shutdown
+/// paths (C and JNI) join the runtime, so the write lands before they
+/// return and can't overwrite the `peers.json` of a node re-initialised
+/// on the same data dir afterwards.
 /// A no-op when nothing changed or the store is disabled.
 impl Drop for PeerStore {
     fn drop(&mut self) {

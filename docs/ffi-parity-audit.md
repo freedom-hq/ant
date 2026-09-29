@@ -83,13 +83,13 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 |---|---|
 | F1 / F2 | `ant_start_gateway` runs `ChainInit`: the #97 check, rediscovery of owned batches (once per handle), and adopting the persisted or on-chain chequebook to switch settlement on. It neither deploys nor funds. The host's `ant_storage_discover` call becomes redundant but stays harmless. |
 | F3 (ant-ffi) | `GatewayHandle::on_batch_bought`; ant-ffi wires it to `ensure_settlement`, so the first gateway buy gets a chequebook and settlement. |
-| F4 | `chequebook_store::check_chequebook` + `ChequebookChecks::verdict`, shared. antd's logs are unchanged. ant-ffi checks a persisted chequebook before enabling it. |
+| F4 | `chequebook_store::check_chequebook` + `ChequebookChecks::verdict`, shared. antd's logs are unchanged; `issuer()` is only read when its answer is reported (`IssuerRead`). ant-ffi checks a persisted chequebook before enabling it; the one `ant_init` enabled unchecked (no RPC at init) is switched off again (`DisablePushsyncSwap`) if the check disqualifies it. A factory "no" for a chequebook whose recorded deploy tx a lagging backend hasn't served yet is not a disqualification. |
 | F5 | `ant_deploy_chequebook` switches settlement on. |
 | Chequebook setup | All settlement paths go through one locked routine (`setup_settlement`), so overlapping paths can't deploy twice. |
 | S20 / S5 (antd) | antd uses the owner-checked chequebook loader. The path-trusting one is removed. |
-| Corrupt `chequebook.json` | Resolved by on-chain rediscovery instead of erroring forever. |
+| Corrupt `chequebook.json` | Resolved by on-chain rediscovery instead of erroring forever. When the scan finds nothing, no chequebook is deployed (the record may name a deposit-0 one the scan can't see); the user fixes or removes the file. |
 | `--network-id` | Now reaches the swarm (`NodeConfig::with_network_id`). |
-| Peerstore | Flushed when the swarm loop is dropped, so both antd's SIGTERM and `ant_shutdown` save it. |
+| Peerstore | Flushed when the swarm loop is dropped, so both antd's SIGTERM and `ant_shutdown` save it. The JNI `nativeShutdown` now joins the runtime like `ant_shutdown` (it used `shutdown_background`), so the flush lands before it returns. |
 | Cleanups | The ignored-config-keys log, the `ant_settlement_*` doc drift, and the dead `default_backoff` are fixed. |
 | Guard (§7) | The AGENTS.md rule and the `parity_guard` test are in, with an empty allowlist. |
 
@@ -99,6 +99,7 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 - **Deposit size:** one default, `chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR` = 0.001 xBZZ. antd's default drops from 0.1 (`--chequebook-deposit-plur` still overrides it).
 - **Deposit top-up:** antd now tops an antd-managed chequebook back up to the target at startup and after every gateway buy, through the shared `top_up_chequebook` that ant-ffi uses on every buy too. Before this, antd never topped up. This matters for Freedom's setup order (xDAI, light mode, then xBZZ): the chequebook is deployed before the wallet holds any xBZZ, so it starts at zero.
 - **Live chequebook address:** `ant_gateway::ChequebookSlot` is shared by the chain context and the writer. A chequebook set up after startup (a buy-triggered deploy, or ant-ffi's gateway-start adoption) shows in `/chequebook/*` and `/wallet`, and can receive `POST /chequebook/deposit`, without a restart, in both entry points.
+- **No deposit into a chequebook the chain rejects:** `top_up_chequebook` re-runs `check_chequebook` right before any transfer and sends only when both checks read "yes" (a failed read is an error, a "no" is `TopUp::Refused`). Both entry points treat a refusal as a disqualifying verdict: antd switches settlement off (`DisablePushsyncSwap`, unless `--chequebook-allow-unverified`) and clears the gateway slot; ant-ffi records it in `DISQUALIFIED` and switches settlement off. ant-ffi's gateway slot is one per handle, so it never reports (or lets `POST /chequebook/deposit` fund) a disqualified chequebook, also after an idempotent `ant_start_gateway` retry, and a failed read never lifts an earlier disqualification.
 
 **Deferred:**
 

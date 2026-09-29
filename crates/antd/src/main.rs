@@ -1423,7 +1423,7 @@ async fn build_upload_runtime(
                             // Phantom-batch guard (2026-07-12): a
                             // persisted issuer proves only that WE once
                             // held the batch — not that the chain still
-                            // does (expiry evicts it; a failed/foreign-
+                            // does (it may have expired; a failed/foreign-
                             // chain buy never registered it). Storer
                             // peers validate every stamp against their
                             // chain-synced batchstore, so an
@@ -1454,6 +1454,15 @@ async fn build_upload_runtime(
                                             batch = %format!("0x{}", hex::encode(id)),
                                             store = %path.display(),
                                             "persisted batch NOT FOUND on-chain (expired or never created) — not registering it; uploads with it would be rejected by every storer",
+                                        );
+                                        continue;
+                                    }
+                                    PersistedBatchVerdict::Expired => {
+                                        tracing::warn!(
+                                            target: "antd",
+                                            batch = %format!("0x{}", hex::encode(id)),
+                                            store = %path.display(),
+                                            "persisted batch has EXPIRED on-chain (remainingBalance 0) — not registering it; uploads with it would be rejected by every storer",
                                         );
                                         continue;
                                     }
@@ -1851,8 +1860,10 @@ async fn resolve_chequebook(
             &ledger_path,
         )
         .await;
-        if pushsync.is_some() {
-            top_up_adopted_chequebook(
+        // The top-up re-runs the chain checks before it sends; a "no"
+        // there switches settlement off like the startup check's.
+        let rejected = pushsync.is_some()
+            && top_up_adopted_chequebook(
                 opt,
                 rpc_url.as_deref(),
                 signing_secret,
@@ -1860,7 +1871,7 @@ async fn resolve_chequebook(
                 persisted,
             )
             .await;
-        }
+        let pushsync = pushsync.filter(|_| !rejected || opt.chequebook_allow_unverified);
         return Ok(ResolvedChequebook {
             address: Some(persisted),
             pushsync,
@@ -1913,8 +1924,8 @@ async fn resolve_chequebook(
                     &ledger_path,
                 )
                 .await;
-                if pushsync.is_some() {
-                    top_up_adopted_chequebook(
+                let rejected = pushsync.is_some()
+                    && top_up_adopted_chequebook(
                         opt,
                         rpc_url.as_deref(),
                         signing_secret,
@@ -1922,7 +1933,7 @@ async fn resolve_chequebook(
                         cb,
                     )
                     .await;
-                }
+                let pushsync = pushsync.filter(|_| !rejected || opt.chequebook_allow_unverified);
                 return Ok(ResolvedChequebook {
                     address: Some(cb),
                     pushsync,
@@ -2045,26 +2056,32 @@ async fn resolve_chequebook(
 /// extending credit (#73). Best-effort; needs an RPC; skipped under
 /// `--no-auto-chequebook`, which opts out of all automatic chequebook
 /// spending.
+///
+/// The shared top-up re-runs the chequebook checks right before any
+/// transfer and sends only on a positive answer to both. Returns `true`
+/// when the chain rejected the chequebook there (nothing was sent): the
+/// caller switches settlement off for it, as the startup check would
+/// have, unless `--chequebook-allow-unverified` is set.
 async fn top_up_adopted_chequebook(
     opt: &Opt,
     rpc_url: Option<&str>,
     signing_secret: [u8; SECP256K1_SECRET_LEN],
     node_eth: &[u8; 20],
     chequebook: [u8; 20],
-) {
+) -> bool {
     use ant_chain::chequebook_store::{top_up_chequebook, TopUp};
 
     if opt.no_auto_chequebook {
-        return;
+        return false;
     }
     let Some(rpc) = rpc_url else {
-        return;
+        return false;
     };
     let wallet = match ant_chain::tx::Wallet::new(signing_secret, ant_chain::tx::GNOSIS_CHAIN_ID) {
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(target: "antd", "chequebook deposit top-up skipped (wallet): {e:#}");
-            return;
+            return false;
         }
     };
     let client = ant_chain::ChainClient::new(rpc);
@@ -2092,12 +2109,23 @@ async fn top_up_adopted_chequebook(
             "chequebook deposit is below target and the node wallet has no xBZZ to top it up; \
              uploads stall once peers stop extending credit",
         ),
+        Ok(TopUp::Refused(verdict)) => {
+            tracing::error!(
+                target: "antd",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                ?verdict,
+                "chequebook failed its on-chain checks right before the deposit top-up; \
+                 nothing was sent, and bee peers drop every cheque drawn on it",
+            );
+            return true;
+        }
         Err(e) => tracing::warn!(
             target: "antd",
             chequebook = %format!("0x{}", hex::encode(chequebook)),
             "chequebook deposit top-up failed: {e}",
         ),
     }
+    false
 }
 
 /// The operator's `--gnosis-rpc-url` (or `GNOSIS_RPC_URL`), if set.
@@ -2200,7 +2228,7 @@ impl SettlementOnBuy {
         match *state {
             Settlement::Manual => {}
             Settlement::Managed(chequebook) => {
-                top_up_adopted_chequebook(
+                let rejected = top_up_adopted_chequebook(
                     &self.opt,
                     configured_rpc_url(&self.opt).as_deref(),
                     self.signing_secret,
@@ -2208,11 +2236,42 @@ impl SettlementOnBuy {
                     chequebook,
                 )
                 .await;
+                if rejected && !self.opt.chequebook_allow_unverified {
+                    self.disable(chequebook).await;
+                    *state = Settlement::Off;
+                }
             }
             Settlement::Off => {
                 if let Some(now) = self.enable().await {
                     *state = now;
                 }
+            }
+        }
+    }
+
+    /// Switch settlement off for a chequebook the chain rejected after
+    /// startup (the top-up's pre-transfer check said no), as the startup
+    /// check would have: the node stops emitting cheques every peer
+    /// drops, and the gateway stops reporting (and funding) it. The
+    /// next buy re-runs the resolution, whose own check keeps it off.
+    async fn disable(&self, chequebook: [u8; 20]) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let cmd = ControlCommand::DisablePushsyncSwap {
+            chequebook,
+            ack: ack_tx,
+        };
+        if self.commands.send(cmd).await.is_ok() {
+            match ack_rx.await {
+                Ok(ControlAck::Ok { message }) => tracing::warn!(target: "antd", "{message}"),
+                Ok(ControlAck::Error { message }) => {
+                    tracing::warn!(target: "antd", "disable outbound SWAP settlement: {message}");
+                }
+                _ => {}
+            }
+        }
+        if let Some(slot) = self.gateway_chequebook.get() {
+            if slot.get() == Some(chequebook) {
+                slot.clear();
             }
         }
     }
@@ -2289,11 +2348,39 @@ async fn verify_then_build_swap(
 ) -> Option<ant_p2p::PushsyncSwapConfig> {
     if let Some(rpc) = rpc_url {
         let client = ant_chain::ChainClient::new(rpc);
+        // Issuer-match check (Fix 4). bee accepts a cheque only when its
+        // signer matches the chequebook's on-chain `issuer()`; a node
+        // whose cheque-signing key differs emits cheques every peer
+        // silently drops, leaving uploads on pseudosettle credit only.
+        // Verify it before enabling outbound SWAP rather than discover
+        // it as a settlement stall under load. Derived up front so the
+        // `issuer()` read is skipped when there's nothing to compare.
+        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
+            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    error = %e,
+                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
+                );
+                None
+            }
+        };
         // Both reads come from the shared helper `ant-ffi` uses too; the
         // arms below report each check separately and apply the same
         // rule as `ChequebookChecks::verdict` ("no" disqualifies, a
         // failed read is skipped), plus `--chequebook-allow-unverified`.
-        let checks = ant_chain::chequebook_store::check_chequebook(&client, &chequebook).await;
+        // `issuer()` is only read when its answer is reported: not
+        // without a signing EOA, and not after a factory "no" that
+        // already disables settlement (with the override on, both
+        // checks are still reported).
+        let issuer_read = match (swap_eoa, allow_unverified) {
+            (None, _) => ant_chain::chequebook_store::IssuerRead::Never,
+            (Some(_), true) => ant_chain::chequebook_store::IssuerRead::Always,
+            (Some(_), false) => ant_chain::chequebook_store::IssuerRead::UnlessUnregistered,
+        };
+        let checks =
+            ant_chain::chequebook_store::check_chequebook(&client, &chequebook, issuer_read).await;
         match &checks.registered {
             Ok(true) => tracing::info!(
                 target: "antd",
@@ -2325,25 +2412,8 @@ async fn verify_then_build_swap(
             ),
         }
 
-        // Issuer-match check (Fix 4). bee accepts a cheque only when its
-        // signer matches the chequebook's on-chain `issuer()`; a node
-        // whose cheque-signing key differs emits cheques every peer
-        // silently drops, leaving uploads on pseudosettle credit only.
-        // Verify it before enabling outbound SWAP rather than discover
-        // it as a settlement stall under load.
-        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
-            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
-            Err(e) => {
-                tracing::warn!(
-                    target: "antd",
-                    error = %e,
-                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
-                );
-                None
-            }
-        };
-        if let Some(swap_eoa) = swap_eoa {
-            match checks.issuer {
+        if let (Some(swap_eoa), Some(issuer)) = (swap_eoa, checks.issuer) {
+            match issuer {
                 Ok(issuer) if issuer == swap_eoa => tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(chequebook)),

@@ -451,6 +451,7 @@ mod tests {
                     postage_dir: std::path::PathBuf::from("/nonexistent/postage"),
                 },
             ))),
+            gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         };
         (handle, (cmd_rx, status_tx))
     }
@@ -612,6 +613,111 @@ mod tests {
             SHUTDOWN_RETURNED.load(Ordering::SeqCst),
             "ant_shutdown returned while the host callback was still running",
         );
+    }
+
+    static OWNER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A chain where every batch is gone: `batchOwner` reads the zero
+    /// address. Anything else gets a JSON-RPC error.
+    unsafe extern "C" fn every_batch_gone_host(
+        request: *const c_char,
+        _ctx: *mut c_void,
+    ) -> *mut c_char {
+        let req: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(request) }.to_str().unwrap()).unwrap();
+        let data = req["params"][0]["data"].as_str().unwrap_or_default();
+        if !data.starts_with("0x2182ddb1") {
+            // The chain init's other steps (rediscovery scan, chequebook
+            // lookup): fail them, they aren't what this observes. No
+            // panic here — it would unwind across `extern "C"`.
+            return malloc_cstr(
+                &serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                                    "error": {"code": -32601, "message": "unscripted"}})
+                .to_string(),
+            );
+        }
+        OWNER_CALLS.fetch_add(1, Ordering::SeqCst);
+        malloc_cstr(
+            &serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                                "result": format!("0x{}", "00".repeat(32))})
+            .to_string(),
+        )
+    }
+
+    /// Re-calling `ant_start_gateway` with an RPC while the gateway is
+    /// already running still runs the chain init, and with it the
+    /// pending persisted-batch check — that is how a host retries one
+    /// whose first pass hit a dead RPC (e.g. on foreground), without an
+    /// `ant_stop_gateway` first.
+    #[test]
+    fn idempotent_gateway_start_retries_the_persisted_batch_check() {
+        let (mut handle, _peers) = handle_for_test();
+        let batch = [0x77; 32];
+        let dir = std::env::temp_dir().join(format!(
+            "ant-idempotent-start-recheck-{}",
+            std::process::id()
+        ));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let issuer = ant_postage::StampIssuer::open_or_new(
+            postage.join(format!("{}.bin", hex::encode(batch))),
+            batch,
+            20,
+            16,
+            false,
+        )
+        .unwrap();
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: std::sync::Mutex::new(std::collections::HashMap::from([(batch, issuer)])),
+            stamp_key: [0u8; 32],
+            batch_owner: [0x0a; 20],
+            postage_dir: postage,
+        });
+        // Grace 0: one "gone" read is believed, so the retry itself is
+        // what this observes (the grace re-check has its own test).
+        handle.chain_init = std::sync::Arc::new(crate::drive::ChainInit::with_not_found_grace(
+            std::sync::Arc::clone(&upload),
+            std::time::Duration::ZERO,
+        ));
+        // A gateway that is already up: the start takes its early return.
+        *handle.gateway_task.lock().unwrap() =
+            Some(handle.runtime.spawn(std::future::pending::<()>()));
+        let rc = unsafe {
+            ant_set_chain_transport(
+                std::ptr::from_mut(&mut handle),
+                Some(every_batch_gone_host),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, ANT_CHAIN_TRANSPORT_OK);
+
+        let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe {
+            crate::ant_start_gateway(
+                std::ptr::from_ref(&handle),
+                std::ptr::null(),
+                true,
+                rpc.as_ptr(),
+                &raw mut err,
+            )
+        };
+        assert!(
+            ok && err.is_null(),
+            "an already-running gateway is a success"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while upload.issuers.lock().unwrap().contains_key(&batch) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idempotent start never re-checked the persisted batch",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(OWNER_CALLS.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

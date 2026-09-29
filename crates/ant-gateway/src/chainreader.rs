@@ -74,6 +74,12 @@ impl ChainReader for AntChainReader {
             .map_err(|e| e.to_string())
     }
 
+    async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
+        ant_chain::fetch_postage_batch_owner(&self.client, &self.postage_contract, &batch_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn batch_meta(&self, batch_id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
         let meta =
             ant_chain::fetch_postage_batch_meta(&self.client, &self.postage_contract, &batch_id)
@@ -255,6 +261,9 @@ pub fn build(
 /// refusal on every JSON-RPC request the gateway's chain surfaces
 /// issue; a can't-serve answer falls through to the URLs above exactly
 /// as it would without a transport. `None` is identical to [`build`].
+///
+/// `chequebook` may be an embedder-owned [`ChequebookSlot`] (cloning
+/// shares it), so the embedder can update the address after startup.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_with_transport(
@@ -262,7 +271,7 @@ pub fn build_with_transport(
     read_fallback_rpc_url: Option<String>,
     postage_contract: String,
     wallet_eth: [u8; 20],
-    chequebook: Option<[u8; 20]>,
+    chequebook: impl Into<ChequebookSlot>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
     transport: Option<ant_chain::SharedChainTransport>,
@@ -287,7 +296,7 @@ pub fn build_with_transport(
     // than refusing to start the daemon — and crucially keeps a
     // read-only fallback node from silently signing transactions against
     // a shared public RPC.
-    let chequebook = ChequebookSlot::new(chequebook);
+    let chequebook = chequebook.into();
     let writer: Option<Arc<dyn ChainWriter>> = match (write_rpc, wallet_secret) {
         (Some(rpc), Some(secret)) => {
             let wallet = Wallet::new(secret, chain_id).ok();
