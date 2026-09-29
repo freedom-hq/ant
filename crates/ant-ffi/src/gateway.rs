@@ -53,15 +53,26 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// background right after the gateway starts:
 ///
 /// 1. Reloaded `postage/*.bin` batches the chain reports as missing
-///    (expired or never created) or owned by another key are
-///    unregistered, with a `WARN` naming the batch id. They're no longer
-///    listed by `GET /stamps` and can't be stamped with; their files
-///    stay on disk. A batch whose read fails stays registered and is
-///    re-checked on the next start.
+///    (evicted or never created), expired (`remainingBalance` 0) or
+///    owned by another key are unregistered, with a `WARN` naming the
+///    batch id. They're no longer listed by `GET /stamps` and can't be
+///    stamped with; their files stay on disk. "Missing" must be read
+///    twice, 45 seconds apart, before it counts: a batch bought just
+///    before a relaunch can read as missing on an RPC backend that
+///    hasn't seen its creation block yet, so the first such read only
+///    schedules a background re-check (the batch stays registered
+///    meanwhile, and steps 2 and 3 don't wait for it).
 /// 2. Funded batches the account owns on-chain but not on disk
 ///    (reinstall, restore from key) are registered.
 /// 3. The persisted or on-chain chequebook is adopted and outbound
 ///    settlement switched on. Nothing is deployed or funded.
+///
+/// A step that fails (a batch whose read fails stays registered, a
+/// failed rediscovery scan, a chequebook that couldn't be resolved) is
+/// retried by the next call with a `gnosis_rpc` — including an
+/// idempotent one that finds the gateway already running, so a host may
+/// simply re-call this (e.g. on foreground) to retry. Steps that already
+/// succeeded are not repeated.
 ///
 /// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
 /// sure settlement is on afterwards, deploying and funding a chequebook
@@ -158,6 +169,15 @@ pub unsafe extern "C" fn ant_start_gateway(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            // Still retry the chain init: a run whose RPC reads failed
+            // left work pending (unconfirmed batches, a failed
+            // rediscovery scan, no chequebook adopted), and re-calling
+            // start (e.g. on foreground) is how a host asks for that
+            // retry.
+            #[cfg(feature = "chain")]
+            if let Some(rpc) = gnosis_rpc {
+                spawn_chain_init(handle, handle.chain_client(rpc));
+            }
             return true;
         }
         // A finished task (bind error / aborted) is cleared so a retry
@@ -208,7 +228,10 @@ pub unsafe extern "C" fn ant_start_gateway(
             // the storage-buy flow) so `/chequebook/address` reflects it.
             // Read-only + fast: this NEVER deploys here (that's
             // `ant_deploy_chequebook`, which spends gas) and a load error
-            // degrades to `None` rather than failing gateway start.
+            // degrades to `None` rather than failing gateway start. A
+            // chequebook this process's chain check disqualified isn't
+            // reported (settlement is off for it), so
+            // `POST /chequebook/deposit` can't fund it either.
             let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook_for(
                 &handle.data_dir.join("chequebook.json"),
                 &handle.eth,
@@ -222,6 +245,17 @@ pub unsafe extern "C" fn ant_start_gateway(
                     None
                 }
             };
+            // The handle's one slot, reset for this start and kept
+            // current afterwards (see `AntHandle::gateway_chequebook`).
+            // A disqualified one is recorded as refused: the gateway
+            // then prices no deposit for it and funds none.
+            match chequebook {
+                Some(cb) if crate::drive::is_disqualified(&handle.eth, &cb) => {
+                    handle.gateway_chequebook.refuse(cb);
+                }
+                Some(cb) => handle.gateway_chequebook.set(cb),
+                None => handle.gateway_chequebook.clear(),
+            }
             ant_gateway::chainreader::build_with_transport(
                 gnosis_rpc.clone(),
                 // No read-only fallback on mobile: chain reads stay gated
@@ -232,7 +266,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // the Gnosis mainnet default (matches `antd`'s default).
                 ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),
                 handle.eth,
-                chequebook,
+                handle.gateway_chequebook.clone(),
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
                 // The storage flows keep the chequebook at the shared
@@ -244,17 +278,17 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // `/wallet`, `/stamps`, `/chainstate` and `/chequebook`
                 // reading the `gnosis_rpc` URL exactly as before.
                 handle.host_chain_transport(),
+                // The account's process-wide wallet tx lock, which the
+                // drive flows and the after-buy settlement task below
+                // hold too: a `POST /stamps` can't race their deposit
+                // transfer or deploy for a nonce or for xBZZ.
+                crate::drive::wallet_tx_lock(&handle.eth),
             )
         } else {
             None
         };
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
-        // The gateway's chequebook address, kept current when the chain
-        // init or a buy sets settlement up after this start.
-        #[cfg(feature = "chain")]
-        let chequebook_slot = chain.as_ref().map(|c| c.chequebook.clone());
-
         // One chain client, routed through the host transport like every
         // client this crate builds, for the background chain init and
         // the after-buy hook below.
@@ -263,9 +297,15 @@ pub unsafe extern "C" fn ant_start_gateway(
         #[cfg(feature = "chain")]
         let on_batch_bought = chain_client
             .clone()
-            .map(|client| after_buy_hook(handle, client, chequebook_slot.clone()));
+            .map(|client| after_buy_hook(handle, client));
         #[cfg(not(feature = "chain"))]
         let on_batch_bought = None;
+        #[cfg(feature = "chain")]
+        let on_chequebook_refused = chain_client
+            .clone()
+            .map(|client| chequebook_refused_hook(handle, client));
+        #[cfg(not(feature = "chain"))]
+        let on_chequebook_refused = None;
 
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
@@ -305,6 +345,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),
             on_batch_bought,
+            on_chequebook_refused,
         };
 
         let task = handle.runtime.spawn(async move {
@@ -316,21 +357,11 @@ pub unsafe extern "C" fn ant_start_gateway(
 
         // First point an RPC is known: run the chain-derived startup
         // work `ant_init` couldn't (see the doc comment above). Off the
-        // caller's thread so the gateway start never waits on the RPC.
+        // caller's thread so the gateway start never waits on the RPC;
+        // failed steps are retried by the next call with an RPC.
         #[cfg(feature = "chain")]
         if let Some(chain) = chain_client {
-            let init = Arc::clone(&handle.chain_init);
-            let cmd_tx = handle.cmd_tx.clone();
-            let data_dir = handle.data_dir.clone();
-            let secret = handle.signing_secret;
-            let slot = chequebook_slot;
-            handle.runtime.spawn(async move {
-                if let (Some(cb), Some(slot)) =
-                    (init.run(&chain, &cmd_tx, &data_dir, secret).await, slot)
-                {
-                    slot.set(cb);
-                }
-            });
+            spawn_chain_init(handle, chain);
         }
         true
     }
@@ -343,20 +374,21 @@ pub unsafe extern "C" fn ant_start_gateway(
 /// fresh install's session uploads without paying peers until the next
 /// launch. Spawned so the buy response doesn't wait on it. The
 /// chequebook setup lock serialises it against a concurrent
-/// `ant_deploy_chequebook` or chain init. The resulting chequebook is
-/// written to the gateway's `slot`, so `/chequebook/*` reports one
-/// deployed here without a gateway restart.
+/// `ant_deploy_chequebook` or chain init. The outcome goes to the
+/// handle's gateway chequebook slot, so `/chequebook/*` reports one
+/// deployed here without a gateway restart, and one the chain check
+/// disqualified is dropped from it.
 #[cfg(feature = "chain")]
 fn after_buy_hook(
     handle: &AntHandle,
     client: ant_chain::ChainClient,
-    slot: Option<ant_gateway::ChequebookSlot>,
 ) -> ant_gateway::BatchBoughtHook {
     let rt = handle.runtime.handle().clone();
     let cmd_tx = handle.cmd_tx.clone();
     let data_dir = handle.data_dir.clone();
     let secret = handle.signing_secret;
     let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
     Arc::new(move |_batch_id| {
         let (client, cmd_tx, data_dir) = (client.clone(), cmd_tx.clone(), data_dir.clone());
         let slot = slot.clone();
@@ -365,11 +397,70 @@ fn after_buy_hook(
                 &cmd_tx, &client, secret, &data_dir, eth,
             )
             .await;
-            if let (Some(cb), Some(slot)) = (chequebook, slot) {
-                slot.set(cb);
-            }
+            crate::drive::sync_gateway_chequebook(&slot, &eth, chequebook);
         });
     })
+}
+
+/// `POST /v0/settlement/deposit` found the chain refusing the account's
+/// chequebook (nothing was sent): the C API's top-up treatment
+/// ([`crate::drive::chequebook_refused`]: the shared lag check, then
+/// recorded as disqualified and settlement switched off), and a
+/// refusal that stands drops the chequebook from the gateway's slot.
+#[cfg(feature = "chain")]
+fn chequebook_refused_hook(
+    handle: &AntHandle,
+    client: ant_chain::ChainClient,
+) -> ant_gateway::ChequebookRefusedHook {
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
+    Arc::new(move |chequebook, refusal| {
+        let (client, cmd_tx, data_dir, slot) = (
+            client.clone(),
+            cmd_tx.clone(),
+            data_dir.clone(),
+            slot.clone(),
+        );
+        Box::pin(async move {
+            let stands = crate::drive::chequebook_refused(
+                &cmd_tx,
+                &client,
+                &data_dir,
+                eth,
+                chequebook,
+                refusal == ant_gateway::ChequebookRefusal::NotRegistered,
+            )
+            .await;
+            if stands {
+                crate::drive::sync_gateway_chequebook(&slot, &eth, None);
+            }
+            stands
+        })
+    })
+}
+
+/// Run [`crate::drive::ChainInit::run`] in the background against
+/// `chain`. Overlapping runs are safe (see `ChainInit::run`), and one
+/// with nothing left to do issues no reads, so calling this on every
+/// `ant_start_gateway` is cheap. Its settlement outcome goes to the
+/// handle's gateway chequebook slot — the live gateway's, also on the
+/// idempotent "already running" retry.
+#[cfg(feature = "chain")]
+fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
+    let init = Arc::clone(&handle.chain_init);
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let secret = handle.signing_secret;
+    let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
+    handle.runtime.spawn(async move {
+        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, |adopted| {
+            crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
+        })
+        .await;
+    });
 }
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].

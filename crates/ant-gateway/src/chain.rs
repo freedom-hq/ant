@@ -63,6 +63,14 @@ pub trait ChainReader: Send + Sync {
     async fn batch_meta(&self, _batch_id: [u8; 32]) -> Result<BatchMetaView, String> {
         Err("batch_meta unsupported".to_string())
     }
+    /// `PostageStamp.batchOwner` alone — the single view `/stamps` needs
+    /// to confirm a batch is gone (zero owner) after its balance read
+    /// fails. Defaults to [`Self::batch_meta`]'s owner; real readers
+    /// override it with one call instead of `batch_meta`'s four, so the
+    /// check doesn't eat the shared enrichment timeout.
+    async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
+        self.batch_meta(batch_id).await.map(|meta| meta.owner)
+    }
 }
 
 /// On-chain views of one postage batch, read directly from the
@@ -167,6 +175,27 @@ pub enum FundingFailure {
     NotFound(String),
     /// A chain read or transaction failed. → `502`.
     Chain(String),
+    /// The chain says no to the node's chequebook (the deposit top-up's
+    /// checks): nothing was swapped or sent. The route hands it to
+    /// [`GatewayHandle::on_chequebook_refused`] before answering.
+    ChequebookRefused {
+        chequebook: [u8; 20],
+        refusal: ChequebookRefusal,
+        /// For the user.
+        message: String,
+    },
+}
+
+/// Which chequebook check said no (`ant_chain::chequebook_store::
+/// ChequebookVerdict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChequebookRefusal {
+    /// The Swarm chequebook factory doesn't know it. For a chequebook
+    /// the node deployed moments ago this can be an RPC that hasn't seen
+    /// the deploy yet.
+    NotRegistered,
+    /// Its `issuer()` is this other address, not the node wallet.
+    IssuerMismatch([u8; 20]),
 }
 
 /// What paying with xDAI takes (`ant_chain::funding::Funding`). PLUR
@@ -212,11 +241,36 @@ pub struct DepositView {
     pub funding: FundingView,
 }
 
-/// Lets one on-chain write run at a time on a node. The write routes
-/// answer `409` while another one runs instead of queueing, so a client
-/// retrying a slow buy can't buy twice. (`ant-chain` also serialises
-/// the transactions themselves per key, which covers the node's
-/// background settlement as well.)
+/// Lets one on-chain write *route* run at a time on a node. The write
+/// routes answer `409` while another one runs instead of queueing, so a
+/// client retrying a slow buy can't buy twice.
+///
+/// Only the HTTP write routes take it. The embedder's background chain
+/// work (antd's after-buy settlement and startup top-up, ant-ffi's C
+/// API and after-buy task) never does: it would otherwise `409` the
+/// user's next buy for as long as a deposit transfer confirms. Those
+/// tasks and the routes are kept apart by the [`WalletTxLock`] instead,
+/// which a route takes *after* the gate and waits for.
+///
+/// # Lock order
+///
+/// Four locks guard the node wallet, each with its own job. Whoever
+/// holds more than one took them in this order, and nothing takes an
+/// earlier one while holding a later one:
+///
+/// 1. [`WriteGate`] (this): one write route at a time, `try` only.
+/// 2. The embedder's settlement lock, if any (antd's after-buy state,
+///    ant-ffi's chequebook-setup lock), which a refused-chequebook hook
+///    takes; routes call that hook only after releasing 3.
+/// 3. [`WalletTxLock`]: one read-then-write sequence at a time (balance
+///    guard → `createBatch`, shortfall read → transfer), shared with the
+///    embedder's own spend paths. Not reentrant: released before the
+///    after-buy hook or any other path that takes it.
+/// 4. `ant-chain`'s per-key sender lock inside every transaction send
+///    (nonce read → receipt). A leaf: nothing is taken while it's held.
+///    It also covers a send that shares no [`WalletTxLock`] (antd's
+///    startup chequebook deploy, before the gateway's chain context
+///    exists).
 #[derive(Debug, Clone, Default)]
 pub struct WriteGate(std::sync::Arc<tokio::sync::Mutex<()>>);
 
@@ -237,12 +291,18 @@ impl WriteGate {
 /// chain init. Setting it here makes `/wallet`, `/chequebook/*` and
 /// `POST /chequebook/deposit` see it without a restart.
 #[derive(Debug, Clone, Default)]
-pub struct ChequebookSlot(std::sync::Arc<std::sync::RwLock<Option<[u8; 20]>>>);
+pub struct ChequebookSlot(
+    std::sync::Arc<std::sync::RwLock<Option<[u8; 20]>>>,
+    std::sync::Arc<std::sync::RwLock<Option<[u8; 20]>>>,
+);
 
 impl ChequebookSlot {
     #[must_use]
     pub fn new(chequebook: Option<[u8; 20]>) -> Self {
-        Self(std::sync::Arc::new(std::sync::RwLock::new(chequebook)))
+        Self(
+            std::sync::Arc::new(std::sync::RwLock::new(chequebook)),
+            std::sync::Arc::default(),
+        )
     }
 
     /// The current chequebook, if any.
@@ -260,8 +320,70 @@ impl ChequebookSlot {
             .0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chequebook);
+        self.set_refused(None);
+    }
+
+    /// Forget the chequebook: the node no longer settles with one (e.g.
+    /// the chain check disqualified it), so `/chequebook/*` reports none
+    /// and `POST /chequebook/deposit` has nothing to fund.
+    pub fn clear(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.set_refused(None);
+    }
+
+    /// Forget `chequebook` because the chain check disqualified it:
+    /// like [`Self::clear`], and the node still *has* that chequebook,
+    /// so a buy won't deploy another one. `/v0/storage/quote` then
+    /// prices no deposit and `/v0/settlement/deposit` funds none.
+    /// [`Self::set`] (a chequebook that checks out) undoes it.
+    pub fn refuse(&self, chequebook: [u8; 20]) {
+        self.clear();
+        self.set_refused(Some(chequebook));
+    }
+
+    /// The chequebook [`Self::refuse`] recorded, while no usable one
+    /// replaced it.
+    #[must_use]
+    pub fn refused(&self) -> Option<[u8; 20]> {
+        *self
+            .1
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_refused(&self, chequebook: Option<[u8; 20]>) {
+        *self
+            .1
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = chequebook;
     }
 }
+
+impl From<Option<[u8; 20]>> for ChequebookSlot {
+    fn from(chequebook: Option<[u8; 20]>) -> Self {
+        Self::new(chequebook)
+    }
+}
+
+/// Serializes every transaction sent from the node wallet.
+///
+/// The wallet fetches its nonce as "pending count" per tx, so two
+/// senders interleaving (a second `POST /stamps` while the first is
+/// still confirming, or the embedder topping up the chequebook in the
+/// background after a buy) race for the same nonce, and a transfer can
+/// drain the xBZZ a buy's balance guard just counted. The write
+/// endpoints hold it from their pre-checks through the last receipt;
+/// an embedder that sends from the same wallet outside the gateway
+/// clones it from [`ChainContext::tx_lock`] (antd) or passes its own to
+/// [`crate::chainreader::build_with_transport`] (ant-ffi, which rebuilds
+/// the context on every gateway start) and holds it the same way. It
+/// only serializes senders that share the one lock. Taken after the
+/// [`WriteGate`] and before `ant-chain`'s per-key sender lock; see
+/// [`WriteGate`]'s lock order.
+pub type WalletTxLock = std::sync::Arc<tokio::sync::Mutex<()>>;
 
 /// Everything the chain-backed endpoints need beyond the reader: the
 /// wallet address whose balances `/wallet` reports, the chequebook
@@ -275,9 +397,11 @@ pub struct ChainContext {
     /// Signer for the on-chain write endpoints. `None` → those endpoints
     /// return `501`.
     pub writer: Option<std::sync::Arc<dyn ChainWriter>>,
-    /// One on-chain write at a time: the write routes answer `409`
-    /// while another runs.
+    /// One on-chain write *route* at a time: the write routes answer
+    /// `409` while another runs; see [`WriteGate`].
     pub writes: WriteGate,
+    /// Held across every wallet transaction; see [`WalletTxLock`].
+    pub tx_lock: WalletTxLock,
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
@@ -576,7 +700,9 @@ where
 }
 
 /// The chain context and its writer, or the chain-init `503`, or the
-/// bee-shaped `501` used when no funded wallet is configured.
+/// bee-shaped `501` used when no funded wallet is configured. A write
+/// route takes the context's [`WriteGate`], then holds its
+/// [`WalletTxLock`] across its transactions.
 #[allow(clippy::result_large_err)]
 fn writer(
     handle: &GatewayHandle,
@@ -725,6 +851,10 @@ pub async fn buy_stamp(
     let total_cost = 1u128
         .checked_shl(u32::from(depth))
         .and_then(|factor| amount.checked_mul(factor));
+    // Held from the balance guard through the buy's last receipt, so a
+    // background top-up can't spend the xBZZ counted here or take the
+    // buy's nonce.
+    let tx = chain.tx_lock.lock().await;
     let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -753,11 +883,14 @@ pub async fn buy_stamp(
         Ok(id) => id,
         Err(r) => return r,
     };
+    drop(tx);
     bought(&handle, batch_id, depth, immutable).await
 }
 
 /// Finish a buy: register the batch, fire the after-buy hook, answer
 /// `201 {batchID}`. Shared by `POST /stamps` and `POST /v0/storage/buy`.
+/// The caller has already released the [`WalletTxLock`]: the hook's
+/// settlement work takes it itself.
 ///
 /// The issuer is registered with the running node *before* the `201`,
 /// so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
@@ -806,6 +939,7 @@ pub async fn topup_stamp(
         Ok(a) => a,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer"),
     };
+    let _tx = chain.tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.topup_batch(batch_id, amount)).await {
         return r;
     }
@@ -829,9 +963,11 @@ pub async fn dilute_stamp(
         Ok(b) => b,
         Err(r) => return r,
     };
+    let tx = chain.tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
     }
+    drop(tx);
     // Bump the live issuer's depth so subsequent uploads use the larger
     // capacity. `immutable` is irrelevant for an existing issuer (the
     // register handler only updates depth when the batch is already
@@ -868,6 +1004,7 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    let _tx = chain.tx_lock.lock().await;
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,
         Err(r) => return r,
@@ -904,14 +1041,22 @@ where
 {
     match tokio::time::timeout(limit, fut).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(FundingFailure::Unsupported)) => Err(json_error(
+        Ok(Err(f)) => Err(failure_response(f)),
+        Err(_) => Err(json_error(StatusCode::GATEWAY_TIMEOUT, timed_out)),
+    }
+}
+
+fn failure_response(f: FundingFailure) -> Response {
+    match f {
+        FundingFailure::Unsupported => json_error(
             StatusCode::NOT_IMPLEMENTED,
             "this node can't fund storage with xDAI",
-        )),
-        Ok(Err(FundingFailure::Rejected(m))) => Err(json_error(StatusCode::BAD_REQUEST, m)),
-        Ok(Err(FundingFailure::NotFound(m))) => Err(json_error(StatusCode::NOT_FOUND, m)),
-        Ok(Err(FundingFailure::Chain(m))) => Err(json_error(StatusCode::BAD_GATEWAY, m)),
-        Err(_) => Err(json_error(StatusCode::GATEWAY_TIMEOUT, timed_out)),
+        ),
+        FundingFailure::Rejected(m) | FundingFailure::ChequebookRefused { message: m, .. } => {
+            json_error(StatusCode::BAD_REQUEST, m)
+        }
+        FundingFailure::NotFound(m) => json_error(StatusCode::NOT_FOUND, m),
+        FundingFailure::Chain(m) => json_error(StatusCode::BAD_GATEWAY, m),
     }
 }
 
@@ -1104,6 +1249,11 @@ pub async fn storage_buy(
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
+    // Held from the balance reads through the last receipt, so the
+    // embedder's background settlement can't spend the xBZZ counted
+    // here; released before `bought` fires the after-buy hook, whose
+    // settlement work takes it itself.
+    let tx = chain.tx_lock.lock().await;
     let batch_id = match funding_call(
         FUNDING_TX_TIMEOUT,
         "chain transaction timed out",
@@ -1114,6 +1264,7 @@ pub async fn storage_buy(
         Ok(id) => id,
         Err(r) => return r,
     };
+    drop(tx);
     bought(&handle, batch_id, depth, immutable).await
 }
 
@@ -1142,6 +1293,7 @@ pub async fn storage_extend(
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
+    let tx = chain.tx_lock.lock().await;
     let depth = match funding_call(
         FUNDING_TX_TIMEOUT,
         "chain transaction timed out",
@@ -1152,6 +1304,7 @@ pub async fn storage_extend(
         Ok(d) => d,
         Err(r) => return r,
     };
+    drop(tx);
     if new_depth.is_some() {
         // Bump the live issuer's depth so uploads use the new capacity
         // (`immutable` is ignored for an existing issuer, see
@@ -1189,6 +1342,13 @@ pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response
 /// `POST /v0/settlement/deposit` tops the chequebook's deposit up to
 /// its target, paid from the node wallet's xDAI. A no-op when it's
 /// already there. Returns the status afterwards.
+///
+/// The deposit and balances are read under the [`WalletTxLock`], so a
+/// background top-up that just landed isn't paid twice. Nothing is
+/// spent on a chequebook the chain rejects (`ant_chain::funding`); such
+/// a refusal goes to [`GatewayHandle::on_chequebook_refused`] once the
+/// lock is released, and the embedder decides whether it stands (and
+/// switches settlement off) or is an RPC that hasn't seen its deploy.
 pub async fn settlement_fund_deposit(State(handle): State<GatewayHandle>) -> Response {
     let (chain, w) = match writer(&handle) {
         Ok(cw) => cw,
@@ -1197,14 +1357,31 @@ pub async fn settlement_fund_deposit(State(handle): State<GatewayHandle>) -> Res
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
-    match funding_call(
-        FUNDING_TX_TIMEOUT,
-        "chain transaction timed out",
-        w.fund_deposit_with_xdai(),
-    )
-    .await
-    {
-        Ok(d) => deposit_response(chain.wallet_eth, &d),
-        Err(r) => r,
+    let tx = chain.tx_lock.lock().await;
+    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai()).await;
+    drop(tx);
+    match funded {
+        Ok(Ok(d)) => deposit_response(chain.wallet_eth, &d),
+        Ok(Err(FundingFailure::ChequebookRefused {
+            chequebook,
+            refusal,
+            message,
+        })) => {
+            let stands = match &handle.on_chequebook_refused {
+                Some(hook) => hook(chequebook, refusal).await,
+                None => true,
+            };
+            if stands {
+                json_error(StatusCode::BAD_REQUEST, message)
+            } else {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the chain RPC hasn't caught up with this node's just-deployed chequebook \
+                     yet; nothing was sent, try again in a few minutes",
+                )
+            }
+        }
+        Ok(Err(f)) => failure_response(f),
+        Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "chain transaction timed out"),
     }
 }

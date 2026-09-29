@@ -19,6 +19,7 @@
 use primitive_types::U256;
 use thiserror::Error;
 
+use crate::chequebook_store::{ChequebookError, ChequebookVerdict, IssuerRead, TopUp};
 use crate::tx::{TxError, Wallet};
 use crate::ChainClient;
 
@@ -158,6 +159,39 @@ pub enum FundingError {
     /// `createBatch` confirmed without a `BatchCreated` event.
     #[error("storage purchase receipt had no batch")]
     NoBatchInReceipt,
+    /// The chain says no to the chequebook a deposit was meant for
+    /// ([`crate::chequebook_store::check_chequebook`]): nothing was
+    /// swapped or sent. A factory "not registered" for a chequebook the
+    /// node just deployed can be a lagging RPC; the caller tells the two
+    /// apart with [`crate::chequebook_store::not_registered_may_be_lag`]
+    /// before it switches settlement off.
+    #[error("{}", refusal_message(chequebook, *verdict))]
+    ChequebookRefused {
+        chequebook: [u8; 20],
+        verdict: ChequebookVerdict,
+    },
+    /// The deposit transfer, or the checks right before it, failed
+    /// ([`crate::chequebook_store::top_up_chequebook`]).
+    #[error("deposit into chequebook: {0}")]
+    Deposit(ChequebookError),
+}
+
+/// Why a chequebook refused by the chain can't take a deposit, for the
+/// user.
+fn refusal_message(chequebook: &[u8; 20], verdict: ChequebookVerdict) -> String {
+    match verdict {
+        ChequebookVerdict::IssuerMismatch(issuer) => format!(
+            "chequebook 0x{} is issued by 0x{}, not this node; peers would drop every cheque \
+             drawn on it, so nothing was deposited into it",
+            hex::encode(chequebook),
+            hex::encode(issuer),
+        ),
+        ChequebookVerdict::NotRegistered | ChequebookVerdict::Usable => format!(
+            "chequebook 0x{} is not registered with the Swarm chequebook factory; peers drop \
+             every cheque drawn on it, so nothing was deposited into it",
+            hex::encode(chequebook),
+        ),
+    }
 }
 
 /// The node wallet a funding call prices or spends from, and the chain
@@ -701,8 +735,22 @@ async fn status_for(
 
 /// Top `chequebook` up to `target`, paying only with xDAI: swap the
 /// xBZZ the wallet lacks, then transfer the shortfall into the
-/// chequebook. A no-op when the deposit is already at its target.
-/// Returns the deposit as the chain reports it afterwards.
+/// chequebook through the shared
+/// [`top_up_chequebook`](crate::chequebook_store::top_up_chequebook).
+/// A no-op when the deposit is already at its target. Returns the
+/// deposit as the chain reports it afterwards.
+///
+/// Nothing is spent on a chequebook the chain rejects: before a swap
+/// the chequebook's checks (factory registration, `issuer()` is the
+/// node wallet) must both read "yes", and `top_up_chequebook` runs them
+/// again right before the transfer. A "no" is
+/// [`FundingError::ChequebookRefused`]; a check that couldn't be read
+/// is an error too, since a deposit can't be taken back.
+///
+/// The caller holds its wallet tx lock (`ant_gateway::WalletTxLock`)
+/// around this call: the deposit and the wallet's balances are read
+/// here, after the lock is taken, so a concurrent top-up that already
+/// landed isn't sent a second time.
 ///
 /// This is the explicit top-up: a chequebook deployed before its
 /// deposit was funded (every install before #73) can be funded no other
@@ -717,22 +765,67 @@ pub async fn fund_deposit_with_xdai(
     if short == 0 {
         return status_for(payer, chequebook, deposited, target).await;
     }
-    acquire_bzz(payer, short.saturating_sub(wallet_bzz(payer).await)).await?;
-    payer
-        .wallet
-        .erc20_transfer(
-            payer.client,
-            &crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
-            chequebook,
-            U256::from(short),
-        )
-        .await
-        .map_err(|source| FundingError::Tx {
-            what: "deposit into chequebook",
-            source,
-        })?;
+    let to_acquire = short.saturating_sub(wallet_bzz(payer).await);
+    if to_acquire > 0 {
+        verify_for_deposit(payer, chequebook).await?;
+        acquire_bzz(payer, to_acquire).await?;
+    }
+    match crate::chequebook_store::top_up_chequebook(
+        payer.client,
+        payer.wallet,
+        payer.owner(),
+        chequebook,
+        target,
+    )
+    .await
+    {
+        Ok(TopUp::NotNeeded | TopUp::Funded { .. }) => {}
+        Ok(TopUp::WalletEmpty { .. }) => {
+            return Err(FundingError::Deposit(ChequebookError::Chain(
+                "the wallet holds no xBZZ to deposit".into(),
+            )));
+        }
+        Ok(TopUp::Refused(verdict)) => {
+            return Err(FundingError::ChequebookRefused {
+                chequebook: *chequebook,
+                verdict,
+            });
+        }
+        Err(e) => return Err(FundingError::Deposit(e)),
+    }
     // Re-read rather than assume: report what the chain says now.
     deposit_status(payer, chequebook, target).await
+}
+
+/// The chequebook checks [`top_up_chequebook`] runs before its transfer,
+/// run before the swap that pays for it: the same strict rule (both
+/// checks read, both "yes").
+///
+/// [`top_up_chequebook`]: crate::chequebook_store::top_up_chequebook
+async fn verify_for_deposit(payer: &Payer<'_>, chequebook: &[u8; 20]) -> Result<(), FundingError> {
+    let checks = crate::chequebook_store::check_chequebook(
+        payer.client,
+        chequebook,
+        IssuerRead::UnlessUnregistered,
+    )
+    .await;
+    match checks.verdict(payer.owner()) {
+        ChequebookVerdict::Usable => {}
+        verdict => {
+            return Err(FundingError::ChequebookRefused {
+                chequebook: *chequebook,
+                verdict,
+            })
+        }
+    }
+    let unread = [checks.registered.err(), checks.issuer.and_then(Result::err)];
+    match unread.into_iter().flatten().next() {
+        Some(e) => Err(FundingError::Read {
+            what: "verify the chequebook before depositing into it",
+            message: e.to_string(),
+        }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -845,11 +938,19 @@ mod tests {
     /// balances, every transaction mined at once, and every receipt
     /// carrying a `BatchCreated` log. It records each transaction by the
     /// contract it went to.
+    #[derive(Default)]
     struct ScriptedChain {
         wallet_bzz: u128,
         wallet_xdai: u128,
+        /// [`CHEQUEBOOK`]'s xBZZ, and its two chain checks: factory
+        /// registration and `issuer()`.
+        chequebook_bzz: u128,
+        registered: bool,
+        issuer: [u8; 20],
         sent: std::sync::Mutex<Vec<&'static str>>,
     }
+
+    const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
 
     const BATCH: [u8; 32] = [0xba; 32];
 
@@ -862,9 +963,33 @@ mod tests {
             let result = match req["method"].as_str().unwrap() {
                 "eth_call" => {
                     let data = req["params"][0]["data"].as_str().unwrap();
+                    let deployed_sel = format!(
+                        "0x{}",
+                        hex::encode(
+                            &crate::chequebook::factory_deployed_contracts_calldata(&CHEQUEBOOK)
+                                [..4]
+                        )
+                    );
+                    let issuer_sel = format!(
+                        "0x{}",
+                        hex::encode(crate::chequebook::chequebook_issuer_selector())
+                    );
                     match &data[..10] {
-                        // balanceOf(address): the node wallet's xBZZ.
+                        // balanceOf(address): the chequebook's deposit or
+                        // the node wallet's xBZZ.
+                        "0x70a08231" if data[34..74] == hex::encode(CHEQUEBOOK) => {
+                            json!(word(self.chequebook_bzz))
+                        }
+                        // A swap delivers the xBZZ it was asked for (and
+                        // then some).
+                        "0x70a08231" if self.sent.lock().unwrap().contains(&"swap") => {
+                            json!(word(self.wallet_bzz + 10 * TARGET))
+                        }
                         "0x70a08231" => json!(word(self.wallet_bzz)),
+                        sel if sel == deployed_sel => json!(word(u128::from(self.registered))),
+                        sel if sel == issuer_sel => {
+                            json!(format!("0x{}{}", "00".repeat(12), hex::encode(self.issuer)))
+                        }
                         // slot0(): about 0.06 xDAI per xBZZ, then padding.
                         "0x3850c7bd" => json!(format!(
                             "{}{}",
@@ -881,10 +1006,17 @@ mod tests {
                 "eth_sendRawTransaction" => {
                     let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
                     let to: Vec<u8> = rlp::Rlp::new(&raw).at(3).unwrap().data().unwrap().to_vec();
+                    let input: Vec<u8> =
+                        rlp::Rlp::new(&raw).at(5).unwrap().data().unwrap().to_vec();
                     let kind = if to == crate::tx::swap_helper_address() {
                         "swap"
                     } else if to == crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES {
-                        "approve"
+                        // transfer(address,uint256) vs approve.
+                        if input.starts_with(&[0xa9, 0x05, 0x9c, 0xbb]) {
+                            "transfer"
+                        } else {
+                            "approve"
+                        }
                     } else {
                         "createBatch"
                     };
@@ -917,7 +1049,7 @@ mod tests {
         let chain = std::sync::Arc::new(ScriptedChain {
             wallet_bzz,
             wallet_xdai,
-            sent: std::sync::Mutex::default(),
+            ..ScriptedChain::default()
         });
         // An unroutable URL: a fall-through would fail loudly.
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
@@ -960,5 +1092,83 @@ mod tests {
             "{result:?}"
         );
         assert!(sent.is_empty(), "nothing may be sent: {sent:?}");
+    }
+
+    async fn fund_deposit_with(
+        chain: ScriptedChain,
+    ) -> (Result<DepositStatus, FundingError>, Vec<&'static str>) {
+        let chain = std::sync::Arc::new(chain);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let payer = Payer::gnosis(&client, &wallet);
+        let result = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET).await;
+        let sent = chain.sent.lock().unwrap().clone();
+        (result, sent)
+    }
+
+    fn node_eth() -> [u8; 20] {
+        *Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID)
+            .unwrap()
+            .address()
+    }
+
+    /// An empty deposit on a chequebook that checks out: swap the
+    /// missing xBZZ, then deposit through the shared top-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deposit_swaps_then_transfers_into_a_checked_chequebook() {
+        let (result, sent) = fund_deposit_with(ScriptedChain {
+            wallet_xdai: WEI_PER_XDAI,
+            registered: true,
+            issuer: node_eth(),
+            ..ScriptedChain::default()
+        })
+        .await;
+        result.unwrap();
+        assert_eq!(sent, ["swap", "transfer"]);
+    }
+
+    /// The chain says no to the chequebook: nothing is swapped or sent,
+    /// whichever check refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_chequebook_gets_no_swap_and_no_deposit() {
+        let stranger = [0x5e; 20];
+        for (registered, issuer, want) in [
+            (false, node_eth(), ChequebookVerdict::NotRegistered),
+            (true, stranger, ChequebookVerdict::IssuerMismatch(stranger)),
+        ] {
+            for wallet_bzz in [0, TARGET] {
+                let (result, sent) = fund_deposit_with(ScriptedChain {
+                    wallet_bzz,
+                    wallet_xdai: WEI_PER_XDAI,
+                    registered,
+                    issuer,
+                    ..ScriptedChain::default()
+                })
+                .await;
+                match result {
+                    Err(FundingError::ChequebookRefused {
+                        chequebook,
+                        verdict,
+                    }) => {
+                        assert_eq!(chequebook, CHEQUEBOOK);
+                        assert_eq!(verdict, want);
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+                assert!(sent.is_empty(), "nothing may be sent: {sent:?}");
+            }
+        }
+    }
+
+    /// Already at its target: nothing to check, swap or send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_deposit_is_left_alone() {
+        let (result, sent) = fund_deposit_with(ScriptedChain {
+            chequebook_bzz: TARGET,
+            ..ScriptedChain::default()
+        })
+        .await;
+        assert!(!result.unwrap().needs_top_up());
+        assert!(sent.is_empty());
     }
 }

@@ -8,8 +8,8 @@ mod common;
 use std::sync::Arc;
 
 use ant_gateway::{
-    ChainContext, ChainReader, ChainWriter, ChequebookSlot, DepositView, FundingFailure,
-    FundingView, StorageQuoteView, WriteGate,
+    ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, DepositView,
+    FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -54,6 +54,7 @@ fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
         chain_id: 100,
         writer: None,
         writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
     })
 }
 
@@ -90,6 +91,7 @@ fn chain_ctx_rw(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
         chain_id: 100,
         writer: Some(Arc::new(FakeWriter)),
         writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
     })
 }
 
@@ -383,6 +385,41 @@ async fn deposit_returns_tx_hash() {
     );
 }
 
+/// An embedder sending from the node wallet outside the gateway (antd's
+/// after-buy chequebook top-up) holds the context's `tx_lock`; every
+/// write endpoint waits for it, so the two can't race for a nonce or
+/// spend the same xBZZ.
+#[tokio::test]
+async fn write_endpoints_wait_for_the_wallet_tx_lock() {
+    let id = hex::encode([0xAB; 32]);
+    let dilute = format!("/stamps/dilute/{id}/22");
+    let topup = format!("/stamps/topup/{id}/500");
+    for (method, uri) in [
+        (Method::POST, "/stamps/1000000/20"),
+        (Method::PATCH, topup.as_str()),
+        (Method::PATCH, dilute.as_str()),
+        (Method::POST, "/chequebook/deposit?amount=1"),
+    ] {
+        let ctx = chain_ctx_rw(Some([0xCD; 20]));
+        let held = ctx.tx_lock.clone().lock_owned().await;
+        let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+        let (m, u) = (method.clone(), uri.to_string());
+        let mut write = tokio::spawn(async move { req(router, m, &u).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut write)
+                .await
+                .is_err(),
+            "{method} {uri} sent while another wallet tx held the lock",
+        );
+        drop(held);
+        let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("write finishes once the lock is released")
+            .unwrap();
+        assert!(status.is_success(), "{method} {uri}: {status}");
+    }
+}
+
 #[tokio::test]
 async fn deposit_requires_amount() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx_rw(Some([0xCD; 20])));
@@ -426,6 +463,8 @@ struct FundingWriter {
     /// once it's waiting.
     hold_buy: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     short_of_xdai: bool,
+    /// Answer the deposit top-up with the chain refusing the chequebook.
+    refuse_deposit: Option<ChequebookRefusal>,
 }
 
 impl FundingWriter {
@@ -544,6 +583,13 @@ impl ChainWriter for FundingWriter {
     }
     async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
         self.record("fund_deposit_with_xdai".into());
+        if let Some(refusal) = self.refuse_deposit {
+            return Err(FundingFailure::ChequebookRefused {
+                chequebook: [0xCB; 20],
+                refusal,
+                message: "chequebook 0xcbcb… is not registered; nothing was deposited".into(),
+            });
+        }
         Ok(DepositView {
             chequebook: Some([0xCB; 20]),
             managed: true,
@@ -563,6 +609,7 @@ fn funding_ctx(writer: Arc<FundingWriter>) -> Arc<ChainContext> {
         chain_id: 100,
         writer: Some(writer),
         writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
     })
 }
 
@@ -860,4 +907,115 @@ async fn buy_stamp_is_immutable_unless_the_header_or_query_says_not() {
             "buy_batch(1000000, 20, immutable=true)",
         ]
     );
+}
+
+/// The xDAI write routes hold the context's wallet tx lock across their
+/// transactions, like `POST /stamps`: while the embedder's background
+/// settlement holds it they wait (they don't `409`: the write gate is
+/// the routes' own), and run once it's released. Quotes and the deposit
+/// status don't wait.
+#[tokio::test]
+async fn v0_writes_wait_for_the_wallet_tx_lock() {
+    let batch = hex::encode([0xAB; 32]);
+    let extend = format!("/v0/storage/extend?batchId={batch}&amountPerChunk=1");
+    for uri in [
+        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        extend.as_str(),
+        "/v0/settlement/deposit",
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let ctx = funding_ctx(writer.clone());
+        let held = ctx.tx_lock.clone().lock_owned().await;
+        let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+
+        let (status, _) = get(router.clone(), "/v0/storage/quote?depth=20&days=30").await;
+        assert_eq!(status, StatusCode::OK, "a quote doesn't wait for the lock");
+        let (status, _) = get(router.clone(), "/v0/settlement/deposit").await;
+        assert_eq!(status, StatusCode::OK, "nor does the deposit status");
+
+        let u = uri.to_string();
+        let mut write = tokio::spawn({
+            let router = router.clone();
+            async move { req(router, Method::POST, &u).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut write)
+                .await
+                .is_err(),
+            "{uri} ran while another wallet tx held the lock",
+        );
+        let writes = || {
+            writer
+                .calls()
+                .into_iter()
+                .filter(|c| !c.starts_with("quote"))
+                .count()
+        };
+        assert_eq!(writes(), 0, "{uri}: {:?}", writer.calls());
+        drop(held);
+        let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("the write finishes once the lock is released")
+            .unwrap();
+        assert!(status.is_success(), "{uri}: {status}");
+        assert_eq!(writes(), 1, "{uri}: {:?}", writer.calls());
+    }
+}
+
+/// A deposit top-up the chain refused goes to the embedder's hook, after
+/// the wallet tx lock is released (the hook may take the embedder's
+/// settlement lock). A refusal that stands is a `400` with the reason;
+/// one the embedder reads as a lagging RPC is a `503` to retry.
+#[tokio::test]
+async fn v0_deposit_refusal_goes_to_the_embedder_hook() {
+    for (stands, want) in [
+        (true, StatusCode::BAD_REQUEST),
+        (false, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let writer = Arc::new(FundingWriter {
+            refuse_deposit: Some(ChequebookRefusal::NotRegistered),
+            ..FundingWriter::default()
+        });
+        let ctx = funding_ctx(writer.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: ant_gateway::ChequebookRefusedHook = {
+            let (seen, lock) = (seen.clone(), ctx.tx_lock.clone());
+            Arc::new(move |chequebook, refusal| {
+                let (seen, lock) = (seen.clone(), lock.clone());
+                Box::pin(async move {
+                    let released = lock.try_lock().is_ok();
+                    seen.lock().unwrap().push((chequebook, refusal, released));
+                    stands
+                })
+            })
+        };
+        let router = common::status_router_with_chain_and_hooks(
+            snapshot_with_one_peer(),
+            ctx,
+            None,
+            Some(hook),
+        );
+        let (status, json) = req(router, Method::POST, "/v0/settlement/deposit").await;
+        assert_eq!(status, want, "{json}");
+        if stands {
+            assert!(json["message"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was deposited"));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [([0xCB; 20], ChequebookRefusal::NotRegistered, true)],
+            "the hook ran once, with the wallet tx lock free",
+        );
+    }
+
+    // No hook: the refusal is answered as it stands.
+    let writer = Arc::new(FundingWriter {
+        refuse_deposit: Some(ChequebookRefusal::IssuerMismatch([0x5E; 20])),
+        ..FundingWriter::default()
+    });
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
+    let (status, _) = req(router, Method::POST, "/v0/settlement/deposit").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

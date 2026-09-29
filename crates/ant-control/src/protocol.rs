@@ -425,6 +425,14 @@ pub struct PostageStatusView {
     /// Defaults `true` so old daemons keep deserializing.
     #[serde(default = "default_true")]
     pub usable: bool,
+    /// Seconds since the node registered this batch at runtime (a buy
+    /// or connect via `RegisterBatch`); `None` for a batch reloaded
+    /// from disk or pre-configured at startup. Lets the gateway give a
+    /// freshly-bought batch a grace window before believing a chain
+    /// read that says it doesn't exist (a load-balanced RPC backend
+    /// may lag the block that created it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_secs_ago: Option<u64>,
     /// `0x`-prefixed hex of the configured batch id. Empty when
     /// `enabled = false`.
     #[serde(default)]

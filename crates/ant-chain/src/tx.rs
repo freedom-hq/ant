@@ -897,6 +897,12 @@ impl Wallet {
 /// one `Wallet` value. Waiting for the receipt, not just the broadcast,
 /// also keeps a load-balanced RPC whose nodes disagree about the pending
 /// count from handing out a nonce twice.
+///
+/// It is the innermost of the node wallet's locks (after the gateway's
+/// `WriteGate` and the embedder's `WalletTxLock`, which guard whole
+/// read-then-write sequences rather than one send): nothing is taken
+/// while it's held, so it can't deadlock with them. It also covers a
+/// send that shares no `WalletTxLock`.
 #[cfg(feature = "chain-rpc")]
 fn sender_lock(address: &[u8; 20]) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     use std::collections::HashMap;

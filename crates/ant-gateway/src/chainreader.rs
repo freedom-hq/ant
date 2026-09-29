@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use crate::{
-    ChainContext, ChainReader, ChainWriter, ChequebookSlot, DepositView, FundingFailure,
-    FundingView, StorageQuoteView, WriteGate,
+    ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, DepositView,
+    FundingFailure, FundingView, StorageQuoteView, WriteGate,
 };
 use ant_chain::funding::{self, DepositPolicy, FundingError, Payer};
 use ant_chain::tx::Wallet;
@@ -78,6 +78,12 @@ impl ChainReader for AntChainReader {
             .map_err(|e| e.to_string())
     }
 
+    async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
+        ant_chain::fetch_postage_batch_owner(&self.client, &self.postage_contract, &batch_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn batch_meta(&self, batch_id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
         let meta =
             ant_chain::fetch_postage_batch_meta(&self.client, &self.postage_contract, &batch_id)
@@ -122,8 +128,12 @@ impl AntChainWriter {
         }
     }
 
+    /// A chequebook the chain check disqualified
+    /// ([`ChequebookSlot::refused`]) is neither funded nor replaced by a
+    /// buy, so a plan is then priced and bought alone.
     fn deposit_policy(&self) -> DepositPolicy {
         match self.deposit_target {
+            _ if self.chequebook.refused().is_some() => DepositPolicy::Unmanaged,
             Some(target) => DepositPolicy::Managed {
                 chequebook: self.chequebook.get(),
                 target,
@@ -192,6 +202,19 @@ fn quote_view(q: &funding::PlanQuote) -> StorageQuoteView {
 /// the message the apps show); anything else is the chain's (`502`).
 fn failure(e: FundingError) -> FundingFailure {
     match e {
+        FundingError::ChequebookRefused {
+            chequebook,
+            verdict,
+        } => FundingFailure::ChequebookRefused {
+            chequebook,
+            refusal: match verdict {
+                ant_chain::chequebook_store::ChequebookVerdict::IssuerMismatch(issuer) => {
+                    ChequebookRefusal::IssuerMismatch(issuer)
+                }
+                _ => ChequebookRefusal::NotRegistered,
+            },
+            message: e.to_string(),
+        },
         FundingError::Invalid(_) | FundingError::InsufficientXdai { .. } => {
             FundingFailure::Rejected(e.to_string())
         }
@@ -308,6 +331,13 @@ impl ChainWriter for AntChainWriter {
     }
 
     async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+        if let Some(cb) = self.chequebook.refused() {
+            return Err(FundingFailure::Rejected(format!(
+                "chequebook 0x{} failed its on-chain checks, so settlement is off for it; \
+                 not depositing into it",
+                hex::encode(cb),
+            )));
+        }
         let cb = self.chequebook.get().ok_or_else(|| {
             FundingFailure::Rejected(
                 "this node has no chequebook yet; buying storage creates one".into(),
@@ -375,6 +405,7 @@ pub fn build(
         wallet_secret,
         deposit_target,
         None,
+        crate::WalletTxLock::default(),
     )
 }
 
@@ -383,6 +414,14 @@ pub fn build(
 /// refusal on every JSON-RPC request the gateway's chain surfaces
 /// issue; a can't-serve answer falls through to the URLs above exactly
 /// as it would without a transport. `None` is identical to [`build`].
+///
+/// `chequebook` may be an embedder-owned [`ChequebookSlot`] (cloning
+/// shares it), so the embedder can update the address after startup.
+///
+/// `tx_lock` becomes [`ChainContext::tx_lock`]. An embedder that also
+/// sends from the node wallet outside the gateway, and rebuilds the
+/// gateway (each start builds a fresh context), passes the one lock its
+/// own transactions hold, so every context it builds shares it.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_with_transport(
@@ -390,11 +429,12 @@ pub fn build_with_transport(
     read_fallback_rpc_url: Option<String>,
     postage_contract: String,
     wallet_eth: [u8; 20],
-    chequebook: Option<[u8; 20]>,
+    chequebook: impl Into<ChequebookSlot>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
     deposit_target: Option<u128>,
     transport: Option<ant_chain::SharedChainTransport>,
+    tx_lock: crate::WalletTxLock,
 ) -> Option<Arc<ChainContext>> {
     // Treat blank strings as unset so an empty env/config value behaves
     // like an absent one.
@@ -416,7 +456,7 @@ pub fn build_with_transport(
     // than refusing to start the daemon — and crucially keeps a
     // read-only fallback node from silently signing transactions against
     // a shared public RPC.
-    let chequebook = ChequebookSlot::new(chequebook);
+    let chequebook = chequebook.into();
     let writer: Option<Arc<dyn ChainWriter>> = match (write_rpc, wallet_secret) {
         (Some(rpc), Some(secret)) => {
             let wallet = Wallet::new(secret, chain_id).ok();
@@ -445,6 +485,7 @@ pub fn build_with_transport(
         chain_id,
         writer,
         writes: WriteGate::default(),
+        tx_lock,
     }))
 }
 
@@ -532,5 +573,44 @@ mod tests {
         )
         .expect("context built");
         assert!(ctx.writer.is_none());
+    }
+
+    /// A chequebook the embedder recorded as refused (the chain check
+    /// disqualified it) is neither priced into a new plan nor funded:
+    /// both answer without a chain call (the RPC is unroutable).
+    #[tokio::test]
+    async fn a_refused_chequebook_gets_no_deposit() {
+        const CB: [u8; 20] = [0xcb; 20];
+        let slot = ChequebookSlot::new(Some(CB));
+        slot.refuse(CB);
+        let ctx = build_with_transport(
+            Some("http://127.0.0.1:1".into()),
+            None,
+            "0x45a1502382541Cd610CC9068e88727426b696293".into(),
+            [0x22; 20],
+            slot.clone(),
+            100,
+            Some(SECRET),
+            Some(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR),
+            None,
+            crate::WalletTxLock::default(),
+        )
+        .expect("context built");
+        let writer = ctx.writer.clone().expect("writer");
+        match writer.fund_deposit_with_xdai().await {
+            Err(FundingFailure::Rejected(m)) => {
+                assert!(m.contains("failed its on-chain checks"), "{m}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let status = writer.deposit_status().await.expect("status");
+        assert_eq!(status.chequebook, None);
+        assert_eq!(status.shortfall_plur, 0);
+        assert_eq!(ctx.chequebook.get(), None);
+
+        // A chequebook that checks out lifts it.
+        slot.set(CB);
+        assert_eq!(slot.refused(), None);
+        assert_eq!(ctx.chequebook.get(), Some(CB));
     }
 }

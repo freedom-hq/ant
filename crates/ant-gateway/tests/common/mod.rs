@@ -211,6 +211,7 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -232,6 +233,17 @@ pub fn status_router_with_chain_and_hook(
     snapshot: StatusSnapshot,
     chain: std::sync::Arc<ChainContext>,
     on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+) -> Router {
+    status_router_with_chain_and_hooks(snapshot, chain, on_batch_bought, None)
+}
+
+/// [`status_router_with_chain_and_hook`] plus an embedder
+/// refused-chequebook hook, for the deposit top-up tests.
+pub fn status_router_with_chain_and_hooks(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -265,6 +277,7 @@ pub fn status_router_with_chain_and_hook(
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought,
+        on_chequebook_refused,
     };
     build_router(handle)
 }
@@ -292,6 +305,7 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -334,6 +348,7 @@ pub fn handle_with_fixture_node() -> Router {
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -860,6 +875,11 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "settlement enable ignored (test fixture)".into(),
             });
         }
+        ControlCommand::DisablePushsyncSwap { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "settlement disable ignored (test fixture)".into(),
+            });
+        }
         // Read-back propagation check. The fixture has a single source
         // (the `DirFetcher`), so report `sources = 1` when the chunk is
         // present and `0` otherwise, matching the production JSON shape.
@@ -1023,6 +1043,7 @@ where
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }

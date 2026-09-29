@@ -202,6 +202,16 @@ pub struct AntHandle {
     /// chequebook. [`ant_start_gateway`] runs it once it has an RPC.
     #[cfg(feature = "chain")]
     chain_init: Arc<drive::ChainInit>,
+    /// The chequebook the in-process gateway reports (`/wallet`,
+    /// `/chequebook/*`) and funds (`POST /chequebook/deposit`). One slot
+    /// for the life of the handle, shared by every gateway start: each
+    /// start resets it from the persisted record, the chain init and
+    /// after-buy hook set it once settlement runs on a chequebook, and a
+    /// disqualifying chain check clears it
+    /// ([`drive::sync_gateway_chequebook`]) — including one landing
+    /// after an idempotent `ant_start_gateway` retry.
+    #[cfg(feature = "chain")]
+    gateway_chequebook: ant_gateway::ChequebookSlot,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
@@ -862,10 +872,14 @@ fn init_inner(
     // storage — so it stays disabled here and gets installed at runtime
     // by the storage-buy flow once a chequebook exists (see
     // `drive::ensure_settlement`). Without an RPC at init we can't run
-    // the factory-registration check; the chequebook was factory-built
-    // when we deployed it, so building unconditionally matches antd's
-    // no-RPC manual path. Gated on `chain`: a download-only build never
-    // uploads, so it never needs (or can deploy) a chequebook.
+    // the factory-registration / `issuer()` checks, so it's enabled
+    // unchecked here (antd's no-RPC manual path does the same). The
+    // checks run once the host supplies an RPC: `ant_start_gateway`'s
+    // chain init (and every buy / connect / deploy) goes through
+    // `drive::setup_settlement`, which switches settlement back *off*
+    // (`DisablePushsyncSwap`) if the chain disqualifies this chequebook.
+    // Gated on `chain`: a download-only build never uploads, so it never
+    // needs (or can deploy) a chequebook.
     #[cfg(feature = "chain")]
     let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook_for(
         &data_dir.join("chequebook.json"),
@@ -940,6 +954,8 @@ fn init_inner(
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
         chain_init,
+        #[cfg(feature = "chain")]
+        gateway_chequebook: ant_gateway::ChequebookSlot::default(),
     })
 }
 
@@ -2102,7 +2118,9 @@ pub unsafe extern "C" fn ant_storage_status(
 /// Outbound-settlement status as JSON `{"enabled":bool,"chequebook":…}`.
 /// `enabled` is `true` once a chequebook is deployed, which is what lets
 /// uploads actually propagate (bee charges the uploader per pushed chunk
-/// and freezes out a node that can't pay). The Storage tab reads this to
+/// and freezes out a node that can't pay). A persisted chequebook a
+/// chain check found unusable reports `false`: settlement is switched
+/// off for it (see `drive::setup_settlement`). The Storage tab reads this to
 /// warn when a connected plan still won't upload reliably. On a build
 /// without `chain` support settlement is never available, so this
 /// reports `{"enabled":false,"chequebook":null}`.
@@ -2144,7 +2162,9 @@ pub unsafe extern "C" fn ant_storage_settlement_status(
 /// collapses into pushsync timeouts, so the Storage tab reads this to
 /// detect that state and offer a top-up ([`ant_storage_settlement_topup`]).
 /// `enabled=false` (zeroed, `needs_top_up=false`) when this account has
-/// no chequebook yet; buying or connecting a plan deploys one, funded.
+/// no chequebook yet (buying or connecting a plan deploys one, funded),
+/// or when this process's chain check disqualified its chequebook
+/// (settlement is off for it, as [`ant_storage_settlement_status`] says).
 ///
 /// Reads chain (two or three light `eth_call`s), so call it on an
 /// explicit refresh rather than every status poll. Requires the `chain`
@@ -2191,7 +2211,12 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// funded no other way.
 ///
 /// Idempotent: a chequebook already at the target is a no-op. Errors when
-/// this account has no chequebook yet. Returns the refreshed
+/// this account has no chequebook yet, or its chequebook fails the chain
+/// checks (factory registration, `issuer()`) this call runs before
+/// spending, and again right before the transfer — a deposit there would
+/// back cheques peers drop — or those checks can't be read, or a
+/// chequebook deployed moments ago isn't visible to the RPC yet (retry
+/// later; nothing was spent). Returns the refreshed
 /// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
 /// and spends real funds** and **blocks** until they confirm, so the app
 /// gates it behind explicit confirmation. Requires the `chain` build
@@ -2889,21 +2914,30 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
         if handle.is_null() {
             return;
         }
-        let handle = Box::from_raw(handle);
-        // Drain the host chain transport first: `ant.h` lets the host
-        // free `host_ctx` once `ant_shutdown` returns, and
-        // `shutdown_timeout` below leaks (rather than joins) a blocking
-        // thread that outruns the grace — so clear the slot and wait for
-        // any in-flight callback here, where the wait is unconditional.
-        #[cfg(feature = "chain")]
-        handle.chain_transport.set(None, std::ptr::null_mut());
-        // Cancels every spawned task (including the node loop) at its
-        // next await point and joins the worker / blocking threads. The
-        // timeout keeps a task wedged in a syscall (a dial holding a
-        // socket open) from hanging the host for good; it leaks the
-        // thread rather than the wait.
-        handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
+        shutdown_handle(Box::from_raw(handle));
     }
+}
+
+/// The one shutdown sequence behind [`ant_shutdown`] and the JNI
+/// `nativeShutdown`. It joins the runtime (bounded by
+/// [`SHUTDOWN_GRACE`]) rather than returning while tasks still run, so
+/// everything dropped with the node loop — the peerstore's final flush
+/// of `peers.json`, upload checkpoints — lands before a host can
+/// re-init a node over the same data dir.
+pub(crate) fn shutdown_handle(handle: Box<AntHandle>) {
+    // Drain the host chain transport first: `ant.h` lets the host
+    // free `host_ctx` once `ant_shutdown` returns, and
+    // `shutdown_timeout` below leaks (rather than joins) a blocking
+    // thread that outruns the grace — so clear the slot and wait for
+    // any in-flight callback here, where the wait is unconditional.
+    #[cfg(feature = "chain")]
+    handle.chain_transport.set(None, std::ptr::null_mut());
+    // Cancels every spawned task (including the node loop) at its
+    // next await point and joins the worker / blocking threads. The
+    // timeout keeps a task wedged in a syscall (a dial holding a
+    // socket open) from hanging the host for good; it leaks the
+    // thread rather than the wait.
+    handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
 }
 
 // ---------------------------------------------------------------------------
@@ -3798,6 +3832,8 @@ mod tests {
                 batch_owner: [0u8; 20],
                 postage_dir: data_dir.join("postage"),
             }))),
+            #[cfg(feature = "chain")]
+            gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         }
     }
 
