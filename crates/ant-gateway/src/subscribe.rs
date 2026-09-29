@@ -51,9 +51,11 @@ pub struct PssSubscribeQuery {
     /// messages there. Absent ⇒ the node's own neighborhood (directed PSS
     /// to this node).
     neighborhood: Option<String>,
-    /// **Mailbox mode** (`?history=true`): on subscribe, sweep the
-    /// trojan-bin backlog so messages sent while this client was offline
-    /// are delivered before live traffic — not just tail from now.
+    /// **Mailbox mode** (`?history=true`): on subscribe, sweep a bounded
+    /// recent window of the trojan-bin backlog so messages sent while
+    /// this client was offline are delivered to it (alongside live
+    /// traffic) — not just tail from now. Recent, not complete, on a busy
+    /// bin; see `ant_p2p::lurker::HISTORY_BACKLOG`.
     #[serde(default)]
     history: bool,
 }
@@ -70,7 +72,10 @@ pub async fn gsoc_subscribe(
     };
     // Watch exactly this SOC address; reside in its neighborhood.
     // GSOC has no mailbox mode (a SOC has a latest value, not a message
-    // backlog) — always live.
+    // backlog) — always live, even when it shares a lurker with a
+    // history PSS subscriber: sweeps only pull PSS bins, only emit PSS
+    // messages, and the registry routes backlog to the requesting
+    // subscriber alone.
     let cmd_target = address;
     ws.on_upgrade(move |socket| {
         run_subscription(handle, socket, cmd_target, vec![address], Vec::new(), false)

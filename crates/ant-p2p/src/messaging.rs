@@ -37,17 +37,26 @@ pub struct WatchState {
     /// node's key. `None` still receives **topic-broadcast** PSS (messages
     /// with no explicit recipient, decryptable via the topic-derived key).
     pub pss_secret: Option<[u8; 32]>,
-    /// **Mailbox mode**: sweep a bounded trojan-bin backlog on subscribe
-    /// rather than only tailing live traffic. When set, fresh PSS pullers
-    /// start a bounded window behind the cursor (see
-    /// `lurker::HISTORY_BACKLOG`) instead of just behind it, so messages
-    /// sent while the receiver was offline are recovered — a recent-history
-    /// window (its reach depends on how busy the swept bin is). Union-OR
-    /// across subscribers: if any asks for history, the shared lurker
-    /// sweeps. Intended for discrete PSS messages; a GSOC watcher wants
-    /// the latest SOC value, not every historical version, so GSOC-only
-    /// subscribers leave this unset.
+    /// **Mailbox mode** request (a subscriber's own watch): sweep a
+    /// bounded trojan-bin backlog once, on subscribe, so PSS messages sent
+    /// while this receiver was offline are recovered — a recent-history
+    /// window whose reach depends on how busy the swept bin is (see
+    /// `lurker::HISTORY_BACKLOG`). It is **one-shot and per subscriber**:
+    /// the registry stamps the request with a [`Self::history_seq`]
+    /// ticket, the shared lurker runs one backlog sweep for it (also when
+    /// the subscriber attaches to an already-running lurker), and the
+    /// swept messages go only to the subscriber(s) whose ticket that sweep
+    /// served — never to live-only or GSOC subscribers on the same lurker.
+    /// Live pullers are unaffected (they always tail from the cursor), so
+    /// later peer churn never re-sweeps. PSS only: a GSOC watcher wants the
+    /// latest SOC value, not every historical version. Not merged into the
+    /// union watch (the union carries only the highest ticket).
     pub history: bool,
+    /// Registry-assigned mailbox ticket for a [`Self::history`] request
+    /// (`0` = none). Tickets are monotonic per registry; on the union
+    /// watch this is the **highest** outstanding ticket, and the lurker
+    /// sweeps whenever it exceeds the last ticket it already swept for.
+    pub history_seq: u64,
 }
 
 impl WatchState {
@@ -73,9 +82,10 @@ impl WatchState {
         if self.pss_secret.is_none() {
             self.pss_secret = other.pss_secret;
         }
-        // Any subscriber asking for history makes the shared lurker
-        // sweep the backlog.
-        self.history |= other.history;
+        // The union carries the newest mailbox ticket, so the lurker
+        // sees a fresh request and runs one sweep for it. `history`
+        // itself is per-subscriber and deliberately NOT unioned.
+        self.history_seq = self.history_seq.max(other.history_seq);
     }
 }
 
@@ -246,35 +256,32 @@ mod tests {
     }
 
     #[test]
-    fn merge_from_unions_topics_secret_and_history() {
+    fn merge_from_unions_topics_secret_and_newest_history_ticket() {
         let mut base = WatchState {
             pss_topics: vec![[1u8; 32]],
             ..Default::default()
         };
-        // A history-wanting subscriber attaches: the shared lurker must
-        // now sweep (history OR), and the union grows.
+        // A mailbox subscriber attaches: the union picks up its ticket
+        // (so the lurker runs a sweep for it) and grows its topics.
         base.merge_from(&WatchState {
             pss_topics: vec![[2u8; 32]],
             pss_secret: Some([9u8; 32]),
             history: true,
+            history_seq: 7,
             ..Default::default()
         });
-        assert!(
-            base.history,
-            "any history subscriber makes the lurker sweep"
-        );
+        assert_eq!(base.history_seq, 7);
+        assert!(!base.history, "the per-subscriber request is not unioned");
         assert_eq!(base.pss_topics, vec![[1u8; 32], [2u8; 32]]);
         assert_eq!(base.pss_secret, Some([9u8; 32]));
 
-        // A later non-history subscriber must NOT turn the sweep back off.
+        // An older ticket (or none) never rolls the union's ticket back.
         base.merge_from(&WatchState {
             gsoc_addresses: HashSet::from([[3u8; 32]]),
+            history_seq: 3,
             ..Default::default()
         });
-        assert!(
-            base.history,
-            "history stays set once any subscriber wanted it"
-        );
+        assert_eq!(base.history_seq, 7);
         assert!(base.gsoc_addresses.contains(&[3u8; 32]));
     }
 

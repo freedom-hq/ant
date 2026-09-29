@@ -2516,6 +2516,8 @@ fn handle_control_command(
                 // the node's key lands when a pss.key is persisted.
                 pss_secret: None,
                 history,
+                // Mailbox ticket: stamped by the registry on subscribe.
+                history_seq: 0,
             };
             if watch.is_empty() {
                 // Nothing to watch — tell the subscriber why before the

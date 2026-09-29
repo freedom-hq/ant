@@ -18,7 +18,7 @@
 //!   full node does when it `TryUnwrap`s every passing chunk. Callers
 //!   that only need GSOC leave `pss_secret` unset and pay nothing.
 
-use crate::lurker_registry::SharedWatch;
+use crate::lurker_registry::{Delivery, SharedWatch};
 use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
 use crate::routing::{proximity, Overlay};
@@ -71,28 +71,38 @@ const HANDOVER_MAX_OVERLAP: Duration = Duration::from_mins(1);
 const PULL_BACKLOG: u64 = 8;
 /// Earliest binID (reserves are 1-indexed; binID 0 is never used).
 const HISTORY_FLOOR: u64 = 1;
-/// Mailbox lookback, in binIDs, per (peer, bin). Mailbox mode starts a
-/// fresh puller this far behind the peer's cursor instead of at
-/// [`PULL_BACKLOG`], recovering messages sent while offline.
+/// Mailbox lookback, in binIDs, per (peer, bin). A mailbox
+/// (`?history=true`) request makes the lurker run **one** backlog sweep
+/// per covering PSS (peer, bin), from this far behind the peer's cursor
+/// up to the cursor, recovering messages sent while the receiver was
+/// offline. Live pullers never use it — they always tail from the
+/// cursor — so peer churn doesn't re-sweep.
 ///
 /// It is a **bounded** window on purpose. binIDs count chunks that
 /// landed in one bin on one peer, and a light node pulls a shallow
 /// covering peer's bin (`b_p ≈ 9-14`), which is busy — so an unbounded
 /// `start = 1` sweep would drag the whole history of a hot bin. This
-/// window caps the sweep at a few thousand recent chunks per bin, which
-/// on a busy bin is a recent-history mailbox (minutes-to-hours,
-/// depending on the bin's fill rate) rather than the complete backlog.
+/// window caps the sweep at a few thousand recent chunks per bin.
 ///
-/// A *complete* backlog sweep would need the trojan concentrated into a
-/// sparse deep bin (a deeper mining prefix pulled by a deeply-resident
-/// receiver) — see [`PSS_MINED_PREFIX_BITS`] for why that trade doesn't
-/// pay at light-node residency. So today the mailbox is "recent", and a
-/// larger [`HISTORY_BACKLOG`] simply extends how far back it reaches at
-/// linear cost.
+/// **What the mailbox guarantees:** a message is recovered if it landed
+/// in the swept bin within the last `HISTORY_BACKLOG` binIDs on at least
+/// one covering peer. On a bin holding fewer chunks than the window the
+/// sweep reaches the floor and is complete; on a busy bin it is a
+/// *recent-history* mailbox (minutes-to-hours, depending on the bin's
+/// fill rate), not the complete backlog. A deeper mining prefix does not
+/// change this for a light-node receiver: its covering peers sit below
+/// both listed `L`, so it sweeps the same busy bin `b_p` either way (see
+/// [`PSS_MINED_PREFIX_BITS`]). A larger `HISTORY_BACKLOG` extends the
+/// reach at linear cost.
 ///
-/// A sweep may exceed [`SEEN_CAP`] and re-deliver its oldest chunks;
-/// that is within the documented at-least-once/may-duplicate contract.
+/// Each sweep dedups within itself only (it must not skip messages the
+/// live pullers already delivered to *other* subscribers before this one
+/// joined), so a message in the sweep/live overlap can reach the
+/// requester twice — within the documented at-least-once contract.
 const HISTORY_BACKLOG: u64 = 4096;
+/// How often an idle driver checks the shared watch for a new mailbox
+/// ticket (see [`mailbox_request_pending`]).
+const MAILBOX_POLL: Duration = Duration::from_millis(500);
 /// Number of closest connected peers to pull from concurrently. A
 /// freshly-pushed chunk lands on the storer(s) nearest its address and
 /// replicates outward; pulling several covering peers catches it
@@ -375,7 +385,7 @@ impl Drop for SeenReservation {
 async fn deliver_chunk(
     seen: &Arc<Mutex<Seen>>,
     watch: &SharedWatch,
-    out: &mpsc::Sender<DecodedMessage>,
+    out: &mpsc::Sender<Delivery>,
     address: &[u8; 32],
     data: &[u8],
 ) -> bool {
@@ -402,7 +412,7 @@ async fn deliver_chunk(
             key,
             committed: false,
         };
-        if out.send(msg).await.is_err() {
+        if out.send(Delivery::live(msg)).await.is_err() {
             // Subscriber gone: the rollback is moot but harmless.
             return false;
         }
@@ -423,7 +433,7 @@ pub async fn run(
     mut peers: watch::Receiver<Vec<(PeerId, Overlay)>>,
     neighborhood_dial: Option<mpsc::Sender<[u8; 32]>>,
     config: LurkerConfig,
-    out: mpsc::Sender<DecodedMessage>,
+    out: mpsc::Sender<Delivery>,
 ) {
     let LurkerConfig { target, watch } = config;
     if watch
@@ -467,6 +477,14 @@ pub async fn run(
     // obsolete, so the handover backstop can force-retire one that has
     // outlived HANDOVER_MAX_OVERLAP waiting for a wedged replacement.
     let mut obsolete_since: HashMap<(PeerId, u8), tokio::time::Instant> = HashMap::new();
+    // Mailbox: the highest registry ticket (`WatchState::history_seq`)
+    // a backlog sweep has already been run for, and that sweep's
+    // one-shot tasks. A newer ticket on the union watch — a history
+    // subscriber spawning *or attaching to* this lurker — triggers one
+    // sweep; sweeps never overlap (a request arriving mid-sweep waits for
+    // the next one, which then covers every ticket queued meanwhile).
+    let mut swept_seq: u64 = 0;
+    let mut sweeps: Vec<AbortOnDrop> = Vec::new();
 
     loop {
         if out.is_closed() {
@@ -495,31 +513,43 @@ pub async fn run(
         // may have added or removed GSOC addresses / PSS topics since
         // the last one, and the desired-set handover below then grows
         // or retires pullers to match.
-        let (want_gsoc, want_pss, history) = {
+        let (want_gsoc, want_pss, history_seq) = {
             let w = watch.read().unwrap_or_else(PoisonError::into_inner);
             (
                 !w.gsoc_addresses.is_empty(),
                 !w.pss_topics.is_empty(),
-                w.history,
+                w.history_seq,
             )
         };
+        sweeps.retain(|h| !h.is_finished());
+        // A mailbox request outstanding and no sweep running: sweep the
+        // PSS bins of every covering peer this pass — including peers
+        // whose live pullers are already running (the attach case).
+        let sweep_due = want_pss && history_seq > swept_seq && sweeps.is_empty();
 
         // Which covering (peer, bin)s do we want, and which peers still
         // need a cursor fetch to start a missing puller? Fetch those
         // cursors concurrently (bounded) so one silent peer can't stall
         // every other peer's coverage.
         let mut desired: HashSet<(PeerId, u8)> = HashSet::new();
-        let mut need_cursors: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        let mut need_cursors: Vec<(PeerId, Vec<u8>, Vec<u8>)> = Vec::new();
         for (peer_id, peer_overlay) in closest_n(&mut peers, &target, COVERING_PEERS) {
-            let bins = covering_bins(proximity(&peer_overlay, &target), want_gsoc, want_pss);
+            let b_p = proximity(&peer_overlay, &target);
+            let bins = covering_bins(b_p, want_gsoc, want_pss);
             for &bin in &bins {
                 desired.insert((peer_id, bin));
             }
-            if bins.iter().any(|b| !active.contains_key(&(peer_id, *b))) {
-                need_cursors.push((peer_id, bins));
+            // Mailbox sweeps only the PSS bins: GSOC has no backlog.
+            let sweep_bins = if sweep_due {
+                covering_bins(b_p, false, true)
+            } else {
+                Vec::new()
+            };
+            if !sweep_bins.is_empty() || bins.iter().any(|b| !active.contains_key(&(peer_id, *b))) {
+                need_cursors.push((peer_id, bins, sweep_bins));
             }
         }
-        let fetches = need_cursors.into_iter().map(|(peer_id, bins)| {
+        let fetches = need_cursors.into_iter().map(|(peer_id, bins, sweep_bins)| {
             let mut ctl = control.clone();
             async move {
                 let cursors = tokio::time::timeout(
@@ -527,15 +557,45 @@ pub async fn run(
                     pullsync::get_cursors(&mut ctl, peer_id),
                 )
                 .await;
-                (peer_id, bins, cursors)
+                (peer_id, bins, sweep_bins, cursors)
             }
         });
         let results = futures::future::join_all(fetches).await;
 
-        for (peer_id, bins, cursors) in results {
+        // One dedup set per sweep, shared by its (peer, bin) tasks —
+        // deliberately NOT the live `seen`: a message live pullers
+        // already handed to earlier subscribers must still reach the
+        // new mailbox subscriber.
+        let sweep_seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
+        let tickets = swept_seq.saturating_add(1)..=history_seq;
+        let mut swept_any_peer = false;
+        for (peer_id, bins, sweep_bins, cursors) in results {
             let Ok(Ok(cursors)) = cursors else {
                 continue; // timed out or errored → try again next pass
             };
+            for &bin in &sweep_bins {
+                swept_any_peer = true;
+                let cursor = cursors.cursors.get(bin as usize).copied().unwrap_or(0);
+                let Some((from, to)) = sweep_window(cursor) else {
+                    continue; // empty bin: nothing to recover
+                };
+                tracing::info!(
+                    target: "ant_p2p::lurker",
+                    peer = %peer_id, bin, from, to, tickets = ?tickets,
+                    "lurker mailbox sweep",
+                );
+                sweeps.push(AbortOnDrop(tokio::spawn(sweep_bin(
+                    control.clone(),
+                    peer_id,
+                    bin,
+                    from,
+                    to,
+                    Arc::clone(&watch),
+                    Arc::clone(&sweep_seen),
+                    out.clone(),
+                    tickets.clone(),
+                ))));
+            }
             for bin in bins {
                 if active.contains_key(&(peer_id, bin)) {
                     continue;
@@ -554,15 +614,16 @@ pub async fn run(
                     .copied()
                     .filter(|(epoch, _)| *epoch == cursors.epoch)
                     .map(|(_, start)| start);
-                // A replaced puller resumes exactly where it stopped.
-                // Otherwise: mailbox mode sweeps the whole bin backlog
-                // (offline delivery); the default just tails live with a
-                // small backlog to cover the reside/cursor-read window.
-                let start = start_bin_id(resume, cursor, history);
+                // A replaced puller resumes exactly where it stopped;
+                // otherwise it tails live with a small backlog to cover
+                // the reside/cursor-read window. Mailbox history is the
+                // separate one-shot sweep above, never a live puller's
+                // start — so later churn can't re-sweep the backlog.
+                let start = start_bin_id(resume, cursor);
                 tracing::info!(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, start, epoch = cursors.epoch,
-                    resumed = resume.is_some(), history,
+                    resumed = resume.is_some(),
                     "lurker pulling neighborhood bin",
                 );
                 next_generation += 1;
@@ -581,6 +642,13 @@ pub async fn run(
                 ));
                 active.insert((peer_id, bin), AbortOnDrop(handle));
             }
+        }
+
+        // The outstanding tickets are served once at least one covering
+        // peer answered with cursors; with none reachable yet, the
+        // request stays pending and the next pass retries it.
+        if sweep_due && swept_any_peer {
+            swept_seq = history_seq;
         }
 
         // Coordinated handover: a peer that fell out of the covering set
@@ -637,6 +705,9 @@ pub async fn run(
                 tokio::time::sleep(TOPUP_DEBOUNCE).await;
             }
             () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
+            // A mailbox subscriber attached (or a sweep finished with
+            // one queued): sweep now, not on the next 30s tick.
+            () = mailbox_request_pending(&watch, swept_seq, &sweeps) => {}
         }
     }
     // `active` drops here; AbortOnDrop retires every remaining puller.
@@ -659,7 +730,7 @@ async fn pull_bin(
     seen: Arc<Mutex<Seen>>,
     positions: Positions,
     ready: ReadySet,
-    out: mpsc::Sender<DecodedMessage>,
+    out: mpsc::Sender<Delivery>,
 ) {
     // Whenever this puller exits — return, stream error, or handover
     // abort — its readiness is removed immediately (not just at the next
@@ -819,30 +890,132 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
     bins
 }
 
-/// The binID a fresh or resumed puller starts at.
+/// The binID a fresh or resumed live puller starts at.
 ///
 /// - **Resume** (epoch-matched replacement puller): exactly where the
 ///   predecessor stopped — never re-pull, never gap.
-/// - **Mailbox** (`history`, fresh puller): [`HISTORY_BACKLOG`] behind
-///   the cursor — sweep the recent bin backlog so messages sent while
-///   offline are recovered. The seen-set dedups the sweep against live
-///   traffic.
-/// - **Default** (fresh puller): a short [`PULL_BACKLOG`] behind the
-///   cursor — covers the window between a storer accepting a chunk and
-///   us reading its cursor, without pulling history.
-fn start_bin_id(resume: Option<u64>, cursor: u64, history: bool) -> u64 {
+/// - **Fresh**: a short [`PULL_BACKLOG`] behind the cursor — covers the
+///   window between a storer accepting a chunk and us reading its
+///   cursor, without pulling history. (Mailbox history is a separate
+///   one-shot [`sweep_bin`], never a live puller's start.)
+fn start_bin_id(resume: Option<u64>, cursor: u64) -> u64 {
     if let Some(start) = resume {
         return start;
     }
-    let backlog = if history {
-        HISTORY_BACKLOG
-    } else {
-        PULL_BACKLOG
-    };
     cursor
         .saturating_add(1)
-        .saturating_sub(backlog)
+        .saturating_sub(PULL_BACKLOG)
         .max(HISTORY_FLOOR)
+}
+
+/// The inclusive binID range a mailbox sweep covers on a bin whose
+/// cursor is `cursor`: the last [`HISTORY_BACKLOG`] binIDs, clamped to
+/// the floor (so a sparse bin is swept completely). `None` for an empty
+/// bin.
+fn sweep_window(cursor: u64) -> Option<(u64, u64)> {
+    if cursor < HISTORY_FLOOR {
+        return None;
+    }
+    let from = cursor
+        .saturating_add(1)
+        .saturating_sub(HISTORY_BACKLOG)
+        .max(HISTORY_FLOOR);
+    Some((from, cursor))
+}
+
+/// Resolves once a mailbox ticket newer than `swept_seq` is on the union
+/// watch and no sweep is running — the driver's cue to sweep now. Polls:
+/// the registry mutates the shared watch in place with no notifier, and
+/// a sub-second latency on a history subscribe is plenty.
+async fn mailbox_request_pending(watch: &SharedWatch, swept_seq: u64, sweeps: &[AbortOnDrop]) {
+    loop {
+        tokio::time::sleep(MAILBOX_POLL).await;
+        let w = watch.read().unwrap_or_else(PoisonError::into_inner);
+        if !w.pss_topics.is_empty()
+            && w.history_seq > swept_seq
+            && sweeps.iter().all(AbortOnDrop::is_finished)
+        {
+            return;
+        }
+    }
+}
+
+/// One-shot mailbox sweep of one (peer, bin): pull binIDs `from..=to`
+/// (the backlog up to the cursor read when the sweep began), deliver the
+/// decoded **PSS** messages as backlog for `tickets` only — the registry
+/// routes them to the subscribers holding those tickets, never to
+/// live-only or GSOC subscribers — then exit. Never touches the live
+/// pullers' positions, readiness, or dedup set. Any stream error or
+/// quiet timeout just ends the sweep early (the other covering peers'
+/// sweeps are the redundancy).
+#[allow(clippy::too_many_arguments)]
+async fn sweep_bin(
+    mut control: Control,
+    peer_id: PeerId,
+    bin: u8,
+    from: u64,
+    to: u64,
+    watch: SharedWatch,
+    seen: Arc<Mutex<Seen>>,
+    out: mpsc::Sender<Delivery>,
+    tickets: std::ops::RangeInclusive<u64>,
+) {
+    let mut start = from;
+    while start <= to {
+        if out.is_closed() {
+            return;
+        }
+        let round = pullsync::sync_once(
+            &mut control,
+            peer_id,
+            bin,
+            start,
+            |o: &OfferedChunk| want(o, &watch.read().unwrap_or_else(PoisonError::into_inner)),
+            || {},
+        );
+        let page = match tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    target: "ant_p2p::lurker",
+                    peer = %peer_id, bin, start, error = %e,
+                    "mailbox sweep round failed; ending sweep",
+                );
+                return;
+            }
+            Err(_) => return, // nothing more to offer below the cursor
+        };
+        for chunk in &page.chunks {
+            let fresh = seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert_key(Seen::key_for(&chunk.address, &chunk.data));
+            if !fresh {
+                continue;
+            }
+            let decoded = classify(
+                &chunk.address,
+                &chunk.data,
+                &watch.read().unwrap_or_else(PoisonError::into_inner),
+            );
+            // PSS only: GSOC has no mailbox (a SOC's old versions are not
+            // messages), so a co-watched SOC in a swept bin is dropped.
+            let Some(msg @ DecodedMessage::Pss { .. }) = decoded else {
+                continue;
+            };
+            let delivery = Delivery {
+                msg,
+                backlog_for: Some(tickets.clone()),
+            };
+            if out.send(delivery).await.is_err() {
+                return;
+            }
+        }
+        if page.topmost < start {
+            return; // no progress: don't spin on a misbehaving peer
+        }
+        start = page.topmost.saturating_add(1);
+    }
 }
 
 /// The `n` connected peers whose overlays are closest to `target`,
@@ -903,12 +1076,12 @@ mod tests {
     async fn aborted_delivery_rolls_back_the_seen_reservation() {
         let (address, data, watch) = watched_gsoc(b"must-not-vanish");
         let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
-        let (out, mut rx) = mpsc::channel::<DecodedMessage>(1);
+        let (out, mut rx) = mpsc::channel::<Delivery>(1);
         // Fill the channel so the delivery send parks.
-        out.try_send(DecodedMessage::Pss {
+        out.try_send(Delivery::live(DecodedMessage::Pss {
             topic: [0u8; 32],
             message: vec![],
-        })
+        }))
         .unwrap();
 
         let task = {
@@ -926,7 +1099,7 @@ mod tests {
         // peer's identical delivery still goes through.
         assert!(rx.try_recv().is_ok()); // drain the filler
         assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
-        match rx.try_recv() {
+        match rx.try_recv().map(|d| d.msg) {
             Ok(DecodedMessage::Gsoc { payload, .. }) => {
                 assert_eq!(payload, b"must-not-vanish");
             }
@@ -939,7 +1112,7 @@ mod tests {
     async fn committed_delivery_stays_deduped() {
         let (address, data, watch) = watched_gsoc(b"once-only");
         let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
-        let (out, mut rx) = mpsc::channel::<DecodedMessage>(4);
+        let (out, mut rx) = mpsc::channel::<Delivery>(4);
         assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
         assert!(rx.try_recv().is_ok());
         // Second covering peer delivers the same version: deduped.
@@ -1082,32 +1255,64 @@ mod tests {
         assert!(covering_bins(12, false, false).is_empty());
     }
 
-    /// Mailbox mode: a FRESH puller sweeps a bounded backlog behind the
-    /// cursor (`HISTORY_BACKLOG`), recovering offline messages; the
-    /// default only tails a short `PULL_BACKLOG`.
+    /// Live pullers only ever tail from the cursor (history or not):
+    /// mailbox history is a separate one-shot sweep, so a fresh puller
+    /// started by later churn can't re-sweep the backlog.
     #[test]
-    fn start_bin_id_mailbox_sweeps_the_backlog_window() {
-        // Deep cursor: history reaches HISTORY_BACKLOG back, default only PULL_BACKLOG.
-        assert_eq!(
-            start_bin_id(None, 50_000, true),
-            50_000 + 1 - HISTORY_BACKLOG
-        );
-        assert_eq!(start_bin_id(None, 50_000, false), 50_000 + 1 - PULL_BACKLOG);
-        // Sparse bin (fewer chunks than the window): backlog underflows
-        // to the floor → the mailbox recovers the ENTIRE bin history.
-        assert_eq!(start_bin_id(None, 500, true), HISTORY_FLOOR);
-        // A near-empty bin can't go below the floor either way.
-        assert_eq!(start_bin_id(None, 2, false), HISTORY_FLOOR);
+    fn start_bin_id_fresh_tails_and_resume_continues() {
+        assert_eq!(start_bin_id(None, 50_000), 50_000 + 1 - PULL_BACKLOG);
+        // A near-empty bin can't go below the floor.
+        assert_eq!(start_bin_id(None, 2), HISTORY_FLOOR);
+        // An epoch-matched replacement continues exactly where it stopped.
+        assert_eq!(start_bin_id(Some(12_345), 50_000), 12_345);
     }
 
-    /// A resumed (epoch-matched replacement) puller ALWAYS continues
-    /// exactly where its predecessor stopped — mailbox mode must not
-    /// rewind it to the floor and re-pull the whole backlog every
-    /// handover.
+    /// The mailbox sweep covers a bounded window ending at the cursor;
+    /// a sparse bin (fewer chunks than the window) is swept from the
+    /// floor, i.e. completely; an empty bin isn't swept at all.
     #[test]
-    fn start_bin_id_resume_overrides_mailbox() {
-        assert_eq!(start_bin_id(Some(12_345), 50_000, true), 12_345);
-        assert_eq!(start_bin_id(Some(12_345), 50_000, false), 12_345);
+    fn sweep_window_is_bounded_and_clamped() {
+        assert_eq!(
+            sweep_window(50_000),
+            Some((50_000 + 1 - HISTORY_BACKLOG, 50_000))
+        );
+        assert_eq!(sweep_window(500), Some((HISTORY_FLOOR, 500)));
+        assert_eq!(sweep_window(0), None);
+        let (from, to) = sweep_window(50_000).unwrap();
+        assert_eq!(to - from + 1, HISTORY_BACKLOG);
+    }
+
+    /// The driver's wake-up for a mailbox request fires for a ticket
+    /// newer than the last sweep, and not for an already-served one (a
+    /// history subscriber attaching to a running lurker must trigger a
+    /// sweep; one that was already swept for must not re-trigger).
+    #[tokio::test]
+    async fn mailbox_request_pending_fires_only_for_new_tickets() {
+        let watch: SharedWatch = Arc::new(RwLock::new(WatchState {
+            pss_topics: vec![[1u8; 32]],
+            history_seq: 3,
+            ..Default::default()
+        }));
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            mailbox_request_pending(&watch, 2, &[]),
+        )
+        .await
+        .expect("newer ticket wakes the driver");
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1500),
+            mailbox_request_pending(&watch, 3, &[]),
+        )
+        .await
+        .is_err());
+        // A sweep still running defers the next one.
+        let running = AbortOnDrop(tokio::spawn(std::future::pending::<()>()));
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1500),
+            mailbox_request_pending(&watch, 2, std::slice::from_ref(&running)),
+        )
+        .await
+        .is_err());
     }
 
     #[test]

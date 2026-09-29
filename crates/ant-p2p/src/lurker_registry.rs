@@ -32,6 +32,8 @@
 
 use crate::messaging::{DecodedMessage, WatchState};
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -63,6 +65,29 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// can grow/shrink it as subscribers come and go.
 pub type SharedWatch = Arc<RwLock<WatchState>>;
 
+/// One decoded message out of a lurker, with its audience.
+#[derive(Clone, Debug)]
+pub struct Delivery {
+    pub msg: DecodedMessage,
+    /// `None`: live traffic, for every subscriber whose watch matches.
+    /// `Some(tickets)`: a mailbox-sweep (backlog) message, only for
+    /// subscribers whose [`WatchState::history_seq`] ticket that sweep
+    /// served — a live-only or GSOC subscriber on the same lurker must
+    /// never receive messages from before it subscribed.
+    pub backlog_for: Option<RangeInclusive<u64>>,
+}
+
+impl Delivery {
+    /// A live message (every matching subscriber).
+    #[must_use]
+    pub fn live(msg: DecodedMessage) -> Self {
+        Self {
+            msg,
+            backlog_for: None,
+        }
+    }
+}
+
 /// One subscriber: its own (non-union) watch, used to route messages,
 /// and the channel its gateway forwarder drains.
 struct Subscriber {
@@ -82,6 +107,8 @@ struct Entry {
 #[derive(Clone, Default)]
 pub struct Registry {
     entries: Arc<Mutex<HashMap<[u8; 32], Entry>>>,
+    /// Last mailbox ticket issued (see [`WatchState::history_seq`]).
+    history_tickets: Arc<AtomicU64>,
 }
 
 impl Registry {
@@ -95,15 +122,27 @@ impl Registry {
     /// subscriber for the neighborhood. Returns the subscriber's
     /// message stream, or `None` when the neighborhood cap is reached
     /// (the caller should refuse the subscription).
+    ///
+    /// A `watch.history` (mailbox) request is stamped with a fresh
+    /// ticket here, whether the subscriber spawns the lurker or attaches
+    /// to a running one: the union's ticket then exceeds what the lurker
+    /// last swept for, so it runs one backlog sweep whose messages are
+    /// routed to this subscriber only.
     pub fn subscribe<F>(
         &self,
         target: [u8; 32],
-        watch: WatchState,
+        mut watch: WatchState,
         spawn_lurker: F,
     ) -> Option<mpsc::Receiver<DecodedMessage>>
     where
-        F: FnOnce(SharedWatch, mpsc::Sender<DecodedMessage>) -> JoinHandle<()>,
+        F: FnOnce(SharedWatch, mpsc::Sender<Delivery>) -> JoinHandle<()>,
     {
+        // Callers don't pick tickets; only a history request gets one.
+        watch.history_seq = if watch.history && !watch.pss_topics.is_empty() {
+            self.history_tickets.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        };
         // Reject an over-large single watch outright (before any lock
         // work) — one subscription can't monopolize the union budget.
         if watch_len(&watch) > MAX_UNION_WATCH {
@@ -159,7 +198,7 @@ impl Registry {
         // watch, for now) and the dispatcher that fans its output out.
         let shared: SharedWatch = Arc::new(RwLock::new(watch.clone()));
         let subscribers = Arc::new(Mutex::new(vec![Subscriber { watch, tx: sub_tx }]));
-        let (out_tx, out_rx) = mpsc::channel::<DecodedMessage>(SUBSCRIBER_BUFFER);
+        let (out_tx, out_rx) = mpsc::channel::<Delivery>(SUBSCRIBER_BUFFER);
         let lurker = spawn_lurker(Arc::clone(&shared), out_tx);
         tokio::spawn(dispatch(
             Arc::clone(&self.entries),
@@ -195,12 +234,18 @@ fn watch_len(w: &WatchState) -> usize {
     w.gsoc_addresses.len() + w.pss_topics.len()
 }
 
-/// Whether a decoded message is for this subscriber's watch.
-fn matches(msg: &DecodedMessage, watch: &WatchState) -> bool {
-    match msg {
+/// Whether a delivery is for this subscriber: its watch matches the
+/// message, and a backlog (mailbox-sweep) message additionally only goes
+/// to the subscribers whose ticket the sweep served.
+fn matches(d: &Delivery, watch: &WatchState) -> bool {
+    let wanted = match &d.msg {
         DecodedMessage::Gsoc { address, .. } => watch.gsoc_addresses.contains(address),
         DecodedMessage::Pss { topic, .. } => watch.pss_topics.contains(topic),
-    }
+    };
+    wanted
+        && d.backlog_for
+            .as_ref()
+            .is_none_or(|tickets| watch.history_seq != 0 && tickets.contains(&watch.history_seq))
 }
 
 /// Fan the lurker's decoded messages out to matching subscribers, prune
@@ -211,7 +256,7 @@ fn matches(msg: &DecodedMessage, watch: &WatchState) -> bool {
 async fn dispatch(
     entries: Arc<Mutex<HashMap<[u8; 32], Entry>>>,
     target: [u8; 32],
-    mut out_rx: mpsc::Receiver<DecodedMessage>,
+    mut out_rx: mpsc::Receiver<Delivery>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     shared: SharedWatch,
 ) {
@@ -226,7 +271,7 @@ async fn dispatch(
                     if !matches(&msg, &s.watch) {
                         return !s.tx.is_closed();
                     }
-                    match s.tx.try_send(msg.clone()) {
+                    match s.tx.try_send(msg.msg.clone()) {
                         Ok(()) => true,
                         // Shed the slow: a subscriber 64 messages behind
                         // loses this one rather than blocking the rest.
@@ -292,13 +337,13 @@ mod tests {
     /// registry's out channel, standing in for the real pull pipeline.
     fn stub_lurker(
         feed: &mut Option<mpsc::Sender<DecodedMessage>>,
-    ) -> impl FnOnce(SharedWatch, mpsc::Sender<DecodedMessage>) -> JoinHandle<()> + '_ {
+    ) -> impl FnOnce(SharedWatch, mpsc::Sender<Delivery>) -> JoinHandle<()> + '_ {
         move |_watch, out_tx| {
             let (feed_tx, mut feed_rx) = mpsc::channel::<DecodedMessage>(16);
             *feed = Some(feed_tx);
             tokio::spawn(async move {
                 while let Some(m) = feed_rx.recv().await {
-                    if out_tx.send(m).await.is_err() {
+                    if out_tx.send(Delivery::live(m)).await.is_err() {
                         return;
                     }
                 }
@@ -372,7 +417,7 @@ mod tests {
                 let out_tx = slot.take().unwrap();
                 tokio::spawn(async move {
                     while let Some(m) = feed_rx.recv().await {
-                        if out_tx.send(m).await.is_err() {
+                        if out_tx.send(Delivery::live(m)).await.is_err() {
                             return;
                         }
                     }
@@ -517,5 +562,117 @@ mod tests {
                 async {}
             ))
             .is_none());
+    }
+
+    async fn recv(rx: &mut mpsc::Receiver<DecodedMessage>) -> DecodedMessage {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("delivery")
+            .expect("open")
+    }
+
+    fn pss_watch(topic: [u8; 32], history: bool) -> WatchState {
+        WatchState {
+            pss_topics: vec![topic],
+            history,
+            ..Default::default()
+        }
+    }
+
+    fn pss_msg(topic: [u8; 32], body: &[u8]) -> DecodedMessage {
+        DecodedMessage::Pss {
+            topic,
+            message: body.to_vec(),
+        }
+    }
+
+    /// Mailbox mode on a SHARED lurker: a history subscriber that attaches
+    /// to an already-running lurker still gets a ticket above what the
+    /// lurker swept for (so it triggers a sweep — R1-F1), and the swept
+    /// backlog reaches only the ticket holder(s) that sweep served — never
+    /// the live-only PSS subscriber or the GSOC subscriber sharing the
+    /// lurker, nor an earlier history subscriber already served (R1-F2,
+    /// R1-M4). Live traffic still reaches everyone matching.
+    #[tokio::test]
+    async fn mailbox_tickets_and_backlog_route_only_to_their_requester() {
+        let reg = Registry::new();
+        let target = [5u8; 32];
+        let topic = [0x70; 32];
+        let gsoc_addr = [0x60; 32];
+
+        let mut feed: Option<mpsc::Sender<Delivery>> = None;
+        let mut shared_probe = None;
+        // L: live-only PSS subscriber, spawns the lurker. No ticket.
+        let mut rx_live = reg
+            .subscribe(target, pss_watch(topic, false), |w, out_tx| {
+                shared_probe = Some(Arc::clone(&w));
+                let (feed_tx, mut feed_rx) = mpsc::channel::<Delivery>(16);
+                feed = Some(feed_tx);
+                tokio::spawn(async move {
+                    while let Some(d) = feed_rx.recv().await {
+                        if out_tx.send(d).await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .unwrap();
+        let shared = shared_probe.unwrap();
+        let feed = feed.unwrap();
+        assert_eq!(shared.read().unwrap().history_seq, 0);
+
+        // G: a GSOC subscriber that (wrongly) asks for history gets no
+        // ticket — GSOC has no mailbox.
+        let mut g_watch = gsoc_watch(gsoc_addr);
+        g_watch.history = true;
+        let mut rx_gsoc = reg
+            .subscribe(target, g_watch, |_w, _tx| tokio::spawn(async {}))
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_seq, 0);
+
+        // H1 then H2 attach to the RUNNING lurker with history: each gets
+        // a fresh ticket and the union advertises the newest.
+        let mut rx_h1 = reg
+            .subscribe(target, pss_watch(topic, true), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_seq, 1);
+        let mut rx_h2 = reg
+            .subscribe(target, pss_watch(topic, true), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_seq, 2);
+
+        // A sweep that served only ticket 2 (ticket 1 was swept before).
+        feed.send(Delivery {
+            msg: pss_msg(topic, b"old"),
+            backlog_for: Some(2..=2),
+        })
+        .await
+        .unwrap();
+        // Then live traffic.
+        feed.send(Delivery::live(pss_msg(topic, b"new")))
+            .await
+            .unwrap();
+        feed.send(Delivery::live(gsoc_msg(gsoc_addr)))
+            .await
+            .unwrap();
+
+        // H2 (the served ticket) gets the backlog, then live.
+        assert_eq!(recv(&mut rx_h2).await, pss_msg(topic, b"old"));
+        assert_eq!(recv(&mut rx_h2).await, pss_msg(topic, b"new"));
+        // H1 and L get ONLY the live message — no stale backlog.
+        assert_eq!(recv(&mut rx_h1).await, pss_msg(topic, b"new"));
+        assert_eq!(recv(&mut rx_live).await, pss_msg(topic, b"new"));
+        // G gets only its GSOC update.
+        assert!(matches!(
+            recv(&mut rx_gsoc).await,
+            DecodedMessage::Gsoc { .. }
+        ));
+        for rx in [&mut rx_h1, &mut rx_live, &mut rx_gsoc, &mut rx_h2] {
+            assert!(rx.try_recv().is_err(), "no extra deliveries");
+        }
     }
 }
