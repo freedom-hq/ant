@@ -4,8 +4,8 @@ mod config;
 mod keystore;
 
 use ant_control::{
-    ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
-    PROTOCOL_VERSION,
+    ControlAck, ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, RetrievalInfo,
+    StatusSnapshot, PROTOCOL_VERSION,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
@@ -25,9 +25,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing_subscriber::EnvFilter;
 
 const AGENT: &str = concat!("antd/", env!("CARGO_PKG_VERSION"));
@@ -37,7 +38,7 @@ const AGENT: &str = concat!("antd/", env!("CARGO_PKG_VERSION"));
 /// agnostic and can be reused in other embedders.
 const BEE_API_VERSION: &str = "7.2.0";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "antd", version, about = "Ant Swarm light node (M1.0)")]
 struct Opt {
     /// Path to a bee-compatible YAML config file (PLAN.md J.5.E1/E2).
@@ -291,7 +292,9 @@ struct Opt {
     /// funds it with `--chequebook-deposit-plur` xBZZ, and persists
     /// the association at `<data-dir>/chequebook.json` so subsequent
     /// starts reuse it (deploy-once, reuse-forever — same shape as
-    /// bee's statestore). Pass this to opt out of all automatic
+    /// bee's statestore). The same resolution runs again after a
+    /// `POST /stamps` buy while settlement is still off (a wallet that
+    /// was unfunded at startup). Pass this to opt out of all automatic
     /// chequebook spending, the deploy and the deposit top-up alike,
     /// and run without outbound SWAP settlement until you supply a
     /// chequebook manually.
@@ -705,6 +708,19 @@ async fn main() -> Result<()> {
     let gateway_chain_state: Arc<std::sync::OnceLock<ant_gateway::GatewayChainState>> =
         Arc::new(std::sync::OnceLock::new());
     let api_addr = opt.api_addr;
+    // Outbound settlement after a gateway stamp buy (see
+    // `SettlementOnBuy`). Built before the gateway so its hook can be
+    // installed; armed with the startup outcome below, before the chain
+    // state (and with it `POST /stamps`) goes live.
+    let settlement_on_buy = Arc::new(SettlementOnBuy {
+        opt: opt.clone(),
+        data_dir: data_dir.clone(),
+        signing_secret,
+        eth,
+        commands: cmd_tx.clone(),
+        enabled: AtomicBool::new(false),
+        resolving: tokio::sync::Mutex::new(()),
+    });
     let gateway_task = if opt.no_http_api {
         None
     } else {
@@ -728,11 +744,7 @@ async fn main() -> Result<()> {
             // ACT publisher identity = the node's swarm key, exactly
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
-            // Not wired yet: antd resolves (or auto-deploys) its
-            // chequebook once, at startup. Whether a gateway buy may
-            // deploy one at runtime is an open question (see
-            // docs/ffi-parity-audit.md, F3).
-            on_batch_bought: None,
+            on_batch_bought: Some(settlement_on_buy.hook()),
         };
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };
@@ -783,10 +795,13 @@ async fn main() -> Result<()> {
             target: "antd",
             "outbound SWAP settlement NOT configured — pushsync uploads will stall \
              after ~20K chunks across the peer set; fund the node wallet (xDAI + xBZZ) \
-             so antd can auto-deploy a chequebook on the next start, or pass \
+             so antd can auto-deploy a chequebook on the next stamp buy or start, or pass \
              --chequebook + --swap-key (CHEQUEBOOK_ADDRESS + WALLET_PRIVATE_KEY)",
         );
     }
+    settlement_on_buy
+        .enabled
+        .store(pushsync_swap_cfg.is_some(), Ordering::Release);
 
     // Hand the chain-derived inputs to the already-running swarm loop.
     // Capacity-1 channel and a single send: this never blocks. A send
@@ -2087,6 +2102,103 @@ async fn top_up_adopted_chequebook(
             chequebook = %format!("0x{}", hex::encode(chequebook)),
             "chequebook deposit top-up failed: {e}",
         ),
+    }
+}
+
+/// Outbound SWAP settlement after a gateway stamp buy, as `ant-ffi`
+/// does. antd resolves its chequebook once at startup, so a node whose
+/// wallet was still unfunded then (Freedom's first run) had no
+/// settlement until restart, and its uploads stalled after ~20K chunks.
+/// After each `POST /stamps` buy, while settlement is still off, this
+/// re-runs the same startup resolution (`resolve_chequebook`: manual
+/// flags, persisted, rediscovered, auto-deploy under
+/// `--no-auto-chequebook`'s control) and switches settlement on in the
+/// running node. Only what the next restart would have done anyway,
+/// done now.
+///
+/// Known gap: the gateway's chain context is built once at startup, so
+/// `/chequebook/address` and `/chequebook/balance` report the new
+/// chequebook only after a restart. Settlement itself is live at once.
+struct SettlementOnBuy {
+    opt: Opt,
+    data_dir: PathBuf,
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    eth: [u8; 20],
+    commands: mpsc::Sender<ControlCommand>,
+    /// Outbound settlement is configured (at startup or by a buy), so
+    /// later buys have nothing to do.
+    enabled: AtomicBool,
+    /// One resolution at a time, so two quick buys can't both deploy.
+    resolving: tokio::sync::Mutex<()>,
+}
+
+impl SettlementOnBuy {
+    /// The gateway hook: a cheap flag check, then the resolution runs
+    /// on its own task so the buy response doesn't wait for it.
+    fn hook(self: &Arc<Self>) -> ant_gateway::BatchBoughtHook {
+        let this = Arc::clone(self);
+        Arc::new(move |_batch_id| {
+            if this.enabled.load(Ordering::Acquire) {
+                return;
+            }
+            let this = Arc::clone(&this);
+            tokio::spawn(async move { this.run().await });
+        })
+    }
+
+    async fn run(&self) {
+        let _one_at_a_time = self.resolving.lock().await;
+        if self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let resolved = match resolve_chequebook(
+            &self.opt,
+            &self.data_dir,
+            self.signing_secret,
+            self.eth,
+            true,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    "could not set up outbound SWAP settlement after a stamp buy: {e:#}",
+                );
+                return;
+            }
+        };
+        // `resolve_chequebook` already logged why when there's none.
+        let Some(cfg) = resolved.pushsync else {
+            return;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let cmd = ControlCommand::EnablePushsyncSwap {
+            chequebook: cfg.chequebook,
+            swap_secret: cfg.swap_secret,
+            chain_id: cfg.chain_id,
+            outbound_ledger_path: cfg.outbound_ledger_path.to_string_lossy().into_owned(),
+            ack: ack_tx,
+        };
+        if self.commands.send(cmd).await.is_err() {
+            return;
+        }
+        match ack_rx.await {
+            Ok(ControlAck::Ok { .. }) => {
+                self.enabled.store(true, Ordering::Release);
+                tracing::info!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
+                    "outbound SWAP settlement enabled after a stamp buy — pushsync will emit cheques",
+                );
+            }
+            Ok(ControlAck::Error { message }) => tracing::warn!(
+                target: "antd",
+                "enable outbound SWAP settlement: {message}",
+            ),
+            _ => {}
+        }
     }
 }
 
