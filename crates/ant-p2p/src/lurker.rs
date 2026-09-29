@@ -25,7 +25,7 @@ use crate::routing::{proximity, Overlay};
 use ant_crypto::keccak256;
 use libp2p::PeerId;
 use libp2p_stream::Control;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -75,10 +75,11 @@ const HISTORY_FLOOR: u64 = 1;
 /// (`?history=true`) request makes the lurker run **one** backlog sweep
 /// per covering PSS (peer, bin) — every peer in the covering set during
 /// the request's [`MAILBOX_SETTLE`] window, so storers that connect after
-/// the first pass are included — from this far behind the peer's cursor
-/// up to the cursor, recovering messages sent while the receiver was
-/// offline. Live pullers never use it — they always tail from the
-/// cursor — so peer churn doesn't re-sweep.
+/// the first pass are included, and a sweep that ended early is retried
+/// within that window — from this far behind the peer's cursor up to the
+/// cursor, recovering messages sent while the receiver was offline. Live
+/// pullers never use it — they always tail from the cursor — so peer
+/// churn past the settle window doesn't re-sweep.
 ///
 /// It is a **bounded** window on purpose. binIDs count chunks that
 /// landed in one bin on one peer, and a light node pulls a shallow
@@ -103,7 +104,7 @@ const HISTORY_FLOOR: u64 = 1;
 /// requester twice — within the documented at-least-once contract.
 const HISTORY_BACKLOG: u64 = 4096;
 /// How often an idle driver checks the shared watch for a new mailbox
-/// ticket (see [`mailbox_request_pending`]).
+/// ticket (see [`mailbox_update_pending`]).
 const MAILBOX_POLL: Duration = Duration::from_millis(500);
 /// How long a mailbox campaign keeps sweeping newly-covering peers after
 /// its first sweep starts. A cold subscribe's first pass sees whatever
@@ -293,7 +294,11 @@ impl Drop for AbortOnDrop {
 /// for [`MAILBOX_SETTLE`] after its first sweep starts, and a
 /// later-connecting storer is swept too. A campaign that hasn't reached
 /// any peer yet stays open indefinitely (nothing was recovered, so the
-/// request is still pending).
+/// request is still pending). A (peer, bin) sweep that ends early (stream
+/// error, stall) is un-marked and retried while the campaign is open and
+/// the peer still covers. A campaign none of whose tickets is still held
+/// by an attached subscriber (`WatchState::history_held`) is cancelled —
+/// its sweeps aborted — since its output would be routed to nobody.
 struct Campaign {
     tickets: std::ops::RangeInclusive<u64>,
     /// Per-campaign dedup across its (peer, bin) sweeps — deliberately
@@ -302,6 +307,9 @@ struct Campaign {
     seen: Arc<Mutex<Seen>>,
     /// (peer, bin)s already swept (or found empty) for this campaign.
     swept: HashSet<(PeerId, u8)>,
+    /// (peer, bin)s whose sweep ended early, reported by the sweep task;
+    /// [`Mailbox::prune`] un-marks them in `swept` so they're retried.
+    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
     /// `None` until the first (peer, bin) is swept; then when the
     /// campaign stops picking up newly-covering peers.
     open_until: Option<tokio::time::Instant>,
@@ -314,6 +322,7 @@ impl Campaign {
             tickets,
             seen: Arc::new(Mutex::new(Seen::new())),
             swept: HashSet::new(),
+            failed: Arc::new(Mutex::new(Vec::new())),
             open_until: None,
             tasks: Vec::new(),
         }
@@ -321,6 +330,12 @@ impl Campaign {
 
     fn is_open(&self, now: tokio::time::Instant) -> bool {
         self.open_until.is_none_or(|t| now < t)
+    }
+
+    /// Whether any subscriber holding one of this campaign's tickets is
+    /// still attached.
+    fn is_held(&self, held: &BTreeSet<u64>) -> bool {
+        held.range(self.tickets.clone()).next().is_some()
     }
 }
 
@@ -330,6 +345,7 @@ struct SweepJob {
     bin: u8,
     tickets: std::ops::RangeInclusive<u64>,
     seen: Arc<Mutex<Seen>>,
+    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
 }
 
 /// The driver's mailbox bookkeeping: which tickets have a campaign, and
@@ -370,10 +386,29 @@ impl Mailbox {
         }
     }
 
-    /// Forget campaigns that are closed and whose sweeps all ended.
+    /// Cancel the campaigns none of whose tickets is still `held` (every
+    /// requester unsubscribed): dropping one aborts its sweeps. Returns
+    /// how many were cancelled.
+    fn cancel_unheld(&mut self, held: &BTreeSet<u64>) -> usize {
+        let before = self.campaigns.len();
+        self.campaigns.retain(|c| c.is_held(held));
+        before - self.campaigns.len()
+    }
+
+    /// Un-mark (peer, bin)s whose sweep ended early, so an open campaign
+    /// retries them, and forget campaigns that are closed and whose
+    /// sweeps all ended.
     fn prune(&mut self, now: tokio::time::Instant) {
         for c in &mut self.campaigns {
             c.tasks.retain(|t| !t.is_finished());
+            for key in c
+                .failed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drain(..)
+            {
+                c.swept.remove(&key);
+            }
         }
         self.campaigns
             .retain(|c| c.is_open(now) || !c.tasks.is_empty());
@@ -403,6 +438,7 @@ impl Mailbox {
                         bin,
                         tickets: c.tickets.clone(),
                         seen: Arc::clone(&c.seen),
+                        failed: Arc::clone(&c.failed),
                     });
                 }
             }
@@ -412,6 +448,12 @@ impl Mailbox {
 
     fn attach(&mut self, campaign: usize, task: AbortOnDrop) {
         self.campaigns[campaign].tasks.push(task);
+    }
+
+    /// The ticket ranges of the running campaigns (for the driver's
+    /// wake-up on a campaign losing all its requesters).
+    fn ticket_ranges(&self) -> Vec<std::ops::RangeInclusive<u64>> {
+        self.campaigns.iter().map(|c| c.tickets.clone()).collect()
     }
 }
 
@@ -663,17 +705,26 @@ pub async fn run(
         // may have added or removed GSOC addresses / PSS topics since
         // the last one, and the desired-set handover below then grows
         // or retires pullers to match.
-        let (want_gsoc, want_pss, history_seq) = {
+        let (want_gsoc, want_pss, history_seq, history_held) = {
             let w = watch.read().unwrap_or_else(PoisonError::into_inner);
             (
                 !w.gsoc_addresses.is_empty(),
                 !w.pss_topics.is_empty(),
                 w.history_seq,
+                w.history_held.clone(),
             )
         };
         let now = tokio::time::Instant::now();
         if want_pss {
             mailbox.admit(history_seq);
+        }
+        let cancelled = mailbox.cancel_unheld(&history_held);
+        if cancelled > 0 {
+            tracing::info!(
+                target: "ant_p2p::lurker",
+                cancelled,
+                "lurker mailbox campaign(s) cancelled: every requester unsubscribed",
+            );
         }
         mailbox.prune(now);
 
@@ -747,6 +798,7 @@ pub async fn run(
                     job.seen,
                     out.clone(),
                     job.tickets,
+                    job.failed,
                 )));
                 mailbox.attach(job.campaign, task);
             }
@@ -772,7 +824,8 @@ pub async fn run(
                 // otherwise it tails live with a small backlog to cover
                 // the reside/cursor-read window. Mailbox history is the
                 // separate one-shot sweep above, never a live puller's
-                // start — so later churn can't re-sweep the backlog.
+                // start — past a campaign's settle window, churn never
+                // re-sweeps the backlog.
                 let start = start_bin_id(resume, cursor);
                 tracing::info!(
                     target: "ant_p2p::lurker",
@@ -851,9 +904,10 @@ pub async fn run(
                 tokio::time::sleep(TOPUP_DEBOUNCE).await;
             }
             () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
-            // A mailbox subscriber attached: sweep now, not on the next
-            // 30s tick.
-            () = mailbox_request_pending(&watch, mailbox.served_seq) => {}
+            // A mailbox subscriber attached (sweep now, not on the next
+            // 30s tick), or every requester of a campaign left (stop its
+            // sweeps now).
+            () = mailbox_update_pending(&watch, mailbox.served_seq, mailbox.ticket_ranges()) => {}
         }
     }
     // `active` drops here; AbortOnDrop retires every remaining puller.
@@ -1071,14 +1125,25 @@ fn sweep_window(cursor: u64) -> Option<(u64, u64)> {
 
 /// Resolves once a mailbox ticket newer than `served_seq` (the newest one
 /// with a campaign) is on the union watch — the driver's cue to open a
-/// campaign now. Polls: the registry mutates the shared watch in place
-/// with no notifier, and a sub-second latency on a history subscribe is
-/// plenty.
-async fn mailbox_request_pending(watch: &SharedWatch, served_seq: u64) {
+/// campaign now — or once one of the running campaigns (`campaigns`, their
+/// ticket ranges) has no ticket held any more — the cue to cancel it.
+/// Polls: the registry mutates the shared watch in place with no
+/// notifier, and a sub-second latency here is plenty.
+async fn mailbox_update_pending(
+    watch: &SharedWatch,
+    served_seq: u64,
+    campaigns: Vec<std::ops::RangeInclusive<u64>>,
+) {
     loop {
         tokio::time::sleep(MAILBOX_POLL).await;
         let w = watch.read().unwrap_or_else(PoisonError::into_inner);
         if !w.pss_topics.is_empty() && w.history_seq > served_seq {
+            return;
+        }
+        if campaigns
+            .iter()
+            .any(|r| w.history_held.range(r.clone()).next().is_none())
+        {
             return;
         }
     }
@@ -1091,8 +1156,10 @@ async fn mailbox_request_pending(watch: &SharedWatch, served_seq: u64) {
 /// live-only or GSOC subscribers — then exit. Never touches the live
 /// pullers' positions, readiness, or dedup set. A stream error, or
 /// [`SWEEP_STALL_RETRIES`] + 1 consecutive round timeouts short of `to`,
-/// ends the sweep early with a warning naming the unswept binIDs (the
-/// other covering peers' sweeps are the redundancy).
+/// ends the sweep early with a warning naming the unswept binIDs and
+/// reports the (peer, bin) in `failed`, so the campaign re-sweeps it if
+/// it's still open and the peer still covers (the campaign's `seen`
+/// dedups what this attempt already delivered).
 #[allow(clippy::too_many_arguments)]
 async fn sweep_bin(
     mut control: Control,
@@ -1104,7 +1171,14 @@ async fn sweep_bin(
     seen: Arc<Mutex<Seen>>,
     out: mpsc::Sender<Delivery>,
     tickets: std::ops::RangeInclusive<u64>,
+    failed: Arc<Mutex<Vec<(PeerId, u8)>>>,
 ) {
+    let report_failed = || {
+        failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((peer_id, bin));
+    };
     let mut start = from;
     let mut stalls: u32 = 0;
     while start <= to {
@@ -1125,8 +1199,9 @@ async fn sweep_bin(
                 tracing::warn!(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, unswept_from = start, unswept_to = to, error = %e,
-                    "mailbox sweep round failed; ending sweep of this (peer, bin) early",
+                    "mailbox sweep round failed; ending sweep of this (peer, bin) early (retried while the campaign is open)",
                 );
+                report_failed();
                 return;
             }
             // Below the cursor the peer has chunks to offer, so a quiet
@@ -1139,8 +1214,9 @@ async fn sweep_bin(
                     tracing::warn!(
                         target: "ant_p2p::lurker",
                         peer = %peer_id, bin, unswept_from = start, unswept_to = to,
-                        "mailbox sweep stalled mid-window; ending sweep of this (peer, bin) early",
+                        "mailbox sweep stalled mid-window; ending sweep of this (peer, bin) early (retried while the campaign is open)",
                     );
+                    report_failed();
                     return;
                 }
                 tracing::debug!(
@@ -1454,7 +1530,7 @@ mod tests {
     /// history subscriber attaching to a running lurker must trigger a
     /// sweep; one that was already swept for must not re-trigger).
     #[tokio::test]
-    async fn mailbox_request_pending_fires_only_for_new_tickets() {
+    async fn mailbox_update_pending_fires_only_for_new_tickets() {
         let watch: SharedWatch = Arc::new(RwLock::new(WatchState {
             pss_topics: vec![[1u8; 32]],
             history_seq: 3,
@@ -1462,13 +1538,13 @@ mod tests {
         }));
         tokio::time::timeout(
             Duration::from_millis(1500),
-            mailbox_request_pending(&watch, 2),
+            mailbox_update_pending(&watch, 2, Vec::new()),
         )
         .await
         .expect("newer ticket wakes the driver");
         assert!(tokio::time::timeout(
             Duration::from_millis(1500),
-            mailbox_request_pending(&watch, 3),
+            mailbox_update_pending(&watch, 3, Vec::new()),
         )
         .await
         .is_err());
@@ -1514,6 +1590,106 @@ mod tests {
         assert!(mb.claim(late, &[13], t2).is_empty());
         mb.prune(t2);
         assert!(mb.campaigns.is_empty());
+    }
+
+    /// R3-M2: once every holder of a campaign's tickets has unsubscribed,
+    /// the campaign is cancelled and its in-flight sweeps are aborted; a
+    /// campaign with one ticket still held survives. The driver's wake-up
+    /// fires on the orphaning, not only on a new ticket.
+    #[tokio::test]
+    async fn mailbox_campaign_cancelled_when_its_requesters_leave() {
+        let p = PeerId::random();
+        let t0 = tokio::time::Instant::now();
+        let mut mb = Mailbox::default();
+        mb.admit(1);
+        assert_eq!(mb.claim(p, &[9], t0).len(), 1);
+        // A sweep task for campaign 0 that never ends on its own; the
+        // oneshot sender it owns drops only when the task is aborted.
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        mb.attach(
+            0,
+            AbortOnDrop(tokio::spawn(async move {
+                let _alive = alive_tx;
+                std::future::pending::<()>().await;
+            })),
+        );
+        mb.admit(2); // swept already → a second campaign for ticket 2
+        assert_eq!(mb.campaigns.len(), 2);
+
+        // Both still held: nothing cancelled, no wake-up.
+        let watch: SharedWatch = Arc::new(RwLock::new(WatchState {
+            pss_topics: vec![[1u8; 32]],
+            history_seq: 2,
+            history_held: BTreeSet::from([1, 2]),
+            ..Default::default()
+        }));
+        assert_eq!(mb.cancel_unheld(&BTreeSet::from([1, 2])), 0);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1500),
+            mailbox_update_pending(&watch, 2, mb.ticket_ranges()),
+        )
+        .await
+        .is_err());
+
+        // Ticket 1's holder leaves: the driver wakes and cancels campaign
+        // 0, aborting its sweep; ticket 2's campaign keeps going.
+        watch.write().unwrap().history_held = BTreeSet::from([2]);
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            mailbox_update_pending(&watch, 2, mb.ticket_ranges()),
+        )
+        .await
+        .expect("an orphaned campaign wakes the driver");
+        assert_eq!(mb.cancel_unheld(&BTreeSet::from([2])), 1);
+        assert_eq!(mb.ticket_ranges(), vec![2..=2]);
+        tokio::time::timeout(Duration::from_secs(1), alive_rx)
+            .await
+            .expect("the cancelled campaign's sweep is aborted")
+            .unwrap_err();
+
+        // Last requester leaves (a live-only subscriber may keep the
+        // lurker up): nothing left to sweep for, no more cursor fetches.
+        assert_eq!(mb.cancel_unheld(&BTreeSet::new()), 1);
+        assert!(mb.campaigns.is_empty());
+        assert!(!mb.wants(p, &[9], t0));
+        // A widened campaign survives while any of its tickets is held.
+        mb.admit(3);
+        mb.admit(4);
+        assert_eq!(mb.ticket_ranges(), vec![3..=4]);
+        assert_eq!(mb.cancel_unheld(&BTreeSet::from([4])), 0);
+    }
+
+    /// R3-M3: a (peer, bin) whose sweep ended early (stream error, stall)
+    /// is retried while the campaign is open and the peer still covers —
+    /// the single storer holding an offline message isn't written off
+    /// after one transient error. Past the settle window it isn't.
+    #[tokio::test]
+    async fn mailbox_failed_sweep_is_retried_within_the_settle_window() {
+        let storer = PeerId::random();
+        let t0 = tokio::time::Instant::now();
+        let mut mb = Mailbox::default();
+        mb.admit(1);
+        let jobs = mb.claim(storer, &[13, 16], t0);
+        assert_eq!(jobs.len(), 2);
+        // Bin 13's sweep failed mid-window; bin 16's completed.
+        jobs[0].failed.lock().unwrap().push((storer, jobs[0].bin));
+        let t1 = t0 + Duration::from_secs(30);
+        mb.prune(t1);
+        assert!(mb.wants(storer, &[13, 16], t1));
+        let retry = mb.claim(storer, &[13, 16], t1);
+        assert_eq!(retry.iter().map(|j| j.bin).collect::<Vec<_>>(), vec![13]);
+        // Same campaign dedup set: what the failed attempt delivered isn't
+        // delivered again.
+        assert!(Arc::ptr_eq(&retry[0].seen, &jobs[0].seen));
+        // The settle window still runs from the first sweep, not the retry.
+        assert_eq!(mb.campaigns[0].open_until, Some(t0 + MAILBOX_SETTLE));
+
+        // A failure reported after the window closed is not retried.
+        retry[0].failed.lock().unwrap().push((storer, 13));
+        let t2 = t0 + MAILBOX_SETTLE + Duration::from_secs(1);
+        mb.prune(t2);
+        assert!(!mb.wants(storer, &[13], t2));
+        assert!(mb.claim(storer, &[13], t2).is_empty());
     }
 
     /// A campaign that couldn't reach any peer yet stays pending (no

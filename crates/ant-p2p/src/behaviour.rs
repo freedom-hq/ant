@@ -2518,6 +2518,7 @@ fn handle_control_command(
                 history,
                 // Mailbox ticket: stamped by the registry on subscribe.
                 history_seq: 0,
+                history_held: std::collections::BTreeSet::new(),
             };
             if watch.is_empty() {
                 // Nothing to watch — tell the subscriber why before the

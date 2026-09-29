@@ -24,7 +24,7 @@
 
 use ant_crypto::pss;
 use ant_crypto::{keccak256, soc_valid, SOC_HEADER_SIZE, SOC_ID_SIZE, SPAN_SIZE};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// What the lurker is currently listening for.
 #[derive(Clone, Default)]
@@ -38,25 +38,38 @@ pub struct WatchState {
     /// with no explicit recipient, decryptable via the topic-derived key).
     pub pss_secret: Option<[u8; 32]>,
     /// **Mailbox mode** request (a subscriber's own watch): sweep a
-    /// bounded trojan-bin backlog once, on subscribe, so PSS messages sent
+    /// bounded trojan-bin backlog on subscribe, so PSS messages sent
     /// while this receiver was offline are recovered — a recent-history
     /// window whose reach depends on how busy the swept bin is (see
-    /// `lurker::HISTORY_BACKLOG`). It is **one-shot and per subscriber**:
-    /// the registry stamps the request with a [`Self::history_seq`]
-    /// ticket, the shared lurker runs one backlog sweep for it (also when
-    /// the subscriber attaches to an already-running lurker), and the
-    /// swept messages go only to the subscriber(s) whose ticket that sweep
-    /// served — never to live-only or GSOC subscribers on the same lurker.
-    /// Live pullers are unaffected (they always tail from the cursor), so
-    /// later peer churn never re-sweeps. PSS only: a GSOC watcher wants the
-    /// latest SOC value, not every historical version. Not merged into the
-    /// union watch (the union carries only the highest ticket).
+    /// `lurker::HISTORY_BACKLOG`). It is **per subscriber**: the registry
+    /// stamps the request with a [`Self::history_seq`] ticket and the
+    /// shared lurker opens a mailbox *campaign* for it (also when the
+    /// subscriber attaches to an already-running lurker). A campaign is
+    /// not a single pass: it sweeps each covering PSS (peer, bin) once,
+    /// **including peers that join the covering set within
+    /// `lurker::MAILBOX_SETTLE` of its first sweep** (the neighborhood's
+    /// storers typically connect seconds after a cold subscribe), and
+    /// re-sweeps a (peer, bin) whose sweep ended early while that window
+    /// is open. Past the window, peer churn only starts live pullers
+    /// (they always tail from the cursor), never another backlog sweep.
+    /// A campaign whose ticket holders have all unsubscribed is
+    /// cancelled (see [`Self::history_held`]). The swept messages go only
+    /// to the subscriber(s) whose ticket the campaign serves — never to
+    /// live-only or GSOC subscribers on the same lurker. PSS only: a GSOC
+    /// watcher wants the latest SOC value, not every historical version.
+    /// Not merged into the union watch (the union carries tickets only).
     pub history: bool,
     /// Registry-assigned mailbox ticket for a [`Self::history`] request
     /// (`0` = none). Tickets are monotonic per registry; on the union
     /// watch this is the **highest** outstanding ticket, and the lurker
-    /// sweeps whenever it exceeds the last ticket it already swept for.
+    /// opens a campaign whenever it exceeds the last ticket it already
+    /// opened one for.
     pub history_seq: u64,
+    /// **Union watch only:** the tickets of the history subscribers still
+    /// attached. The lurker cancels a mailbox campaign none of whose
+    /// tickets is in here any more — its output would be routed to
+    /// nobody. Empty on a subscriber's own watch.
+    pub history_held: BTreeSet<u64>,
 }
 
 impl WatchState {
@@ -86,6 +99,12 @@ impl WatchState {
         // sees a fresh request and runs one sweep for it. `history`
         // itself is per-subscriber and deliberately NOT unioned.
         self.history_seq = self.history_seq.max(other.history_seq);
+        // ...and every still-attached subscriber's ticket, so the lurker
+        // can cancel campaigns whose requesters have all left.
+        self.history_held.extend(other.history_held.iter().copied());
+        if other.history_seq != 0 {
+            self.history_held.insert(other.history_seq);
+        }
     }
 }
 
@@ -282,6 +301,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(base.history_seq, 7);
+        assert_eq!(base.history_held, BTreeSet::from([3, 7]));
         assert!(base.gsoc_addresses.contains(&[3u8; 32]));
     }
 

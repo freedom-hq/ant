@@ -189,6 +189,9 @@ impl Registry {
                 // ticket whose subscriber isn't about to be pushed.
                 issue_ticket(&mut watch);
                 probe.history_seq = probe.history_seq.max(watch.history_seq);
+                if watch.history_seq != 0 {
+                    probe.history_held.insert(watch.history_seq);
+                }
                 *union = probe;
             }
             entry
@@ -206,7 +209,11 @@ impl Registry {
 
         // First subscriber: spawn the lurker on the union watch (== this
         // watch, for now) and the dispatcher that fans its output out.
-        let shared: SharedWatch = Arc::new(RwLock::new(watch.clone()));
+        let mut union = watch.clone();
+        if watch.history_seq != 0 {
+            union.history_held.insert(watch.history_seq);
+        }
+        let shared: SharedWatch = Arc::new(RwLock::new(union));
         let subscribers = Arc::new(Mutex::new(vec![Subscriber { watch, tx: sub_tx }]));
         let (out_tx, out_rx) = mpsc::channel::<Delivery>(SUBSCRIBER_BUFFER);
         let lurker = spawn_lurker(Arc::clone(&shared), out_tx);
@@ -334,7 +341,7 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     fn gsoc_watch(addr: [u8; 32]) -> WatchState {
         WatchState {
@@ -734,5 +741,77 @@ mod tests {
         for rx in [&mut rx_h1, &mut rx_live, &mut rx_gsoc, &mut rx_h2] {
             assert!(rx.try_recv().is_err(), "no extra deliveries");
         }
+    }
+
+    /// R3-M2: the union watch lists the tickets of the history
+    /// subscribers still attached, and drops a ticket once its holder
+    /// leaves — the lurker's cue to cancel that ticket's campaign.
+    #[tokio::test]
+    async fn union_tracks_held_history_tickets_as_subscribers_leave() {
+        let reg = Registry::new();
+        let target = [6u8; 32];
+        let topic = [0x71; 32];
+
+        let mut feed: Option<mpsc::Sender<Delivery>> = None;
+        let mut shared_probe = None;
+        // H1 spawns the lurker with history: ticket 1 is held from the
+        // start (not only after the first attach).
+        let rx_h1 = reg
+            .subscribe(target, pss_watch(topic, true), |w, out_tx| {
+                shared_probe = Some(Arc::clone(&w));
+                let (feed_tx, mut feed_rx) = mpsc::channel::<Delivery>(16);
+                feed = Some(feed_tx);
+                tokio::spawn(async move {
+                    while let Some(d) = feed_rx.recv().await {
+                        if out_tx.send(d).await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .unwrap();
+        let shared = shared_probe.unwrap();
+        let feed = feed.unwrap();
+        assert_eq!(shared.read().unwrap().history_held, BTreeSet::from([1]));
+
+        let mut rx_live = reg
+            .subscribe(target, pss_watch(topic, false), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        let rx_h2 = reg
+            .subscribe(target, pss_watch(topic, true), |_w, _tx| {
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert_eq!(shared.read().unwrap().history_held, BTreeSet::from([1, 2]));
+
+        // H1 leaves; the next dispatcher pass shrinks the union.
+        drop(rx_h1);
+        feed.send(Delivery::live(pss_msg(topic, b"x")))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut rx_live).await, pss_msg(topic, b"x"));
+        wait_for(|| shared.read().unwrap().history_held == BTreeSet::from([2])).await;
+        assert_eq!(shared.read().unwrap().history_seq, 2);
+
+        // H2 leaves too: no ticket is held; the live subscriber keeps the
+        // lurker alive but no campaign has anyone to serve.
+        drop(rx_h2);
+        feed.send(Delivery::live(pss_msg(topic, b"y")))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut rx_live).await, pss_msg(topic, b"y"));
+        wait_for(|| shared.read().unwrap().history_held.is_empty()).await;
+    }
+
+    async fn wait_for(cond: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition within 2s");
     }
 }
