@@ -89,15 +89,25 @@ const COVERING_PEERS: usize = 5;
 /// accepts them (bee's cap is 1..=[`ant_crypto::pss::MAX_TARGET_LEN`] bytes and ant
 /// mirrors it), but a trojan that agrees with the target on only 8 bits
 /// is pushed to whichever neighbourhood is closest to its *mined*
-/// address, which with mainnet storage depth `d ≈ 9-11 > 8` is almost
-/// never the target's — so no covering storer holds it and no
-/// receiver (bee or ant) can reliably get it. Covering `L = 8` anyway
-/// would make every PSS subscription pull bins `8..=11` from each
-/// covering peer: at `d ≈ 10` those are the storer's *fullest* reserve
-/// bins (≈ 75-90 % of its ingest vs ≈ 2-25 % for bin `b_p`), all of
-/// which `want()` downloads and trial-unwraps — a many-fold bandwidth
-/// cost on a light node to catch messages that essentially never land
-/// there. Senders wanting delivery must use ≥ 2-byte targets.
+/// address. With mainnet storage depth `d ≈ 9-11 > 8` it lands in the
+/// target's depth-`d` neighbourhood only by chance, with probability
+/// `2^-(d-8)` (≈ 1/2 at `d = 9`, 1/4 at `d = 10`, 1/8 at `d = 11`) —
+/// so a 1-byte sender gets unreliable, lossy delivery, not none. When it
+/// does land there — agreeing with the target past bit `b_p` of a
+/// covering peer `p` — it sits at exactly bin `b_p` on `p` (the same
+/// deterministic argument as the `b_p < L` regime below), and bin `b_p`
+/// is pulled anyway for the 3-byte case whenever `b_p < 24`, i.e. on
+/// every realistic covering peer — so ant still receives that lucky
+/// fraction of 1-byte messages at no extra cost. What is *not* done is
+/// pull the `8 + Geom(1/2)` bins a `b_p >= 8` peer would file the
+/// remaining 1-byte trojans under: covering `L = 8` would make every PSS
+/// subscription pull bins `8..=11` from each covering peer, and at
+/// `d ≈ 10` those are the storer's *fullest* reserve bins (≈ 75-90 % of
+/// its ingest vs ≈ 2-25 % for bin `b_p`), all of which `want()`
+/// downloads and trial-unwraps — a many-fold bandwidth cost on a light
+/// node for messages that mostly weren't stored in the target's
+/// neighbourhood to begin with. Senders wanting reliable delivery must
+/// use ≥ 2-byte targets.
 ///
 /// Correction due to Viktor Trón: which bin a trojan `c` occupies on a
 /// covering peer `p` depends on how `b_p = PO(p, target)` compares to
@@ -113,9 +123,9 @@ const COVERING_PEERS: usize = 5;
 ///   it; the correct base is `L`, with a small deeper window for the
 ///   geometric tail (each +1 bin halves the missed mass).
 ///
-/// `L` must exceed the storage depth `d` or no storer in the target's
-/// neighbourhood keeps the trojan at all — why `L = 8` is excluded
-/// above. Beyond that the sender picks `L` freely (via its target
+/// `L` must exceed the storage depth `d` for the target's neighbourhood
+/// to reliably keep the trojan (below `d` it does so only with
+/// probability `2^-(d-L)`) — why `L = 8` is excluded above. Beyond that the sender picks `L` freely (via its target
 /// length); the receiver does not need to agree on one, since it covers
 /// every listed `L`.
 ///
@@ -751,7 +761,9 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
     if want_pss {
         // The sender's prefix length is unknown to us: cover every
         // deliverable length (2- and 3-byte targets; see
-        // PSS_MINED_PREFIX_BITS for why 1-byte is excluded).
+        // PSS_MINED_PREFIX_BITS for why 1-byte is excluded — the
+        // 1-byte trojans that do land in the neighbourhood sit at
+        // `b_p`, which the L = 24 pass below adds for any b_p < 24).
         for l in PSS_MINED_PREFIX_BITS {
             if b_p < l {
                 // Deterministic regime: PO(c, p) = b_p exactly.
@@ -887,7 +899,8 @@ mod tests {
 
     /// Covered prefix lengths are the 2- and 3-byte targets `/pss/send`
     /// takes; 1-byte (`L = 8`, below storage depth) is deliberately
-    /// excluded — pulling bins 8..=11 costs a light node most of each
+    /// excluded (its in-neighbourhood fraction still arrives via bin
+    /// `b_p`) — pulling bins 8..=11 costs a light node most of each
     /// storer's reserve ingest (R2-F1 on PR #54). The deepest covered
     /// `L` must track the API's max target length.
     #[test]
