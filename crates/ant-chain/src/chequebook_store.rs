@@ -11,7 +11,7 @@
 //! `ant_p2p::PushsyncSwapConfig` from the resolved address stays with
 //! each caller, since that type belongs to a higher layer.
 //!
-//! `load_persisted_chequebook` / `persist_chequebook` / [`ChequebookFile`]
+//! `load_persisted_chequebook_for` / `persist_chequebook` / [`ChequebookFile`]
 //! are pure file I/O and compile everywhere; the deploy / factory-check
 //! helpers drive a JSON-RPC node and are gated on `chain-rpc`.
 
@@ -97,26 +97,15 @@ fn strip_0x(s: &str) -> &str {
 }
 
 /// Load the persisted chequebook address from `path`, if the file
-/// exists. A malformed file is a hard error — silently ignoring it
-/// would re-trigger a deploy and waste gas on every restart, so callers
-/// decide whether to treat that as fatal (`antd`) or self-heal
-/// (`ant-ffi` re-deploys on the next buy).
-pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, ChequebookError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| ChequebookError::Read(path.display().to_string(), e))?;
-    let file: ChequebookFile = serde_json::from_str(&raw)
-        .map_err(|e| ChequebookError::Parse(path.display().to_string(), e))?;
-    let mut cb = [0u8; 20];
-    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
-        .map_err(|_| ChequebookError::Decode(file.chequebook.clone()))?;
-    Ok(Some(cb))
-}
-
-/// Like [`load_persisted_chequebook`], but only adopts the record when
-/// the `issuer` it names is `owner`.
+/// exists **and** the `issuer` it names is `owner`. This is the only
+/// loader: both `antd` and `ant-ffi` know their own EOA, and trusting
+/// the path alone is exactly the drift the parity audit found
+/// (`docs/ffi-parity-audit.md`).
+///
+/// A malformed file is an error rather than "none": silently ignoring
+/// it could re-trigger a deploy on every start, so callers decide.
+/// `antd` treats it as fatal; `ant-ffi` rediscovers on-chain first and
+/// only deploys (overwriting the file) when the chain has none.
 ///
 /// A chequebook's issuer is baked into the contract on-chain: bee only
 /// accepts a cheque whose signature recovers to `chequebook.issuer()`,
@@ -124,8 +113,8 @@ pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, Cheque
 /// silently drops while its own settlement status reads "ready". A
 /// record can outlive the account that wrote it whenever the node key
 /// changes under a fixed data dir (a restore-from-backup-key flow), and
-/// the file already carries the owner, so callers that know their own
-/// EOA should use this rather than trusting the path. A foreign record
+/// the file already carries the owner, so the path alone is never
+/// trusted. A foreign record
 /// reads as `Ok(None)` — "no chequebook for this account" — which is
 /// exactly what a fresh account is, so callers rediscover or deploy
 /// their own instead of failing.
@@ -375,7 +364,10 @@ mod tests {
         let path = dir.join("chequebook.json");
         let cb = [0x11u8; 20];
         persist_chequebook(&path, &ChequebookFile::rediscovered(&cb, &[0x22u8; 20])).unwrap();
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), Some(cb));
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            Some(cb)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -405,7 +397,10 @@ mod tests {
     fn missing_file_is_none() {
         let path = std::env::temp_dir().join("definitely-not-a-chequebook-file-xyz.json");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), None);
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -414,7 +409,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chequebook.json");
         std::fs::write(&path, b"not json").unwrap();
-        assert!(load_persisted_chequebook(&path).is_err());
+        assert!(load_persisted_chequebook_for(&path, &[0x22u8; 20]).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1813,8 +1813,15 @@ async fn resolve_chequebook(
         }
     }
 
-    // 2. Persisted auto-deployed chequebook — reuse forever.
-    if let Some(persisted) = ant_chain::chequebook_store::load_persisted_chequebook(&persist_path)?
+    // 2. Persisted auto-deployed chequebook — reuse forever, but only if
+    //    it was issued by *this* node key. A record left behind when the
+    //    key changed under the same data dir (e.g. Freedom swapped
+    //    `keys/swarm.key`) would have us sign cheques every peer drops;
+    //    it reads as "none" (with a warning) so we rediscover or deploy
+    //    our own below. The old account's chequebook stays rediscoverable
+    //    on-chain from its key. Same loader `ant-ffi` uses.
+    if let Some(persisted) =
+        ant_chain::chequebook_store::load_persisted_chequebook_for(&persist_path, &node_eth)?
     {
         tracing::info!(
             target: "antd",
