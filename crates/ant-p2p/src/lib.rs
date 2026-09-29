@@ -31,7 +31,6 @@ pub use pushsync_swap::{
 pub use routing::{proximity, RoutingTable, NUM_BINS, OVERLAY_LEN};
 
 use libp2p::multiaddr::Multiaddr;
-use std::time::Duration;
 
 /// Default mainnet bootnodes, matching upstream `bee` >= 2.7
 /// (`/dnsaddr/mainnet.ethswarm.org` is the only published entry).
@@ -41,10 +40,4 @@ pub fn default_mainnet_bootnodes() -> Vec<Multiaddr> {
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect()
-}
-
-/// Default backoff range after a failed dial / handshake.
-#[must_use]
-pub const fn default_backoff() -> Duration {
-    Duration::from_secs(5)
 }

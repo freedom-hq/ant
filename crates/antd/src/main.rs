@@ -339,7 +339,7 @@ async fn main() -> Result<()> {
         Ok(o) => o,
         Err(e) => e.exit(),
     };
-    let resolved_password = apply_config_file(&mut opt, &matches)?;
+    let (resolved_password, ignored_config_keys) = apply_config_file(&mut opt, &matches)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -349,6 +349,16 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&opt.log_level)),
         )
         .init();
+    // Logged only now: the config merge above runs before the subscriber
+    // exists (it decides the log level), so anything it logged was lost.
+    if !ignored_config_keys.is_empty() {
+        tracing::debug!(
+            target: "antd",
+            "ignoring {} unmodelled bee config key(s): {}",
+            ignored_config_keys.len(),
+            ignored_config_keys.join(", "),
+        );
+    }
 
     // Held for the lifetime of the daemon: dropping the `File` releases the
     // advisory `flock`. Bound at function scope (not in a helper) so it stays
@@ -1137,13 +1147,18 @@ fn expand_tilde(p: &Path) -> PathBuf {
 
 /// Load `--config` (if given), merging its values into `opt` for every
 /// setting the operator did **not** pass on the command line. Returns
-/// the resolved keystore password (from `--password` / `--password-file`
+/// the config keys it doesn't model (for the caller to log once the
+/// tracing subscriber exists) and the resolved keystore password (from
+/// `--password` / `--password-file`
 /// or the config's `password` / `password-file`), if any.
 ///
 /// CLI > config file > default — the same precedence bee uses, so a
 /// Freedom-written config behaves predictably while an operator can
 /// still override one knob on the command line.
-fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option<String>> {
+fn apply_config_file(
+    opt: &mut Opt,
+    matches: &clap::ArgMatches,
+) -> Result<(Option<String>, Vec<String>)> {
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     // CLI password flags take precedence; fall back to the config file
@@ -1188,31 +1203,26 @@ fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option
                 opt.log_level = level;
             }
         }
-        let ignored = cfg.extra.len();
-        if ignored > 0 {
-            let keys: Vec<&str> = cfg.extra.keys().map(String::as_str).collect();
-            tracing::debug!(
-                target: "antd",
-                "ignoring {ignored} unmodelled bee config key(s): {}",
-                keys.join(", "),
-            );
-        }
     }
+    let ignored_keys: Vec<String> = cfg
+        .as_ref()
+        .map(|c| c.extra.keys().cloned().collect())
+        .unwrap_or_default();
 
     // Resolve the password: CLI flag wins, then CLI password-file, then
     // the config file's `password` / `password-file`.
-    if let Some(p) = cli_password {
-        return Ok(Some(p));
-    }
-    if let Some(file) = cli_password_file {
+    let password = if let Some(p) = cli_password {
+        Some(p)
+    } else if let Some(file) = cli_password_file {
         let raw = std::fs::read_to_string(&file)
             .with_context(|| format!("read --password-file {}", file.display()))?;
-        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_string()));
-    }
-    if let Some(cfg) = &cfg {
-        return cfg.resolve_password();
-    }
-    Ok(None)
+        Some(raw.trim_end_matches(['\n', '\r']).to_string())
+    } else if let Some(cfg) = &cfg {
+        cfg.resolve_password()?
+    } else {
+        None
+    };
+    Ok((password, ignored_keys))
 }
 
 /// Load the node identity from a bee Web3 v3 keystore at

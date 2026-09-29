@@ -59,7 +59,7 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
 /// [`crate::ant_set_chain_transport`] *before* this; installing one
-/// later only affects the per-call `ant_storage_*` / `ant_settlement_*`
+/// later only affects the per-call `ant_storage_*` / `ant_deploy_chequebook`
 /// paths until the gateway is stopped and started again. What is
 /// captured is the handle's transport *slot*, though, so replacing or
 /// clearing a transport that was installed before the start does reach

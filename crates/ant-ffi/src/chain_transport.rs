@@ -213,7 +213,8 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// concurrently from several such threads.
 ///
 /// **Ordering:** takes effect immediately for the storage / settlement
-/// calls (`ant_storage_*`, `ant_settlement_*`, `ant_deploy_chequebook`),
+/// calls (`ant_storage_*`, including `ant_storage_settlement_*`, and
+/// `ant_deploy_chequebook`),
 /// which build a chain client per call. The in-process gateway
 /// (`ant_start_gateway`) captures its chain wiring once at start, so a
 /// transport installed while none was installed at that start is only
