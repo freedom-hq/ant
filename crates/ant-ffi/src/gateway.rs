@@ -47,6 +47,15 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (`antd`) parity. Only honoured when the crate is built with the
 /// `chain` feature; ignored otherwise.
 ///
+/// A `gnosis_rpc` also triggers the on-chain check of the postage
+/// batches [`crate::ant_init`] reloaded from `postage/*.bin` (it had no
+/// RPC to do it itself). It runs in the background right after the
+/// gateway starts: batches the chain reports as missing (expired or
+/// never created) or owned by another key are unregistered — no longer
+/// listed by `GET /stamps`, no longer stampable — with a `WARN` naming
+/// the batch id; their files stay on disk. A batch whose read fails
+/// stays registered and is re-checked on the next start.
+///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
 /// [`crate::ant_set_chain_transport`] *before* this; installing one
@@ -203,7 +212,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 }
             };
             ant_gateway::chainreader::build_with_transport(
-                gnosis_rpc,
+                gnosis_rpc.clone(),
                 // No read-only fallback on mobile: chain reads stay gated
                 // on the host-supplied `gnosis_rpc` (this branch only runs
                 // when it's set), so behavior is unchanged.
@@ -273,6 +282,24 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
         });
         *slot = Some(task);
+
+        // First point an RPC is known: confirm the postage batches
+        // `ant_init` reloaded from disk and unregister the ones the chain
+        // disowns (expired / never created / foreign), as `antd` does at
+        // startup — otherwise `/stamps` keeps offering a dead batch until
+        // a peer rejects the first push. Off the caller's thread so the
+        // gateway start never waits on the RPC; batches whose read fails
+        // stay registered and are retried on the next start.
+        #[cfg(feature = "chain")]
+        if let Some(rpc) = gnosis_rpc {
+            let chain = handle.chain_client(rpc);
+            let persisted = Arc::clone(&handle.persisted_issuers);
+            handle.runtime.spawn(async move {
+                persisted
+                    .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+                    .await;
+            });
+        }
         true
     }
 }

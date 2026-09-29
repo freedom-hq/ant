@@ -1396,17 +1396,20 @@ async fn build_upload_runtime(
                             // — a later re-buy or re-sync recovers).
                             // RPC read errors keep the batch
                             // (unconfirmed ≠ dead); no RPC keeps the
-                            // historical trust-the-disk behaviour.
+                            // historical trust-the-disk behaviour. The
+                            // verdict is shared with `ant-ffi`'s reload.
                             if let Some(rpc) = rpc_url.clone() {
+                                use ant_chain::discover::PersistedBatchVerdict;
                                 let chain = ant_chain::ChainClient::new(rpc);
-                                match ant_chain::fetch_postage_batch_meta(
+                                match ant_chain::discover::verify_persisted_batch(
                                     &chain,
                                     &postage_contract,
                                     &id,
+                                    &batch_owner,
                                 )
                                 .await
                                 {
-                                    Ok(meta) if meta.batch_owner_eth == [0u8; 20] => {
+                                    PersistedBatchVerdict::NotFound => {
                                         tracing::warn!(
                                             target: "antd",
                                             batch = %format!("0x{}", hex::encode(id)),
@@ -1415,18 +1418,18 @@ async fn build_upload_runtime(
                                         );
                                         continue;
                                     }
-                                    Ok(meta) if meta.batch_owner_eth != batch_owner => {
+                                    PersistedBatchVerdict::ForeignOwner(on_chain_owner) => {
                                         tracing::warn!(
                                             target: "antd",
                                             batch = %format!("0x{}", hex::encode(id)),
-                                            on_chain_owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
+                                            on_chain_owner = %format!("0x{}", hex::encode(on_chain_owner)),
                                             our_owner = %format!("0x{}", hex::encode(batch_owner)),
                                             "persisted batch is owned by a different key on-chain — not registering it (stamps we sign would be rejected)",
                                         );
                                         continue;
                                     }
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!(
+                                    PersistedBatchVerdict::Owned => {}
+                                    PersistedBatchVerdict::Unverified(e) => tracing::warn!(
                                         target: "antd",
                                         batch = %format!("0x{}", hex::encode(id)),
                                         "could not confirm persisted batch on-chain ({e}); registering it unverified",

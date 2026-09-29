@@ -117,6 +117,20 @@ impl StampEntry {
             batch_ttl: PLACEHOLDER_BATCH_TTL_SECS,
         })
     }
+
+    /// The chain confirms this batch does not exist — expired (the
+    /// contract evicts it) or never created. Report it the way bee does
+    /// a batch missing from its batchstore (`exists: false`,
+    /// `batchTTL: -1`) and not `usable`, so a client learns it is dead
+    /// from the listing rather than from a peer rejecting its first
+    /// push. (`ant-ffi` also unregisters such a batch once it has an
+    /// RPC; this covers the window before that, and a batch that
+    /// expires while the node runs.)
+    fn mark_not_on_chain(&mut self) {
+        self.exists = false;
+        self.usable = false;
+        self.batch_ttl = -1;
+    }
 }
 
 /// Fetch every registered postage batch over the control channel.
@@ -205,6 +219,11 @@ const STAMPS_ENRICH_TIMEOUT: Duration = Duration::from_secs(8);
 /// happy. `amount = remainingBalance + totalOutPayment` and
 /// `batchTTL = (remainingBalance / currentPrice) * blockTime`, matching
 /// bee.
+///
+/// A batch whose balance read fails *and* whose `batchOwner` reads as
+/// the zero address is one the chain doesn't hold: it is marked
+/// [`StampEntry::mark_not_on_chain`]. Any other failure keeps the
+/// placeholders — an RPC hiccup must not make a funded batch look dead.
 async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
     let Some(chain) = handle.chain() else {
         return;
@@ -212,23 +231,38 @@ async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
     if stamps.is_empty() {
         return;
     }
-    let _ = tokio::time::timeout(STAMPS_ENRICH_TIMEOUT, async {
-        let price = chain.reader.current_price().await.unwrap_or(0);
-        let total_out = chain.reader.total_amount().await.unwrap_or(0);
-        for entry in stamps.iter_mut() {
-            let mut id = [0u8; 32];
-            if hex::decode_to_slice(&entry.batch_id, &mut id).is_err() {
-                continue;
-            }
-            let Ok(remaining) = chain.reader.batch_remaining_balance(id).await else {
-                continue;
-            };
-            // Normalised per-chunk balance bee reports as `amount`.
-            entry.amount = remaining.saturating_add(total_out).to_string();
-            entry.batch_ttl = batch_ttl_secs(remaining, price);
-        }
-    })
+    let _ = tokio::time::timeout(
+        STAMPS_ENRICH_TIMEOUT,
+        enrich_entries(stamps, chain.reader.as_ref()),
+    )
     .await;
+}
+
+async fn enrich_entries(stamps: &mut [StampEntry], reader: &dyn crate::ChainReader) {
+    let price = reader.current_price().await.unwrap_or(0);
+    let total_out = reader.total_amount().await.unwrap_or(0);
+    for entry in stamps.iter_mut() {
+        let mut id = [0u8; 32];
+        if hex::decode_to_slice(&entry.batch_id, &mut id).is_err() {
+            continue;
+        }
+        let Ok(remaining) = reader.batch_remaining_balance(id).await else {
+            // `remainingBalance` reverts for a batch the contract no
+            // longer holds; confirm with the owner view before calling
+            // it dead.
+            if reader
+                .batch_meta(id)
+                .await
+                .is_ok_and(|meta| meta.owner == [0u8; 20])
+            {
+                entry.mark_not_on_chain();
+            }
+            continue;
+        };
+        // Normalised per-chunk balance bee reports as `amount`.
+        entry.amount = remaining.saturating_add(total_out).to_string();
+        entry.batch_ttl = batch_ttl_secs(remaining, price);
+    }
 }
 
 /// `GET /stamps/{id}`. Returns the registered batch whose id matches,
@@ -465,5 +499,90 @@ mod tests {
     fn astronomical_ttl_clamps_to_i64_max() {
         // Would overflow i64 → clamp instead of wrapping negative.
         assert_eq!(batch_ttl_secs(u128::MAX, 1), i64::MAX);
+    }
+
+    const LIVE: [u8; 32] = [0x11; 32];
+    const GONE: [u8; 32] = [0x22; 32];
+    const FLAKY: [u8; 32] = [0x33; 32];
+
+    /// `LIVE` is funded; `GONE` is not on chain (`remainingBalance`
+    /// reverts, zero owner); `FLAKY`'s reads all fail.
+    struct Chain;
+
+    #[async_trait::async_trait]
+    impl crate::ChainReader for Chain {
+        async fn block_number(&self) -> Result<u64, String> {
+            Ok(1)
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            Ok(100)
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            Ok(7)
+        }
+        async fn bzz_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn native_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn batch_remaining_balance(&self, id: [u8; 32]) -> Result<u128, String> {
+            match id {
+                LIVE => Ok(1_000),
+                GONE => Err("execution reverted: 0x4ee9bc0f".into()),
+                _ => Err("backend unavailable".into()),
+            }
+        }
+        async fn batch_meta(&self, id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
+            match id {
+                GONE => Ok(crate::BatchMetaView {
+                    owner: [0u8; 20],
+                    depth: 0,
+                    bucket_depth: 0,
+                    immutable: false,
+                }),
+                _ => Err("backend unavailable".into()),
+            }
+        }
+    }
+
+    fn entry(id: [u8; 32]) -> StampEntry {
+        StampEntry::from_view(&PostageStatusView {
+            usable: true,
+            enabled: true,
+            batch_id: format!("0x{}", hex::encode(id)),
+            batch_depth: 20,
+            bucket_depth: 16,
+            ..PostageStatusView::default()
+        })
+        .unwrap()
+    }
+
+    /// A batch the chain confirms is gone is reported dead (bee's
+    /// `exists: false` / `batchTTL: -1`, not `usable`) instead of green
+    /// until a peer rejects it; a batch whose reads merely fail keeps
+    /// the optimistic placeholders.
+    #[tokio::test]
+    async fn batch_missing_on_chain_is_not_usable() {
+        let mut stamps = [entry(LIVE), entry(GONE), entry(FLAKY)];
+        enrich_entries(&mut stamps, &Chain).await;
+        let [live, gone, flaky] = &stamps;
+
+        assert!(live.usable && live.exists);
+        assert_eq!(live.amount, "1007");
+        assert_eq!(live.batch_ttl, 50);
+
+        assert!(!gone.usable, "a batch the chain doesn't hold is not usable");
+        assert!(!gone.exists);
+        assert_eq!(gone.batch_ttl, -1);
+
+        assert!(
+            flaky.usable && flaky.exists,
+            "a failed read is not a dead batch"
+        );
+        assert_eq!(flaky.batch_ttl, PLACEHOLDER_BATCH_TTL_SECS);
     }
 }

@@ -255,6 +255,53 @@ pub async fn discover_owned_batches(
     Ok(out)
 }
 
+/// What the chain says about a postage batch reloaded from a persisted
+/// `postage/<id>.bin` store — see [`verify_persisted_batch`].
+#[derive(Debug)]
+pub enum PersistedBatchVerdict {
+    /// On-chain and owned by the key we stamp with: keep it.
+    Owned,
+    /// `batchOwner` reads as the zero address: the batch expired (the
+    /// contract evicts it) or was never created. Every storer would
+    /// reject its stamps, so it must not be registered.
+    NotFound,
+    /// On-chain, but owned by this other address — stamps we sign
+    /// would be rejected, so it must not be registered.
+    ForeignOwner([u8; 20]),
+    /// The chain read itself failed. Unconfirmed is not dead: callers
+    /// keep the batch, since dropping a funded batch on an RPC hiccup
+    /// is the worse failure.
+    Unverified(RpcError),
+}
+
+/// Confirm a postage batch reloaded from disk against the chain before
+/// stamping with it (the phantom-batch guard, issue #49).
+///
+/// A persisted issuer proves only that *we once* held the batch — not
+/// that the chain still does (expiry evicts it; a failed or
+/// foreign-chain buy never registered it). Storer peers validate every
+/// stamp against their chain-synced batchstore, so an unconfirmable
+/// batch means every push is rejected while `/stamps` reads green.
+///
+/// Shared by `antd`'s startup reload and `ant-ffi`'s (which runs it
+/// once the host hands it an RPC), so both entry points draw the same
+/// line between "dead" and "unconfirmed".
+pub async fn verify_persisted_batch(
+    client: &ChainClient,
+    postage_contract: &str,
+    batch_id: &[u8; 32],
+    our_owner: &[u8; 20],
+) -> PersistedBatchVerdict {
+    match crate::fetch_postage_batch_meta(client, postage_contract, batch_id).await {
+        Ok(meta) if meta.batch_owner_eth == [0u8; 20] => PersistedBatchVerdict::NotFound,
+        Ok(meta) if meta.batch_owner_eth != *our_owner => {
+            PersistedBatchVerdict::ForeignOwner(meta.batch_owner_eth)
+        }
+        Ok(_) => PersistedBatchVerdict::Owned,
+        Err(e) => PersistedBatchVerdict::Unverified(e),
+    }
+}
+
 /// Discover the SWAP chequebook deployed by `node_eoa`. Reuses the same
 /// `Transfer(from = node_eoa)` scan: every funded chequebook was
 /// deposited into by the node EOA, so it is among the `to` addresses.
@@ -547,6 +594,8 @@ mod tests {
         /// When set, the `eth_call` carrying this selector answers with a
         /// JSON-RPC error instead of a value — a transient read failure.
         fail_selector: Option<&'static str>,
+        /// What `batchOwner` answers; `None` is [`NODE_EOA`].
+        batch_owner: Option<[u8; 20]>,
     }
 
     fn word_hex(bytes: &[u8]) -> String {
@@ -613,12 +662,13 @@ mod tests {
                 }
                 "eth_call" => {
                     let data = params[0]["data"].as_str().unwrap();
+                    let owner = self.batch_owner.unwrap_or(NODE_EOA);
                     let word = match &data[0..10] {
-                        "0x2182ddb1" => word_hex(&NODE_EOA), // batchOwner
-                        "0x44beae8e" => word_hex(&[17]),     // batchDepth
-                        "0x32ac57dd" => word_hex(&[16]),     // bucketDepth
-                        "0xd968f44b" => word_hex(&[1]),      // immutableFlag
-                        "0xd71ba7c4" => word_hex(&[42]),     // remainingBalance
+                        "0x2182ddb1" => word_hex(&owner), // batchOwner
+                        "0x44beae8e" => word_hex(&[17]),  // batchDepth
+                        "0x32ac57dd" => word_hex(&[16]),  // bucketDepth
+                        "0xd968f44b" => word_hex(&[1]),   // immutableFlag
+                        "0xd71ba7c4" => word_hex(&[42]),  // remainingBalance
                         other => panic!("unscripted eth_call selector {other}"),
                     };
                     json!(word)
@@ -748,6 +798,71 @@ mod tests {
             .await
             .expect_err("a failed owner read must not read as not-ours");
         assert!(err.to_string().contains("backend unavailable"), "got {err}");
+    }
+
+    // --- persisted-issuer verification (issue #49) ---
+
+    async fn verify_against(script: ScriptedChain) -> PersistedBatchVerdict {
+        let client = ChainClient::new("http://127.0.0.1:1")
+            .with_transport(Some(std::sync::Arc::new(script)));
+        verify_persisted_batch(&client, crate::GNOSIS_POSTAGE_STAMP, &OUR_BATCH, &NODE_EOA).await
+    }
+
+    #[tokio::test]
+    async fn persisted_batch_we_own_is_kept() {
+        let verdict = verify_against(ScriptedChain::default()).await;
+        assert!(
+            matches!(verdict, PersistedBatchVerdict::Owned),
+            "got {verdict:?}"
+        );
+    }
+
+    /// The phantom-batch case: an expired (evicted) or never-created
+    /// batch reads as the zero owner.
+    #[tokio::test]
+    async fn zero_owner_is_not_found() {
+        let verdict = verify_against(ScriptedChain {
+            batch_owner: Some([0u8; 20]),
+            ..ScriptedChain::default()
+        })
+        .await;
+        assert!(
+            matches!(verdict, PersistedBatchVerdict::NotFound),
+            "got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_owner_is_foreign() {
+        let stranger = [0x5e; 20];
+        let verdict = verify_against(ScriptedChain {
+            batch_owner: Some(stranger),
+            ..ScriptedChain::default()
+        })
+        .await;
+        assert!(
+            matches!(verdict, PersistedBatchVerdict::ForeignOwner(o) if o == stranger),
+            "got {verdict:?}"
+        );
+    }
+
+    /// A failed read is not a dead batch: it must come back as
+    /// `Unverified` (kept), never as `NotFound` / `ForeignOwner`.
+    #[tokio::test]
+    async fn failed_read_is_unverified_not_dead() {
+        for selector in ["0x2182ddb1", "0x44beae8e"] {
+            let verdict = verify_against(ScriptedChain {
+                fail_selector: Some(selector),
+                ..ScriptedChain::default()
+            })
+            .await;
+            match verdict {
+                PersistedBatchVerdict::Unverified(e) => {
+                    assert!(e.to_string().contains("backend unavailable"), "got {e}");
+                }
+                other => panic!("failed {selector} read must be Unverified, got {other:?}"),
+            }
+        }
     }
 
     // --- chequebook discovery: a failed read is not "no chequebook" ---
