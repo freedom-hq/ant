@@ -75,7 +75,7 @@ mod subscribe;
 mod tags;
 
 #[cfg(feature = "http-api")]
-pub use chain::{BatchMetaView, ChainContext, ChainReader, ChainWriter};
+pub use chain::{BatchMetaView, ChainContext, ChainReader, ChainWriter, ChequebookSlot};
 #[cfg(feature = "http-api")]
 pub use cors::CorsConfig;
 #[cfg(feature = "http-api")]

@@ -7,7 +7,7 @@ mod common;
 
 use std::sync::Arc;
 
-use ant_gateway::{ChainContext, ChainReader, ChainWriter};
+use ant_gateway::{ChainContext, ChainReader, ChainWriter, ChequebookSlot};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -47,7 +47,7 @@ fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
         reader: Arc::new(FakeChain),
         wallet_eth: [0x11; 20],
-        chequebook,
+        chequebook: ChequebookSlot::new(chequebook),
         chain_id: 100,
         writer: None,
     })
@@ -82,7 +82,7 @@ fn chain_ctx_rw(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
         reader: Arc::new(FakeChain),
         wallet_eth: [0x11; 20],
-        chequebook,
+        chequebook: ChequebookSlot::new(chequebook),
         chain_id: 100,
         writer: Some(Arc::new(FakeWriter)),
     })
@@ -170,6 +170,28 @@ async fn chequebook_address_reports_configured_address() {
     let (status, json) = get(router, "/chequebook/address").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)));
+}
+
+/// A chequebook resolved after startup (a deploy triggered by a stamp
+/// buy) shows up without rebuilding the chain context or restarting.
+#[tokio::test]
+async fn chequebook_set_after_startup_is_reported_live() {
+    let ctx = chain_ctx(None);
+    let router = status_router_with_chain(snapshot_with_one_peer(), Arc::clone(&ctx));
+
+    let (_, json) = get(router.clone(), "/chequebook/address").await;
+    assert_eq!(json["chequebookAddress"], format!("0x{}", "0".repeat(40)));
+
+    let cb = [0xCD; 20];
+    ctx.chequebook.set(cb);
+    let (status, json) = get(router.clone(), "/chequebook/address").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)));
+    let (_, json) = get(router, "/wallet").await;
+    assert_eq!(
+        json["chequebookContractAddress"],
+        format!("0x{}", hex::encode(cb))
+    );
 }
 
 #[tokio::test]

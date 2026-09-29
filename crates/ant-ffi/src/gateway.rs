@@ -247,6 +247,10 @@ pub unsafe extern "C" fn ant_start_gateway(
         };
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
+        // The gateway's chequebook address, kept current when the chain
+        // init or a buy sets settlement up after this start.
+        #[cfg(feature = "chain")]
+        let chequebook_slot = chain.as_ref().map(|c| c.chequebook.clone());
 
         // One chain client, routed through the host transport like every
         // client this crate builds, for the background chain init and
@@ -256,7 +260,7 @@ pub unsafe extern "C" fn ant_start_gateway(
         #[cfg(feature = "chain")]
         let on_batch_bought = chain_client
             .clone()
-            .map(|client| after_buy_hook(handle, client));
+            .map(|client| after_buy_hook(handle, client, chequebook_slot.clone()));
         #[cfg(not(feature = "chain"))]
         let on_batch_bought = None;
 
@@ -316,8 +320,13 @@ pub unsafe extern "C" fn ant_start_gateway(
             let cmd_tx = handle.cmd_tx.clone();
             let data_dir = handle.data_dir.clone();
             let secret = handle.signing_secret;
+            let slot = chequebook_slot;
             handle.runtime.spawn(async move {
-                init.run(&chain, &cmd_tx, &data_dir, secret).await;
+                if let (Some(cb), Some(slot)) =
+                    (init.run(&chain, &cmd_tx, &data_dir, secret).await, slot)
+                {
+                    slot.set(cb);
+                }
             });
         }
         true
@@ -331,11 +340,14 @@ pub unsafe extern "C" fn ant_start_gateway(
 /// fresh install's session uploads without paying peers until the next
 /// launch. Spawned so the buy response doesn't wait on it. The
 /// chequebook setup lock serialises it against a concurrent
-/// `ant_deploy_chequebook` or chain init.
+/// `ant_deploy_chequebook` or chain init. The resulting chequebook is
+/// written to the gateway's `slot`, so `/chequebook/*` reports one
+/// deployed here without a gateway restart.
 #[cfg(feature = "chain")]
 fn after_buy_hook(
     handle: &AntHandle,
     client: ant_chain::ChainClient,
+    slot: Option<ant_gateway::ChequebookSlot>,
 ) -> ant_gateway::BatchBoughtHook {
     let rt = handle.runtime.handle().clone();
     let cmd_tx = handle.cmd_tx.clone();
@@ -344,9 +356,15 @@ fn after_buy_hook(
     let eth = handle.eth;
     Arc::new(move |_batch_id| {
         let (client, cmd_tx, data_dir) = (client.clone(), cmd_tx.clone(), data_dir.clone());
+        let slot = slot.clone();
         rt.spawn(async move {
-            crate::drive::ensure_settlement_best_effort(&cmd_tx, &client, secret, &data_dir, eth)
-                .await;
+            let chequebook = crate::drive::ensure_settlement_best_effort(
+                &cmd_tx, &client, secret, &data_dir, eth,
+            )
+            .await;
+            if let (Some(cb), Some(slot)) = (chequebook, slot) {
+                slot.set(cb);
+            }
         });
     })
 }

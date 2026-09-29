@@ -103,6 +103,41 @@ pub trait ChainWriter: Send + Sync {
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String>;
 }
 
+/// The node's chequebook address, as the gateway reports and funds it.
+///
+/// Shared between the [`ChainContext`] and the writer (cloning shares
+/// the slot), and updatable after startup. The embedder resolves the
+/// chequebook at startup, but it can also appear later: a deploy
+/// triggered by a stamp buy, or one adopted by `ant-ffi`'s gateway-start
+/// chain init. Setting it here makes `/wallet`, `/chequebook/*` and
+/// `POST /chequebook/deposit` see it without a restart.
+#[derive(Debug, Clone, Default)]
+pub struct ChequebookSlot(std::sync::Arc<std::sync::RwLock<Option<[u8; 20]>>>);
+
+impl ChequebookSlot {
+    #[must_use]
+    pub fn new(chequebook: Option<[u8; 20]>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(chequebook)))
+    }
+
+    /// The current chequebook, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<[u8; 20]> {
+        *self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record the chequebook the node now settles with.
+    pub fn set(&self, chequebook: [u8; 20]) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chequebook);
+    }
+}
+
 /// Everything the chain-backed endpoints need beyond the reader: the
 /// wallet address whose balances `/wallet` reports, the chequebook
 /// address (if one is deployed), the chain id bee-js branches on, and
@@ -110,7 +145,7 @@ pub trait ChainWriter: Send + Sync {
 pub struct ChainContext {
     pub reader: std::sync::Arc<dyn ChainReader>,
     pub wallet_eth: [u8; 20],
-    pub chequebook: Option<[u8; 20]>,
+    pub chequebook: ChequebookSlot,
     pub chain_id: u64,
     /// Signer for the on-chain write endpoints. `None` → those endpoints
     /// return `501`.
@@ -194,7 +229,7 @@ pub async fn wallet(State(handle): State<GatewayHandle>) -> Response {
         native_token_balance: native.to_string(),
         chain_id: chain.chain_id,
         wallet_address: format!("0x{}", hex::encode(chain.wallet_eth)),
-        chequebook_contract_address: chain.chequebook.map_or_else(
+        chequebook_contract_address: chain.chequebook.get().map_or_else(
             || ZERO_ADDRESS.to_string(),
             |a| format!("0x{}", hex::encode(a)),
         ),
@@ -218,7 +253,7 @@ pub async fn chequebook_address(State(handle): State<GatewayHandle>) -> Response
     if handle.chain_state().is_none() {
         return crate::error::chain_initializing();
     }
-    let addr = handle.chain().and_then(|c| c.chequebook).map_or_else(
+    let addr = handle.chain().and_then(|c| c.chequebook.get()).map_or_else(
         || ZERO_ADDRESS.to_string(),
         |a| format!("0x{}", hex::encode(a)),
     );
@@ -255,7 +290,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         }
         return zero();
     };
-    let Some(cb) = chain.chequebook else {
+    let Some(cb) = chain.chequebook.get() else {
         return zero();
     };
     let bal = match guarded(chain.reader.chequebook_balance(cb)).await {

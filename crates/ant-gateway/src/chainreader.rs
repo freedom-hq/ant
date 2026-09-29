@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::{ChainContext, ChainReader, ChainWriter};
+use crate::{ChainContext, ChainReader, ChainWriter, ChequebookSlot};
 use ant_chain::tx::Wallet;
 use ant_chain::{ChainClient, GNOSIS_BZZ_TOKEN};
 use anyhow::{anyhow, Result};
@@ -109,7 +109,9 @@ struct AntChainWriter {
     /// buy to be accepted, this must match the key `antd` signs stamps
     /// with — by default the node wallet itself.
     owner: [u8; 20],
-    chequebook: Option<[u8; 20]>,
+    /// Shared with the [`ChainContext`], so a chequebook resolved after
+    /// startup can be deposited into without a restart.
+    chequebook: ChequebookSlot,
 }
 
 #[async_trait]
@@ -186,6 +188,7 @@ impl ChainWriter for AntChainWriter {
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String> {
         let cb = self
             .chequebook
+            .get()
             .ok_or_else(|| "no chequebook configured to deposit into".to_string())?;
         let receipt = self
             .wallet
@@ -284,6 +287,7 @@ pub fn build_with_transport(
     // than refusing to start the daemon — and crucially keeps a
     // read-only fallback node from silently signing transactions against
     // a shared public RPC.
+    let chequebook = ChequebookSlot::new(chequebook);
     let writer: Option<Arc<dyn ChainWriter>> = match (write_rpc, wallet_secret) {
         (Some(rpc), Some(secret)) => {
             let wallet = Wallet::new(secret, chain_id).ok();
@@ -296,7 +300,7 @@ pub fn build_with_transport(
                     postage_contract: postage,
                     bzz_token: bzz,
                     owner: wallet_eth,
-                    chequebook,
+                    chequebook: chequebook.clone(),
                 })
                     as Arc<dyn ChainWriter>),
                 _ => None,

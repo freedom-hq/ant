@@ -170,37 +170,46 @@ impl ChainInit {
     ///    settlement on. Nothing is deployed or funded here: both spend
     ///    the user's funds, which only an explicit host call
     ///    ([`deploy_chequebook`]) or a storage buy may do.
+    ///
+    /// Returns the chequebook settlement now runs on, if any, for the
+    /// gateway to report.
     pub(crate) async fn run(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
         data_dir: &std::path::Path,
         swap_secret: [u8; 32],
-    ) {
+    ) -> Option<[u8; 20]> {
         self.verify_persisted(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         self.rediscover_owned(chain, cmd_tx).await;
         let node_eth = self.upload.batch_owner;
-        match ant_chain::tx::Wallet::new(swap_secret, GNOSIS_CHAIN_ID) {
-            Ok(wallet) => {
-                if let Err(e) = setup_settlement(
-                    cmd_tx,
-                    chain,
-                    &wallet,
-                    data_dir,
-                    swap_secret,
-                    node_eth,
-                    false,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "ant-ffi",
-                        "could not adopt a chequebook for network settlement: {e}",
-                    );
-                }
+        let wallet = match ant_chain::tx::Wallet::new(swap_secret, GNOSIS_CHAIN_ID) {
+            Ok(wallet) => wallet,
+            Err(e) => {
+                tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}");
+                return None;
             }
-            Err(e) => tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}"),
+        };
+        match setup_settlement(
+            cmd_tx,
+            chain,
+            &wallet,
+            data_dir,
+            swap_secret,
+            node_eth,
+            false,
+        )
+        .await
+        {
+            Ok(chequebook) => chequebook,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ant-ffi",
+                    "could not adopt a chequebook for network settlement: {e}",
+                );
+                None
+            }
         }
     }
 
@@ -1517,7 +1526,8 @@ pub(crate) fn storage_buy_xdai(
 /// deposit). A gateway start adopts an existing chequebook
 /// ([`ChainInit::run`]) but never deploys or funds one.
 /// The node wallet both pays gas and is the issuer, so no external key
-/// is ever introduced.
+/// is ever introduced. Returns the chequebook settlement now runs on,
+/// if any.
 #[cfg(feature = "chain")]
 pub(crate) async fn ensure_settlement(
     cmd_tx: &mpsc::Sender<ControlCommand>,
@@ -1526,8 +1536,8 @@ pub(crate) async fn ensure_settlement(
     data_dir: &std::path::Path,
     swap_secret: [u8; 32],
     node_eth: [u8; 20],
-) {
-    if let Err(e) = setup_settlement(
+) -> Option<[u8; 20]> {
+    match setup_settlement(
         cmd_tx,
         client,
         wallet,
@@ -1538,11 +1548,15 @@ pub(crate) async fn ensure_settlement(
     )
     .await
     {
-        tracing::warn!(
-            target: "ant-ffi",
-            "could not enable network settlement (uploads still work for a while, \
-             then stall until a chequebook exists): {e}",
-        );
+        Ok(chequebook) => chequebook,
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                "could not enable network settlement (uploads still work for a while, \
+                 then stall until a chequebook exists): {e}",
+            );
+            None
+        }
     }
 }
 
@@ -1644,10 +1658,13 @@ pub(crate) async fn ensure_settlement_best_effort(
     secret: [u8; 32],
     data_dir: &std::path::Path,
     node_eth: [u8; 20],
-) {
+) -> Option<[u8; 20]> {
     match ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID) {
         Ok(wallet) => ensure_settlement(cmd_tx, client, &wallet, data_dir, secret, node_eth).await,
-        Err(e) => tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}"),
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}");
+            None
+        }
     }
 }
 
@@ -3110,8 +3127,9 @@ mod chain_tests {
         let script = std::sync::Arc::new(script);
         let (cmd_tx, node) = fake_node();
 
-        init.run(&client(&script), &cmd_tx, &dir, NODE_KEY).await;
+        let adopted = init.run(&client(&script), &cmd_tx, &dir, NODE_KEY).await;
 
+        assert_eq!(adopted, Some(CANDIDATE), "reported for the gateway");
         {
             let node = node.lock().unwrap();
             assert_eq!(
