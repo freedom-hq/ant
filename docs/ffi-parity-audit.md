@@ -93,10 +93,12 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 | Cleanups | The ignored-config-keys log, the `ant_settlement_*` doc drift, and the dead `default_backoff` are fixed. |
 | Guard (§7) | The AGENTS.md rule and the `parity_guard` test are in, with an empty allowlist. |
 
-**Open, needs a decision:**
+**Done in the follow-up (`feat/antd-settlement-parity`, stacked on the catch-up):**
 
-- **F3 (antd):** should a desktop gateway buy deploy a chequebook at runtime? antd passes `on_batch_bought: None` for now.
-- **Deposit size:** the plan is to unify the two amounts; the value isn't chosen yet.
+- **F3 (antd):** antd wires `on_batch_bought`. After a gateway buy, while settlement is still off, it re-runs its startup chequebook resolution (honouring `--no-auto-chequebook` and the manual flags) and enables settlement at runtime.
+  - Known gap: `/chequebook/address` and `/chequebook/balance` show the new chequebook only after a restart.
+- **Deposit size:** one default, `chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR` = 0.001 xBZZ. antd's default drops from 0.1 (`--chequebook-deposit-plur` still overrides it).
+- **Deposit top-up:** antd now tops an adopted chequebook back up to the target at startup and after a buy, through the shared `top_up_chequebook` that ant-ffi uses too. Before this, antd never topped up.
 
 **Deferred:**
 
@@ -242,7 +244,7 @@ Rows marked n/a in §2 are intentionally not proposed for porting.
   - What the comments promise: `init_inner` warns and says "a fresh deploy on the next buy overwrites it" (`ffi:876-884`); `cbstore:98-103` says the same.
   - What the code does: `resolve_or_deploy_chequebook` propagates the error (`drive:1743-1744`). `ensure_settlement` then warns and returns on every buy, so the file is never overwritten and settlement never comes up.
   - No test covers this.
-- **Chequebook deposit size diverges:** antd 0.1 xBZZ (`antd:46`), ant-ffi 0.001 xBZZ (`drive:623`). This may be intentional (a mobile wallet is thinner), but it isn't written down.
+- **Chequebook deposit size diverges:** antd 0.1 xBZZ (`antd:46`), ant-ffi 0.001 xBZZ (`drive:623`). This may be intentional (a mobile wallet is thinner), but it isn't written down. *(Resolved in the follow-up: one shared 0.001 xBZZ default, plus a top-up to it in both entry points.)*
 - **antd logs a config-file debug message before any subscriber exists** (`antd:1194-1198` runs before the `tracing_subscriber` init at `347`), so the "ignored config keys" message is always dropped.
 - **Doc drift:** `crates/ant-ffi/src/chain_transport.rs:216` and `ffi-gw:53` refer to `ant_settlement_*`; the real names are `ant_storage_settlement_*`.
 - **Unused helper:** `ant_p2p::default_backoff()` (`crates/ant-p2p/src/lib.rs:46-49`) has no callers.
