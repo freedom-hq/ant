@@ -226,6 +226,68 @@ pub async fn read_chequebook_issuer(
     Ok(out)
 }
 
+/// The two on-chain checks a chequebook must pass before a node signs
+/// cheques on it (see [`check_chequebook`]). Each field keeps its own
+/// read result so a caller can report them separately, as `antd` does.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug)]
+pub struct ChequebookChecks {
+    /// [`verify_chequebook_with_factory`]: `Ok(false)` means bee drops
+    /// every cheque drawn on it.
+    pub registered: Result<bool, ChequebookError>,
+    /// [`read_chequebook_issuer`]: bee only accepts cheques signed by
+    /// this EOA.
+    pub issuer: Result<[u8; 20], ChequebookError>,
+}
+
+/// Whether a node signing with a given key may use a chequebook, per
+/// [`ChequebookChecks::verdict`].
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChequebookVerdict {
+    /// Every check that could be read passed.
+    Usable,
+    /// The Swarm chequebook factory doesn't know it.
+    NotRegistered,
+    /// Its on-chain `issuer()` is this other EOA, not the signer.
+    IssuerMismatch([u8; 20]),
+}
+
+#[cfg(feature = "chain-rpc")]
+impl ChequebookChecks {
+    /// The shared rule for `antd` and `ant-ffi`: a check that answered
+    /// "no" disqualifies the chequebook, while a check whose read
+    /// *failed* is skipped rather than failed. Unverified is not bad, and
+    /// dropping settlement over an RPC hiccup stalls uploads. `antd`
+    /// lets `--chequebook-allow-unverified` override a disqualification.
+    #[must_use]
+    pub fn verdict(&self, signer: &[u8; 20]) -> ChequebookVerdict {
+        if matches!(self.registered, Ok(false)) {
+            return ChequebookVerdict::NotRegistered;
+        }
+        match self.issuer {
+            Ok(issuer) if issuer != *signer => ChequebookVerdict::IssuerMismatch(issuer),
+            _ => ChequebookVerdict::Usable,
+        }
+    }
+}
+
+/// Run both chequebook checks against the chain: factory registration
+/// and `issuer()`. Shared by `antd` (every chequebook it adopts at
+/// startup) and `ant-ffi` (a persisted chequebook before enabling
+/// settlement), so the two can't disagree on what makes a chequebook
+/// unusable.
+#[cfg(feature = "chain-rpc")]
+pub async fn check_chequebook(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> ChequebookChecks {
+    ChequebookChecks {
+        registered: verify_chequebook_with_factory(client, chequebook).await,
+        issuer: read_chequebook_issuer(client, chequebook).await,
+    }
+}
+
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
 /// gas paid by `wallet`), persist the association at `persist_path`,
 /// then optionally fund it with up to `deposit_plur` xBZZ (capped to
@@ -411,5 +473,44 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_persisted_chequebook_for(&path, &[0x22u8; 20]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    #[test]
+    fn chequebook_verdict_disqualifies_only_on_a_read_no() {
+        let signer = [0x0au8; 20];
+        let failed = || ChequebookError::Chain("backend unavailable".into());
+        let checks = |registered, issuer| ChequebookChecks { registered, issuer };
+
+        assert_eq!(
+            checks(Ok(true), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(false), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        assert_eq!(
+            checks(Ok(true), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::IssuerMismatch([0x5e; 20])
+        );
+        // Not registered wins over a mismatch: it's the first thing bee checks.
+        assert_eq!(
+            checks(Ok(false), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        // A read that failed is skipped, never a disqualification.
+        assert_eq!(
+            checks(Err(failed()), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(true), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Err(failed()), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
     }
 }

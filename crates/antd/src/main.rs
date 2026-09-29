@@ -2019,9 +2019,12 @@ async fn verify_then_build_swap(
 ) -> Option<ant_p2p::PushsyncSwapConfig> {
     if let Some(rpc) = rpc_url {
         let client = ant_chain::ChainClient::new(rpc);
-        match ant_chain::chequebook_store::verify_chequebook_with_factory(&client, &chequebook)
-            .await
-        {
+        // Both reads come from the shared helper `ant-ffi` uses too; the
+        // arms below report each check separately and apply the same
+        // rule as `ChequebookChecks::verdict` ("no" disqualifies, a
+        // failed read is skipped), plus `--chequebook-allow-unverified`.
+        let checks = ant_chain::chequebook_store::check_chequebook(&client, &chequebook).await;
+        match &checks.registered {
             Ok(true) => tracing::info!(
                 target: "antd",
                 chequebook = %format!("0x{}", hex::encode(chequebook)),
@@ -2070,7 +2073,7 @@ async fn verify_then_build_swap(
             }
         };
         if let Some(swap_eoa) = swap_eoa {
-            match ant_chain::chequebook_store::read_chequebook_issuer(&client, &chequebook).await {
+            match checks.issuer {
                 Ok(issuer) if issuer == swap_eoa => tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(chequebook)),
