@@ -100,6 +100,13 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 - **Deposit top-up:** antd now tops an antd-managed chequebook back up to the target at startup and after every gateway buy, through the shared `top_up_chequebook` that ant-ffi uses on every buy too. Before this, antd never topped up. This matters for Freedom's setup order (xDAI, light mode, then xBZZ): the chequebook is deployed before the wallet holds any xBZZ, so it starts at zero.
 - **Live chequebook address:** `ant_gateway::ChequebookSlot` is shared by the chain context and the writer. A chequebook set up after startup (a buy-triggered deploy, or ant-ffi's gateway-start adoption) shows in `/chequebook/*` and `/wallet`, and can receive `POST /chequebook/deposit`, without a restart, in both entry points.
 
+**Done in the xDAI funding follow-up (`feat/xdai-storage-funding`, stacked on the settlement follow-up):**
+
+- **Storage funding is shared.** AntDrive's xDAI-only flow (price a plan against the node wallet, swap the missing xBZZ through the `BzzSwapHelper`, buy; the same for extending or resizing a batch and for the chequebook deposit) moves from ant-ffi's `drive.rs` into `ant_chain::funding`. ant-ffi's C functions keep their JSON and call it; so does the gateway's chain writer, which serves new ant-specific routes on both entry points: `GET /v0/storage/quote`, `POST /v0/storage/buy`, `POST /v0/storage/extend`, `GET`/`POST /v0/settlement/deposit` (R13).
+- **One on-chain write at a time.** Every gateway write route answers `409` while another runs (a `WriteGate` on the chain context), and `ant-chain` serialises every transaction a key signs, process-wide, from the nonce read to the receipt (R14).
+- **Immutable by default.** `POST /stamps` reads bee-js's `immutable` header as well as the query and defaults to immutable, like bee; `POST /v0/storage/buy` does too.
+- **Guard:** `ant_chain::funding` is an orchestration module. antd's side counts the gateway's chain writer (`ant-gateway/src/chainreader.rs`), which its HTTP routes run through. `top_up_batch` is listed as antd-only: bee's `PATCH /stamps/topup` pays in xBZZ, and the C API only extends with xDAI.
+
 **Deferred:**
 
 - F6 (fd limit: measure on a device first).
@@ -161,6 +168,8 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
 | R10 | Readiness / health | `ant-gateway/src/status.rs:43-113` | `/health.chainReady` flips late; `/node` answers 503 until then | preset, so `/node` is ready immediately; `light_mode` is whatever the host passes | **shared** handlers, **ported** wiring | n/a |
 | R11 | `/stamps` chain enrichment | `ant-gateway/src/stamps.rs:208-232` | yes (the read fallback also gives ultra-light nodes a real TTL) | only when `gnosis_rpc` is set | **shared** | #97 adds `exists:false` / `usable:false` for batches confirmed missing on-chain |
 | R12 | Gateway activity registry shared with the node (`antop` Retrieval tab) | `with_gateway_activity` (`antd:566`, `661`, `709`) | standalone `GatewayActivity::new()`; the node never reads it (`ffi-gw:242-244`) | **n/a** | No `antop` on mobile |
+| R13 | xDAI storage funding: quote, buy, extend or resize, chequebook deposit | `ant-chain/src/funding.rs` | the gateway's `/v0/storage/*`, `/v0/settlement/deposit` (`ant-gateway/src/chain.rs`, `chainreader.rs`); the deposit is priced in unless `--no-auto-chequebook` or a manual `--chequebook` | the same routes on `ant_start_gateway`, plus `ant_storage_quote`, `ant_storage_buy_xdai`, `ant_storage_topup_*`, `ant_storage_settlement_*` (`drive.rs`) | **shared** (after `feat/xdai-storage-funding`) | — |
+| R14 | Write serialisation | `WriteGate` (`ant-gateway/src/chain.rs`); per-key `sender_lock` (`ant-chain/src/tx.rs`) | gateway writes answer `409` while one runs; every transaction takes the key's lock | the same gateway; the C API and the background settlement take the key's lock | **shared** | — |
 
 ### 2.3 Configuration surface
 
