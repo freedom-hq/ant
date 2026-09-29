@@ -446,8 +446,10 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * deposit to the chequebook. The explicit top-up path — a chequebook's
  * deposit is only read at deploy time, so an already-deployed one can be
  * funded no other way. Idempotent (a chequebook at the target is a
- * no-op); errors when this account has no chequebook yet or its
- * chequebook failed the chain check (never funds that one). Returns the
+ * no-op); errors when this account has no chequebook yet, when its
+ * chequebook fails the chain checks (factory registration, issuer())
+ * this call runs before spending — it never funds that one — or when
+ * those checks can't be read (retry; nothing spent). Returns the
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.
