@@ -37,14 +37,6 @@ const AGENT: &str = concat!("antd/", env!("CARGO_PKG_VERSION"));
 /// agnostic and can be reused in other embedders.
 const BEE_API_VERSION: &str = "7.2.0";
 
-/// Default BZZ deposit for an auto-deployed chequebook, in PLUR
-/// (1 BZZ = 1e16 PLUR). 0.1 BZZ is a modest float that lets the
-/// chequebook honour the first wave of cashed cheques without
-/// draining a thin wallet of the BZZ it also needs for postage; the
-/// actual transfer is capped to the wallet's BZZ balance, so this is
-/// an upper bound, not a hard requirement.
-const DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR: u128 = 1_000_000_000_000_000;
-
 #[derive(Parser, Debug)]
 #[command(name = "antd", version, about = "Ant Swarm light node (M1.0)")]
 struct Opt {
@@ -299,21 +291,28 @@ struct Opt {
     /// funds it with `--chequebook-deposit-plur` xBZZ, and persists
     /// the association at `<data-dir>/chequebook.json` so subsequent
     /// starts reuse it (deploy-once, reuse-forever — same shape as
-    /// bee's statestore). Pass this to opt out and run without
-    /// outbound SWAP settlement until you supply a chequebook
-    /// manually.
+    /// bee's statestore). Pass this to opt out of all automatic
+    /// chequebook spending, the deploy and the deposit top-up alike,
+    /// and run without outbound SWAP settlement until you supply a
+    /// chequebook manually.
     #[arg(long, default_value_t = false)]
     no_auto_chequebook: bool,
 
-    /// BZZ to deposit into an auto-deployed chequebook, in PLUR
-    /// (1 BZZ = 1e16 PLUR). Capped to the node wallet's BZZ balance
-    /// so a thin wallet still gets a (smaller, or zero) deposit
-    /// rather than a failed transfer — a factory-registered but
-    /// unfunded chequebook already unblocks uploads (bee accepts the
-    /// cheque; cashing waits for a later deposit). Ignored when a
-    /// chequebook is supplied manually or reloaded from disk. Falls
-    /// back to `CHEQUEBOOK_DEPOSIT_PLUR` env.
-    #[arg(long, env = "CHEQUEBOOK_DEPOSIT_PLUR", default_value_t = DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR)]
+    /// Target xBZZ deposit behind the node's chequebook, in PLUR
+    /// (1 BZZ = 1e16 PLUR). A freshly deployed chequebook is funded
+    /// with it, and an adopted one (reloaded from disk or rediscovered
+    /// on-chain) is topped back up to it. Never withdrawn from; capped
+    /// to the node wallet's xBZZ, so a thin wallet gives a smaller (or
+    /// zero) deposit rather than a failed transfer. Default 0.001 xBZZ,
+    /// shared with `ant-ffi`
+    /// (`ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`).
+    /// Ignored for a manually supplied chequebook. Falls back to
+    /// `CHEQUEBOOK_DEPOSIT_PLUR` env.
+    #[arg(
+        long,
+        env = "CHEQUEBOOK_DEPOSIT_PLUR",
+        default_value_t = ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR
+    )]
     chequebook_deposit_plur: u128,
 }
 
@@ -1842,6 +1841,16 @@ async fn resolve_chequebook(
             &ledger_path,
         )
         .await;
+        if pushsync.is_some() {
+            top_up_adopted_chequebook(
+                opt,
+                rpc_url.as_deref(),
+                signing_secret,
+                &node_eth,
+                persisted,
+            )
+            .await;
+        }
         return Ok(ResolvedChequebook {
             address: Some(persisted),
             pushsync,
@@ -1894,6 +1903,16 @@ async fn resolve_chequebook(
                     &ledger_path,
                 )
                 .await;
+                if pushsync.is_some() {
+                    top_up_adopted_chequebook(
+                        opt,
+                        rpc_url.as_deref(),
+                        signing_secret,
+                        &node_eth,
+                        cb,
+                    )
+                    .await;
+                }
                 return Ok(ResolvedChequebook {
                     address: Some(cb),
                     pushsync,
@@ -2005,6 +2024,69 @@ async fn resolve_chequebook(
                 pushsync: None,
             })
         }
+    }
+}
+
+/// Top an adopted chequebook's deposit back up to
+/// `--chequebook-deposit-plur` from the node wallet, via the shared
+/// `top_up_chequebook` that `ant-ffi` uses too. A chequebook reloaded
+/// from disk or rediscovered on-chain can hold less than the target, or
+/// nothing at all. One that backs nothing stalls uploads once peers stop
+/// extending credit (#73). Best-effort; needs an RPC; skipped under
+/// `--no-auto-chequebook`, which opts out of all automatic chequebook
+/// spending.
+async fn top_up_adopted_chequebook(
+    opt: &Opt,
+    rpc_url: Option<&str>,
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    node_eth: &[u8; 20],
+    chequebook: [u8; 20],
+) {
+    use ant_chain::chequebook_store::{top_up_chequebook, TopUp};
+
+    if opt.no_auto_chequebook {
+        return;
+    }
+    let Some(rpc) = rpc_url else {
+        return;
+    };
+    let wallet = match ant_chain::tx::Wallet::new(signing_secret, ant_chain::tx::GNOSIS_CHAIN_ID) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(target: "antd", "chequebook deposit top-up skipped (wallet): {e:#}");
+            return;
+        }
+    };
+    let client = ant_chain::ChainClient::new(rpc);
+    match top_up_chequebook(
+        &client,
+        &wallet,
+        node_eth,
+        &chequebook,
+        opt.chequebook_deposit_plur,
+    )
+    .await
+    {
+        Ok(TopUp::NotNeeded) => {}
+        Ok(TopUp::Funded { amount, tx }) => tracing::info!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            deposit_plur = amount,
+            tx = %format!("0x{}", hex::encode(tx)),
+            "topped the chequebook's settlement deposit back up",
+        ),
+        Ok(TopUp::WalletEmpty { shortfall }) => tracing::warn!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            shortfall_plur = shortfall,
+            "chequebook deposit is below target and the node wallet has no xBZZ to top it up; \
+             uploads stall once peers stop extending credit",
+        ),
+        Err(e) => tracing::warn!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            "chequebook deposit top-up failed: {e}",
+        ),
     }
 }
 
