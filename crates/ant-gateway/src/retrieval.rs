@@ -905,7 +905,18 @@ pub async fn upload_pss(
     }
 
     // Parse targets: comma-separated hex prefixes, all the same length,
-    // 1..=3 bytes each (bee's API cap).
+    // 1..=3 bytes each (bee's API cap). 1-byte targets are accepted for
+    // bee compatibility but deliver unreliably on mainnet: an 8-bit prefix
+    // is shallower than storage depth `d`, so the trojan lands in the
+    // target's neighbourhood only with probability 2^-(d-8) (~1/4 at
+    // d = 10), and ant's lurker receives even fewer: only a trojan that
+    // agrees with the target past bit `b_p` of a covering peer sits in
+    // bin `b_p`, the bin the lurker pulls anyway (~2^-(b_p-7), ~1/64 at
+    // b_p = 13). One with d <= PO(c, target) <= b_p is stored in the
+    // neighbourhood but filed under a bin the lurker does not pull. The
+    // lurker does not pull the extra `8 + Geom` bins a full 1-byte
+    // cover would need — see `PSS_MINED_PREFIX_BITS` in ant-p2p's
+    // lurker.
     let mut targets: Vec<Vec<u8>> = Vec::new();
     for t in targets_str.split(',') {
         let t = t.trim();
