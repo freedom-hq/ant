@@ -386,6 +386,14 @@ struct PublisherState {
     /// and treating that instant as "drained" would end the broadcast
     /// with its last segments never reaching a playlist.
     pump_finished: bool,
+    /// Set by the pump, under the same lock as its "backlog is empty"
+    /// observation, once the run is cancelled and it will pop no more.
+    /// [`LiveRun::push`] refuses from then on. Distinct from
+    /// `pump_finished` (which additionally waits for in-flight uploads):
+    /// closing intake only once uploads had drained left a window in
+    /// which a push that raced `cancel()` was accepted as `Queued` and
+    /// then swept up as dropped instead of published.
+    intake_closed: bool,
     /// Next sequence the committer will fold into the playlist.
     next_commit: u64,
     /// Next sequence [`LiveRun::push`] hands out.
@@ -773,18 +781,30 @@ impl LiveRun {
         if self.cancel.load(Ordering::SeqCst) {
             return PushOutcome::Closed;
         }
+        self.enqueue(kind, data, duration_ms, discontinuity)
+    }
+
+    /// [`Self::push`] past its cancel check. Split out so tests can
+    /// drive the push that raced `cancel()` deterministically.
+    fn enqueue(
+        &self,
+        kind: SegmentKind,
+        data: Vec<u8>,
+        duration_ms: u32,
+        discontinuity: bool,
+    ) -> PushOutcome {
         let mut dropped_oldest = false;
         {
             let mut state = lock(&self.state);
             // `cancel()` can land between the check above and this lock.
-            // Once the pump has done its final sweep nothing will ever
-            // pop `pending` again, so enqueueing now would orphan the
-            // segment — reported queued, but never published, failed or
-            // dropped. The sweep and `pump_finished` are set under this
-            // same lock, so the race has exactly two outcomes: enqueue
-            // before the sweep (and be swept up as dropped) or observe
-            // the flag here and refuse.
-            if state.pump_finished {
+            // Once the pump has closed intake nothing will ever pop
+            // `pending` again, so enqueueing now would orphan the
+            // segment. The pump closes intake under this same lock, in
+            // the same critical section where it sees `pending` empty,
+            // so the race has exactly two outcomes: enqueue before that
+            // (and the pump pops and publishes it, as stop promises) or
+            // observe the flag here and refuse.
+            if state.intake_closed {
                 return PushOutcome::Closed;
             }
             let seq = state.next_seq;
@@ -1017,6 +1037,7 @@ pub fn start(
         push_notify,
         commit_notify,
         status_rx,
+        manifest_task: Mutex::new(None),
     });
     runtime.spawn(async move { drive(ctx).await });
     Ok(run)
@@ -1034,9 +1055,27 @@ struct RunCtx {
     push_notify: Arc<Notify>,
     commit_notify: Arc<Notify>,
     status_rx: Option<watch::Receiver<StatusSnapshot>>,
+    /// The one channel-manifest attempt that may be running (start-time
+    /// or a committer retry). Kept here rather than detached so
+    /// [`drive`] can join it before marking the run finished: a
+    /// reference that lands after the final report would be lost to
+    /// the host, and it is the only shareable one.
+    manifest_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl RunCtx {
+    /// Start a channel-manifest attempt unless one is already running.
+    fn spawn_channel_manifest(self: &Arc<Self>) {
+        let mut slot = lock(&self.manifest_task);
+        if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let ctx = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            ensure_channel_manifest(&ctx).await;
+        }));
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
@@ -1057,16 +1096,20 @@ async fn drive(ctx: Arc<RunCtx>) {
     // waiting for a reference nobody has been given yet. It is
     // best-effort for the same reason — the feed updates are what carry
     // the stream — and the committer retries it until it lands.
-    let manifest = {
-        let ctx = Arc::clone(&ctx);
-        tokio::spawn(async move { ensure_channel_manifest(&ctx).await })
-    };
+    ctx.spawn_channel_manifest();
 
     let pump = tokio::spawn(pump(Arc::clone(&ctx)));
     let committer = tokio::spawn(commit_loop(Arc::clone(&ctx)));
     let _ = pump.await;
     let _ = committer.await;
-    manifest.abort();
+    // Join, don't abort, the manifest attempt still on the wire: it ran
+    // alongside the drain, so this rarely waits, and a reference that
+    // lands after `finished` would be missing from the final report. The
+    // committer has exited, so no new attempt can be spawned behind it.
+    let manifest = lock(&ctx.manifest_task).take();
+    if let Some(manifest) = manifest {
+        let _ = manifest.await;
+    }
 
     if let Some(sampler) = sampler {
         sampler.abort();
@@ -1114,11 +1157,20 @@ async fn pump(ctx: Arc<RunCtx>) {
         let notified = ctx.push_notify.notified();
         tokio::pin!(notified);
 
-        let next = lock(&ctx.state).pending.pop_front();
-        let Some(pending) = next else {
-            if ctx.cancelled() {
+        let next = {
+            let mut state = lock(&ctx.state);
+            let next = state.pending.pop_front();
+            if next.is_none() && ctx.cancelled() {
+                // Close intake atomically with seeing the backlog
+                // empty: every push accepted before this point is in
+                // `pending` and has been popped for publishing; every
+                // later one observes the flag and is refused.
+                state.intake_closed = true;
                 break;
             }
+            next
+        };
+        let Some(pending) = next else {
             notified.await;
             continue;
         };
@@ -1138,22 +1190,11 @@ async fn pump(ctx: Arc<RunCtx>) {
     }
     // The pump is the only producer of commit work; publish that it is
     // done and wake the committer so it can fold in the final segments
-    // and close the playlist.
-    //
-    // The sweep and the flag are one critical section: a `push` that
-    // raced `cancel()` past its entry check either enqueued before this
-    // lock (its segment is swept up as dropped here, with the committer
-    // still waiting on `done`) or acquires the lock after it, observes
-    // `pump_finished`, and refuses — so no segment can sit in `pending`
-    // with nobody left to pop it.
+    // and close the playlist. Intake closed with `pending` empty, so
+    // there is nothing left to sweep.
     {
         let mut state = lock(&ctx.state);
-        while let Some(victim) = state.pending.pop_front() {
-            if victim.kind == SegmentKind::Media {
-                state.segments_dropped += 1;
-            }
-            state.done.insert(victim.seq, Committed::Dropped);
-        }
+        debug_assert!(state.pending.is_empty());
         state.pump_finished = true;
     }
     ctx.commit_notify.notify_one();
@@ -1315,11 +1356,13 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
     // ends up with a shareable reference — but *spawned*, never awaited:
     // this runs on the committer, and a `POST /feeds` hanging on its
     // 60 s deadline must not stall the playlist and feed updates for
-    // segments that already landed. `channel_manifest_in_flight` keeps
-    // it to one attempt at a time, same as at start.
-    if lock(&ctx.state).channel_reference.is_none() {
-        let ctx = Arc::clone(ctx);
-        tokio::spawn(async move { ensure_channel_manifest(&ctx).await });
+    // segments that already landed. One attempt at a time, and `drive`
+    // joins it before the run reports finished, so its reference lands
+    // in the final report. Not after the closing playlist: a fresh
+    // attempt there would add a whole publish deadline to stop's drain
+    // (an attempt already in flight is still joined).
+    if !endlist && lock(&ctx.state).channel_reference.is_none() {
+        ctx.spawn_channel_manifest();
     }
 }
 
@@ -1924,6 +1967,10 @@ mod tests {
         /// Refuse every feed update from now on, the segments
         /// themselves still uploading fine.
         fail_soc: bool,
+        /// Refuse this many `POST /feeds` before accepting one.
+        fail_feeds: u32,
+        /// Extra latency on `POST /feeds` only.
+        feeds_delay: Duration,
     }
 
     /// A gateway stub that answers bee-shaped `{"reference":...}` to
@@ -1967,13 +2014,27 @@ mod tests {
                                     headers: lines.map(str::to_string).collect(),
                                     body: raw[split + 4..split + 4 + want].to_vec(),
                                 };
-                                let fail = {
+                                let is_feeds = request.method_path.contains("/feeds/");
+                                let (fail, feeds_delay) = {
                                     let mut slot = lock(&log);
                                     slot.seen.push(request.clone());
-                                    (slot.fail_bzz && request.method_path.contains("/bzz"))
-                                        || (slot.fail_soc && request.method_path.contains("/soc/"))
+                                    let fail_feeds = is_feeds && slot.fail_feeds > 0;
+                                    if fail_feeds {
+                                        slot.fail_feeds -= 1;
+                                    }
+                                    let fail = fail_feeds
+                                        || (slot.fail_bzz && request.method_path.contains("/bzz"))
+                                        || (slot.fail_soc && request.method_path.contains("/soc/"));
+                                    (
+                                        fail,
+                                        if is_feeds {
+                                            slot.feeds_delay
+                                        } else {
+                                            Duration::ZERO
+                                        },
+                                    )
                                 };
-                                tokio::time::sleep(delay).await;
+                                tokio::time::sleep(delay + feeds_delay).await;
                                 let response = if fail {
                                     let body = br#"{"message":"batch not usable"}"#;
                                     let mut r = format!(
@@ -2365,5 +2426,104 @@ mod tests {
         );
         settle(&run).await;
         assert_eq!(run.report().segments_pushed, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_racing_stop_is_published_or_refused_never_queued_then_dropped() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        // Slow enough that the first segment is still uploading when the
+        // pump sees the cancel and starts draining in-flight work.
+        let addr = stub_gateway(log, Duration::from_millis(300)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        run.cancel();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // The push that passed its cancel check just before `cancel()`
+        // and takes the lock only now, while uploads still drain.
+        let outcome = run.enqueue(SegmentKind::Media, vec![2u8; 4096], 2000, false);
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.segments_dropped, 0, "{outcome:?} {report:?}");
+        match outcome {
+            PushOutcome::Closed => assert_eq!(report.segments_published, 1, "{report:?}"),
+            PushOutcome::Queued => assert_eq!(report.segments_published, 2, "{report:?}"),
+            PushOutcome::QueuedDroppingOldest => panic!("unexpected {outcome:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_channel_manifest_lands_in_the_final_report() {
+        let log = Arc::new(Mutex::new(StubLog {
+            feeds_delay: Duration::from_millis(600),
+            ..StubLog::default()
+        }));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        run.cancel();
+        settle(&run).await;
+        assert!(
+            !run.report().channel_reference.is_empty(),
+            "manifest still in flight at stop must be joined, not lost",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retried_channel_manifest_lands_in_the_final_report() {
+        // The start-time `POST /feeds` fails; the committer's retry is
+        // still on the wire when the broadcast is stopped.
+        let log = Arc::new(Mutex::new(StubLog {
+            fail_feeds: 1,
+            feeds_delay: Duration::from_millis(400),
+            ..StubLog::default()
+        }));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        // Let the failing start-time attempt finish before the first
+        // playlist, so the playlist spawns the retry.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        let feeds = lock(&log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.contains("/feeds/"))
+            .count();
+        assert!(feeds >= 2, "retry never fired ({feeds} POST /feeds)");
+        assert!(!report.channel_reference.is_empty(), "{report:?}");
     }
 }

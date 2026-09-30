@@ -2103,11 +2103,6 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
     }
 }
 
-/// Push `chunks` to the network in parallel via `PushChunk` control
-/// commands. Bounded by `MAX_PUSH_CONCURRENCY` so a 1 K-chunk file
-/// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
-/// HTTP error response on the first chunk that fails to push.
-#[allow(clippy::result_large_err)]
 /// Map a node-side upload failure onto bee's HTTP status.
 ///
 /// One function for every write endpoint that dispatches a `PushChunk`
@@ -2146,6 +2141,10 @@ pub(crate) fn upload_error_status(message: &str) -> StatusCode {
     }
 }
 
+/// Push `chunks` to the network in parallel via `PushChunk` control
+/// commands. Bounded by `MAX_PUSH_CONCURRENCY` so a 1 K-chunk file
+/// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
+/// HTTP error response on the first chunk that fails to push.
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn push_chunks(
     handle: &GatewayHandle,
