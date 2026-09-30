@@ -73,6 +73,37 @@ Stamps are bought **only** through the gateway: `POST /stamps/{amount}/{depth}` 
 - The peerstore is not flushed on antd SIGTERM or `ant_shutdown`.
 - ant-ffi's malformed-`chequebook.json` handling contradicts its own comments.
 
+### 1.1 Status after the parity catch-up (`fix/ffi-parity-catchup`)
+
+The matrix below describes `75d7328`. The catch-up branch, stacked on #97, changes it as follows.
+
+**Done:**
+
+| Item | What changed |
+|---|---|
+| F1 / F2 | `ant_start_gateway` runs `ChainInit`: the #97 check, rediscovery of owned batches (once per handle), and adopting the persisted or on-chain chequebook to switch settlement on. It neither deploys nor funds. The host's `ant_storage_discover` call becomes redundant but stays harmless. |
+| F3 (ant-ffi) | `GatewayHandle::on_batch_bought`; ant-ffi wires it to `ensure_settlement`, so the first gateway buy gets a chequebook and settlement. |
+| F4 | `chequebook_store::check_chequebook` + `ChequebookChecks::verdict`, shared. antd's logs are unchanged; `issuer()` is only read when its answer is reported (`IssuerRead`). ant-ffi checks a persisted chequebook before enabling it; the one `ant_init` enabled unchecked (no RPC at init) is switched off again (`DisablePushsyncSwap`) if the check disqualifies it. A factory "no" for a chequebook whose recorded deploy tx a lagging backend hasn't served yet is not a disqualification. |
+| F5 | `ant_deploy_chequebook` switches settlement on. |
+| Chequebook setup | All settlement paths go through one locked routine (`setup_settlement`), so overlapping paths can't deploy twice. |
+| S20 / S5 (antd) | antd uses the owner-checked chequebook loader. The path-trusting one is removed. |
+| Corrupt `chequebook.json` | Resolved by on-chain rediscovery instead of erroring forever. When the scan finds nothing, no chequebook is deployed (the record may name a deposit-0 one the scan can't see); the user fixes or removes the file. |
+| `--network-id` | Now reaches the swarm (`NodeConfig::with_network_id`). |
+| Peerstore | Flushed when the swarm loop is dropped, so both antd's SIGTERM and `ant_shutdown` save it. The JNI `nativeShutdown` now joins the runtime like `ant_shutdown` (it used `shutdown_background`), so the flush lands before it returns. |
+| Cleanups | The ignored-config-keys log, the `ant_settlement_*` doc drift, and the dead `default_backoff` are fixed. |
+| Guard (§7) | The AGENTS.md rule and the `parity_guard` test are in, with an empty allowlist. |
+
+**Open, needs a decision:**
+
+- **F3 (antd):** should a desktop gateway buy deploy a chequebook at runtime? antd passes `on_batch_bought: None` for now.
+- **Deposit size:** the plan is to unify the two amounts; the value isn't chosen yet.
+
+**Deferred:**
+
+- F6 (fd limit: measure on a device first).
+- F7 (check whether freedom-mobile-ffi composes `log_layer()`).
+- antd `Resume` trigger, antd host chain transport, and porting `bind_account_state` to antd.
+
 ---
 
 ## 2. Parity matrix

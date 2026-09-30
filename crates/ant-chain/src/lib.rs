@@ -95,7 +95,9 @@ pub const GNOSIS_BZZ_WXDAI_POOL: &str = "0x7583b9C573FA4FB5Ea21C83454939c4Cf6aac
 /// a constant, pre-computable address.
 pub const CREATE2_DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 
+/// Cheap to clone: the HTTP client and the transport are shared handles.
 #[cfg(feature = "chain-rpc")]
+#[derive(Clone)]
 pub struct ChainClient {
     url: String,
     http: reqwest::Client,

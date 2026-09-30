@@ -343,7 +343,7 @@ async fn main() -> Result<()> {
         Ok(o) => o,
         Err(e) => e.exit(),
     };
-    let resolved_password = apply_config_file(&mut opt, &matches)?;
+    let (resolved_password, ignored_config_keys) = apply_config_file(&mut opt, &matches)?;
     validate_cors_origins(&opt.cors_allowed_origins)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
@@ -354,6 +354,16 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&opt.log_level)),
         )
         .init();
+    // Logged only now: the config merge above runs before the subscriber
+    // exists (it decides the log level), so anything it logged was lost.
+    if !ignored_config_keys.is_empty() {
+        tracing::debug!(
+            target: "antd",
+            "ignoring {} unmodelled bee config key(s): {}",
+            ignored_config_keys.len(),
+            ignored_config_keys.join(", "),
+        );
+    }
 
     // Held for the lifetime of the daemon: dropping the `File` releases the
     // advisory `flock`. Bound at function scope (not in a helper) so it stays
@@ -654,6 +664,10 @@ async fn main() -> Result<()> {
     let (late_chain_tx, late_chain_rx) = mpsc::channel::<ant_node::LateChainInit>(1);
     let mut node_task = tokio::spawn(run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
+            // `--network-id` / config `network-id`: the overlay logged and
+            // reported above was derived from it, so the swarm must use the
+            // same value or its handshake overlay won't match.
+            .with_network_id(opt.network_id)
             .with_status(status_tx)
             .with_process_start(process_start)
             .with_external_addrs(external_addrs)
@@ -720,6 +734,11 @@ async fn main() -> Result<()> {
             // ACT publisher identity = the node's swarm key, exactly
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
+            // Not wired yet: antd resolves (or auto-deploys) its
+            // chequebook once, at startup. Whether a gateway buy may
+            // deploy one at runtime is an open question (see
+            // docs/ffi-parity-audit.md, F3).
+            on_batch_bought: None,
         };
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };
@@ -1154,13 +1173,18 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
 
 /// Load `--config` (if given), merging its values into `opt` for every
 /// setting the operator did **not** pass on the command line. Returns
-/// the resolved keystore password (from `--password` / `--password-file`
+/// the config keys it doesn't model (for the caller to log once the
+/// tracing subscriber exists) and the resolved keystore password (from
+/// `--password` / `--password-file`
 /// or the config's `password` / `password-file`), if any.
 ///
 /// CLI > config file > default — the same precedence bee uses, so a
 /// Freedom-written config behaves predictably while an operator can
 /// still override one knob on the command line.
-fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option<String>> {
+fn apply_config_file(
+    opt: &mut Opt,
+    matches: &clap::ArgMatches,
+) -> Result<(Option<String>, Vec<String>)> {
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     // CLI password flags take precedence; fall back to the config file
@@ -1205,31 +1229,26 @@ fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option
                 opt.log_level = level;
             }
         }
-        let ignored = cfg.extra.len();
-        if ignored > 0 {
-            let keys: Vec<&str> = cfg.extra.keys().map(String::as_str).collect();
-            tracing::debug!(
-                target: "antd",
-                "ignoring {ignored} unmodelled bee config key(s): {}",
-                keys.join(", "),
-            );
-        }
     }
+    let ignored_keys: Vec<String> = cfg
+        .as_ref()
+        .map(|c| c.extra.keys().cloned().collect())
+        .unwrap_or_default();
 
     // Resolve the password: CLI flag wins, then CLI password-file, then
     // the config file's `password` / `password-file`.
-    if let Some(p) = cli_password {
-        return Ok(Some(p));
-    }
-    if let Some(file) = cli_password_file {
+    let password = if let Some(p) = cli_password {
+        Some(p)
+    } else if let Some(file) = cli_password_file {
         let raw = std::fs::read_to_string(&file)
             .with_context(|| format!("read --password-file {}", file.display()))?;
-        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_string()));
-    }
-    if let Some(cfg) = &cfg {
-        return cfg.resolve_password();
-    }
-    Ok(None)
+        Some(raw.trim_end_matches(['\n', '\r']).to_string())
+    } else if let Some(cfg) = &cfg {
+        cfg.resolve_password()?
+    } else {
+        None
+    };
+    Ok((password, ignored_keys))
 }
 
 /// Load the node identity from a bee Web3 v3 keystore at
@@ -1825,8 +1844,15 @@ async fn resolve_chequebook(
         }
     }
 
-    // 2. Persisted auto-deployed chequebook — reuse forever.
-    if let Some(persisted) = ant_chain::chequebook_store::load_persisted_chequebook(&persist_path)?
+    // 2. Persisted auto-deployed chequebook — reuse forever, but only if
+    //    it was issued by *this* node key. A record left behind when the
+    //    key changed under the same data dir (e.g. Freedom swapped
+    //    `keys/swarm.key`) would have us sign cheques every peer drops;
+    //    it reads as "none" (with a warning) so we rediscover or deploy
+    //    our own below. The old account's chequebook stays rediscoverable
+    //    on-chain from its key. Same loader `ant-ffi` uses.
+    if let Some(persisted) =
+        ant_chain::chequebook_store::load_persisted_chequebook_for(&persist_path, &node_eth)?
     {
         tracing::info!(
             target: "antd",
@@ -2024,9 +2050,40 @@ async fn verify_then_build_swap(
 ) -> Option<ant_p2p::PushsyncSwapConfig> {
     if let Some(rpc) = rpc_url {
         let client = ant_chain::ChainClient::new(rpc);
-        match ant_chain::chequebook_store::verify_chequebook_with_factory(&client, &chequebook)
-            .await
-        {
+        // Issuer-match check (Fix 4). bee accepts a cheque only when its
+        // signer matches the chequebook's on-chain `issuer()`; a node
+        // whose cheque-signing key differs emits cheques every peer
+        // silently drops, leaving uploads on pseudosettle credit only.
+        // Verify it before enabling outbound SWAP rather than discover
+        // it as a settlement stall under load. Derived up front so the
+        // `issuer()` read is skipped when there's nothing to compare.
+        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
+            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    error = %e,
+                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
+                );
+                None
+            }
+        };
+        // Both reads come from the shared helper `ant-ffi` uses too; the
+        // arms below report each check separately and apply the same
+        // rule as `ChequebookChecks::verdict` ("no" disqualifies, a
+        // failed read is skipped), plus `--chequebook-allow-unverified`.
+        // `issuer()` is only read when its answer is reported: not
+        // without a signing EOA, and not after a factory "no" that
+        // already disables settlement (with the override on, both
+        // checks are still reported).
+        let issuer_read = match (swap_eoa, allow_unverified) {
+            (None, _) => ant_chain::chequebook_store::IssuerRead::Never,
+            (Some(_), true) => ant_chain::chequebook_store::IssuerRead::Always,
+            (Some(_), false) => ant_chain::chequebook_store::IssuerRead::UnlessUnregistered,
+        };
+        let checks =
+            ant_chain::chequebook_store::check_chequebook(&client, &chequebook, issuer_read).await;
+        match &checks.registered {
             Ok(true) => tracing::info!(
                 target: "antd",
                 chequebook = %format!("0x{}", hex::encode(chequebook)),
@@ -2057,25 +2114,8 @@ async fn verify_then_build_swap(
             ),
         }
 
-        // Issuer-match check (Fix 4). bee accepts a cheque only when its
-        // signer matches the chequebook's on-chain `issuer()`; a node
-        // whose cheque-signing key differs emits cheques every peer
-        // silently drops, leaving uploads on pseudosettle credit only.
-        // Verify it before enabling outbound SWAP rather than discover
-        // it as a settlement stall under load.
-        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
-            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
-            Err(e) => {
-                tracing::warn!(
-                    target: "antd",
-                    error = %e,
-                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
-                );
-                None
-            }
-        };
-        if let Some(swap_eoa) = swap_eoa {
-            match ant_chain::chequebook_store::read_chequebook_issuer(&client, &chequebook).await {
+        if let (Some(swap_eoa), Some(issuer)) = (swap_eoa, checks.issuer) {
+            match issuer {
                 Ok(issuer) if issuer == swap_eoa => tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(chequebook)),

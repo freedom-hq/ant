@@ -11,7 +11,7 @@
 //! `ant_p2p::PushsyncSwapConfig` from the resolved address stays with
 //! each caller, since that type belongs to a higher layer.
 //!
-//! `load_persisted_chequebook` / `persist_chequebook` / [`ChequebookFile`]
+//! `load_persisted_chequebook_for` / `persist_chequebook` / [`ChequebookFile`]
 //! are pure file I/O and compile everywhere; the deploy / factory-check
 //! helpers drive a JSON-RPC node and are gated on `chain-rpc`.
 
@@ -97,26 +97,15 @@ fn strip_0x(s: &str) -> &str {
 }
 
 /// Load the persisted chequebook address from `path`, if the file
-/// exists. A malformed file is a hard error — silently ignoring it
-/// would re-trigger a deploy and waste gas on every restart, so callers
-/// decide whether to treat that as fatal (`antd`) or self-heal
-/// (`ant-ffi` re-deploys on the next buy).
-pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, ChequebookError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| ChequebookError::Read(path.display().to_string(), e))?;
-    let file: ChequebookFile = serde_json::from_str(&raw)
-        .map_err(|e| ChequebookError::Parse(path.display().to_string(), e))?;
-    let mut cb = [0u8; 20];
-    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
-        .map_err(|_| ChequebookError::Decode(file.chequebook.clone()))?;
-    Ok(Some(cb))
-}
-
-/// Like [`load_persisted_chequebook`], but only adopts the record when
-/// the `issuer` it names is `owner`.
+/// exists **and** the `issuer` it names is `owner`. This is the only
+/// loader: both `antd` and `ant-ffi` know their own EOA, and trusting
+/// the path alone is exactly the drift the parity audit found
+/// (`docs/ffi-parity-audit.md`).
+///
+/// A malformed file is an error rather than "none": silently ignoring
+/// it could re-trigger a deploy on every start, so callers decide.
+/// `antd` treats it as fatal; `ant-ffi` rediscovers on-chain first and
+/// only deploys (overwriting the file) when the chain has none.
 ///
 /// A chequebook's issuer is baked into the contract on-chain: bee only
 /// accepts a cheque whose signature recovers to `chequebook.issuer()`,
@@ -124,8 +113,8 @@ pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, Cheque
 /// silently drops while its own settlement status reads "ready". A
 /// record can outlive the account that wrote it whenever the node key
 /// changes under a fixed data dir (a restore-from-backup-key flow), and
-/// the file already carries the owner, so callers that know their own
-/// EOA should use this rather than trusting the path. A foreign record
+/// the file already carries the owner, so the path alone is never
+/// trusted. A foreign record
 /// reads as `Ok(None)` — "no chequebook for this account" — which is
 /// exactly what a fresh account is, so callers rediscover or deploy
 /// their own instead of failing.
@@ -235,6 +224,95 @@ pub async fn read_chequebook_issuer(
     let mut out = [0u8; 20];
     out.copy_from_slice(&word[12..32]);
     Ok(out)
+}
+
+/// The two on-chain checks a chequebook must pass before a node signs
+/// cheques on it (see [`check_chequebook`]). Each field keeps its own
+/// read result so a caller can report them separately, as `antd` does.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug)]
+pub struct ChequebookChecks {
+    /// [`verify_chequebook_with_factory`]: `Ok(false)` means bee drops
+    /// every cheque drawn on it.
+    pub registered: Result<bool, ChequebookError>,
+    /// [`read_chequebook_issuer`]: bee only accepts cheques signed by
+    /// this EOA. `None` when [`check_chequebook`]'s [`IssuerRead`]
+    /// policy skipped the read (nothing to compare against, or the
+    /// factory check already disqualified the chequebook).
+    pub issuer: Option<Result<[u8; 20], ChequebookError>>,
+}
+
+/// When [`check_chequebook`] reads `issuer()` — each read is an RPC
+/// round-trip, so skip it when its answer can't change the outcome.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuerRead {
+    /// Don't read it (e.g. no signing EOA to compare it with).
+    Never,
+    /// Read it unless the factory already answered "not registered",
+    /// which disqualifies the chequebook on its own.
+    UnlessUnregistered,
+    /// Always read it (a caller that reports every check even when one
+    /// has already failed, like `antd` under
+    /// `--chequebook-allow-unverified`).
+    Always,
+}
+
+/// Whether a node signing with a given key may use a chequebook, per
+/// [`ChequebookChecks::verdict`].
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChequebookVerdict {
+    /// Every check that could be read passed.
+    Usable,
+    /// The Swarm chequebook factory doesn't know it.
+    NotRegistered,
+    /// Its on-chain `issuer()` is this other EOA, not the signer.
+    IssuerMismatch([u8; 20]),
+}
+
+#[cfg(feature = "chain-rpc")]
+impl ChequebookChecks {
+    /// The shared rule for `antd` and `ant-ffi`: a check that answered
+    /// "no" disqualifies the chequebook, while a check whose read
+    /// *failed* is skipped rather than failed. Unverified is not bad, and
+    /// dropping settlement over an RPC hiccup stalls uploads. `antd`
+    /// lets `--chequebook-allow-unverified` override a disqualification.
+    #[must_use]
+    pub fn verdict(&self, signer: &[u8; 20]) -> ChequebookVerdict {
+        if matches!(self.registered, Ok(false)) {
+            return ChequebookVerdict::NotRegistered;
+        }
+        match self.issuer {
+            Some(Ok(issuer)) if issuer != *signer => ChequebookVerdict::IssuerMismatch(issuer),
+            _ => ChequebookVerdict::Usable,
+        }
+    }
+}
+
+/// Run the chequebook checks against the chain: factory registration,
+/// then `issuer()` as `issuer_read` allows. Shared by `antd` (every
+/// chequebook it adopts at startup) and `ant-ffi` (a persisted
+/// chequebook before enabling settlement), so the two can't disagree on
+/// what makes a chequebook unusable.
+#[cfg(feature = "chain-rpc")]
+pub async fn check_chequebook(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+    issuer_read: IssuerRead,
+) -> ChequebookChecks {
+    let registered = verify_chequebook_with_factory(client, chequebook).await;
+    let read_issuer = match issuer_read {
+        IssuerRead::Never => false,
+        IssuerRead::UnlessUnregistered => !matches!(registered, Ok(false)),
+        IssuerRead::Always => true,
+    };
+    let issuer = if read_issuer {
+        Some(read_chequebook_issuer(client, chequebook).await)
+    } else {
+        None
+    };
+    ChequebookChecks { registered, issuer }
 }
 
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
@@ -375,7 +453,10 @@ mod tests {
         let path = dir.join("chequebook.json");
         let cb = [0x11u8; 20];
         persist_chequebook(&path, &ChequebookFile::rediscovered(&cb, &[0x22u8; 20])).unwrap();
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), Some(cb));
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            Some(cb)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -405,7 +486,10 @@ mod tests {
     fn missing_file_is_none() {
         let path = std::env::temp_dir().join("definitely-not-a-chequebook-file-xyz.json");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), None);
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -414,7 +498,62 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chequebook.json");
         std::fs::write(&path, b"not json").unwrap();
-        assert!(load_persisted_chequebook(&path).is_err());
+        assert!(load_persisted_chequebook_for(&path, &[0x22u8; 20]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    #[test]
+    fn chequebook_verdict_disqualifies_only_on_a_read_no() {
+        let signer = [0x0au8; 20];
+        let failed = || ChequebookError::Chain("backend unavailable".into());
+        let checks = |registered, issuer| ChequebookChecks {
+            registered,
+            issuer: Some(issuer),
+        };
+
+        assert_eq!(
+            checks(Ok(true), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(false), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        assert_eq!(
+            checks(Ok(true), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::IssuerMismatch([0x5e; 20])
+        );
+        // Not registered wins over a mismatch: it's the first thing bee checks.
+        assert_eq!(
+            checks(Ok(false), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        // A read that failed is skipped, never a disqualification.
+        assert_eq!(
+            checks(Err(failed()), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(true), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Err(failed()), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        // An issuer read that was skipped is not a mismatch.
+        let skipped = |registered| ChequebookChecks {
+            registered,
+            issuer: None,
+        };
+        assert_eq!(
+            skipped(Ok(true)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            skipped(Ok(false)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
     }
 }

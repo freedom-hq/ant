@@ -61,9 +61,8 @@ pub(crate) enum DriveError {
 /// skipped with a warning rather than failing the whole node bring-up.
 ///
 /// Init has no RPC, so the batches are registered *unconfirmed*; with
-/// the `chain` feature, [`PersistedIssuers::verify_on_chain`] drops the
-/// ones the chain disowns once the host supplies one
-/// ([`crate::ant_start_gateway`]).
+/// the `chain` feature, [`ChainInit::run`] drops the ones the chain
+/// disowns once the host supplies one ([`crate::ant_start_gateway`]).
 ///
 /// A store records the batch but not its owner, so this cannot tell a
 /// batch *this* account paid for from one the previous account did —
@@ -111,22 +110,44 @@ pub(crate) fn reload_persisted_issuers(
     issuers
 }
 
-/// The batches [`reload_persisted_issuers`] registered at init that the
-/// chain has not confirmed yet, plus the live registry they sit in.
+/// ant-ffi's counterpart of `antd`'s startup chain block, run by
+/// [`crate::ant_start_gateway`] once the host supplies an RPC.
 ///
-/// `antd` confirms each reloaded batch on-chain before registering it
-/// (issue #49, phantom batches), but `ant_init` takes no RPC — on iOS
-/// the Gnosis endpoint only arrives with [`crate::ant_start_gateway`].
-/// Until then a batch that expired or was never created reads as
-/// `usable` in `GET /stamps` and is offered for publishing, and only a
-/// peer rejection of the first push reveals it.
-/// [`Self::verify_on_chain`] closes that window as soon as an RPC is
-/// known, applying `antd`'s rule.
+/// `antd` does all of its chain-derived startup in one place before
+/// the node gets its upload wiring: confirm the reloaded batches
+/// (issue #49), rediscover owned batches (step 3), and resolve the
+/// chequebook. `ant_init` takes no RPC (on iOS the Gnosis endpoint
+/// only arrives with [`crate::ant_start_gateway`]), so until [`Self::run`]
+/// runs:
+///
+/// - a batch that expired or was never created reads as `usable` in
+///   `GET /stamps`;
+/// - a batch the account owns on-chain but not on disk (reinstall,
+///   restore from key) is missing;
+/// - a chequebook that exists only on-chain isn't used for settlement.
+///
+/// The decisions come from the same shared helpers `antd` uses, so the
+/// two entry points can't disagree on them (see
+/// `docs/ffi-parity-audit.md`).
 #[cfg(feature = "chain")]
-pub(crate) struct PersistedIssuers {
+pub(crate) struct ChainInit {
     upload: std::sync::Arc<ant_p2p::UploadRuntime>,
+    /// Reloaded batches not yet confirmed on-chain.
     unverified: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
-    /// Serializes [`Self::verify_on_chain`] passes: every
+    /// Holds `true` once an owned-batch rediscovery scan has completed
+    /// and registered every batch it found, so a gateway restart in the
+    /// same process doesn't rescan. A failed scan or a failed
+    /// registration leaves it `false`, so the next run retries. Held
+    /// across the scan, so two overlapping runs (an idempotent
+    /// `ant_start_gateway` re-call while the first run is in flight)
+    /// don't both scan and double-register the same batch: the second
+    /// waits and then sees the flag.
+    batches_rediscovered: tokio::sync::Mutex<bool>,
+    /// Set once settlement has been switched on for an adopted
+    /// chequebook, so a later run (every idempotent `ant_start_gateway`
+    /// re-call spawns one) doesn't re-resolve it over RPC.
+    settlement_on: std::sync::atomic::AtomicBool,
+    /// Serializes [`Self::verify_pass`] sweeps: every
     /// `ant_start_gateway` call with an RPC spawns one (including the
     /// idempotent "already running" path), so a host re-calling it on
     /// foreground can overlap a pass still in flight. The second waits
@@ -146,7 +167,7 @@ pub(crate) struct PersistedIssuers {
 
 /// How long a persisted batch's first `NotFound` read must stand before
 /// a second one unregisters it — see
-/// [`PersistedIssuers::not_found_since`]. A lagging load-balanced
+/// [`ChainInit::not_found_since`]. A lagging load-balanced
 /// backend trails by a few blocks (5 s each on Gnosis), so 45 s covers
 /// it. Deliberately much shorter than `ant-gateway`'s five-minute
 /// `FRESH_BATCH_GRACE`: the suspect clock lives only in memory, so a
@@ -157,7 +178,7 @@ pub(crate) struct PersistedIssuers {
 const PERSISTED_NOT_FOUND_GRACE: Duration = Duration::from_secs(45);
 
 #[cfg(feature = "chain")]
-impl PersistedIssuers {
+impl ChainInit {
     /// Track every batch currently registered in `upload` — call it
     /// right after the reload, before anything registers at runtime, so
     /// only batches that came from disk are checked (a batch bought this
@@ -180,10 +201,157 @@ impl PersistedIssuers {
         Self {
             upload,
             unverified: std::sync::Mutex::new(unverified),
+            batches_rediscovered: tokio::sync::Mutex::new(false),
+            settlement_on: std::sync::atomic::AtomicBool::new(false),
             pass: tokio::sync::Mutex::new(()),
             not_found_since: std::sync::Mutex::new(HashMap::new()),
             not_found_grace,
         }
+    }
+
+    /// Run the chain init: the ant-ffi equivalent of `antd`'s startup
+    /// chain block. Each step is best-effort and independent; a failed
+    /// step logs and is retried by the next `ant_start_gateway` call
+    /// with an RPC — including an idempotent one that finds the gateway
+    /// already running, which spawns this again. Overlapping runs are
+    /// safe: step 1 is serialized per sweep, step 2 holds its own lock
+    /// across the scan, step 3 takes the process-wide chequebook setup
+    /// lock.
+    ///
+    /// 1. Unregister reloaded batches the chain disowns (#49). A first
+    ///    `NotFound` read only marks the batch suspect; it is re-read
+    ///    once the grace window has passed, after steps 2 and 3, so the
+    ///    wait never delays them.
+    /// 2. Register batches this account owns on-chain but not on disk.
+    /// 3. Adopt the persisted or on-chain chequebook and switch outbound
+    ///    settlement on. Nothing is deployed or funded here: both spend
+    ///    the user's funds, which only an explicit host call
+    ///    ([`deploy_chequebook`]) or a storage buy may do.
+    pub(crate) async fn run(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+        swap_secret: [u8; 32],
+    ) {
+        let recheck_at = self
+            .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await;
+        self.rediscover_owned(chain, cmd_tx).await;
+        self.adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
+            .await;
+        if let Some(recheck_at) = recheck_at {
+            tokio::time::sleep_until(recheck_at).await;
+            self.verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+                .await;
+        }
+    }
+
+    /// Step 3 of [`Self::run`]: adopt the chequebook without spending,
+    /// once per handle.
+    async fn adopt_settlement(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+        swap_secret: [u8; 32],
+    ) {
+        use std::sync::atomic::Ordering;
+
+        if self.settlement_on.load(Ordering::Acquire) {
+            return;
+        }
+        let node_eth = self.upload.batch_owner;
+        match ant_chain::tx::Wallet::new(swap_secret, GNOSIS_CHAIN_ID) {
+            Ok(wallet) => match setup_settlement(
+                cmd_tx,
+                chain,
+                &wallet,
+                data_dir,
+                swap_secret,
+                node_eth,
+                false,
+            )
+            .await
+            {
+                Ok(Some(_)) => self.settlement_on.store(true, Ordering::Release),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    target: "ant-ffi",
+                    "could not adopt a chequebook for network settlement: {e}",
+                ),
+            },
+            Err(e) => tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}"),
+        }
+    }
+
+    /// `antd` step 3: register every funded batch this account owns
+    /// on-chain that isn't registered yet (a reinstall or restore from
+    /// key leaves them on-chain but not on disk). Uses the same shared
+    /// scan as `antd` and `ant_storage_discover`. A new issuer starts at
+    /// index 0, as in `antd` without a bee `stamperstore`.
+    async fn rediscover_owned(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+    ) {
+        let mut rediscovered = self.batches_rediscovered.lock().await;
+        if *rediscovered {
+            return;
+        }
+        let found = match ant_chain::discover::discover_owned_batches(
+            chain,
+            ant_chain::GNOSIS_POSTAGE_STAMP,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            &self.upload.batch_owner,
+            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ant-ffi",
+                    "postage batch rediscovery scan failed: {e}; retrying on the next gateway start",
+                );
+                return;
+            }
+        };
+        let mut all_registered = true;
+        for b in found {
+            let known = self
+                .upload
+                .issuers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&b.batch_id);
+            if known {
+                continue;
+            }
+            match register_batch(cmd_tx, b.batch_id, b.depth, b.bucket_depth, b.immutable).await {
+                Ok(()) => tracing::info!(
+                    target: "ant-ffi",
+                    batch = %format!("0x{}", hex::encode(b.batch_id)),
+                    depth = b.depth,
+                    bucket_depth = b.bucket_depth,
+                    immutable = b.immutable,
+                    remaining_balance = b.remaining_balance,
+                    "rediscovered owned postage batch from chain",
+                ),
+                Err(e) => {
+                    all_registered = false;
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        batch = %format!("0x{}", hex::encode(b.batch_id)),
+                        "could not register rediscovered batch: {e}; retrying on the next gateway start",
+                    );
+                }
+            }
+        }
+        // Only a clean pass ends the rediscovery: a batch whose
+        // registration failed is picked up by the next run's scan (the
+        // ones registered now are skipped as known).
+        *rediscovered = all_registered;
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
@@ -202,20 +370,20 @@ impl PersistedIssuers {
     /// call then waits out the grace window and reads it once more,
     /// unregistering it only if that read agrees. A suspect whose
     /// re-read fails stays pending for the next `ant_start_gateway`.
-    pub(crate) async fn verify_on_chain(
-        &self,
-        chain: &ant_chain::ChainClient,
-        postage_contract: &str,
-    ) {
+    /// [`Self::run`] does the same, but runs its other steps before
+    /// waiting out the grace.
+    #[cfg(test)]
+    async fn verify_persisted(&self, chain: &ant_chain::ChainClient, postage_contract: &str) {
         if let Some(recheck_at) = self.verify_pass(chain, postage_contract).await {
             tokio::time::sleep_until(recheck_at).await;
             self.verify_pass(chain, postage_contract).await;
         }
     }
 
-    /// One serialized sweep over the pending batches. Returns when the
-    /// last `NotFound` suspect it left pending becomes due for its
-    /// confirming re-read, if any.
+    /// One serialized sweep over the pending batches (the `pass` lock is
+    /// held only for the sweep, never across the grace wait). Returns
+    /// when the last `NotFound` suspect it left pending becomes due for
+    /// its confirming re-read, if any.
     async fn verify_pass(
         &self,
         chain: &ant_chain::ChainClient,
@@ -1490,11 +1658,11 @@ pub(crate) fn storage_buy_xdai(
 /// wallet (no spare xDAI for the one-time deploy, no spare xBZZ for the
 /// deposit) or flaky RPC just logs a warning; settlement enables — and
 /// the deposit lands — the next time one of this function's callers
-/// runs: a storage buy, a plan connect, or a plan discover (an explicit
-/// [`deploy_chequebook`] / [`settlement_topup_xdai`] also lands the
-/// deposit). **Not** on a bare app launch: `ant_init` only re-wires
-/// settlement from the persisted `chequebook.json` record and never
-/// reaches this path, so nothing here is retried there.
+/// runs: a storage buy (including one through the gateway's
+/// `POST /stamps`), a plan connect, a plan discover, or an explicit
+/// [`deploy_chequebook`] ([`settlement_topup_xdai`] also lands the
+/// deposit). A gateway start adopts an existing chequebook
+/// ([`ChainInit::run`]) but never deploys or funds one.
 /// The node wallet both pays gas and is the issuer, so no external key
 /// is ever introduced.
 #[cfg(feature = "chain")]
@@ -1506,26 +1674,140 @@ pub(crate) async fn ensure_settlement(
     swap_secret: [u8; 32],
     node_eth: [u8; 20],
 ) {
-    let resolved = match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(
-                target: "ant-ffi",
-                "could not enable network settlement (uploads still work for a while, \
-                 then stall until a chequebook exists): {e}",
-            );
-            return;
-        }
-    };
-    let chequebook = resolved.address;
-    // A chequebook we just deployed was funded as part of the deploy; an
-    // adopted one carries whatever deposit it already had, which for
-    // anything deployed before #73 is nothing at all.
-    if !resolved.deployed {
-        fund_chequebook_best_effort(client, wallet, &node_eth, &chequebook).await;
+    if let Err(e) = setup_settlement(
+        cmd_tx,
+        client,
+        wallet,
+        data_dir,
+        swap_secret,
+        node_eth,
+        true,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "ant-ffi",
+            "could not enable network settlement (uploads still work for a while, \
+             then stall until a chequebook exists): {e}",
+        );
     }
+}
 
+/// Serialises chequebook setup across every caller. The host's
+/// launch-time [`deploy_chequebook`], the gateway's after-buy hook, a
+/// storage buy and the gateway-start [`ChainInit::run`] can overlap, and
+/// two of them concluding "no chequebook yet" at once would deploy and
+/// fund two (or top one up twice). Process-wide rather than
+/// per-handle: one node per process is the norm, and serialising two
+/// handles' setups costs nothing but a short wait.
+#[cfg(feature = "chain")]
+static CHEQUEBOOK_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The one chequebook routine behind every settlement path: resolve the
+/// account's chequebook, optionally spend on it, and switch outbound
+/// settlement on in the running node. Returns the chequebook, or `None`
+/// when there is none to use yet (no chequebook and either `may_spend`
+/// is off or the wallet can't pay for the deploy).
+///
+/// `may_spend` allows deploying a chequebook and topping up an adopted
+/// one's deposit (a chequebook reached as persisted or rediscovered can
+/// be sitting at deposit 0, as every install before #73 is). Only host
+/// calls and buys pass `true`; the gateway-start chain init passes
+/// `false`.
+#[cfg(feature = "chain")]
+pub(crate) async fn setup_settlement(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    swap_secret: [u8; 32],
+    node_eth: [u8; 20],
+    may_spend: bool,
+) -> Result<Option<[u8; 20]>, DriveError> {
+    let _setup = CHEQUEBOOK_SETUP.lock().await;
+    let resolved =
+        match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth, may_spend).await? {
+            Resolution::Use(resolved) => resolved,
+            Resolution::NoneYet => return Ok(None),
+            Resolution::Disqualified { chequebook, reason } => {
+                // `ant_init` has no RPC, so it switched settlement on
+                // from the persisted record unchecked. Now that the
+                // chain says no, switch it off again: cheques every peer
+                // drops only burn bandwidth while the status and logs
+                // claim settlement works.
+                lock_disqualified().insert((node_eth, chequebook));
+                disable_settlement(cmd_tx, chequebook).await;
+                return Err(DriveError::Op(reason));
+            }
+        };
+    lock_disqualified().remove(&(node_eth, resolved.address));
+    // A chequebook we just deployed was funded as part of the deploy; an
+    // adopted one carries whatever deposit it already had.
+    if may_spend && !resolved.deployed {
+        fund_chequebook_best_effort(client, wallet, &node_eth, &resolved.address).await;
+    }
+    enable_settlement(cmd_tx, resolved.address, swap_secret, data_dir).await;
+    Ok(Some(resolved.address))
+}
+
+/// `(owner, chequebook)` pairs the last chain check in this process
+/// disqualified (see [`setup_settlement`] and
+/// [`settlement_topup_xdai_for`]). [`settlement_status`] reads it so a
+/// persisted record the chain rejected isn't reported as working
+/// settlement. Process-wide like [`CHEQUEBOOK_SETUP`], so keyed by the
+/// signing account too: an issuer mismatch is relative to the account
+/// that checked, and the chequebook account A was refused (issued by B)
+/// is exactly the one an in-process switch to B may legitimately use.
+#[cfg(feature = "chain")]
+type DisqualifiedSet = std::collections::BTreeSet<([u8; 20], [u8; 20])>;
+
+#[cfg(feature = "chain")]
+static DISQUALIFIED: std::sync::Mutex<DisqualifiedSet> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(feature = "chain")]
+fn lock_disqualified() -> std::sync::MutexGuard<'static, DisqualifiedSet> {
+    DISQUALIFIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Switch outbound SWAP settlement off in the running node if it runs on
+/// `chequebook` (`DisablePushsyncSwap`). Logs the node's answer.
+#[cfg(feature = "chain")]
+async fn disable_settlement(cmd_tx: &mpsc::Sender<ControlCommand>, chequebook: [u8; 20]) {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if send(
+        cmd_tx,
+        ControlCommand::DisablePushsyncSwap {
+            chequebook,
+            ack: ack_tx,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    match recv_oneshot(ack_rx).await {
+        Ok(ControlAck::Ok { message }) => tracing::info!(target: "ant-ffi", "{message}"),
+        Ok(ControlAck::Error { message }) => {
+            tracing::warn!(target: "ant-ffi", "disable settlement: {message}");
+        }
+        _ => {}
+    }
+}
+
+/// Switch outbound SWAP settlement on in the running node for
+/// `chequebook` (`EnablePushsyncSwap`, idempotent for the same
+/// chequebook). Logs the node's answer.
+#[cfg(feature = "chain")]
+async fn enable_settlement(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    chequebook: [u8; 20],
+    swap_secret: [u8; 32],
+    data_dir: &std::path::Path,
+) {
     let (ack_tx, ack_rx) = oneshot::channel();
     if send(
         cmd_tx,
@@ -1562,7 +1844,7 @@ pub(crate) async fn ensure_settlement(
 /// leaves settlement off; the Storage UI then shows the "settlement not
 /// set up" state via [`settlement_status`].
 #[cfg(feature = "chain")]
-async fn ensure_settlement_best_effort(
+pub(crate) async fn ensure_settlement_best_effort(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
     secret: [u8; 32],
@@ -1582,13 +1864,19 @@ async fn ensure_settlement_best_effort(
 /// Storage tab reads this to warn the user when a connected plan still
 /// won't upload reliably. Local + cheap: it just reads the persisted
 /// `chequebook.json` association (written when a chequebook was
-/// deployed), no chain round-trip.
+/// deployed), no chain round-trip — minus a chequebook this process's
+/// last chain check disqualified ([`setup_settlement`] switched
+/// settlement off for it).
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
     let path = h.data_dir.join("chequebook.json");
     let (enabled, chequebook) =
         match ant_chain::chequebook_store::load_persisted_chequebook_for(&path, &h.eth) {
-            Ok(Some(cb)) => (true, Some(format!("0x{}", hex::encode(cb)))),
+            // A chequebook the chain check disqualified has settlement
+            // switched off (see `setup_settlement`).
+            Ok(Some(cb)) if !lock_disqualified().contains(&(h.eth, cb)) => {
+                (true, Some(format!("0x{}", hex::encode(cb))))
+            }
             _ => (false, None),
         };
     to_json(&SettlementStatus {
@@ -1646,6 +1934,11 @@ async fn quote_deposit_shortfall(
     let Some(cb) = persisted_chequebook(data_dir, owner) else {
         return deposit::TARGET_PLUR;
     };
+    // A disqualified chequebook is neither funded nor replaced by a buy
+    // (see `setup_settlement`), so there's no deposit to price in.
+    if lock_disqualified().contains(&(*owner, cb)) {
+        return 0;
+    }
     match chequebook_deposit_plur(client, &cb).await {
         Ok(have) => deposit::shortfall(have),
         Err(e) => {
@@ -1733,20 +2026,36 @@ async fn fund_chequebook_best_effort(
 /// "xdai_to_send_display","sufficient_funds"}`. `enabled=false` (with
 /// zeroed fields) when this account has no chequebook yet — there is
 /// nothing to top up then; buying or connecting a plan deploys one,
-/// funded. Two or three light `eth_call`s, so it belongs on an explicit
+/// funded — or when its chequebook was disqualified (see
+/// [`settlement_deposit_for`]). Two or three light `eth_call`s, so it belongs on an explicit
 /// refresh, not on every status poll.
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
     h.runtime.block_on(async move {
-        let Some(cb) = persisted_chequebook(&data_dir, &owner) else {
-            return to_json(&SettlementDeposit::none());
-        };
-        let client = h.chain_client(rpc);
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        settlement_deposit_json(&client, &owner, &cb, deposited).await
+        settlement_deposit_for(&h.chain_client(rpc), &data_dir, &owner).await
     })
+}
+
+/// [`settlement_deposit`]'s body, against an explicit chain client. A
+/// chequebook this process's chain check disqualified reads as "none",
+/// the same answer [`settlement_status`] gives: its settlement is off,
+/// so the card must not offer to top it up.
+#[cfg(feature = "chain")]
+async fn settlement_deposit_for(
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: &[u8; 20],
+) -> Result<String, DriveError> {
+    let Some(cb) = persisted_chequebook(data_dir, owner) else {
+        return to_json(&SettlementDeposit::none());
+    };
+    if lock_disqualified().contains(&(*owner, cb)) {
+        return to_json(&SettlementDeposit::none());
+    }
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    settlement_deposit_json(client, owner, &cb, deposited).await
 }
 
 /// Fund the node's chequebook up to [`deposit::TARGET_PLUR`], funding
@@ -1765,72 +2074,115 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
     let secret = h.signing_secret;
+    let cmd_tx = h.cmd_tx.clone();
     h.runtime.block_on(async move {
-        use primitive_types::U256;
-
-        let cb = persisted_chequebook(&data_dir, &owner).ok_or_else(|| {
-            DriveError::Op(
-                "no chequebook for this account yet — connect or buy a storage plan first".into(),
-            )
-        })?;
-        let client = h.chain_client(rpc);
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        let short = deposit::shortfall(deposited);
-        if short == 0 {
-            return settlement_deposit_json(&client, &owner, &cb, deposited).await;
-        }
-
-        let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
-            .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
-        let have_bzz = client
-            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
-            .await
-            .unwrap_or(0);
-        let to_acquire = short.saturating_sub(have_bzz);
-        if to_acquire > 0 {
-            let xdai = client
-                .eth_get_balance_lower128(&owner)
-                .await
-                .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
-            let swap_input = buffered_swap_input(&client, to_acquire).await?;
-            let required = swap_input.saturating_add(GAS_RESERVE_WEI);
-            if xdai < required {
-                return Err(DriveError::Op(format!(
-                    "not enough xDAI: send {} more xDAI to your account, then try again",
-                    format_native(required - xdai)
-                )));
-            }
-            let helper = wallet
-                .ensure_swap_helper(&client)
-                .await
-                .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
-            wallet
-                .swap_xdai_for_bzz(
-                    &client,
-                    &helper,
-                    &owner,
-                    U256::from(swap_input),
-                    U256::from(to_acquire),
-                )
-                .await
-                .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
-        }
-
-        wallet
-            .erc20_transfer(
-                &client,
-                &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
-                &cb,
-                U256::from(short),
-            )
-            .await
-            .map_err(|e| DriveError::Op(format!("deposit into chequebook: {e}")))?;
-
-        // Re-read rather than assuming: the card should show what the
-        // chain says the deposit is now, not what we intended it to be.
-        let deposited = chequebook_deposit_plur(&client, &cb).await?;
-        settlement_deposit_json(&client, &owner, &cb, deposited).await
+        settlement_topup_xdai_for(&cmd_tx, &h.chain_client(rpc), &data_dir, owner, secret).await
     })
+}
+
+/// [`settlement_topup_xdai`]'s body, against an explicit chain client.
+/// Refuses a chequebook that fails its chain checks — peers drop its
+/// cheques, so a deposit would only strand xBZZ in it. The checks run
+/// here, before anything is spent, rather than trusting that a chain
+/// init already ran them: a gateway started without an RPC (or whose
+/// init is still in flight) leaves [`DISQUALIFIED`] empty. A check whose
+/// read *failed* refuses too: unlike switching settlement on, a deposit
+/// can't be taken back, so it waits for a verified "yes". A chequebook
+/// found disqualified here gets the same treatment as in
+/// [`setup_settlement`]: recorded and switched off in the node.
+#[cfg(feature = "chain")]
+async fn settlement_topup_xdai_for(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: [u8; 20],
+    secret: [u8; 32],
+) -> Result<String, DriveError> {
+    use primitive_types::U256;
+
+    let cb = persisted_chequebook(data_dir, &owner).ok_or_else(|| {
+        DriveError::Op(
+            "no chequebook for this account yet — connect or buy a storage plan first".into(),
+        )
+    })?;
+    if lock_disqualified().contains(&(owner, cb)) {
+        return Err(DriveError::Op(format!(
+            "chequebook 0x{} failed its on-chain checks, so settlement is off for it; \
+             not depositing into it",
+            hex::encode(cb),
+        )));
+    }
+    match check_persisted_chequebook(client, &data_dir.join("chequebook.json"), &cb, &owner).await {
+        PersistedCheck::Usable => {}
+        PersistedCheck::Unverified(e) => {
+            return Err(DriveError::Op(format!(
+                "could not verify chequebook 0x{} on-chain ({e}); not depositing into it \
+                 until it checks out — try again",
+                hex::encode(cb),
+            )));
+        }
+        PersistedCheck::Disqualified(reason) => {
+            lock_disqualified().insert((owner, cb));
+            disable_settlement(cmd_tx, cb).await;
+            return Err(DriveError::Op(format!("{reason}; not depositing into it")));
+        }
+    }
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    let short = deposit::shortfall(deposited);
+    if short == 0 {
+        return settlement_deposit_json(client, &owner, &cb, deposited).await;
+    }
+
+    let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
+        .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
+    let have_bzz = client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
+        .await
+        .unwrap_or(0);
+    let to_acquire = short.saturating_sub(have_bzz);
+    if to_acquire > 0 {
+        let xdai = client
+            .eth_get_balance_lower128(&owner)
+            .await
+            .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
+        let swap_input = buffered_swap_input(client, to_acquire).await?;
+        let required = swap_input.saturating_add(GAS_RESERVE_WEI);
+        if xdai < required {
+            return Err(DriveError::Op(format!(
+                "not enough xDAI: send {} more xDAI to your account, then try again",
+                format_native(required - xdai)
+            )));
+        }
+        let helper = wallet
+            .ensure_swap_helper(client)
+            .await
+            .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
+        wallet
+            .swap_xdai_for_bzz(
+                client,
+                &helper,
+                &owner,
+                U256::from(swap_input),
+                U256::from(to_acquire),
+            )
+            .await
+            .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
+    }
+
+    wallet
+        .erc20_transfer(
+            client,
+            &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
+            &cb,
+            U256::from(short),
+        )
+        .await
+        .map_err(|e| DriveError::Op(format!("deposit into chequebook: {e}")))?;
+
+    // Re-read rather than assuming: the card should show what the
+    // chain says the deposit is now, not what we intended it to be.
+    let deposited = chequebook_deposit_plur(client, &cb).await?;
+    settlement_deposit_json(client, &owner, &cb, deposited).await
 }
 
 /// Render the settlement-deposit card payload for a known chequebook,
@@ -1890,6 +2242,10 @@ async fn settlement_deposit_json(
 /// xBZZ so its cheques are backed, persists the association, and returns
 /// the new address. Blocks on the handle's tokio runtime.
 ///
+/// It also switches outbound settlement on in the running node, so a
+/// chequebook deployed now is used this session rather than from the
+/// next launch.
+///
 /// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. The caller restarts
 /// the gateway afterwards so [`crate::ant_start_gateway`] reloads the
 /// persisted address into its `ChainContext` and `/chequebook/address`
@@ -1899,6 +2255,7 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
     let secret = h.signing_secret;
     let node_eth = h.eth;
     let data_dir = h.data_dir.clone();
+    let cmd_tx = h.cmd_tx.clone();
 
     h.runtime.block_on(async move {
         let client = h.chain_client(rpc);
@@ -1909,25 +2266,104 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
         // → deploy a fresh one (persisting the association). Shared with
         // `antd`'s resolve/rediscover/deploy mechanics, so a wallet that
         // already deployed a chequebook (e.g. on desktop with the same
-        // vault) is adopted rather than duplicated.
-        match resolve_or_deploy_chequebook(&client, &wallet, &data_dir, node_eth).await? {
-            Some(resolved) => {
-                // An adopted chequebook may still be at deposit 0 — fund
-                // it here too, so this checklist step means the same
-                // thing whichever branch produced the address.
-                if !resolved.deployed {
-                    fund_chequebook_best_effort(&client, &wallet, &node_eth, &resolved.address)
-                        .await;
-                }
-                to_json(&DeployedChequebook {
-                    chequebook_address: format!("0x{}", hex::encode(resolved.address)),
-                })
-            }
+        // vault) is adopted rather than duplicated. An adopted chequebook
+        // may still be at deposit 0, so it's funded here too; this
+        // checklist step means the same thing whichever branch produced
+        // the address.
+        match setup_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, node_eth, true).await?
+        {
+            Some(chequebook) => to_json(&DeployedChequebook {
+                chequebook_address: format!("0x{}", hex::encode(chequebook)),
+            }),
             None => Err(DriveError::Op(
                 "chequebook could not be deployed — wallet has no xDAI for gas".into(),
             )),
         }
     })
+}
+
+/// What [`resolve_or_deploy_chequebook`] concluded.
+#[cfg(feature = "chain")]
+enum Resolution {
+    /// Use this chequebook.
+    Use(ResolvedChequebook),
+    /// No chequebook to use yet (none exists, and deploying one isn't
+    /// allowed or affordable).
+    NoneYet,
+    /// The persisted chequebook failed a chain check. Not a reason to
+    /// deploy another — which one to use is for the user to sort out —
+    /// but settlement must not stay on it.
+    Disqualified {
+        chequebook: [u8; 20],
+        reason: String,
+    },
+}
+
+/// What [`check_persisted_chequebook`] concluded about a persisted
+/// chequebook.
+#[cfg(feature = "chain")]
+enum PersistedCheck {
+    /// Every check answered and passed.
+    Usable,
+    /// A check answered "no"; the reason, for the user.
+    Disqualified(String),
+    /// No check said "no", but at least one read failed.
+    Unverified(String),
+}
+
+/// The chain checks `antd` runs before signing cheques on a chequebook
+/// (factory registration, `issuer()`), with the shared
+/// [`ChequebookVerdict`](ant_chain::chequebook_store::ChequebookVerdict)
+/// rule plus the just-deployed lag grace. Whether an unverified result
+/// is good enough is the caller's call: enabling settlement accepts it,
+/// spending on the chequebook doesn't.
+#[cfg(feature = "chain")]
+async fn check_persisted_chequebook(
+    client: &ant_chain::ChainClient,
+    persist_path: &std::path::Path,
+    cb: &[u8; 20],
+    node_eth: &[u8; 20],
+) -> PersistedCheck {
+    use ant_chain::chequebook_store::{self, ChequebookVerdict, IssuerRead};
+
+    let checks =
+        chequebook_store::check_chequebook(client, cb, IssuerRead::UnlessUnregistered).await;
+    let mut verdict = checks.verdict(node_eth);
+    if verdict == ChequebookVerdict::NotRegistered
+        && not_registered_may_be_lag(client, persist_path, cb).await
+    {
+        tracing::warn!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(cb)),
+            "the RPC reports our just-deployed chequebook as unregistered, but it hasn't \
+             caught up with the deploy yet; using it",
+        );
+        verdict = ChequebookVerdict::Usable;
+    }
+    match verdict {
+        ChequebookVerdict::Usable => {
+            let failed = [
+                checks.registered.as_ref().err(),
+                checks.issuer.as_ref().and_then(|r| r.as_ref().err()),
+            ];
+            match failed.into_iter().flatten().next() {
+                Some(e) => PersistedCheck::Unverified(e.to_string()),
+                None => PersistedCheck::Usable,
+            }
+        }
+        ChequebookVerdict::NotRegistered => PersistedCheck::Disqualified(format!(
+            "chequebook 0x{} is not registered with the Swarm chequebook factory; \
+             peers drop every cheque drawn on it, so settlement stays off",
+            hex::encode(cb),
+        )),
+        ChequebookVerdict::IssuerMismatch(issuer) => PersistedCheck::Disqualified(format!(
+            "chequebook 0x{} is issued by 0x{}, not this account (0x{}); \
+             peers would drop every cheque we sign on it, so settlement stays off",
+            hex::encode(cb),
+            hex::encode(issuer),
+            hex::encode(node_eth),
+        )),
+    }
 }
 
 /// A chequebook resolved for this account, and how we got to it.
@@ -1945,10 +2381,16 @@ struct ResolvedChequebook {
 
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
-/// resolved chequebook, or `None` when the wallet can't afford the
-/// one-time deploy (a soft skip, not an error). A rediscovery scan that
-/// *failed* is an error, never a fall-through to the deploy: only an
-/// authoritative "this account owns no chequebook" may trigger one.
+/// resolved chequebook, [`Resolution::NoneYet`] when there's none to
+/// use (the account has no chequebook and either `may_deploy` is off or
+/// the wallet can't afford the one-time deploy — a soft skip, not an
+/// error), or [`Resolution::Disqualified`] when the persisted one fails
+/// its chain checks. A rediscovery scan that *failed* is an error, never
+/// a fall-through to the deploy: only an authoritative "this account
+/// owns no chequebook" may trigger one — and when the persisted record
+/// was unreadable, only once the record's own bytes name no chequebook
+/// of ours (see step 2). Call it through [`setup_settlement`], which holds
+/// the lock that keeps two callers from both deploying.
 /// The persist / rediscover / deploy mechanics are shared with `antd` via
 /// [`ant_chain::chequebook_store`]; only the resolution *order* (no
 /// operator-flag branches) and the deposit sizing live here.
@@ -1958,7 +2400,8 @@ async fn resolve_or_deploy_chequebook(
     wallet: &ant_chain::tx::Wallet,
     data_dir: &std::path::Path,
     node_eth: [u8; 20],
-) -> Result<Option<ResolvedChequebook>, DriveError> {
+    may_deploy: bool,
+) -> Result<Resolution, DriveError> {
     use ant_chain::chequebook_store::{self, ChequebookError, ChequebookFile};
 
     let persist_path = data_dir.join("chequebook.json");
@@ -1967,13 +2410,50 @@ async fn resolve_or_deploy_chequebook(
     //    issued by *this* account — a record left behind by a different
     //    account is skipped, so we rediscover / deploy our own below
     //    instead of signing cheques nobody will honour.
-    if let Some(cb) = chequebook_store::load_persisted_chequebook_for(&persist_path, &node_eth)
-        .map_err(map_cb_err)?
-    {
-        return Ok(Some(ResolvedChequebook {
-            address: cb,
-            deployed: false,
-        }));
+    //
+    //    An unreadable record isn't the end of settlement: as a hard
+    //    error it disabled settlement for good, since every buy failed on
+    //    it and nothing ever rewrote the file. The rediscovery below finds
+    //    the chequebook it pointed at if that one holds xBZZ, and rewrites
+    //    the record. But the scan can't see a deposit-0 chequebook (every
+    //    install before #73), so its "none" doesn't prove there's no
+    //    chequebook behind the record: step 2 then recovers the address
+    //    from the record's bytes before it will deploy.
+    let (persisted, record_unreadable) = match chequebook_store::load_persisted_chequebook_for(
+        &persist_path,
+        &node_eth,
+    ) {
+        Ok(p) => (p, false),
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                "ignoring unreadable chequebook association ({e}); looking the chequebook up on-chain instead",
+            );
+            (None, true)
+        }
+    };
+    if let Some(cb) = persisted {
+        // Same checks `antd` runs before signing cheques on a chequebook
+        // (factory registration, `issuer()`), same shared rule: a "no"
+        // disqualifies it, a failed read doesn't. A disqualified
+        // chequebook is not a reason to deploy another; which one to use
+        // is for the user to sort out.
+        match check_persisted_chequebook(client, &persist_path, &cb, &node_eth).await {
+            // Unverified is not bad: dropping settlement over an RPC
+            // hiccup stalls uploads.
+            PersistedCheck::Usable | PersistedCheck::Unverified(_) => {
+                return Ok(Resolution::Use(ResolvedChequebook {
+                    address: cb,
+                    deployed: false,
+                }))
+            }
+            PersistedCheck::Disqualified(reason) => {
+                return Ok(Resolution::Disqualified {
+                    chequebook: cb,
+                    reason,
+                })
+            }
+        }
     }
 
     // 2. Rediscover a chequebook this node EOA already owns on-chain
@@ -2000,33 +2480,87 @@ async fn resolve_or_deploy_chequebook(
                 chequebook = %format!("0x{}", hex::encode(cb)),
                 "rediscovered node-owned chequebook on-chain; adopting it",
             );
-            return Ok(Some(ResolvedChequebook {
+            return Ok(Resolution::Use(ResolvedChequebook {
                 address: cb,
                 deployed: false,
             }));
         }
-        // Authoritative "this EOA owns no chequebook" — the only answer
-        // that may fall through to the deploy below.
-        Ok(None) => {}
+        // Authoritative "this EOA owns no funded chequebook" — the only
+        // answer that may fall through to the deploy below.
+        //
+        // An unreadable record may still name a deposit-0 chequebook the
+        // funded-only scan can't see. Recover it from the file's bytes
+        // when they still hold its address (the common truncated / half-
+        // written case) and it checks out on-chain as ours. When they
+        // don't, the file is moved aside rather than left to block every
+        // deploy: a mobile user can't reach it to fix or remove it, and
+        // whatever it named holds no deposit (the scan would have found
+        // one), so a second chequebook costs only deploy gas.
+        Ok(None) => {
+            if record_unreadable {
+                match salvage_unreadable_record(client, &persist_path, &node_eth).await {
+                    Salvage::Found(cb) => {
+                        if let Err(e) = chequebook_store::persist_chequebook(
+                            &persist_path,
+                            &ChequebookFile::rediscovered(&cb, &node_eth),
+                        ) {
+                            tracing::warn!(target: "ant-ffi", "rewrite chequebook association: {e}");
+                        }
+                        tracing::info!(
+                            target: "ant-ffi",
+                            chequebook = %format!("0x{}", hex::encode(cb)),
+                            "recovered our chequebook from the unreadable association; adopting it",
+                        );
+                        return Ok(Resolution::Use(ResolvedChequebook {
+                            address: cb,
+                            deployed: false,
+                        }));
+                    }
+                    Salvage::Unknown(e) if may_deploy => {
+                        return Err(DriveError::Op(format!(
+                            "{} is unreadable and checking the chequebook it names failed ({e}); \
+                             not deploying a second one on chain state we could not read",
+                            persist_path.display(),
+                        )));
+                    }
+                    Salvage::Unknown(_) | Salvage::Nothing => {}
+                }
+            }
+            if !may_deploy {
+                return Ok(Resolution::NoneYet);
+            }
+            if record_unreadable {
+                let parked = unused_park_path(&persist_path);
+                std::fs::rename(&persist_path, &parked).map_err(|e| {
+                    DriveError::Op(format!(
+                        "move unreadable {} aside: {e}",
+                        persist_path.display()
+                    ))
+                })?;
+                tracing::warn!(
+                    target: "ant-ffi",
+                    parked = %parked.display(),
+                    "the unreadable chequebook association names no chequebook of ours; \
+                     moved it aside and deploying a fresh one",
+                );
+            }
+        }
         Err(e) => {
             // A scan that *failed* is not "no chequebook exists". Falling
             // through would deploy and fund a second chequebook on chain
             // state we could not read, burning gas and stranding the
             // existing chequebook's deposit. Skip chequebook setup for
             // this run instead: staying without settlement is
-            // recoverable — the next buy / plan connect / discover (or an
-            // explicit deploy) rescans — a stranded deposit is not.
-            // Unlike `antd`, nothing rescans at app start here: `ant_init`
-            // only reloads the persisted `chequebook.json`, so the retry
-            // is bound to those user actions. The cost of the trade is
-            // real and deliberate — a node whose chain reads keep failing
-            // runs without a chequebook rather than deploying one.
+            // recoverable — the next gateway start, buy, plan connect,
+            // discover or explicit deploy rescans — a stranded deposit is
+            // not. The cost of the trade is real and deliberate: a node
+            // whose chain reads keep failing runs without a chequebook
+            // rather than deploying one.
             tracing::warn!(
                 target: "ant-ffi",
                 "chequebook rediscovery scan failed: {e}; network settlement stays OFF — not \
-                 deploying a chequebook on chain state we could not read (the next buy, plan \
-                 connect, discover or explicit deploy retries the scan; relaunching the app on \
-                 its own does not)",
+                 deploying a chequebook on chain state we could not read (the next gateway \
+                 start, buy, plan connect, discover or explicit deploy retries the scan)",
             );
             return Err(DriveError::Op(format!(
                 "chequebook rediscovery scan failed, so we cannot tell whether this account \
@@ -2051,7 +2585,7 @@ async fn resolve_or_deploy_chequebook(
     )
     .await
     {
-        Ok(cb) => Ok(Some(ResolvedChequebook {
+        Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
             address: cb,
             deployed: true,
         })),
@@ -2061,9 +2595,164 @@ async fn resolve_or_deploy_chequebook(
                 "not enough spare xDAI to deploy a chequebook (need ~{need} wei); \
                  network settlement will turn on after you add a little more xDAI and buy again",
             );
-            Ok(None)
+            Ok(Resolution::NoneYet)
         }
         Err(e) => Err(map_cb_err(e)),
+    }
+}
+
+/// Where to move an unreadable `chequebook.json` aside:
+/// `chequebook.json.unreadable`, or the first free
+/// `chequebook.json.unreadable.N` when an earlier episode's parked file
+/// is still there — a rename would silently replace it, and it is kept
+/// for diagnosis. Called under [`CHEQUEBOOK_SETUP`], so nothing else
+/// parks between the probe and the rename.
+#[cfg(feature = "chain")]
+fn unused_park_path(persist_path: &std::path::Path) -> std::path::PathBuf {
+    let mut parked = persist_path.with_extension("json.unreadable");
+    let mut n = 0u64;
+    while parked.exists() {
+        n += 1;
+        parked = persist_path.with_extension(format!("json.unreadable.{n}"));
+    }
+    parked
+}
+
+/// What an unreadable `chequebook.json` still tells us, per
+/// [`salvage_unreadable_record`].
+#[cfg(feature = "chain")]
+enum Salvage {
+    /// An address in the file is a factory-registered chequebook issued
+    /// by this account.
+    Found([u8; 20]),
+    /// A candidate's checks couldn't be read, so it may be ours.
+    Unknown(String),
+    /// No candidate address, or the chain positively rejected each one.
+    Nothing,
+}
+
+/// Look for our chequebook's address in the raw bytes of an unreadable
+/// record (every `0x` + 40-hex run other than `owner`, i.e. the
+/// `chequebook` field when it survived) and confirm it on-chain: only a
+/// positively registered chequebook whose `issuer()` is `owner` counts.
+/// Unlike [`ChequebookChecks::verdict`], a failed read isn't a pass here —
+/// the bytes are untrusted, so it yields [`Salvage::Unknown`].
+#[cfg(feature = "chain")]
+async fn salvage_unreadable_record(
+    client: &ant_chain::ChainClient,
+    persist_path: &std::path::Path,
+    owner: &[u8; 20],
+) -> Salvage {
+    use ant_chain::chequebook_store::{check_chequebook, IssuerRead};
+
+    // A file we can't even read (I/O error) isn't known to be garbage.
+    let bytes = match std::fs::read(persist_path) {
+        Ok(b) => b,
+        Err(e) => return Salvage::Unknown(format!("read {}: {e}", persist_path.display())),
+    };
+    let mut unknown = None;
+    for cb in addresses_in(&bytes) {
+        if cb == *owner {
+            continue;
+        }
+        let checks = check_chequebook(client, &cb, IssuerRead::UnlessUnregistered).await;
+        match (&checks.registered, &checks.issuer) {
+            (Ok(true), Some(Ok(issuer))) if issuer == owner => return Salvage::Found(cb),
+            // A "no" from the chain: not ours.
+            (Ok(false), _) => {}
+            (_, Some(Ok(issuer))) if issuer != owner => {}
+            // Registered unknown, or issuer unread: may still be ours.
+            (Err(e), _) | (_, Some(Err(e))) => unknown = Some(e.to_string()),
+            (Ok(true), _) => unknown = Some("issuer() not read".into()),
+        }
+    }
+    unknown.map_or(Salvage::Nothing, Salvage::Unknown)
+}
+
+/// Every distinct `0x`-prefixed 40-hex-digit run in `bytes` (a longer
+/// run, like a tx hash, doesn't count).
+#[cfg(feature = "chain")]
+fn addresses_in(bytes: &[u8]) -> Vec<[u8; 20]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'0' && bytes[i + 1].eq_ignore_ascii_case(&b'x') {
+            let run = bytes[i + 2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            let mut a = [0u8; 20];
+            if run == 40
+                && hex::decode_to_slice(&bytes[i + 2..i + 42], &mut a).is_ok()
+                && !out.contains(&a)
+            {
+                out.push(a);
+            }
+            i += 2 + run;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// How long after our own deploy (the record's write time) a factory
+/// "not registered" may still be a lagging backend. A load-balanced RPC
+/// trails by seconds to a few minutes, not for good.
+#[cfg(feature = "chain")]
+const DEPLOY_LAG_GRACE: std::time::Duration = std::time::Duration::from_mins(10);
+
+/// Whether a factory "not registered" answer for the persisted `cb` may
+/// just be a backend that hasn't seen our deploy yet (a load-balanced
+/// RPC trails by a few blocks; the host's launch-time
+/// `ant_deploy_chequebook` is followed within seconds by the gateway
+/// start's check). Only for a chequebook we deployed ourselves — the
+/// record carries its deploy tx — and only within [`DEPLOY_LAG_GRACE`]
+/// of the record being written: `true` then when that tx's receipt isn't
+/// visible or can't be read (unconfirmed, not "no"), or shows the
+/// factory deploying `cb` (registered by construction). A visible
+/// receipt without that deploy lets the "not registered" stand, as does
+/// a record without a deploy tx (a rediscovered chequebook) or one older
+/// than the grace (a backend doesn't lag for that long; a record whose
+/// deploy tx isn't on this chain would otherwise pass as "lag" forever).
+#[cfg(feature = "chain")]
+async fn not_registered_may_be_lag(
+    client: &ant_chain::ChainClient,
+    persist_path: &std::path::Path,
+    cb: &[u8; 20],
+) -> bool {
+    use ant_chain::chequebook::{GNOSIS_CHEQUEBOOK_FACTORY, SIMPLE_SWAP_DEPLOYED_TOPIC};
+
+    // An unreadable mtime, or one in the future (clock change), counts as
+    // outside the grace: the factory's "no" is a real answer.
+    let recent = std::fs::metadata(persist_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < DEPLOY_LAG_GRACE);
+    if !recent {
+        return false;
+    }
+    let Some(deploy_tx) = std::fs::read(persist_path)
+        .ok()
+        .and_then(|b| {
+            serde_json::from_slice::<ant_chain::chequebook_store::ChequebookFile>(&b).ok()
+        })
+        .and_then(|f| {
+            let mut tx = [0u8; 32];
+            hex::decode_to_slice(f.deploy_tx.trim_start_matches("0x"), &mut tx).ok()?;
+            Some(tx)
+        })
+    else {
+        return false;
+    };
+    match client.eth_get_transaction_receipt(&deploy_tx).await {
+        Ok(Some(receipt)) => receipt.logs.iter().any(|l| {
+            l.address == GNOSIS_CHEQUEBOOK_FACTORY
+                && l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC)
+                && l.data.get(12..32) == Some(cb.as_slice())
+        }),
+        Ok(None) | Err(_) => true,
     }
 }
 
@@ -2464,15 +3153,20 @@ mod chain_tests {
         let dir = std::env::temp_dir().join(format!("ant-cb-scan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // `ResolvedChequebook` is not `Debug`, so unwrap by hand.
-        let err = match resolve_or_deploy_chequebook(&client, &wallet, &dir, node_eth).await {
+        // `Resolution` is not `Debug`, so unwrap by hand.
+        let err = match resolve_or_deploy_chequebook(&client, &wallet, &dir, node_eth, true).await {
             Err(e) => e,
-            Ok(Some(r)) => panic!(
+            Ok(super::Resolution::Use(r)) => panic!(
                 "a failed scan must not resolve to a chequebook: 0x{} (deployed = {})",
                 hex::encode(r.address),
                 r.deployed,
             ),
-            Ok(None) => panic!("a failed scan must not read as an affordability skip"),
+            Ok(super::Resolution::NoneYet) => {
+                panic!("a failed scan must not read as an affordability skip")
+            }
+            Ok(super::Resolution::Disqualified { reason, .. }) => {
+                panic!("nothing was persisted to disqualify: {reason}")
+            }
         };
 
         let seen = script.seen.lock().unwrap().clone();
@@ -2558,7 +3252,7 @@ mod chain_tests {
     /// batch still missing on the re-read is unregistered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn not_found_is_rechecked_after_grace_before_unregistering() {
-        use super::PersistedIssuers;
+        use super::ChainInit;
         use std::collections::{BTreeSet, HashMap};
         use std::sync::Arc;
         use std::time::Duration;
@@ -2586,10 +3280,7 @@ mod chain_tests {
             postage_dir: postage.clone(),
         });
         let grace = Duration::from_millis(400);
-        let persisted = Arc::new(PersistedIssuers::with_not_found_grace(
-            Arc::clone(&upload),
-            grace,
-        ));
+        let persisted = Arc::new(ChainInit::with_not_found_grace(Arc::clone(&upload), grace));
         let script = Arc::new(OwnerScript {
             owners: Mutex::new(HashMap::from([
                 (lagging, Some([0u8; 20])),
@@ -2606,7 +3297,7 @@ mod chain_tests {
             let persisted = Arc::clone(&persisted);
             tokio::spawn(async move {
                 persisted
-                    .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                    .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
                     .await;
             })
         };
@@ -2649,7 +3340,7 @@ mod chain_tests {
     /// is asked about once and unregistered once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlapping_passes_query_each_batch_once() {
-        use super::PersistedIssuers;
+        use super::ChainInit;
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -2693,7 +3384,7 @@ mod chain_tests {
         });
         // Grace 0: a single `NotFound` read is believed (the grace
         // re-check has its own test).
-        let persisted = Arc::new(PersistedIssuers::with_not_found_grace(
+        let persisted = Arc::new(ChainInit::with_not_found_grace(
             Arc::clone(&upload),
             std::time::Duration::ZERO,
         ));
@@ -2706,7 +3397,7 @@ mod chain_tests {
                     .with_transport(Some(script.clone() as Arc<dyn ChainTransport>));
                 tokio::spawn(async move {
                     persisted
-                        .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+                        .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
                         .await;
                 })
             })
@@ -2731,7 +3422,7 @@ mod chain_tests {
     /// A batch registered at runtime is never re-checked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persisted_issuers_the_chain_disowns_are_unregistered() {
-        use super::{reload_persisted_issuers, PersistedIssuers};
+        use super::{reload_persisted_issuers, ChainInit};
         use std::collections::{BTreeSet, HashMap};
         use std::sync::Arc;
 
@@ -2762,7 +3453,7 @@ mod chain_tests {
             postage_dir: postage.clone(),
         });
         let persisted =
-            PersistedIssuers::with_not_found_grace(Arc::clone(&upload), std::time::Duration::ZERO);
+            ChainInit::with_not_found_grace(Arc::clone(&upload), std::time::Duration::ZERO);
         // Registered after the reload, as a runtime buy would be.
         upload.issuers.lock().unwrap().insert(
             bought,
@@ -2786,7 +3477,7 @@ mod chain_tests {
             || -> BTreeSet<[u8; 32]> { upload.issuers.lock().unwrap().keys().copied().collect() };
 
         persisted
-            .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+            .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         assert_eq!(
             registered(),
@@ -2811,7 +3502,7 @@ mod chain_tests {
         script.owners.lock().unwrap().insert(unreadable, Some(ours));
         script.queried.lock().unwrap().clear();
         persisted
-            .verify_on_chain(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
+            .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         assert_eq!(registered(), BTreeSet::from([live, unreadable, bought]));
         assert!(persisted.unverified().is_empty());
@@ -2823,5 +3514,939 @@ mod chain_tests {
             .all(|id| *id == unreadable));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- chain init + chequebook setup (parity catch-up) ---
+
+    /// A scripted Gnosis backend covering what [`super::ChainInit::run`]
+    /// and [`super::setup_settlement`] read: the xBZZ `Transfer` scan,
+    /// `BatchCreated`, the postage batch views, and the chequebook
+    /// factory / `issuer()` views. Anything that would spend (gas
+    /// pre-flight, nonce, broadcast) answers an error and is recorded,
+    /// so a test can assert nothing was spent.
+    struct ChainScript {
+        node_eth: [u8; 20],
+        /// `Transfer(from = node_eth, to)` hits, each in its own tx.
+        transfers: Vec<([u8; 20], [u8; 32])>,
+        /// `BatchCreated` logs in `HIT_BLOCK`: `(batch, tx)`.
+        created: Vec<([u8; 32], [u8; 32])>,
+        /// Chequebook views: `(registered with the factory, issuer)`.
+        chequebooks: std::collections::HashMap<[u8; 20], (bool, [u8; 20])>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ChainScript {
+        fn new(node_eth: [u8; 20]) -> Self {
+            Self {
+                node_eth,
+                transfers: Vec::new(),
+                created: Vec::new(),
+                chequebooks: std::collections::HashMap::new(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self, method: &str) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == method)
+                .count()
+        }
+
+        fn eth_call(&self, to: &str, data: &str) -> Option<serde_json::Value> {
+            let to = to.to_ascii_lowercase();
+            let sel = &data[0..10];
+            if to == ant_chain::GNOSIS_POSTAGE_STAMP.to_ascii_lowercase() {
+                return Some(json!(match sel {
+                    "0x2182ddb1" => word_hex(&self.node_eth), // batchOwner
+                    "0x44beae8e" => word_hex(&[20]),          // batchDepth
+                    "0x32ac57dd" => word_hex(&[16]),          // bucketDepth
+                    "0xd968f44b" => word_hex(&[0]),           // immutableFlag
+                    "0xd71ba7c4" => word_hex(&[42]),          // remainingBalance
+                    other => panic!("unscripted postage view {other}"),
+                }));
+            }
+            let mut addr = [0u8; 20];
+            if to
+                == format!(
+                    "0x{}",
+                    hex::encode(ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY)
+                )
+            {
+                // deployedContracts(address): the address is the
+                // right-aligned argument word.
+                hex::decode_to_slice(&data[34..74], &mut addr).unwrap();
+                let registered = self.chequebooks.get(&addr).is_some_and(|c| c.0);
+                return Some(json!(word_hex(&[u8::from(registered)])));
+            }
+            if to == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() && sel == "0x70a08231" {
+                // balanceOf: every account holds the full deposit target,
+                // so an adopted chequebook needs no top-up.
+                return Some(json!(format!("0x{:064x}", super::deposit::TARGET_PLUR)));
+            }
+            hex::decode_to_slice(to.trim_start_matches("0x"), &mut addr).unwrap();
+            let (_, issuer) = self.chequebooks.get(&addr)?;
+            Some(json!(word_hex(issuer)))
+        }
+    }
+
+    impl ChainTransport for ChainScript {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let method = req["method"].as_str().unwrap().to_string();
+            self.seen.lock().unwrap().push(method.clone());
+            let id = req["id"].clone();
+            let result = match method.as_str() {
+                "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
+                // A backend that hasn't seen the tx (yet).
+                "eth_getTransactionReceipt" => serde_json::Value::Null,
+                "eth_getLogs" => {
+                    let filter = &req["params"][0];
+                    let address = filter["address"].as_str().unwrap().to_ascii_lowercase();
+                    if address == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() {
+                        json!(self
+                            .transfers
+                            .iter()
+                            .map(|(to, tx)| json!({
+                                "address": ant_chain::GNOSIS_BZZ_TOKEN,
+                                "topics": [
+                                    format!("0x{}", hex::encode(ant_chain::discover::ERC20_TRANSFER_TOPIC)),
+                                    word_hex(&self.node_eth),
+                                    word_hex(to),
+                                ],
+                                "data": "0x",
+                                "transactionHash": format!("0x{}", hex::encode(tx)),
+                                "blockNumber": format!("0x{HIT_BLOCK:x}"),
+                            }))
+                            .collect::<Vec<_>>())
+                    } else {
+                        let bc = format!(
+                            "0x{}",
+                            hex::encode(ant_chain::tx::batch_created_event_topic())
+                        );
+                        json!(self
+                            .created
+                            .iter()
+                            .map(|(batch, tx)| json!({
+                                "address": ant_chain::GNOSIS_POSTAGE_STAMP,
+                                "topics": [bc.clone(), word_hex(batch)],
+                                "data": "0x",
+                                "transactionHash": format!("0x{}", hex::encode(tx)),
+                                "blockNumber": format!("0x{HIT_BLOCK:x}"),
+                            }))
+                            .collect::<Vec<_>>())
+                    }
+                }
+                "eth_call" => {
+                    let call = &req["params"][0];
+                    match self
+                        .eth_call(call["to"].as_str().unwrap(), call["data"].as_str().unwrap())
+                    {
+                        Some(v) => v,
+                        None => panic!("unscripted eth_call {call}"),
+                    }
+                }
+                // Spending paths: answer an error, but record them.
+                _ => {
+                    return Some(
+                        json!({"jsonrpc": "2.0", "id": id,
+                               "error": {"code": -32603, "message": "scripted: not allowed here"}})
+                        .to_string(),
+                    )
+                }
+            };
+            Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+        }
+    }
+
+    /// What a fake node loop saw: registered batches and the chequebooks
+    /// settlement was switched on for.
+    #[derive(Default)]
+    struct NodeLog {
+        registered: Vec<[u8; 32]>,
+        enabled: Vec<[u8; 20]>,
+        disabled: Vec<[u8; 20]>,
+        /// Fail this many `RegisterBatch` commands before accepting.
+        fail_registers: usize,
+    }
+
+    fn fake_node() -> (
+        tokio::sync::mpsc::Sender<ant_control::ControlCommand>,
+        std::sync::Arc<Mutex<NodeLog>>,
+    ) {
+        use ant_control::{ControlAck, ControlCommand};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
+        let log = std::sync::Arc::new(Mutex::new(NodeLog::default()));
+        let sink = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::RegisterBatch { batch_id, ack, .. } => {
+                        let mut log = sink.lock().unwrap();
+                        if log.fail_registers > 0 {
+                            log.fail_registers -= 1;
+                            let _ = ack.send(ControlAck::Error {
+                                message: "scripted register failure".into(),
+                            });
+                            continue;
+                        }
+                        log.registered.push(batch_id);
+                        let _ = ack.send(ControlAck::Ok {
+                            message: "registered".into(),
+                        });
+                    }
+                    ControlCommand::DisablePushsyncSwap {
+                        chequebook, ack, ..
+                    } => {
+                        sink.lock().unwrap().disabled.push(chequebook);
+                        let _ = ack.send(ControlAck::Ok {
+                            message: "disabled".into(),
+                        });
+                    }
+                    ControlCommand::EnablePushsyncSwap {
+                        chequebook, ack, ..
+                    } => {
+                        sink.lock().unwrap().enabled.push(chequebook);
+                        let _ = ack.send(ControlAck::Ok {
+                            message: "enabled".into(),
+                        });
+                    }
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+        });
+        (tx, log)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ant-ffi-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn client(script: &std::sync::Arc<ChainScript>) -> ChainClient {
+        ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()))
+    }
+
+    const NODE_KEY: [u8; 32] = [7u8; 32];
+
+    fn node_wallet() -> (ant_chain::tx::Wallet, [u8; 20]) {
+        let wallet = ant_chain::tx::Wallet::new(NODE_KEY, crate::GNOSIS_CHAIN_ID).unwrap();
+        let eth = *wallet.address();
+        (wallet, eth)
+    }
+
+    /// A corrupt `chequebook.json` no longer disables settlement for
+    /// good: the chequebook is found on-chain, the record rewritten, and
+    /// settlement switched on. Adopt-only mode, so nothing is spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_chequebook_record_is_recovered_on_chain() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-corrupt");
+        std::fs::write(dir.join("chequebook.json"), b"{ truncated").unwrap();
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((CANDIDATE, [0x71; 32]));
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect("recovered");
+
+        assert_eq!(got, Some(CANDIDATE));
+        assert_eq!(
+            ant_chain::chequebook_store::load_persisted_chequebook_for(
+                &dir.join("chequebook.json"),
+                &eth
+            )
+            .unwrap(),
+            Some(CANDIDATE),
+            "the corrupt record is rewritten",
+        );
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn persist(dir: &std::path::Path, cb: [u8; 20], issuer: [u8; 20]) {
+        ant_chain::chequebook_store::persist_chequebook(
+            &dir.join("chequebook.json"),
+            &ant_chain::chequebook_store::ChequebookFile::rediscovered(&cb, &issuer),
+        )
+        .unwrap();
+    }
+
+    /// A persisted chequebook that passes antd's checks is switched on,
+    /// including by `ant_deploy_chequebook`'s path (F5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persisted_chequebook_is_checked_then_enabled() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-ok");
+        persist(&dir, CANDIDATE, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, Some(CANDIDATE));
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        assert_eq!(script.seen("eth_call"), 2, "factory + issuer() checks");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F4: a persisted chequebook the factory doesn't know, or one issued
+    /// by another key, is not switched on, and no replacement is deployed.
+    /// Settlement `ant_init` switched on for it unchecked is switched off
+    /// again (R1-F1), and the status stops reporting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disqualified_persisted_chequebook_is_not_enabled() {
+        // Its own address: `DISQUALIFIED` is process-wide, and other
+        // tests adopt `CANDIDATE` concurrently.
+        const BAD: [u8; 20] = [0xd1; 20];
+        let (wallet, eth) = node_wallet();
+        for (registered, issuer, why, issuer_reads) in [
+            (false, eth, "not registered", 0),
+            (true, [0x5e; 20], "is issued by", 1),
+        ] {
+            let dir = scratch("cb-bad");
+            persist(&dir, BAD, eth);
+            let mut script = ChainScript::new(eth);
+            script.chequebooks.insert(BAD, (registered, issuer));
+            let script = std::sync::Arc::new(script);
+            let (cmd_tx, node) = fake_node();
+
+            let err = super::setup_settlement(
+                &cmd_tx,
+                &client(&script),
+                &wallet,
+                &dir,
+                NODE_KEY,
+                eth,
+                true,
+            )
+            .await
+            .expect_err("a disqualified chequebook must not be used");
+
+            assert!(err.to_string().contains(why), "got {err}");
+            assert!(node.lock().unwrap().enabled.is_empty());
+            assert_eq!(
+                node.lock().unwrap().disabled,
+                vec![BAD],
+                "settlement enabled unchecked at init is switched off",
+            );
+            assert!(super::lock_disqualified().contains(&(eth, BAD)));
+            // The factory read, then `issuer()` only when it can matter.
+            assert_eq!(script.seen("eth_call"), 1 + issuer_reads);
+            assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+            assert_eq!(script.seen("eth_getBalance"), 0, "no deploy pre-flight");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Adopt-only mode (gateway start) with no chequebook anywhere: a
+    /// clean "none", and nothing that would spend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopt_only_never_deploys() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-none");
+        let script = std::sync::Arc::new(ChainScript::new(eth));
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, None);
+        assert!(node.lock().unwrap().enabled.is_empty());
+        for spend in [
+            "eth_getBalance",
+            "eth_getTransactionCount",
+            "eth_sendRawTransaction",
+        ] {
+            assert_eq!(script.seen(spend), 0, "{spend} must not be called");
+        }
+        assert!(!dir.join("chequebook.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Gateway-start chain init registers the funded batches this account
+    /// owns on-chain that aren't registered yet (antd step 3), and
+    /// adopts the on-chain chequebook without spending. A second run in
+    /// the same process doesn't rescan for batches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chain_init_rediscovers_batches_and_adopts_the_chequebook() {
+        let (_, eth) = node_wallet();
+        let dir = scratch("chain-init");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let (known, lost) = ([0xa1u8; 32], [0xa2u8; 32]);
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::from([(
+                known,
+                ant_postage::StampIssuer::open_or_new(
+                    postage.join(format!("{}.bin", hex::encode(known))),
+                    known,
+                    20,
+                    16,
+                    false,
+                )
+                .unwrap(),
+            )])),
+            stamp_key: NODE_KEY,
+            batch_owner: eth,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(std::sync::Arc::clone(&upload));
+
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((postage_addr, [0x01; 32]));
+        script.transfers.push((postage_addr, [0x02; 32]));
+        script.transfers.push((CANDIDATE, [0x03; 32]));
+        script.created.push((known, [0x01; 32]));
+        script.created.push((lost, [0x02; 32]));
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        init.run(&client(&script), &cmd_tx, &dir, NODE_KEY).await;
+
+        {
+            let node = node.lock().unwrap();
+            assert_eq!(
+                node.registered,
+                vec![lost],
+                "only the batch missing locally"
+            );
+            assert_eq!(node.enabled, vec![CANDIDATE], "on-chain chequebook adopted");
+        }
+        for spend in [
+            "eth_getBalance",
+            "eth_getTransactionCount",
+            "eth_sendRawTransaction",
+        ] {
+            assert_eq!(
+                script.seen(spend),
+                0,
+                "{spend} must not be called at gateway start"
+            );
+        }
+
+        // A gateway restart: the batch scan doesn't run again, and
+        // settlement, already on, isn't set up a second time.
+        let scans = script.seen("eth_getLogs");
+        init.run(&client(&script), &cmd_tx, &dir, NODE_KEY).await;
+        assert_eq!(script.seen("eth_getLogs"), scans, "no rescan on restart");
+        assert_eq!(node.lock().unwrap().registered, vec![lost]);
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M1: a rediscovered batch whose registration failed is retried
+    /// by the next chain-init run instead of being dropped for the rest
+    /// of the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_rediscovered_registration_is_retried() {
+        let (_, eth) = node_wallet();
+        let dir = scratch("chain-init-retry");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let lost = [0xa3u8; 32];
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: eth,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(std::sync::Arc::clone(&upload));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((postage_addr, [0x04; 32]));
+        script.created.push((lost, [0x04; 32]));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+        node.lock().unwrap().fail_registers = 1;
+
+        init.rediscover_owned(&client(&script), &cmd_tx).await;
+        assert!(node.lock().unwrap().registered.is_empty());
+        assert!(!*init.batches_rediscovered.lock().await);
+
+        init.rediscover_owned(&client(&script), &cmd_tx).await;
+        assert_eq!(node.lock().unwrap().registered, vec![lost], "retried");
+        assert!(*init.batches_rediscovered.lock().await);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M2: a chequebook we just deployed (the record carries its
+    /// deploy tx) that a lagging backend reports as unregistered is
+    /// still used while that backend hasn't seen the deploy receipt —
+    /// and disqualified once a visible receipt shows no such deploy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn just_deployed_chequebook_survives_a_lagging_factory_read() {
+        const FRESH: [u8; 20] = [0xd2; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-lag");
+        ant_chain::chequebook_store::persist_chequebook(
+            &dir.join("chequebook.json"),
+            &ant_chain::chequebook_store::ChequebookFile {
+                chequebook: format!("0x{}", hex::encode(FRESH)),
+                issuer: format!("0x{}", hex::encode(eth)),
+                salt: String::new(),
+                deploy_tx: format!("0x{}", hex::encode([0x77u8; 32])),
+            },
+        )
+        .unwrap();
+        // Lagging: the backend hasn't seen the deploy block, so the
+        // factory says "no" and the receipt isn't there yet.
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(FRESH, (false, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect("a lagging read is not a disqualification");
+        assert_eq!(got, Some(FRESH));
+        assert_eq!(node.lock().unwrap().enabled, vec![FRESH]);
+        assert!(node.lock().unwrap().disabled.is_empty());
+        assert_eq!(script.seen("eth_getTransactionReceipt"), 1);
+
+        // R2-M2: the same record long after the deploy: a backend
+        // doesn't lag that far behind, so the factory's "no" stands.
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("chequebook.json"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - super::DEPLOY_LAG_GRACE * 2)
+            .unwrap();
+        let err = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect_err("past the grace, an unregistered chequebook is disqualified");
+        assert!(err.to_string().contains("not registered"), "got {err}");
+        assert_eq!(node.lock().unwrap().disabled, vec![FRESH]);
+        assert_eq!(
+            script.seen("eth_getTransactionReceipt"),
+            1,
+            "no receipt read"
+        );
+        super::lock_disqualified().remove(&(eth, FRESH));
+
+        // A rediscovered record has no deploy tx to vouch for it: the
+        // factory's "no" stands.
+        persist(&dir, FRESH, eth);
+        let err = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect_err("no deploy tx, so the factory answer stands");
+        assert!(err.to_string().contains("not registered"), "got {err}");
+        assert_eq!(node.lock().unwrap().disabled, vec![FRESH, FRESH]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M3 / R2-M3: an unreadable record may name a deposit-0
+    /// chequebook the funded-only rediscovery scan can't see. When its
+    /// bytes still hold that address and the chain confirms it's ours,
+    /// it's adopted (no deploy) and the record rewritten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_record_is_salvaged_from_its_bytes() {
+        const UNFUNDED: [u8; 20] = [0xd3; 20];
+        let (wallet, eth) = node_wallet();
+        for may_spend in [false, true] {
+            let dir = scratch(&format!("cb-corrupt-salvage-{may_spend}"));
+            // Half-written: the address survived, the JSON didn't.
+            std::fs::write(
+                dir.join("chequebook.json"),
+                format!(
+                    "{{\"chequebook\":\"0x{}\",\"issuer\":\"0x{}\",\"sa",
+                    hex::encode(UNFUNDED),
+                    hex::encode(eth)
+                ),
+            )
+            .unwrap();
+            let mut script = ChainScript::new(eth);
+            script.chequebooks.insert(UNFUNDED, (true, eth));
+            let script = std::sync::Arc::new(script);
+            let (cmd_tx, node) = fake_node();
+
+            let got = super::setup_settlement(
+                &cmd_tx,
+                &client(&script),
+                &wallet,
+                &dir,
+                NODE_KEY,
+                eth,
+                may_spend,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(got, Some(UNFUNDED));
+            assert_eq!(node.lock().unwrap().enabled, vec![UNFUNDED]);
+            assert_eq!(
+                ant_chain::chequebook_store::load_persisted_chequebook_for(
+                    &dir.join("chequebook.json"),
+                    &eth
+                )
+                .unwrap(),
+                Some(UNFUNDED),
+                "record rewritten",
+            );
+            assert!(!dir.join("chequebook.json.unreadable").exists());
+            assert_eq!(script.seen("eth_getBalance"), 0, "no deploy pre-flight");
+            assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// R2-M3: an unreadable record that names no chequebook of ours is
+    /// moved aside instead of blocking every deploy for good (a mobile
+    /// user can't reach the file to fix it); adopt-only leaves it alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_record_naming_nothing_is_parked_before_a_deploy() {
+        const FOREIGN: [u8; 20] = [0xd4; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-corrupt-none");
+        let record = dir.join("chequebook.json");
+        std::fs::write(
+            &record,
+            format!("{{ \"chequebook\": \"0x{}\", trunc", hex::encode(FOREIGN)),
+        )
+        .unwrap();
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(FOREIGN, (true, [0x5e; 20]));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, None);
+        assert!(record.exists(), "adopt-only doesn't touch the record");
+        assert_eq!(script.seen("eth_getBalance"), 0);
+
+        // A spending caller moves it aside and goes on to deploy (which
+        // the script refuses — the deploy pre-flight is what we look for).
+        let _ = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            true,
+        )
+        .await;
+        assert!(node.lock().unwrap().enabled.is_empty());
+        assert!(!record.exists());
+        assert!(dir.join("chequebook.json.unreadable").exists());
+        assert!(script.seen("eth_getBalance") > 0, "deploy attempted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-M3: the salvage only trusts addresses the chain confirms, and
+    /// skips longer hex runs (tx hashes, salts).
+    #[test]
+    fn addresses_in_finds_only_address_runs() {
+        let a = [0xabu8; 20];
+        let text = format!(
+            "x0x{} 0x{} 0X{} 0x{}",
+            hex::encode(a),
+            hex::encode([0x11u8; 32]),
+            hex::encode(a),
+            &hex::encode(a)[..39],
+        );
+        assert_eq!(super::addresses_in(text.as_bytes()), vec![a]);
+    }
+
+    /// R2-M1: a chequebook the chain check disqualified reads as "none"
+    /// on the deposit card (like `settlement_status`) and is never
+    /// funded by the top-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disqualified_chequebook_is_neither_shown_nor_funded() {
+        const BAD: [u8; 20] = [0xd5; 20];
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-dq-topup");
+        persist(&dir, BAD, eth);
+        let script = std::sync::Arc::new(ChainScript::new(eth));
+        super::lock_disqualified().insert((eth, BAD));
+
+        let card = super::settlement_deposit_for(&client(&script), &dir, &eth)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["enabled"], false);
+        assert_eq!(card["needs_top_up"], false);
+        let (cmd_tx, _node) = fake_node();
+        let err = super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
+            .await
+            .expect_err("no deposit into a disqualified chequebook");
+        assert!(
+            err.to_string().contains("failed its on-chain checks"),
+            "got {err}"
+        );
+        assert_eq!(
+            super::quote_deposit_shortfall(&client(&script), &dir, &eth).await,
+            0
+        );
+        assert!(
+            script.seen.lock().unwrap().is_empty(),
+            "no chain call at all"
+        );
+        super::lock_disqualified().remove(&(eth, BAD));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R3-M1: the top-up runs the chequebook's chain checks itself
+    /// before spending, instead of relying on a chain init (none without
+    /// an RPC, or still in flight) to have filled `DISQUALIFIED`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_checks_the_chequebook_before_spending() {
+        const BAD: [u8; 20] = [0xd6; 20];
+        let (_, eth) = node_wallet();
+        for (registered, issuer, why, issuer_reads) in [
+            (false, eth, "not registered", 0),
+            (true, [0x5e; 20], "is issued by", 1),
+        ] {
+            let dir = scratch("cb-topup-check");
+            persist(&dir, BAD, eth);
+            let mut script = ChainScript::new(eth);
+            script.chequebooks.insert(BAD, (registered, issuer));
+            let script = std::sync::Arc::new(script);
+            let (cmd_tx, node) = fake_node();
+            assert!(!super::lock_disqualified().contains(&(eth, BAD)));
+
+            let err =
+                super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
+                    .await
+                    .expect_err("no deposit into a chequebook that fails its checks");
+
+            assert!(err.to_string().contains(why), "got {err}");
+            assert_eq!(
+                script.seen("eth_call"),
+                1 + issuer_reads,
+                "only the checks ran"
+            );
+            assert_eq!(script.seen("eth_getBalance"), 0);
+            assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+            assert!(super::lock_disqualified().contains(&(eth, BAD)));
+            assert_eq!(node.lock().unwrap().disabled, vec![BAD]);
+            super::lock_disqualified().remove(&(eth, BAD));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// R3-M1: a chequebook that passes its checks goes on to the deposit
+    /// read (here: already at target, so a no-op), nothing disqualified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_of_a_checked_chequebook_proceeds() {
+        const GOOD: [u8; 20] = [0xd7; 20];
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-topup-ok");
+        persist(&dir, GOOD, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(GOOD, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let card = super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["enabled"], true);
+        assert_eq!(card["needs_top_up"], false);
+        assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+        assert!(node.lock().unwrap().disabled.is_empty());
+        assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R3-M2: a disqualification is scoped to the account that checked.
+    /// Account A refusing X (issued by B) must not hide X from B after
+    /// an in-process switch to B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disqualification_is_per_account() {
+        const X: [u8; 20] = [0xd8; 20];
+        const A: [u8; 20] = [0xa1; 20];
+        let (_, b) = node_wallet();
+        let dir = scratch("cb-dq-per-account");
+        persist(&dir, X, b);
+        let script = std::sync::Arc::new(ChainScript::new(b));
+        super::lock_disqualified().insert((A, X));
+
+        assert_eq!(
+            super::quote_deposit_shortfall(&client(&script), &dir, &b).await,
+            0,
+            "B's chequebook is read (full in the script), not treated as disqualified",
+        );
+        let card = super::settlement_deposit_for(&client(&script), &dir, &b)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["enabled"], true);
+        assert!(script.seen("eth_call") > 0, "B's deposit was read on-chain");
+        super::lock_disqualified().remove(&(A, X));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R3-M3: parking a second unreadable record keeps the first parked
+    /// file instead of renaming over it.
+    #[test]
+    fn park_path_never_reuses_a_parked_file() {
+        let dir = scratch("cb-park");
+        let record = dir.join("chequebook.json");
+        let first = super::unused_park_path(&record);
+        assert_eq!(first, dir.join("chequebook.json.unreadable"));
+        std::fs::write(&first, b"episode 1").unwrap();
+        let second = super::unused_park_path(&record);
+        assert_eq!(second, dir.join("chequebook.json.unreadable.1"));
+        std::fs::write(&second, b"episode 2").unwrap();
+        assert_eq!(
+            super::unused_park_path(&record),
+            dir.join("chequebook.json.unreadable.2")
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"episode 1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two overlapping chain-init runs (an idempotent `ant_start_gateway`
+    /// re-call while the first run is still in flight) scan for batches
+    /// once and register a rediscovered batch once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_chain_init_runs_rediscover_once() {
+        let (_, eth) = node_wallet();
+        let dir = scratch("chain-init-overlap");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let lost = [0xa2u8; 32];
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: eth,
+            postage_dir: postage,
+        });
+        let init = std::sync::Arc::new(super::ChainInit::new(std::sync::Arc::clone(&upload)));
+
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((postage_addr, [0x02; 32]));
+        script.transfers.push((CANDIDATE, [0x03; 32]));
+        script.created.push((lost, [0x02; 32]));
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        // One run alone, for the scan count to compare against.
+        let solo_dir = scratch("chain-init-solo");
+        let solo_script = std::sync::Arc::new({
+            let mut s = ChainScript::new(eth);
+            s.transfers.push((postage_addr, [0x02; 32]));
+            s.transfers.push((CANDIDATE, [0x03; 32]));
+            s.created.push((lost, [0x02; 32]));
+            s.chequebooks.insert(CANDIDATE, (true, eth));
+            s
+        });
+        let (solo_tx, _solo_node) = fake_node();
+        super::ChainInit::new(std::sync::Arc::clone(&upload))
+            .run(&client(&solo_script), &solo_tx, &solo_dir, NODE_KEY)
+            .await;
+        let one_scan = solo_script.seen("eth_getLogs");
+
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                let (init, chain, cmd_tx, dir) = (
+                    std::sync::Arc::clone(&init),
+                    client(&script),
+                    cmd_tx.clone(),
+                    dir.clone(),
+                );
+                tokio::spawn(async move { init.run(&chain, &cmd_tx, &dir, NODE_KEY).await })
+            })
+            .collect();
+        for run in runs {
+            run.await.unwrap();
+        }
+
+        assert_eq!(script.seen("eth_getLogs"), one_scan, "one scan, not two");
+        assert_eq!(
+            node.lock().unwrap().registered,
+            vec![lost],
+            "registered once"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&solo_dir).ok();
     }
 }

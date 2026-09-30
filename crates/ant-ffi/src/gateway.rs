@@ -11,8 +11,10 @@
 //! bee-HTTP Swift layer (`BeeAPIClient`, `BzzSchemeHandler`) points at
 //! `http://127.0.0.1:<port>` unchanged. There is exactly one gateway
 //! per handle; a second `ant_start_gateway` while one is running
-//! succeeds without touching it (it only retries the persisted-batch
-//! check).
+//! succeeds without touching it; with a `gnosis_rpc` it re-runs the
+//! chain startup work (persisted-batch check, owned-batch rediscovery,
+//! chequebook adoption) so a step that failed earlier is retried —
+//! a step that already succeeded is skipped.
 //!
 //! CORS is off by default: the gateway has no auth, so any page a
 //! browser lets read its responses can read `/wallet`, `/addresses`,
@@ -23,8 +25,13 @@
 //! stop a page from *sending* a request: a CORS-simple request (a
 //! `POST` with no body or a form/text body and no custom headers) needs
 //! no preflight, so any page can still fire the state-changing routes —
-//! `POST /stamps/{amount}/{depth}` (buys a batch), `POST
-//! /chequebook/deposit` (moves xBZZ) — with `mode: 'no-cors'`, whatever
+//! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
+//! `gnosis_rpc`, then deploys a chequebook if the account has none and
+//! funds it, or tops up an existing one below the settlement-deposit
+//! target, by transferring the wallet's existing xBZZ — every one of
+//! those transactions costs xDAI gas; nothing is swapped),
+//! `POST /chequebook/deposit` (moves xBZZ, paying xDAI gas) —
+//! with `mode: 'no-cors'`, whatever
 //! the allow-list says. Those routes are unprotected against
 //! cross-site requests; see issue #105.
 
@@ -62,27 +69,44 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (`antd`) parity. Only honoured when the crate is built with the
 /// `chain` feature; ignored otherwise.
 ///
-/// A `gnosis_rpc` also triggers the on-chain check of the postage
-/// batches [`crate::ant_init`] reloaded from `postage/*.bin` (it had no
-/// RPC to do it itself). It runs in the background right after the
-/// gateway starts: batches the chain reports as missing (evicted or
-/// never created), expired (`remainingBalance` 0) or owned by another
-/// key are unregistered — no longer listed by `GET /stamps`, no longer
-/// stampable — with a `WARN` naming the batch id; their files stay on
-/// disk. "Missing" must be read twice, 45 seconds apart, before it
-/// counts: a batch bought just before a relaunch can read as missing
-/// on an RPC backend that hasn't seen its creation block yet, so the
-/// first such read only schedules a background re-check (the batch
-/// stays registered meanwhile). A batch whose read fails
-/// stays registered and is re-checked by the next call with a
-/// `gnosis_rpc` — including an idempotent one that finds the gateway
-/// already running, so a host may simply re-call this (e.g. on
-/// foreground) to retry.
+/// A `gnosis_rpc` also triggers the chain-derived startup work
+/// [`crate::ant_init`] can't do without an RPC (`drive::ChainInit`,
+/// the counterpart of `antd`'s startup chain block). It runs in the
+/// background right after the gateway starts:
+///
+/// 1. Reloaded `postage/*.bin` batches the chain reports as missing
+///    (evicted or never created), expired (`remainingBalance` 0) or
+///    owned by another key are unregistered, with a `WARN` naming the
+///    batch id. They're no longer listed by `GET /stamps` and can't be
+///    stamped with; their files stay on disk. "Missing" must be read
+///    twice, 45 seconds apart, before it counts: a batch bought just
+///    before a relaunch can read as missing on an RPC backend that
+///    hasn't seen its creation block yet, so the first such read only
+///    schedules a background re-check (the batch stays registered
+///    meanwhile, and steps 2 and 3 don't wait for it).
+/// 2. Funded batches the account owns on-chain but not on disk
+///    (reinstall, restore from key) are registered.
+/// 3. The persisted or on-chain chequebook is adopted and outbound
+///    settlement switched on. Nothing is deployed or funded.
+///
+/// A step that fails (a batch whose read fails stays registered, a
+/// failed rediscovery scan, a chequebook that couldn't be resolved) is
+/// retried by the next call with a `gnosis_rpc` — including an
+/// idempotent one that finds the gateway already running, so a host may
+/// simply re-call this (e.g. on foreground) to retry. Steps that already
+/// succeeded are not repeated.
+///
+/// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
+/// sure settlement is on afterwards, as `ant_storage_buy` does: it
+/// deploys a chequebook if the account has none (paying gas in xDAI)
+/// and brings the deposit of a new or existing chequebook up to the
+/// settlement target from the wallet's existing xBZZ (capped to what
+/// the wallet holds; nothing is swapped).
 ///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
 /// [`crate::ant_set_chain_transport`] *before* this; installing one
-/// later only affects the per-call `ant_storage_*` / `ant_settlement_*`
+/// later only affects the per-call `ant_storage_*` / `ant_deploy_chequebook`
 /// paths until the gateway is stopped and started again. What is
 /// captured is the handle's transport *slot*, though, so replacing or
 /// clearing a transport that was installed before the start does reach
@@ -94,8 +118,9 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// none, so it sends no CORS headers and no page from another origin can
 /// read its responses. That does not stop a page from *sending*
 /// CORS-simple requests, which still execute — including spending ones
-/// like `POST /stamps/{amount}/{depth}` and `POST /chequebook/deposit`
-/// (see the module docs).
+/// like `POST /stamps/{amount}/{depth}` (which may also deploy a
+/// chequebook and move xBZZ into a new or under-funded one, above) and
+/// `POST /chequebook/deposit` (see the module docs).
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -103,8 +128,15 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// while one is live is a success that leaves the running gateway
 /// untouched — it keeps the CORS list and chain wiring it started with
 /// (a changed [`ant_set_gateway_cors`] list only applies after
-/// [`ant_stop_gateway`] + start) and only retries the pending
-/// persisted-batch check above.
+/// [`ant_stop_gateway`] + start). With a `gnosis_rpc` it re-runs the
+/// chain startup work above, retrying only what hasn't succeeded yet: a
+/// batch whose check failed or is still pending is re-read, and a
+/// rediscovery scan or chequebook adoption that failed is retried. A
+/// rediscovery scan or adoption that already succeeded is not repeated
+/// in this process — a batch bought on another device only shows up
+/// after an explicit `ant_storage_discover`, or a fresh `ant_init`
+/// followed by a start with a `gnosis_rpc` (`ant_init` alone only
+/// reloads persisted state; the rescan runs here, in `ChainInit::run`).
 ///
 /// # Safety
 ///
@@ -182,12 +214,14 @@ pub unsafe extern "C" fn ant_start_gateway(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
-            // Still retry the persisted-batch check: a pass whose RPC
-            // read failed left batches pending, and re-calling start
-            // (e.g. on foreground) is how a host asks for that retry.
+            // Still retry the chain init: a run whose RPC reads failed
+            // left work pending (unconfirmed batches, a failed
+            // rediscovery scan, no chequebook adopted), and re-calling
+            // start (e.g. on foreground) is how a host asks for that
+            // retry.
             #[cfg(feature = "chain")]
             if let Some(rpc) = gnosis_rpc {
-                spawn_persisted_issuer_check(handle, rpc);
+                spawn_chain_init(handle, handle.chain_client(rpc));
             }
             return true;
         }
@@ -290,6 +324,18 @@ pub unsafe extern "C" fn ant_start_gateway(
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
 
+        // One chain client, routed through the host transport like every
+        // client this crate builds, for the background chain init and
+        // the after-buy hook below.
+        #[cfg(feature = "chain")]
+        let chain_client = gnosis_rpc.clone().map(|rpc| handle.chain_client(rpc));
+        #[cfg(feature = "chain")]
+        let on_batch_bought = chain_client
+            .clone()
+            .map(|client| after_buy_hook(handle, client));
+        #[cfg(not(feature = "chain"))]
+        let on_batch_bought = None;
+
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
             api_version: Arc::new(BEE_API_VERSION.to_string()),
@@ -329,6 +375,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             // ACT publisher identity: the node signing key, like bee's
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),
+            on_batch_bought,
         };
 
         let task = handle.runtime.spawn(async move {
@@ -338,34 +385,57 @@ pub unsafe extern "C" fn ant_start_gateway(
         });
         *slot = Some(task);
 
-        // First point an RPC is known: confirm the postage batches
-        // `ant_init` reloaded from disk and unregister the ones the chain
-        // disowns (expired / never created / foreign), as `antd` does at
-        // startup — otherwise `/stamps` keeps offering a dead batch until
-        // a peer rejects the first push. Off the caller's thread so the
-        // gateway start never waits on the RPC; batches whose read fails
-        // stay registered and are retried by the next call with an RPC.
+        // First point an RPC is known: run the chain-derived startup
+        // work `ant_init` couldn't (see the doc comment above). Off the
+        // caller's thread so the gateway start never waits on the RPC;
+        // failed steps are retried by the next call with an RPC.
         #[cfg(feature = "chain")]
-        if let Some(rpc) = gnosis_rpc {
-            spawn_persisted_issuer_check(handle, rpc);
+        if let Some(chain) = chain_client {
+            spawn_chain_init(handle, chain);
         }
         true
     }
 }
 
-/// Run [`crate::drive::PersistedIssuers::verify_on_chain`] in the
-/// background against `rpc` (or the host transport, via
-/// `chain_client`). Passes are serialized inside `verify_on_chain`, and
-/// one with nothing pending issues no reads, so calling this on every
+/// The gateway's after-buy hook: once `POST /stamps` has bought and
+/// registered a batch, make sure outbound settlement is on, resolving,
+/// deploying or funding the chequebook exactly as `ant_storage_buy`
+/// does. Without it, the first batch bought through the gateway in a
+/// fresh install's session uploads without paying peers until the next
+/// launch. Spawned so the buy response doesn't wait on it. The
+/// chequebook setup lock serialises it against a concurrent
+/// `ant_deploy_chequebook` or chain init.
+#[cfg(feature = "chain")]
+fn after_buy_hook(
+    handle: &AntHandle,
+    client: ant_chain::ChainClient,
+) -> ant_gateway::BatchBoughtHook {
+    let rt = handle.runtime.handle().clone();
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let secret = handle.signing_secret;
+    let eth = handle.eth;
+    Arc::new(move |_batch_id| {
+        let (client, cmd_tx, data_dir) = (client.clone(), cmd_tx.clone(), data_dir.clone());
+        rt.spawn(async move {
+            crate::drive::ensure_settlement_best_effort(&cmd_tx, &client, secret, &data_dir, eth)
+                .await;
+        });
+    })
+}
+
+/// Run [`crate::drive::ChainInit::run`] in the background against
+/// `chain`. Overlapping runs are safe (see `ChainInit::run`), and one
+/// with nothing left to do issues no reads, so calling this on every
 /// `ant_start_gateway` is cheap.
 #[cfg(feature = "chain")]
-fn spawn_persisted_issuer_check(handle: &AntHandle, rpc: String) {
-    let chain = handle.chain_client(rpc);
-    let persisted = Arc::clone(&handle.persisted_issuers);
+fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
+    let init = Arc::clone(&handle.chain_init);
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let secret = handle.signing_secret;
     handle.runtime.spawn(async move {
-        persisted
-            .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
-            .await;
+        init.run(&chain, &cmd_tx, &data_dir, secret).await;
     });
 }
 
@@ -411,9 +481,13 @@ fn spawn_persisted_issuer_check(handle: &AntHandle, rpc: String) {
 /// writes: a CORS-simple request needs no preflight, so any page can
 /// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
 /// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
-/// executes it — spending the wallet's xBZZ — even though the page
-/// cannot read the reply. Don't rely on this call to protect the
-/// wallet's funds.
+/// executes it — spending the wallet's xBZZ (for `/stamps` both the
+/// batch and a transfer into a new or under-funded chequebook's
+/// deposit) and xDAI gas for every transaction it sends — the batch
+/// purchase and, for `/stamps`, deploying a chequebook if there is none
+/// yet and the deposit transfer into a new or under-funded one; nothing
+/// is swapped — even though the page cannot read the reply. Don't rely
+/// on this call to protect the wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a

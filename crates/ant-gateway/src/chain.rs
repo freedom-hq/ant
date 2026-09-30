@@ -574,6 +574,9 @@ pub async fn buy_stamp(
     if let Err(r) = register_batch(&handle, batch_id, depth, immutable).await {
         return r;
     }
+    if let Some(hook) = &handle.on_batch_bought {
+        hook(batch_id);
+    }
     (
         StatusCode::CREATED,
         Json(BatchIdBody {

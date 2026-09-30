@@ -409,7 +409,10 @@ char *ant_storage_status(const AntHandle *handle, char **out_err);
  *   {"enabled":bool,"chequebook":"0x…"|null}
  * `enabled=true` once a chequebook is deployed, which is what lets
  * uploads actually propagate (bee charges the uploader per pushed chunk
- * and freezes out a node that can't pay). Builds without the `chain`
+ * and freezes out a node that can't pay). A persisted chequebook that a
+ * chain check (gateway start, buy, deploy) found unusable — not
+ * registered with the factory, or issued by another key — reports
+ * `enabled=false`: settlement is switched off for it. Builds without the `chain`
  * feature always report {"enabled":false,"chequebook":null}.
  */
 char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
@@ -426,7 +429,9 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
  * out, then collapses into pushsync timeouts — so the Storage tab reads
  * this to detect that and offer ant_storage_settlement_topup.
  * `enabled=false` (zeroed, needs_top_up=false) when this account has no
- * chequebook yet; buying/connecting a plan deploys one, funded. Reads
+ * chequebook yet (buying/connecting a plan deploys one, funded), or when
+ * this process's chain check disqualified its chequebook (settlement is
+ * off for it, as ant_storage_settlement_status reports). Reads
  * chain (a few light eth_calls) — for an explicit refresh, not every
  * status poll. Requires the `chain` cargo feature.
  */
@@ -441,7 +446,10 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * deposit to the chequebook. The explicit top-up path — a chequebook's
  * deposit is only read at deploy time, so an already-deployed one can be
  * funded no other way. Idempotent (a chequebook at the target is a
- * no-op); errors when this account has no chequebook yet. Returns the
+ * no-op); errors when this account has no chequebook yet, when its
+ * chequebook fails the chain checks (factory registration, issuer())
+ * this call runs before spending — it never funds that one — or when
+ * those checks can't be read (retry; nothing spent). Returns the
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.
@@ -710,15 +718,30 @@ void ant_free_string(char *ptr);
  * and /stamps postage state (desktop `antd` parity). Honoured only when
  * the library is built with the `chain` feature; ignored otherwise.
  *
- * A `gnosis_rpc` also triggers, in the background, the on-chain check of
- * the postage batches ant_init reloaded from postage/<id>.bin: batches the
- * chain reports as missing, expired (remainingBalance 0) or owned by
- * another key are unregistered (files stay on disk). "Missing" must be
- * read twice, 45 seconds apart, before it counts (an RPC backend may
- * not have seen a just-bought batch's creation yet); the first such read
- * only schedules a background re-check. A batch whose read fails stays
- * registered and is re-checked by the next call with a `gnosis_rpc` —
- * including one that finds the gateway already running.
+ * A `gnosis_rpc` also triggers, in the background, the chain-derived
+ * startup work ant_init can't do without an RPC (antd's startup chain
+ * block):
+ *
+ *   1. Postage batches ant_init reloaded from postage/<id>.bin that the
+ *      chain reports as missing, expired (remainingBalance 0) or owned by
+ *      another key are unregistered (files stay on disk). "Missing" must
+ *      be read twice, 45 seconds apart, before it counts (an RPC backend
+ *      may not have seen a just-bought batch's creation yet); the first
+ *      such read only schedules a background re-check, and steps 2 and 3
+ *      don't wait for it.
+ *   2. Funded batches the account owns on-chain but not on disk
+ *      (reinstall, restore from key) are registered.
+ *   3. The persisted or on-chain chequebook is adopted and outbound
+ *      settlement switched on. Nothing is deployed or funded.
+ *
+ * A step that fails (e.g. a batch whose read fails stays registered) is
+ * retried by the next call with a `gnosis_rpc` — including one that
+ * finds the gateway already running. Steps that already succeeded are
+ * not repeated. With a `gnosis_rpc`, a batch bought through POST /stamps
+ * also makes sure settlement is on afterwards, as ant_storage_buy does:
+ * it deploys a chequebook if the account has none (xDAI gas) and brings
+ * a new or existing chequebook's deposit up to the settlement target
+ * from the wallet's existing xBZZ (nothing is swapped).
  *
  * The gateway's chain wiring is captured here, once. A host serving
  * chain reads itself must call ant_set_chain_transport BEFORE this.
@@ -730,15 +753,23 @@ void ant_free_string(char *ptr);
  * on that must now call ant_set_gateway_cors explicitly.)
  * CORS only stops reads: any page can still send CORS-simple requests,
  * which execute — including the spending routes POST
- * /stamps/{amount}/{depth} and POST /chequebook/deposit (see
+ * /stamps/{amount}/{depth} (which, as above, may also deploy a
+ * chequebook for xDAI gas and transfer the wallet's xBZZ into a new or
+ * under-funded one; no swap) and POST /chequebook/deposit (see
  * ant_set_gateway_cors; issue #105).
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
- * one is live is a success that leaves the gateway untouched (it only
- * retries the pending persisted-batch check above). Run off the main
- * thread.
+ * one is live is a success that leaves the gateway untouched; with a
+ * `gnosis_rpc` it re-runs the chain startup work above, retrying only
+ * what hasn't succeeded: a failed or pending batch check is re-read, a
+ * failed rediscovery scan or chequebook adoption is retried. A scan or
+ * adoption that already succeeded is not repeated in this process (a
+ * batch bought on another device needs ant_storage_discover, or a fresh
+ * ant_init followed by ant_start_gateway with a `gnosis_rpc` — ant_init
+ * alone only reloads persisted state and never rescans). Run off the
+ * main thread.
  */
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
@@ -787,8 +818,13 @@ bool ant_start_gateway(const AntHandle *handle,
  * A CORS-simple request needs no preflight, so any page can still
  * fetch(url, {method: "POST", mode: "no-cors"}) against
  * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
- * gateway executes it, spending the wallet's xBZZ, even though the page
- * cannot read the reply. Do not rely on this call to protect funds.
+ * gateway executes it, spending the wallet's xBZZ (for /stamps both the
+ * batch and a transfer into a new or under-funded chequebook's deposit)
+ * and xDAI gas for every transaction it sends — the batch purchase and,
+ * for /stamps, deploying a chequebook if there is none yet and the
+ * deposit transfer into a new or under-funded one (nothing is swapped)
+ * — even though the page cannot read the reply. Do not rely on this
+ * call to protect funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL, non-UTF-8 or malformed-wildcard entry) returns false, leaves the stored list

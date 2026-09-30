@@ -213,7 +213,8 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// concurrently from several such threads.
 ///
 /// **Ordering:** takes effect immediately for the storage / settlement
-/// calls (`ant_storage_*`, `ant_settlement_*`, `ant_deploy_chequebook`),
+/// calls (`ant_storage_*`, including `ant_storage_settlement_*`, and
+/// `ant_deploy_chequebook`),
 /// which build a chain client per call. The in-process gateway
 /// (`ant_start_gateway`) captures its chain wiring once at start, so a
 /// transport installed while none was installed at that start is only
@@ -443,14 +444,14 @@ mod tests {
             gateway_cors: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
             chain_transport: std::sync::Arc::new(HostChainTransport::new()),
-            persisted_issuers: std::sync::Arc::new(crate::drive::PersistedIssuers::new(
-                std::sync::Arc::new(ant_p2p::UploadRuntime {
+            chain_init: std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(
+                ant_p2p::UploadRuntime {
                     issuers: std::sync::Mutex::new(std::collections::HashMap::new()),
                     stamp_key: [0u8; 32],
                     batch_owner: [0u8; 20],
                     postage_dir: std::path::PathBuf::from("/nonexistent/postage"),
-                }),
-            )),
+                },
+            ))),
         };
         (handle, (cmd_rx, status_tx))
     }
@@ -617,7 +618,7 @@ mod tests {
     static OWNER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     /// A chain where every batch is gone: `batchOwner` reads the zero
-    /// address. Anything else is unscripted.
+    /// address. Anything else gets a JSON-RPC error.
     unsafe extern "C" fn every_batch_gone_host(
         request: *const c_char,
         _ctx: *mut c_void,
@@ -625,7 +626,16 @@ mod tests {
         let req: serde_json::Value =
             serde_json::from_str(unsafe { CStr::from_ptr(request) }.to_str().unwrap()).unwrap();
         let data = req["params"][0]["data"].as_str().unwrap_or_default();
-        assert!(data.starts_with("0x2182ddb1"), "unscripted request {req}");
+        if !data.starts_with("0x2182ddb1") {
+            // The chain init's other steps (rediscovery scan, chequebook
+            // lookup): fail them, they aren't what this observes. No
+            // panic here — it would unwind across `extern "C"`.
+            return malloc_cstr(
+                &serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                                    "error": {"code": -32601, "message": "unscripted"}})
+                .to_string(),
+            );
+        }
         OWNER_CALLS.fetch_add(1, Ordering::SeqCst);
         malloc_cstr(
             &serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
@@ -635,9 +645,10 @@ mod tests {
     }
 
     /// Re-calling `ant_start_gateway` with an RPC while the gateway is
-    /// already running still runs the pending persisted-batch check —
-    /// that is how a host retries one whose first pass hit a dead RPC
-    /// (e.g. on foreground), without an `ant_stop_gateway` first.
+    /// already running still runs the chain init, and with it the
+    /// pending persisted-batch check — that is how a host retries one
+    /// whose first pass hit a dead RPC (e.g. on foreground), without an
+    /// `ant_stop_gateway` first.
     #[test]
     fn idempotent_gateway_start_retries_the_persisted_batch_check() {
         let (mut handle, _peers) = handle_for_test();
@@ -664,11 +675,10 @@ mod tests {
         });
         // Grace 0: one "gone" read is believed, so the retry itself is
         // what this observes (the grace re-check has its own test).
-        handle.persisted_issuers =
-            std::sync::Arc::new(crate::drive::PersistedIssuers::with_not_found_grace(
-                std::sync::Arc::clone(&upload),
-                std::time::Duration::ZERO,
-            ));
+        handle.chain_init = std::sync::Arc::new(crate::drive::ChainInit::with_not_found_grace(
+            std::sync::Arc::clone(&upload),
+            std::time::Duration::ZERO,
+        ));
         // A gateway that is already up: the start takes its early return.
         *handle.gateway_task.lock().unwrap() =
             Some(handle.runtime.spawn(std::future::pending::<()>()));
