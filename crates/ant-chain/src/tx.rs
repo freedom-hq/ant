@@ -395,21 +395,11 @@ impl ChainClient {
             "method": "eth_getTransactionCount",
             "params": params,
         });
-        let v: serde_json::Value = self
-            .http()
-            .post(self.url())
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = v.get("error") {
-            return Err(RpcError::Rpc(err.to_string()));
+        let v = self.rpc(&body).await?;
+        if let Some(err) = crate::rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
         }
-        let s = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        let s = crate::rpc_result_str(&v)?;
         let s = s.strip_prefix("0x").unwrap_or(s);
         let s = if s.is_empty() { "0" } else { s };
         u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(e.to_string()))
@@ -425,21 +415,11 @@ impl ChainClient {
             "method": "eth_sendRawTransaction",
             "params": [format!("0x{}", hex::encode(raw))],
         });
-        let v: serde_json::Value = self
-            .http()
-            .post(self.url())
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = v.get("error") {
-            return Err(RpcError::Rpc(err.to_string()));
+        let v = self.rpc(&body).await?;
+        if let Some(err) = crate::rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
         }
-        let s = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        let s = crate::rpc_result_str(&v)?;
         let s = s.strip_prefix("0x").unwrap_or(s);
         let mut out = [0u8; 32];
         hex::decode_to_slice(s, &mut out).map_err(|e| RpcError::Decode(e.to_string()))?;
@@ -462,16 +442,9 @@ impl ChainClient {
             "method": "eth_getTransactionReceipt",
             "params": [format!("0x{}", hex::encode(tx_hash))],
         });
-        let v: serde_json::Value = self
-            .http()
-            .post(self.url())
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = v.get("error") {
-            return Err(RpcError::Rpc(err.to_string()));
+        let v = self.rpc(&body).await?;
+        if let Some(err) = crate::rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
         }
         let Some(receipt) = v.get("result").filter(|r| !r.is_null()) else {
             return Ok(None);
@@ -509,18 +482,9 @@ impl ChainClient {
                 "method": "eth_getTransactionReceipt",
                 "params": [format!("0x{}", hex::encode(tx_hash))],
             });
-            let v: serde_json::Value = self
-                .http()
-                .post(self.url())
-                .json(&body)
-                .send()
-                .await
-                .map_err(RpcError::Http)?
-                .json()
-                .await
-                .map_err(RpcError::Http)?;
-            if let Some(err) = v.get("error") {
-                return Err(RpcError::Rpc(err.to_string()).into());
+            let v = self.rpc(&body).await?;
+            if let Some(err) = crate::rpc_error_json(&v) {
+                return Err(RpcError::Rpc(err).into());
             }
             if let Some(receipt) = v.get("result").filter(|r| !r.is_null()) {
                 let status = receipt.get("status").and_then(|s| s.as_str()).unwrap_or("");

@@ -1,6 +1,6 @@
 [package]
 name = "ant-p2p"
-version = "0.5.44"
+version = "0.5.49"
 edition.workspace = true
 license.workspace = true
 
@@ -24,6 +24,7 @@ async-trait = "0.1.89"
 base64 = "0.22.1"
 futures = "0.3.31"
 hex.workspace = true
+if-addrs = "0.15.0"
 hickory-resolver = { version = "0.25.2", default-features = false, features = [
   "system-config",
   "tokio"

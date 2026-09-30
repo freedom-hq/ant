@@ -481,7 +481,7 @@ pub(crate) fn storage_connect_batch(
     let secret = h.signing_secret;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let chain = ant_chain::ChainClient::new(rpc);
+        let chain = h.chain_client(rpc);
         let meta =
             ant_chain::fetch_postage_batch_meta(&chain, ant_chain::GNOSIS_POSTAGE_STAMP, &batch_id)
                 .await
@@ -521,7 +521,7 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
     let secret = h.signing_secret;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let chain = ant_chain::ChainClient::new(rpc);
+        let chain = h.chain_client(rpc);
         let found = ant_chain::discover::discover_owned_batches(
             &chain,
             ant_chain::GNOSIS_POSTAGE_STAMP,
@@ -705,7 +705,7 @@ pub(crate) fn storage_quote(
     let eth = h.eth;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let price = client
             .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
             .await
@@ -782,7 +782,7 @@ pub(crate) fn storage_topup_quote(
     let eth = h.eth;
     h.runtime.block_on(async move {
         let view = connected_plan(&cmd_tx).await?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let price = client
             .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
             .await
@@ -873,7 +873,7 @@ pub(crate) fn storage_topup_xdai(
         let batch_id = parse_batch_id(&view.batch_id)?;
         let depth = view.batch_depth;
 
-        let client = ant_chain::ChainClient::new(tx_rpc);
+        let client = h.chain_client(tx_rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -985,7 +985,7 @@ pub(crate) fn storage_validity(h: &AntHandle, rpc: String) -> Result<String, Dri
             });
         }
         let batch_id = parse_batch_id(&view.batch_id)?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         // Price per chunk per block; clamp to 1 so a transient zero read
         // doesn't blow the division up into a bogus eternity.
         let price = client
@@ -1076,7 +1076,7 @@ pub(crate) fn storage_buy(
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -1149,7 +1149,7 @@ pub(crate) fn storage_buy_xdai(
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
         let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
@@ -1262,7 +1262,12 @@ pub(crate) fn storage_buy_xdai(
 /// Best-effort: never fails the surrounding storage purchase. A thin
 /// wallet (no spare xDAI for the one-time deploy, no spare xBZZ for the
 /// deposit) or flaky RPC just logs a warning; settlement enables — and
-/// the deposit lands — on the next buy or app launch.
+/// the deposit lands — the next time one of this function's callers
+/// runs: a storage buy, a plan connect, or a plan discover (an explicit
+/// [`deploy_chequebook`] / [`settlement_topup_xdai`] also lands the
+/// deposit). **Not** on a bare app launch: `ant_init` only re-wires
+/// settlement from the persisted `chequebook.json` record and never
+/// reaches this path, so nothing here is retried there.
 /// The node wallet both pays gas and is the issuer, so no external key
 /// is ever introduced.
 #[cfg(feature = "chain")]
@@ -1511,7 +1516,7 @@ pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, D
         let Some(cb) = persisted_chequebook(&data_dir, &owner) else {
             return to_json(&SettlementDeposit::none());
         };
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let deposited = chequebook_deposit_plur(&client, &cb).await?;
         settlement_deposit_json(&client, &owner, &cb, deposited).await
     })
@@ -1541,7 +1546,7 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
                 "no chequebook for this account yet — connect or buy a storage plan first".into(),
             )
         })?;
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let deposited = chequebook_deposit_plur(&client, &cb).await?;
         let short = deposit::shortfall(deposited);
         if short == 0 {
@@ -1669,7 +1674,7 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
     let data_dir = h.data_dir.clone();
 
     h.runtime.block_on(async move {
-        let client = ant_chain::ChainClient::new(rpc);
+        let client = h.chain_client(rpc);
         let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
             .map_err(|e| DriveError::Op(format!("derive node wallet: {e}")))?;
 
@@ -1714,8 +1719,10 @@ struct ResolvedChequebook {
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
 /// resolved chequebook, or `None` when the wallet can't afford the
-/// one-time deploy (a soft skip, not an error). The persist /
-/// rediscover / deploy mechanics are shared with `antd` via
+/// one-time deploy (a soft skip, not an error). A rediscovery scan that
+/// *failed* is an error, never a fall-through to the deploy: only an
+/// authoritative "this account owns no chequebook" may trigger one.
+/// The persist / rediscover / deploy mechanics are shared with `antd` via
 /// [`ant_chain::chequebook_store`]; only the resolution *order* (no
 /// operator-flag branches) and the deposit sizing live here.
 #[cfg(feature = "chain")]
@@ -1771,8 +1778,34 @@ async fn resolve_or_deploy_chequebook(
                 deployed: false,
             }));
         }
+        // Authoritative "this EOA owns no chequebook" — the only answer
+        // that may fall through to the deploy below.
         Ok(None) => {}
-        Err(e) => tracing::warn!(target: "ant-ffi", "chequebook rediscovery scan failed: {e}"),
+        Err(e) => {
+            // A scan that *failed* is not "no chequebook exists". Falling
+            // through would deploy and fund a second chequebook on chain
+            // state we could not read, burning gas and stranding the
+            // existing chequebook's deposit. Skip chequebook setup for
+            // this run instead: staying without settlement is
+            // recoverable — the next buy / plan connect / discover (or an
+            // explicit deploy) rescans — a stranded deposit is not.
+            // Unlike `antd`, nothing rescans at app start here: `ant_init`
+            // only reloads the persisted `chequebook.json`, so the retry
+            // is bound to those user actions. The cost of the trade is
+            // real and deliberate — a node whose chain reads keep failing
+            // runs without a chequebook rather than deploying one.
+            tracing::warn!(
+                target: "ant-ffi",
+                "chequebook rediscovery scan failed: {e}; network settlement stays OFF — not \
+                 deploying a chequebook on chain state we could not read (the next buy, plan \
+                 connect, discover or explicit deploy retries the scan; relaunching the app on \
+                 its own does not)",
+            );
+            return Err(DriveError::Op(format!(
+                "chequebook rediscovery scan failed, so we cannot tell whether this account \
+                 already owns a chequebook; not deploying a second one: {e}"
+            )));
+        }
     }
 
     // 3. Auto-deploy, funded with [`deposit::TARGET_PLUR`]: bee accepts
@@ -2098,5 +2131,137 @@ mod tests {
             deposit::bzz_to_acquire(plan, deposit::shortfall(0), u128::MAX),
             0
         );
+    }
+}
+
+#[cfg(all(test, feature = "chain"))]
+mod chain_tests {
+    use super::resolve_or_deploy_chequebook;
+    use ant_chain::{ChainClient, ChainTransport};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A `to` address the node EOA once funded — the single candidate
+    /// the rediscovery scan has to verify.
+    const CANDIDATE: [u8; 20] = [0xcb; 20];
+    const HIT_BLOCK: u64 = 0x1dd_8ac8;
+
+    fn word_hex(bytes: &[u8]) -> String {
+        let mut w = [0u8; 32];
+        w[32 - bytes.len()..].copy_from_slice(bytes);
+        format!("0x{}", hex::encode(w))
+    }
+
+    fn deployed_contracts_selector() -> String {
+        let data = ant_chain::chequebook::factory_deployed_contracts_calldata(&CANDIDATE);
+        format!("0x{}", hex::encode(&data[0..4]))
+    }
+
+    /// Scripted Gnosis backend, plugged in through this PR's own
+    /// host-transport seam: the `Transfer` scan finds one candidate, and
+    /// the `eth_call` that would verify it fails transiently. Every
+    /// method is recorded so the test can assert what was *not* sent.
+    struct ScriptedChain {
+        node_eth: [u8; 20],
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ChainTransport for ScriptedChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let method = req["method"].as_str().unwrap().to_string();
+            self.seen.lock().unwrap().push(method.clone());
+            let id = req["id"].clone();
+            let rpc_error = |code: i64, message: &str| {
+                Some(
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+                        .to_string(),
+                )
+            };
+            let result = match method.as_str() {
+                "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
+                "eth_getLogs" => json!([{
+                    "address": ant_chain::GNOSIS_BZZ_TOKEN,
+                    "topics": [
+                        format!("0x{}", hex::encode(ant_chain::discover::ERC20_TRANSFER_TOPIC)),
+                        word_hex(&self.node_eth),
+                        word_hex(&CANDIDATE),
+                    ],
+                    "data": "0x",
+                    "transactionHash": format!("0x{}", "77".repeat(32)),
+                    "blockNumber": format!("0x{HIT_BLOCK:x}"),
+                }]),
+                // The verifying read fails transiently. Deliberately not
+                // -32000: that code means "I don't cover this range" and
+                // would fall back to the configured URL instead.
+                "eth_call" => {
+                    let data = req["params"][0]["data"].as_str().unwrap_or_default();
+                    assert!(
+                        data.starts_with(&deployed_contracts_selector()),
+                        "unexpected eth_call {data}",
+                    );
+                    return rpc_error(-32603, "backend unavailable");
+                }
+                // Everything below is only reachable by the auto-deploy,
+                // which must never run on an unread scan. Scripted
+                // (rather than panicking) so the pre-fix code gets all
+                // the way to the broadcast and the assertion below is
+                // what fails.
+                "eth_getBalance" => json!("0xde0b6b3a7640000"), // 1 xDAI of gas
+                "eth_getTransactionCount" => json!("0x0"),
+                "eth_sendRawTransaction" => {
+                    return rpc_error(-32603, "scripted: no tx should be broadcast here")
+                }
+                other => panic!("unscripted method {other}"),
+            };
+            Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+        }
+    }
+
+    /// A rediscovery scan that *failed* must not be read as "this
+    /// account owns no chequebook": deploying on that basis burns gas and
+    /// strands the deposit sitting in the chequebook we could not see
+    /// (R3-M1). Settlement is skipped for this run instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_rediscovery_scan_does_not_auto_deploy() {
+        let wallet = ant_chain::tx::Wallet::new([7u8; 32], crate::GNOSIS_CHAIN_ID).unwrap();
+        let node_eth = *wallet.address();
+        let script = std::sync::Arc::new(ScriptedChain {
+            node_eth,
+            seen: Mutex::new(Vec::new()),
+        });
+        // An unroutable URL: a fall-through would fail the call rather
+        // than quietly reach a real RPC.
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+
+        let dir = std::env::temp_dir().join(format!("ant-cb-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `ResolvedChequebook` is not `Debug`, so unwrap by hand.
+        let err = match resolve_or_deploy_chequebook(&client, &wallet, &dir, node_eth).await {
+            Err(e) => e,
+            Ok(Some(r)) => panic!(
+                "a failed scan must not resolve to a chequebook: 0x{} (deployed = {})",
+                hex::encode(r.address),
+                r.deployed,
+            ),
+            Ok(None) => panic!("a failed scan must not read as an affordability skip"),
+        };
+
+        let seen = script.seen.lock().unwrap().clone();
+        assert!(
+            !seen.iter().any(|m| m == "eth_sendRawTransaction"),
+            "no chequebook deploy may be broadcast after a failed scan: {seen:?}",
+        );
+        assert!(
+            !dir.join("chequebook.json").exists(),
+            "nothing may be persisted for a chequebook we never deployed",
+        );
+        assert!(
+            err.to_string().contains("backend unavailable"),
+            "the real reason must survive: {err}",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

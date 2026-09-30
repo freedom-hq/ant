@@ -22,6 +22,7 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 pub mod bench;
+mod chain_transport;
 mod drive;
 mod gateway;
 #[cfg(feature = "jni")]
@@ -34,7 +35,11 @@ mod stream;
 // entry points at the crate root so workspace Rust callers (and tests)
 // can reference them by path, the same way `ant_init` is reachable.
 // The `#[no_mangle]` symbols are unaffected — this only adds Rust paths.
-pub use gateway::{ant_start_gateway, ant_stop_gateway};
+pub use chain_transport::{
+    ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
+    ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
+};
+pub use gateway::{ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
@@ -173,6 +178,13 @@ pub struct AntHandle {
     /// the iOS app serve `http://127.0.0.1:<port>` in-process instead of
     /// spawning the `antd` daemon. See [`gateway`].
     gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// CORS allow-list the next [`ant_start_gateway`] hands its gateway,
+    /// set by [`ant_set_gateway_cors`]. Empty by default: the gateway
+    /// then sends no CORS headers at all, so no other-origin page can read its
+    /// responses (issue #101). Only written while no gateway is running
+    /// (the setter checks under the `gateway_task` lock), so a live
+    /// gateway always serves exactly the list it started with.
+    gateway_cors: Mutex<Vec<String>>,
     /// The `AntStream` publisher throughput benchmark currently running
     /// on this handle, if any (issue #67 stage 1). `None` until
     /// [`ant_bench_start`]; cleared by [`ant_bench_stop`]. Exactly one
@@ -186,6 +198,46 @@ pub struct AntHandle {
     /// in-flight window, which is precisely what the stage-1 window
     /// measurements say not to do.
     publisher: Mutex<Option<Arc<publisher::LiveRun>>>,
+    /// Host-provided JSON-RPC transport for chain reads/writes (issue
+    /// #77), installed by [`ant_set_chain_transport`]. Empty by default,
+    /// which means every chain request goes to the configured
+    /// `gnosis_rpc` URL, exactly as before.
+    ///
+    /// The slot itself lives for the whole life of the handle and every
+    /// chain client shares this one `Arc` — a clear/replace therefore
+    /// reaches clients built earlier (notably the gateway's, captured
+    /// once at [`ant_start_gateway`]) instead of leaving them calling a
+    /// `host_ctx` the host has since freed.
+    #[cfg(feature = "chain")]
+    chain_transport: Arc<chain_transport::HostChainTransport>,
+}
+
+/// Chain wiring shared by the storage / settlement calls and the
+/// in-process gateway.
+#[cfg(feature = "chain")]
+impl AntHandle {
+    /// The handle's transport slot, if a host transport is installed
+    /// right now.
+    ///
+    /// What is handed out is the *slot*, not a snapshot of the callback:
+    /// a later [`ant_set_chain_transport`] retargets (or empties) it for
+    /// every holder, so a long-lived client — the gateway's — can never
+    /// call a `host_ctx` the host was told it may free. An empty slot
+    /// stays `None` so the common no-transport build keeps the plain
+    /// `POST <url>` path with no per-request detour.
+    pub(crate) fn host_chain_transport(&self) -> Option<ant_chain::SharedChainTransport> {
+        self.chain_transport
+            .is_installed()
+            .then(|| self.chain_transport.clone() as ant_chain::SharedChainTransport)
+    }
+
+    /// A [`ant_chain::ChainClient`] for `rpc`, routed through the host
+    /// transport when one is installed. **Every** chain client this
+    /// crate builds must come from here, so a host that plugs in a
+    /// verified source is not bypassed by one forgotten call site.
+    pub(crate) fn chain_client(&self, rpc: impl Into<String>) -> ant_chain::ChainClient {
+        ant_chain::ChainClient::new(rpc).with_transport(self.host_chain_transport())
+    }
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -887,8 +939,11 @@ fn init_inner(
         eth,
         data_dir: data_dir.to_path_buf(),
         gateway_task: Mutex::new(None),
+        gateway_cors: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
         publisher: Mutex::new(None),
+        #[cfg(feature = "chain")]
+        chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
     })
 }
 
@@ -2825,6 +2880,10 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
 /// both copies for the next switch to abort on in
 /// `move_account_entries`.
 ///
+/// A host chain transport ([`ant_set_chain_transport`]) is cleared and
+/// drained first, so no callback is running — and none can start — once
+/// this returns, and the host may free its `host_ctx`.
+///
 /// # Safety
 ///
 /// `handle` must have come from [`ant_init`]. Null is a no-op.
@@ -2835,6 +2894,13 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
             return;
         }
         let handle = Box::from_raw(handle);
+        // Drain the host chain transport first: `ant.h` lets the host
+        // free `host_ctx` once `ant_shutdown` returns, and
+        // `shutdown_timeout` below leaks (rather than joins) a blocking
+        // thread that outruns the grace — so clear the slot and wait for
+        // any in-flight callback here, where the wait is unconditional.
+        #[cfg(feature = "chain")]
+        handle.chain_transport.set(None, std::ptr::null_mut());
         // Cancels every spawned task (including the node loop) at its
         // next await point and joins the worker / blocking threads. The
         // timeout keeps a task wedged in a syscall (a dial holding a
@@ -3461,19 +3527,46 @@ fn secp256k1_keypair_from_signing_secret(
 // The proper mobile artefact (PLAN.md § 11) replaces both with a
 // `set_log_sink` callback so the host owns sink lifecycle; the smoke
 // tests don't need that yet.
+//
+// The subscriber is process-global and the first `try_init` wins, so a
+// host that links ant-ffi together with another Rust library that also
+// wants a `tracing` layer (freedom-mobile-ffi: ant + freedom-ipfs, whose
+// retrieval-progress recorder is a layer) must install ONE subscriber
+// carrying both before `ant_init` runs. [`log_layer`] is ant's half of
+// that: the same filter + writer as below, as a composable layer with
+// its filter scoped to itself, so it can't hide events from the other
+// layers. `install_log_subscriber` then finds the slot taken and leaves
+// it alone.
 // ---------------------------------------------------------------------------
+
+/// ant-ffi's log output as a `tracing` layer: `ANT_LOG` / `RUST_LOG`
+/// (default `info`), formatted to logcat under the tag `ant-ffi` on
+/// Android and to stderr elsewhere. The filter is per-layer, so events
+/// it drops still reach any other layer on the same subscriber.
+///
+/// For hosts that own the global subscriber (see the note above);
+/// `ant_init` installs this on its own when nothing else has.
+#[must_use]
+pub fn log_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::Layer;
+    let filter = std::env::var("ANT_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
+    tracing_subscriber::fmt::layer()
+        .with_writer(default_log_writer())
+        .with_filter(tracing_subscriber::EnvFilter::new(filter))
+}
 
 fn install_log_subscriber() {
     use std::sync::Once;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let filter = std::env::var("ANT_LOG")
-            .or_else(|_| std::env::var("RUST_LOG"))
-            .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(default_log_writer())
-            .try_init();
+        let _ = tracing_subscriber::registry().with(log_layer()).try_init();
     });
 }
 
@@ -3552,6 +3645,31 @@ mod android_log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `log_layer`'s filter must stay scoped to itself: a host composing
+    /// it with another layer (freedom-ipfs's progress recorder) needs
+    /// that layer to see events ant's log level drops.
+    #[test]
+    fn log_layer_filter_does_not_hide_events_from_other_layers() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(log_layer())
+            .with(Count(seen.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "log_layer_test", phase = "probe", "below ant's log level");
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn parse_reference_accepts_bare_hex() {
@@ -3773,6 +3891,230 @@ mod tests {
         dir
     }
 
+    /// A handle whose gateway can actually start: `test_handle` plus a
+    /// valid signing secret (`/addresses` derives the public key).
+    fn gateway_test_handle(tag: &str) -> AntHandle {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let mut h = test_handle(runtime, &scratch_dir(tag));
+        h.signing_secret = [0x11u8; SECP256K1_SECRET_LEN];
+        h
+    }
+
+    /// Start the handle's gateway on a free loopback port via the real
+    /// FFI entry point and return that address.
+    fn start_test_gateway(h: &AntHandle) -> std::net::SocketAddr {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("pick a free port");
+        let c_addr = std::ffi::CString::new(addr.to_string()).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe {
+            ant_start_gateway(
+                &raw const *h,
+                c_addr.as_ptr(),
+                false,
+                std::ptr::null(),
+                &raw mut err,
+            )
+        };
+        assert!(ok, "ant_start_gateway failed: {}", unsafe { take_err(err) });
+        addr
+    }
+
+    unsafe fn take_err(err: *mut c_char) -> String {
+        if err.is_null() {
+            return String::new();
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ant_free_string(err) };
+        s
+    }
+
+    /// Raw HTTP/1.1 request against the gateway; returns the status
+    /// line + lowercased headers (the body isn't needed here). Retries
+    /// the connect while the spawned serve task is still binding.
+    fn gateway_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        extra: &str,
+    ) -> String {
+        use std::io::{Read, Write};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("connect {addr}: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).expect("read response");
+        let resp = String::from_utf8_lossy(&resp);
+        resp.split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+
+    fn set_cors(h: *const AntHandle, origins: &[&str]) -> Result<(), String> {
+        let owned: Vec<std::ffi::CString> = origins
+            .iter()
+            .map(|o| std::ffi::CString::new(*o).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe { ant_set_gateway_cors(h, ptrs.as_ptr(), ptrs.len(), &raw mut err) };
+        let msg = unsafe { take_err(err) };
+        if ok {
+            Ok(())
+        } else {
+            Err(msg)
+        }
+    }
+
+    /// Issue #101: a page's fetch that is redirected across origins
+    /// arrives with `Origin: null`. With no host configuration the
+    /// gateway must not let that (or any) origin read `/wallet` and
+    /// friends — it used to answer `Access-Control-Allow-Origin: null`.
+    #[test]
+    fn gateway_refuses_redirect_tainted_null_origin_by_default() {
+        let h = gateway_test_handle("gw-cors-default");
+        let addr = start_test_gateway(&h);
+
+        for path in ["/wallet", "/addresses", "/stamps"] {
+            let resp = gateway_request(addr, "GET", path, "Origin: null\r\n");
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "GET {path} with Origin: null must carry no CORS allow header:\n{resp}"
+            );
+        }
+        let preflight = gateway_request(
+            addr,
+            "OPTIONS",
+            "/wallet",
+            "Origin: null\r\nAccess-Control-Request-Method: GET\r\n",
+        );
+        assert!(
+            !preflight.contains("access-control-allow-origin"),
+            "preflight from Origin: null must not be allowed:\n{preflight}"
+        );
+        // A real origin gets nothing either.
+        let resp = gateway_request(
+            addr,
+            "GET",
+            "/addresses",
+            "Origin: https://evil.example\r\n",
+        );
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+        // Non-browser clients (no Origin, e.g. the app's own URLSession)
+        // are unaffected.
+        let resp = gateway_request(addr, "GET", "/addresses", "");
+        assert!(resp.starts_with("http/1.1 200"), "{resp}");
+
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    /// A host-configured origin is allowed; `null` stays refused unless
+    /// the host lists it explicitly.
+    #[test]
+    fn gateway_allows_only_host_configured_origins() {
+        let h = gateway_test_handle("gw-cors-configured");
+        set_cors(&raw const h, &["https://App.Example", " "]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        let resp = gateway_request(addr, "GET", "/addresses", "Origin: https://app.example\r\n");
+        assert!(resp.starts_with("http/1.1 200"), "{resp}");
+        assert!(
+            resp.contains("access-control-allow-origin: https://app.example"),
+            "configured origin must be echoed:\n{resp}"
+        );
+        let preflight = gateway_request(
+            addr,
+            "OPTIONS",
+            "/bzz",
+            "Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n",
+        );
+        assert!(
+            preflight.contains("access-control-allow-origin: https://app.example"),
+            "{preflight}"
+        );
+        for origin in ["null", "https://evil.example"] {
+            let resp = gateway_request(addr, "GET", "/wallet", &format!("Origin: {origin}\r\n"));
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "Origin: {origin} must not be allowed:\n{resp}"
+            );
+        }
+
+        // The list can't change under a running gateway ...
+        let err = set_cors(&raw const h, &["null"]).expect_err("set while running must fail");
+        assert!(err.contains("gateway is running"), "{err}");
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+
+        // ... but applies at the next start; an explicit `null` opt-in
+        // (iOS opaque-origin pages) works, and clearing turns CORS off.
+        unsafe { ant_stop_gateway(&raw const h) };
+        set_cors(&raw const h, &["null"]).expect("set after stop");
+        let addr = start_test_gateway(&h);
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(resp.contains("access-control-allow-origin: null"), "{resp}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(unsafe { ant_set_gateway_cors(&raw const h, std::ptr::null(), 0, &raw mut err) });
+        let addr = start_test_gateway(&h);
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    #[test]
+    fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
+        let h = gateway_test_handle("gw-cors-bad-input");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+
+        let good = std::ffi::CString::new("null").unwrap();
+        let ptrs = [good.as_ptr(), std::ptr::null()];
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe { ant_set_gateway_cors(&raw const h, ptrs.as_ptr(), 2, &raw mut err) });
+        assert!(unsafe { take_err(err) }.contains("origin 1 is null"));
+
+        let bad = [0xffu8, 0];
+        let ptrs = [bad.as_ptr().cast::<c_char>()];
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe { ant_set_gateway_cors(&raw const h, ptrs.as_ptr(), 1, &raw mut err) });
+        assert!(unsafe { take_err(err) }.contains("not valid UTF-8"));
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe {
+            ant_set_gateway_cors(std::ptr::null(), std::ptr::null(), 0, &raw mut err)
+        });
+        assert!(unsafe { take_err(err) }.contains("null handle"));
+
+        assert_eq!(
+            *h.gateway_cors.lock().unwrap(),
+            vec!["https://app.example".to_string()]
+        );
+    }
+
     #[test]
     fn account_switch_parks_the_previous_accounts_state() {
         let dir = scratch_dir("account-switch");
@@ -3950,8 +4292,11 @@ mod tests {
             eth: [0u8; 20],
             data_dir: data_dir.to_path_buf(),
             gateway_task: Mutex::new(None),
+            gateway_cors: Mutex::new(Vec::new()),
             bench: Mutex::new(None),
             publisher: Mutex::new(None),
+            #[cfg(feature = "chain")]
+            chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         }
     }
 

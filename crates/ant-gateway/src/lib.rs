@@ -26,6 +26,14 @@
 //! [`PLAN.md`]: ../../../PLAN.md
 
 #![cfg_attr(not(feature = "http-api"), allow(dead_code))]
+// Handler helpers early-return an already-built axum `Response` as the
+// `Err` variant (`Result<T, Response>` + `?`) — axum's idiomatic "stop
+// here and send this reply". `clippy::result_large_err` flags that
+// ~128-byte `Response`; boxing it would cost a `*` unwrap at every `?`
+// site for nothing on a path about to do network I/O. So each such
+// helper carries a targeted `#[allow(clippy::result_large_err)]`
+// rather than a crate-wide one, keeping the lint live for any other
+// genuinely large error type added here.
 
 #[cfg(feature = "http-api")]
 mod act;

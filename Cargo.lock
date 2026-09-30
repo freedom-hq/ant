@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ant-chain"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-crypto",
  "getrandom 0.3.4",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "ant-control"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "hex",
  "serde",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "ant-crypto"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "ant-ffi"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gateway"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "ant-p2p"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -248,6 +248,7 @@ dependencies = [
  "futures",
  "hex",
  "hickory-resolver",
+ "if-addrs",
  "k256",
  "libp2p",
  "libp2p-stream",
@@ -266,9 +267,10 @@ dependencies = [
 
 [[package]]
 name = "ant-postage"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-crypto",
+ "fs4",
  "hex",
  "k256",
  "rmp-serde",
@@ -280,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "ant-retrieval"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-crypto",
  "ant-postage",
@@ -308,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "antctl"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -328,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "antd"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "aes",
  "ant-chain",
@@ -364,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "antop"
-version = "0.5.44"
+version = "0.5.49"
 dependencies = [
  "ant-control",
  "anyhow",

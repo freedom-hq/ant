@@ -1085,6 +1085,7 @@ pub async fn upload_pss(
 /// issuer** on this node — the same bar (and the same "not usable"
 /// wording, so status mapping stays uniform) that `PushChunk` applies,
 /// just checked before mining instead of after.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
     let (ack_tx, ack_rx) = oneshot::channel();
     if handle
@@ -2145,6 +2146,7 @@ pub(crate) fn upload_error_status(message: &str) -> StatusCode {
     }
 }
 
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn push_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
@@ -3524,6 +3526,7 @@ fn parse_pin_header(headers: &HeaderMap) -> Result<bool, Response> {
 /// pinned when `putter.Done` runs). The chunks were pushed a moment
 /// ago and sit in the node's local caches, so the pin traversal is a
 /// cheap local walk. Failure maps to bee's 500 for a failed `Done`.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn pin_uploaded_reference(
     handle: &GatewayHandle,
     reference: Vec<u8>,

@@ -125,6 +125,16 @@ struct Opt {
     #[arg(long, value_delimiter = ',')]
     external_address: Vec<String>,
 
+    /// Dial peers' private, loopback and link-local underlays even when this
+    /// host isn't on the same subnet. By default only globally routable
+    /// underlays (plus private ones inside a subnet this host is attached
+    /// to) are dialed, since hive gossip carries bee nodes' Docker /
+    /// Kubernetes pod addresses and dialing those from a hosted server looks
+    /// like a network scan. Enable only for dev/test networks that live on
+    /// a single private network or on loopback.
+    #[arg(long)]
+    allow_private_dials: bool,
+
     /// Path to the JSON peer snapshot. Defaults to `<data-dir>/peers.json`.
     /// Loaded at startup to warm the dial pipeline so the next run skips the
     /// bootnode hop, flushed every 30 s and on shutdown.
@@ -642,6 +652,7 @@ async fn main() -> Result<()> {
             .with_status(status_tx)
             .with_process_start(process_start)
             .with_external_addrs(external_addrs)
+            .with_allow_private_dials(opt.allow_private_dials)
             .with_peerstore_path(peerstore_path)
             .with_commands(cmd_rx)
             .with_target_peers(opt.target_peers)
@@ -1680,7 +1691,11 @@ struct ResolvedChequebook {
 ///
 /// A standalone `--swap-key` without a chequebook keeps the historical
 /// "disabled" behaviour rather than auto-deploying with a non-node
-/// issuer — auto-deploy never injects an external key.
+/// issuer — auto-deploy never injects an external key. Only an
+/// authoritative step-3 answer ("this EOA owns no chequebook") reaches
+/// step 4: a rediscovery scan that *failed* starts the node without
+/// settlement instead, since deploying on unread chain state would
+/// strand the deposit in a chequebook we simply could not see.
 async fn resolve_chequebook(
     opt: &Opt,
     data_dir: &Path,
@@ -1855,14 +1870,29 @@ async fn resolve_chequebook(
                     pushsync,
                 });
             }
+            // Authoritative: every candidate was read, none is ours —
+            // the only answer that may lead to an auto-deploy.
             Ok(None) => tracing::info!(
                 target: "antd",
                 "no node-owned chequebook found on-chain; will auto-deploy if enabled",
             ),
-            Err(e) => tracing::warn!(
-                target: "antd",
-                "chequebook rediscovery scan failed: {e}; will auto-deploy if enabled",
-            ),
+            // A scan that *failed* is not "no chequebook exists":
+            // auto-deploying on it burns gas and strands the deposit in
+            // the chequebook we could not see. Start without outbound
+            // settlement instead and let the next start rescan — that is
+            // recoverable, a stranded deposit is not.
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    "chequebook rediscovery scan failed: {e}; starting without outbound SWAP \
+                     settlement rather than deploying a chequebook on chain state we could not \
+                     read (the next start retries the scan)",
+                );
+                return Ok(ResolvedChequebook {
+                    address: None,
+                    pushsync: None,
+                });
+            }
         }
     }
 
