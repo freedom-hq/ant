@@ -10,8 +10,30 @@
 //! sandbox), so this is the in-process equivalent: the existing
 //! bee-HTTP Swift layer (`BeeAPIClient`, `BzzSchemeHandler`) points at
 //! `http://127.0.0.1:<port>` unchanged. There is exactly one gateway
-//! per handle; a second `ant_start_gateway` while one is running is a
-//! no-op success.
+//! per handle; a second `ant_start_gateway` while one is running
+//! succeeds without touching it; with a `gnosis_rpc` it re-runs the
+//! chain startup work (persisted-batch check, owned-batch rediscovery,
+//! chequebook adoption) so a step that failed earlier is retried —
+//! a step that already succeeded is skipped.
+//!
+//! CORS is off by default: the gateway has no auth, so any page a
+//! browser lets read its responses can read `/wallet`, `/addresses`,
+//! `/stamps`, … A host whose own pages need cross-origin access opts
+//! in with [`ant_set_gateway_cors`] before starting (issue #101).
+//!
+//! CORS only governs whether a page may *read* a response. It does not
+//! stop a page from *sending* a request: a CORS-simple request (a
+//! `POST` with no body or a form/text body and no custom headers) needs
+//! no preflight, so any page can still fire the state-changing routes —
+//! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
+//! `gnosis_rpc`, then deploys a chequebook if the account has none and
+//! funds it, or tops up an existing one below the settlement-deposit
+//! target, by transferring the wallet's existing xBZZ — every one of
+//! those transactions costs xDAI gas; nothing is swapped),
+//! `POST /chequebook/deposit` (moves xBZZ, paying xDAI gas) —
+//! with `mode: 'no-cors'`, whatever
+//! the allow-list says. Those routes are unprotected against
+//! cross-site requests; see issue #105.
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
@@ -75,8 +97,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// succeeded are not repeated.
 ///
 /// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
-/// sure settlement is on afterwards, deploying and funding a chequebook
-/// if the account has none, as `ant_storage_buy` does.
+/// sure settlement is on afterwards, as `ant_storage_buy` does: it
+/// deploys a chequebook if the account has none (paying gas in xDAI)
+/// and brings the deposit of a new or existing chequebook up to the
+/// settlement target from the wallet's existing xBZZ (capped to what
+/// the wallet holds; nothing is swapped).
 ///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
@@ -88,10 +113,30 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// this gateway immediately — a cleared one falls back to `gnosis_rpc`
 /// rather than calling a `host_ctx` the host has been told it may free.
 ///
+/// CORS: the gateway lets cross-origin pages read its responses only
+/// for the origins last set with [`ant_set_gateway_cors`]; by default
+/// none, so it sends no CORS headers and no page from another origin can
+/// read its responses. That does not stop a page from *sending*
+/// CORS-simple requests, which still execute — including spending ones
+/// like `POST /stamps/{amount}/{depth}` (which may also deploy a
+/// chequebook and move xBZZ into a new or under-funded one, above) and
+/// `POST /chequebook/deposit` (see the module docs).
+///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
 /// (free with [`crate::ant_free_string`]). Idempotent: a second call
-/// while one is live is a no-op success.
+/// while one is live is a success that leaves the running gateway
+/// untouched — it keeps the CORS list and chain wiring it started with
+/// (a changed [`ant_set_gateway_cors`] list only applies after
+/// [`ant_stop_gateway`] + start). With a `gnosis_rpc` it re-runs the
+/// chain startup work above, retrying only what hasn't succeeded yet: a
+/// batch whose check failed or is still pending is re-read, and a
+/// rediscovery scan or chequebook adoption that failed is retried. A
+/// rediscovery scan or adoption that already succeeded is not repeated
+/// in this process — a batch bought on another device only shows up
+/// after an explicit `ant_storage_discover`, or a fresh `ant_init`
+/// followed by a start with a `gnosis_rpc` (`ant_init` alone only
+/// reloads persisted state; the rescan runs here, in `ChainInit::run`).
 ///
 /// # Safety
 ///
@@ -207,6 +252,17 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
         };
 
+        // The host's CORS allow-list (empty unless it called
+        // `ant_set_gateway_cors`). Read under the `gateway_task` guard,
+        // which the setter also takes, so it can't change mid-start.
+        let cors = CorsConfig::new(
+            handle
+                .gateway_cors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter(),
+        );
+
         // Probe-bind synchronously so a port clash surfaces as a clean
         // FFI error instead of a silently-dead background task. There's
         // a tiny TOCTOU window before `Gateway::serve` rebinds, but on
@@ -308,10 +364,12 @@ pub unsafe extern "C" fn ant_start_gateway(
             // writer on iOS (no `antop` Retrieval tab consuming it).
             activity: GatewayActivity::new(),
             tags: Arc::new(TagRegistry::new()),
-            // Freedom's dweb pages fetch/upload from an opaque (`null`)
-            // origin, so the gateway must echo `null` in CORS — matches
-            // bee started with `--cors-allowed-origins=null`.
-            cors: Arc::new(CorsConfig::new(["null"])),
+            // Host-chosen allow-list, empty (= no CORS headers, like
+            // bee without `--cors-allowed-origins`) by default. This
+            // used to be pinned to `null`, which any page can send: a
+            // fetch that is redirected after a cross-origin hop carries
+            // `Origin: null` (issue #101).
+            cors: Arc::new(cors),
             // The FFI path resolves its chain wiring before starting
             // the gateway, so the slot is preset — no chain-init 503
             // window here. On-chain reader/writer when built with the
@@ -407,6 +465,113 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
         })
         .await;
     });
+}
+
+/// Set the CORS origins the in-process gateway allows. Takes effect at
+/// the next [`ant_start_gateway`]; must be called while no gateway is
+/// running on `handle` (before the first start, or after
+/// [`ant_stop_gateway`]) and fails otherwise, so a running gateway never
+/// serves a list other than the one the host last saw accepted.
+///
+/// `origins` points at `origins_len` NUL-terminated UTF-8 strings,
+/// matched like bee's `cors-allowed-origins`: an exact origin such as
+/// `https://app.example` (case-insensitive), `*` for any origin, or
+/// `null` for opaque origins. A null `origins` or `origins_len == 0`
+/// clears the list — the default — so the gateway sends no CORS headers
+/// and no page from another origin can read its responses. Blank
+/// entries are ignored.
+///
+/// Only allow origins whose pages you trust with the whole API: there
+/// is no auth, so an allowed page can read `/wallet`, `/addresses`,
+/// `/stamps` etc. and also send non-simple (preflighted) requests, e.g.
+/// uploads with `Swarm-*` headers. `null` in particular matches *any*
+/// page whose request was redirected across origins (the Fetch spec
+/// taints the origin to `null`), and `*` matches every page.
+///
+/// This list protects *reads* only. An empty list does not block
+/// writes: a CORS-simple request needs no preflight, so any page can
+/// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
+/// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
+/// executes it — spending the wallet's xBZZ (for `/stamps` both the
+/// batch and a transfer into a new or under-funded chequebook's
+/// deposit) and xDAI gas for every transaction it sends — the batch
+/// purchase and, for `/stamps`, deploying a chequebook if there is none
+/// yet and the deposit transfer into a new or under-funded one; nothing
+/// is swapped — even though the page cannot read the reply. Don't rely
+/// on this call to protect the wallet's funds.
+///
+/// Returns `true` on success; `false` with an allocated message in
+/// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a
+/// running gateway, or a null/non-UTF-8 entry — the stored list is then
+/// left unchanged.
+///
+/// # Safety
+///
+/// `handle` must come from [`crate::ant_init`] and must not have been
+/// passed to [`crate::ant_shutdown`]. If `origins_len > 0` and `origins`
+/// is non-null, `origins` must point to `origins_len` readable
+/// `*const c_char`s, each a NUL-terminated string (a null entry is
+/// reported as an error). `out_err`, if non-null, must point to a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_gateway_cors(
+    handle: *const AntHandle,
+    origins: *const *const c_char,
+    origins_len: usize,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_set_gateway_cors: null handle");
+            return false;
+        };
+
+        let mut list = Vec::new();
+        if !origins.is_null() {
+            for i in 0..origins_len {
+                let ptr = *origins.add(i);
+                if ptr.is_null() {
+                    write_out_err(
+                        out_err,
+                        &format!("ant_set_gateway_cors: origin {i} is null"),
+                    );
+                    return false;
+                }
+                match CStr::from_ptr(ptr).to_str().map(str::trim) {
+                    Ok("") => {}
+                    Ok(o) => list.push(o.to_string()),
+                    Err(_) => {
+                        write_out_err(
+                            out_err,
+                            &format!("ant_set_gateway_cors: origin {i} is not valid UTF-8"),
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Same guard `ant_start_gateway` holds across its whole start,
+        // so this can't slip in between a start's read of the list and
+        // its spawn.
+        let task = handle
+            .gateway_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.as_ref().is_some_and(|t| !t.is_finished()) {
+            write_out_err(
+                out_err,
+                "ant_set_gateway_cors: gateway is running; call ant_stop_gateway first",
+            );
+            return false;
+        }
+        *handle
+            .gateway_cors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = list;
+        true
+    }
 }
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
