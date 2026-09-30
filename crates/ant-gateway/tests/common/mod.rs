@@ -263,6 +263,46 @@ pub fn status_router_with_chain_hooks_and_cors(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
 ) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        on_batch_bought,
+        on_chequebook_refused,
+        cors,
+        None,
+    )
+}
+
+/// The `RegisterBatch` commands a chain test router received, as
+/// `(batch_id, depth, immutable, bought_at_block)`.
+pub type Registrations = Arc<std::sync::Mutex<Vec<([u8; 32], u8, bool, Option<u64>)>>>;
+
+/// [`status_router_with_chain`] that also records every batch the
+/// gateway registers with the node.
+pub fn status_router_recording_registrations(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+) -> (Router, Registrations) {
+    let seen = Registrations::default();
+    let router = chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        Some(seen.clone()),
+    );
+    (router, seen)
+}
+
+fn chain_router(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
+    cors: CorsConfig,
+    registrations: Option<Registrations>,
+) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
@@ -272,7 +312,20 @@ pub fn status_router_with_chain_hooks_and_cors(
     // exercise the node loop).
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
-            if let ControlCommand::RegisterBatch { ack, .. } = cmd {
+            if let ControlCommand::RegisterBatch {
+                batch_id,
+                depth,
+                immutable,
+                bought_at_block,
+                ack,
+                ..
+            } = cmd
+            {
+                if let Some(seen) = &registrations {
+                    seen.lock()
+                        .unwrap()
+                        .push((batch_id, depth, immutable, bought_at_block));
+                }
                 let _ = ack.send(ControlAck::Ok {
                     message: "registered (chain test fixture)".into(),
                 });

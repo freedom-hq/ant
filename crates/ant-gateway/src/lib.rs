@@ -73,7 +73,7 @@ mod tags;
 #[cfg(feature = "http-api")]
 pub use chain::{
     BatchMetaView, ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot,
-    DepositView, FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
+    DepositView, FundingFailure, FundingView, NewBatch, StorageQuoteView, WalletTxLock, WriteGate,
 };
 #[cfg(feature = "http-api")]
 pub use cors::CorsConfig;

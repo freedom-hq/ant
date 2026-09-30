@@ -328,6 +328,17 @@ pub enum ControlCommand {
         depth: u8,
         bucket_depth: u8,
         immutable: bool,
+        /// The block of the `createBatch` receipt, when the caller has
+        /// just bought this batch; `None` for a batch registered by id,
+        /// rediscovered, or re-registered after a dilute.
+        ///
+        /// A just-bought batch isn't usable yet: storers accept its
+        /// stamps only once their postage listeners have synced its
+        /// creation block. The node then reports it `usable: false`
+        /// and treats peers' "not found on-chain" rejections as
+        /// propagation lag rather than a phantom batch, for bee's
+        /// confirmation window.
+        bought_at_block: Option<u64>,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Install (or replace) the outbound SWAP settlement subsystem on

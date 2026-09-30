@@ -137,6 +137,15 @@ impl DepositStatus {
     }
 }
 
+/// A batch a buy just created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewBatch {
+    pub id: [u8; 32],
+    /// The block of its `createBatch` receipt: bee's `blockNumber`, and
+    /// where the storers' propagation window starts.
+    pub block: u64,
+}
+
 /// Why a funding call failed. `Display` is the message the apps show.
 #[derive(Debug, Error)]
 pub enum FundingError {
@@ -581,7 +590,7 @@ pub async fn buy_plan_with_xdai(
     depth: u8,
     amount_per_chunk: u128,
     immutable: bool,
-) -> Result<[u8; 32], FundingError> {
+) -> Result<NewBatch, FundingError> {
     validate_depth(depth)?;
     let plan = checked_cost(amount_per_chunk, depth, "plan")?;
     let deposit = deposit_due(payer, policy).await;
@@ -633,7 +642,7 @@ pub async fn buy_batch(
     amount_per_chunk: u128,
     depth: u8,
     immutable: bool,
-) -> Result<[u8; 32], FundingError> {
+) -> Result<NewBatch, FundingError> {
     validate_depth(depth)?;
     let total = checked_cost(amount_per_chunk, depth, "plan")?;
     payer
@@ -667,7 +676,11 @@ pub async fn buy_batch(
             what: "buy storage",
             source,
         })?;
-    crate::tx::extract_created_batch_id(&receipt).ok_or(FundingError::NoBatchInReceipt)
+    let id = crate::tx::extract_created_batch_id(&receipt).ok_or(FundingError::NoBatchInReceipt)?;
+    Ok(NewBatch {
+        id,
+        block: receipt.block_number,
+    })
 }
 
 /// Extend batch `batch_id` (currently `depth`) from the xBZZ the wallet
@@ -1077,7 +1090,7 @@ mod tests {
     async fn buy_with(
         wallet_bzz: u128,
         wallet_xdai: u128,
-    ) -> (Result<[u8; 32], FundingError>, Vec<&'static str>) {
+    ) -> (Result<NewBatch, FundingError>, Vec<&'static str>) {
         let chain = std::sync::Arc::new(ScriptedChain {
             wallet_bzz,
             wallet_xdai,
@@ -1100,7 +1113,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_xdai_buy_swaps_then_approves_then_creates_the_batch() {
         let (result, sent) = buy_with(0, WEI_PER_XDAI).await;
-        assert_eq!(result.unwrap(), BATCH);
+        // The id and the block come from the `createBatch` receipt.
+        assert_eq!(
+            result.unwrap(),
+            NewBatch {
+                id: BATCH,
+                block: 1
+            }
+        );
         assert_eq!(sent, ["swap", "approve", "createBatch"]);
     }
 
@@ -1110,7 +1130,7 @@ mod tests {
     async fn a_wallet_holding_the_xbzz_skips_the_swap() {
         let plan = plan_cost_plur(amount_per_chunk_for(24_000, 30), 20).unwrap();
         let (result, sent) = buy_with(plan + TARGET, 0).await;
-        assert_eq!(result.unwrap(), BATCH);
+        assert_eq!(result.unwrap().id, BATCH);
         assert_eq!(sent, ["approve", "createBatch"]);
     }
 

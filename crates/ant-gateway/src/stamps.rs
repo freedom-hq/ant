@@ -18,7 +18,10 @@
 //! On-chain **writes** (`POST /stamps/{amount}/{depth}` to buy,
 //! `PATCH /stamps/topup|dilute/...`) live in [`crate::chain`]; a buy
 //! registers the new issuer with the running node before returning, so
-//! the bought batch shows up here as `usable` within seconds.
+//! the bought batch shows up here at once. It reads `usable: false`
+//! (with `exists: true` and a positive `batchTTL`) for bee's
+//! confirmation window, about 70 s, until the storers have synced its
+//! creation block; see `BATCH_PROPAGATION` in `ant-p2p`.
 
 use std::time::Duration;
 
@@ -116,7 +119,9 @@ impl StampEntry {
             depth: view.batch_depth,
             amount: "0".to_string(),
             bucket_depth: view.bucket_depth,
-            block_number: 0,
+            // The creation block, when the node bought the batch
+            // itself; `0` (bee's "unknown") otherwise.
+            block_number: view.block_number.unwrap_or(0),
             immutable_flag: view.immutable,
             exists: true,
             batch_ttl: PLACEHOLDER_BATCH_TTL_SECS,
@@ -651,6 +656,24 @@ mod tests {
         );
         assert!(expired.exists, "still on chain until evicted");
         assert_eq!(expired.batch_ttl, 0);
+    }
+
+    /// bee's `blockNumber`: the creation block of a batch the node
+    /// bought itself, `0` when it doesn't know.
+    #[test]
+    fn block_number_is_the_buy_receipts_block() {
+        let view = |block_number| PostageStatusView {
+            enabled: true,
+            batch_id: format!("0x{}", hex::encode([0x42u8; 32])),
+            batch_depth: 20,
+            bucket_depth: 16,
+            block_number,
+            ..PostageStatusView::default()
+        };
+        let bought = StampEntry::from_view(&view(Some(48_500_000))).unwrap();
+        assert_eq!(bought.block_number, 48_500_000);
+        let connected = StampEntry::from_view(&view(None)).unwrap();
+        assert_eq!(connected.block_number, 0);
     }
 
     /// A batch the node registered at runtime moments ago (just bought)

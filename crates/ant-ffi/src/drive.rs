@@ -365,7 +365,16 @@ impl ChainInit {
             if known {
                 continue;
             }
-            match register_batch(cmd_tx, b.batch_id, b.depth, b.bucket_depth, b.immutable).await {
+            match register_batch(
+                cmd_tx,
+                b.batch_id,
+                b.depth,
+                b.bucket_depth,
+                b.immutable,
+                None,
+            )
+            .await
+            {
                 Ok(()) => tracing::info!(
                     target: "ant-ffi",
                     batch = %format!("0x{}", hex::encode(b.batch_id)),
@@ -931,6 +940,7 @@ pub(crate) fn storage_connect_batch(
             meta.depth,
             meta.bucket_depth,
             meta.immutable,
+            None,
         )
         .await?;
         // Connecting a plan must also turn on outbound settlement —
@@ -965,7 +975,15 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
         .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
         let mut registered = Vec::new();
         for b in &found {
-            register_batch(&cmd_tx, b.batch_id, b.depth, b.bucket_depth, b.immutable).await?;
+            register_batch(
+                &cmd_tx,
+                b.batch_id,
+                b.depth,
+                b.bucket_depth,
+                b.immutable,
+                None,
+            )
+            .await?;
             registered.push(format!("0x{}", hex::encode(b.batch_id)));
         }
         // If we connected at least one plan, make sure outbound
@@ -986,12 +1004,17 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
 }
 
 #[cfg(feature = "chain")]
+/// Register a batch with the running node. `bought_at_block` is the
+/// `createBatch` receipt's block for a batch this node just bought (the
+/// node then holds it back as `usable: false` until the storers have
+/// synced it), and `None` for a batch connected or rediscovered.
 async fn register_batch(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     batch_id: [u8; 32],
     depth: u8,
     bucket_depth: u8,
     immutable: bool,
+    bought_at_block: Option<u64>,
 ) -> Result<(), DriveError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     send(
@@ -1001,6 +1024,7 @@ async fn register_batch(
             depth,
             bucket_depth,
             immutable,
+            bought_at_block,
             ack: ack_tx,
         },
     )
@@ -1311,11 +1335,11 @@ pub(crate) fn storage_buy(
         // [`wallet_tx_lock`]); released before the settlement step below,
         // which takes it itself.
         let tx = wallet_tx_lock(&h.eth).lock_owned().await;
-        let batch_id = funding::buy_batch(&payer, amount, depth, immutable)
+        let new = funding::buy_batch(&payer, amount, depth, immutable)
             .await
             .map_err(funding_err)?;
         drop(tx);
-        activate_bought_batch(h, &client, &wallet, batch_id, depth, immutable).await
+        activate_bought_batch(h, &client, &wallet, new, depth, immutable).await
     })
 }
 
@@ -1347,11 +1371,11 @@ pub(crate) fn storage_buy_xdai(
         // shortfall is read after any other spend finished; released
         // before the settlement step below, which takes it itself.
         let tx = wallet_tx_lock(&h.eth).lock_owned().await;
-        let batch_id = funding::buy_plan_with_xdai(&payer, policy, depth, amount, immutable)
+        let new = funding::buy_plan_with_xdai(&payer, policy, depth, amount, immutable)
             .await
             .map_err(funding_err)?;
         drop(tx);
-        activate_bought_batch(h, &client, &wallet, batch_id, depth, immutable).await
+        activate_bought_batch(h, &client, &wallet, new, depth, immutable).await
     })
 }
 
@@ -1364,11 +1388,19 @@ async fn activate_bought_batch(
     h: &AntHandle,
     client: &ant_chain::ChainClient,
     wallet: &ant_chain::tx::Wallet,
-    batch_id: [u8; 32],
+    new: funding::NewBatch,
     depth: u8,
     immutable: bool,
 ) -> Result<String, DriveError> {
-    register_batch(&h.cmd_tx, batch_id, depth, POSTAGE_BUCKET_DEPTH, immutable).await?;
+    register_batch(
+        &h.cmd_tx,
+        new.id,
+        depth,
+        POSTAGE_BUCKET_DEPTH,
+        immutable,
+        Some(new.block),
+    )
+    .await?;
     ensure_settlement(
         &h.cmd_tx,
         client,

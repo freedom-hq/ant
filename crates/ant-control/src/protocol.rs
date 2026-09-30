@@ -418,13 +418,22 @@ pub struct UploadJobView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostageStatusView {
     pub enabled: bool,
-    /// `false` once storer peers have rejected this batch's stamps as
+    /// `false` while a just-bought batch is still propagating to the
+    /// storers (see `ControlCommand::RegisterBatch::bought_at_block`),
+    /// and once storer peers have rejected this batch's stamps as
     /// not-on-chain (peer-attested phantom batch: never created on
     /// this chain, expired and evicted, or not yet synced) — the
     /// gateway's `/stamps` must then stop reporting the batch green.
     /// Defaults `true` so old daemons keep deserializing.
     #[serde(default = "default_true")]
     pub usable: bool,
+    /// `true` while `usable` is `false` only because a just-bought
+    /// batch is still propagating to the storers (not because peers
+    /// rejected it). `PushChunk` accepts such a batch and waits the
+    /// propagation out, so a pre-flight that applies the push's bar
+    /// (the gateway's `/pss/send`) must accept it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub propagating: bool,
     /// Seconds since the node registered this batch at runtime (a buy
     /// or connect via `RegisterBatch`); `None` for a batch reloaded
     /// from disk or pre-configured at startup. Lets the gateway give a
@@ -433,6 +442,12 @@ pub struct PostageStatusView {
     /// may lag the block that created it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_secs_ago: Option<u64>,
+    /// The block the batch was created in, when the node registered it
+    /// right after buying it (the buy receipt's block); `None` for a
+    /// batch registered by id, rediscovered, or reloaded from disk.
+    /// The gateway reports it as bee's `blockNumber`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
     /// `0x`-prefixed hex of the configured batch id. Empty when
     /// `enabled = false`.
     #[serde(default)]

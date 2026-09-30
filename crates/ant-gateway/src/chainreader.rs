@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::{
     ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, DepositView,
-    FundingFailure, FundingView, StorageQuoteView, WriteGate,
+    FundingFailure, FundingView, NewBatch, StorageQuoteView, WriteGate,
 };
 use ant_chain::funding::{self, DepositPolicy, FundingError, Payer};
 use ant_chain::tx::Wallet;
@@ -205,6 +205,13 @@ fn funding_view(f: &funding::Funding) -> FundingView {
     }
 }
 
+fn new_batch(b: funding::NewBatch) -> NewBatch {
+    NewBatch {
+        id: b.id,
+        block: b.block,
+    }
+}
+
 fn quote_view(q: &funding::PlanQuote) -> StorageQuoteView {
     StorageQuoteView {
         depth: q.depth,
@@ -247,9 +254,10 @@ impl ChainWriter for AntChainWriter {
         amount_per_chunk: u128,
         depth: u8,
         immutable: bool,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<NewBatch, String> {
         funding::buy_batch(&self.payer(), amount_per_chunk, depth, immutable)
             .await
+            .map(new_batch)
             .map_err(|e| e.to_string())
     }
 
@@ -313,7 +321,7 @@ impl ChainWriter for AntChainWriter {
         depth: u8,
         amount_per_chunk: u128,
         immutable: bool,
-    ) -> Result<[u8; 32], FundingFailure> {
+    ) -> Result<NewBatch, FundingFailure> {
         funding::buy_plan_with_xdai(
             &self.payer(),
             self.deposit_policy(),
@@ -322,6 +330,7 @@ impl ChainWriter for AntChainWriter {
             immutable,
         )
         .await
+        .map(new_batch)
         .map_err(failure)
     }
 
