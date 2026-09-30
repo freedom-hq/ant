@@ -12,6 +12,11 @@
 //! `http://127.0.0.1:<port>` unchanged. There is exactly one gateway
 //! per handle; a second `ant_start_gateway` while one is running is a
 //! no-op success.
+//!
+//! CORS is off by default: the gateway has no auth, so any page a
+//! browser lets read its responses can read `/wallet`, `/addresses`,
+//! `/stamps`, … A host whose own pages need cross-origin access opts
+//! in with [`ant_set_gateway_cors`] before starting (issue #101).
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
@@ -56,6 +61,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// clearing a transport that was installed before the start does reach
 /// this gateway immediately — a cleared one falls back to `gnosis_rpc`
 /// rather than calling a `host_ctx` the host has been told it may free.
+///
+/// CORS: the gateway answers cross-origin requests only for the
+/// origins last set with [`ant_set_gateway_cors`]; by default none, so
+/// it sends no CORS headers and no page from another origin can read
+/// its responses.
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -167,6 +177,17 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
         };
 
+        // The host's CORS allow-list (empty unless it called
+        // `ant_set_gateway_cors`). Read under the `gateway_task` guard,
+        // which the setter also takes, so it can't change mid-start.
+        let cors = CorsConfig::new(
+            handle
+                .gateway_cors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter(),
+        );
+
         // Probe-bind synchronously so a port clash surfaces as a clean
         // FFI error instead of a silently-dead background task. There's
         // a tiny TOCTOU window before `Gateway::serve` rebinds, but on
@@ -243,10 +264,12 @@ pub unsafe extern "C" fn ant_start_gateway(
             // writer on iOS (no `antop` Retrieval tab consuming it).
             activity: GatewayActivity::new(),
             tags: Arc::new(TagRegistry::new()),
-            // Freedom's dweb pages fetch/upload from an opaque (`null`)
-            // origin, so the gateway must echo `null` in CORS — matches
-            // bee started with `--cors-allowed-origins=null`.
-            cors: Arc::new(CorsConfig::new(["null"])),
+            // Host-chosen allow-list, empty (= no CORS headers, like
+            // bee without `--cors-allowed-origins`) by default. This
+            // used to be pinned to `null`, which any page can send: a
+            // fetch that is redirected after a cross-origin hop carries
+            // `Origin: null` (issue #101).
+            cors: Arc::new(cors),
             // The FFI path resolves its chain wiring before starting
             // the gateway, so the slot is preset — no chain-init 503
             // window here. On-chain reader/writer when built with the
@@ -273,6 +296,100 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
         });
         *slot = Some(task);
+        true
+    }
+}
+
+/// Set the CORS origins the in-process gateway allows. Takes effect at
+/// the next [`ant_start_gateway`]; must be called while no gateway is
+/// running on `handle` (before the first start, or after
+/// [`ant_stop_gateway`]) and fails otherwise, so a running gateway never
+/// serves a list other than the one the host last saw accepted.
+///
+/// `origins` points at `origins_len` NUL-terminated UTF-8 strings,
+/// matched like bee's `cors-allowed-origins`: an exact origin such as
+/// `https://app.example` (case-insensitive), `*` for any origin, or
+/// `null` for opaque origins. A null `origins` or `origins_len == 0`
+/// clears the list — the default — so the gateway sends no CORS headers
+/// and no page from another origin can read its responses. Blank
+/// entries are ignored.
+///
+/// Only allow origins whose pages you trust with the whole API: there
+/// is no auth, so an allowed page can read `/wallet`, `/addresses`,
+/// `/stamps` etc. and upload. `null` in particular matches *any* page
+/// whose request was redirected across origins (the Fetch spec taints
+/// the origin to `null`), and `*` matches every page.
+///
+/// Returns `true` on success; `false` with an allocated message in
+/// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a
+/// running gateway, or a null/non-UTF-8 entry — the stored list is then
+/// left unchanged.
+///
+/// # Safety
+///
+/// `handle` must come from [`crate::ant_init`] and must not have been
+/// passed to [`crate::ant_shutdown`]. If `origins_len > 0` and `origins`
+/// is non-null, `origins` must point to `origins_len` readable
+/// `*const c_char`s, each a NUL-terminated string (a null entry is
+/// reported as an error). `out_err`, if non-null, must point to a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_gateway_cors(
+    handle: *const AntHandle,
+    origins: *const *const c_char,
+    origins_len: usize,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_set_gateway_cors: null handle");
+            return false;
+        };
+
+        let mut list = Vec::new();
+        if !origins.is_null() {
+            for i in 0..origins_len {
+                let ptr = *origins.add(i);
+                if ptr.is_null() {
+                    write_out_err(
+                        out_err,
+                        &format!("ant_set_gateway_cors: origin {i} is null"),
+                    );
+                    return false;
+                }
+                match CStr::from_ptr(ptr).to_str().map(str::trim) {
+                    Ok("") => {}
+                    Ok(o) => list.push(o.to_string()),
+                    Err(_) => {
+                        write_out_err(
+                            out_err,
+                            &format!("ant_set_gateway_cors: origin {i} is not valid UTF-8"),
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Same guard `ant_start_gateway` holds across its whole start,
+        // so this can't slip in between a start's read of the list and
+        // its spawn.
+        let task = handle
+            .gateway_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.as_ref().is_some_and(|t| !t.is_finished()) {
+            write_out_err(
+                out_err,
+                "ant_set_gateway_cors: gateway is running; call ant_stop_gateway first",
+            );
+            return false;
+        }
+        *handle
+            .gateway_cors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = list;
         true
     }
 }
