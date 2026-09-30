@@ -106,7 +106,10 @@ struct Opt {
     /// and the literal `null` allows opaque-origin pages. Freedom sets
     /// this to `null` so its `bzz://` dweb pages can call `window.swarm`
     /// (PLAN.md J.4.8). Empty (default) disables CORS, matching a bee
-    /// node started without the option.
+    /// node started without the option. The xDAI-spending
+    /// `POST /v0/storage/*` and `POST /v0/settlement/deposit` refuse
+    /// web pages except an origin listed here exactly (`*` and `null`
+    /// don't unlock them).
     #[arg(long, value_delimiter = ',')]
     cors_allowed_origins: Vec<String>,
 

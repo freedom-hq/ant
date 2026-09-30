@@ -8,15 +8,15 @@ mod common;
 use std::sync::Arc;
 
 use ant_gateway::{
-    ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, DepositView,
-    FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
+    ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, CorsConfig,
+    DepositView, FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
 };
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router, status_router_with_chain,
-    status_router_with_chain_and_hook,
+    status_router_with_chain_and_hook, status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -1018,4 +1018,114 @@ async fn v0_deposit_refusal_goes_to_the_embedder_hook() {
     let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
     let (status, _) = req(router, Method::POST, "/v0/settlement/deposit").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Send `method uri` with the given extra headers; return the status.
+async fn status_with_headers(
+    router: axum::Router,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    let mut b = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    send(router, b.body(Body::empty()).unwrap()).await.status()
+}
+
+/// The xDAI-spending routes are query-only, so a page could send them
+/// as CORS-simple requests with no preflight. They refuse anything a
+/// browser sent unless the origin is listed exactly: nothing is swapped
+/// or bought for a cross-site page, a `null`-origin dweb page, or an
+/// origin only `*` covers. Reads and non-browser callers still work.
+#[tokio::test]
+async fn v0_wallet_spending_routes_refuse_web_pages() {
+    const WRITES: [&str; 3] = [
+        "/v0/storage/buy?depth=24&amountPerChunk=1000",
+        "/v0/storage/extend?batchId=abababababababababababababababababababababababababababababababab&amountPerChunk=1000",
+        "/v0/settlement/deposit",
+    ];
+    let browser_headers: [&[(&str, &str)]; 5] = [
+        &[
+            ("origin", "https://evil.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+        &[("origin", "null")],
+        &[("origin", "https://app.example:8443")],
+        &[
+            ("origin", "http://127.0.0.1:1633"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        &[("sec-fetch-site", "cross-site")],
+    ];
+    for cors in [
+        CorsConfig::default(),
+        CorsConfig::new(["*", "null"]),
+        CorsConfig::new(["https://app.example"]),
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let router = status_router_with_chain_hooks_and_cors(
+            snapshot_with_one_peer(),
+            funding_ctx(writer.clone()),
+            None,
+            None,
+            cors.clone(),
+        );
+        for uri in WRITES {
+            for h in browser_headers {
+                assert_eq!(
+                    status_with_headers(router.clone(), Method::POST, uri, h).await,
+                    StatusCode::FORBIDDEN,
+                    "{uri} {h:?} {cors:?}",
+                );
+            }
+        }
+        assert_eq!(writer.calls(), Vec::<String>::new(), "{cors:?}");
+        // Quotes and the deposit status are reads: not guarded.
+        for uri in [
+            "/v0/storage/quote?depth=20&days=30",
+            "/v0/settlement/deposit",
+        ] {
+            assert_eq!(
+                status_with_headers(
+                    router.clone(),
+                    Method::GET,
+                    uri,
+                    &[("origin", "https://evil.example")]
+                )
+                .await,
+                StatusCode::OK,
+                "{uri}",
+            );
+        }
+    }
+
+    // Non-browser callers (Freedom's main process, the ant-ffi host,
+    // curl), a user-typed request, and an exactly listed origin go
+    // through.
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain_hooks_and_cors(
+        snapshot_with_one_peer(),
+        funding_ctx(writer.clone()),
+        None,
+        None,
+        CorsConfig::new(["https://App.Example", "null"]),
+    );
+    let buy = "/v0/storage/buy?depth=24&amountPerChunk=1000";
+    for h in [
+        &[][..],
+        &[("sec-fetch-site", "none")][..],
+        &[
+            ("origin", "https://app.example"),
+            ("sec-fetch-site", "cross-site"),
+        ][..],
+    ] {
+        assert_eq!(
+            status_with_headers(router.clone(), Method::POST, buy, h).await,
+            StatusCode::CREATED,
+            "{h:?}",
+        );
+    }
+    assert_eq!(writer.calls().len(), 3);
 }

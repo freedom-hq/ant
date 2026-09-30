@@ -245,6 +245,24 @@ pub fn status_router_with_chain_and_hooks(
     on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
 ) -> Router {
+    status_router_with_chain_hooks_and_cors(
+        snapshot,
+        chain,
+        on_batch_bought,
+        on_chequebook_refused,
+        CorsConfig::default(),
+    )
+}
+
+/// [`status_router_with_chain_and_hooks`] with a `cors-allowed-origins`
+/// policy, for the wallet-spend guard tests.
+pub fn status_router_with_chain_hooks_and_cors(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
+    cors: CorsConfig,
+) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
@@ -269,7 +287,7 @@ pub fn status_router_with_chain_and_hooks(
         commands: cmd_tx,
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
-        cors: Arc::new(CorsConfig::default()),
+        cors: Arc::new(cors),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: Some(chain),
