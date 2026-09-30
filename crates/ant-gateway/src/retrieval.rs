@@ -243,8 +243,12 @@ pub(crate) const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// (`BATCH_PROPAGATION` + `PROPAGATION_REJECTION_GRACE` in `ant-p2p`,
 /// up to 100 s after registration, then one 12 s patience budget).
 /// Matches the upload manager's 2-minute push timeout, so a push the
-/// node is still legitimately waiting out isn't reported as a 504
-/// while it lands in the background.
+/// node is still legitimately *waiting* out isn't reported as a 504
+/// while it lands in the background. That covers the waits, not the
+/// walks: deadlines are checked between walks, and a walk in flight
+/// can take up to one 45 s pushsync timeout per candidate peer, so a
+/// slow last walk can still overshoot into a 504 while the node keeps
+/// pushing in the background (see `PROPAGATION_REJECTION_GRACE`).
 pub(crate) const CHUNK_PUSH_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Abort a streaming body once it goes this long without delivering any

@@ -4221,9 +4221,18 @@ const BATCH_PROPAGATION: Duration = Duration::from_secs((10 + 4) * 5);
 
 /// How long past [`BATCH_PROPAGATION`] a push still reads a "not found
 /// on-chain" rejection as propagation lag, for storers whose listener
-/// polls late. Short enough that a push waiting out the whole window,
-/// then one default patience budget, stays inside the upload manager's
-/// 2-minute push timeout (and the gateway's `CHUNK_PUSH_TIMEOUT`).
+/// polls late. Short enough that the *waiting* — the whole window, then
+/// one default patience budget, 112 s — stays inside the upload
+/// manager's 2-minute push timeout (and the gateway's
+/// `CHUNK_PUSH_TIMEOUT`). The walks themselves come on top: deadlines
+/// are only checked between walks, and one walk can spend up to one
+/// `PUSHSYNC_TIMEOUT` (45 s, `ant-retrieval`) per candidate peer. So a
+/// push whose last walk starts near the end of the wait and runs slow
+/// can still ack past 2 minutes: the caller then sees a timeout (504
+/// on the gateway routes, a re-dispatch in the upload manager) while
+/// the push finishes in the background. Nothing is lost; the same
+/// overshoot existed before the propagation wait (budget + walk time
+/// against the old 60 s cap).
 const PROPAGATION_REJECTION_GRACE: Duration = Duration::from_secs(30);
 
 /// Pause between re-walks while a push waits for its batch to reach
@@ -9562,12 +9571,14 @@ mod tests {
     #[test]
     fn the_propagation_window_is_bees_confirmation_window() {
         assert_eq!(BATCH_PROPAGATION, Duration::from_secs(70));
-        // A push waiting out the whole window must fit the upload
-        // manager's 2-minute push timeout.
-        // A push waiting out the whole window, then one default
-        // patience budget for a transient failure, must fit the upload
+        // The *waiting* — the whole window, then one default patience
+        // budget for a transient failure — must fit the upload
         // manager's 2-minute push timeout (and the gateway's
-        // `CHUNK_PUSH_TIMEOUT` for the one-shot routes).
+        // `CHUNK_PUSH_TIMEOUT` for the one-shot routes). Walk time is
+        // not bounded by this: a walk in flight at the deadline runs to
+        // completion (up to one 45 s pushsync timeout per candidate),
+        // so the ack itself can overshoot; see
+        // `PROPAGATION_REJECTION_GRACE`.
         assert!(
             BATCH_PROPAGATION + PROPAGATION_REJECTION_GRACE + Duration::from_secs(12)
                 < Duration::from_mins(2)
