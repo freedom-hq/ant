@@ -1140,14 +1140,6 @@ fn expand_tilde(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Load `--config` (if given), merging its values into `opt` for every
-/// setting the operator did **not** pass on the command line. Returns
-/// the resolved keystore password (from `--password` / `--password-file`
-/// or the config's `password` / `password-file`), if any.
-///
-/// CLI > config file > default — the same precedence bee uses, so a
-/// Freedom-written config behaves predictably while an operator can
-/// still override one knob on the command line.
 /// Reject a malformed `cors-allowed-origins` entry (CLI or config file)
 /// instead of letting [`ant_gateway::CorsConfig::new`] drop it silently
 /// — a typo such as `*.bzz.example` (no scheme) would otherwise leave
@@ -1160,6 +1152,14 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Load `--config` (if given), merging its values into `opt` for every
+/// setting the operator did **not** pass on the command line. Returns
+/// the resolved keystore password (from `--password` / `--password-file`
+/// or the config's `password` / `password-file`), if any.
+///
+/// CLI > config file > default — the same precedence bee uses, so a
+/// Freedom-written config behaves predictably while an operator can
+/// still override one knob on the command line.
 fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option<String>> {
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
