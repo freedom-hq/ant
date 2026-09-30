@@ -209,6 +209,16 @@ pub struct AntHandle {
     /// chequebook. [`ant_start_gateway`] runs it once it has an RPC.
     #[cfg(feature = "chain")]
     chain_init: Arc<drive::ChainInit>,
+    /// The chequebook the in-process gateway reports (`/wallet`,
+    /// `/chequebook/*`) and funds (`POST /chequebook/deposit`). One slot
+    /// for the life of the handle, shared by every gateway start: each
+    /// start resets it from the persisted record, the chain init and
+    /// after-buy hook set it once settlement runs on a chequebook, and a
+    /// disqualifying chain check clears it
+    /// ([`drive::sync_gateway_chequebook`]) — including one landing
+    /// after an idempotent `ant_start_gateway` retry.
+    #[cfg(feature = "chain")]
+    gateway_chequebook: ant_gateway::ChequebookSlot,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
@@ -952,6 +962,8 @@ fn init_inner(
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
         chain_init,
+        #[cfg(feature = "chain")]
+        gateway_chequebook: ant_gateway::ChequebookSlot::default(),
     })
 }
 
@@ -4138,6 +4150,8 @@ mod tests {
                 batch_owner: [0u8; 20],
                 postage_dir: data_dir.join("postage"),
             }))),
+            #[cfg(feature = "chain")]
+            gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         }
     }
 

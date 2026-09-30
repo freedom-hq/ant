@@ -111,6 +111,72 @@ pub trait ChainWriter: Send + Sync {
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String>;
 }
 
+/// The node's chequebook address, as the gateway reports and funds it.
+///
+/// Shared between the [`ChainContext`] and the writer (cloning shares
+/// the slot), and updatable after startup. The embedder resolves the
+/// chequebook at startup, but it can also appear later: a deploy
+/// triggered by a stamp buy, or one adopted by `ant-ffi`'s gateway-start
+/// chain init. Setting it here makes `/wallet`, `/chequebook/*` and
+/// `POST /chequebook/deposit` see it without a restart.
+#[derive(Debug, Clone, Default)]
+pub struct ChequebookSlot(std::sync::Arc<std::sync::RwLock<Option<[u8; 20]>>>);
+
+impl ChequebookSlot {
+    #[must_use]
+    pub fn new(chequebook: Option<[u8; 20]>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(chequebook)))
+    }
+
+    /// The current chequebook, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<[u8; 20]> {
+        *self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record the chequebook the node now settles with.
+    pub fn set(&self, chequebook: [u8; 20]) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(chequebook);
+    }
+
+    /// Forget the chequebook: the node no longer settles with one (e.g.
+    /// the chain check disqualified it), so `/chequebook/*` reports none
+    /// and `POST /chequebook/deposit` has nothing to fund.
+    pub fn clear(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+impl From<Option<[u8; 20]>> for ChequebookSlot {
+    fn from(chequebook: Option<[u8; 20]>) -> Self {
+        Self::new(chequebook)
+    }
+}
+
+/// Serializes every transaction sent from the node wallet.
+///
+/// The wallet fetches its nonce as "pending count" per tx, so two
+/// senders interleaving (a second `POST /stamps` while the first is
+/// still confirming, or the embedder topping up the chequebook in the
+/// background after a buy) race for the same nonce, and a transfer can
+/// drain the xBZZ a buy's balance guard just counted. The write
+/// endpoints hold it from their pre-checks through the last receipt;
+/// an embedder that sends from the same wallet outside the gateway
+/// clones it from [`ChainContext::tx_lock`] (antd) or passes its own to
+/// [`crate::chainreader::build_with_transport`] (ant-ffi, which rebuilds
+/// the context on every gateway start) and holds it the same way. It
+/// only serializes senders that share the one lock.
+pub type WalletTxLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
 /// Everything the chain-backed endpoints need beyond the reader: the
 /// wallet address whose balances `/wallet` reports, the chequebook
 /// address (if one is deployed), the chain id bee-js branches on, and
@@ -118,11 +184,13 @@ pub trait ChainWriter: Send + Sync {
 pub struct ChainContext {
     pub reader: std::sync::Arc<dyn ChainReader>,
     pub wallet_eth: [u8; 20],
-    pub chequebook: Option<[u8; 20]>,
+    pub chequebook: ChequebookSlot,
     pub chain_id: u64,
     /// Signer for the on-chain write endpoints. `None` → those endpoints
     /// return `501`.
     pub writer: Option<std::sync::Arc<dyn ChainWriter>>,
+    /// Held across every wallet transaction; see [`WalletTxLock`].
+    pub tx_lock: WalletTxLock,
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
@@ -203,7 +271,7 @@ pub async fn wallet(State(handle): State<GatewayHandle>) -> Response {
         native_token_balance: native.to_string(),
         chain_id: chain.chain_id,
         wallet_address: format!("0x{}", hex::encode(chain.wallet_eth)),
-        chequebook_contract_address: chain.chequebook.map_or_else(
+        chequebook_contract_address: chain.chequebook.get().map_or_else(
             || ZERO_ADDRESS.to_string(),
             |a| format!("0x{}", hex::encode(a)),
         ),
@@ -227,7 +295,7 @@ pub async fn chequebook_address(State(handle): State<GatewayHandle>) -> Response
     if handle.chain_state().is_none() {
         return crate::error::chain_initializing();
     }
-    let addr = handle.chain().and_then(|c| c.chequebook).map_or_else(
+    let addr = handle.chain().and_then(|c| c.chequebook.get()).map_or_else(
         || ZERO_ADDRESS.to_string(),
         |a| format!("0x{}", hex::encode(a)),
     );
@@ -264,7 +332,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         }
         return zero();
     };
-    let Some(cb) = chain.chequebook else {
+    let Some(cb) = chain.chequebook.get() else {
         return zero();
     };
     let bal = match guarded(chain.reader.chequebook_balance(cb)).await {
@@ -424,14 +492,18 @@ where
 
 /// Resolve the writer or produce the bee-shaped `501` used when no
 /// funded wallet is configured.
+/// Also returns the wallet's [`WalletTxLock`], which the caller holds
+/// across its transaction.
 #[allow(clippy::result_large_err)]
-fn writer(handle: &GatewayHandle) -> Result<std::sync::Arc<dyn ChainWriter>, Response> {
+fn writer(
+    handle: &GatewayHandle,
+) -> Result<(std::sync::Arc<dyn ChainWriter>, WalletTxLock), Response> {
     if handle.chain_state().is_none() {
         return Err(crate::error::chain_initializing());
     }
     handle
         .chain()
-        .and_then(|c| c.writer.clone())
+        .and_then(|c| Some((c.writer.clone()?, c.tx_lock.clone())))
         .ok_or_else(|| {
             json_error(
                 StatusCode::NOT_IMPLEMENTED,
@@ -550,6 +622,10 @@ pub async fn buy_stamp(
     let total_cost = 1u128
         .checked_shl(u32::from(depth))
         .and_then(|factor| amount.checked_mul(factor));
+    // Held from the balance guard through the buy's last receipt, so a
+    // background top-up can't spend the xBZZ counted here or take the
+    // buy's nonce.
+    let tx = chain.tx_lock.lock().await;
     let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -566,6 +642,7 @@ pub async fn buy_stamp(
         Ok(id) => id,
         Err(r) => return r,
     };
+    drop(tx);
     // Register the issuer with the running node *before* returning 201,
     // so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
     // finds a usable batch without a restart. We construct the issuer
@@ -592,7 +669,7 @@ pub async fn topup_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, amount)): Path<(String, String)>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -604,6 +681,7 @@ pub async fn topup_stamp(
         Ok(a) => a,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer"),
     };
+    let _tx = tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.topup_batch(batch_id, amount)).await {
         return r;
     }
@@ -616,7 +694,7 @@ pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -624,9 +702,11 @@ pub async fn dilute_stamp(
         Ok(b) => b,
         Err(r) => return r,
     };
+    let tx = tx_lock.lock().await;
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
     }
+    drop(tx);
     // Bump the live issuer's depth so subsequent uploads use the larger
     // capacity. `immutable` is irrelevant for an existing issuer (the
     // register handler only updates depth when the batch is already
@@ -644,7 +724,7 @@ pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let w = match writer(&handle) {
+    let (w, tx_lock) = match writer(&handle) {
         Ok(w) => w,
         Err(r) => return r,
     };
@@ -660,6 +740,7 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    let _tx = tx_lock.lock().await;
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,
         Err(r) => return r,

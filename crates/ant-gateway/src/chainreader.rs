@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::{ChainContext, ChainReader, ChainWriter};
+use crate::{ChainContext, ChainReader, ChainWriter, ChequebookSlot};
 use ant_chain::tx::Wallet;
 use ant_chain::{ChainClient, GNOSIS_BZZ_TOKEN};
 use anyhow::{anyhow, Result};
@@ -115,7 +115,9 @@ struct AntChainWriter {
     /// buy to be accepted, this must match the key `antd` signs stamps
     /// with — by default the node wallet itself.
     owner: [u8; 20],
-    chequebook: Option<[u8; 20]>,
+    /// Shared with the [`ChainContext`], so a chequebook resolved after
+    /// startup can be deposited into without a restart.
+    chequebook: ChequebookSlot,
 }
 
 #[async_trait]
@@ -192,6 +194,7 @@ impl ChainWriter for AntChainWriter {
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String> {
         let cb = self
             .chequebook
+            .get()
             .ok_or_else(|| "no chequebook configured to deposit into".to_string())?;
         let receipt = self
             .wallet
@@ -250,6 +253,7 @@ pub fn build(
         chain_id,
         wallet_secret,
         None,
+        crate::WalletTxLock::default(),
     )
 }
 
@@ -258,6 +262,14 @@ pub fn build(
 /// refusal on every JSON-RPC request the gateway's chain surfaces
 /// issue; a can't-serve answer falls through to the URLs above exactly
 /// as it would without a transport. `None` is identical to [`build`].
+///
+/// `chequebook` may be an embedder-owned [`ChequebookSlot`] (cloning
+/// shares it), so the embedder can update the address after startup.
+///
+/// `tx_lock` becomes [`ChainContext::tx_lock`]. An embedder that also
+/// sends from the node wallet outside the gateway, and rebuilds the
+/// gateway (each start builds a fresh context), passes the one lock its
+/// own transactions hold, so every context it builds shares it.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_with_transport(
@@ -265,10 +277,11 @@ pub fn build_with_transport(
     read_fallback_rpc_url: Option<String>,
     postage_contract: String,
     wallet_eth: [u8; 20],
-    chequebook: Option<[u8; 20]>,
+    chequebook: impl Into<ChequebookSlot>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
     transport: Option<ant_chain::SharedChainTransport>,
+    tx_lock: crate::WalletTxLock,
 ) -> Option<Arc<ChainContext>> {
     // Treat blank strings as unset so an empty env/config value behaves
     // like an absent one.
@@ -290,6 +303,7 @@ pub fn build_with_transport(
     // than refusing to start the daemon — and crucially keeps a
     // read-only fallback node from silently signing transactions against
     // a shared public RPC.
+    let chequebook = chequebook.into();
     let writer: Option<Arc<dyn ChainWriter>> = match (write_rpc, wallet_secret) {
         (Some(rpc), Some(secret)) => {
             let wallet = Wallet::new(secret, chain_id).ok();
@@ -302,7 +316,7 @@ pub fn build_with_transport(
                     postage_contract: postage,
                     bzz_token: bzz,
                     owner: wallet_eth,
-                    chequebook,
+                    chequebook: chequebook.clone(),
                 })
                     as Arc<dyn ChainWriter>),
                 _ => None,
@@ -317,6 +331,7 @@ pub fn build_with_transport(
         chequebook,
         chain_id,
         writer,
+        tx_lock,
     }))
 }
 

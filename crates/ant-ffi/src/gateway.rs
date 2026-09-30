@@ -284,12 +284,15 @@ pub unsafe extern "C" fn ant_start_gateway(
             // the storage-buy flow) so `/chequebook/address` reflects it.
             // Read-only + fast: this NEVER deploys here (that's
             // `ant_deploy_chequebook`, which spends gas) and a load error
-            // degrades to `None` rather than failing gateway start.
+            // degrades to `None` rather than failing gateway start. A
+            // chequebook this process's chain check disqualified isn't
+            // reported (settlement is off for it), so
+            // `POST /chequebook/deposit` can't fund it either.
             let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook_for(
                 &handle.data_dir.join("chequebook.json"),
                 &handle.eth,
             ) {
-                Ok(cb) => cb,
+                Ok(cb) => cb.filter(|cb| !crate::drive::is_disqualified(&handle.eth, cb)),
                 Err(e) => {
                     tracing::warn!(
                         target: "ant-ffi",
@@ -298,6 +301,12 @@ pub unsafe extern "C" fn ant_start_gateway(
                     None
                 }
             };
+            // The handle's one slot, reset for this start and kept
+            // current afterwards (see `AntHandle::gateway_chequebook`).
+            match chequebook {
+                Some(cb) => handle.gateway_chequebook.set(cb),
+                None => handle.gateway_chequebook.clear(),
+            }
             ant_gateway::chainreader::build_with_transport(
                 gnosis_rpc.clone(),
                 // No read-only fallback on mobile: chain reads stay gated
@@ -308,7 +317,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // the Gnosis mainnet default (matches `antd`'s default).
                 ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),
                 handle.eth,
-                chequebook,
+                handle.gateway_chequebook.clone(),
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
                 // Host-provided chain transport (issue #77), if the app
@@ -317,13 +326,17 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // `/wallet`, `/stamps`, `/chainstate` and `/chequebook`
                 // reading the `gnosis_rpc` URL exactly as before.
                 handle.host_chain_transport(),
+                // The account's process-wide wallet tx lock, which the
+                // drive flows and the after-buy settlement task below
+                // hold too: a `POST /stamps` can't race their deposit
+                // transfer or deploy for a nonce or for xBZZ.
+                crate::drive::wallet_tx_lock(&handle.eth),
             )
         } else {
             None
         };
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
-
         // One chain client, routed through the host transport like every
         // client this crate builds, for the background chain init and
         // the after-buy hook below.
@@ -404,7 +417,10 @@ pub unsafe extern "C" fn ant_start_gateway(
 /// fresh install's session uploads without paying peers until the next
 /// launch. Spawned so the buy response doesn't wait on it. The
 /// chequebook setup lock serialises it against a concurrent
-/// `ant_deploy_chequebook` or chain init.
+/// `ant_deploy_chequebook` or chain init. The outcome goes to the
+/// handle's gateway chequebook slot, so `/chequebook/*` reports one
+/// deployed here without a gateway restart, and one the chain check
+/// disqualified is dropped from it.
 #[cfg(feature = "chain")]
 fn after_buy_hook(
     handle: &AntHandle,
@@ -415,11 +431,16 @@ fn after_buy_hook(
     let data_dir = handle.data_dir.clone();
     let secret = handle.signing_secret;
     let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
     Arc::new(move |_batch_id| {
         let (client, cmd_tx, data_dir) = (client.clone(), cmd_tx.clone(), data_dir.clone());
+        let slot = slot.clone();
         rt.spawn(async move {
-            crate::drive::ensure_settlement_best_effort(&cmd_tx, &client, secret, &data_dir, eth)
-                .await;
+            let chequebook = crate::drive::ensure_settlement_best_effort(
+                &cmd_tx, &client, secret, &data_dir, eth,
+            )
+            .await;
+            crate::drive::sync_gateway_chequebook(&slot, &eth, chequebook);
         });
     })
 }
@@ -427,15 +448,22 @@ fn after_buy_hook(
 /// Run [`crate::drive::ChainInit::run`] in the background against
 /// `chain`. Overlapping runs are safe (see `ChainInit::run`), and one
 /// with nothing left to do issues no reads, so calling this on every
-/// `ant_start_gateway` is cheap.
+/// `ant_start_gateway` is cheap. Its settlement outcome goes to the
+/// handle's gateway chequebook slot — the live gateway's, also on the
+/// idempotent "already running" retry.
 #[cfg(feature = "chain")]
 fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
     let init = Arc::clone(&handle.chain_init);
     let cmd_tx = handle.cmd_tx.clone();
     let data_dir = handle.data_dir.clone();
     let secret = handle.signing_secret;
+    let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
     handle.runtime.spawn(async move {
-        init.run(&chain, &cmd_tx, &data_dir, secret).await;
+        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, |adopted| {
+            crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
+        })
+        .await;
     });
 }
 

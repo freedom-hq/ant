@@ -452,6 +452,7 @@ mod tests {
                     postage_dir: std::path::PathBuf::from("/nonexistent/postage"),
                 },
             ))),
+            gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         };
         (handle, (cmd_rx, status_tx))
     }

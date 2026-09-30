@@ -7,7 +7,7 @@ mod common;
 
 use std::sync::Arc;
 
-use ant_gateway::{ChainContext, ChainReader, ChainWriter};
+use ant_gateway::{ChainContext, ChainReader, ChainWriter, ChequebookSlot, WalletTxLock};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -47,9 +47,10 @@ fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
         reader: Arc::new(FakeChain),
         wallet_eth: [0x11; 20],
-        chequebook,
+        chequebook: ChequebookSlot::new(chequebook),
         chain_id: 100,
         writer: None,
+        tx_lock: WalletTxLock::default(),
     })
 }
 
@@ -82,9 +83,10 @@ fn chain_ctx_rw(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
         reader: Arc::new(FakeChain),
         wallet_eth: [0x11; 20],
-        chequebook,
+        chequebook: ChequebookSlot::new(chequebook),
         chain_id: 100,
         writer: Some(Arc::new(FakeWriter)),
+        tx_lock: WalletTxLock::default(),
     })
 }
 
@@ -170,6 +172,28 @@ async fn chequebook_address_reports_configured_address() {
     let (status, json) = get(router, "/chequebook/address").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)));
+}
+
+/// A chequebook resolved after startup (a deploy triggered by a stamp
+/// buy) shows up without rebuilding the chain context or restarting.
+#[tokio::test]
+async fn chequebook_set_after_startup_is_reported_live() {
+    let ctx = chain_ctx(None);
+    let router = status_router_with_chain(snapshot_with_one_peer(), Arc::clone(&ctx));
+
+    let (_, json) = get(router.clone(), "/chequebook/address").await;
+    assert_eq!(json["chequebookAddress"], format!("0x{}", "0".repeat(40)));
+
+    let cb = [0xCD; 20];
+    ctx.chequebook.set(cb);
+    let (status, json) = get(router.clone(), "/chequebook/address").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)));
+    let (_, json) = get(router, "/wallet").await;
+    assert_eq!(
+        json["chequebookContractAddress"],
+        format!("0x{}", hex::encode(cb))
+    );
 }
 
 #[tokio::test]
@@ -354,6 +378,41 @@ async fn deposit_returns_tx_hash() {
         json["transactionHash"],
         format!("0x{}", hex::encode([0xD0; 32])),
     );
+}
+
+/// An embedder sending from the node wallet outside the gateway (antd's
+/// after-buy chequebook top-up) holds the context's `tx_lock`; every
+/// write endpoint waits for it, so the two can't race for a nonce or
+/// spend the same xBZZ.
+#[tokio::test]
+async fn write_endpoints_wait_for_the_wallet_tx_lock() {
+    let id = hex::encode([0xAB; 32]);
+    let dilute = format!("/stamps/dilute/{id}/22");
+    let topup = format!("/stamps/topup/{id}/500");
+    for (method, uri) in [
+        (Method::POST, "/stamps/1000000/20"),
+        (Method::PATCH, topup.as_str()),
+        (Method::PATCH, dilute.as_str()),
+        (Method::POST, "/chequebook/deposit?amount=1"),
+    ] {
+        let ctx = chain_ctx_rw(Some([0xCD; 20]));
+        let held = ctx.tx_lock.clone().lock_owned().await;
+        let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+        let (m, u) = (method.clone(), uri.to_string());
+        let mut write = tokio::spawn(async move { req(router, m, &u).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut write)
+                .await
+                .is_err(),
+            "{method} {uri} sent while another wallet tx held the lock",
+        );
+        drop(held);
+        let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("write finishes once the lock is released")
+            .unwrap();
+        assert!(status.is_success(), "{method} {uri}: {status}");
+    }
 }
 
 #[tokio::test]
