@@ -26,10 +26,11 @@
 //! `POST` with no body or a form/text body and no custom headers) needs
 //! no preflight, so any page can still fire the state-changing routes —
 //! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
-//! `gnosis_rpc`, then deploys a chequebook if the account has none —
-//! xDAI gas — and funds it, or tops up an existing one below the
-//! settlement-deposit target, by transferring the wallet's existing
-//! xBZZ; nothing is swapped), `POST /chequebook/deposit` (moves xBZZ) —
+//! `gnosis_rpc`, then deploys a chequebook if the account has none and
+//! funds it, or tops up an existing one below the settlement-deposit
+//! target, by transferring the wallet's existing xBZZ — every one of
+//! those transactions costs xDAI gas; nothing is swapped),
+//! `POST /chequebook/deposit` (moves xBZZ, paying xDAI gas) —
 //! with `mode: 'no-cors'`, whatever
 //! the allow-list says. Those routes are unprotected against
 //! cross-site requests; see issue #105.
@@ -133,7 +134,9 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// rediscovery scan or chequebook adoption that failed is retried. A
 /// rediscovery scan or adoption that already succeeded is not repeated
 /// in this process — a batch bought on another device only shows up
-/// after a fresh `ant_init` or an explicit `ant_storage_discover`.
+/// after an explicit `ant_storage_discover`, or a fresh `ant_init`
+/// followed by a start with a `gnosis_rpc` (`ant_init` alone only
+/// reloads persisted state; the rescan runs here, in `ChainInit::run`).
 ///
 /// # Safety
 ///
@@ -463,10 +466,11 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 /// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
 /// executes it — spending the wallet's xBZZ (for `/stamps` both the
 /// batch and a transfer into a new or under-funded chequebook's
-/// deposit) and, for `/stamps` with no chequebook yet, xDAI gas to
-/// deploy one; nothing is swapped — even though the page cannot read
-/// the reply. Don't rely on this call to protect
-/// the wallet's funds.
+/// deposit) and xDAI gas for every transaction it sends — the batch
+/// purchase and, for `/stamps`, deploying a chequebook if there is none
+/// yet and the deposit transfer into a new or under-funded one; nothing
+/// is swapped — even though the page cannot read the reply. Don't rely
+/// on this call to protect the wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a

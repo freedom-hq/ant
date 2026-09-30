@@ -766,8 +766,10 @@ void ant_free_string(char *ptr);
  * what hasn't succeeded: a failed or pending batch check is re-read, a
  * failed rediscovery scan or chequebook adoption is retried. A scan or
  * adoption that already succeeded is not repeated in this process (a
- * batch bought on another device needs ant_storage_discover or a fresh
- * ant_init). Run off the main thread.
+ * batch bought on another device needs ant_storage_discover, or a fresh
+ * ant_init followed by ant_start_gateway with a `gnosis_rpc` — ant_init
+ * alone only reloads persisted state and never rescans). Run off the
+ * main thread.
  */
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
@@ -801,8 +803,11 @@ bool ant_start_gateway(const AntHandle *handle,
  * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
  * gateway executes it, spending the wallet's xBZZ (for /stamps both the
  * batch and a transfer into a new or under-funded chequebook's deposit)
- * and, for /stamps with no chequebook yet, xDAI gas to deploy one
- * (nothing is swapped), even though the page cannot read the reply. Do not rely on this call to protect funds.
+ * and xDAI gas for every transaction it sends — the batch purchase and,
+ * for /stamps, deploying a chequebook if there is none yet and the
+ * deposit transfer into a new or under-funded one (nothing is swapped)
+ * — even though the page cannot read the reply. Do not rely on this
+ * call to protect funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL or non-UTF-8 entry) returns false, leaves the stored list
