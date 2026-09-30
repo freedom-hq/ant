@@ -3848,6 +3848,93 @@ mod tests {
         unsafe { ant_stop_gateway(&raw const h) };
     }
 
+    /// Freedom Android serves each content root from its own virtual
+    /// origin (`https://<label>.bzz.freedom.baby`); a host-set wildcard
+    /// allows exactly those, not the apex, lookalikes, `null` or others.
+    #[test]
+    fn gateway_allows_host_configured_wildcard_subdomains() {
+        let h = gateway_test_handle("gw-cors-wildcard");
+        set_cors(&raw const h, &["https://*.bzz.freedom.baby"]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        for origin in [
+            "https://3kescpg.bzz.freedom.baby",
+            "https://aa.bb.bzz.freedom.baby",
+        ] {
+            let resp = gateway_request(addr, "GET", "/addresses", &format!("Origin: {origin}\r\n"));
+            assert!(resp.starts_with("http/1.1 200"), "{resp}");
+            assert!(
+                resp.contains(&format!("access-control-allow-origin: {origin}")),
+                "subdomain origin must be echoed:\n{resp}"
+            );
+            let preflight = gateway_request(
+                addr,
+                "OPTIONS",
+                "/bzz",
+                &format!("Origin: {origin}\r\nAccess-Control-Request-Method: POST\r\n"),
+            );
+            assert!(
+                preflight.contains(&format!("access-control-allow-origin: {origin}")),
+                "{preflight}"
+            );
+        }
+        for origin in [
+            "https://bzz.freedom.baby",
+            "https://x.bzz.freedom.baby.evil.example",
+            "http://x.bzz.freedom.baby",
+            "https://x.bzz.freedom.baby:8443",
+            "null",
+            "https://evil.example",
+        ] {
+            let resp = gateway_request(addr, "GET", "/wallet", &format!("Origin: {origin}\r\n"));
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "Origin: {origin} must not be allowed:\n{resp}"
+            );
+            let preflight = gateway_request(
+                addr,
+                "OPTIONS",
+                "/wallet",
+                &format!("Origin: {origin}\r\nAccess-Control-Request-Method: GET\r\n"),
+            );
+            assert!(
+                !preflight.contains("access-control-allow-origin"),
+                "preflight from {origin} must not be allowed:\n{preflight}"
+            );
+        }
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    #[test]
+    fn set_gateway_cors_rejects_malformed_wildcards_without_changing_the_list() {
+        let h = gateway_test_handle("gw-cors-bad-wildcard");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+        for bad in [
+            "https://*.",
+            "*.bzz.freedom.baby",
+            "https://a.*.freedom.baby",
+            "https://*.bzz.freedom.baby:8443",
+            "https://*.bzz.freedom.baby/path",
+        ] {
+            // All-or-nothing: a valid entry alongside doesn't get stored.
+            let err = set_cors(&raw const h, &["https://*.ens.freedom.baby", bad]).expect_err(bad);
+            assert!(
+                err.contains("origin 1") && err.contains("wildcard"),
+                "{bad}: {err}"
+            );
+            assert_eq!(
+                *h.gateway_cors.lock().unwrap(),
+                vec!["https://app.example".to_string()],
+                "{bad}"
+            );
+        }
+        set_cors(&raw const h, &["https://*.bzz.freedom.baby", "null"]).expect("valid wildcard");
+        assert_eq!(
+            *h.gateway_cors.lock().unwrap(),
+            vec!["https://*.bzz.freedom.baby".to_string(), "null".to_string()]
+        );
+    }
+
     #[test]
     fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
         let h = gateway_test_handle("gw-cors-bad-input");

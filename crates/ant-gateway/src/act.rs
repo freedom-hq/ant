@@ -370,6 +370,7 @@ fn add_grantee(
 /// ACT headers; pass it through untouched otherwise. This is bee's
 /// `actDecryptionHandler` middleware, applied by the `/bytes`,
 /// `/chunks` and `/bzz` GET/HEAD handlers before dispatching.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn act_maybe_resolve(
     handle: &GatewayHandle,
     headers: &HeaderMap,
@@ -430,6 +431,7 @@ pub(crate) struct ActUploadOutcome {
 /// access control. Creates + stores a fresh history/kvs when the
 /// request had no (or a zero) history address; reuses the epoch valid
 /// now otherwise, storing nothing new.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn act_encrypt_upload(
     handle: &GatewayHandle,
     act: &ActUpload,
@@ -509,6 +511,7 @@ fn publisher_key(handle: &GatewayHandle) -> Result<PublicKey, Response> {
 
 /// Push ACT bookkeeping chunks (kvs manifests, history nodes, grantee
 /// lists) through the normal pushsync path.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn push_act_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
@@ -805,6 +808,7 @@ fn parse_act_history_header(
 
 /// Bee's `UpdateHandler`, verbatim semantics — see the module docs for
 /// the epoch/access-key rules. Returns `(egranteeref, historyref)`.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn update_grantees(
     handle: &GatewayHandle,
     batch_id: [u8; 32],

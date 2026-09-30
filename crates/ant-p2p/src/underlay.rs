@@ -244,15 +244,24 @@ pub(crate) fn is_globally_routable_ip(ip: IpAddr) -> bool {
     ip_scope(ip) == IpScope::Global
 }
 
-/// The IP subnets this host is directly attached to (non-loopback
-/// interfaces). A peer underlay in [`IpScope::Private`] space is only worth
-/// dialing when it falls inside one of these — e.g. phone on
+/// The IP subnets this host is directly attached to (interfaces that are
+/// up, non-loopback and not a host-internal virtual bridge). A peer
+/// underlay in [`IpScope::Private`] space is only worth dialing when it
+/// falls inside one of these — e.g. phone on
 /// `192.168.1.0/24` and a bee node on the same Wi-Fi advertising
 /// `192.168.1.20`. Traffic to a directly-attached subnet never leaves the
 /// local network, so it can't look like a scan to an upstream provider.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalSubnets {
+    /// Subnets of interfaces that are up — what [`Self::contains`] matches.
     nets: Vec<(IpAddr, u8)>,
+    /// Subnets of every candidate interface, up *or* down — what
+    /// [`Self::same_networks`] compares. Kept separate so a transient
+    /// carrier drop (Wi-Fi reassociation clearing `IFF_RUNNING` while the
+    /// address stays configured) stops same-LAN dials for its duration
+    /// without reading as a network move that purges the cached same-LAN
+    /// underlays.
+    attached: Vec<(IpAddr, u8)>,
 }
 
 impl LocalSubnets {
@@ -262,15 +271,14 @@ impl LocalSubnets {
     /// the snapshot changes and a failed read is not a network move.
     pub(crate) fn from_interfaces() -> Option<Self> {
         match if_addrs::get_if_addrs() {
-            Ok(ifs) => Some(Self::from_nets(
-                ifs.into_iter()
-                    .filter(|i| !i.is_loopback())
-                    .map(|i| match i.addr {
-                        if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
-                        if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), a.prefixlen),
-                    })
-                    .collect(),
-            )),
+            Ok(ifs) => Some(Self::from_interface_list(ifs.into_iter().map(|i| {
+                let up = i.is_oper_up();
+                let (ip, prefix) = match i.addr {
+                    if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
+                    if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), a.prefixlen),
+                };
+                (i.name, up, ip, prefix)
+            }))),
             Err(e) => {
                 tracing::debug!(target: "ant_p2p", "enumerate local interfaces: {e}");
                 None
@@ -278,11 +286,45 @@ impl LocalSubnets {
         }
     }
 
-    /// Build from `(interface address, prefix length)` pairs.
-    pub(crate) fn from_nets(mut nets: Vec<(IpAddr, u8)>) -> Self {
-        nets.sort_unstable();
-        nets.dedup();
-        Self { nets }
+    /// Build from `(interface name, is up, address, prefix length)` rows,
+    /// keeping only the interfaces that can put us on the same LAN as a
+    /// peer: up, not loopback, and not a host-internal virtual bridge (see
+    /// [`is_virtual_interface`]). A down `docker0` or a live `br-…` still
+    /// carries a `172.17.0.1/16`-style address, but that subnet is this
+    /// host's container network — a peer advertising `172.17.0.5` is in
+    /// *its* container network, not ours (issue #92).
+    ///
+    /// A down (not `IFF_RUNNING`) interface's address is still remembered
+    /// for change detection, though: see the `attached` field.
+    pub(crate) fn from_interface_list(
+        ifs: impl IntoIterator<Item = (String, bool, IpAddr, u8)>,
+    ) -> Self {
+        let mut nets = Vec::new();
+        let mut attached = Vec::new();
+        for (name, up, ip, prefix) in ifs {
+            if ip.to_canonical().is_loopback() || is_virtual_interface(&name) {
+                continue;
+            }
+            attached.push((ip, prefix));
+            if up {
+                nets.push((ip, prefix));
+            }
+        }
+        Self::build(nets, attached)
+    }
+
+    /// Build from `(interface address, prefix length)` pairs, all up.
+    #[cfg(test)]
+    pub(crate) fn from_nets(nets: Vec<(IpAddr, u8)>) -> Self {
+        Self::build(nets.clone(), nets)
+    }
+
+    fn build(mut nets: Vec<(IpAddr, u8)>, mut attached: Vec<(IpAddr, u8)>) -> Self {
+        for v in [&mut nets, &mut attached] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        Self { nets, attached }
     }
 
     /// Do two snapshots describe the same attached networks, as far as
@@ -299,14 +341,17 @@ impl LocalSubnets {
     ///   either;
     /// * private IPv4 subnets compare by host address *and* prefix: a new
     ///   DHCP lease inside the same `192.168.1.0/24` is the best available
-    ///   hint that this may be a different LAN reusing the numbering.
+    ///   hint that this may be a different LAN reusing the numbering;
+    /// * an interface's up/down state is ignored — a carrier flap that keeps
+    ///   the address is not a move (a real move changes or drops the
+    ///   address, which is still caught).
     pub(crate) fn same_networks(&self, other: &Self) -> bool {
         self.network_key() == other.network_key()
     }
 
     fn network_key(&self) -> Vec<(IpAddr, u8)> {
         let mut key: Vec<(IpAddr, u8)> = self
-            .nets
+            .attached
             .iter()
             .filter(|&&(ip, _)| ip_scope(ip) == IpScope::Private)
             .map(|&(ip, prefix)| match ip.to_canonical() {
@@ -330,6 +375,60 @@ impl LocalSubnets {
             _ => false,
         })
     }
+}
+
+/// Interface-name prefixes of host-internal virtual networks: container
+/// bridges and veth pairs (Docker, Podman, k8s CNIs) and hypervisor
+/// host-only / NAT networks (`virbr*`, `vboxnet*`, `vmnet*`). Their subnets
+/// are routed to a local bridge, so they never make a remote peer's private
+/// address reachable. Matched case-insensitively. VPN tunnels (`tun*`,
+/// `utun*`, `wg*`, `tailscale*`) are deliberately *not* listed: those do
+/// reach real remote private networks.
+///
+/// Two families are too broad to match by prefix and are handled in
+/// [`is_virtual_interface`] instead: Docker user-defined networks
+/// (`br-<12 hex>` — a bare `br-` would also catch `OpenWrt`'s real LAN bridge
+/// `br-lan`) and Hyper-V/WSL (`vEthernet (…)` — a Hyper-V *External*
+/// switch is also `vEthernet (<name>)` and carries the host's real LAN
+/// address).
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "docker", "veth", "cni", "flannel", "cali", "cilium", "weave", "kube-", "virbr", "vboxnet",
+    "vmnet", "podman", "lxcbr", "lxdbr",
+];
+
+/// Hyper-V adapters that are always host-internal: the built-in NAT
+/// `Default Switch`, WSL 2's switch (`WSL`, `WSL (Hyper-V firewall)`) and
+/// Docker Desktop's `nat` network. Other `vEthernet (…)` adapters are
+/// user-named switches — possibly an External switch bridged onto the
+/// real LAN — so they are left in.
+const HYPERV_INTERNAL_PREFIXES: &[&str] = &[
+    "vEthernet (Default Switch)",
+    "vEthernet (WSL",
+    "vEthernet (nat)",
+];
+
+/// Is `name` a host-internal virtual network? A naming heuristic — it
+/// catches the common defaults on Linux, macOS and Windows; anything it
+/// misses can be worked around with `allow_private_dials`.
+pub(crate) fn is_virtual_interface(name: &str) -> bool {
+    let has_prefix = |p: &str| {
+        name.get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    };
+    // Hyper-V names are decided by the allowlist alone: the generic `veth`
+    // prefix would otherwise swallow every `vEthernet (…)`, External
+    // switches included.
+    if has_prefix("vEthernet") {
+        return HYPERV_INTERNAL_PREFIXES.iter().any(|p| has_prefix(p));
+    }
+    VIRTUAL_INTERFACE_PREFIXES.iter().any(|p| has_prefix(p)) || is_docker_network_bridge(name)
+}
+
+/// Docker names a user-defined network's bridge `br-` followed by the
+/// first 12 hex characters of the network id (`br-68148f6025cd`).
+fn is_docker_network_bridge(name: &str) -> bool {
+    name.strip_prefix("br-")
+        .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// `ip` with every bit past the first `prefix` cleared.
@@ -605,6 +704,159 @@ mod tests {
         let kept =
             filter_dialable_underlays(&[ma("/ip6/::ffff:192.168.1.20/tcp/1634")], &local, false);
         assert_eq!(kept.len(), 1);
+    }
+
+    fn iface(name: &str, up: bool, addr: &str, prefix: u8) -> (String, bool, IpAddr, u8) {
+        (name.to_string(), up, ip(addr), prefix)
+    }
+
+    /// Issue #92: Docker/virtual bridges and down interfaces don't count
+    /// as "same LAN".
+    #[test]
+    fn local_subnets_skip_virtual_and_down_interfaces() {
+        let local = LocalSubnets::from_interface_list(vec![
+            iface("lo", true, "127.0.0.1", 8),
+            iface("docker0", true, "172.17.0.1", 16),
+            iface("wlan0", true, "192.168.1.7", 24),
+        ]);
+        assert!(local.contains(ip("192.168.1.20")));
+        assert!(!local.contains(ip("172.17.0.5")));
+        let addrs = vec![
+            ma("/ip4/192.168.1.20/tcp/1634"),
+            ma("/ip4/172.17.0.5/tcp/1634"),
+        ];
+        assert_eq!(
+            filter_dialable_underlays(&addrs, &local, false),
+            vec![ma("/ip4/192.168.1.20/tcp/1634")],
+        );
+        // `allow_private_dials` stays the escape hatch.
+        assert_eq!(filter_dialable_underlays(&addrs, &local, true), addrs);
+
+        // The vibing.at shape from the issue, plus the other common
+        // virtual networks; only the real LAN survives.
+        let local = LocalSubnets::from_interface_list(vec![
+            iface("br-68148f6025cd", true, "172.18.0.1", 16),
+            iface("docker0", false, "172.17.0.1", 16),
+            iface("veth1a2b3c", true, "fd00:dead::1", 64),
+            iface("cni0", true, "10.42.0.1", 24),
+            iface("flannel.1", true, "10.244.0.0", 32),
+            iface("cali1234abcd", true, "10.233.64.1", 32),
+            iface("virbr0", true, "192.168.122.1", 24),
+            iface("vboxnet0", true, "192.168.56.1", 24),
+            iface("podman0", true, "10.88.0.1", 16),
+            iface("vEthernet (WSL)", true, "172.29.16.1", 20),
+            iface("eth0", true, "10.0.0.5", 24),
+        ]);
+        for foreign in [
+            "172.18.0.2",
+            "172.17.0.2",
+            "fd00:dead::2",
+            "10.42.0.9",
+            "10.244.0.0",
+            "10.233.64.1",
+            "192.168.122.5",
+            "192.168.56.101",
+            "10.88.0.2",
+            "172.29.16.5",
+        ] {
+            assert!(!local.contains(ip(foreign)), "{foreign}");
+        }
+        assert!(local.contains(ip("10.0.0.9")));
+
+        // Real LAN bridges that share a naming family with virtual ones:
+        // OpenWrt's `br-lan`, a Hyper-V External switch.
+        for lan in ["br-lan", "vEthernet (External)"] {
+            let local = LocalSubnets::from_interface_list(vec![
+                iface(lan, true, "192.168.1.7", 24),
+                iface("br-68148f6025cd", true, "172.18.0.1", 16),
+            ]);
+            assert!(local.contains(ip("192.168.1.20")), "{lan}");
+            assert!(!local.contains(ip("172.18.0.2")), "{lan}");
+        }
+
+        // A real interface that is down doesn't count either.
+        let down = LocalSubnets::from_interface_list(vec![iface("en0", false, "192.168.1.7", 24)]);
+        assert!(!down.contains(ip("192.168.1.20")));
+    }
+
+    /// A carrier drop that keeps the address (Wi-Fi reassociation clearing
+    /// `IFF_RUNNING`) stops same-LAN matching while it lasts but is not a
+    /// network change; losing or changing the address still is.
+    #[test]
+    fn local_subnets_carrier_flap_is_not_a_network_change() {
+        let up = LocalSubnets::from_interface_list(vec![
+            iface("wlan0", true, "192.168.1.7", 24),
+            iface("docker0", true, "172.17.0.1", 16),
+        ]);
+        let flapped = LocalSubnets::from_interface_list(vec![
+            iface("wlan0", false, "192.168.1.7", 24),
+            iface("docker0", false, "172.17.0.1", 16),
+        ]);
+        assert!(up.contains(ip("192.168.1.20")));
+        assert!(!flapped.contains(ip("192.168.1.20")));
+        assert!(up.same_networks(&flapped));
+        assert!(flapped.same_networks(&up));
+
+        let gone =
+            LocalSubnets::from_interface_list(vec![iface("docker0", true, "172.17.0.1", 16)]);
+        assert!(!up.same_networks(&gone));
+        let new_lease =
+            LocalSubnets::from_interface_list(vec![iface("wlan0", false, "192.168.1.8", 24)]);
+        assert!(!up.same_networks(&new_lease));
+        // A virtual bridge appearing or disappearing is never a move.
+        let no_docker =
+            LocalSubnets::from_interface_list(vec![iface("wlan0", true, "192.168.1.7", 24)]);
+        assert!(up.same_networks(&no_docker));
+    }
+
+    #[test]
+    fn virtual_interface_names() {
+        for v in [
+            "docker0",
+            "br-68148f6025cd",
+            "veth9f8e7d",
+            "cni0",
+            "flannel.1",
+            "cali0123",
+            "virbr0",
+            "vboxnet0",
+            "vmnet8",
+            "podman1",
+            "vEthernet (Default Switch)",
+            "VETHERNET (WSL)",
+            "vEthernet (WSL (Hyper-V firewall))",
+            "vEthernet (nat)",
+        ] {
+            assert!(is_virtual_interface(v), "{v}");
+        }
+        for real in [
+            "eth0",
+            "wlan0",
+            "en0",
+            "enp3s0",
+            "wlp2s0",
+            "Wi-Fi",
+            "Ethernet",
+            "utun3",
+            "tun0",
+            "wg0",
+            "tailscale0",
+            "bridge0",
+            "br0",
+            // OpenWrt's LAN bridge, and near-misses of Docker's `br-<12 hex>`.
+            "br-lan",
+            "br-wan",
+            "br-68148f6025c",
+            "br-68148f6025cdx",
+            "br-68148f6025cg",
+            // A Hyper-V External switch bridges the physical NIC and
+            // carries the host's real LAN address.
+            "vEthernet (External)",
+            "vEthernet (Intel(R) Wi-Fi 6 AX201 160MHz Virtual Switch)",
+            "",
+        ] {
+            assert!(!is_virtual_interface(real), "{real}");
+        }
     }
 
     #[test]

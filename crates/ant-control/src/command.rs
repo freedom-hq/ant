@@ -117,6 +117,13 @@ pub enum ControlCommand {
         /// PSS topics to watch (`keccak256(topic_string)`); reception uses
         /// the node's PSS key if present, else topic-broadcast.
         pss_topics: Vec<[u8; 32]>,
+        /// **Mailbox mode**: run one bounded sweep of the trojan-bin
+        /// backlog on subscribe so recent PSS messages sent while the
+        /// receiver was offline are recovered (delivered to this
+        /// subscriber only), rather than only tailing live traffic. Backs
+        /// the WebSocket `?history=true` option; ignored for GSOC. See
+        /// `ant_p2p`'s `WatchState::history`.
+        history: bool,
         ack: mpsc::Sender<ControlAck>,
     },
     /// Walk the manifest at `reference`, resolve `path`, then join the

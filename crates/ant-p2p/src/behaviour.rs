@@ -2814,6 +2814,7 @@ fn handle_control_command(
             target,
             gsoc_addresses,
             pss_topics,
+            history,
             ack,
         } => {
             use crate::lurker::{self, LurkerConfig};
@@ -2826,6 +2827,10 @@ fn handle_control_command(
                 // only (the topic-derived key handles it). Directed PSS to
                 // the node's key lands when a pss.key is persisted.
                 pss_secret: None,
+                history,
+                // Mailbox ticket: stamped by the registry on subscribe.
+                history_seq: 0,
+                history_held: std::collections::BTreeSet::new(),
             };
             if watch.is_empty() {
                 // Nothing to watch — tell the subscriber why before the
@@ -8110,6 +8115,36 @@ mod tests {
         rotated.push(("2a01:4f8:1:2:cafe::1".parse().unwrap(), 64));
         state.set_local_subnets(crate::underlay::LocalSubnets::from_nets(rotated));
         assert!(state.known_dialable.contains_key(&lan_only));
+
+        // PR #93 R2-M1: a carrier drop on the LAN interface that keeps its
+        // address (Wi-Fi reassociation clearing IFF_RUNNING) stops same-LAN
+        // matching but is not a move — nothing is purged, and once the
+        // carrier is back the cached LAN underlay dials again.
+        let queued = state.hint_queue.len();
+        let iface = |up| {
+            crate::underlay::LocalSubnets::from_interface_list(vec![(
+                "wlan0".to_string(),
+                up,
+                "192.168.1.33".parse().unwrap(),
+                24,
+            )])
+        };
+        state.set_local_subnets(iface(false));
+        assert!(!state
+            .local_subnets
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("192.168.1.20".parse().unwrap()));
+        assert!(state.known_dialable.contains_key(&lan_only));
+        assert_eq!(state.hint_queue.len(), queued);
+        assert!(state.seen_hints.contains(&lan_only));
+        state.set_local_subnets(iface(true));
+        let cached = state.known_dialable[&lan_only].clone();
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()]),
+        );
 
         // R2-M2: a failed interface read keeps the previous snapshot (and
         // the cached same-LAN underlays) instead of acting as "no networks".

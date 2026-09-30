@@ -105,11 +105,15 @@ struct Opt {
     /// `cors-allowed-origins`). Comma-separated; `*` allows any origin
     /// and the literal `null` allows opaque-origin pages. Freedom sets
     /// this to `null` so its `bzz://` dweb pages can call `window.swarm`
-    /// (PLAN.md J.4.8). Empty (default) disables CORS, matching a bee
-    /// node started without the option. The xDAI-spending
-    /// `POST /v0/storage/*` and `POST /v0/settlement/deposit` refuse
-    /// web pages except an origin listed here exactly (`*` and `null`
-    /// don't unlock them).
+    /// (PLAN.md J.4.8). Beyond bee, `scheme://*.host` (e.g.
+    /// `https://*.bzz.example`) allows every subdomain of `host` on that
+    /// scheme, without port; `host` needs at least two labels, and any
+    /// other entry containing `*` is rejected at startup. Empty
+    /// (default) disables CORS, matching a bee node started without the
+    /// option. The xDAI-spending `POST /v0/storage/*` and
+    /// `POST /v0/settlement/deposit` refuse web pages except an origin
+    /// listed here exactly (`*`, `null` and wildcard entries don't unlock
+    /// them).
     #[arg(long, value_delimiter = ',')]
     cors_allowed_origins: Vec<String>,
 
@@ -344,6 +348,7 @@ async fn main() -> Result<()> {
         Err(e) => e.exit(),
     };
     let (resolved_password, ignored_config_keys) = apply_config_file(&mut opt, &matches)?;
+    validate_cors_origins(&opt.cors_allowed_origins)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -1192,6 +1197,18 @@ fn expand_tilde(p: &Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// Reject a malformed `cors-allowed-origins` entry (CLI or config file)
+/// instead of letting [`ant_gateway::CorsConfig::new`] drop it silently
+/// — a typo such as `*.bzz.example` (no scheme) would otherwise leave
+/// CORS disabled with no hint why.
+fn validate_cors_origins(origins: &[String]) -> Result<()> {
+    for o in origins {
+        ant_gateway::CorsConfig::check_entry(o)
+            .map_err(|e| anyhow::anyhow!("cors-allowed-origins: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Load `--config` (if given), merging its values into `opt` for every
@@ -2970,5 +2987,29 @@ mod tests {
             .await;
         assert_eq!(slot.get(), None);
         assert_eq!(slot.refused(), Some(CB));
+    }
+}
+
+#[cfg(test)]
+mod cors_origin_tests {
+    use super::validate_cors_origins;
+
+    #[test]
+    fn accepts_bee_forms_and_wildcards() {
+        let ok: Vec<String> = ["*", "null", "https://app.example", "https://*.bzz.example"]
+            .map(String::from)
+            .to_vec();
+        assert!(validate_cors_origins(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_wildcards() {
+        for bad in ["*.bzz.example", "https://*.com", "https://a.*.example"] {
+            let err = validate_cors_origins(&[bad.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("cors-allowed-origins"),
+                "{bad}: {err}"
+            );
+        }
     }
 }

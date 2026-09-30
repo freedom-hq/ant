@@ -26,18 +26,14 @@
 //! [`PLAN.md`]: ../../../PLAN.md
 
 #![cfg_attr(not(feature = "http-api"), allow(dead_code))]
-// Handlers and their helpers early-return an already-built axum
-// `Response` as the `Err` variant (`Result<T, Response>` + `?`), which
-// is axum's own idiomatic shape for "stop here and send this HTTP
-// reply". `clippy::result_large_err` measures that `Response` at ~128
-// bytes and flags all ten such helpers. Boxing it would mean a
-// `Box<Response>` unwrap at every `?` site across the whole crate for
-// no gain on a path that is about to do network I/O anyway, so the
-// lint is switched off for this crate — where the pattern is
-// universal — rather than for the workspace. Introduced by the
-// stable-toolchain bump to 1.98 (the lint is new), on code this
-// crate has carried unchanged for months.
-#![allow(clippy::result_large_err)]
+// Handler helpers early-return an already-built axum `Response` as the
+// `Err` variant (`Result<T, Response>` + `?`) — axum's idiomatic "stop
+// here and send this reply". `clippy::result_large_err` flags that
+// ~128-byte `Response`; boxing it would cost a `*` unwrap at every `?`
+// site for nothing on a path about to do network I/O. So each such
+// helper carries a targeted `#[allow(clippy::result_large_err)]`
+// rather than a crate-wide one, keeping the lint live for any other
+// genuinely large error type added here.
 
 #[cfg(feature = "http-api")]
 mod act;
