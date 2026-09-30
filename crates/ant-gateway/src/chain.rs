@@ -1037,6 +1037,7 @@ const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// sending.
 const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(5);
 
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn funding_call<F, T>(limit: Duration, timed_out: &str, fut: F) -> Result<T, Response>
 where
     F: std::future::Future<Output = Result<T, FundingFailure>>,
@@ -1193,6 +1194,7 @@ pub async fn storage_quote(
     let quote = async {
         let days: u64 = required(&q, "days")?;
         let depth = param::<u8>(&q, "depth")?.map(valid_depth).transpose()?;
+        #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
         let batch_id = q.get("batchId").map(|id| parse_batch_id(id)).transpose()?;
         let fut = async {
             match (batch_id, depth) {
@@ -1238,6 +1240,7 @@ pub async fn storage_buy(
         Ok(cw) => cw,
         Err(r) => return r,
     };
+    #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
     let params = (|| {
         let depth = valid_depth(required(&q, "depth")?)?;
         let amount: u128 = required(&q, "amountPerChunk")?;
@@ -1282,6 +1285,7 @@ pub async fn storage_extend(
         Ok(cw) => cw,
         Err(r) => return r,
     };
+    #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
     let params = (|| {
         let batch_id = parse_batch_id(q.get("batchId").map_or("", String::as_str))?;
         let amount: u128 = required(&q, "amountPerChunk")?;
