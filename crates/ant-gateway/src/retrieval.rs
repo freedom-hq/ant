@@ -2133,7 +2133,9 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
 ///   bucket.
 /// * `400` — the batch is not registered/usable here.
 /// * `422` — storer peers attested the batch does not exist on-chain
-///   (phantom / expired / unsynced). Deterministic, not retryable.
+///   (phantom / expired / unsynced). Deterministic, not retryable. The
+///   node doesn't report this for a batch it just bought: it waits out
+///   the storers' sync instead (`BATCH_PROPAGATION` in `ant-p2p`).
 /// * `502` — everything else: transient pushsync failure.
 pub(crate) fn upload_error_status(message: &str) -> StatusCode {
     if message.starts_with("uploads not configured") {

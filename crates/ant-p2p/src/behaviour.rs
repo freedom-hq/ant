@@ -88,10 +88,12 @@ fn postage_status_view(
     stats: &ant_postage::BucketStats,
     usable: bool,
     registered_at: Option<Instant>,
+    block_number: Option<u64>,
 ) -> ant_control::PostageStatusView {
     ant_control::PostageStatusView {
         usable,
         registered_secs_ago: registered_at.map(|t| t.elapsed().as_secs()),
+        block_number,
         enabled: true,
         batch_id: format!("0x{}", hex::encode(stats.batch_id)),
         batch_depth: stats.batch_depth,
@@ -106,6 +108,28 @@ fn postage_status_view(
         remaining_total_chunks: stats.remaining_total,
         worst_case_remaining_chunks: stats.worst_case_remaining,
     }
+}
+
+/// One registered batch's view. It isn't usable while peers reject it
+/// as not-on-chain, nor while a just-bought batch is still propagating
+/// to the storers.
+fn batch_view(
+    state: &SwarmState,
+    issuer: &ant_postage::StampIssuer,
+) -> ant_control::PostageStatusView {
+    let id = issuer.batch_id();
+    let rejected = state
+        .rejected_batches
+        .lock()
+        .is_ok_and(|s| s.contains_key(id));
+    let bought = state.bought_batches.get(id);
+    let propagating = bought.is_some_and(|b| b.propagating(Instant::now()));
+    postage_status_view(
+        &issuer.stats(),
+        !rejected && !propagating,
+        state.runtime_registered.get(id).copied(),
+        bought.map(|b| b.block),
+    )
 }
 
 /// The `enabled: false` view returned when no batch is registered.
@@ -945,6 +969,12 @@ struct SwarmState {
     /// because a lagging RPC backend hasn't seen its `BatchCreated`
     /// block yet. Batches reloaded from disk at startup have no entry.
     runtime_registered: HashMap<[u8; 32], Instant>,
+    /// Batches registered right after this node bought them
+    /// (`RegisterBatch::bought_at_block`). Until [`BATCH_PROPAGATION`]
+    /// has passed, such a batch is reported not usable, and a peer's
+    /// "not found on-chain" is propagation lag rather than a phantom
+    /// batch.
+    bought_batches: HashMap<[u8; 32], BoughtBatch>,
     /// Last successfully-resolved sequence-feed index per
     /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
     /// append-only, so a previously-resolved index is always a valid
@@ -1035,6 +1065,7 @@ impl SwarmState {
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_registered: HashMap::new(),
+            bought_batches: HashMap::new(),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -3335,17 +3366,7 @@ fn handle_control_command(
                     issuers
                         .values()
                         .next()
-                        .map_or_else(postage_status_disabled, |iss| {
-                            let rejected = state
-                                .rejected_batches
-                                .lock()
-                                .is_ok_and(|s| s.contains_key(iss.batch_id()));
-                            postage_status_view(
-                                &iss.stats(),
-                                !rejected,
-                                state.runtime_registered.get(iss.batch_id()).copied(),
-                            )
-                        })
+                        .map_or_else(postage_status_disabled, |iss| batch_view(state, iss))
                 }
                 None => postage_status_disabled(),
             };
@@ -3360,20 +3381,7 @@ fn handle_control_command(
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    issuers
-                        .values()
-                        .map(|iss| {
-                            let rejected = state
-                                .rejected_batches
-                                .lock()
-                                .is_ok_and(|s| s.contains_key(iss.batch_id()));
-                            postage_status_view(
-                                &iss.stats(),
-                                !rejected,
-                                state.runtime_registered.get(iss.batch_id()).copied(),
-                            )
-                        })
-                        .collect()
+                    issuers.values().map(|iss| batch_view(state, iss)).collect()
                 }
                 None => Vec::new(),
             };
@@ -3384,6 +3392,7 @@ fn handle_control_command(
             depth,
             bucket_depth,
             immutable,
+            bought_at_block,
             ack,
         } => {
             let Some(rt) = upload.as_ref() else {
@@ -3408,6 +3417,9 @@ fn handle_control_command(
                         return;
                     }
                 }
+                if let Some(block) = bought_at_block {
+                    note_bought_batch(state, batch_id, block);
+                }
                 let _ = ack.send(ControlAck::Ok {
                     message: format!("batch 0x{} refreshed", hex::encode(batch_id)),
                 });
@@ -3426,6 +3438,9 @@ fn handle_control_command(
                 Ok(issuer) => {
                     issuers.insert(batch_id, issuer);
                     state.runtime_registered.insert(batch_id, Instant::now());
+                    if let Some(block) = bought_at_block {
+                        note_bought_batch(state, batch_id, block);
+                    }
                     info!(
                         target: "ant_p2p",
                         batch = %format!("0x{}", hex::encode(batch_id)),
@@ -4044,6 +4059,12 @@ fn read_retry_wait() -> Duration {
 /// the 16-worker soak measured as 0.35 % of SOCs never becoming
 /// retrievable from an independent node — a 201'd write the network
 /// cannot see.)
+///
+/// `rejections_are_lag_until` is set for a batch this node just bought
+/// ([`rejection_lag_deadline`]). Until then a "not found on-chain"
+/// rejection means the storers haven't synced the batch's creation
+/// block yet, so the push waits a block and re-walks instead of
+/// failing, however long the patience budget is.
 async fn push_with_patience(
     fetcher: &ant_retrieval::RoutingFetcher,
     mut peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
@@ -4051,9 +4072,12 @@ async fn push_with_patience(
     wire: Vec<u8>,
     stamp: [u8; ant_postage::STAMP_SIZE],
     strict_first: bool,
+    rejections_are_lag_until: Option<Instant>,
 ) -> Result<(), ant_retrieval::pushsync::PushSyncError> {
     let budget = gateway_push_patience();
     let started = std::time::Instant::now();
+    let deadline =
+        rejections_are_lag_until.map_or(started + budget, |until| until.max(started + budget));
     let mut last_err = None;
     let mut walk = 0u32;
     loop {
@@ -4080,14 +4104,28 @@ async fn push_with_patience(
                 // storers — re-walking or falling back to shallow can
                 // never help, and burning the patience budget turns an
                 // instant clear failure into a slow opaque one
-                // (phantom-batch report).
+                // (phantom-batch report). Except for a just-bought
+                // batch: storers learn of it only once their postage
+                // listeners sync its creation block.
+                if let Some(wait) = propagation_wait(&e, rejections_are_lag_until, Instant::now()) {
+                    debug!(
+                        target: "ant_p2p",
+                        addr = %hex::encode(addr),
+                        walk,
+                        err = %e,
+                        "batch not yet known to the storers (just bought); waiting a block to re-walk",
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 if matches!(
                     e,
                     ant_retrieval::pushsync::PushSyncError::StampRejected { .. }
                 ) {
                     return Err(e);
                 }
-                if started.elapsed() >= budget {
+                if Instant::now() >= deadline {
                     // Strict SOCs get one final bee-aligned
                     // shallow-accepting walk before we give up: stored
                     // shallow beats a 502 with nothing stored.
@@ -4135,6 +4173,92 @@ fn gateway_push_patience() -> Duration {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(12)
     }))
+}
+
+/// How long a just-bought batch takes to reach the storers: bee's
+/// `blockThreshold` of 10 blocks past the creation block
+/// (`pkg/postage/service.go`, `IssuerUsable`), plus the 4 blocks bee's
+/// postage listener trails the chain head (`tailSize`,
+/// `pkg/postage/listener/listener.go`), at Gnosis's 5 s blocks. Storers
+/// reject a batch's stamps as "not found on-chain" until their
+/// batchstores have synced its creation block, and bee doesn't stamp
+/// with a batch before then either. Counted from registration, which
+/// follows the buy receipt, so it never starts early.
+const BATCH_PROPAGATION: Duration = Duration::from_secs((10 + 4) * 5);
+
+/// How long past [`BATCH_PROPAGATION`] a push still reads a "not found
+/// on-chain" rejection as propagation lag, for storers whose listener
+/// polls late. Short enough that a push waiting out the whole window
+/// stays inside the upload manager's 2-minute push timeout.
+const PROPAGATION_REJECTION_GRACE: Duration = Duration::from_secs(30);
+
+/// Pause between re-walks while a push waits for its batch to reach
+/// the storers: one Gnosis block.
+const PROPAGATION_RETRY: Duration = Duration::from_secs(5);
+
+/// A batch this node registered right after buying it.
+#[derive(Debug, Clone, Copy)]
+struct BoughtBatch {
+    /// The `createBatch` receipt's block, reported as `blockNumber`.
+    block: u64,
+    registered: Instant,
+}
+
+impl BoughtBatch {
+    /// Whether the storers may not know the batch yet, so it isn't
+    /// usable.
+    fn propagating(&self, now: Instant) -> bool {
+        now < self.registered + BATCH_PROPAGATION
+    }
+
+    /// Until when a "not found on-chain" rejection is propagation lag.
+    fn rejections_are_lag_until(&self) -> Instant {
+        self.registered + BATCH_PROPAGATION + PROPAGATION_REJECTION_GRACE
+    }
+}
+
+/// Record a batch registered right after its buy. A second
+/// registration (a retried buy flow) keeps the first record.
+fn note_bought_batch(state: &mut SwarmState, batch_id: [u8; 32], block: u64) {
+    state
+        .bought_batches
+        .entry(batch_id)
+        .or_insert_with(|| BoughtBatch {
+            block,
+            registered: Instant::now(),
+        });
+}
+
+/// How long a push waits before re-walking after `err`: `Some` only
+/// for a "not found on-chain" rejection while the batch is still
+/// propagating (`lag_until` in the future), at most one block.
+fn propagation_wait(
+    err: &ant_retrieval::pushsync::PushSyncError,
+    lag_until: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    if !matches!(
+        err,
+        ant_retrieval::pushsync::PushSyncError::StampRejected { .. }
+    ) {
+        return None;
+    }
+    let left = lag_until?.saturating_duration_since(now);
+    (!left.is_zero()).then(|| PROPAGATION_RETRY.min(left))
+}
+
+/// Until when a push stamped with `stamp` may treat "not found on-chain"
+/// as propagation lag: set only for a batch this node just bought.
+fn rejection_lag_deadline(
+    state: &SwarmState,
+    stamp: &[u8; ant_postage::STAMP_SIZE],
+) -> Option<Instant> {
+    let mut batch_id = [0u8; 32];
+    batch_id.copy_from_slice(&stamp[..32]);
+    state
+        .bought_batches
+        .get(&batch_id)
+        .map(BoughtBatch::rejections_are_lag_until)
 }
 
 /// First self-probe delay after a batch is peer-rejected. Rejections
@@ -4451,6 +4575,7 @@ fn push_with_stamp(
     ack: oneshot::Sender<ControlAck>,
 ) {
     let rejected_batches = state.rejected_batches.clone();
+    let lag_until = rejection_lag_deadline(state, &stamp);
     let patience_peers = state.peers_watch.subscribe();
     if state.peers_watch.subscribe().borrow().is_empty() {
         let _ = ack.send(ControlAck::Error {
@@ -4485,21 +4610,30 @@ fn push_with_stamp(
                 );
             }
         }
-        let reply =
-            match push_with_patience(&fetcher, patience_peers, addr, wire, stamp, false).await {
-                Ok(()) => {
-                    note_stamp_outcome(&rejected_batches, &stamp, None);
-                    ControlAck::ChunkUploaded {
-                        reference: format!("0x{}", hex::encode(addr)),
-                    }
+        let reply = match push_with_patience(
+            &fetcher,
+            patience_peers,
+            addr,
+            wire,
+            stamp,
+            false,
+            lag_until,
+        )
+        .await
+        {
+            Ok(()) => {
+                note_stamp_outcome(&rejected_batches, &stamp, None);
+                ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(addr)),
                 }
-                Err(e) => {
-                    note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
-                    ControlAck::Error {
-                        message: format!("pushsync: {e}"),
-                    }
+            }
+            Err(e) => {
+                note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
+                ControlAck::Error {
+                    message: format!("pushsync: {e}"),
                 }
-            };
+            }
+        };
         let _ = ack.send(reply);
     });
 }
@@ -4518,6 +4652,7 @@ fn push_soc_with_stamp(
 ) {
     const SOC_HEADER: usize = 32 + 65;
     let rejected_batches = state.rejected_batches.clone();
+    let lag_until = rejection_lag_deadline(state, &stamp);
     let patience_peers = state.peers_watch.subscribe();
     if state.peers_watch.subscribe().borrow().is_empty() {
         let _ = ack.send(ControlAck::NotReady {
@@ -4578,21 +4713,30 @@ fn push_soc_with_stamp(
         // Fix B: SOCs run strict-receipt during the patience budget —
         // the walk hunts a DEEP placement (re-walking after deepening)
         // and only degrades to shallow-accept at the ceiling.
-        let reply =
-            match push_with_patience(&fetcher, patience_peers, address, wire, stamp, true).await {
-                Ok(()) => {
-                    note_stamp_outcome(&rejected_batches, &stamp, None);
-                    ControlAck::ChunkUploaded {
-                        reference: format!("0x{}", hex::encode(address)),
-                    }
+        let reply = match push_with_patience(
+            &fetcher,
+            patience_peers,
+            address,
+            wire,
+            stamp,
+            true,
+            lag_until,
+        )
+        .await
+        {
+            Ok(()) => {
+                note_stamp_outcome(&rejected_batches, &stamp, None);
+                ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
                 }
-                Err(e) => {
-                    note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
-                    ControlAck::Error {
-                        message: format!("pushsync: {e}"),
-                    }
+            }
+            Err(e) => {
+                note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
+                ControlAck::Error {
+                    message: format!("pushsync: {e}"),
                 }
-            };
+            }
+        };
         let _ = ack.send(reply);
     });
 }
@@ -9245,6 +9389,7 @@ mod tests {
                 depth: 20,
                 bucket_depth: 16,
                 immutable: true,
+                bought_at_block: None,
                 ack: ack_tx,
             },
         );
@@ -9278,5 +9423,131 @@ mod tests {
             age(bought_id).is_some_and(|a| a < 60),
             "runtime-registered batch reports a fresh age"
         );
+    }
+
+    /// A batch registered right after its buy isn't usable until the
+    /// storers can have synced its creation block (bee's confirmation
+    /// window), and reports that block. A batch registered by id
+    /// (connect, rediscovery) is usable at once.
+    #[tokio::test]
+    async fn a_just_bought_batch_is_not_usable_until_it_has_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let bought_id = [0x0bu8; 32];
+        let connected_id = [0x0cu8; 32];
+        let rt = Arc::new(UploadRuntime {
+            issuers: std::sync::Mutex::new(HashMap::new()),
+            stamp_key: [1u8; SECP256K1_SECRET_LEN],
+            batch_owner: [0u8; 20],
+            postage_dir: dir.path().to_path_buf(),
+        });
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        for (batch_id, bought_at_block) in [(bought_id, Some(48_500_000)), (connected_id, None)] {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            handle_control_command(
+                &mut state,
+                &mut peerstore,
+                &control,
+                Some(rt.clone()),
+                0,
+                ControlCommand::RegisterBatch {
+                    batch_id,
+                    depth: 20,
+                    bucket_depth: 16,
+                    immutable: true,
+                    bought_at_block,
+                    ack: ack_tx,
+                },
+            );
+            assert!(matches!(ack_rx.await.unwrap(), ControlAck::Ok { .. }));
+        }
+        let list = |state: &mut SwarmState, peerstore: &mut PeerStore| {
+            let (ack_tx, mut ack_rx) = oneshot::channel();
+            handle_control_command(
+                state,
+                peerstore,
+                &control,
+                Some(rt.clone()),
+                0,
+                ControlCommand::PostageList { ack: ack_tx },
+            );
+            let Ok(ControlAck::PostageList(views)) = ack_rx.try_recv() else {
+                panic!("expected a postage list");
+            };
+            views
+        };
+        let find = |views: &[ant_control::PostageStatusView], id: [u8; 32]| {
+            let v = views
+                .iter()
+                .find(|v| v.batch_id == format!("0x{}", hex::encode(id)))
+                .expect("batch listed")
+                .clone();
+            (v.usable, v.block_number)
+        };
+
+        let views = list(&mut state, &mut peerstore);
+        assert_eq!(
+            find(&views, bought_id),
+            (false, Some(48_500_000)),
+            "just bought: not usable yet, with its creation block"
+        );
+        assert_eq!(
+            find(&views, connected_id),
+            (true, None),
+            "connected by id: usable at once"
+        );
+
+        // Once the window has passed, the bought batch is usable.
+        state.bought_batches.get_mut(&bought_id).unwrap().registered -=
+            BATCH_PROPAGATION + Duration::from_secs(1);
+        let views = list(&mut state, &mut peerstore);
+        assert_eq!(find(&views, bought_id), (true, Some(48_500_000)));
+    }
+
+    /// Bee's window: 10 blocks past creation, plus the 4 its listener
+    /// trails the head, at 5 s blocks.
+    #[test]
+    fn the_propagation_window_is_bees_confirmation_window() {
+        assert_eq!(BATCH_PROPAGATION, Duration::from_secs(70));
+        // A push waiting out the whole window must fit the upload
+        // manager's 2-minute push timeout.
+        assert!(BATCH_PROPAGATION + PROPAGATION_REJECTION_GRACE < Duration::from_mins(2));
+    }
+
+    /// A "not found on-chain" rejection is waited out, a block at a
+    /// time, only while the batch is still propagating; any other
+    /// failure, or a rejection after the window, isn't.
+    #[test]
+    fn only_a_propagating_batch_waits_out_a_rejection() {
+        use ant_retrieval::pushsync::PushSyncError;
+        let rejected = PushSyncError::StampRejected {
+            batch_id: [1; 32],
+            rejections: 2,
+            sample: "invalid stamp: batchstore get: storage: not found".into(),
+        };
+        let other = PushSyncError::ReceiptMismatch;
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        assert_eq!(
+            propagation_wait(&rejected, Some(later), now),
+            Some(PROPAGATION_RETRY)
+        );
+        assert_eq!(
+            propagation_wait(&rejected, Some(now + Duration::from_secs(2)), now),
+            Some(Duration::from_secs(2)),
+            "never waits past the window"
+        );
+        assert_eq!(propagation_wait(&rejected, Some(now), now), None);
+        assert_eq!(propagation_wait(&rejected, None, now), None);
+        assert_eq!(propagation_wait(&other, Some(later), now), None);
     }
 }

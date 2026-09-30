@@ -101,7 +101,7 @@ pub trait ChainWriter: Send + Sync {
         amount_per_chunk: u128,
         depth: u8,
         immutable: bool,
-    ) -> Result<[u8; 32], String>;
+    ) -> Result<NewBatch, String>;
     /// `PostageStamp.topUp(batchId, amountPerChunk)`.
     async fn topup_batch(&self, batch_id: [u8; 32], amount_per_chunk: u128) -> Result<(), String>;
     /// `PostageStamp.increaseDepth(batchId, newDepth)` (a.k.a "dilute").
@@ -138,7 +138,7 @@ pub trait ChainWriter: Send + Sync {
         _depth: u8,
         _amount_per_chunk: u128,
         _immutable: bool,
-    ) -> Result<[u8; 32], FundingFailure> {
+    ) -> Result<NewBatch, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
     /// Extend (and with `new_depth`, resize) `batch_id`, swapping xDAI
@@ -160,6 +160,14 @@ pub trait ChainWriter: Send + Sync {
     async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
+}
+
+/// A batch a buy just created: its id and the block of its
+/// `createBatch` receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewBatch {
+    pub id: [u8; 32],
+    pub block: u64,
 }
 
 /// Why an xDAI storage-funding call failed, so the route answers with
@@ -761,6 +769,7 @@ async fn register_batch(
     batch_id: [u8; 32],
     depth: u8,
     immutable: bool,
+    bought_at_block: Option<u64>,
 ) -> Result<(), Response> {
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
     let cmd = ControlCommand::RegisterBatch {
@@ -768,6 +777,7 @@ async fn register_batch(
         depth,
         bucket_depth: POSTAGE_BUCKET_DEPTH,
         immutable,
+        bought_at_block,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -881,12 +891,12 @@ pub async fn buy_stamp(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let batch_id = match guarded_tx(w.buy_batch(amount, depth, immutable)).await {
-        Ok(id) => id,
+    let new = match guarded_tx(w.buy_batch(amount, depth, immutable)).await {
+        Ok(new) => new,
         Err(r) => return r,
     };
     drop(tx);
-    bought(&handle, batch_id, depth, immutable).await
+    bought(&handle, new, depth, immutable).await
 }
 
 /// Finish a buy: register the batch, fire the after-buy hook, answer
@@ -899,22 +909,20 @@ pub async fn buy_stamp(
 /// finds a usable batch without a restart. It's built from the known
 /// buy params (depth, `bucket_depth` = 16, immutable); the batch is never
 /// read back from chain, because Gnosis indexing lags the receipt.
-async fn bought(
-    handle: &GatewayHandle,
-    batch_id: [u8; 32],
-    depth: u8,
-    immutable: bool,
-) -> Response {
-    if let Err(r) = register_batch(handle, batch_id, depth, immutable).await {
+async fn bought(handle: &GatewayHandle, new: NewBatch, depth: u8, immutable: bool) -> Response {
+    // With its creation block, the node reports the batch `usable:
+    // false` until the storers have synced it (bee's confirmation
+    // window), instead of letting the first upload be rejected.
+    if let Err(r) = register_batch(handle, new.id, depth, immutable, Some(new.block)).await {
         return r;
     }
     if let Some(hook) = &handle.on_batch_bought {
-        hook(batch_id);
+        hook(new.id);
     }
     (
         StatusCode::CREATED,
         Json(BatchIdBody {
-            batch_id: hex::encode(batch_id),
+            batch_id: hex::encode(new.id),
         }),
     )
         .into_response()
@@ -974,7 +982,7 @@ pub async fn dilute_stamp(
     // capacity. `immutable` is irrelevant for an existing issuer (the
     // register handler only updates depth when the batch is already
     // live), so pass `false`.
-    if let Err(r) = register_batch(&handle, batch_id, depth, false).await {
+    if let Err(r) = register_batch(&handle, batch_id, depth, false, None).await {
         return r;
     }
     Json(BatchIdBody { batch_id: id }).into_response()
@@ -1259,18 +1267,18 @@ pub async fn storage_buy(
     // here; released before `bought` fires the after-buy hook, whose
     // settlement work takes it itself.
     let tx = chain.tx_lock.lock().await;
-    let batch_id = match funding_call(
+    let new = match funding_call(
         FUNDING_TX_TIMEOUT,
         "chain transaction timed out",
         w.buy_with_xdai(depth, amount, immutable),
     )
     .await
     {
-        Ok(id) => id,
+        Ok(new) => new,
         Err(r) => return r,
     };
     drop(tx);
-    bought(&handle, batch_id, depth, immutable).await
+    bought(&handle, new, depth, immutable).await
 }
 
 /// `POST /v0/storage/extend?batchId=&amountPerChunk=[&depth=]` tops a
@@ -1315,7 +1323,7 @@ pub async fn storage_extend(
         // Bump the live issuer's depth so uploads use the new capacity
         // (`immutable` is ignored for an existing issuer, see
         // `dilute_stamp`).
-        if let Err(r) = register_batch(&handle, batch_id, depth, false).await {
+        if let Err(r) = register_batch(&handle, batch_id, depth, false, None).await {
             return r;
         }
     }

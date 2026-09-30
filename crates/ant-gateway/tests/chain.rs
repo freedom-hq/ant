@@ -9,13 +9,14 @@ use std::sync::Arc;
 
 use ant_gateway::{
     ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, CorsConfig,
-    DepositView, FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
+    DepositView, FundingFailure, FundingView, NewBatch, StorageQuoteView, WalletTxLock, WriteGate,
 };
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::{
-    body_bytes, send, snapshot_with_one_peer, status_only_router, status_router_with_chain,
+    body_bytes, send, snapshot_with_one_peer, status_only_router,
+    status_router_recording_registrations, status_router_with_chain,
     status_router_with_chain_and_hook, status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
@@ -69,8 +70,11 @@ impl ChainWriter for FakeWriter {
         _amount: u128,
         _depth: u8,
         _immutable: bool,
-    ) -> Result<[u8; 32], String> {
-        Ok([0x7E; 32])
+    ) -> Result<NewBatch, String> {
+        Ok(NewBatch {
+            id: [0x7E; 32],
+            block: 48_500_001,
+        })
     }
     async fn topup_batch(&self, _id: [u8; 32], _amount: u128) -> Result<(), String> {
         Ok(())
@@ -494,11 +498,14 @@ impl ChainWriter for FundingWriter {
         amount: u128,
         depth: u8,
         immutable: bool,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<NewBatch, String> {
         self.record(format!(
             "buy_batch({amount}, {depth}, immutable={immutable})"
         ));
-        Ok([0x7E; 32])
+        Ok(NewBatch {
+            id: [0x7E; 32],
+            block: 48_500_001,
+        })
     }
     async fn topup_batch(&self, _id: [u8; 32], _amount: u128) -> Result<(), String> {
         Ok(())
@@ -544,7 +551,7 @@ impl ChainWriter for FundingWriter {
         depth: u8,
         amount: u128,
         immutable: bool,
-    ) -> Result<[u8; 32], FundingFailure> {
+    ) -> Result<NewBatch, FundingFailure> {
         self.record(format!(
             "buy_with_xdai({depth}, {amount}, immutable={immutable})"
         ));
@@ -557,7 +564,10 @@ impl ChainWriter for FundingWriter {
             started.notify_one();
             release.notified().await;
         }
-        Ok([0xB0; 32])
+        Ok(NewBatch {
+            id: [0xB0; 32],
+            block: 48_500_002,
+        })
     }
     async fn extend_with_xdai(
         &self,
@@ -1128,4 +1138,34 @@ async fn v0_wallet_spending_routes_refuse_web_pages() {
         );
     }
     assert_eq!(writer.calls().len(), 3);
+}
+
+/// A buy hands the node its `createBatch` block, so the node holds the
+/// new batch back as not usable until the storers have synced it
+/// (bee's confirmation window). A dilute re-registers without one.
+#[tokio::test]
+async fn buys_register_the_batch_with_its_creation_block() {
+    let writer = Arc::new(FundingWriter::default());
+    let (router, seen) =
+        status_router_recording_registrations(snapshot_with_one_peer(), funding_ctx(writer));
+    let (status, _) = req(router.clone(), Method::POST, "/stamps/1000000/20").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = req(
+        router.clone(),
+        Method::POST,
+        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let dilute = format!("/stamps/dilute/{}/21", hex::encode([0xAB; 32]));
+    let (status, _) = req(router, Method::PATCH, &dilute).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            ([0x7E; 32], 20, true, Some(48_500_001)),
+            ([0xB0; 32], 20, true, Some(48_500_002)),
+            ([0xAB; 32], 21, false, None),
+        ]
+    );
 }

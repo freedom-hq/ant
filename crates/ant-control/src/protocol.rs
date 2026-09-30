@@ -418,7 +418,9 @@ pub struct UploadJobView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostageStatusView {
     pub enabled: bool,
-    /// `false` once storer peers have rejected this batch's stamps as
+    /// `false` while a just-bought batch is still propagating to the
+    /// storers (see `ControlCommand::RegisterBatch::bought_at_block`),
+    /// and once storer peers have rejected this batch's stamps as
     /// not-on-chain (peer-attested phantom batch: never created on
     /// this chain, expired and evicted, or not yet synced) — the
     /// gateway's `/stamps` must then stop reporting the batch green.
@@ -433,6 +435,12 @@ pub struct PostageStatusView {
     /// may lag the block that created it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_secs_ago: Option<u64>,
+    /// The block the batch was created in, when the node registered it
+    /// right after buying it (the buy receipt's block); `None` for a
+    /// batch registered by id, rediscovered, or reloaded from disk.
+    /// The gateway reports it as bee's `blockNumber`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
     /// `0x`-prefixed hex of the configured batch id. Empty when
     /// `enabled = false`.
     #[serde(default)]
