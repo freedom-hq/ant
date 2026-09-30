@@ -15,7 +15,7 @@
 //!   otherwise an exact, case-insensitive origin match is required.
 //!   Extension over bee: `scheme://*.host` allows every direct-or-deeper
 //!   subdomain of `host` on that scheme (not the apex, not other
-//!   schemes or ports) — for hosts that serve each content root from
+//!   schemes or ports; `host` needs at least two labels) — for hosts that serve each content root from
 //!   its own synthetic origin (Freedom Android's virtual origins).
 //! - When the request's `Origin` is allowed we **echo it back** in
 //!   `Access-Control-Allow-Origin` (not `*`) and set `Vary: Origin`, so
@@ -145,7 +145,8 @@ impl CorsConfig {
     /// # Errors
     ///
     /// A malformed wildcard entry (`https://*.`, `*.host`,
-    /// `https://a.*.host`, `https://*.host:8443`, ...).
+    /// `https://a.*.host`, `https://*.host:8443`, a bare-TLD
+    /// `https://*.com`, ...).
     pub fn check_entry(entry: &str) -> Result<(), String> {
         let o = entry.trim();
         if o == "*" || !o.contains('*') {
@@ -192,8 +193,8 @@ impl CorsConfig {
 
 /// Parse a wildcard-subdomain entry `scheme://*.host` into
 /// `("scheme://", ".host")` (lowercased). The wildcard must be the whole
-/// leftmost label; `host` must be a plain DNS name (no port, path,
-/// further `*`, or empty label).
+/// leftmost label; `host` must be a plain DNS name of at least two
+/// labels (no bare TLD, port, path, further `*`, or empty label).
 fn parse_wildcard(entry: &str) -> Result<(String, String), String> {
     let lower = entry.trim().to_ascii_lowercase();
     let bad = |why: &str| Err(format!("invalid wildcard CORS origin {entry:?}: {why}"));
@@ -212,6 +213,14 @@ fn parse_wildcard(entry: &str) -> Result<(String, String), String> {
     };
     if !is_dns_name(host) {
         return bad("host after `*.` must be a DNS name without port or path");
+    }
+    // `https://*.com` / `https://*.baby` would admit every site under a
+    // TLD — nearly as open as `*`. Require a registrable-looking host
+    // (at least two labels). This can't catch multi-label public
+    // suffixes (`*.co.uk`) without a PSL, but it closes the bare-TLD
+    // case.
+    if !host.contains('.') {
+        return bad("host after `*.` needs at least two labels (not a bare TLD)");
     }
     Ok((format!("{scheme}://"), format!(".{host}")))
 }
@@ -431,6 +440,9 @@ mod tests {
             "https://*bzz.freedom.baby",
             "https://*.bzz..baby",
             "://*.bzz.freedom.baby",
+            "https://*.com",
+            "https://*.baby",
+            "https://*.localhost",
         ] {
             assert!(CorsConfig::check_entry(bad).is_err(), "{bad}");
             // And a malformed wildcard never enables anything.

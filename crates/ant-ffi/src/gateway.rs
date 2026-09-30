@@ -333,9 +333,10 @@ pub unsafe extern "C" fn ant_start_gateway(
 /// not the apex `https://bzz.freedom.baby`, not a lookalike such as
 /// `https://x.bzz.freedom.baby.evil.example`, not `http://`, and not
 /// `https://x.bzz.freedom.baby:8443`. Matching is case-insensitive. The
-/// `*` must be the whole leftmost label and `host` a plain DNS name; any
-/// other entry containing `*` (`https://*.`, `*.host` without scheme,
-/// `https://a.*.host`, a wildcard with a port or path) is rejected.
+/// `*` must be the whole leftmost label and `host` a plain DNS name of
+/// at least two labels; any other entry containing `*` (`https://*.`,
+/// `*.host` without scheme, `https://a.*.host`, a bare TLD such as
+/// `https://*.com`, a wildcard with a port or path) is rejected.
 /// This is for hosts that serve each content root from its own synthetic
 /// origin (Freedom Android's virtual origins): the set of origins is
 /// unbounded so it can't be listed exactly, and a wildcard keeps it to
