@@ -87,11 +87,13 @@ type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
 fn postage_status_view(
     stats: &ant_postage::BucketStats,
     usable: bool,
+    propagating: bool,
     registered_at: Option<Instant>,
     block_number: Option<u64>,
 ) -> ant_control::PostageStatusView {
     ant_control::PostageStatusView {
         usable,
+        propagating,
         registered_secs_ago: registered_at.map(|t| t.elapsed().as_secs()),
         block_number,
         enabled: true,
@@ -127,6 +129,7 @@ fn batch_view(
     postage_status_view(
         &issuer.stats(),
         !rejected && !propagating,
+        !rejected && propagating,
         state.runtime_registered.get(id).copied(),
         bought.map(|b| b.block),
     )
@@ -4064,7 +4067,11 @@ fn read_retry_wait() -> Duration {
 /// ([`rejection_lag_deadline`]). Until then a "not found on-chain"
 /// rejection means the storers haven't synced the batch's creation
 /// block yet, so the push waits a block and re-walks instead of
-/// failing, however long the patience budget is.
+/// failing, however long the patience budget is. Only those waits run
+/// past the budget: every other failure still gets the ordinary
+/// patience budget, counted from the last propagation wait (so a
+/// transient exhaustion right after the storers accept the batch gets
+/// its re-walks too) — see [`Patience`].
 async fn push_with_patience(
     fetcher: &ant_retrieval::RoutingFetcher,
     mut peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
@@ -4074,15 +4081,13 @@ async fn push_with_patience(
     strict_first: bool,
     rejections_are_lag_until: Option<Instant>,
 ) -> Result<(), ant_retrieval::pushsync::PushSyncError> {
-    let budget = gateway_push_patience();
     let started = std::time::Instant::now();
-    let deadline =
-        rejections_are_lag_until.map_or(started + budget, |until| until.max(started + budget));
+    let mut patience = Patience::new(gateway_push_patience(), started);
     let mut last_err = None;
     let mut walk = 0u32;
     loop {
         walk += 1;
-        let strict = strict_first && started.elapsed() < budget;
+        let strict = strict_first && !patience.exhausted(Instant::now());
         let res = fetcher
             .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, strict)
             .await;
@@ -4117,6 +4122,7 @@ async fn push_with_patience(
                     );
                     last_err = Some(e);
                     tokio::time::sleep(wait).await;
+                    patience.restart(Instant::now());
                     continue;
                 }
                 if matches!(
@@ -4125,7 +4131,7 @@ async fn push_with_patience(
                 ) {
                     return Err(e);
                 }
-                if Instant::now() >= deadline {
+                if patience.exhausted(Instant::now()) {
                     // Strict SOCs get one final bee-aligned
                     // shallow-accepting walk before we give up: stored
                     // shallow beats a 502 with nothing stored.
@@ -4162,6 +4168,33 @@ async fn push_with_patience(
     }
 }
 
+/// The re-walk budget of [`push_with_patience`]. It runs from the
+/// push's start, and restarts after each wait for a just-bought batch
+/// to reach the storers: those waits are bounded by the batch's own
+/// window ([`propagation_wait`]), and must not stretch the budget for
+/// other failures (a transient "exhausted peers" is given up on after
+/// `budget`, not after the batch's whole propagation window).
+#[derive(Debug, Clone, Copy)]
+struct Patience {
+    budget: Duration,
+    from: Instant,
+}
+
+impl Patience {
+    fn new(budget: Duration, now: Instant) -> Self {
+        Self { budget, from: now }
+    }
+
+    /// Start the budget over, after a propagation wait.
+    fn restart(&mut self, now: Instant) {
+        self.from = now;
+    }
+
+    fn exhausted(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.from) >= self.budget
+    }
+}
+
 /// `ANT_GATEWAY_PUSH_PATIENCE_SECS` — outer re-walk budget for gateway
 /// one-shot pushes. Default 12 s; `0` disables (single-walk, the
 /// pre-fix behaviour, kept as the A/B control arm).
@@ -4188,8 +4221,9 @@ const BATCH_PROPAGATION: Duration = Duration::from_secs((10 + 4) * 5);
 
 /// How long past [`BATCH_PROPAGATION`] a push still reads a "not found
 /// on-chain" rejection as propagation lag, for storers whose listener
-/// polls late. Short enough that a push waiting out the whole window
-/// stays inside the upload manager's 2-minute push timeout.
+/// polls late. Short enough that a push waiting out the whole window,
+/// then one default patience budget, stays inside the upload manager's
+/// 2-minute push timeout (and the gateway's `CHUNK_PUSH_TIMEOUT`).
 const PROPAGATION_REJECTION_GRACE: Duration = Duration::from_secs(30);
 
 /// Pause between re-walks while a push waits for its batch to reach
@@ -9500,6 +9534,15 @@ mod tests {
             (false, Some(48_500_000)),
             "just bought: not usable yet, with its creation block"
         );
+        let propagating = |views: &[ant_control::PostageStatusView], id: [u8; 32]| {
+            views
+                .iter()
+                .find(|v| v.batch_id == format!("0x{}", hex::encode(id)))
+                .expect("batch listed")
+                .propagating
+        };
+        assert!(propagating(&views, bought_id), "held back as propagating");
+        assert!(!propagating(&views, connected_id));
         assert_eq!(
             find(&views, connected_id),
             (true, None),
@@ -9511,6 +9554,7 @@ mod tests {
             BATCH_PROPAGATION + Duration::from_secs(1);
         let views = list(&mut state, &mut peerstore);
         assert_eq!(find(&views, bought_id), (true, Some(48_500_000)));
+        assert!(!propagating(&views, bought_id));
     }
 
     /// Bee's window: 10 blocks past creation, plus the 4 its listener
@@ -9520,7 +9564,41 @@ mod tests {
         assert_eq!(BATCH_PROPAGATION, Duration::from_secs(70));
         // A push waiting out the whole window must fit the upload
         // manager's 2-minute push timeout.
-        assert!(BATCH_PROPAGATION + PROPAGATION_REJECTION_GRACE < Duration::from_mins(2));
+        // A push waiting out the whole window, then one default
+        // patience budget for a transient failure, must fit the upload
+        // manager's 2-minute push timeout (and the gateway's
+        // `CHUNK_PUSH_TIMEOUT` for the one-shot routes).
+        assert!(
+            BATCH_PROPAGATION + PROPAGATION_REJECTION_GRACE + Duration::from_secs(12)
+                < Duration::from_mins(2)
+        );
+    }
+
+    /// The patience budget doesn't stretch to a just-bought batch's
+    /// propagation window: a non-rejection failure gives up after the
+    /// budget from the push's start, and after a propagation wait the
+    /// budget starts over from that wait.
+    #[test]
+    fn patience_restarts_after_a_propagation_wait_but_is_never_stretched() {
+        let budget = Duration::from_secs(12);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        // No propagation wait (e.g. only "exhausted pushsync peers"
+        // failures for a just-bought batch): the plain budget, however
+        // far off the batch's lag deadline is.
+        let plain = Patience::new(budget, t0);
+        assert!(!plain.exhausted(at(11)));
+        assert!(plain.exhausted(at(12)));
+        assert!(plain.exhausted(at(13)), "not held open until lag_until");
+
+        // Storers rejected the batch until t=60, then a transient
+        // failure: it still gets its re-walks for one budget.
+        let mut waited = Patience::new(budget, t0);
+        waited.restart(at(60));
+        assert!(!waited.exhausted(at(61)));
+        assert!(!waited.exhausted(at(71)));
+        assert!(waited.exhausted(at(72)));
     }
 
     /// A "not found on-chain" rejection is waited out, a block at a

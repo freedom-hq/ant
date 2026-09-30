@@ -427,6 +427,13 @@ pub struct PostageStatusView {
     /// Defaults `true` so old daemons keep deserializing.
     #[serde(default = "default_true")]
     pub usable: bool,
+    /// `true` while `usable` is `false` only because a just-bought
+    /// batch is still propagating to the storers (not because peers
+    /// rejected it). `PushChunk` accepts such a batch and waits the
+    /// propagation out, so a pre-flight that applies the push's bar
+    /// (the gateway's `/pss/send`) must accept it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub propagating: bool,
     /// Seconds since the node registered this batch at runtime (a buy
     /// or connect via `RegisterBatch`); `None` for a batch reloaded
     /// from disk or pre-configured at startup. Lets the gateway give a

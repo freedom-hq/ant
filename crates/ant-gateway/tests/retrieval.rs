@@ -2527,3 +2527,58 @@ async fn pss_send_rejects_unusable_batch_before_mining() {
         "must fail fast, not mine"
     );
 }
+
+/// `/pss/send`'s pre-flight applies `PushChunk`'s bar: a just-bought
+/// batch still propagating to the storers (`usable: false,
+/// propagating: true`) is accepted — the node push waits the
+/// propagation out — while a peer-rejected batch (`usable: false`
+/// alone) is refused before mining.
+#[tokio::test]
+async fn pss_send_accepts_a_propagating_batch_but_not_a_rejected_one() {
+    use ant_control::PostageStatusView;
+    let batch_hex = "22".repeat(32);
+    for (propagating, want) in [
+        (true, StatusCode::CREATED),
+        (false, StatusCode::BAD_REQUEST),
+    ] {
+        let batch_id = format!("0x{batch_hex}");
+        let router = router_with_dispatcher(move |cmd| {
+            let batch_id = batch_id.clone();
+            async move {
+                match cmd {
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(vec![PostageStatusView {
+                            enabled: true,
+                            usable: false,
+                            propagating,
+                            batch_id,
+                            batch_depth: 20,
+                            bucket_depth: 16,
+                            ..PostageStatusView::default()
+                        }]));
+                    }
+                    ControlCommand::PushChunk { ack, .. } => {
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", "00".repeat(32)),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                // A 1-byte target: mining is a few hundred hashes.
+                .uri("/pss/send/test-topic/aa")
+                .header("swarm-postage-batch-id", batch_hex.as_str())
+                .body(Body::from("hello"))
+                .unwrap(),
+        )
+        .await;
+        let status = resp.status();
+        let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert_eq!(status, want, "propagating={propagating}: {text}");
+    }
+}

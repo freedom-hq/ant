@@ -37,7 +37,7 @@ use tracing::debug;
 
 use crate::error::{json_error, params_error, parse_hex_param, ParamKind, Reason};
 use crate::handle::GatewayHandle;
-use crate::retrieval::CHUNK_REQUEST_TIMEOUT;
+use crate::retrieval::CHUNK_PUSH_TIMEOUT;
 
 /// Bee's `websocket.CloseUnsupportedData`.
 const CLOSE_UNSUPPORTED: u16 = 1003;
@@ -223,7 +223,7 @@ async fn handle_upload_stream(
             error_close(&mut socket, CLOSE_INTERNAL, "chunk write error").await;
             return;
         }
-        let Ok(Ok(ack)) = tokio::time::timeout(CHUNK_REQUEST_TIMEOUT, ack_rx).await else {
+        let Ok(Ok(ack)) = tokio::time::timeout(CHUNK_PUSH_TIMEOUT, ack_rx).await else {
             error_close(&mut socket, CLOSE_INTERNAL, "chunk write error").await;
             return;
         };

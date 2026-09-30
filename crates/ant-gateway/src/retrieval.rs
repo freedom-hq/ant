@@ -236,6 +236,16 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 /// retries on a single chunk without inheriting the much larger
 /// multi-chunk envelope.
 pub(crate) const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+/// Default cap on a single-chunk *push* (`POST /chunks`, `/soc`,
+/// `/feeds`, `/pss/send`'s push, each `/chunks/stream` chunk). Longer
+/// than [`CHUNK_REQUEST_TIMEOUT`]: right after a buy, the node waits
+/// for the storers to sync the new batch instead of failing the push
+/// (`BATCH_PROPAGATION` + `PROPAGATION_REJECTION_GRACE` in `ant-p2p`,
+/// up to 100 s after registration, then one 12 s patience budget).
+/// Matches the upload manager's 2-minute push timeout, so a push the
+/// node is still legitimately waiting out isn't reported as a 504
+/// while it lands in the background.
+pub(crate) const CHUNK_PUSH_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Abort a streaming body once it goes this long without delivering any
 /// further bytes — even while the daemon keeps heart-beating `Progress`.
@@ -755,7 +765,7 @@ pub async fn upload_chunk(
         }
     }
 
-    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let timeout = request_timeout(&headers, CHUNK_PUSH_TIMEOUT);
 
     let guard = handle
         .activity
@@ -994,8 +1004,15 @@ pub async fn upload_pss(
     // ONE budget for the whole request: mining and the push-ack wait
     // draw down the same deadline, so the worst case is `timeout`, not
     // 2×`timeout` (mining alone can eat the full budget on deep targets).
-    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
-    let deadline = tokio::time::Instant::now() + timeout;
+    // Without a timeout header, mining keeps the single-chunk cap and
+    // only the push may run on to the push cap (a just-bought batch's
+    // propagation wait, see `CHUNK_PUSH_TIMEOUT`): this route is
+    // unauthenticated, so the CPU budget doesn't grow with it.
+    let start = tokio::time::Instant::now();
+    let mine_timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let mine_deadline = start + mine_timeout;
+    let timeout = request_timeout(&headers, CHUNK_PUSH_TIMEOUT);
+    let deadline = start + timeout;
 
     // At most a couple of concurrent mining jobs per gateway; everyone
     // else waits briefly, then sheds with 503 instead of stacking
@@ -1025,11 +1042,11 @@ pub async fn upload_pss(
     let mining = tokio::task::spawn_blocking(move || {
         wrap_cancellable(&topic, &msg, &recipient, &targets, &mine_cancel)
     });
-    let Ok(wrapped) = tokio::time::timeout_at(deadline, mining).await else {
+    let Ok(wrapped) = tokio::time::timeout_at(mine_deadline, mining).await else {
         cancel.store(true, Ordering::Relaxed);
         return json_error(
             StatusCode::GATEWAY_TIMEOUT,
-            format!("pss mining timed out after {}s", timeout.as_secs()),
+            format!("pss mining timed out after {}s", mine_timeout.as_secs()),
         );
     };
     drop(permit); // mining finished — release before the network round-trip
@@ -1095,7 +1112,9 @@ pub async fn upload_pss(
 /// Pre-flight for `/pss/send`: the batch must be a **registered, usable
 /// issuer** on this node — the same bar (and the same "not usable"
 /// wording, so status mapping stays uniform) that `PushChunk` applies,
-/// just checked before mining instead of after.
+/// just checked before mining instead of after. A just-bought batch
+/// still propagating to the storers (`propagating`) passes, as it does
+/// for `PushChunk`, which waits the propagation out.
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -1121,7 +1140,7 @@ async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Re
     let id_hex = hex::encode(batch_id);
     let usable = views.iter().any(|v| {
         v.enabled
-            && v.usable
+            && (v.usable || v.propagating)
             && v.batch_id
                 .trim_start_matches("0x")
                 .eq_ignore_ascii_case(&id_hex)
@@ -1249,7 +1268,7 @@ pub async fn upload_soc(
         }
     }
 
-    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let timeout = request_timeout(&headers, CHUNK_PUSH_TIMEOUT);
 
     let guard = handle.activity.begin(
         GatewayRequestKind::Soc,
@@ -1764,7 +1783,7 @@ pub async fn create_feed(
         Err(resp) => return resp,
     };
 
-    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let timeout = request_timeout(&headers, CHUNK_PUSH_TIMEOUT);
     let guard = handle.activity.begin(
         GatewayRequestKind::Feed,
         short_reference(&hex::encode(topic)),
