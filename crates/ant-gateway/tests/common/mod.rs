@@ -210,6 +210,8 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -221,6 +223,45 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
 pub fn status_router_with_chain(
     snapshot: StatusSnapshot,
     chain: std::sync::Arc<ChainContext>,
+) -> Router {
+    status_router_with_chain_and_hook(snapshot, chain, None)
+}
+
+/// [`status_router_with_chain`] with an embedder after-buy hook, for the
+/// tests that check `POST /stamps` calls it.
+pub fn status_router_with_chain_and_hook(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+) -> Router {
+    status_router_with_chain_and_hooks(snapshot, chain, on_batch_bought, None)
+}
+
+/// [`status_router_with_chain_and_hook`] plus an embedder
+/// refused-chequebook hook, for the deposit top-up tests.
+pub fn status_router_with_chain_and_hooks(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
+) -> Router {
+    status_router_with_chain_hooks_and_cors(
+        snapshot,
+        chain,
+        on_batch_bought,
+        on_chequebook_refused,
+        CorsConfig::default(),
+    )
+}
+
+/// [`status_router_with_chain_and_hooks`] with a `cors-allowed-origins`
+/// policy, for the wallet-spend guard tests.
+pub fn status_router_with_chain_hooks_and_cors(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
+    cors: CorsConfig,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -246,13 +287,15 @@ pub fn status_router_with_chain(
         commands: cmd_tx,
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
-        cors: Arc::new(CorsConfig::default()),
+        cors: Arc::new(cors),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: Some(chain),
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought,
+        on_chequebook_refused,
     };
     build_router(handle)
 }
@@ -279,6 +322,8 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -320,6 +365,8 @@ pub fn handle_with_fixture_node() -> Router {
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }
@@ -501,6 +548,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         ControlCommand::LurkerSubscribe {
             gsoc_addresses,
             pss_topics,
+            history,
             ack,
             ..
         } => {
@@ -527,7 +575,13 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 .send(ControlAck::LurkerMessage {
                     kind,
                     key,
-                    payload: b"fixture-lurker-payload".to_vec(),
+                    // Echo the mailbox flag so tests can see it reached
+                    // the node command (not just that the query parsed).
+                    payload: if history {
+                        b"fixture-lurker-payload+history".to_vec()
+                    } else {
+                        b"fixture-lurker-payload".to_vec()
+                    },
                 })
                 .await;
             // An all-0xCD address models a LIVE subscription: hold the
@@ -846,6 +900,11 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "settlement enable ignored (test fixture)".into(),
             });
         }
+        ControlCommand::DisablePushsyncSwap { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "settlement disable ignored (test fixture)".into(),
+            });
+        }
         // Read-back propagation check. The fixture has a single source
         // (the `DirFetcher`), so report `sources = 1` when the chunk is
         // present and `0` otherwise, matching the production JSON shape.
@@ -1008,6 +1067,8 @@ where
         }
         .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
     };
     build_router(handle)
 }

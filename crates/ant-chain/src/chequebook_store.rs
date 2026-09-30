@@ -11,11 +11,22 @@
 //! `ant_p2p::PushsyncSwapConfig` from the resolved address stays with
 //! each caller, since that type belongs to a higher layer.
 //!
-//! `load_persisted_chequebook` / `persist_chequebook` / [`ChequebookFile`]
+//! `load_persisted_chequebook_for` / `persist_chequebook` / [`ChequebookFile`]
 //! are pure file I/O and compile everywhere; the deploy / factory-check
 //! helpers drive a JSON-RPC node and are gated on `chain-rpc`.
 
 use std::path::Path;
+
+/// Target xBZZ deposit behind a node's chequebook, in PLUR (1 xBZZ =
+/// 1e16 PLUR): **0.001 xBZZ**, the one default for `antd` and `ant-ffi`.
+/// It is grounded in the #67 benchmark, where that deposit backed 65 K+
+/// cheques with a wide margin (~300× one soak's measured settlement
+/// demand). That is small enough not to compete with the postage the
+/// user came to buy, and it isn't spent money: an unspent deposit stays
+/// withdrawable by the issuer. A fresh deploy is funded up to it, and
+/// an adopted chequebook is topped back up to it
+/// ([`top_up_chequebook`]).
+pub const DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR: u128 = 10_000_000_000_000;
 
 /// On-disk record of the chequebook a node auto-deployed (or
 /// rediscovered) for outbound settlement, persisted at
@@ -97,26 +108,15 @@ fn strip_0x(s: &str) -> &str {
 }
 
 /// Load the persisted chequebook address from `path`, if the file
-/// exists. A malformed file is a hard error — silently ignoring it
-/// would re-trigger a deploy and waste gas on every restart, so callers
-/// decide whether to treat that as fatal (`antd`) or self-heal
-/// (`ant-ffi` re-deploys on the next buy).
-pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, ChequebookError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| ChequebookError::Read(path.display().to_string(), e))?;
-    let file: ChequebookFile = serde_json::from_str(&raw)
-        .map_err(|e| ChequebookError::Parse(path.display().to_string(), e))?;
-    let mut cb = [0u8; 20];
-    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
-        .map_err(|_| ChequebookError::Decode(file.chequebook.clone()))?;
-    Ok(Some(cb))
-}
-
-/// Like [`load_persisted_chequebook`], but only adopts the record when
-/// the `issuer` it names is `owner`.
+/// exists **and** the `issuer` it names is `owner`. This is the only
+/// loader: both `antd` and `ant-ffi` know their own EOA, and trusting
+/// the path alone is exactly the drift the parity audit found
+/// (`docs/ffi-parity-audit.md`).
+///
+/// A malformed file is an error rather than "none": silently ignoring
+/// it could re-trigger a deploy on every start, so callers decide.
+/// `antd` treats it as fatal; `ant-ffi` rediscovers on-chain first and
+/// only deploys (overwriting the file) when the chain has none.
 ///
 /// A chequebook's issuer is baked into the contract on-chain: bee only
 /// accepts a cheque whose signature recovers to `chequebook.issuer()`,
@@ -124,8 +124,8 @@ pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, Cheque
 /// silently drops while its own settlement status reads "ready". A
 /// record can outlive the account that wrote it whenever the node key
 /// changes under a fixed data dir (a restore-from-backup-key flow), and
-/// the file already carries the owner, so callers that know their own
-/// EOA should use this rather than trusting the path. A foreign record
+/// the file already carries the owner, so the path alone is never
+/// trusted. A foreign record
 /// reads as `Ok(None)` — "no chequebook for this account" — which is
 /// exactly what a fresh account is, so callers rediscover or deploy
 /// their own instead of failing.
@@ -235,6 +235,251 @@ pub async fn read_chequebook_issuer(
     let mut out = [0u8; 20];
     out.copy_from_slice(&word[12..32]);
     Ok(out)
+}
+
+/// The two on-chain checks a chequebook must pass before a node signs
+/// cheques on it (see [`check_chequebook`]). Each field keeps its own
+/// read result so a caller can report them separately, as `antd` does.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug)]
+pub struct ChequebookChecks {
+    /// [`verify_chequebook_with_factory`]: `Ok(false)` means bee drops
+    /// every cheque drawn on it.
+    pub registered: Result<bool, ChequebookError>,
+    /// [`read_chequebook_issuer`]: bee only accepts cheques signed by
+    /// this EOA. `None` when [`check_chequebook`]'s [`IssuerRead`]
+    /// policy skipped the read (nothing to compare against, or the
+    /// factory check already disqualified the chequebook).
+    pub issuer: Option<Result<[u8; 20], ChequebookError>>,
+}
+
+/// When [`check_chequebook`] reads `issuer()` — each read is an RPC
+/// round-trip, so skip it when its answer can't change the outcome.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuerRead {
+    /// Don't read it (e.g. no signing EOA to compare it with).
+    Never,
+    /// Read it unless the factory already answered "not registered",
+    /// which disqualifies the chequebook on its own.
+    UnlessUnregistered,
+    /// Always read it (a caller that reports every check even when one
+    /// has already failed, like `antd` under
+    /// `--chequebook-allow-unverified`).
+    Always,
+}
+
+/// Whether a node signing with a given key may use a chequebook, per
+/// [`ChequebookChecks::verdict`].
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChequebookVerdict {
+    /// Every check that could be read passed.
+    Usable,
+    /// The Swarm chequebook factory doesn't know it.
+    NotRegistered,
+    /// Its on-chain `issuer()` is this other EOA, not the signer.
+    IssuerMismatch([u8; 20]),
+}
+
+#[cfg(feature = "chain-rpc")]
+impl ChequebookChecks {
+    /// The shared rule for `antd` and `ant-ffi`: a check that answered
+    /// "no" disqualifies the chequebook, while a check whose read
+    /// *failed* is skipped rather than failed. Unverified is not bad, and
+    /// dropping settlement over an RPC hiccup stalls uploads. `antd`
+    /// lets `--chequebook-allow-unverified` override a disqualification.
+    #[must_use]
+    pub fn verdict(&self, signer: &[u8; 20]) -> ChequebookVerdict {
+        if matches!(self.registered, Ok(false)) {
+            return ChequebookVerdict::NotRegistered;
+        }
+        match self.issuer {
+            Some(Ok(issuer)) if issuer != *signer => ChequebookVerdict::IssuerMismatch(issuer),
+            _ => ChequebookVerdict::Usable,
+        }
+    }
+}
+
+/// How long after our own deploy (the record's write time) a factory
+/// "not registered" may still be a lagging backend. A load-balanced RPC
+/// trails by seconds to a few minutes, not for good.
+#[cfg(feature = "chain-rpc")]
+pub const DEPLOY_LAG_GRACE: std::time::Duration = std::time::Duration::from_mins(10);
+
+/// Whether a factory "not registered" answer for the persisted `cb` may
+/// just be a backend that hasn't seen our deploy yet (a load-balanced
+/// RPC trails by a few blocks; e.g. `ant-ffi`'s launch-time
+/// `ant_deploy_chequebook` followed within seconds by the gateway
+/// start's check, or `antd` topping up the chequebook it deployed at
+/// startup on the first stamp buy). Only for a chequebook we deployed ourselves — the
+/// record carries its deploy tx — and only within [`DEPLOY_LAG_GRACE`]
+/// of the record being written: `true` then when that tx's receipt isn't
+/// visible or can't be read (unconfirmed, not "no"), or shows the
+/// factory deploying `cb` (registered by construction). A visible
+/// receipt without that deploy lets the "not registered" stand, as does
+/// a record without a deploy tx (a rediscovered chequebook) or one older
+/// than the grace (a backend doesn't lag for that long; a record whose
+/// deploy tx isn't on this chain would otherwise pass as "lag" forever).
+#[cfg(feature = "chain-rpc")]
+pub async fn not_registered_may_be_lag(
+    client: &crate::ChainClient,
+    persist_path: &std::path::Path,
+    cb: &[u8; 20],
+) -> bool {
+    use crate::chequebook::{GNOSIS_CHEQUEBOOK_FACTORY, SIMPLE_SWAP_DEPLOYED_TOPIC};
+
+    // An unreadable mtime, or one in the future (clock change), counts as
+    // outside the grace: the factory's "no" is a real answer.
+    let recent = std::fs::metadata(persist_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < DEPLOY_LAG_GRACE);
+    if !recent {
+        return false;
+    }
+    let Some(deploy_tx) = std::fs::read(persist_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<ChequebookFile>(&b).ok())
+        .and_then(|f| {
+            let mut tx = [0u8; 32];
+            hex::decode_to_slice(f.deploy_tx.trim_start_matches("0x"), &mut tx).ok()?;
+            Some(tx)
+        })
+    else {
+        return false;
+    };
+    match client.eth_get_transaction_receipt(&deploy_tx).await {
+        Ok(Some(receipt)) => receipt.logs.iter().any(|l| {
+            l.address == GNOSIS_CHEQUEBOOK_FACTORY
+                && l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC)
+                && l.data.get(12..32) == Some(cb.as_slice())
+        }),
+        Ok(None) | Err(_) => true,
+    }
+}
+
+/// What [`top_up_chequebook`] did.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopUp {
+    /// The chequebook already holds at least the target.
+    NotNeeded,
+    /// Moved `amount` PLUR from the wallet into the chequebook.
+    Funded { amount: u128, tx: [u8; 32] },
+    /// The chequebook is `shortfall` PLUR short, and the wallet holds no
+    /// xBZZ to give.
+    WalletEmpty { shortfall: u128 },
+    /// The chain says no to this chequebook for `node_eth` (not
+    /// factory-registered, or issued by someone else): nothing was
+    /// sent. Peers drop its cheques, so a deposit would only strand
+    /// xBZZ in it; the caller should switch settlement off for it.
+    Refused(ChequebookVerdict),
+}
+
+/// Top `chequebook`'s xBZZ deposit up to `target_plur` from the node
+/// wallet. The transfer is capped to what the wallet holds: a thin
+/// wallet gives a partial deposit rather than a failed transfer (some
+/// backing beats none). It never withdraws, so a chequebook at or above
+/// the target is left alone.
+///
+/// Right before the transfer it runs [`check_chequebook`] and sends
+/// only on a positive answer to both checks (registered with the
+/// factory, `issuer()` is `node_eth`). Stricter than
+/// [`ChequebookChecks::verdict`], which lets a failed read pass so an
+/// RPC hiccup doesn't switch settlement off: a deposit can't be taken
+/// back, so a failed read is an error here and a "no" is
+/// [`TopUp::Refused`]. The check runs whatever the caller already
+/// verified, so no path can fund a chequebook the chain rejects.
+///
+/// A chequebook that backs nothing only publishes until the peers'
+/// payment tolerance runs out, then stalls (#73). Adopted chequebooks
+/// (persisted, or rediscovered on-chain) can be sitting at zero, so both
+/// `antd` and `ant-ffi` top them up with this before relying on them.
+#[cfg(feature = "chain-rpc")]
+pub async fn top_up_chequebook(
+    client: &crate::ChainClient,
+    wallet: &crate::tx::Wallet,
+    node_eth: &[u8; 20],
+    chequebook: &[u8; 20],
+    target_plur: u128,
+) -> Result<TopUp, ChequebookError> {
+    use crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES;
+    use primitive_types::U256;
+
+    let have = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, chequebook)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read chequebook deposit: {e}")))?;
+    let shortfall = target_plur.saturating_sub(have);
+    if shortfall == 0 {
+        return Ok(TopUp::NotNeeded);
+    }
+    let wallet_bzz = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, node_eth)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read wallet xBZZ: {e}")))?;
+    let amount = shortfall.min(wallet_bzz);
+    if amount == 0 {
+        return Ok(TopUp::WalletEmpty { shortfall });
+    }
+    let checks = check_chequebook(client, chequebook, IssuerRead::UnlessUnregistered).await;
+    match checks.verdict(node_eth) {
+        ChequebookVerdict::Usable => {}
+        refused => return Ok(TopUp::Refused(refused)),
+    }
+    // Usable with a read that failed is unverified, not a "yes".
+    let unread = [
+        checks.registered.err(),
+        checks.issuer.map_or_else(
+            || Some(ChequebookError::Chain("issuer() not read".into())),
+            Result::err,
+        ),
+    ];
+    if let Some(e) = unread.into_iter().flatten().next() {
+        return Err(ChequebookError::Chain(format!(
+            "could not verify the chequebook before depositing into it: {e}"
+        )));
+    }
+    let receipt = wallet
+        .erc20_transfer(
+            client,
+            &GNOSIS_BZZ_TOKEN_BYTES,
+            chequebook,
+            U256::from(amount),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("deposit transfer: {e}")))?;
+    Ok(TopUp::Funded {
+        amount,
+        tx: receipt.tx_hash,
+    })
+}
+
+/// Run the chequebook checks against the chain: factory registration,
+/// then `issuer()` as `issuer_read` allows. Shared by `antd` (every
+/// chequebook it adopts at startup) and `ant-ffi` (a persisted
+/// chequebook before enabling settlement), so the two can't disagree on
+/// what makes a chequebook unusable.
+#[cfg(feature = "chain-rpc")]
+pub async fn check_chequebook(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+    issuer_read: IssuerRead,
+) -> ChequebookChecks {
+    let registered = verify_chequebook_with_factory(client, chequebook).await;
+    let read_issuer = match issuer_read {
+        IssuerRead::Never => false,
+        IssuerRead::UnlessUnregistered => !matches!(registered, Ok(false)),
+        IssuerRead::Always => true,
+    };
+    let issuer = if read_issuer {
+        Some(read_chequebook_issuer(client, chequebook).await)
+    } else {
+        None
+    };
+    ChequebookChecks { registered, issuer }
 }
 
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
@@ -375,7 +620,10 @@ mod tests {
         let path = dir.join("chequebook.json");
         let cb = [0x11u8; 20];
         persist_chequebook(&path, &ChequebookFile::rediscovered(&cb, &[0x22u8; 20])).unwrap();
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), Some(cb));
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            Some(cb)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -405,7 +653,10 @@ mod tests {
     fn missing_file_is_none() {
         let path = std::env::temp_dir().join("definitely-not-a-chequebook-file-xyz.json");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(load_persisted_chequebook(&path).unwrap(), None);
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x22u8; 20]).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -414,7 +665,255 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chequebook.json");
         std::fs::write(&path, b"not json").unwrap();
-        assert!(load_persisted_chequebook(&path).is_err());
+        assert!(load_persisted_chequebook_for(&path, &[0x22u8; 20]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    #[test]
+    fn chequebook_verdict_disqualifies_only_on_a_read_no() {
+        let signer = [0x0au8; 20];
+        let failed = || ChequebookError::Chain("backend unavailable".into());
+        let checks = |registered, issuer| ChequebookChecks {
+            registered,
+            issuer: Some(issuer),
+        };
+
+        assert_eq!(
+            checks(Ok(true), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(false), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        assert_eq!(
+            checks(Ok(true), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::IssuerMismatch([0x5e; 20])
+        );
+        // Not registered wins over a mismatch: it's the first thing bee checks.
+        assert_eq!(
+            checks(Ok(false), Ok([0x5e; 20])).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+        // A read that failed is skipped, never a disqualification.
+        assert_eq!(
+            checks(Err(failed()), Ok(signer)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Ok(true), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            checks(Err(failed()), Err(failed())).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        // An issuer read that was skipped is not a mismatch.
+        let skipped = |registered| ChequebookChecks {
+            registered,
+            issuer: None,
+        };
+        assert_eq!(
+            skipped(Ok(true)).verdict(&signer),
+            ChequebookVerdict::Usable
+        );
+        assert_eq!(
+            skipped(Ok(false)).verdict(&signer),
+            ChequebookVerdict::NotRegistered
+        );
+    }
+
+    /// A scripted backend for the top-up decisions: xBZZ `balanceOf`,
+    /// plus the two chequebook checks (`None` answers an RPC error).
+    /// Anything else (a transfer) answers an error and is counted.
+    #[cfg(feature = "chain-rpc")]
+    struct Balances {
+        of: std::collections::HashMap<[u8; 20], u128>,
+        registered: Option<bool>,
+        issuer: Option<[u8; 20]>,
+        other_calls: std::sync::Mutex<usize>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for Balances {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let data = req["params"][0]["data"].as_str().unwrap_or_default();
+            let error = || {
+                Some(
+                    serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                        "error": {"code": -32603, "message": "backend unavailable"}})
+                    .to_string(),
+                )
+            };
+            let word = |w: String| {
+                Some(
+                    serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": w}).to_string(),
+                )
+            };
+            if req["method"] == "eth_call" {
+                let deployed_sel = hex::encode(
+                    &crate::chequebook::factory_deployed_contracts_calldata(&CHEQUEBOOK)[..4],
+                );
+                let issuer_sel = hex::encode(crate::chequebook::chequebook_issuer_selector());
+                if data.starts_with("0x70a08231") {
+                    let mut owner = [0u8; 20];
+                    hex::decode_to_slice(&data[34..74], &mut owner).unwrap();
+                    return match self.of.get(&owner) {
+                        Some(bal) => word(format!("0x{bal:064x}")),
+                        None => error(),
+                    };
+                }
+                if data[2..].starts_with(&deployed_sel) {
+                    return match self.registered {
+                        Some(r) => word(format!("0x{:064x}", u8::from(r))),
+                        None => error(),
+                    };
+                }
+                if data[2..].starts_with(&issuer_sel) {
+                    return match self.issuer {
+                        Some(i) => word(format!("0x{}{}", "00".repeat(12), hex::encode(i))),
+                        None => error(),
+                    };
+                }
+            }
+            *self.other_calls.lock().unwrap() += 1;
+            Some(
+                serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                    "error": {"code": -32603, "message": "scripted: no transfer here"}})
+                .to_string(),
+            )
+        }
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    async fn top_up_with(of: &[([u8; 20], u128)]) -> (Result<TopUp, ChequebookError>, usize) {
+        top_up_checked(of, Some(true), Some(WALLET)).await
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    async fn top_up_checked(
+        of: &[([u8; 20], u128)],
+        registered: Option<bool>,
+        issuer: Option<[u8; 20]>,
+    ) -> (Result<TopUp, ChequebookError>, usize) {
+        let script = std::sync::Arc::new(Balances {
+            of: of.iter().copied().collect(),
+            registered,
+            issuer,
+            other_calls: std::sync::Mutex::new(0),
+        });
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()));
+        let wallet = crate::tx::Wallet::new([7u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let result = top_up_chequebook(
+            &client,
+            &wallet,
+            &WALLET,
+            &CHEQUEBOOK,
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+        )
+        .await;
+        let others = *script.other_calls.lock().unwrap();
+        (result, others)
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    const WALLET: [u8; 20] = [0x0a; 20];
+    #[cfg(feature = "chain-rpc")]
+    const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
+
+    /// At or above the target: nothing moves, never a withdrawal.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_leaves_a_funded_chequebook_alone() {
+        for have in [
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+            100 * DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+        ] {
+            let (result, others) = top_up_with(&[(CHEQUEBOOK, have), (WALLET, u128::MAX)]).await;
+            assert_eq!(result.unwrap(), TopUp::NotNeeded);
+            assert_eq!(others, 0, "no transfer");
+        }
+    }
+
+    /// Short, but the wallet has no xBZZ: report the shortfall, no transfer.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_reports_an_empty_wallet() {
+        let have = DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR / 4;
+        let (result, others) = top_up_with(&[(CHEQUEBOOK, have), (WALLET, 0)]).await;
+        assert_eq!(
+            result.unwrap(),
+            TopUp::WalletEmpty {
+                shortfall: DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR - have
+            }
+        );
+        assert_eq!(others, 0, "no transfer");
+    }
+
+    /// A deposit that can't be read is an error, not "empty": the caller
+    /// must not treat it as a shortfall and send money.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_fails_on_an_unreadable_deposit() {
+        let (result, others) = top_up_with(&[(WALLET, u128::MAX)]).await;
+        assert!(result.is_err());
+        assert_eq!(others, 0, "no transfer");
+    }
+
+    /// Short and the wallet can pay, but the chain says no: nothing is
+    /// sent, whichever check refused.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_refuses_a_chequebook_the_chain_rejects() {
+        let balances = [(CHEQUEBOOK, 0), (WALLET, u128::MAX)];
+        let (result, others) = top_up_checked(&balances, Some(false), Some(WALLET)).await;
+        assert_eq!(
+            result.unwrap(),
+            TopUp::Refused(ChequebookVerdict::NotRegistered)
+        );
+        assert_eq!(others, 0, "no transfer");
+
+        let stranger = [0x5e; 20];
+        let (result, others) = top_up_checked(&balances, Some(true), Some(stranger)).await;
+        assert_eq!(
+            result.unwrap(),
+            TopUp::Refused(ChequebookVerdict::IssuerMismatch(stranger))
+        );
+        assert_eq!(others, 0, "no transfer");
+    }
+
+    /// A check that can't be read is an error before any transfer: the
+    /// verdict's "failed read passes" rule doesn't apply to spending.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_fails_when_the_checks_cannot_be_read() {
+        let balances = [(CHEQUEBOOK, 0), (WALLET, u128::MAX)];
+        for (registered, issuer) in [(None, Some(WALLET)), (Some(true), None)] {
+            let (result, others) = top_up_checked(&balances, registered, issuer).await;
+            assert!(result.is_err(), "{registered:?}/{issuer:?}");
+            assert_eq!(others, 0, "no transfer");
+        }
+    }
+
+    /// Both checks positive: the transfer is attempted (and here fails,
+    /// since the script has no transaction backend).
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn top_up_transfers_after_both_checks_pass() {
+        let (result, others) = top_up_with(&[(CHEQUEBOOK, 0), (WALLET, u128::MAX)]).await;
+        assert!(result.is_err(), "scripted transfer failure");
+        assert!(others > 0, "a transfer was attempted");
+    }
+
+    #[test]
+    fn default_deposit_is_one_thousandth_of_a_bzz() {
+        // 1 xBZZ = 1e16 PLUR (16 decimals, not 18).
+        assert_eq!(
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR * 1_000,
+            10_000_000_000_000_000
+        );
     }
 }

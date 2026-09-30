@@ -32,6 +32,8 @@ const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 /// listener; the binary code in [`crate::Gateway::serve`] uses the same
 /// builder.
 pub fn build(handle: GatewayHandle) -> Router {
+    let spend_guard =
+        middleware::from_fn_with_state(handle.clone(), crate::cors::wallet_spend_guard);
     Router::new()
         .route("/health", get(status::health))
         .route("/readiness", get(status::readiness))
@@ -99,6 +101,27 @@ pub fn build(handle: GatewayHandle) -> Router {
         // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
         // chequebook. `501` without a funded wallet key.
         .route("/chequebook/deposit", post(chain::chequebook_deposit))
+        // Ant-specific xDAI storage funding: price and pay for storage
+        // from the node wallet's plain xDAI (the node swaps for xBZZ
+        // itself). Namespaced under `/v0/` like `/v0/manifest`.
+        // The writes swap the wallet's xDAI, so they refuse requests
+        // from web pages (`cors::wallet_spend_guard`): being
+        // query-only, they'd otherwise be CORS-simple and reachable
+        // from any page without a preflight.
+        .route("/v0/storage/quote", get(chain::storage_quote))
+        .route(
+            "/v0/storage/buy",
+            post(chain::storage_buy).route_layer(spend_guard.clone()),
+        )
+        .route(
+            "/v0/storage/extend",
+            post(chain::storage_extend).route_layer(spend_guard.clone()),
+        )
+        .route(
+            "/v0/settlement/deposit",
+            get(chain::settlement_deposit)
+                .merge(post(chain::settlement_fund_deposit).route_layer(spend_guard.clone())),
+        )
         // Upload-progress tags (PLAN.md J.2.4 / C3). `POST /tags`
         // creates a tag; `GET /tags` lists them; `GET /tags/{uid}`
         // polls one; `DELETE` drops it; `PATCH` marks the "done split"

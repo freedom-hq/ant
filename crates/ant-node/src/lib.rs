@@ -159,6 +159,15 @@ impl NodeConfig {
         self
     }
 
+    /// Swarm network id (`1` = mainnet, the `mainnet_default`). It feeds
+    /// both the overlay address and the BZZ handshake, so it must be the
+    /// same value the caller derived its displayed overlay from.
+    #[must_use]
+    pub const fn with_network_id(mut self, network_id: u64) -> Self {
+        self.network_id = network_id;
+        self
+    }
+
     #[must_use]
     pub fn with_external_addrs(mut self, addrs: Vec<Multiaddr>) -> Self {
         self.external_addrs = addrs;

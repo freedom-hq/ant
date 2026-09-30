@@ -211,9 +211,10 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeAgentStrin
 
 /// `at.vibing.ant.downloadsmoke.AntNode.nativeShutdown(handle: Long): Unit`
 ///
-/// Mirror of [`crate::ant_shutdown`]. Drops the box, which aborts the
-/// embedded Tokio runtime and frees every spawned task. After this
-/// returns, the Kotlin side must zero out its cached handle field so
+/// Mirror of [`crate::ant_shutdown`]. Drops the box, which cancels
+/// every spawned task and joins the embedded Tokio runtime (bounded, so
+/// this blocks up to a few seconds — call it off the UI thread). After
+/// this returns, the Kotlin side must zero out its cached handle field so
 /// no later JNI call dereferences a freed pointer.
 ///
 /// Null / zero handle is a no-op.
@@ -233,7 +234,12 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeShutdown<'
             // once. The Kotlin side guards this with a single
             // `nativeHandle: Long` field that's zeroed after this call.
             let handle = unsafe { Box::from_raw(handle as *mut AntHandle) };
-            handle.runtime.shutdown_background();
+            // Same bounded join as `ant_shutdown` (not
+            // `shutdown_background`, which returns while the node loop's
+            // drop — the peerstore's final `peers.json` flush — may
+            // still be running and could land over a node the host
+            // re-inits on the same data dir right after).
+            crate::shutdown_handle(handle);
             Ok(())
         })
         .resolve::<ThrowRuntimeExAndDefault>();

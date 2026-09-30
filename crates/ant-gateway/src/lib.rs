@@ -71,11 +71,16 @@ mod subscribe;
 mod tags;
 
 #[cfg(feature = "http-api")]
-pub use chain::{BatchMetaView, ChainContext, ChainReader, ChainWriter};
+pub use chain::{
+    BatchMetaView, ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot,
+    DepositView, FundingFailure, FundingView, StorageQuoteView, WalletTxLock, WriteGate,
+};
 #[cfg(feature = "http-api")]
 pub use cors::CorsConfig;
 #[cfg(feature = "http-api")]
-pub use handle::{GatewayChainState, GatewayHandle, GatewayIdentity};
+pub use handle::{
+    BatchBoughtHook, ChequebookRefusedHook, GatewayChainState, GatewayHandle, GatewayIdentity,
+};
 #[cfg(feature = "http-api")]
 pub use tags::TagRegistry;
 

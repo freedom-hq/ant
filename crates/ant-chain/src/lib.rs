@@ -14,6 +14,11 @@ pub mod chequebook_store;
 /// from the node EOA. RPC-driven, so it needs the `chain-rpc` feature.
 #[cfg(feature = "chain-rpc")]
 pub mod discover;
+/// Storage funding shared by `antd` and `ant-ffi`: price a postage plan
+/// against the node wallet and pay for it (and for extending it or the
+/// chequebook deposit) with xDAI only.
+#[cfg(feature = "chain-rpc")]
+pub mod funding;
 /// The pluggable JSON-RPC transport seam (issue #77): a host can serve
 /// ant's chain requests from its own verified source, with the
 /// configured RPC URL as the built-in default and fallback.
@@ -95,7 +100,9 @@ pub const GNOSIS_BZZ_WXDAI_POOL: &str = "0x7583b9C573FA4FB5Ea21C83454939c4Cf6aac
 /// a constant, pre-computable address.
 pub const CREATE2_DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 
+/// Cheap to clone: the HTTP client and the transport are shared handles.
 #[cfg(feature = "chain-rpc")]
+#[derive(Clone)]
 pub struct ChainClient {
     url: String,
     http: reqwest::Client,
@@ -375,17 +382,11 @@ pub async fn fetch_postage_batch_meta(
     postage_contract: &str,
     batch_id: &[u8; 32],
 ) -> Result<PostageBatchMeta, RpcError> {
-    let sel_owner = encode_word32_call("2182ddb1", batch_id);
     let sel_depth = encode_word32_call("44beae8e", batch_id);
     let sel_buck = encode_word32_call("32ac57dd", batch_id);
     let sel_imm = encode_word32_call("d968f44b", batch_id);
 
-    let owner_bytes = client.eth_call(postage_contract, &sel_owner).await?;
-    last_word_eth_address(&owner_bytes)?;
-
-    let mut batch_owner_eth = [0u8; 20];
-    let w = padded_last_word(&owner_bytes)?;
-    batch_owner_eth.copy_from_slice(&w[12..32]);
+    let batch_owner_eth = fetch_postage_batch_owner(client, postage_contract, batch_id).await?;
 
     let d = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_depth).await?)?;
     let b = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_buck).await?)?;
@@ -397,6 +398,23 @@ pub async fn fetch_postage_batch_meta(
         immutable: im != 0,
         batch_owner_eth,
     })
+}
+
+/// `PostageStamp.batchOwner(bytes32)` alone — one `eth_call`, for
+/// callers that only need to tell "not on chain" (zero address) apart
+/// without paying for the other three [`fetch_postage_batch_meta`] views.
+#[cfg(feature = "chain-rpc")]
+pub async fn fetch_postage_batch_owner(
+    client: &ChainClient,
+    postage_contract: &str,
+    batch_id: &[u8; 32],
+) -> Result<[u8; 20], RpcError> {
+    let sel_owner = encode_word32_call("2182ddb1", batch_id);
+    let owner_bytes = client.eth_call(postage_contract, &sel_owner).await?;
+    last_word_eth_address(&owner_bytes)?;
+    let mut owner = [0u8; 20];
+    owner.copy_from_slice(&padded_last_word(&owner_bytes)?[12..32]);
+    Ok(owner)
 }
 
 #[cfg(feature = "chain-rpc")]

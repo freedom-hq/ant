@@ -87,9 +87,11 @@ type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
 fn postage_status_view(
     stats: &ant_postage::BucketStats,
     usable: bool,
+    registered_at: Option<Instant>,
 ) -> ant_control::PostageStatusView {
     ant_control::PostageStatusView {
         usable,
+        registered_secs_ago: registered_at.map(|t| t.elapsed().as_secs()),
         enabled: true,
         batch_id: format!("0x{}", hex::encode(stats.batch_id)),
         batch_depth: stats.batch_depth,
@@ -936,6 +938,13 @@ struct SwarmState {
     /// ever pushes with a rejected batch again — the node re-validates
     /// it itself with backoff and clears the mark when peers accept.
     rejected_batches: RejectedBatches,
+    /// When each batch was registered at runtime via
+    /// `ControlCommand::RegisterBatch` (a buy or connect). Surfaced as
+    /// `PostageStatusView::registered_secs_ago` so the gateway's
+    /// `/stamps` doesn't declare a just-bought batch "not on chain"
+    /// because a lagging RPC backend hasn't seen its `BatchCreated`
+    /// block yet. Batches reloaded from disk at startup have no entry.
+    runtime_registered: HashMap<[u8; 32], Instant>,
     /// Last successfully-resolved sequence-feed index per
     /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
     /// append-only, so a previously-resolved index is always a valid
@@ -1025,6 +1034,7 @@ impl SwarmState {
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            runtime_registered: HashMap::new(),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -2839,6 +2849,7 @@ fn handle_control_command(
             target,
             gsoc_addresses,
             pss_topics,
+            history,
             ack,
         } => {
             use crate::lurker::{self, LurkerConfig};
@@ -2851,6 +2862,10 @@ fn handle_control_command(
                 // only (the topic-derived key handles it). Directed PSS to
                 // the node's key lands when a pss.key is persisted.
                 pss_secret: None,
+                history,
+                // Mailbox ticket: stamped by the registry on subscribe.
+                history_seq: 0,
+                history_held: std::collections::BTreeSet::new(),
             };
             if watch.is_empty() {
                 // Nothing to watch — tell the subscriber why before the
@@ -3325,7 +3340,11 @@ fn handle_control_command(
                                 .rejected_batches
                                 .lock()
                                 .is_ok_and(|s| s.contains_key(iss.batch_id()));
-                            postage_status_view(&iss.stats(), !rejected)
+                            postage_status_view(
+                                &iss.stats(),
+                                !rejected,
+                                state.runtime_registered.get(iss.batch_id()).copied(),
+                            )
                         })
                 }
                 None => postage_status_disabled(),
@@ -3348,7 +3367,11 @@ fn handle_control_command(
                                 .rejected_batches
                                 .lock()
                                 .is_ok_and(|s| s.contains_key(iss.batch_id()));
-                            postage_status_view(&iss.stats(), !rejected)
+                            postage_status_view(
+                                &iss.stats(),
+                                !rejected,
+                                state.runtime_registered.get(iss.batch_id()).copied(),
+                            )
                         })
                         .collect()
                 }
@@ -3402,6 +3425,7 @@ fn handle_control_command(
             ) {
                 Ok(issuer) => {
                     issuers.insert(batch_id, issuer);
+                    state.runtime_registered.insert(batch_id, Instant::now());
                     info!(
                         target: "ant_p2p",
                         batch = %format!("0x{}", hex::encode(batch_id)),
@@ -3466,6 +3490,30 @@ fn handle_control_command(
                     hex::encode(chequebook),
                 ),
             });
+        }
+        ControlCommand::DisablePushsyncSwap { chequebook, ack } => {
+            let running = state
+                .pushsync_swap
+                .as_ref()
+                .is_some_and(|s| s.chequebook() == chequebook);
+            let message = if running {
+                state.pushsync_swap = None;
+                warn!(
+                    target: "ant_p2p::pushsync_swap",
+                    chequebook = %hex::encode(chequebook),
+                    "outbound SWAP settlement disabled at runtime — chequebook failed its chain checks",
+                );
+                format!(
+                    "outbound SWAP settlement disabled (chequebook 0x{})",
+                    hex::encode(chequebook),
+                )
+            } else {
+                format!(
+                    "outbound SWAP settlement was not running on chequebook 0x{}",
+                    hex::encode(chequebook),
+                )
+            };
+            let _ = ack.send(ControlAck::Ok { message });
         }
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);
@@ -9079,5 +9127,156 @@ mod tests {
             }
             other => panic!("expected the latest cached update to resolve, got {other:?}"),
         }
+    }
+
+    /// `DisablePushsyncSwap` switches off settlement running on the named
+    /// chequebook — the path `ant-ffi` takes when the chain disqualifies
+    /// the chequebook `ant_init` enabled unchecked — and leaves a service
+    /// on any other chequebook alone.
+    #[tokio::test]
+    async fn disable_pushsync_swap_only_stops_the_named_chequebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (bad, other) = ([0xbau8; 20], [0x0cu8; 20]);
+        let mut send = |state: &mut SwarmState, cmd| {
+            handle_control_command(state, &mut peerstore, &control, None, 0, cmd);
+        };
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::EnablePushsyncSwap {
+                chequebook: bad,
+                swap_secret: [3u8; 32],
+                chain_id: 100,
+                outbound_ledger_path: dir.path().join("out.json").to_string_lossy().into(),
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert_eq!(
+            state.pushsync_swap.as_ref().map(|s| s.chequebook()),
+            Some(bad)
+        );
+
+        // A disable naming another chequebook is a no-op.
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: other,
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert_eq!(
+            state.pushsync_swap.as_ref().map(|s| s.chequebook()),
+            Some(bad)
+        );
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: bad,
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        assert!(state.pushsync_swap.is_none(), "settlement is off again");
+    }
+
+    /// `PostageList` reports a registration age only for batches the node
+    /// registered at runtime (`RegisterBatch`, i.e. a buy / connect) — the
+    /// gateway uses it to give a just-bought batch a grace window against
+    /// a lagging RPC backend. A batch reloaded from disk carries none, so
+    /// its on-chain check applies immediately.
+    #[tokio::test]
+    async fn postage_list_reports_registration_age_only_for_runtime_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let reloaded_id = [0x0au8; 32];
+        let bought_id = [0x0bu8; 32];
+        let reloaded = ant_postage::StampIssuer::open_or_new(
+            dir.path().join(format!("{}.bin", hex::encode(reloaded_id))),
+            reloaded_id,
+            20,
+            16,
+            true,
+        )
+        .unwrap();
+        let rt = Arc::new(UploadRuntime {
+            issuers: std::sync::Mutex::new(HashMap::from([(reloaded_id, reloaded)])),
+            stamp_key: [1u8; SECP256K1_SECRET_LEN],
+            batch_owner: [0u8; 20],
+            postage_dir: dir.path().to_path_buf(),
+        });
+
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            Some(rt.clone()),
+            0,
+            ControlCommand::RegisterBatch {
+                batch_id: bought_id,
+                depth: 20,
+                bucket_depth: 16,
+                immutable: true,
+                ack: ack_tx,
+            },
+        );
+        assert!(matches!(ack_rx.await.unwrap(), ControlAck::Ok { .. }));
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            Some(rt),
+            0,
+            ControlCommand::PostageList { ack: ack_tx },
+        );
+        let ControlAck::PostageList(views) = ack_rx.await.unwrap() else {
+            panic!("expected a postage list");
+        };
+        let age = |id: [u8; 32]| {
+            views
+                .iter()
+                .find(|v| v.batch_id == format!("0x{}", hex::encode(id)))
+                .expect("batch listed")
+                .registered_secs_ago
+        };
+        assert_eq!(
+            age(reloaded_id),
+            None,
+            "reloaded batch has no registration age"
+        );
+        assert!(
+            age(bought_id).is_some_and(|a| a < 60),
+            "runtime-registered batch reports a fresh age"
+        );
     }
 }

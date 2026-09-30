@@ -38,6 +38,31 @@ pub struct GatewayIdentity {
     pub peer_id: String,
 }
 
+/// Embedder callback run after `POST /stamps` bought a batch and
+/// registered it with the node (see [`GatewayHandle::on_batch_bought`]).
+/// It receives the new batch id. It runs on the request's task, so it
+/// must not block: spawn any chain work.
+pub type BatchBoughtHook = Arc<dyn Fn([u8; 32]) + Send + Sync>;
+
+/// Embedder callback run when `POST /v0/settlement/deposit` found the
+/// chain refusing the node's chequebook (see
+/// [`GatewayHandle::on_chequebook_refused`]). Nothing was sent. It
+/// resolves to `true` when the refusal stands (the embedder records it
+/// and switches settlement off for that chequebook, unless configured
+/// otherwise) and to `false` when it may just be an RPC that hasn't
+/// seen the node's own deploy yet (a factory "not registered" within
+/// `ant_chain::chequebook_store::DEPLOY_LAG_GRACE` of it), which must
+/// not switch anything off. The route awaits it after releasing the
+/// wallet tx lock, so it may take the embedder's settlement lock.
+pub type ChequebookRefusedHook = Arc<
+    dyn Fn(
+            [u8; 20],
+            crate::chain::ChequebookRefusal,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Live wiring the gateway needs to serve every Tier-A endpoint.
 ///
 /// Cloning is cheap: the `watch::Receiver`, `mpsc::Sender`, and `Arc`
@@ -101,6 +126,18 @@ pub struct GatewayHandle {
     /// and `identity.public_key_hex` must be its public key so clients
     /// can read the publisher from `GET /addresses`.
     pub act_secret: Arc<[u8; 32]>,
+    /// Called after a successful `POST /stamps` buy. A buy makes the
+    /// node publish-capable, but uploads also need outbound SWAP
+    /// settlement (a chequebook), and the gateway can't set that up
+    /// itself. `ant-ffi` uses this to resolve or deploy the chequebook
+    /// and switch settlement on, so a first buy in a fresh app session
+    /// doesn't upload without paying peers. `None` does nothing (`antd`
+    /// resolves its chequebook at startup).
+    pub on_batch_bought: Option<BatchBoughtHook>,
+    /// Called when the xDAI deposit top-up found the chain refusing the
+    /// node's chequebook; see [`ChequebookRefusedHook`]. `None`: the
+    /// route answers the refusal and nothing else happens.
+    pub on_chequebook_refused: Option<ChequebookRefusedHook>,
 }
 
 /// The chain-derived slice of gateway wiring, resolved by `antd`'s
