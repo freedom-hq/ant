@@ -992,14 +992,20 @@ fn acquire_store_lock(persist: &Path) -> Result<std::fs::File, PostageError> {
         .write(true)
         .open(&lock_path)
         .map_err(|e| PostageError::Persist(format!("{}: {e}", lock_path.display())))?;
-    match f.try_lock() {
+    // `fs4` (flock(2) via rustix on Unix, LockFileEx on Windows) rather
+    // than std's `File::try_lock`: std (at least through Rust 1.94) reports
+    // "try_lock() not supported" on Android, which failed every batch
+    // registration there (#95). Our lock must not depend on which
+    // toolchain an embedder builds with.
+    // Called as `FileExt::try_lock` so the std inherent method doesn't win.
+    match fs4::FileExt::try_lock(&f) {
         Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => Err(PostageError::Persist(format!(
+        Err(fs4::TryLockError::WouldBlock) => Err(PostageError::Persist(format!(
             "postage store {} is locked by another issuer/process — two issuers over one \
              store would double-issue (batch, bucket, index) tuples",
             persist.display()
         ))),
-        Err(std::fs::TryLockError::Error(e)) => Err(PostageError::Persist(format!(
+        Err(fs4::TryLockError::Error(e)) => Err(PostageError::Persist(format!(
             "{}: acquiring store lock: {e}",
             lock_path.display()
         ))),
@@ -1430,6 +1436,32 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The store lock must actually be taken — not error out as
+    /// unsupported (std's `File::try_lock` does on Android, #95, which
+    /// failed every `register_batch`) — must refuse a second issuer over
+    /// the same store, and must be released when the holder drops.
+    #[test]
+    fn store_lock_is_exclusive_and_released_on_drop() {
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x95; 32];
+        let first = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true)
+            .expect("store lock must be supported on this platform");
+        match StampIssuer::open_or_new(path.clone(), batch, 21, 16, true) {
+            Err(PostageError::Persist(msg)) => {
+                assert!(msg.contains("is locked by another"), "{msg}");
+            }
+            other => panic!(
+                "second issuer over a held store must fail: {:?}",
+                other.err()
+            ),
+        }
+        drop(first);
+        StampIssuer::open_or_new(path, batch, 21, 16, true)
+            .expect("lock is released when the holder drops");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
