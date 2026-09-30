@@ -4585,4 +4585,66 @@ mod tests {
             }
         }
     }
+
+    /// `include/ant.h` is hand-written C, and C block comments don't
+    /// nest. A "/*" inside one (easy to type in an example such as a
+    /// wildcard origin with its scheme) is a `-Wcomment` warning, which
+    /// `FreedomMobile`'s `-Werror` module smoke turns into a failed iOS
+    /// build; v0.5.50 shipped one. Checked here so the Rust gate catches
+    /// it without a C toolchain.
+    #[test]
+    fn header_block_comments_contain_no_comment_opener() {
+        assert_eq!(
+            nested_comment_openers(include_str!("../include/ant.h")),
+            Vec::<usize>::new(),
+            "ant.h has '/*' inside a block comment on these lines (rephrase, e.g. keep the \
+             scheme's \"//\" away from a \"*\")",
+        );
+        // The checker itself: finds the nesting, ignores line comments
+        // and a comment's own closer.
+        assert_eq!(
+            nested_comment_openers("/* ok */\n/**\n * \"https://*.x\"\n */\n// a/*b\n"),
+            vec![3]
+        );
+        assert!(nested_comment_openers("/* a */ int x; /* b */\n/*/ c */\n").is_empty());
+    }
+
+    /// 1-based line numbers where "/*" appears inside a block comment.
+    fn nested_comment_openers(src: &str) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut in_block = false;
+        for (n, line) in src.lines().enumerate() {
+            let mut rest = line;
+            loop {
+                if in_block {
+                    let close = rest.find("*/");
+                    match rest.find("/*") {
+                        Some(open) if close.is_none_or(|c| open < c) => {
+                            found.push(n + 1);
+                            rest = &rest[open + 2..];
+                        }
+                        _ => match close {
+                            Some(c) => {
+                                in_block = false;
+                                rest = &rest[c + 2..];
+                            }
+                            None => break,
+                        },
+                    }
+                } else {
+                    let line_comment = rest.find("//");
+                    match rest.find("/*") {
+                        Some(open) if line_comment.is_none_or(|l| open < l) => {
+                            in_block = true;
+                            // "/*/" opens a comment: its "*" isn't a closer.
+                            rest = &rest[open + 2..];
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        found.dedup();
+        found
+    }
 }

@@ -796,17 +796,20 @@ bool ant_start_gateway(const AntHandle *handle,
  * the default — so the gateway sends no CORS headers and no page from
  * another origin can read its responses. Blank entries are ignored.
  *
- * Beyond bee, an entry may be a wildcard subdomain "scheme://*.host"
- * (e.g. "https://*.bzz.freedom.baby"): it allows every direct-or-deeper
+ * Beyond bee, an entry may be a wildcard subdomain: a scheme, then
+ * "://", then "*." and a host (e.g. scheme https with host
+ * "*.bzz.freedom.baby"). It allows every direct-or-deeper
  * subdomain of host on exactly that scheme with no port
  * ("https://abc.bzz.freedom.baby", "https://a.b.bzz.freedom.baby"), but
  * not the apex "https://bzz.freedom.baby", not a lookalike such as
  * "https://x.bzz.freedom.baby.evil.example", not "http://", and not
  * "https://x.bzz.freedom.baby:8443". Matching is case-insensitive. The
  * "*" must be the whole leftmost label and host a plain DNS name of at
- * least two labels; any other entry containing "*" ("https://*.",
- * "*.host" without scheme, "https://a.*.host", a bare TLD such as
- * "https://*.com", a wildcard with a port or path) is rejected.
+ * least two labels. Any other entry containing "*" is rejected: nothing
+ * after the "*.", "*.host" without a scheme, "https://a.*.host", a bare
+ * TLD such as "*.com" after the scheme, a wildcard with a port or path.
+ * (These examples never write the scheme's "//" next to the "*": in
+ * this header that pair would open a C comment inside this one.)
  * Use it when each content root is served from its own synthetic origin
  * (Freedom Android's virtual origins): that set is unbounded, so it
  * cannot be listed exactly, and a wildcard keeps it to the host's own
