@@ -48,10 +48,13 @@
 - **One orchestration, two sequencers.** `antd` and `ant-ffi` are two
  entry points over the same node. Any startup or chain-init decision
  both need (what counts as a dead batch, when a chequebook is usable or
- may be deployed, …) is a named `pub` helper in a shared orchestration
- module, today `ant_chain::discover` and `ant_chain::chequebook_store`.
- `crates/antd/src/main.rs` and `crates/ant-ffi/src/` only *sequence*
- those helpers; they don't re-implement the decision. A fix to such a
+ may be deployed, how storage is priced and paid for, …) is a named
+ `pub` helper in a shared orchestration module, today
+ `ant_chain::discover`, `ant_chain::chequebook_store` and
+ `ant_chain::funding`. `crates/antd/src/main.rs`, the gateway's chain
+ writer (`crates/ant-gateway/src/chainreader.rs`, behind both entry
+ points' HTTP routes) and `crates/ant-ffi/src/` only *sequence* those
+ helpers; they don't re-implement the decision. A fix to such a
  decision goes into the helper so both entry points get it. The #49
  phantom-batch fix shipped in `antd` only for exactly this reason.
    - `docs/ffi-parity-audit.md` is the reference matrix of every

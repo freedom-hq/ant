@@ -34,6 +34,16 @@
 //! with `mode: 'no-cors'`, whatever
 //! the allow-list says. Those routes are unprotected against
 //! cross-site requests; see issue #105.
+//!
+//! The gateway also serves the xDAI storage-funding routes,
+//! `POST /v0/storage/buy`, `POST /v0/storage/extend` and
+//! `POST /v0/settlement/deposit`, which **do** swap the wallet's xDAI
+//! into xBZZ (and then buy/extend a batch or fund the chequebook
+//! deposit). Those refuse (`403`) any request carrying a browser
+//! `Origin` or cross-origin `Sec-Fetch-Site`, unless the origin is listed
+//! exactly in [`ant_set_gateway_cors`] — `*` and `null` don't count. So
+//! a page can't spend xDAI through them, but an exactly listed origin
+//! can; the host itself (no `Origin`) always can.
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
@@ -120,7 +130,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// CORS-simple requests, which still execute — including spending ones
 /// like `POST /stamps/{amount}/{depth}` (which may also deploy a
 /// chequebook and move xBZZ into a new or under-funded one, above) and
-/// `POST /chequebook/deposit` (see the module docs).
+/// `POST /chequebook/deposit` (see the module docs). The xDAI-swapping
+/// `/v0/storage/buy`, `/v0/storage/extend` and `POST
+/// /v0/settlement/deposit` routes it also serves refuse any request
+/// from a web page unless its origin is listed exactly (not `*` or
+/// `null`) in [`ant_set_gateway_cors`].
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -292,7 +306,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 &handle.data_dir.join("chequebook.json"),
                 &handle.eth,
             ) {
-                Ok(cb) => cb.filter(|cb| !crate::drive::is_disqualified(&handle.eth, cb)),
+                Ok(cb) => cb,
                 Err(e) => {
                     tracing::warn!(
                         target: "ant-ffi",
@@ -303,7 +317,12 @@ pub unsafe extern "C" fn ant_start_gateway(
             };
             // The handle's one slot, reset for this start and kept
             // current afterwards (see `AntHandle::gateway_chequebook`).
+            // A disqualified one is recorded as refused: the gateway
+            // then prices no deposit for it and funds none.
             match chequebook {
+                Some(cb) if crate::drive::is_disqualified(&handle.eth, &cb) => {
+                    handle.gateway_chequebook.refuse(cb);
+                }
                 Some(cb) => handle.gateway_chequebook.set(cb),
                 None => handle.gateway_chequebook.clear(),
             }
@@ -320,6 +339,9 @@ pub unsafe extern "C" fn ant_start_gateway(
                 handle.gateway_chequebook.clone(),
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
+                // The storage flows keep the chequebook at the shared
+                // 0.001 xBZZ deposit, so `/v0/storage/quote` prices it in.
+                Some(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR),
                 // Host-provided chain transport (issue #77), if the app
                 // installed one with `ant_set_chain_transport` before
                 // starting the gateway. `None` — the default — leaves
@@ -348,6 +370,12 @@ pub unsafe extern "C" fn ant_start_gateway(
             .map(|client| after_buy_hook(handle, client));
         #[cfg(not(feature = "chain"))]
         let on_batch_bought = None;
+        #[cfg(feature = "chain")]
+        let on_chequebook_refused = chain_client
+            .clone()
+            .map(|client| chequebook_refused_hook(handle, client));
+        #[cfg(not(feature = "chain"))]
+        let on_chequebook_refused = None;
 
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
@@ -389,6 +417,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),
             on_batch_bought,
+            on_chequebook_refused,
         };
 
         let task = handle.runtime.spawn(async move {
@@ -442,6 +471,45 @@ fn after_buy_hook(
             .await;
             crate::drive::sync_gateway_chequebook(&slot, &eth, chequebook);
         });
+    })
+}
+
+/// `POST /v0/settlement/deposit` found the chain refusing the account's
+/// chequebook (nothing was sent): the C API's top-up treatment
+/// ([`crate::drive::chequebook_refused`]: the shared lag check, then
+/// recorded as disqualified and settlement switched off), and a
+/// refusal that stands drops the chequebook from the gateway's slot.
+#[cfg(feature = "chain")]
+fn chequebook_refused_hook(
+    handle: &AntHandle,
+    client: ant_chain::ChainClient,
+) -> ant_gateway::ChequebookRefusedHook {
+    let cmd_tx = handle.cmd_tx.clone();
+    let data_dir = handle.data_dir.clone();
+    let eth = handle.eth;
+    let slot = handle.gateway_chequebook.clone();
+    Arc::new(move |chequebook, refusal| {
+        let (client, cmd_tx, data_dir, slot) = (
+            client.clone(),
+            cmd_tx.clone(),
+            data_dir.clone(),
+            slot.clone(),
+        );
+        Box::pin(async move {
+            let stands = crate::drive::chequebook_refused(
+                &cmd_tx,
+                &client,
+                &data_dir,
+                eth,
+                chequebook,
+                refusal == ant_gateway::ChequebookRefusal::NotRegistered,
+            )
+            .await;
+            if stands {
+                crate::drive::sync_gateway_chequebook(&slot, &eth, None);
+            }
+            stands
+        })
     })
 }
 
@@ -516,6 +584,13 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 /// yet and the deposit transfer into a new or under-funded one; nothing
 /// is swapped — even though the page cannot read the reply. Don't rely
 /// on this call to protect the wallet's funds.
+///
+/// The routes that *do* swap xDAI (`POST /v0/storage/buy`,
+/// `POST /v0/storage/extend`, `POST /v0/settlement/deposit`) are
+/// guarded separately: they refuse (`403`) requests from web pages
+/// whatever this list says, except from an origin listed here exactly —
+/// `*` and `null` never unlock them. Listing an exact origin therefore
+/// also lets that site spend the wallet's xDAI.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a

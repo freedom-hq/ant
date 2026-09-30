@@ -448,8 +448,10 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * funded no other way. Idempotent (a chequebook at the target is a
  * no-op); errors when this account has no chequebook yet, when its
  * chequebook fails the chain checks (factory registration, issuer())
- * this call runs before spending — it never funds that one — or when
- * those checks can't be read (retry; nothing spent). Returns the
+ * this call runs before spending (and again right before the transfer)
+ * — it never funds that one — or when those checks can't be read, or a
+ * chequebook deployed moments ago isn't visible to the RPC yet (retry;
+ * nothing spent). Returns the
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.
@@ -756,7 +758,11 @@ void ant_free_string(char *ptr);
  * /stamps/{amount}/{depth} (which, as above, may also deploy a
  * chequebook for xDAI gas and transfer the wallet's xBZZ into a new or
  * under-funded one; no swap) and POST /chequebook/deposit (see
- * ant_set_gateway_cors; issue #105).
+ * ant_set_gateway_cors; issue #105). The gateway also serves the
+ * xDAI-swapping routes POST /v0/storage/buy, POST /v0/storage/extend
+ * and POST /v0/settlement/deposit; those refuse (403) any request from
+ * a web page unless its origin is listed exactly (not "*" or "null")
+ * with ant_set_gateway_cors.
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
@@ -825,6 +831,13 @@ bool ant_start_gateway(const AntHandle *handle,
  * deposit transfer into a new or under-funded one (nothing is swapped)
  * — even though the page cannot read the reply. Do not rely on this
  * call to protect funds.
+ *
+ * The routes that DO swap xDAI (POST /v0/storage/buy, POST
+ * /v0/storage/extend, POST /v0/settlement/deposit) are guarded
+ * separately: they refuse (403) requests from web pages whatever this
+ * list says, except from an origin listed here exactly — "*" and
+ * "null" never unlock them. Listing an exact origin therefore also
+ * lets that site spend the wallet's xDAI.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL, non-UTF-8 or malformed-wildcard entry) returns false, leaves the stored list

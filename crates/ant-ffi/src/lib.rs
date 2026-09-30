@@ -2221,8 +2221,10 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// Idempotent: a chequebook already at the target is a no-op. Errors when
 /// this account has no chequebook yet, or its chequebook fails the chain
 /// checks (factory registration, `issuer()`) this call runs before
-/// spending — a deposit there would back cheques peers drop — or those
-/// checks can't be read (retry later; nothing was spent). Returns the refreshed
+/// spending, and again right before the transfer — a deposit there would
+/// back cheques peers drop — or those checks can't be read, or a
+/// chequebook deployed moments ago isn't visible to the RPC yet (retry
+/// later; nothing was spent). Returns the refreshed
 /// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
 /// and spends real funds** and **blocks** until they confirm, so the app
 /// gates it behind explicit confirmation. Requires the `chain` build

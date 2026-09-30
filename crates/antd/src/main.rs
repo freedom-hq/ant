@@ -110,7 +110,10 @@ struct Opt {
     /// scheme, without port; `host` needs at least two labels, and any
     /// other entry containing `*` is rejected at startup. Empty
     /// (default) disables CORS, matching a bee node started without the
-    /// option.
+    /// option. The xDAI-spending `POST /v0/storage/*` and
+    /// `POST /v0/settlement/deposit` refuse web pages except an origin
+    /// listed here exactly (`*`, `null` and wildcard entries don't unlock
+    /// them).
     #[arg(long, value_delimiter = ',')]
     cors_allowed_origins: Vec<String>,
 
@@ -751,6 +754,7 @@ async fn main() -> Result<()> {
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
             on_batch_bought: Some(settlement_on_buy.hook()),
+            on_chequebook_refused: Some(settlement_on_buy.refused_hook()),
         };
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };
@@ -786,10 +790,7 @@ async fn main() -> Result<()> {
     // the config (when present and factory-verified) is what pushsync
     // signs cheques with. Without any of these, sustained pushsync
     // uploads stall after a few hundred chunks per peer.
-    let ResolvedChequebook {
-        address: chequebook_addr,
-        pushsync: pushsync_swap_cfg,
-    } = resolve_chequebook(
+    let resolved = resolve_chequebook(
         &opt,
         &data_dir,
         signing_secret,
@@ -798,6 +799,11 @@ async fn main() -> Result<()> {
         &settlement_on_buy.wallet,
     )
     .await?;
+    let startup_refused = resolved.refused();
+    let ResolvedChequebook {
+        address: chequebook_addr,
+        pushsync: pushsync_swap_cfg,
+    } = resolved;
 
     if pushsync_swap_cfg.is_some() {
         tracing::info!(
@@ -856,13 +862,14 @@ async fn main() -> Result<()> {
             chequebook_addr,
             ant_chain::tx::GNOSIS_CHAIN_ID,
             Some(signing_secret),
+            managed_deposit_target(&opt),
         )
     };
 
     // Arm the after-buy settlement with the startup outcome and the
     // gateway's chequebook slot, before `POST /stamps` goes live below.
     settlement_on_buy
-        .arm(startup_settlement, chain_ctx.as_deref())
+        .arm(startup_settlement, startup_refused, chain_ctx.as_deref())
         .await;
     // Top up an adopted chequebook's deposit in the background: it waits
     // on a transfer receipt, and the chain state below must not.
@@ -1755,6 +1762,18 @@ struct ResolvedChequebook {
     pushsync: Option<ant_p2p::PushsyncSwapConfig>,
 }
 
+impl ResolvedChequebook {
+    /// The chequebook the resolution found but the startup chain check
+    /// disqualified: every path that yields an address builds the swap
+    /// config unless [`verify_then_build_swap`] said no. The gateway
+    /// records it as refused ([`ant_gateway::ChequebookSlot::refuse`]),
+    /// so a buy neither prices in nor swaps for a deposit that would
+    /// never be made.
+    fn refused(&self) -> Option<[u8; 20]> {
+        self.address.filter(|_| self.pushsync.is_none())
+    }
+}
+
 /// Resolve the chequebook for outbound SWAP settlement, in priority
 /// order:
 ///
@@ -2209,6 +2228,16 @@ fn manual_chequebook(opt: &Opt) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The chequebook deposit antd keeps topped up itself, so a
+/// `/v0/storage/quote` prices it into a new plan and the xDAI buy
+/// acquires it: `--chequebook-deposit-plur`, unless the operator runs a
+/// manual `--chequebook` or opted out of automatic chequebook spending
+/// with `--no-auto-chequebook`.
+fn managed_deposit_target(opt: &Opt) -> Option<u128> {
+    (!opt.no_auto_chequebook && manual_chequebook(opt).is_none())
+        .then_some(opt.chequebook_deposit_plur)
+}
+
 /// What antd's own chain work shares with the gateway and across
 /// chequebook resolutions (startup and after-buy).
 #[derive(Default)]
@@ -2347,11 +2376,35 @@ struct SettlementOnBuy {
 impl SettlementOnBuy {
     /// Record the startup outcome and the gateway's chequebook slot.
     /// Called once, before `POST /stamps` can fire the hook.
-    async fn arm(&self, state: Settlement, chain: Option<&ant_gateway::ChainContext>) {
+    ///
+    /// `refused` is the chequebook the startup check disqualified
+    /// ([`ResolvedChequebook::refused`]): the slot records it as refused,
+    /// as [`Self::disable`] does for one disqualified later, so
+    /// `/v0/storage/*` prices and buys the plan alone instead of swapping
+    /// xDAI for a deposit no path will make.
+    async fn arm(
+        &self,
+        state: Settlement,
+        refused: Option<[u8; 20]>,
+        chain: Option<&ant_gateway::ChainContext>,
+    ) {
         *self.state.lock().await = state;
         if let Some(chain) = chain {
             let _ = self.gateway_chequebook.set(chain.chequebook.clone());
             let _ = self.wallet.tx_lock.set(chain.tx_lock.clone());
+        }
+        if let Some(chequebook) = refused {
+            self.refuse_in_gateway(chequebook);
+        }
+    }
+
+    /// Mark `chequebook` refused in the gateway's slot, if the slot still
+    /// holds it.
+    fn refuse_in_gateway(&self, chequebook: [u8; 20]) {
+        if let Some(slot) = self.gateway_chequebook.get() {
+            if slot.get() == Some(chequebook) {
+                slot.refuse(chequebook);
+            }
         }
     }
 
@@ -2438,11 +2491,69 @@ impl SettlementOnBuy {
                 _ => {}
             }
         }
-        if let Some(slot) = self.gateway_chequebook.get() {
-            if slot.get() == Some(chequebook) {
-                slot.clear();
+        self.refuse_in_gateway(chequebook);
+    }
+
+    /// The gateway's refused-chequebook hook: `POST /v0/settlement/deposit`
+    /// found the chain refusing `chequebook` and sent nothing.
+    fn refused_hook(self: &Arc<Self>) -> ant_gateway::ChequebookRefusedHook {
+        let this = Arc::clone(self);
+        Arc::new(move |chequebook, refusal| {
+            let this = Arc::clone(&this);
+            Box::pin(async move { this.refused(chequebook, refusal).await })
+        })
+    }
+
+    /// Whether a chain refusal of `chequebook` stands; if it does,
+    /// treat it as the after-buy top-up does ([`Self::top_up_or_disable`]).
+    ///
+    /// A factory "not registered" for the chequebook antd deployed
+    /// moments ago goes through the shared lag check first
+    /// (`not_registered_may_be_lag`), which must not switch anything off.
+    /// Otherwise, unless `--chequebook-allow-unverified`, settlement
+    /// running on it is switched off ([`Self::disable`]); a chequebook
+    /// settlement isn't running on is just no longer reported or funded
+    /// by the gateway. Called by the route after it released the wallet
+    /// tx lock, so taking the state lock here keeps the lock order.
+    async fn refused(&self, chequebook: [u8; 20], refusal: ant_gateway::ChequebookRefusal) -> bool {
+        if refusal == ant_gateway::ChequebookRefusal::NotRegistered {
+            if let Some(rpc) = configured_rpc_url(&self.opt) {
+                let lagging = ant_chain::chequebook_store::not_registered_may_be_lag(
+                    &ant_chain::ChainClient::new(rpc),
+                    &self.data_dir.join("chequebook.json"),
+                    &chequebook,
+                )
+                .await;
+                if lagging {
+                    tracing::warn!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(chequebook)),
+                        "the RPC doesn't know our just-deployed chequebook yet; not depositing \
+                         into it this time",
+                    );
+                    return false;
+                }
             }
         }
+        tracing::error!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            ?refusal,
+            "chequebook failed its on-chain checks right before a deposit top-up; nothing was \
+             sent, and bee peers drop every cheque drawn on it",
+        );
+        if self.opt.chequebook_allow_unverified {
+            return true;
+        }
+        let mut state = self.state.lock().await;
+        match *state {
+            Settlement::Managed(cb) if cb == chequebook => {
+                self.disable(chequebook).await;
+                *state = Settlement::Off;
+            }
+            _ => self.refuse_in_gateway(chequebook),
+        }
+        true
     }
 
     /// Re-run the startup resolution and, when it yields a chequebook,
@@ -2468,6 +2579,11 @@ impl SettlementOnBuy {
                 return None;
             }
         };
+        // A chequebook the check disqualified again: keep the gateway
+        // from pricing in a deposit for it (as at startup).
+        if let Some(chequebook) = resolved.refused() {
+            self.refuse_in_gateway(chequebook);
+        }
         // `resolve_chequebook` already logged why when there's none.
         let cfg = resolved.pushsync?;
         if let Settlement::Managed(chequebook) = Settlement::of(&self.opt, Some(&cfg)) {
@@ -2757,6 +2873,120 @@ mod tests {
         assert!(!c.request());
         c.started();
         assert!(c.request());
+    }
+
+    fn settlement_for_test(
+        rpc: Option<&str>,
+        data_dir: PathBuf,
+    ) -> (Arc<SettlementOnBuy>, mpsc::Receiver<ControlCommand>) {
+        let mut opt = Opt::parse_from(["antd"]);
+        opt.gnosis_rpc_url = rpc.map(str::to_string);
+        let (commands, rx) = mpsc::channel(4);
+        let this = Arc::new(SettlementOnBuy {
+            opt,
+            data_dir,
+            signing_secret: [0x42; SECP256K1_SECRET_LEN],
+            eth: [0xe0; 20],
+            commands,
+            state: tokio::sync::Mutex::new(Settlement::Off),
+            pending: RunCoalescer::default(),
+            gateway_chequebook: std::sync::OnceLock::new(),
+            wallet: WalletCoord::default(),
+        });
+        (this, rx)
+    }
+
+    /// `POST /v0/settlement/deposit` found the chain refusing the managed
+    /// chequebook: settlement is switched off for it and the gateway
+    /// stops pricing and funding a deposit for it, as the after-buy
+    /// top-up's refusal does.
+    #[tokio::test]
+    async fn a_refused_deposit_switches_managed_settlement_off() {
+        const CB: [u8; 20] = [0xcb; 20];
+        let dir = std::env::temp_dir().join(format!("antd-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (this, mut node) = settlement_for_test(None, dir.clone());
+        *this.state.lock().await = Settlement::Managed(CB);
+        let slot = ant_gateway::ChequebookSlot::new(Some(CB));
+        let _ = this.gateway_chequebook.set(slot.clone());
+
+        let acker = tokio::spawn(async move {
+            match node.recv().await {
+                Some(ControlCommand::DisablePushsyncSwap { chequebook, ack }) => {
+                    let _ = ack.send(ControlAck::Ok {
+                        message: "off".into(),
+                    });
+                    chequebook
+                }
+                _ => panic!("expected DisablePushsyncSwap"),
+            }
+        });
+        let hook = this.refused_hook();
+        assert!(hook(CB, ant_gateway::ChequebookRefusal::NotRegistered).await);
+        assert_eq!(acker.await.unwrap(), CB);
+        assert!(matches!(*this.state.lock().await, Settlement::Off));
+        assert_eq!(slot.get(), None);
+        assert_eq!(slot.refused(), Some(CB));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A factory "not registered" for the chequebook antd deployed
+    /// moments ago (the record carries its deploy tx) whose receipt the
+    /// RPC can't show yet may be lag: nothing is switched off.
+    #[tokio::test]
+    async fn a_refusal_that_may_be_lag_switches_nothing_off() {
+        const CB: [u8; 20] = [0xcc; 20];
+        let dir = std::env::temp_dir().join(format!("antd-refused-lag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ant_chain::chequebook_store::persist_chequebook(
+            &dir.join("chequebook.json"),
+            &ant_chain::chequebook_store::ChequebookFile {
+                chequebook: format!("0x{}", hex::encode(CB)),
+                issuer: format!("0x{}", hex::encode([0xe0u8; 20])),
+                salt: String::new(),
+                deploy_tx: format!("0x{}", hex::encode([0x77u8; 32])),
+            },
+        )
+        .unwrap();
+        // Unroutable: the receipt can't be read, which is not a "no".
+        let (this, mut node) = settlement_for_test(Some("http://127.0.0.1:1"), dir.clone());
+        *this.state.lock().await = Settlement::Managed(CB);
+        let slot = ant_gateway::ChequebookSlot::new(Some(CB));
+        let _ = this.gateway_chequebook.set(slot.clone());
+
+        let hook = this.refused_hook();
+        assert!(!hook(CB, ant_gateway::ChequebookRefusal::NotRegistered).await);
+        assert!(node.try_recv().is_err(), "no command sent to the node");
+        assert!(matches!(*this.state.lock().await, Settlement::Managed(c) if c == CB));
+        assert_eq!(slot.get(), Some(CB));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M3: a chequebook the startup check disqualified is recorded as
+    /// refused in the gateway slot, so `/v0/storage/buy` stops pricing in
+    /// (and swapping for) a deposit that no path would make.
+    #[tokio::test]
+    async fn a_startup_disqualified_chequebook_is_refused_in_the_gateway() {
+        const CB: [u8; 20] = [0xcd; 20];
+        let disqualified = ResolvedChequebook {
+            address: Some(CB),
+            pushsync: None,
+        };
+        assert_eq!(disqualified.refused(), Some(CB));
+        let none = ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        };
+        assert_eq!(none.refused(), None);
+
+        let dir = std::env::temp_dir().join(format!("antd-startup-refused-{}", std::process::id()));
+        let (this, _node) = settlement_for_test(None, dir);
+        let slot = ant_gateway::ChequebookSlot::new(Some(CB));
+        let _ = this.gateway_chequebook.set(slot.clone());
+        this.arm(Settlement::Off, disqualified.refused(), None)
+            .await;
+        assert_eq!(slot.get(), None);
+        assert_eq!(slot.refused(), Some(CB));
     }
 }
 

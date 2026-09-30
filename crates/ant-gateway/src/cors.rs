@@ -277,6 +277,63 @@ pub async fn cors_middleware(
     resp
 }
 
+/// Guard for the routes that spend the node wallet's **xDAI**
+/// (`POST /v0/storage/buy`, `POST /v0/storage/extend`,
+/// `POST /v0/settlement/deposit`): refuse any request a web page made,
+/// unless the page's origin is listed exactly in `cors-allowed-origins`.
+///
+/// These routes take only query parameters, so a page can send them as
+/// CORS-*simple* requests (`fetch(url, {method: 'POST', mode:
+/// 'no-cors'})`): the browser sends them without a preflight and only
+/// hides the response, which is too late — the swap and the buy have
+/// already happened. So the policy can't live in the CORS headers; the
+/// request itself has to be refused.
+///
+/// A browser always sends `Origin` on a `POST` (and `Sec-Fetch-Site` on
+/// any request); the intended callers — Freedom desktop's main process,
+/// the ant-ffi host app, `curl` — send neither. So:
+///
+/// - no `Origin` and no `Sec-Fetch-Site` (or `Sec-Fetch-Site: none`, a
+///   user-typed request): allowed;
+/// - an `Origin` listed exactly in `cors-allowed-origins`: allowed (the
+///   operator named that site);
+/// - anything else, including `null` (every `bzz://` / sandboxed dweb
+///   page) and origins only matched by `*`, and a page served by the
+///   gateway itself: `403`. `null` and `*` are for reading and uploading,
+///   not for spending the wallet.
+pub async fn wallet_spend_guard(
+    State(handle): State<GatewayHandle>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if browser_request_allowed(&handle.cors, req.headers()) {
+        next.run(req).await
+    } else {
+        crate::error::json_error(
+            StatusCode::FORBIDDEN,
+            "this route spends the node wallet's xDAI and does not accept requests from web pages; \
+             list the page's origin explicitly in cors-allowed-origins to allow it",
+        )
+    }
+}
+
+/// The decision behind [`wallet_spend_guard`].
+fn browser_request_allowed(cfg: &CorsConfig, h: &axum::http::HeaderMap) -> bool {
+    let origin = h.get(header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
+    match origin {
+        Some(o) => {
+            // Only an exact listed origin; `*` and `null` don't count.
+            let o = o.trim().to_ascii_lowercase();
+            !o.is_empty() && o != "null" && cfg.origins.iter().any(|a| a == &o)
+        }
+        None => h
+            .get(SEC_FETCH_SITE)
+            .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"none")),
+    }
+}
+
+const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
+
 /// Build the `204 No Content` answer to a CORS preflight. When the
 /// origin is disallowed we still return `204` (matching bee/gorilla) but
 /// without the allow-origin header, so the browser cleanly blocks the

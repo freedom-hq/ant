@@ -14,6 +14,11 @@ pub mod chequebook_store;
 /// from the node EOA. RPC-driven, so it needs the `chain-rpc` feature.
 #[cfg(feature = "chain-rpc")]
 pub mod discover;
+/// Storage funding shared by `antd` and `ant-ffi`: price a postage plan
+/// against the node wallet and pay for it (and for extending it or the
+/// chequebook deposit) with xDAI only.
+#[cfg(feature = "chain-rpc")]
+pub mod funding;
 /// The pluggable JSON-RPC transport seam (issue #77): a host can serve
 /// ant's chain requests from its own verified source, with the
 /// configured RPC URL as the built-in default and fallback.
