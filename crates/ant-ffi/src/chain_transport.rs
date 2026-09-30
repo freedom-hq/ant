@@ -440,6 +440,7 @@ mod tests {
             eth: [0u8; 20],
             data_dir: std::path::PathBuf::from("/nonexistent"),
             gateway_task: std::sync::Mutex::new(None),
+            gateway_cors: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
             chain_transport: std::sync::Arc::new(HostChainTransport::new()),
             persisted_issuers: std::sync::Arc::new(crate::drive::PersistedIssuers::new(
