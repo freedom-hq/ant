@@ -481,6 +481,23 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 /// and no page from another origin can read its responses. Blank
 /// entries are ignored.
 ///
+/// Beyond bee, an entry may be a wildcard subdomain `scheme://*.host`
+/// (e.g. `https://*.bzz.freedom.baby`): it allows every direct-or-deeper
+/// subdomain of `host` on exactly that scheme with no port
+/// (`https://abc.bzz.freedom.baby`, `https://a.b.bzz.freedom.baby`), but
+/// not the apex `https://bzz.freedom.baby`, not a lookalike such as
+/// `https://x.bzz.freedom.baby.evil.example`, not `http://`, and not
+/// `https://x.bzz.freedom.baby:8443`. Matching is case-insensitive. The
+/// `*` must be the whole leftmost label and `host` a plain DNS name of
+/// at least two labels; any other entry containing `*` (`https://*.`,
+/// `*.host` without scheme, `https://a.*.host`, a bare TLD such as
+/// `https://*.com`, a wildcard with a port or path) is rejected.
+/// This is for hosts that serve each content root from its own synthetic
+/// origin (Freedom Android's virtual origins): the set of origins is
+/// unbounded so it can't be listed exactly, and a wildcard keeps it to
+/// the host's own namespace, where `*` would let any page in any other
+/// browser on the device read the API.
+///
 /// Only allow origins whose pages you trust with the whole API: there
 /// is no auth, so an allowed page can read `/wallet`, `/addresses`,
 /// `/stamps` etc. and also send non-simple (preflighted) requests, e.g.
@@ -502,7 +519,8 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a
-/// running gateway, or a null/non-UTF-8 entry — the stored list is then
+/// running gateway, or a null/non-UTF-8/malformed-wildcard entry — the
+/// stored list is then
 /// left unchanged.
 ///
 /// # Safety
@@ -540,7 +558,16 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
                 }
                 match CStr::from_ptr(ptr).to_str().map(str::trim) {
                     Ok("") => {}
-                    Ok(o) => list.push(o.to_string()),
+                    Ok(o) => {
+                        if let Err(e) = CorsConfig::check_entry(o) {
+                            write_out_err(
+                                out_err,
+                                &format!("ant_set_gateway_cors: origin {i}: {e}"),
+                            );
+                            return false;
+                        }
+                        list.push(o.to_string());
+                    }
                     Err(_) => {
                         write_out_err(
                             out_err,

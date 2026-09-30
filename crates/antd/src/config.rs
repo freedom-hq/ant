@@ -21,7 +21,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// `cors-allowed-origins` accepts either a single scalar (`"null"`,
-/// `"*"`) or a YAML list. Untagged so both shapes deserialize.
+/// `"*"`) or a YAML list. Untagged so both shapes deserialize. Entries
+/// may also be wildcard subdomains `scheme://*.host` (host with at
+/// least two labels); `antd` refuses to start on a malformed one.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum CorsOrigins {
