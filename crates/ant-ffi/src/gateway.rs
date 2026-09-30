@@ -17,6 +17,15 @@
 //! browser lets read its responses can read `/wallet`, `/addresses`,
 //! `/stamps`, … A host whose own pages need cross-origin access opts
 //! in with [`ant_set_gateway_cors`] before starting (issue #101).
+//!
+//! CORS only governs whether a page may *read* a response. It does not
+//! stop a page from *sending* a request: a CORS-simple request (a
+//! `POST` with no body or a form/text body and no custom headers) needs
+//! no preflight, so any page can still fire the state-changing routes —
+//! `POST /stamps/{amount}/{depth}` (buys a batch), `POST
+//! /chequebook/deposit` (moves xBZZ) — with `mode: 'no-cors'`, whatever
+//! the allow-list says. Those routes are unprotected against
+//! cross-site requests; see issue #105.
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
@@ -62,10 +71,13 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// this gateway immediately — a cleared one falls back to `gnosis_rpc`
 /// rather than calling a `host_ctx` the host has been told it may free.
 ///
-/// CORS: the gateway answers cross-origin requests only for the
-/// origins last set with [`ant_set_gateway_cors`]; by default none, so
-/// it sends no CORS headers and no page from another origin can read
-/// its responses.
+/// CORS: the gateway lets cross-origin pages read its responses only
+/// for the origins last set with [`ant_set_gateway_cors`]; by default
+/// none, so it sends no CORS headers and no page from another origin can
+/// read its responses. That does not stop a page from *sending*
+/// CORS-simple requests, which still execute — including spending ones
+/// like `POST /stamps/{amount}/{depth}` and `POST /chequebook/deposit`
+/// (see the module docs).
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -316,9 +328,18 @@ pub unsafe extern "C" fn ant_start_gateway(
 ///
 /// Only allow origins whose pages you trust with the whole API: there
 /// is no auth, so an allowed page can read `/wallet`, `/addresses`,
-/// `/stamps` etc. and upload. `null` in particular matches *any* page
-/// whose request was redirected across origins (the Fetch spec taints
-/// the origin to `null`), and `*` matches every page.
+/// `/stamps` etc. and also send non-simple (preflighted) requests, e.g.
+/// uploads with `Swarm-*` headers. `null` in particular matches *any*
+/// page whose request was redirected across origins (the Fetch spec
+/// taints the origin to `null`), and `*` matches every page.
+///
+/// This list protects *reads* only. An empty list does not block
+/// writes: a CORS-simple request needs no preflight, so any page can
+/// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
+/// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
+/// executes it — spending the wallet's xBZZ — even though the page
+/// cannot read the reply. Don't rely on this call to protect the
+/// wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a

@@ -718,6 +718,10 @@ void ant_free_string(char *ptr);
  * headers, so no page from another origin can read its responses.
  * (Up to 0.5.48 it always allowed the `null` origin; hosts that relied
  * on that must now call ant_set_gateway_cors explicitly.)
+ * CORS only stops reads: any page can still send CORS-simple requests,
+ * which execute — including the spending routes POST
+ * /stamps/{amount}/{depth} and POST /chequebook/deposit (see
+ * ant_set_gateway_cors; issue #105).
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
@@ -744,10 +748,18 @@ bool ant_start_gateway(const AntHandle *handle,
  * another origin can read its responses. Blank entries are ignored.
  *
  * The gateway has no auth: an allowed page can read /wallet, /addresses,
- * /stamps, ... and upload. "null" matches ANY page whose request was
+ * /stamps, ... and send preflighted requests (e.g. uploads with Swarm-*
+ * headers). "null" matches ANY page whose request was
  * redirected across origins (the Fetch spec taints its Origin to
  * "null"), and "*" matches every page — allow them only if that is
  * acceptable.
+ *
+ * This list protects READS only; an empty list does not block writes.
+ * A CORS-simple request needs no preflight, so any page can still
+ * fetch(url, {method: "POST", mode: "no-cors"}) against
+ * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
+ * gateway executes it, spending the wallet's xBZZ, even though the page
+ * cannot read the reply. Do not rely on this call to protect funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL or non-UTF-8 entry) returns false, leaves the stored list
