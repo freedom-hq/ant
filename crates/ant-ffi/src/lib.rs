@@ -30,6 +30,7 @@ mod jni;
 mod manifest;
 #[cfg(test)]
 mod parity_guard;
+pub mod publisher;
 mod stream;
 
 // The gateway FFI lives in a private submodule; re-export its C-ABI
@@ -192,6 +193,13 @@ pub struct AntHandle {
     /// run at a time — two concurrent runs would each measure the
     /// other's upload contention rather than the network's.
     bench: Mutex<Option<Arc<bench::BenchRun>>>,
+    /// The live broadcast currently publishing from this node, if any
+    /// (issue #67 stage 2). `None` until [`ant_publisher_start`];
+    /// cleared by [`ant_publisher_stop`]. Exactly one at a time — two
+    /// broadcasts would compete for the same uplink and the same
+    /// in-flight window, which is precisely what the stage-1 window
+    /// measurements say not to do.
+    publisher: Mutex<Option<Arc<publisher::LiveRun>>>,
     /// Host-provided JSON-RPC transport for chain reads/writes (issue
     /// #77), installed by [`ant_set_chain_transport`]. Empty by default,
     /// which means every chain request goes to the configured
@@ -958,6 +966,7 @@ fn init_inner(
         gateway_task: Mutex::new(None),
         gateway_cors: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
+        publisher: Mutex::new(None),
         #[cfg(feature = "chain")]
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
@@ -3127,6 +3136,282 @@ pub unsafe extern "C" fn ant_bench_stop(
 }
 
 // ---------------------------------------------------------------------------
+// AntStream live publisher (issue #67 stage 2)
+// ---------------------------------------------------------------------------
+
+/// How long [`ant_publisher_stop`] waits for a cancelled broadcast to
+/// settle before returning the report anyway.
+///
+/// Stopping publishes what is already captured. With every upload
+/// timing out that drain is at worst *three* rounds of the publisher's
+/// 60 s per-segment deadline — the in-flight window, a segment the
+/// pump had already popped behind it, then the backlog (capped at
+/// `max_backlog`, so at most one further round) — so a fully wedged
+/// uplink can outlive this grace. That is deliberate: a drain that
+/// slow means the tail is lost regardless, so the call returns at
+/// ~130 s with an honest report and the loop finishes in the
+/// background and releases its slot.
+const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
+
+/// Poll interval while waiting for a cancelled broadcast to settle.
+const PUBLISHER_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Start a live broadcast from this node.
+///
+/// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
+/// and `batch_id` are required (a broadcast needs a name and a storage
+/// plan). Segments come from the host's capture pipeline through
+/// [`ant_publisher_push_segment`]; per segment the publisher does one
+/// `POST /bzz`, rebuilds the HLS playlist, and publishes it as a
+/// sequence-feed update with `POST /soc` — all against `gateway`, which
+/// must already be listening (see [`ant_start_gateway`]).
+///
+/// Returns immediately — the loop drives itself on the node's runtime.
+/// Poll it with [`ant_publisher_progress`] and finish it with
+/// [`ant_publisher_stop`]. Only one broadcast at a time per handle.
+///
+/// Returns `true` on success, `false` with an allocated message in
+/// `out_err` (free with [`ant_free_string`]) otherwise.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `config_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_start(
+    handle: *const AntHandle,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_publisher_start: null handle");
+            return false;
+        };
+        let config = match cstr_to_str(config_json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<publisher::PublisherConfig>(raw)
+                    .map_err(|e| format!("ant_publisher_start: invalid config: {e}"))
+            }) {
+            Ok(c) => c,
+            Err(msg) => {
+                write_out_err(out_err, &msg);
+                return false;
+            }
+        };
+
+        // Hold the slot across check → start → store, so two concurrent
+        // starts can't both pass the "already broadcasting" check.
+        let mut slot = handle
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|run| !run.is_finished()) {
+            write_out_err(
+                out_err,
+                "ant_publisher_start: this node is already broadcasting",
+            );
+            return false;
+        }
+        match publisher::start(
+            handle.runtime.handle(),
+            config,
+            handle.signing_secret,
+            handle.eth,
+            Some(handle.status_rx.clone()),
+        ) {
+            Ok(run) => {
+                *slot = Some(run);
+                true
+            }
+            Err(e) => {
+                write_out_err(out_err, &format!("ant_publisher_start: {e}"));
+                false
+            }
+        }
+    }
+}
+
+/// Hand one finished capture segment to the running broadcast.
+///
+/// `is_init` marks the fMP4 *initialization* segment (`ftyp` + `moov`),
+/// which every following media segment needs to be playable; push a
+/// fresh one whenever the writer restarts (camera flip, interruption
+/// recovery, bitrate downshift) and set `discontinuity` on the first
+/// media segment after it. `duration_ms` is the segment's real duration
+/// (ignored for the initialization segment).
+///
+/// **Call order is the broadcast order.** Segments are numbered as these
+/// calls arrive, and that number fixes both the playlist order and which
+/// `#EXT-X-MAP` a media segment is listed under — so the caller must
+/// push in capture order, from one thread or an ordered queue. Getting
+/// it wrong around a writer restart lists the old writer's last segment
+/// under the new writer's map, which no player can decode.
+///
+/// **Never blocks**: a capture pipeline stalled on the uplink drops
+/// frames. When the publisher is already a window behind, the oldest
+/// pending segment is dropped instead — the live-edge discipline the
+/// return value reports.
+///
+/// Returns:
+///
+/// * `0` — queued.
+/// * `1` — queued, and the oldest pending segment was dropped to stay at
+///   the live edge (the playlist marks the gap `#EXT-X-DISCONTINUITY`).
+/// * `2` — refused: the broadcast is stopping.
+/// * `-1` — error, with an allocated message in `out_err` (free with
+///   [`ant_free_string`]).
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `data` must point at `len` readable bytes for
+/// the duration of the call (the publisher copies them). `out_err`, if
+/// non-null, must point at a writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_push_segment(
+    handle: *const AntHandle,
+    is_init: bool,
+    data: *const u8,
+    len: usize,
+    duration_ms: u32,
+    discontinuity: bool,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_publisher_push_segment: null handle");
+            return -1;
+        };
+        if data.is_null() || len == 0 {
+            write_out_err(out_err, "ant_publisher_push_segment: empty segment");
+            return -1;
+        }
+        let run = handle
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(run) = run else {
+            write_out_err(
+                out_err,
+                "ant_publisher_push_segment: this node is not broadcasting",
+            );
+            return -1;
+        };
+        let payload = std::slice::from_raw_parts(data, len).to_vec();
+        let kind = if is_init {
+            publisher::SegmentKind::Init
+        } else {
+            publisher::SegmentKind::Media
+        };
+        match run.push(kind, payload, duration_ms, discontinuity) {
+            publisher::PushOutcome::Queued => 0,
+            publisher::PushOutcome::QueuedDroppingOldest => 1,
+            publisher::PushOutcome::Closed => 2,
+        }
+    }
+}
+
+/// Live progress of the broadcast started by [`ant_publisher_start`], as
+/// an allocated [`publisher::PublisherSnapshot`] JSON string (free with
+/// [`ant_free_string`]). Non-blocking — this is what drives the
+/// on-screen publish-lag indicator, so it is polled once a second.
+/// Returns null with an error when no broadcast has been started on this
+/// handle.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_progress(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_publisher_progress", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .publisher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "this node is not broadcasting".to_string())?;
+            serde_json::to_string(&run.snapshot()).map_err(|e| format!("serialize snapshot: {e}"))
+        })
+    }
+}
+
+/// End the broadcast and return its final
+/// [`publisher::PublisherReport`] as an allocated JSON string (free with
+/// [`ant_free_string`]).
+///
+/// **Blocking**: stopping is cooperative. Segments already captured are
+/// published (the last seconds of a broadcast are real content, not a
+/// truncated measurement) and the playlist is closed with
+/// `#EXT-X-ENDLIST` so viewers see a finished recording rather than a
+/// stream that just stopped updating. Returns after
+/// [`PUBLISHER_STOP_GRACE`] (~130 s) at the latest — a worst-case
+/// drain can still be finishing in the background past that (see the
+/// constant) — so call it off the UI thread.
+///
+/// Calling it on a broadcast that already finished on its own returns
+/// that broadcast's report. Once a stop call has *returned* and
+/// released the slot, a second call fails with "not broadcasting" —
+/// keep the report from the first call rather than re-fetching it.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_stop(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_publisher_stop", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .publisher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "this node is not broadcasting".to_string())?;
+            run.cancel();
+            let deadline = Instant::now() + PUBLISHER_STOP_GRACE;
+            while !run.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(PUBLISHER_STOP_POLL);
+            }
+            let report = run.report();
+            // Only release the slot once the loop is actually done, and
+            // only if it still holds *this* broadcast: while we waited,
+            // a concurrent `ant_publisher_start` could legitimately have
+            // installed a new one, which clearing would orphan (and let
+            // a third start run two publishers on one uplink).
+            if run.is_finished() {
+                let mut slot = handle
+                    .publisher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &run)) {
+                    *slot = None;
+                }
+            }
+            serde_json::to_string(&report).map_err(|e| format!("serialize report: {e}"))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -4143,6 +4428,7 @@ mod tests {
             gateway_task: Mutex::new(None),
             gateway_cors: Mutex::new(Vec::new()),
             bench: Mutex::new(None),
+            publisher: Mutex::new(None),
             #[cfg(feature = "chain")]
             chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
             #[cfg(feature = "chain")]

@@ -443,6 +443,7 @@ mod tests {
             gateway_task: std::sync::Mutex::new(None),
             gateway_cors: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
+            publisher: std::sync::Mutex::new(None),
             chain_transport: std::sync::Arc::new(HostChainTransport::new()),
             chain_init: std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(
                 ant_p2p::UploadRuntime {

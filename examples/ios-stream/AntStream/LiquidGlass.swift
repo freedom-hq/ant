@@ -254,8 +254,16 @@ struct AddressQRCode: View {
 
 /// Format a byte count using Apple's `.file` style. Wrapped here so every
 /// call site is consistent.
+///
+/// `allowsNonnumericFormatting` is off because the default renders zero
+/// as the word "Zero" — "Zero KB free" in the broadcast checklist, "Zero
+/// KB" for a broadcast that has not published a byte yet. Next to real
+/// figures in the same row, a number is what reads correctly.
 func formatBytes(_ count: UInt64) -> String {
-    ByteCountFormatter.string(fromByteCount: Int64(min(count, UInt64(Int64.max))), countStyle: .file)
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.allowsNonnumericFormatting = false
+    return formatter.string(fromByteCount: Int64(min(count, UInt64(Int64.max))))
 }
 
 /// Put a secret on the pasteboard with a short expiry so a copied account

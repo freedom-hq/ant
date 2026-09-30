@@ -595,6 +595,106 @@ final class AntNode: ObservableObject {
         return report
     }
 
+    // MARK: - Live publisher (#67 stage 2)
+
+    /// Start a live broadcast on the node. `batchId` is the connected
+    /// plan's postage batch — every segment, playlist and feed update is
+    /// stamped with it, so a broadcast without a plan is refused here
+    /// rather than failing per segment on the gateway.
+    ///
+    /// The publish window is left at the node's default (4): stage 1
+    /// measured 4 as the stable point and 8 as a connection-layer
+    /// collapse, so it is not a knob this screen should offer.
+    func startPublisher(
+        channel: String,
+        batchId: String,
+        bitrateKbps: UInt32,
+        segmentMs: UInt32,
+        notes: String
+    ) async throws {
+        let config: [String: Any] = [
+            "channel": channel,
+            "gateway": "http://\(Self.gatewayAddress)",
+            "batch_id": batchId,
+            "bitrate_kbps": bitrateKbps,
+            "segment_ms": segmentMs,
+            "notes": notes,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: config),
+              let json = String(data: data, encoding: .utf8) else {
+            throw AntError.op("could not encode the broadcast configuration")
+        }
+        // `nil` from `withHandle` means there is no node; a non-nil
+        // inner value is the failure detail (`nil` inside = started).
+        let failure: String?? = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { () -> String? in
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let ok = json.withCString { ant_publisher_start(h, $0, &errPtr) }
+                let detail = ok ? nil : errPtr.map { String(cString: $0) }
+                if let errPtr { ant_free_string(errPtr) }
+                return ok ? nil : (detail ?? "could not start the broadcast")
+            }.value
+        }
+        guard let started = failure else { throw AntError.notReady }
+        if let message = started { throw AntError.op(message) }
+    }
+
+    /// Hand one captured segment to the publisher. Returns the FFI's
+    /// disposition: `0` queued, `1` queued after dropping the oldest
+    /// pending segment, `2` refused (stopping), `-1` error.
+    ///
+    /// Non-blocking node-side, so the capture pipeline is never stalled
+    /// by the uplink — which is the whole point of the drop-oldest
+    /// backlog behind it.
+    @discardableResult
+    func pushSegment(_ segment: CaptureEngine.Segment) async -> Int32 {
+        let outcome: Int32? = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { () -> Int32 in
+                segment.data.withUnsafeBytes { raw -> Int32 in
+                    guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+                    var errPtr: UnsafeMutablePointer<CChar>? = nil
+                    let code = ant_publisher_push_segment(
+                        h,
+                        segment.isInitialization,
+                        base,
+                        raw.count,
+                        segment.durationMs,
+                        segment.discontinuity,
+                        &errPtr
+                    )
+                    if let errPtr { ant_free_string(errPtr) }
+                    return code
+                }
+            }.value
+        }
+        return outcome ?? -1
+    }
+
+    /// Live progress of the broadcast, or `nil` when there is none.
+    func publisherProgress() async -> PublisherSnapshot? {
+        guard let json = try? await ffiString(name: "broadcast progress", { h, errPtr in
+            ant_publisher_progress(h, errPtr)
+        }) else { return nil }
+        return StreamDecoder.publisherSnapshot(from: json)
+    }
+
+    /// End the broadcast and take its final report.
+    ///
+    /// `ant_publisher_stop` blocks while the already-captured segments
+    /// are published and the playlist is closed with `#EXT-X-ENDLIST`
+    /// (up to ~130 s, its stop grace), so this must not run on the main
+    /// actor's thread — ``ffiString`` already hops onto a detached task
+    /// for that reason.
+    func stopPublisher() async throws -> PublisherReport {
+        let json = try await ffiString(name: "stop broadcast") { h, errPtr in
+            ant_publisher_stop(h, errPtr)
+        }
+        guard let report = StreamDecoder.publisherReport(from: json) else {
+            throw AntError.op("could not read the broadcast report")
+        }
+        return report
+    }
+
     // MARK: - Refresh
 
     func refreshAll() async {
@@ -679,6 +779,40 @@ final class AntNode: ObservableObject {
     /// sample in place for the capture. Never set outside the shot path.
     private var screenshotSampleActive = false
 
+    /// A modest connected plan: `plan.enabled` is what gates both the
+    /// deposit card and the going-live screen, and the storage meter
+    /// shows a populated bar rather than "no plan".
+    private static func sampleConnectedPlan(batchId: String) -> StoragePlan {
+        StoragePlan(
+            enabled: true,
+            batchId: batchId,
+            batchDepth: 22,
+            immutable: false,
+            totalCapacityChunks: 1_250_000,   // ~5 GB at 4 KiB/chunk
+            issuedChunks: 40_000,             // ~160 MB used
+            worstCaseRemainingChunks: 1_210_000
+        )
+    }
+
+    /// Let `-antstream-shot-live` reach the going-live screen on a
+    /// runner. A fresh simulator account has no storage plan, and
+    /// broadcasting is refused without one, so a sample plan is
+    /// published to get past that gate.
+    ///
+    /// The batch id is deliberately **not** a real one: the segments are
+    /// captured, encoded, segmented and handed to the publisher for
+    /// real, and the gateway then rejects the stamp — the same "no
+    /// usable batch" wall the stage-1 publish rows hit. Nothing here
+    /// fakes a successful upload.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-live`.
+    func installBroadcastSample() {
+        screenshotSampleActive = true
+        plan = Self.sampleConnectedPlan(
+            batchId: "0x" + String(repeating: "a1", count: 32)
+        )
+    }
+
     /// Drive the Storage tab to the deposit-0 top-up state for a CI
     /// screenshot.
     ///
@@ -696,16 +830,8 @@ final class AntNode: ObservableObject {
     /// `refreshAccount`), so only the settlement figures are synthetic.
     func installDepositTopUpSample() {
         screenshotSampleActive = true
-        // A modest connected plan so `plan.enabled` gates the card in, and
-        // the storage meter shows a populated bar rather than "no plan".
-        plan = StoragePlan(
-            enabled: true,
-            batchId: "0x0000000000000000000000000000000000000000000000000000000000000000",
-            batchDepth: 22,
-            immutable: false,
-            totalCapacityChunks: 1_250_000,   // ~5 GB at 4 KiB/chunk
-            issuedChunks: 40_000,             // ~160 MB used
-            worstCaseRemainingChunks: 1_210_000
+        plan = Self.sampleConnectedPlan(
+            batchId: "0x0000000000000000000000000000000000000000000000000000000000000000"
         )
         // A deployed chequebook (settlement enabled) …
         settlement = SettlementInfo(

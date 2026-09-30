@@ -4,18 +4,22 @@
 //! camera: a generator produces HLS-shaped segments on a wall clock at a
 //! configured bitrate, and each finished segment is published with one
 //! `POST /bzz` against the bee-shaped gateway (`ant_start_gateway`
-//! in-process on iOS, `antd` on desktop). Stage 2 replaces the generator
-//! with the real capture pipeline and adds the playlist / feed writes;
-//! everything below the generator is meant to survive that swap, which
-//! is why the measurement harness lives in `ant-ffi` rather than in a
-//! throwaway script.
+//! in-process on iOS, `antd` on desktop).
 //!
-//! Deliberately **not** in stage 1 (they belong to stage 2 of #67):
-//! playlist rebuilds, `POST /soc` feed updates, drop-oldest live-edge
-//! discipline, and the on-screen lag indicator. What is here is the
-//! measurement those decisions need: sustained Mbit/s, chunks/s,
-//! per-segment publish latency, and publish *lag* (how far behind the
-//! live edge the uploader has fallen), sampled over a long run.
+//! That swap has since happened: stage 2's live publisher lives in
+//! [`crate::publisher`], and the publish path this harness measures —
+//! the loopback HTTP client, the `POST /bzz` call, the chunk-count
+//! arithmetic — **is** that module's, imported here rather than
+//! duplicated. What stays in this file is only the measurement: a
+//! wall-clock generator, and the statistics a go/no-go row is made of.
+//!
+//! Deliberately **not** in stage 1 (they are stage 2, in
+//! [`crate::publisher`]): playlist rebuilds, `POST /soc` feed updates,
+//! drop-oldest live-edge discipline, and the on-screen lag indicator.
+//! What is here is the measurement those decisions needed: sustained
+//! Mbit/s, chunks/s, per-segment publish latency, and publish *lag* (how
+//! far behind the live edge the uploader has fallen), sampled over a
+//! long run.
 //!
 //! Two modes, sharing one loop:
 //!
@@ -39,27 +43,16 @@ use std::time::{Duration, Instant};
 
 use ant_control::StatusSnapshot;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{watch, Semaphore};
 
-/// Swarm chunk payload size. Segment byte counts are converted to chunk
-/// counts with this so `chunks/s` is comparable to the desktop
-/// `--target-peers` sweep in PLAN.md (Phase 7g: 105.3 chunks/s at 400
-/// peers).
-const CHUNK_SIZE: u64 = 4096;
+// The publish path itself is stage 2's product code (see the module
+// docs): the bench measures exactly what a live broadcast runs.
+use crate::publisher::{lock, ms, percentile, publish_bzz, Target};
 
-/// Branching factor of the Swarm chunk tree (128 × 32-byte references
-/// per intermediate chunk). Mirrors `ant_retrieval::BRANCHES`; kept
-/// local so [`data_chunk_count`] stays a pure function usable from the
-/// unit tests without pulling the splitter in.
-const BRANCHES: u64 = 128;
-
-/// Per-segment publish deadline. A segment that has not landed within
-/// this long is recorded as a failure rather than stalling the run: at
-/// live-edge bitrates anything past ~1 min is already unusable, and the
-/// bench must keep sampling so the report shows *where* it broke.
-const PUBLISH_TIMEOUT: Duration = Duration::from_mins(1);
+/// Number of chunks a segment splits into — re-exported from
+/// [`crate::publisher`] so existing callers of `bench::data_chunk_count`
+/// keep working.
+pub use crate::publisher::data_chunk_count;
 
 /// How often the run samples the node's peer count (and, on hosts that
 /// supply one, the battery/thermal note). Cheap watch-channel read.
@@ -259,27 +252,6 @@ impl SegmentGenerator {
         }
         out
     }
-}
-
-/// Number of chunks a `payload_bytes`-long body splits into: the data
-/// leaves plus every intermediate level of the Swarm chunk tree.
-///
-/// Excludes the 1–2 mantaray manifest chunks a `POST /bzz` adds on top
-/// (< 0.5 % at segment sizes, and they are the same for every mode), so
-/// the reported `chunks/s` is strictly the *content* rate — directly
-/// comparable to the desktop `--target-peers` sweep in PLAN.md.
-#[must_use]
-pub const fn data_chunk_count(payload_bytes: u64) -> u64 {
-    if payload_bytes <= CHUNK_SIZE {
-        return 1;
-    }
-    let mut level = payload_bytes.div_ceil(CHUNK_SIZE);
-    let mut total = level;
-    while level > 1 {
-        level = level.div_ceil(BRANCHES);
-        total += level;
-    }
-    total
 }
 
 // ---------------------------------------------------------------------------
@@ -643,28 +615,6 @@ fn build_report(config: &BenchConfig, stats: &BenchStats, elapsed: Duration) -> 
     report
 }
 
-/// Nearest-rank percentile (`ceil(pct/100 × n)`, 1-indexed). Chosen
-/// over the interpolating variant because a tail latency must never be
-/// *understated*: with 5 samples, "p95" here is the worst one, not the
-/// fourth.
-fn percentile(sorted_ms: &[u64], pct: usize) -> u64 {
-    if sorted_ms.is_empty() {
-        return 0;
-    }
-    let rank = (sorted_ms.len() * pct).div_ceil(100).max(1);
-    sorted_ms[rank.min(sorted_ms.len()) - 1]
-}
-
-fn ms(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Poison-tolerant lock: a panicked bench thread must not poison the
-/// stats for the reader that is about to render the report.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Start a run on `runtime`, returning the handle immediately.
 ///
 /// The caller keeps the [`BenchRun`] alive for the duration; dropping it
@@ -679,7 +629,7 @@ pub fn start(
 ) -> Result<Arc<BenchRun>, BenchError> {
     config.validate()?;
     let target = if config.mode() == Mode::Publish {
-        Some(Target::parse(&config.gateway)?)
+        Some(Target::parse(&config.gateway).map_err(BenchError::Config)?)
     } else {
         None
     };
@@ -845,30 +795,25 @@ async fn sleep_until(deadline: Instant) {
 // Publish path
 // ---------------------------------------------------------------------------
 
-/// Publish one segment with `POST /bzz`, exactly as the stage-2 loop
-/// will. Returns the segment's data-chunk count on success.
+/// Publish one segment with `POST /bzz` — the live publisher's own
+/// call ([`crate::publisher::publish_bzz`]), so the bench measures the
+/// path a broadcast runs rather than a copy of it. Returns the
+/// segment's data-chunk count on success.
 async fn publish_segment(
     target: &Target,
     batch: [u8; 32],
     seq: u64,
     payload: &[u8],
 ) -> Result<u64, String> {
-    let path = format!("{}/bzz?name=seg-{seq}.m4s", target.prefix);
-    let headers = [
-        ("content-type".to_string(), "video/iso.segment".to_string()),
-        ("swarm-postage-batch-id".to_string(), hex::encode(batch)),
-    ];
-    let response =
-        tokio::time::timeout(PUBLISH_TIMEOUT, http_post(target, &path, &headers, payload))
-            .await
-            .map_err(|_| format!("segment {seq}: publish timed out after {PUBLISH_TIMEOUT:?}"))??;
-    if response.status != 201 {
-        return Err(format!(
-            "segment {seq}: gateway returned {} {}",
-            response.status,
-            String::from_utf8_lossy(&response.body).trim(),
-        ));
-    }
+    publish_bzz(
+        target,
+        batch,
+        &format!("seg-{seq}.m4s"),
+        "video/iso.segment",
+        payload,
+    )
+    .await
+    .map_err(|e| format!("segment {seq}: {e}"))?;
     Ok(data_chunk_count(payload.len() as u64))
 }
 
@@ -906,135 +851,13 @@ fn parse_batch_id(raw: &str) -> Result<[u8; 32], BenchError> {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal loopback HTTP/1.1 client
-// ---------------------------------------------------------------------------
-//
-// The gateway the publisher posts to is always on loopback — in-process
-// on iOS (`ant_start_gateway`), `antd` on desktop — so a full HTTP
-// client stack would be dead weight in the mobile slice, which
-// deliberately drops `reqwest` (see `ant-ffi/Cargo.toml`). This is the
-// smallest thing that speaks the one request shape the publisher needs:
-// `POST` with a `Content-Length` body, one response, connection closed.
-
-/// Parsed `http://host:port/prefix` gateway base.
-#[derive(Debug, Clone)]
-struct Target {
-    authority: String,
-    /// Path prefix, without a trailing slash (`""` for a bare host).
-    prefix: String,
-}
-
-impl Target {
-    fn parse(url: &str) -> Result<Self, BenchError> {
-        let rest = url.trim().strip_prefix("http://").ok_or_else(|| {
-            BenchError::Config(format!(
-                "gateway must be an http:// URL (the publisher posts to a loopback gateway), got `{url}`",
-            ))
-        })?;
-        let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-        if authority.is_empty() {
-            return Err(BenchError::Config(format!("gateway has no host: `{url}`")));
-        }
-        let authority = if authority.contains(':') {
-            authority.to_string()
-        } else {
-            format!("{authority}:80")
-        };
-        let prefix = path.trim_end_matches('/');
-        Ok(Self {
-            authority,
-            prefix: if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("/{prefix}")
-            },
-        })
-    }
-}
-
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-async fn http_post(
-    target: &Target,
-    path: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Result<HttpResponse, String> {
-    let mut stream = TcpStream::connect(&target.authority)
-        .await
-        .map_err(|e| format!("connect {}: {e}", target.authority))?;
-    // Loopback + small bodies: Nagle only adds latency to the
-    // measurement we are here to take.
-    let _ = stream.set_nodelay(true);
-
-    let mut head = format!(
-        "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        target.authority,
-        body.len(),
-    );
-    for (name, value) in headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(value);
-        head.push_str("\r\n");
-    }
-    head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .map_err(|e| format!("write request head: {e}"))?;
-    stream
-        .write_all(body)
-        .await
-        .map_err(|e| format!("write request body: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush request: {e}"))?;
-
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| format!("read response: {e}"))?;
-    parse_response(&raw)
-}
-
-/// Parse a `connection: close` response: status line, headers, body to
-/// EOF. Chunked transfer-encoding is not handled — the gateway answers
-/// uploads with a small `Content-Length` JSON object, and a body we
-/// can't parse would show up as a non-201 status anyway.
-fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed response: no header terminator".to_string())?;
-    let head = String::from_utf8_lossy(&raw[..split]);
-    let mut lines = head.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| "malformed response: empty".to_string())?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| format!("malformed status line: `{status_line}`"))?;
-    Ok(HttpResponse {
-        status,
-        body: raw[split + 4..].to_vec(),
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn config() -> BenchConfig {
         BenchConfig {
@@ -1076,41 +899,11 @@ mod tests {
     }
 
     #[test]
-    fn chunk_count_covers_the_tree() {
-        assert_eq!(data_chunk_count(0), 1);
-        assert_eq!(data_chunk_count(4096), 1);
-        // 2 leaves + 1 root.
-        assert_eq!(data_chunk_count(4097), 3);
-        // 850 000 B → 208 leaves → 2 intermediates → 1 root.
-        assert_eq!(data_chunk_count(850_000), 208 + 2 + 1);
-    }
-
-    #[test]
     fn batch_id_parses_with_and_without_prefix() {
         let hexed = "ab".repeat(32);
         assert_eq!(parse_batch_id(&hexed).unwrap(), [0xab; 32]);
         assert_eq!(parse_batch_id(&format!("0x{hexed}")).unwrap(), [0xab; 32]);
         assert!(parse_batch_id("0xdead").is_err());
-    }
-
-    #[test]
-    fn target_parses_host_and_prefix() {
-        let t = Target::parse("http://127.0.0.1:1633").unwrap();
-        assert_eq!(t.authority, "127.0.0.1:1633");
-        assert_eq!(t.prefix, "");
-        let t = Target::parse("http://example.test/ant/").unwrap();
-        assert_eq!(t.authority, "example.test:80");
-        assert_eq!(t.prefix, "/ant");
-        assert!(Target::parse("https://example.test").is_err());
-    }
-
-    #[test]
-    fn response_parser_reads_status_and_body() {
-        let raw = b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\n{}";
-        let r = parse_response(raw).unwrap();
-        assert_eq!(r.status, 201);
-        assert_eq!(r.body, b"{}");
-        assert!(parse_response(b"garbage").is_err());
     }
 
     #[test]
@@ -1247,14 +1040,6 @@ mod tests {
         assert_eq!(report.measured_segments_ok, 0);
         assert!(!report.sustained);
         assert!(report.markdown_row().contains("**no**"));
-    }
-
-    #[test]
-    fn percentiles_are_stable_on_small_samples() {
-        assert_eq!(percentile(&[], 50), 0);
-        assert_eq!(percentile(&[5], 95), 5);
-        assert_eq!(percentile(&[1, 2, 3, 4, 5], 50), 3);
-        assert_eq!(percentile(&[1, 2, 3, 4, 5], 95), 5);
     }
 
     // -----------------------------------------------------------------

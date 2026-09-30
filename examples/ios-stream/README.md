@@ -4,11 +4,11 @@ SwiftUI app that broadcasts live video from the device camera onto Swarm
 and plays live streams back, on top of an embedded light node
 ([`crates/ant-ffi`](../../crates/ant-ffi)).
 
-This directory currently holds the **app shell**: node lifecycle, the
-ported storage-onboarding flow, and Keychain/Secure-Enclave key storage.
-Camera capture, the publish loop, and the viewer land in the follow-up
-tickets (#65, #66, #67); the **Broadcast** tab's readiness checklist is
-the contract between them and this shell.
+The app shell (node lifecycle, the ported storage-onboarding flow,
+Keychain/Secure-Enclave key storage) now carries a working broadcast:
+camera capture (#65) and the live publisher (#67 stage 2). The viewer
+(#66) is still to come; the **Broadcast** tab's readiness checklist is
+the contract between it and this shell.
 
 Bundle id: `at.vibing.ant.stream`. Data dir:
 `Application Support/antstream/`.
@@ -21,6 +21,10 @@ Bundle id: `at.vibing.ant.stream`. Data dir:
 | `AntNode.swift` | Swift wrapper over the C FFI: init with a host-held identity, gateway, storage plan, account. |
 | `AccountKeystore.swift` | The account key: created, stored and restored through the Keychain / Secure Enclave. |
 | `BroadcastView.swift` | "Ready to broadcast" checklist and the Go-live entry point. |
+| `CaptureEngine.swift` | #65: `AVCaptureSession` → H.264 → `AVAssetWriter` in `.mpeg4AppleHLS` mode, emitting fMP4 segments; interruption handling and the on-disk segment ring. |
+| `LiveBroadcast.swift` | Joins capture to `ant_publisher_*`, holds the foreground keep-alive, polls publish progress. |
+| `LiveView.swift` | The going-live screen: preview, publish-lag indicator, live counters. |
+| `BenchView.swift` | #67 stage 1: the throughput bench sheet. |
 | `GetStartedView.swift` | Ported onboarding: plan tiers → on-chain quote → payment detection → one-shot auto-activation. |
 | `StorageView.swift` | Ported storage tab: plan meter, extend/top-up, settlement warning, account + key backup/restore. |
 | `StreamModels.swift`, `LiquidGlass.swift` | FFI JSON models and the shared glass chrome, lifted from `examples/ios-drive`. |
@@ -37,7 +41,7 @@ Bundle id: `at.vibing.ant.stream`. Data dir:
 4. `ant_start_gateway("127.0.0.1:1633", light_mode: true, gnosisRpc)` —
    the in-process bee-shaped HTTP API. `light_mode` is what permits
    publish / feed / SOC writes; ultra-light is read-only. This is the
-   surface the publisher (#67) and viewer (#66) will use.
+   surface the publisher (#67) uses and the viewer (#66) will.
 
 `start()`, `shutdown()` and the Restore flow's restart all run on one
 lifecycle queue, so only one of them is ever in flight: a Restore tapped
@@ -196,3 +200,36 @@ desktop numbers are directly comparable.
 
 Criteria, results so far and the exact steps for a quotable 30-minute
 device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM_BENCH.md).
+
+## Going live (issues #65 + #67 stage 2)
+
+**Broadcast → Go live** opens `LiveView`, which runs the real thing:
+
+1. `CaptureEngine` starts an `AVCaptureSession` (camera + mic) into an
+   `AVAssetWriter` in `.mpeg4AppleHLS` mode. The writer emits one fMP4
+   initialization segment and then a media segment every
+   `segmentSeconds`; both are handed straight to the node.
+2. `ant_publisher_push_segment` queues each one. Per segment the node
+   does `POST /bzz`, rebuilds the rolling HLS playlist, publishes it,
+   and points the channel's sequence feed at it with `POST /soc` — the
+   bee-js update shape, so any bee gateway resolves the channel from the
+   feed manifest `POST /feeds` created at start.
+3. The screen shows the **publish lag** (capture → the feed update that
+   makes the segment playable) the whole time, plus how many segments
+   the live-edge discipline dropped to hold it there.
+
+Defaults are the stage-1 go/no-go row: 360p at ~900 kbit/s, 2 s
+segments, a 4-deep publish window. Window 4 is measured, not arbitrary —
+window 8 collapsed the connection layer in the stage-1 soaks — so it is
+not exposed as a UI knob.
+
+Interruptions (incoming call, backgrounding, camera flip, orientation,
+thermal downshift) finish the current segment cleanly and start a fresh
+writer; the first segment after one is marked `#EXT-X-DISCONTINUITY` in
+the playlist. The idle timer is held off and the audio session is
+configured for recording for the broadcast's duration.
+
+Camera and broadcast paths are device-only — the simulator has no
+capture device. `antstream-visual` covers the screen by running the same
+encoder and publisher from a generated test pattern
+(`-antstream-shot-live`), which is labelled as such on screen.

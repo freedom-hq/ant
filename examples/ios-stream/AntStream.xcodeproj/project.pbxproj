@@ -17,6 +17,9 @@
 		BA00000000000000000000011 /* GetStartedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000013 /* GetStartedView.swift */; };
 		BA00000000000000000000012 /* AccountKeystore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000014 /* AccountKeystore.swift */; };
 		BA00000000000000000000013 /* BenchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000015 /* BenchView.swift */; };
+		BA00000000000000000000014 /* LiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000016 /* LiveView.swift */; };
+		BA00000000000000000000015 /* LiveBroadcast.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000017 /* LiveBroadcast.swift */; };
+		BA00000000000000000000016 /* CaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000018 /* CaptureEngine.swift */; };
 		BA00000000000000000000008 /* libant_ffi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000012 /* libant_ffi.a */; };
 		BA00000000000000000000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000010 /* Assets.xcassets */; };
 		BA00000000000000000000010 /* peers.seed.json in Resources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000011 /* peers.seed.json */; };
@@ -34,6 +37,9 @@
 		FA00000000000000000000013 /* GetStartedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GetStartedView.swift; sourceTree = "<group>"; };
 		FA00000000000000000000014 /* AccountKeystore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountKeystore.swift; sourceTree = "<group>"; };
 		FA00000000000000000000015 /* BenchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000016 /* LiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000017 /* LiveBroadcast.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveBroadcast.swift; sourceTree = "<group>"; };
+		FA00000000000000000000018 /* CaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureEngine.swift; sourceTree = "<group>"; };
 		FA00000000000000000000008 /* AntStream-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "AntStream-Bridging-Header.h"; sourceTree = "<group>"; };
 		FA00000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		FA00000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -79,6 +85,9 @@
 				FA00000000000000000000004 /* StorageView.swift */,
 				FA00000000000000000000013 /* GetStartedView.swift */,
 				FA00000000000000000000015 /* BenchView.swift */,
+				FA00000000000000000000016 /* LiveView.swift */,
+				FA00000000000000000000017 /* LiveBroadcast.swift */,
+				FA00000000000000000000018 /* CaptureEngine.swift */,
 				FA00000000000000000000005 /* AntNode.swift */,
 				FA00000000000000000000006 /* StreamModels.swift */,
 				FA00000000000000000000014 /* AccountKeystore.swift */,
@@ -198,6 +207,9 @@
 				BA00000000000000000000004 /* StorageView.swift in Sources */,
 				BA00000000000000000000011 /* GetStartedView.swift in Sources */,
 				BA00000000000000000000013 /* BenchView.swift in Sources */,
+				BA00000000000000000000014 /* LiveView.swift in Sources */,
+				BA00000000000000000000015 /* LiveBroadcast.swift in Sources */,
+				BA00000000000000000000016 /* CaptureEngine.swift in Sources */,
 				BA00000000000000000000005 /* AntNode.swift in Sources */,
 				BA00000000000000000000006 /* StreamModels.swift in Sources */,
 				BA00000000000000000000012 /* AccountKeystore.swift in Sources */,

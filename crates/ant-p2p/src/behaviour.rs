@@ -2514,6 +2514,41 @@ fn handle_control_command(
                     });
                     return;
                 };
+                // Same collision-bucket guard `PushChunk` applies, and
+                // for the same reason. SOCs are not a rare write: every
+                // redundant upload mints dispersed replicas as SOCs, and
+                // a live feed writes one per playlist update (#67
+                // stage 2), so a long broadcast walks a batch's buckets
+                // exactly like a bulk file upload does. Without this the
+                // immutable case surfaced as a bare `stamp issue failed:
+                // bucket full` and the mutable case wrapped a bucket —
+                // evicting somebody's chunk — with no log at all.
+                if !issuer.has_stamp(&address) && issuer.bucket_is_full(&address) {
+                    if issuer.immutable() {
+                        warn!(
+                            target: "ant_p2p",
+                            batch = %hex::encode(batch_id),
+                            depth = issuer.batch_depth(),
+                            addr = %hex::encode(address),
+                            "refusing to stamp soc: collision bucket full on immutable batch — stamping would evict an existing chunk (buy/dilute a larger batch)",
+                        );
+                        let _ = ack.send(ControlAck::Error {
+                            message: format!(
+                                "batch 0x{} saturated: collision bucket full at depth {} on an immutable batch — stamping would evict an existing chunk; buy or dilute to a larger batch",
+                                hex::encode(batch_id),
+                                issuer.batch_depth(),
+                            ),
+                        });
+                        return;
+                    }
+                    warn!(
+                        target: "ant_p2p",
+                        batch = %hex::encode(batch_id),
+                        depth = issuer.batch_depth(),
+                        addr = %hex::encode(address),
+                        "collision bucket full on mutable batch — wrapping (evicting the oldest stamp in this bucket); consider diluting to a larger batch",
+                    );
+                }
                 match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &address) {
                     Ok(s) => s,
                     Err(e) => {

@@ -406,7 +406,183 @@ struct BenchReport: Codable, Equatable {
     }
 }
 
+/// Live progress of a broadcast, as returned by
+/// `ant_publisher_progress` (issue #67 stage 2).
+struct PublisherSnapshot: Codable, Equatable {
+    let running: Bool
+    let elapsedS: Double
+    let channel: String
+    let topic: String
+    let owner: String
+    /// The feed manifest a viewer resolves the channel from — the one
+    /// reference worth sharing.
+    let channelReference: String
+    let playlistReference: String
+    let feedIndex: UInt64
+    let segmentsPushed: UInt64
+    let segmentsPublished: UInt64
+    /// Of those, the ones that reached a published playlist — what a
+    /// viewer could actually play.
+    let segmentsListed: UInt64
+    let segmentsFailed: UInt64
+    /// Segments the live-edge discipline dropped rather than falling
+    /// further behind. Visible on screen: a broadcast that is shedding
+    /// is a broadcast the uplink can't carry.
+    let segmentsDropped: UInt64
+    let bytesPublished: UInt64
+    let playlistsPublished: UInt64
+    let publishMsP50: UInt64
+    let publishMsP95: UInt64
+    /// Live-edge lag: how far behind live a viewer is right now — the
+    /// age of the newest segment a landed feed update made playable.
+    /// The number the on-screen indicator shows. An age, not the
+    /// latency of the last update that landed, so it keeps climbing
+    /// while the feed is stuck rather than freezing at its last good
+    /// value.
+    let lagMs: UInt64
+    /// Highest capture → playable latency any one update recorded.
+    let lagMsMax: UInt64
+    /// `lagMs` inside three segment durations — the same budget the
+    /// stage-1 bench verdict uses.
+    let keepingUp: Bool
+    let sustainedMbitS: Double
+    let peers: UInt32
+    let lastError: String
+    let errorCount: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case running, channel, topic, owner, peers
+        case elapsedS = "elapsed_s"
+        case channelReference = "channel_reference"
+        case playlistReference = "playlist_reference"
+        case feedIndex = "feed_index"
+        case segmentsPushed = "segments_pushed"
+        case segmentsPublished = "segments_published"
+        case segmentsListed = "segments_listed"
+        case segmentsFailed = "segments_failed"
+        case segmentsDropped = "segments_dropped"
+        case bytesPublished = "bytes_published"
+        case playlistsPublished = "playlists_published"
+        case publishMsP50 = "publish_ms_p50"
+        case publishMsP95 = "publish_ms_p95"
+        case lagMs = "lag_ms"
+        case lagMsMax = "lag_ms_max"
+        case keepingUp = "keeping_up"
+        case sustainedMbitS = "sustained_mbit_s"
+        case lastError = "last_error"
+        case errorCount = "error_count"
+    }
+
+    /// "Live", "2.4 s behind", or "Connecting…" before the first feed
+    /// update lands. One place, so the badge and the detail row can
+    /// never disagree about what the lag means.
+    var lagLabel: String {
+        guard playlistsPublished > 0 else { return "Connecting…" }
+        return String(format: "%.1f s behind", Double(lagMs) / 1000.0)
+    }
+}
+
+/// Final result of a broadcast, as returned by `ant_publisher_stop`.
+struct PublisherReport: Codable, Equatable {
+    let channel: String
+    let topic: String
+    let owner: String
+    let channelReference: String
+    let playlistReference: String
+    let notes: String
+    let targetBitrateKbps: UInt32
+    let segmentMs: UInt32
+    let maxInFlight: Int
+    let durationS: Double
+    let segmentsPushed: UInt64
+    let segmentsPublished: UInt64
+    /// Of those, the ones that reached a published playlist. This — not
+    /// `segmentsPublished` — is what `keptUp` counts.
+    let segmentsListed: UInt64
+    let segmentsFailed: UInt64
+    let segmentsDropped: UInt64
+    let bytesPublished: UInt64
+    let chunksPublished: UInt64
+    let playlistsPublished: UInt64
+    let feedUpdates: UInt64
+    let sustainedMbitS: Double
+    let sustainedChunksS: Double
+    let publishMsP50: UInt64
+    let publishMsP95: UInt64
+    let publishMsMax: UInt64
+    let lagMsP50: UInt64
+    let lagMsP95: UInt64
+    let lagMsMax: UInt64
+    /// The live edge where the broadcast ended: the age of the newest
+    /// playable segment at stop, frozen there.
+    let lagMsFinal: UInt64
+    let keptUp: Bool
+    let errors: [String]
+    let errorCount: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case channel, topic, owner, notes, errors
+        case channelReference = "channel_reference"
+        case playlistReference = "playlist_reference"
+        case targetBitrateKbps = "target_bitrate_kbps"
+        case segmentMs = "segment_ms"
+        case maxInFlight = "max_in_flight"
+        case durationS = "duration_s"
+        case segmentsPushed = "segments_pushed"
+        case segmentsPublished = "segments_published"
+        case segmentsListed = "segments_listed"
+        case segmentsFailed = "segments_failed"
+        case segmentsDropped = "segments_dropped"
+        case bytesPublished = "bytes_published"
+        case chunksPublished = "chunks_published"
+        case playlistsPublished = "playlists_published"
+        case feedUpdates = "feed_updates"
+        case sustainedMbitS = "sustained_mbit_s"
+        case sustainedChunksS = "sustained_chunks_s"
+        case publishMsP50 = "publish_ms_p50"
+        case publishMsP95 = "publish_ms_p95"
+        case publishMsMax = "publish_ms_max"
+        case lagMsP50 = "lag_ms_p50"
+        case lagMsP95 = "lag_ms_p95"
+        case lagMsMax = "lag_ms_max"
+        case lagMsFinal = "lag_ms_final"
+        case keptUp = "kept_up"
+        case errorCount = "error_count"
+    }
+
+    var durationLabel: String {
+        let total = Int(durationS.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    /// Whether `keptUp` is a verdict about anything. It is a conjunction
+    /// whose first clause is "at least one segment published", so a
+    /// broadcast that played nothing reports `keptUp == false` — and
+    /// rendering that as "fell behind" would blame the uplink for a
+    /// broadcast that never started. Mirrors the first clause of Rust's
+    /// `PublisherReport::kept_up` **verbatim**, including its use of
+    /// `segments_listed` rather than `segments_published`; the same
+    /// three-state treatment `BenchReport.hasMeasurement` gives the
+    /// throughput verdict.
+    var hasVerdict: Bool { segmentsListed > 0 }
+
+    var verdictLabel: String {
+        guard hasVerdict else { return "Broadcast ended without publishing" }
+        return keptUp ? "Broadcast kept up" : "Broadcast fell behind"
+    }
+}
+
 enum StreamDecoder {
+    static func publisherSnapshot(from json: String) -> PublisherSnapshot? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(PublisherSnapshot.self, from: data)
+    }
+
+    static func publisherReport(from json: String) -> PublisherReport? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(PublisherReport.self, from: data)
+    }
+
     static func benchSnapshot(from json: String) -> BenchSnapshot? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(BenchSnapshot.self, from: data)

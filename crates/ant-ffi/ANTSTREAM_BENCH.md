@@ -213,3 +213,22 @@ Stage 1 only. Not here, by design (they are stage 2 / 3 of #67):
 playlist rebuilds, `POST /soc` feed updates, drop-oldest live-edge
 discipline, the on-screen publish-lag indicator, foreground keep-alive
 beyond the bench's own idle-timer hold, and the VOD finalize path.
+
+### What stage 2 did to this file
+
+Stage 2 (`crates/ant-ffi/src/publisher.rs`) is the same loop with the
+generator replaced by the real camera pipeline, so the publish path
+moved *out* of `bench.rs` and into `publisher.rs` as product code:
+`Target`, the loopback HTTP client, `publish_bzz` and
+`data_chunk_count` now live there and `bench.rs` imports them. The
+bench therefore keeps measuring exactly the call a broadcast makes —
+if the two ever drift, the numbers here stop describing the product.
+
+The stage-1 findings that became stage-2 constants:
+
+| finding | where it landed |
+|---|---|
+| window 4 sustains, window 8 collapses the connection layer | `DEFAULT_MAX_IN_FLIGHT = 4` |
+| 360p @ 900 kbit/s, 2 s segments is the reachable rendition | `DEFAULT_BITRATE_KBPS = 900`, `DEFAULT_SEGMENT_MS = 2000` |
+| lag budget = 3 × segment duration | `PublisherReport::kept_up` |
+| a publisher that quietly drifts behind is not a pass | drop-oldest backlog + `#EXT-X-DISCONTINUITY` |

@@ -19,7 +19,14 @@ struct RootView: View {
     static let shotArgs = Set(ProcessInfo.processInfo.arguments)
 
     var body: some View {
-        if Self.shotArgs.contains("-antstream-shot-getstarted") {
+        if Self.shotArgs.contains("-antstream-shot-live") {
+            // The going-live screen (#67 stage 2 / #65) full-screen, so
+            // CI can capture a broadcast actually running: `LiveView`
+            // sees the same flag and starts one from the generated test
+            // pattern, since a runner has neither a camera nor a tap
+            // driver.
+            LiveView().preferredColorScheme(.dark)
+        } else if Self.shotArgs.contains("-antstream-shot-getstarted") {
             // The buy flow (Get Started) full-screen, so CI can capture
             // the plan picker and — with `-antstream-shot-getstarted-pay`
             // — the payment cost breakdown, including the new one-time

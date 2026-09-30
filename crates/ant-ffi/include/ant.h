@@ -1013,6 +1013,145 @@ char *ant_bench_progress(const AntHandle *handle, char **out_err);
  */
 char *ant_bench_stop(const AntHandle *handle, char **out_err);
 
+/* -------------------------------------------------------------------
+ * AntStream live publisher (issue #67 stage 2)
+ * ------------------------------------------------------------------- */
+
+/*
+ * Start a live broadcast from this node.
+ *
+ * This is the bench loop above with the synthetic generator replaced by
+ * the host's camera pipeline. Per segment: POST /bzz the segment,
+ * rebuild the HLS media playlist over a sliding window, POST /bzz the
+ * playlist, and publish its reference as a sequence-feed update with
+ * POST /soc (bee-js shape: id = keccak256(topic || index_be8), payload
+ * timestamp_be8 || reference) so any bee gateway resolves the channel.
+ * A feed manifest is created once at start with POST /feeds; its
+ * reference is the single thing a viewer needs.
+ *
+ * `config_json` is a PublisherConfig document; "channel" and "batch_id"
+ * are required:
+ *   {
+ *     "channel":         "Kitchen",               // required, names the feed
+ *     "topic":           "0x<64 hex>",            // omit -> derived per broadcast
+ *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
+ *     "batch_id":        "0x<64 hex>",            // required: the storage plan
+ *     "segment_ms":      2000,                    // nominal segment duration
+ *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition
+ *     "max_in_flight":   4,                       // measured stable window
+ *     "max_backlog":     4,                       // drop-oldest past this
+ *     "playlist_window": 6,                       // segments in the live playlist
+ *     "notes":           "iPhone 15 Pro / LTE"
+ *   }
+ *
+ * Do NOT raise max_in_flight without re-measuring: stage 1 found
+ * window 4 stable (899/899 segments) and window 8 a connection-layer
+ * collapse (26/316). See crates/ant-ffi/ANTSTREAM_BENCH.md.
+ *
+ * Returns immediately; the loop drives itself on the node's runtime.
+ * Only one broadcast at a time per handle. Returns true on success,
+ * false with an allocated message in *out_err (free with
+ * ant_free_string).
+ */
+bool ant_publisher_start(const AntHandle *handle,
+                         const char *config_json,
+                         char **out_err);
+
+/*
+ * Hand one finished capture segment to the running broadcast.
+ *
+ * `is_init` marks the fMP4 initialization segment (ftyp + moov), which
+ * every following media segment needs to be playable; push a fresh one
+ * whenever the writer restarts (camera flip, interruption recovery,
+ * thermal downshift) and set `discontinuity` on the first media segment
+ * after it. `duration_ms` is the segment's real duration (ignored for
+ * the initialization segment). The bytes are copied; the caller may
+ * free `data` as soon as this returns.
+ *
+ * CALL ORDER IS THE BROADCAST ORDER — segments are numbered as these
+ * calls arrive, and that number fixes both the playlist order and which
+ * EXT-X-MAP a media segment is listed under. Push in capture order,
+ * from one thread or an ordered queue: getting it wrong around a writer
+ * restart lists the old writer's last segment under the new writer's
+ * map, which no player can decode.
+ *
+ * NEVER BLOCKS — a capture pipeline stalled on the uplink drops frames.
+ * When the publisher is already a window behind, the oldest pending
+ * segment is dropped instead (live-edge discipline).
+ *
+ * Returns:
+ *    0  queued
+ *    1  queued, and the oldest pending segment was dropped to stay at
+ *       the live edge (the playlist marks the gap EXT-X-DISCONTINUITY)
+ *    2  refused: the broadcast is stopping
+ *   -1  error, with an allocated message in *out_err
+ */
+int32_t ant_publisher_push_segment(const AntHandle *handle,
+                                   bool is_init,
+                                   const unsigned char *data,
+                                   size_t len,
+                                   uint32_t duration_ms,
+                                   bool discontinuity,
+                                   char **out_err);
+
+/*
+ * Live progress of the broadcast, as an allocated JSON object (free
+ * with ant_free_string):
+ *   {"running":true,"elapsed_s":42.0,"channel":"Kitchen",
+ *    "topic":"<64 hex>","owner":"<40 hex>",
+ *    "channel_reference":"<64 hex>","playlist_reference":"<64 hex>",
+ *    "feed_index":21,"segments_pushed":22,"segments_published":21,
+ *    "segments_listed":21,"segments_failed":0,"segments_dropped":0,
+ *    "bytes_published":4725000,
+ *    "playlists_published":21,"publish_ms_p50":900,"publish_ms_p95":2100,
+ *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
+ *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0}
+ *
+ * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
+ * behind live a viewer is right now, i.e. the age of the newest segment
+ * a landed feed update made playable. It is an age, not the latency of
+ * the last update that landed, so a broadcast whose feed updates stop
+ * landing keeps climbing here (and turns "keeping_up" false) instead of
+ * freezing at its last good figure while segments go on uploading.
+ * "keeping_up" is that lag inside three segment durations, the same
+ * budget the bench verdict uses. Non-blocking; poll it about once a
+ * second. Returns NULL + an error when this node is not broadcasting.
+ */
+char *ant_publisher_progress(const AntHandle *handle, char **out_err);
+
+/*
+ * End the broadcast and return its final report as an allocated JSON
+ * object (free with ant_free_string): the progress fields above plus
+ * duration_s, chunks_published, feed_updates, sustained_chunks_s,
+ * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
+ * strings, and a "kept_up" verdict (at least one feed update landed AND
+ * every captured media segment reached a published playlist AND the
+ * live edge ended inside 3 x segment_ms). "lag_ms_final" is that live
+ * edge — the age of the newest playable segment at stop, frozen there
+ * so a report read later still describes the broadcast rather than how
+ * long the host waited to ask. The count it uses is
+ * "segments_listed", not "segments_published": a segment whose
+ * initialization segment never landed uploads fine and is still
+ * unplayable, so hosts rendering a verdict should key "is there a
+ * verdict at all?" off segments_listed too.
+ *
+ * BLOCKING: stopping is cooperative. Segments already captured are
+ * published — the last seconds of a broadcast are real content — and
+ * the playlist is closed with EXT-X-ENDLIST so viewers see a finished
+ * recording rather than a stream that stopped updating. Returns after
+ * ~130 s at the latest; a worst-case drain (the in-flight window, a
+ * segment the pump had already popped behind it, then the backlog —
+ * up to three rounds of the 60 s per-segment publish deadline) can
+ * still be finishing in the background past that, with the report
+ * returned honestly either way. Call it off the main thread.
+ *
+ * Calling it on a broadcast that already finished on its own returns
+ * that broadcast's report. Once a stop call has returned and released
+ * the slot, a second call fails with "not broadcasting" — keep the
+ * report from the first call rather than re-fetching it.
+ */
+char *ant_publisher_stop(const AntHandle *handle, char **out_err);
+
 /*
  * Shut the embedded node down and free the handle. After this
  * returns, `handle` must not be used again.

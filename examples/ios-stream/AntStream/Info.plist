@@ -24,6 +24,15 @@
     <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <!--
+        Broadcasting (#65 capture → #67 publisher) opens the camera and
+        the microphone. iOS terminates the app on first use if these are
+        missing, so they are not optional copy.
+    -->
+    <key>NSCameraUsageDescription</key>
+    <string>AntStream uses the camera to record the video you broadcast.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>AntStream uses the microphone to record the audio you broadcast.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <!--

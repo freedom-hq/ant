@@ -159,6 +159,30 @@ jobs:
             -antstream-shot-storage -antstream-shot-deposit
           sleep 22
           xcrun simctl io booted screenshot shots/10-storage-deposit-topup.png
+          # --- Going live (#67 stage 2 / #65) ---
+          # 11/12 — the broadcast screen with a broadcast actually
+          # running. A simulator has no camera, so `-antstream-shot-live`
+          # runs the capture pipeline from the generated test pattern
+          # (labelled as such on screen) through the real encoder,
+          # segmenter and publisher: AVAssetWriter in .mpeg4AppleHLS mode
+          # -> ant_publisher_push_segment -> POST /bzz. It also installs
+          # a sample connected plan, because a fresh runner account has
+          # none and the screen refuses to go live without one.
+          #
+          # The uploads themselves cannot succeed here: the sample batch
+          # is not a real postage batch, so the gateway rejects it —
+          # exactly the "no usable batch" wall the stage-1 publish rows
+          # hit. That is the honest evidence this runner can produce, and
+          # it still covers everything up to the batch check: capture,
+          # segmentation, the FFI hand-off, the lag indicator and the
+          # error surface.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-live
+          # The screen waits for `ant_init` before starting (~20 s cold).
+          sleep 40
+          xcrun simctl io booted screenshot shots/11-live-broadcast.png
+          sleep 30
+          xcrun simctl io booted screenshot shots/12-live-publish-lag.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

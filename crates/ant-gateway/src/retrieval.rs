@@ -1329,22 +1329,7 @@ pub async fn upload_soc(
             resp
         }
         ControlAck::NotReady { message } => json_error(StatusCode::SERVICE_UNAVAILABLE, message),
-        ControlAck::Error { message } => {
-            let status = if message.contains("not usable") {
-                StatusCode::BAD_REQUEST
-            } else if message.contains("rejected by") && message.contains("not found on-chain") {
-                // Storer peers rejected the stamp: the batch is not in
-                // their chain-synced batchstore (phantom batch —
-                // never created on this chain, expired, or unsynced).
-                // Deterministic and NOT retryable, so it must be
-                // distinguishable from transient pushsync exhaustion
-                // (502): 422 with the batch id + a peer's own words.
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            json_error(status, message)
-        }
+        ControlAck::Error { message } => json_error(upload_error_status(&message), message),
         other => {
             warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
@@ -2129,11 +2114,49 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
     }
 }
 
+/// Map a node-side upload failure onto bee's HTTP status.
+///
+/// One function for every write endpoint that dispatches a `PushChunk`
+/// / `PushSoc` (`/bzz`, `/bytes`, `/chunks`, `/soc`, `/feeds`): the
+/// status class is what a client's retry logic keys off, so `/soc`
+/// answering a saturated batch with a different code than `/bzz` would
+/// make the same condition look transient on one endpoint and fatal on
+/// the other.
+///
+/// * `503` — the node cannot stamp at all (no upload runtime).
+/// * `402 "batch is overissued"` (bee's `postage.ErrBucketFull`
+///   mapping) — the batch's collision bucket is full. **Not** retryable:
+///   the caller has to dilute or buy. This is the one a long-running
+///   writer hits, e.g. an `AntStream` broadcast walking a batch's
+///   buckets for an hour (#67 stage 2), and reporting it as a 502 sent
+///   publishers into an unbounded retry against a permanently full
+///   bucket.
+/// * `400` — the batch is not registered/usable here.
+/// * `422` — storer peers attested the batch does not exist on-chain
+///   (phantom / expired / unsynced). Deterministic, not retryable.
+/// * `502` — everything else: transient pushsync failure.
+pub(crate) fn upload_error_status(message: &str) -> StatusCode {
+    if message.starts_with("uploads not configured") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if message.contains("overissued")
+        || message.contains("bucket full")
+        || message.contains("saturated")
+    {
+        StatusCode::PAYMENT_REQUIRED
+    } else if message.contains("not usable") {
+        StatusCode::BAD_REQUEST
+    } else if message.contains("rejected by") && message.contains("not found on-chain") {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 /// Push `chunks` to the network in parallel via `PushChunk` control
 /// commands. Bounded by `MAX_PUSH_CONCURRENCY` so a 1 K-chunk file
 /// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
 /// HTTP error response on the first chunk that fails to push.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn push_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
@@ -2182,24 +2205,10 @@ pub(crate) async fn push_chunks(
                     );
                     Ok(())
                 }
-                Ok(Ok(ControlAck::Error { message })) => {
-                    let status = if message.starts_with("uploads not configured") {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else if message.contains("not usable") {
-                        StatusCode::BAD_REQUEST
-                    } else if message.contains("rejected by")
-                        && message.contains("not found on-chain")
-                    {
-                        // Peer-attested phantom batch: deterministic,
-                        // NOT retryable — distinct from transient
-                        // pushsync exhaustion (502) so clients stop
-                        // treating a dead batch as a flaky network.
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    };
-                    Err(json_error(status, format!("push chunk failed: {message}")))
-                }
+                Ok(Ok(ControlAck::Error { message })) => Err(json_error(
+                    upload_error_status(&message),
+                    format!("push chunk failed: {message}"),
+                )),
                 Ok(Ok(other)) => {
                     warn!(target: "ant_gateway", ?other, "unexpected ack from PushChunk");
                     Err(json_error(
@@ -4764,6 +4773,47 @@ mod humantime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every write endpoint shares one status mapping, and a saturated
+    /// batch is bee's `402 "batch is overissued"` — not a 502 a client
+    /// will retry forever. The saturation strings are the ones the node
+    /// actually emits: `PushChunk`/`PushSoc`'s immutable-batch refusal
+    /// and `ant_postage::PostageError::BucketFull`'s `Display`.
+    #[test]
+    fn a_saturated_batch_is_payment_required_not_a_bad_gateway() {
+        for message in [
+            "batch 0xab… saturated: collision bucket full at depth 20 on an immutable batch — stamping would evict an existing chunk; buy or dilute to a larger batch",
+            "stamp issue failed: bucket full",
+            "batch is overissued",
+        ] {
+            assert_eq!(
+                upload_error_status(message),
+                StatusCode::PAYMENT_REQUIRED,
+                "{message}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_other_upload_error_classes_keep_their_status() {
+        assert_eq!(
+            upload_error_status("uploads not configured: node cannot stamp"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert_eq!(
+            upload_error_status("batch 0xab not usable"),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            upload_error_status("rejected by 0xpeer: batch 0xab not found on-chain",),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        // Transient pushsync trouble stays retryable.
+        assert_eq!(
+            upload_error_status("pushsync: exhausted pushsync peers"),
+            StatusCode::BAD_GATEWAY,
+        );
+    }
 
     /// Go `parseRange` parity, case by case (matches Go 1.26's
     /// `net/http` — bee serves ranges via `http.ServeContent`).

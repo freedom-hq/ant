@@ -5,14 +5,12 @@ import SwiftUI
 /// deployed chequebook, live storage plan, gateway listening — without
 /// the user ever touching `antctl`.
 ///
-/// The camera capture pipeline (#65) and the publish loop (#67) attach to
-/// the **Go live** button below; everything they need (a light-mode
-/// gateway on `AntNode.gatewayURL`, a stamped batch, working settlement)
-/// is what this checklist guarantees.
+/// The camera capture pipeline (#65) and the publish loop (#67 stage 2)
+/// hang off the **Go live** button below, which opens ``LiveView``;
+/// everything they need (a light-mode gateway on `AntNode.gatewayURL`, a
+/// stamped batch, working settlement) is what this checklist guarantees.
 struct BroadcastView: View {
     @EnvironmentObject var node: AntNode
-    @StateObject private var banner = BannerState()
-
     @State private var showGetStarted = false
     /// Opened by the **Run bench** button — and, on launch, by
     /// `-antstreamShowBench YES`, which iOS folds into `UserDefaults`.
@@ -21,6 +19,10 @@ struct BroadcastView: View {
     /// screenshot of the button alone is not evidence that the sheet
     /// behind it renders.
     @State private var showBench = UserDefaults.standard.bool(forKey: "antstreamShowBench")
+    /// The going-live screen. Full-screen rather than a sheet: a
+    /// broadcast owns the camera and the screen for its duration, and a
+    /// swipe-dismissable sheet would orphan a run in progress.
+    @State private var showLive = false
 
     var body: some View {
         ZStack {
@@ -42,9 +44,9 @@ struct BroadcastView: View {
             .refreshable { await node.refreshAll() }
         }
         .preferredColorScheme(.dark)
-        .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .sheet(isPresented: $showBench) { BenchView() }
+        .fullScreenCover(isPresented: $showLive) { LiveView() }
         .task { await node.refreshAll() }
     }
 
@@ -78,17 +80,14 @@ struct BroadcastView: View {
                     .font(.system(.title2, design: .rounded).weight(.bold))
                     .foregroundStyle(.white)
                 Text(node.isReadyToBroadcast
-                     ? "Your account, storage plan and network settlement are all set. Camera capture arrives in the next release."
+                     ? "Your account, storage plan and network settlement are all set. Segments publish straight to Swarm and the channel's feed follows the live edge."
                      : "Finish the steps below and this device can go live.")
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
 
                 Button {
-                    // Capture + publish land in the follow-up tickets;
-                    // until then the button reports the state the
-                    // pipeline will start from.
-                    banner.flash("Camera capture lands in the next release")
+                    showLive = true
                 } label: {
                     Text("Go live")
                         .font(.headline)
