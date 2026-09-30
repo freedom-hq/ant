@@ -422,3 +422,13 @@ is baked in; the ABI is pre-1.0 and will change when the UniFFI
 artefact lands. See PLAN.md § "Interim releasable iOS artifact —
 `AntFFI.xcframework` (pre-UniFFI)" for remaining work items (Swift
 wrapper package, codesigning) and known limitations.
+
+## AntStream publisher throughput bench
+
+`ant_bench_start` / `ant_bench_progress` / `ant_bench_stop` drive the
+AntStream stage-1 throughput benchmark (issue #67) — the publisher loop
+with synthetic segments in place of the camera, measuring sustained
+Mbit/s, chunks/s, publish latency and live-edge lag. Runnable natively
+(`cargo run --release -p ant-ffi --example publish_bench`) and on device
+via the AntStream app's **Broadcast → Run bench**. Criteria, results and
+how to run it: [`ANTSTREAM_BENCH.md`](ANTSTREAM_BENCH.md).

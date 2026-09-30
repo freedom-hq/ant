@@ -1,0 +1,374 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		BA00000000000000000000001 /* AntStreamApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000001 /* AntStreamApp.swift */; };
+		BA00000000000000000000002 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000002 /* RootView.swift */; };
+		BA00000000000000000000003 /* BroadcastView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000003 /* BroadcastView.swift */; };
+		BA00000000000000000000004 /* StorageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000004 /* StorageView.swift */; };
+		BA00000000000000000000005 /* AntNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000005 /* AntNode.swift */; };
+		BA00000000000000000000006 /* StreamModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000006 /* StreamModels.swift */; };
+		BA00000000000000000000007 /* LiquidGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000007 /* LiquidGlass.swift */; };
+		BA00000000000000000000011 /* GetStartedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000013 /* GetStartedView.swift */; };
+		BA00000000000000000000012 /* AccountKeystore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000014 /* AccountKeystore.swift */; };
+		BA00000000000000000000013 /* BenchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000015 /* BenchView.swift */; };
+		BA00000000000000000000008 /* libant_ffi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000012 /* libant_ffi.a */; };
+		BA00000000000000000000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000010 /* Assets.xcassets */; };
+		BA00000000000000000000010 /* peers.seed.json in Resources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000011 /* peers.seed.json */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		FA00000000000000000000000 /* AntStream.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AntStream.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA00000000000000000000001 /* AntStreamApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntStreamApp.swift; sourceTree = "<group>"; };
+		FA00000000000000000000002 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000003 /* BroadcastView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BroadcastView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000004 /* StorageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000005 /* AntNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntNode.swift; sourceTree = "<group>"; };
+		FA00000000000000000000006 /* StreamModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamModels.swift; sourceTree = "<group>"; };
+		FA00000000000000000000007 /* LiquidGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlass.swift; sourceTree = "<group>"; };
+		FA00000000000000000000013 /* GetStartedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GetStartedView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000014 /* AccountKeystore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountKeystore.swift; sourceTree = "<group>"; };
+		FA00000000000000000000015 /* BenchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchView.swift; sourceTree = "<group>"; };
+		FA00000000000000000000008 /* AntStream-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "AntStream-Bridging-Header.h"; sourceTree = "<group>"; };
+		FA00000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		FA00000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		FA00000000000000000000011 /* peers.seed.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = peers.seed.json; sourceTree = "<group>"; };
+		FA00000000000000000000012 /* libant_ffi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libant_ffi.a; path = "../../target/aarch64-apple-ios-sim/release/libant_ffi.a"; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		SA00000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BA00000000000000000000008 /* libant_ffi.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		GA00000000000000000000001 /* */ = {
+			isa = PBXGroup;
+			children = (
+				GA00000000000000000000003 /* AntStream */,
+				GA00000000000000000000004 /* Frameworks */,
+				GA00000000000000000000002 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		GA00000000000000000000002 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				FA00000000000000000000000 /* AntStream.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		GA00000000000000000000003 /* AntStream */ = {
+			isa = PBXGroup;
+			children = (
+				FA00000000000000000000001 /* AntStreamApp.swift */,
+				FA00000000000000000000002 /* RootView.swift */,
+				FA00000000000000000000003 /* BroadcastView.swift */,
+				FA00000000000000000000004 /* StorageView.swift */,
+				FA00000000000000000000013 /* GetStartedView.swift */,
+				FA00000000000000000000015 /* BenchView.swift */,
+				FA00000000000000000000005 /* AntNode.swift */,
+				FA00000000000000000000006 /* StreamModels.swift */,
+				FA00000000000000000000014 /* AccountKeystore.swift */,
+				FA00000000000000000000007 /* LiquidGlass.swift */,
+				FA00000000000000000000008 /* AntStream-Bridging-Header.h */,
+				FA00000000000000000000009 /* Info.plist */,
+				FA00000000000000000000010 /* Assets.xcassets */,
+				FA00000000000000000000011 /* peers.seed.json */,
+			);
+			path = AntStream;
+			sourceTree = "<group>";
+		};
+		GA00000000000000000000004 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				FA00000000000000000000012 /* libant_ffi.a */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		TA00000000000000000000001 /* AntStream */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CA00000000000000000000002 /* Build configuration list for PBXNativeTarget "AntStream" */;
+			buildPhases = (
+				SA00000000000000000000004 /* Build Rust */,
+				SA00000000000000000000001 /* Sources */,
+				SA00000000000000000000002 /* Frameworks */,
+				SA00000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AntStream;
+			productName = AntStream;
+			productReference = FA00000000000000000000000 /* AntStream.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		PA00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					TA00000000000000000000001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = CA00000000000000000000001 /* Build configuration list for PBXProject "AntStream" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = GA00000000000000000000001;
+			productRefGroup = GA00000000000000000000002 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				TA00000000000000000000001 /* AntStream */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		SA00000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BA00000000000000000000009 /* Assets.xcassets in Resources */,
+				BA00000000000000000000010 /* peers.seed.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		SA00000000000000000000004 /* Build Rust */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "# Cross-compile crates/ant-ffi (with the `chain` feature, which the\n# Storage tab needs to read the account's plan from Gnosis, and which\n# the in-process gateway needs for its on-chain /wallet and /stamps\n# surfaces) for the slice this build targets. The xtask prints\n# libant_ffi.a's path on the last line; we ignore it because\n# LIBRARY_SEARCH_PATHS points at the same well-known location.\nset -euo pipefail\n\ncd \"$SRCROOT/../..\"\n\nPROFILE=release\nif [ \"${CONFIGURATION:-Release}\" = \"Debug\" ]; then\n    PROFILE=debug\nfi\n\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\nif [ \"${PLATFORM_NAME:-iphonesimulator}\" = \"iphoneos\" ]; then\n    cargo xtask build-ios-device --profile \"$PROFILE\" --features chain\nelse\n    ARCH=aarch64\n    host_arch=$(uname -m)\n    if [ \"${ARCHS:-arm64}\" = \"x86_64\" ]; then\n        ARCH=x86_64\n    elif [ \"${ARCHS:-arm64}\" = \"arm64\" ]; then\n        ARCH=aarch64\n    else\n        case \"$host_arch\" in\n            arm64) ARCH=aarch64 ;;\n            x86_64) ARCH=x86_64 ;;\n        esac\n    fi\n    cargo xtask build-ios-sim --arch \"$ARCH\" --profile \"$PROFILE\" --features chain\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		SA00000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BA00000000000000000000001 /* AntStreamApp.swift in Sources */,
+				BA00000000000000000000002 /* RootView.swift in Sources */,
+				BA00000000000000000000003 /* BroadcastView.swift in Sources */,
+				BA00000000000000000000004 /* StorageView.swift in Sources */,
+				BA00000000000000000000011 /* GetStartedView.swift in Sources */,
+				BA00000000000000000000013 /* BenchView.swift in Sources */,
+				BA00000000000000000000005 /* AntNode.swift in Sources */,
+				BA00000000000000000000006 /* StreamModels.swift in Sources */,
+				BA00000000000000000000012 /* AccountKeystore.swift in Sources */,
+				BA00000000000000000000007 /* LiquidGlass.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		DA00000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		DA00000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		DA00000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 46XPHRBLH5;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../crates/ant-ffi/include",
+				);
+				INFOPLIST_FILE = AntStream/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios/debug",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios-sim/debug",
+					"$(SRCROOT)/../../target/x86_64-apple-ios/debug",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					SystemConfiguration,
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "at.vibing.ant.stream";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "AntStream/AntStream-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		DA00000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEPLOYMENT_POSTPROCESSING = YES;
+				DEVELOPMENT_TEAM = 46XPHRBLH5;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../crates/ant-ffi/include",
+				);
+				INFOPLIST_FILE = AntStream/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios/release",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios-sim/release",
+					"$(SRCROOT)/../../target/x86_64-apple-ios/release",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					SystemConfiguration,
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "at.vibing.ant.stream";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRIP_INSTALLED_PRODUCT = YES;
+				STRIP_STYLE = all;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "AntStream/AntStream-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		CA00000000000000000000001 /* Build configuration list for PBXProject "AntStream" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DA00000000000000000000001 /* Debug */,
+				DA00000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CA00000000000000000000002 /* Build configuration list for PBXNativeTarget "AntStream" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DA00000000000000000000003 /* Debug */,
+				DA00000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = PA00000000000000000000001 /* Project object */;
+}

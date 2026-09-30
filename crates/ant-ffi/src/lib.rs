@@ -21,6 +21,8 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
+pub mod bench;
+mod chain_transport;
 mod drive;
 mod gateway;
 #[cfg(feature = "jni")]
@@ -32,14 +34,18 @@ mod stream;
 // entry points at the crate root so workspace Rust callers (and tests)
 // can reference them by path, the same way `ant_init` is reachable.
 // The `#[no_mangle]` symbols are unaffected — this only adds Rust paths.
-pub use gateway::{ant_start_gateway, ant_stop_gateway};
+pub use chain_transport::{
+    ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
+    ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
+};
+pub use gateway::{ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
 use ant_crypto::{
-    ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
-    random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
+    ethereum_address_from_public_key, keccak256, overlay_from_ethereum_address,
+    random_overlay_nonce, random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
 };
 use ant_node::{run_node, NodeConfig, UploadManager};
 use ant_p2p::UploadRuntime;
@@ -73,6 +79,13 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 /// the whole warmup window is friendlier than forcing the Swift
 /// side to poll.
 const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long [`ant_shutdown`] waits for the runtime's tasks to stop
+/// before giving up on them. Long enough for an in-flight checkpoint
+/// write to finish (that is the point — see [`ant_shutdown`]), short
+/// enough that a wedged dial can't hold an app teardown or a restore
+/// hostage. Matches the node's own suspend checkpoint bound (~5 s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// On-disk `SQLite` chunk cache cap for the embedded node. The whole
 /// point of running a Swarm node on-device is to amortise fetches
@@ -164,6 +177,59 @@ pub struct AntHandle {
     /// the iOS app serve `http://127.0.0.1:<port>` in-process instead of
     /// spawning the `antd` daemon. See [`gateway`].
     gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// CORS allow-list the next [`ant_start_gateway`] hands its gateway,
+    /// set by [`ant_set_gateway_cors`]. Empty by default: the gateway
+    /// then sends no CORS headers at all, so no other-origin page can read its
+    /// responses (issue #101). Only written while no gateway is running
+    /// (the setter checks under the `gateway_task` lock), so a live
+    /// gateway always serves exactly the list it started with.
+    gateway_cors: Mutex<Vec<String>>,
+    /// The `AntStream` publisher throughput benchmark currently running
+    /// on this handle, if any (issue #67 stage 1). `None` until
+    /// [`ant_bench_start`]; cleared by [`ant_bench_stop`]. Exactly one
+    /// run at a time — two concurrent runs would each measure the
+    /// other's upload contention rather than the network's.
+    bench: Mutex<Option<Arc<bench::BenchRun>>>,
+    /// Host-provided JSON-RPC transport for chain reads/writes (issue
+    /// #77), installed by [`ant_set_chain_transport`]. Empty by default,
+    /// which means every chain request goes to the configured
+    /// `gnosis_rpc` URL, exactly as before.
+    ///
+    /// The slot itself lives for the whole life of the handle and every
+    /// chain client shares this one `Arc` — a clear/replace therefore
+    /// reaches clients built earlier (notably the gateway's, captured
+    /// once at [`ant_start_gateway`]) instead of leaving them calling a
+    /// `host_ctx` the host has since freed.
+    #[cfg(feature = "chain")]
+    chain_transport: Arc<chain_transport::HostChainTransport>,
+}
+
+/// Chain wiring shared by the storage / settlement calls and the
+/// in-process gateway.
+#[cfg(feature = "chain")]
+impl AntHandle {
+    /// The handle's transport slot, if a host transport is installed
+    /// right now.
+    ///
+    /// What is handed out is the *slot*, not a snapshot of the callback:
+    /// a later [`ant_set_chain_transport`] retargets (or empties) it for
+    /// every holder, so a long-lived client — the gateway's — can never
+    /// call a `host_ctx` the host was told it may free. An empty slot
+    /// stays `None` so the common no-transport build keeps the plain
+    /// `POST <url>` path with no per-request detour.
+    pub(crate) fn host_chain_transport(&self) -> Option<ant_chain::SharedChainTransport> {
+        self.chain_transport
+            .is_installed()
+            .then(|| self.chain_transport.clone() as ant_chain::SharedChainTransport)
+    }
+
+    /// A [`ant_chain::ChainClient`] for `rpc`, routed through the host
+    /// transport when one is installed. **Every** chain client this
+    /// crate builds must come from here, so a host that plugs in a
+    /// verified source is not bypassed by one forgotten call site.
+    pub(crate) fn chain_client(&self, rpc: impl Into<String>) -> ant_chain::ChainClient {
+        ant_chain::ChainClient::new(rpc).with_transport(self.host_chain_transport())
+    }
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -222,6 +288,25 @@ struct IdentityFile {
     signing_key: String,
     overlay_nonce: String,
     libp2p_keypair: Option<String>,
+}
+
+/// Domain separator for the overlay nonce we derive when an identity is
+/// rebuilt from a bare account key ([`ant_identity_from_key`]). Deriving
+/// it from the *public* Ethereum address (never the secret) keeps a
+/// key-only restore reproducible — the same key always yields the same
+/// overlay — without publishing any function of the private key.
+const OVERLAY_NONCE_DOMAIN: &[u8] = b"ant-ffi/overlay-nonce/v1";
+
+/// Where the node's identity (account key) comes from.
+enum IdentitySource<'a> {
+    /// Legacy/desktop behaviour: `identity.json` inside the data dir,
+    /// created on first run. The library owns the key material on disk.
+    DataDir,
+    /// Host-provided identity JSON (same shape as `identity.json`). The
+    /// library never reads or writes the key on disk — this is the
+    /// `KeyProvider` backend PLAN.md § 5.10 plans for mobile, where the
+    /// host keeps the key in the iOS Keychain / Android Keystore.
+    Provided(&'a str),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -299,7 +384,7 @@ pub unsafe extern "C" fn ant_init_with_options(
             } else {
                 Some(cstr_to_path(source_root)?)
             };
-            init_inner(&path, source_root.as_deref())
+            init_inner(&path, source_root.as_deref(), IdentitySource::DataDir)
         }));
         match result {
             Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
@@ -315,14 +400,318 @@ pub unsafe extern "C" fn ant_init_with_options(
     }
 }
 
-fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, FfiError> {
+/// Like [`ant_init_with_options`], but the *host* owns the account key:
+/// `identity_json` carries the identity document (the same shape
+/// [`ant_identity_generate`] returns) and the library neither reads nor
+/// writes `identity.json` in the data dir. This is the `KeyProvider`
+/// backend PLAN.md § 5.10 plans for mobile — on iOS the document lives in
+/// the Keychain (optionally Secure-Enclave-wrapped), so an attacker with
+/// the app container never gets the key.
+///
+/// Everything else behaves exactly like [`ant_init_with_options`].
+///
+/// # Safety
+///
+/// * `data_dir` and `identity_json` must be valid NUL-terminated UTF-8
+///   strings.
+/// * `source_root` must be a valid NUL-terminated UTF-8 string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null
+///   to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_init_with_identity(
+    data_dir: *const c_char,
+    source_root: *const c_char,
+    identity_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntHandle {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
+            let path = cstr_to_path(data_dir)?;
+            let source_root = if source_root.is_null() {
+                None
+            } else {
+                Some(cstr_to_path(source_root)?)
+            };
+            let identity = cstr_to_str(identity_json)?;
+            init_inner(
+                &path,
+                source_root.as_deref(),
+                IdentitySource::Provided(identity),
+            )
+        }));
+        match result {
+            Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_init_with_identity");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// Mint a fresh node identity without starting a node, so a host that
+/// keeps the key itself (iOS Keychain / Android Keystore) can create one
+/// on first run and feed it back to [`ant_init_with_identity`].
+///
+/// Returns an allocated JSON document
+/// `{"signing_key","overlay_nonce","libp2p_keypair"}` — all hex, and all
+/// secret: `signing_key` *is* the account. Free with
+/// [`ant_free_string`]. On failure returns null and writes an allocated
+/// message into `*out_err`.
+///
+/// # Safety
+///
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_generate(out_err: *mut *mut c_char) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_generate", || {
+            let id = new_identity().map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+/// Rebuild a node identity from a backed-up account key (64 hex chars,
+/// `0x` prefix tolerated) — the "restore my account" path when the
+/// Keychain copy is gone but the user still has their key. Returns the
+/// same JSON document as [`ant_identity_generate`], with the overlay
+/// nonce derived from the account address so the restore is
+/// reproducible. Rejects malformed or out-of-range keys.
+///
+/// # Safety
+///
+/// * `signing_key_hex` must be a valid NUL-terminated UTF-8 string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_from_key(
+    signing_key_hex: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_from_key", || {
+            let hex_str = cstr_to_str(signing_key_hex).map_err(|e| e.to_string())?;
+            let id = identity_from_signing_key(hex_str).map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account-scoped on-disk state
+// ---------------------------------------------------------------------------
+
+/// Data-dir entries that belong to one specific *account* (the node EOA)
+/// rather than to the device.
+///
+/// None of these transfer between accounts. A postage store issues
+/// stamps over a batch whose owner is recorded on-chain; a chequebook is
+/// bound on-chain to its issuer; both SWAP ledgers are denominated in
+/// cheques signed by (or payable to) one account; an upload job stamps
+/// against a specific batch. Signing any of them with a different key
+/// produces state that looks healthy locally and is rejected by every
+/// peer, so they travel with the account instead of staying put (see
+/// [`bind_account_state`]).
+///
+/// Everything else in the data dir is account-independent and stays:
+/// `peers.json` (a network peer list), `chunks.sqlite` (a content cache
+/// keyed by chunk address), and `identity.json` — which *is* the
+/// account, and only exists in [`IdentitySource::DataDir`] mode, where
+/// the account can't change behind our back in the first place.
+const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
+    "postage",
+    "uploads",
+    "chequebook.json",
+    "swap_credits.json",
+    "pushsync_outbound.json",
+];
+
+/// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
+/// their canonical paths belong to. Holds the *public* Ethereum address
+/// only — no function of the key — so the host-held-identity guarantee
+/// ("the library never writes key material to disk") is unaffected.
+const ACCOUNT_MARKER_FILE: &str = "account.json";
+
+/// Parent of the per-account parking dirs: `<data_dir>/accounts/<0xeth>/`.
+const ACCOUNT_PARK_DIR: &str = "accounts";
+
+/// Parking name for state whose marker exists but is unreadable. We know
+/// it isn't ours (a marker we wrote is well-formed), but not whose it is.
+const UNKNOWN_ACCOUNT: &str = "unknown";
+
+/// The `account.json` marker.
+#[derive(Serialize, Deserialize)]
+struct AccountMarker {
+    /// `0x` + 40 hex: the node EOA that owns the account-scoped state.
+    account: String,
+}
+
+/// Make the data dir's account-scoped state belong to `eth` before
+/// anything reads it.
+///
+/// Without this, a key swap silently mixes two accounts: the postage
+/// reload (`drive::reload_persisted_issuers`) and the chequebook
+/// association are keyed by path, not by owner, so the new key would
+/// sign stamps over the *old* account's batch and cheques against the
+/// *old* account's chequebook. Nothing local notices — the plan reads as
+/// active and settlement as ready — while every peer drops both, which
+/// is precisely the failure mode that has to be caught before startup
+/// rather than at first use.
+///
+/// The previous account's state is *parked* under
+/// `<data_dir>/accounts/<its address>/` rather than deleted, and this
+/// account's parked state (from an earlier switch) is swapped back in,
+/// so switching keys back and forth loses nothing.
+///
+/// Ordering is crash-safe: parking runs before the marker is rewritten
+/// (a crash in between just re-runs a now-empty park), and the adopt
+/// step runs on every start (a crash mid-adopt is finished by the next
+/// one).
+fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
+    let current = format!("0x{}", hex::encode(eth));
+    let marker = data_dir.join(ACCOUNT_MARKER_FILE);
+    match read_account_marker(&marker)? {
+        // Same account as last launch: the canonical paths are its own.
+        Some(previous) if previous.eq_ignore_ascii_case(&current) => {}
+        // Someone else's (or unattributable) state sitting where this
+        // account's belongs — park it before anything opens it.
+        Some(previous) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                previous = %previous,
+                current = %current,
+                "data dir belongs to a different account; parking its postage / chequebook / settlement state",
+            );
+            move_account_entries(data_dir, &account_park_dir(data_dir, &previous))?;
+            write_account_marker(&marker, &current)?;
+        }
+        // No marker: either a fresh data dir, or the first start under a
+        // build that keeps one. Whatever is here was written by the
+        // account starting now — before host-held identities the key
+        // came from this very directory and could not change.
+        None => write_account_marker(&marker, &current)?,
+    }
+
+    // Swap this account's own parked state (if any) back in. Runs on
+    // every start so an interrupted adopt is completed on the next one.
+    let parked = account_park_dir(data_dir, &current);
+    if parked.is_dir() {
+        move_account_entries(&parked, data_dir)?;
+        // Empty now; a leftover (something else was put in there) is
+        // left alone rather than removed.
+        let _ = std::fs::remove_dir(&parked);
+    }
+    Ok(())
+}
+
+/// `<data_dir>/accounts/<owner>` — `owner` is always either a validated
+/// `0x` + 40-hex address or [`UNKNOWN_ACCOUNT`], so it can never escape
+/// the data dir.
+fn account_park_dir(data_dir: &Path, owner: &str) -> PathBuf {
+    data_dir.join(ACCOUNT_PARK_DIR).join(owner)
+}
+
+/// Move every [`ACCOUNT_SCOPED_ENTRIES`] entry present in `from` into
+/// `to`. Refuses (rather than clobbering) when the destination already
+/// holds an entry of the same name: two accounts' copies of one name
+/// means we can no longer tell which is whose, and guessing is how the
+/// wrong batch gets stamped.
+fn move_account_entries(from: &Path, to: &Path) -> Result<(), FfiError> {
+    for name in ACCOUNT_SCOPED_ENTRIES {
+        let src = from.join(name);
+        if !src.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(to)
+            .map_err(|e| FfiError::Io(format!("create {}: {e}", to.display())))?;
+        let dst = to.join(name);
+        if dst.exists() {
+            return Err(FfiError::Io(format!(
+                "refusing to start: {} and {} both exist; move one aside by hand",
+                src.display(),
+                dst.display(),
+            )));
+        }
+        std::fs::rename(&src, &dst).map_err(|e| {
+            FfiError::Io(format!("move {} to {}: {e}", src.display(), dst.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The account the data dir's state belongs to: `Ok(None)` when there is
+/// no marker at all, `Ok(Some(`[`UNKNOWN_ACCOUNT`]`))` when one exists but
+/// its *contents* aren't a valid marker (fail closed — state we can't
+/// attribute is treated as another account's).
+///
+/// A marker we can't *read* (I/O error, not a missing file) is an error,
+/// not an unknown account: reporting it as unattributable would park this
+/// account's own postage / chequebook state under `accounts/unknown`,
+/// where the adopt step — which only ever looks at
+/// `accounts/<own address>` — never brings it back. A transient read
+/// failure has to fail the start it happened on, so the next one (which
+/// can read the marker) comes up with the account intact.
+fn read_account_marker(path: &Path) -> Result<Option<String>, FfiError> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(FfiError::Io(format!(
+                "refusing to start: cannot read the account marker {}: {e}",
+                path.display(),
+            )))
+        }
+    };
+    let account = serde_json::from_slice::<AccountMarker>(&raw)
+        .ok()
+        .map(|m| m.account)
+        .filter(|a| is_eth_address(a));
+    if account.is_none() {
+        tracing::warn!(
+            target: "ant-ffi",
+            path = %path.display(),
+            "corrupt account marker; treating the data dir's state as another account's",
+        );
+    }
+    Ok(Some(account.unwrap_or_else(|| UNKNOWN_ACCOUNT.to_string())))
+}
+
+fn write_account_marker(path: &Path, account: &str) -> Result<(), FfiError> {
+    let json = serde_json::to_string(&AccountMarker {
+        account: account.to_string(),
+    })
+    .map_err(|e| FfiError::Io(format!("serialize account marker: {e}")))?;
+    // Write-tmp + rename: a torn marker would make the next start park
+    // this account's own state as a stranger's.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| FfiError::Io(format!("write {}: {e}", path.display())))
+}
+
+fn is_eth_address(s: &str) -> bool {
+    s.len() == 42 && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn init_inner(
+    data_dir: &Path,
+    source_root: Option<&Path>,
+    identity: IdentitySource<'_>,
+) -> Result<AntHandle, FfiError> {
     install_log_subscriber();
 
     std::fs::create_dir_all(data_dir)
         .map_err(|e| FfiError::Io(format!("create data dir {}: {e}", data_dir.display())))?;
 
-    let id_path = data_dir.join("identity.json");
-    let (signing_secret, overlay_nonce, libp2p_keypair) = load_or_create_identity(&id_path)?;
+    let (signing_secret, overlay_nonce, libp2p_keypair) = match identity {
+        IdentitySource::DataDir => load_or_create_identity(&data_dir.join("identity.json"))?,
+        IdentitySource::Provided(json) => decode_identity_json(json)?,
+    };
 
     let vk = *SigningKey::from_bytes((&signing_secret).into())
         .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
@@ -330,6 +719,12 @@ fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, 
     let eth = ethereum_address_from_public_key(&vk);
     let overlay = overlay_from_ethereum_address(&eth, 1, &overlay_nonce);
     let peer_id = libp2p_keypair.public().to_peer_id();
+
+    // The host can hand us a *different* account than it did last launch
+    // (`ant_identity_from_key` + a Restore flow), so make the data dir's
+    // account-scoped state belong to this account before anything below
+    // opens it.
+    bind_account_state(data_dir, &eth)?;
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -468,8 +863,9 @@ fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, 
     // no-RPC manual path. Gated on `chain`: a download-only build never
     // uploads, so it never needs (or can deploy) a chequebook.
     #[cfg(feature = "chain")]
-    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook(
+    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook_for(
         &data_dir.join("chequebook.json"),
+        &eth,
     ) {
         Ok(Some(chequebook)) => {
             tracing::info!(
@@ -535,6 +931,10 @@ fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, 
         eth,
         data_dir: data_dir.to_path_buf(),
         gateway_task: Mutex::new(None),
+        gateway_cors: Mutex::new(Vec::new()),
+        bench: Mutex::new(None),
+        #[cfg(feature = "chain")]
+        chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
     })
 }
 
@@ -1726,6 +2126,105 @@ pub unsafe extern "C" fn ant_storage_settlement_status(
     }
 }
 
+/// Settlement-deposit status as JSON `{"enabled","chequebook",
+/// "deposit_plur","deposit_bzz","target_plur","target_bzz",
+/// "shortfall_plur","shortfall_bzz","needs_top_up","xdai_required",
+/// "xdai_required_display","xdai_to_send","xdai_to_send_display",
+/// "sufficient_funds"}`.
+///
+/// [`ant_storage_settlement_status`] answers "is a chequebook deployed?";
+/// this answers "does it actually back the cheques it signs?". A
+/// chequebook at deposit 0 — what every install before this deployed —
+/// publishes fine until the peers' payment tolerance runs out, then
+/// collapses into pushsync timeouts, so the Storage tab reads this to
+/// detect that state and offer a top-up ([`ant_storage_settlement_topup`]).
+/// `enabled=false` (zeroed, `needs_top_up=false`) when this account has
+/// no chequebook yet; buying or connecting a plan deploys one, funded.
+///
+/// Reads chain (two or three light `eth_call`s), so call it on an
+/// explicit refresh rather than every status poll. Requires the `chain`
+/// build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_deposit(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_deposit", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_storage_settlement_deposit: gnosis_rpc required".to_string());
+                }
+                drive::settlement_deposit(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Fund this account's chequebook up to the settlement deposit target
+/// (0.001 xBZZ), funding **only with xDAI**: the node swaps the xBZZ
+/// shortfall on-chain if it doesn't already hold it, then transfers the
+/// deposit to the chequebook. The explicit top-up path — a chequebook's
+/// deposit is only read at deploy time, so an already-deployed one can be
+/// funded no other way.
+///
+/// Idempotent: a chequebook already at the target is a no-op. Errors when
+/// this account has no chequebook yet. Returns the refreshed
+/// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
+/// and spends real funds** and **blocks** until they confirm, so the app
+/// gates it behind explicit confirmation. Requires the `chain` build
+/// feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_topup(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_topup", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_storage_settlement_topup: gnosis_rpc required".to_string());
+                }
+                drive::settlement_topup_xdai(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
 /// Deep read-back propagation check for an uploaded `reference`.
 ///
 /// Resolves the manifest at `reference` to its data root, enumerates the
@@ -1957,13 +2456,14 @@ pub unsafe extern "C" fn ant_storage_discover(
 /// iOS publish-setup checklist's "chequebook deployed" step can complete.
 ///
 /// Idempotent: if this device already deployed a chequebook (persisted at
-/// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy.
-/// Otherwise this signs an on-chain `factory.deploySimpleSwap` (issuer =
-/// node EOA) deployed **unfunded** — xDAI gas only, zero xBZZ deposit
-/// (bee still accepts the cheques; the user's xBZZ stays in their
-/// wallet) — persists the association, and returns the new address. This
-/// is an on-chain transaction: it spends gas and **blocks** until the tx
-/// confirms. Light-mode (`chain`-feature) builds only.
+/// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy —
+/// though one still short of its settlement deposit is topped up from
+/// spare xBZZ. Otherwise this signs an on-chain `factory.deploySimpleSwap`
+/// (issuer = node EOA), funds it with the 0.001 xBZZ settlement deposit
+/// so its cheques are actually backed, persists the association, and
+/// returns the new address. These are on-chain transactions: they spend
+/// gas plus the deposit and **block** until confirmed. Light-mode
+/// (`chain`-feature) builds only.
 ///
 /// Returns a heap C string `{"chequebookAddress":"0x<40hex>"}` on success
 /// (free with [`ant_free_string`]), or `NULL` with an error written to
@@ -2003,10 +2503,15 @@ pub unsafe extern "C" fn ant_deploy_chequebook(
 }
 
 /// Price a storage plan: returns a JSON object with the plan cost
-/// (`total_cost_plur` / `total_cost_bzz`), the account's xBZZ / xDAI
-/// balances, and whether they cover it — the "payment information" the
-/// Get Started flow shows before activating. No transaction is sent.
-/// Requires the `chain` build feature.
+/// (`total_cost_plur` / `total_cost_bzz`), the one-time settlement
+/// deposit the account's chequebook still needs
+/// (`settlement_deposit_plur` / `settlement_deposit_bzz`, zero once it is
+/// funded), the account's xBZZ / xDAI balances, and whether they cover
+/// the lot — the "payment information" the Get Started flow shows before
+/// activating. The all-in figures (`needed_bzz`, `xdai_required`,
+/// `xdai_to_send`, `sufficient_funds`) include the deposit, because
+/// activating a plan is also what deploys and funds the chequebook. No
+/// transaction is sent. Requires the `chain` build feature.
 ///
 /// # Safety
 ///
@@ -2353,8 +2858,22 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
     }
 }
 
-/// Shut the embedded node down. Aborts the Tokio runtime and frees the
+/// Shut the embedded node down. Stops the Tokio runtime and frees the
 /// handle. After this returns, `handle` must not be used again.
+///
+/// Blocks until the node's tasks have stopped (bounded by
+/// [`SHUTDOWN_GRACE`]), so call it off the host's main thread. It has to
+/// block: a restore does `ant_shutdown(A)` then `ant_init(B)` over the
+/// same data dir, and a task of A's still running after this returns
+/// (an upload checkpoint or postage persist is a `create_dir_all`, a
+/// write and a rename) would recreate A's canonical files *after*
+/// `ant_init(B)` parked them — attributing A's state to B, or leaving
+/// both copies for the next switch to abort on in
+/// `move_account_entries`.
+///
+/// A host chain transport ([`ant_set_chain_transport`]) is cleared and
+/// drained first, so no callback is running — and none can start — once
+/// this returns, and the host may free its `host_ctx`.
 ///
 /// # Safety
 ///
@@ -2366,11 +2885,197 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
             return;
         }
         let handle = Box::from_raw(handle);
-        // Dropping the runtime aborts every spawned task (including the
-        // node loop) and joins blocking threads. We ship it off to a
-        // `shutdown_background` call so this FFI entry point never blocks
-        // if the node loop is mid-dial and holding a socket open.
-        handle.runtime.shutdown_background();
+        // Drain the host chain transport first: `ant.h` lets the host
+        // free `host_ctx` once `ant_shutdown` returns, and
+        // `shutdown_timeout` below leaks (rather than joins) a blocking
+        // thread that outruns the grace — so clear the slot and wait for
+        // any in-flight callback here, where the wait is unconditional.
+        #[cfg(feature = "chain")]
+        handle.chain_transport.set(None, std::ptr::null_mut());
+        // Cancels every spawned task (including the node loop) at its
+        // next await point and joins the worker / blocking threads. The
+        // timeout keeps a task wedged in a syscall (a dial holding a
+        // socket open) from hanging the host for good; it leaks the
+        // thread rather than the wait.
+        handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AntStream publisher throughput benchmark (issue #67 stage 1)
+// ---------------------------------------------------------------------------
+
+/// How long [`ant_bench_stop`] waits for a cancelled run to settle
+/// before returning the report anyway. An in-flight `POST /bzz` is
+/// bounded by the bench's own 60 s publish deadline, so a run that
+/// hasn't finished by then is not going to.
+const BENCH_STOP_GRACE: Duration = Duration::from_secs(65);
+
+/// Poll interval while waiting for a cancelled run to settle.
+const BENCH_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Start an `AntStream` publisher throughput benchmark on this node.
+///
+/// `config_json` is a [`bench::BenchConfig`] document; only `label` is
+/// required. With a `batch_id` the run publishes real segments through
+/// `POST /bzz` on `gateway` (start it first with
+/// [`ant_start_gateway`]); without one it measures the local
+/// chunk + stamp pipeline only, which needs no network and no batch.
+///
+/// Returns immediately — the run drives itself on the node's runtime.
+/// Poll it with [`ant_bench_progress`] and finish it with
+/// [`ant_bench_stop`]. Only one run at a time per handle: a second
+/// start while one is live fails rather than silently measuring two
+/// publishers competing for the same uplink.
+///
+/// Returns `true` on success, `false` with an allocated message in
+/// `out_err` (free with [`ant_free_string`]) otherwise.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `config_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_start(
+    handle: *const AntHandle,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_bench_start: null handle");
+            return false;
+        };
+        let config = match cstr_to_str(config_json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<bench::BenchConfig>(raw)
+                    .map_err(|e| format!("ant_bench_start: invalid config: {e}"))
+            }) {
+            Ok(c) => c,
+            Err(msg) => {
+                write_out_err(out_err, &msg);
+                return false;
+            }
+        };
+
+        // Hold the slot across check → start → store, so two concurrent
+        // starts can't both pass the "already running" check.
+        let mut slot = handle
+            .bench
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|run| !run.is_finished()) {
+            write_out_err(
+                out_err,
+                "ant_bench_start: a benchmark is already running on this node",
+            );
+            return false;
+        }
+        match bench::start(
+            handle.runtime.handle(),
+            config,
+            handle.signing_secret,
+            Some(handle.status_rx.clone()),
+        ) {
+            Ok(run) => {
+                *slot = Some(run);
+                true
+            }
+            Err(e) => {
+                write_out_err(out_err, &format!("ant_bench_start: {e}"));
+                false
+            }
+        }
+    }
+}
+
+/// Live progress of the run started by [`ant_bench_start`], as an
+/// allocated [`bench::BenchSnapshot`] JSON string (free with
+/// [`ant_free_string`]). Non-blocking. Returns null with an error when
+/// no run has been started on this handle.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_progress(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_bench_progress", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .bench
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "no benchmark has been started on this node".to_string())?;
+            serde_json::to_string(&run.snapshot()).map_err(|e| format!("serialize snapshot: {e}"))
+        })
+    }
+}
+
+/// Stop the run and return its final [`bench::BenchReport`] as an
+/// allocated JSON string (free with [`ant_free_string`]).
+///
+/// **Blocking**: the cancel is cooperative, so this waits (up to ~65 s,
+/// the bench's own per-segment publish deadline) for the in-flight
+/// segments to land — a truncated tail would understate the sustained
+/// figure the report exists to state. Call it off the UI thread.
+///
+/// Safe to call on an already-finished run: it returns the same report.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_stop(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_bench_stop", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .bench
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "no benchmark has been started on this node".to_string())?;
+            run.cancel();
+            let deadline = Instant::now() + BENCH_STOP_GRACE;
+            while !run.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(BENCH_STOP_POLL);
+            }
+            let report = run.report();
+            // Only release the slot once the loop is actually done —
+            // otherwise the next `ant_bench_start` would run against a
+            // node that is still uploading the previous run's tail. And
+            // only if the slot still holds *this* run: while we waited,
+            // the run could have settled and a concurrent
+            // `ant_bench_start` legitimately installed a new one, which
+            // clearing the slot would orphan (and let a third start run
+            // two publishers on one uplink).
+            if run.is_finished() {
+                let mut slot = handle
+                    .bench
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &run)) {
+                    *slot = None;
+                }
+            }
+            serde_json::to_string(&report).map_err(|e| format!("serialize report: {e}"))
+        })
     }
 }
 
@@ -2418,42 +3123,98 @@ fn load_or_create_identity(
     if id_path.exists() {
         let raw = std::fs::read_to_string(id_path)
             .map_err(|e| FfiError::Io(format!("read {}: {e}", id_path.display())))?;
-        let id: IdentityFile = serde_json::from_str(&raw)
-            .map_err(|e| FfiError::Io(format!("parse identity.json: {e}")))?;
-        let mut signing_secret = [0u8; SECP256K1_SECRET_LEN];
-        hex::decode_to_slice(&id.signing_key, &mut signing_secret)
-            .map_err(|e| FfiError::Io(format!("decode signing_key: {e}")))?;
-        let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
-        hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
-            .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
-        let kp = if let Some(ref enc) = id.libp2p_keypair {
-            let bytes = hex::decode(enc)
-                .map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
-            Keypair::from_protobuf_encoding(&bytes)
-                .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
-        } else {
-            secp256k1_keypair_from_signing_secret(&signing_secret)?
-        };
-        return Ok((signing_secret, overlay_nonce, kp));
+        return decode_identity_json(&raw);
     }
 
-    let signing_secret = random_secp256k1_secret();
-    let overlay_nonce = random_overlay_nonce();
-    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    let id = new_identity()?;
+    let decoded = decode_identity(&id)?;
+    let pretty = serde_json::to_string_pretty(&id)
+        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
+    std::fs::write(id_path, pretty)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
+    Ok(decoded)
+}
 
-    let id = IdentityFile {
+/// Parse an identity JSON document (`identity.json`'s shape) into the
+/// three pieces the node loop needs. Shared by the on-disk path and the
+/// host-provided (`ant_init_with_identity`) path.
+fn decode_identity_json(
+    raw: &str,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let id: IdentityFile =
+        serde_json::from_str(raw).map_err(|e| FfiError::Io(format!("parse identity json: {e}")))?;
+    decode_identity(&id)
+}
+
+fn decode_identity(
+    id: &IdentityFile,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let signing_secret = decode_signing_key(&id.signing_key)?;
+    let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
+    hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
+        .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
+    let kp = if let Some(ref enc) = id.libp2p_keypair {
+        let bytes =
+            hex::decode(enc).map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
+        Keypair::from_protobuf_encoding(&bytes)
+            .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
+    } else {
+        secp256k1_keypair_from_signing_secret(&signing_secret)?
+    };
+    Ok((signing_secret, overlay_nonce, kp))
+}
+
+/// Decode a 64-hex account key (an optional `0x` prefix is tolerated,
+/// since that's how wallets hand keys to users) and reject anything the
+/// secp256k1 group won't accept — zero, or ≥ the curve order. Doing this
+/// here means a mistyped restore fails with a clear message instead of
+/// surfacing as an opaque node-startup error.
+fn decode_signing_key(hex_str: &str) -> Result<[u8; SECP256K1_SECRET_LEN], FfiError> {
+    let trimmed = hex_str.trim();
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let mut secret = [0u8; SECP256K1_SECRET_LEN];
+    hex::decode_to_slice(body, &mut secret)
+        .map_err(|e| FfiError::Crypto(format!("decode signing_key: {e}")))?;
+    SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?;
+    Ok(secret)
+}
+
+/// A brand-new identity: random account key, random overlay nonce, and
+/// the libp2p keypair derived from the key.
+fn new_identity() -> Result<IdentityFile, FfiError> {
+    identity_file(random_secp256k1_secret(), random_overlay_nonce())
+}
+
+/// Rebuild an identity from a bare account key — the "I still have my
+/// backed-up key" restore path. The overlay nonce is derived from the
+/// account's Ethereum address so the same key always produces the same
+/// overlay, making the restore reproducible across devices.
+fn identity_from_signing_key(hex_str: &str) -> Result<IdentityFile, FfiError> {
+    let secret = decode_signing_key(hex_str)?;
+    let vk = *SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
+        .verifying_key();
+    let eth = ethereum_address_from_public_key(&vk);
+    let mut preimage = Vec::with_capacity(OVERLAY_NONCE_DOMAIN.len() + eth.len());
+    preimage.extend_from_slice(OVERLAY_NONCE_DOMAIN);
+    preimage.extend_from_slice(&eth);
+    identity_file(secret, keccak256(&preimage))
+}
+
+fn identity_file(
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    overlay_nonce: [u8; OVERLAY_NONCE_LEN],
+) -> Result<IdentityFile, FfiError> {
+    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    Ok(IdentityFile {
         signing_key: hex::encode(signing_secret),
         overlay_nonce: hex::encode(overlay_nonce),
         libp2p_keypair: Some(hex::encode(
             kp.to_protobuf_encoding()
                 .map_err(|e| FfiError::Io(format!("encode libp2p keypair: {e}")))?,
         )),
-    };
-    let pretty = serde_json::to_string_pretty(&id)
-        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
-    std::fs::write(id_path, pretty)
-        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
-    Ok((signing_secret, overlay_nonce, kp))
+    })
 }
 
 fn secp256k1_keypair_from_signing_secret(
@@ -2481,19 +3242,46 @@ fn secp256k1_keypair_from_signing_secret(
 // The proper mobile artefact (PLAN.md § 11) replaces both with a
 // `set_log_sink` callback so the host owns sink lifecycle; the smoke
 // tests don't need that yet.
+//
+// The subscriber is process-global and the first `try_init` wins, so a
+// host that links ant-ffi together with another Rust library that also
+// wants a `tracing` layer (freedom-mobile-ffi: ant + freedom-ipfs, whose
+// retrieval-progress recorder is a layer) must install ONE subscriber
+// carrying both before `ant_init` runs. [`log_layer`] is ant's half of
+// that: the same filter + writer as below, as a composable layer with
+// its filter scoped to itself, so it can't hide events from the other
+// layers. `install_log_subscriber` then finds the slot taken and leaves
+// it alone.
 // ---------------------------------------------------------------------------
+
+/// ant-ffi's log output as a `tracing` layer: `ANT_LOG` / `RUST_LOG`
+/// (default `info`), formatted to logcat under the tag `ant-ffi` on
+/// Android and to stderr elsewhere. The filter is per-layer, so events
+/// it drops still reach any other layer on the same subscriber.
+///
+/// For hosts that own the global subscriber (see the note above);
+/// `ant_init` installs this on its own when nothing else has.
+#[must_use]
+pub fn log_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::Layer;
+    let filter = std::env::var("ANT_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
+    tracing_subscriber::fmt::layer()
+        .with_writer(default_log_writer())
+        .with_filter(tracing_subscriber::EnvFilter::new(filter))
+}
 
 fn install_log_subscriber() {
     use std::sync::Once;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let filter = std::env::var("ANT_LOG")
-            .or_else(|_| std::env::var("RUST_LOG"))
-            .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(default_log_writer())
-            .try_init();
+        let _ = tracing_subscriber::registry().with(log_layer()).try_init();
     });
 }
 
@@ -2573,6 +3361,31 @@ mod android_log {
 mod tests {
     use super::*;
 
+    /// `log_layer`'s filter must stay scoped to itself: a host composing
+    /// it with another layer (freedom-ipfs's progress recorder) needs
+    /// that layer to see events ant's log level drops.
+    #[test]
+    fn log_layer_filter_does_not_hide_events_from_other_layers() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(log_layer())
+            .with(Count(seen.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "log_layer_test", phase = "probe", "below ant's log level");
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn parse_reference_accepts_bare_hex() {
         let hex = "a".repeat(64);
@@ -2651,6 +3464,771 @@ mod tests {
     fn parse_reference_rejects_bad_length() {
         let err = parse_reference("abc").unwrap_err();
         assert!(matches!(err, FfiError::Reference(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generated_identity_round_trips_through_json() {
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, nonce, kp) = decode_identity_json(&json).expect("decode");
+        assert_eq!(hex::encode(secret), id.signing_key);
+        assert_eq!(hex::encode(nonce), id.overlay_nonce);
+        // The embedded libp2p keypair must be the one derived from the
+        // account key, or the node would announce a peer id that doesn't
+        // match the overlay it signs handshakes for.
+        let derived = secp256k1_keypair_from_signing_secret(&secret).expect("derive keypair");
+        assert_eq!(kp.public().to_peer_id(), derived.public().to_peer_id());
+    }
+
+    #[test]
+    fn generated_identities_are_distinct() {
+        let a = new_identity().expect("generate a");
+        let b = new_identity().expect("generate b");
+        assert_ne!(a.signing_key, b.signing_key);
+        assert_ne!(a.overlay_nonce, b.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_is_reproducible() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let a = identity_from_signing_key(key).expect("from key");
+        let b = identity_from_signing_key(key).expect("from key again");
+        assert_eq!(a.signing_key, key);
+        // Same key ⇒ same overlay nonce ⇒ same overlay, so restoring on a
+        // second device lands the node in the same neighbourhood.
+        assert_eq!(a.overlay_nonce, b.overlay_nonce);
+        assert_eq!(a.libp2p_keypair, b.libp2p_keypair);
+    }
+
+    #[test]
+    fn identity_from_key_accepts_0x_prefix_and_whitespace() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let bare = identity_from_signing_key(key).expect("bare");
+        let prefixed = identity_from_signing_key(&format!("  0x{key}\n")).expect("prefixed");
+        assert_eq!(bare.signing_key, prefixed.signing_key);
+        assert_eq!(bare.overlay_nonce, prefixed.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_rejects_bad_keys() {
+        // Too short, not hex, zero, and ≥ the secp256k1 group order.
+        for bad in [
+            "abcd",
+            "zz0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            &"0".repeat(64),
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        ] {
+            assert!(
+                identity_from_signing_key(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_identity_json_rejects_malformed_documents() {
+        assert!(decode_identity_json("not json").is_err());
+        // Valid JSON, but the nonce isn't 32 bytes of hex.
+        let id = new_identity().expect("generate identity");
+        let bad = format!(
+            r#"{{"signing_key":"{}","overlay_nonce":"beef","libp2p_keypair":null}}"#,
+            id.signing_key
+        );
+        assert!(decode_identity_json(&bad).is_err());
+    }
+
+    #[test]
+    fn data_dir_identity_is_written_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-datadir-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let id_path = dir.join("identity.json");
+
+        let (first, nonce, _) = load_or_create_identity(&id_path).expect("create");
+        assert!(id_path.exists(), "first call must persist identity.json");
+        let (second, nonce2, _) = load_or_create_identity(&id_path).expect("reload");
+        assert_eq!(first, second, "reload must return the same account key");
+        assert_eq!(nonce, nonce2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provided_identity_leaves_no_key_on_disk() {
+        // The whole point of the host-held path: nothing key-shaped may
+        // land in the data dir when the embedder supplies the identity.
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-provided-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, ..) = decode_identity_json(&json).expect("decode provided identity");
+        assert_eq!(hex::encode(secret), id.signing_key);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "expected an empty data dir, got {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data dir seeded with one batch store, a chequebook association
+    /// and both SWAP ledgers — the state a working account leaves behind.
+    fn seed_account_state(dir: &Path) {
+        std::fs::create_dir_all(dir.join("postage")).expect("create postage dir");
+        std::fs::write(dir.join("postage").join("batch.bin"), b"batch").expect("write batch");
+        std::fs::create_dir_all(dir.join("uploads")).expect("create uploads dir");
+        std::fs::write(dir.join("chequebook.json"), b"{}").expect("write chequebook");
+        std::fs::write(dir.join("swap_credits.json"), b"{}").expect("write credits");
+        std::fs::write(dir.join("pushsync_outbound.json"), b"{}").expect("write outbound");
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ant-ffi-{tag}-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A handle whose gateway can actually start: `test_handle` plus a
+    /// valid signing secret (`/addresses` derives the public key).
+    fn gateway_test_handle(tag: &str) -> AntHandle {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let mut h = test_handle(runtime, &scratch_dir(tag));
+        h.signing_secret = [0x11u8; SECP256K1_SECRET_LEN];
+        h
+    }
+
+    /// Start the handle's gateway on a free loopback port via the real
+    /// FFI entry point and return that address.
+    fn start_test_gateway(h: &AntHandle) -> std::net::SocketAddr {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("pick a free port");
+        let c_addr = std::ffi::CString::new(addr.to_string()).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe {
+            ant_start_gateway(
+                &raw const *h,
+                c_addr.as_ptr(),
+                false,
+                std::ptr::null(),
+                &raw mut err,
+            )
+        };
+        assert!(ok, "ant_start_gateway failed: {}", unsafe { take_err(err) });
+        addr
+    }
+
+    unsafe fn take_err(err: *mut c_char) -> String {
+        if err.is_null() {
+            return String::new();
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ant_free_string(err) };
+        s
+    }
+
+    /// Raw HTTP/1.1 request against the gateway; returns the status
+    /// line + lowercased headers (the body isn't needed here). Retries
+    /// the connect while the spawned serve task is still binding.
+    fn gateway_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        extra: &str,
+    ) -> String {
+        use std::io::{Read, Write};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("connect {addr}: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).expect("read response");
+        let resp = String::from_utf8_lossy(&resp);
+        resp.split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+
+    fn set_cors(h: *const AntHandle, origins: &[&str]) -> Result<(), String> {
+        let owned: Vec<std::ffi::CString> = origins
+            .iter()
+            .map(|o| std::ffi::CString::new(*o).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe { ant_set_gateway_cors(h, ptrs.as_ptr(), ptrs.len(), &raw mut err) };
+        let msg = unsafe { take_err(err) };
+        if ok {
+            Ok(())
+        } else {
+            Err(msg)
+        }
+    }
+
+    /// Issue #101: a page's fetch that is redirected across origins
+    /// arrives with `Origin: null`. With no host configuration the
+    /// gateway must not let that (or any) origin read `/wallet` and
+    /// friends — it used to answer `Access-Control-Allow-Origin: null`.
+    #[test]
+    fn gateway_refuses_redirect_tainted_null_origin_by_default() {
+        let h = gateway_test_handle("gw-cors-default");
+        let addr = start_test_gateway(&h);
+
+        for path in ["/wallet", "/addresses", "/stamps"] {
+            let resp = gateway_request(addr, "GET", path, "Origin: null\r\n");
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "GET {path} with Origin: null must carry no CORS allow header:\n{resp}"
+            );
+        }
+        let preflight = gateway_request(
+            addr,
+            "OPTIONS",
+            "/wallet",
+            "Origin: null\r\nAccess-Control-Request-Method: GET\r\n",
+        );
+        assert!(
+            !preflight.contains("access-control-allow-origin"),
+            "preflight from Origin: null must not be allowed:\n{preflight}"
+        );
+        // A real origin gets nothing either.
+        let resp = gateway_request(
+            addr,
+            "GET",
+            "/addresses",
+            "Origin: https://evil.example\r\n",
+        );
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+        // Non-browser clients (no Origin, e.g. the app's own URLSession)
+        // are unaffected.
+        let resp = gateway_request(addr, "GET", "/addresses", "");
+        assert!(resp.starts_with("http/1.1 200"), "{resp}");
+
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    /// A host-configured origin is allowed; `null` stays refused unless
+    /// the host lists it explicitly.
+    #[test]
+    fn gateway_allows_only_host_configured_origins() {
+        let h = gateway_test_handle("gw-cors-configured");
+        set_cors(&raw const h, &["https://App.Example", " "]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        let resp = gateway_request(addr, "GET", "/addresses", "Origin: https://app.example\r\n");
+        assert!(resp.starts_with("http/1.1 200"), "{resp}");
+        assert!(
+            resp.contains("access-control-allow-origin: https://app.example"),
+            "configured origin must be echoed:\n{resp}"
+        );
+        let preflight = gateway_request(
+            addr,
+            "OPTIONS",
+            "/bzz",
+            "Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n",
+        );
+        assert!(
+            preflight.contains("access-control-allow-origin: https://app.example"),
+            "{preflight}"
+        );
+        for origin in ["null", "https://evil.example"] {
+            let resp = gateway_request(addr, "GET", "/wallet", &format!("Origin: {origin}\r\n"));
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "Origin: {origin} must not be allowed:\n{resp}"
+            );
+        }
+
+        // The list can't change under a running gateway ...
+        let err = set_cors(&raw const h, &["null"]).expect_err("set while running must fail");
+        assert!(err.contains("gateway is running"), "{err}");
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+
+        // ... but applies at the next start; an explicit `null` opt-in
+        // (iOS opaque-origin pages) works, and clearing turns CORS off.
+        unsafe { ant_stop_gateway(&raw const h) };
+        set_cors(&raw const h, &["null"]).expect("set after stop");
+        let addr = start_test_gateway(&h);
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(resp.contains("access-control-allow-origin: null"), "{resp}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(unsafe { ant_set_gateway_cors(&raw const h, std::ptr::null(), 0, &raw mut err) });
+        let addr = start_test_gateway(&h);
+        let resp = gateway_request(addr, "GET", "/wallet", "Origin: null\r\n");
+        assert!(!resp.contains("access-control-allow-origin"), "{resp}");
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    /// Freedom Android serves each content root from its own virtual
+    /// origin (`https://<label>.bzz.freedom.baby`); a host-set wildcard
+    /// allows exactly those, not the apex, lookalikes, `null` or others.
+    #[test]
+    fn gateway_allows_host_configured_wildcard_subdomains() {
+        let h = gateway_test_handle("gw-cors-wildcard");
+        set_cors(&raw const h, &["https://*.bzz.freedom.baby"]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        for origin in [
+            "https://3kescpg.bzz.freedom.baby",
+            "https://aa.bb.bzz.freedom.baby",
+        ] {
+            let resp = gateway_request(addr, "GET", "/addresses", &format!("Origin: {origin}\r\n"));
+            assert!(resp.starts_with("http/1.1 200"), "{resp}");
+            assert!(
+                resp.contains(&format!("access-control-allow-origin: {origin}")),
+                "subdomain origin must be echoed:\n{resp}"
+            );
+            let preflight = gateway_request(
+                addr,
+                "OPTIONS",
+                "/bzz",
+                &format!("Origin: {origin}\r\nAccess-Control-Request-Method: POST\r\n"),
+            );
+            assert!(
+                preflight.contains(&format!("access-control-allow-origin: {origin}")),
+                "{preflight}"
+            );
+        }
+        for origin in [
+            "https://bzz.freedom.baby",
+            "https://x.bzz.freedom.baby.evil.example",
+            "http://x.bzz.freedom.baby",
+            "https://x.bzz.freedom.baby:8443",
+            "null",
+            "https://evil.example",
+        ] {
+            let resp = gateway_request(addr, "GET", "/wallet", &format!("Origin: {origin}\r\n"));
+            assert!(
+                !resp.contains("access-control-allow-origin"),
+                "Origin: {origin} must not be allowed:\n{resp}"
+            );
+            let preflight = gateway_request(
+                addr,
+                "OPTIONS",
+                "/wallet",
+                &format!("Origin: {origin}\r\nAccess-Control-Request-Method: GET\r\n"),
+            );
+            assert!(
+                !preflight.contains("access-control-allow-origin"),
+                "preflight from {origin} must not be allowed:\n{preflight}"
+            );
+        }
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
+    #[test]
+    fn set_gateway_cors_rejects_malformed_wildcards_without_changing_the_list() {
+        let h = gateway_test_handle("gw-cors-bad-wildcard");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+        for bad in [
+            "https://*.",
+            "*.bzz.freedom.baby",
+            "https://a.*.freedom.baby",
+            "https://*.bzz.freedom.baby:8443",
+            "https://*.bzz.freedom.baby/path",
+        ] {
+            // All-or-nothing: a valid entry alongside doesn't get stored.
+            let err = set_cors(&raw const h, &["https://*.ens.freedom.baby", bad]).expect_err(bad);
+            assert!(
+                err.contains("origin 1") && err.contains("wildcard"),
+                "{bad}: {err}"
+            );
+            assert_eq!(
+                *h.gateway_cors.lock().unwrap(),
+                vec!["https://app.example".to_string()],
+                "{bad}"
+            );
+        }
+        set_cors(&raw const h, &["https://*.bzz.freedom.baby", "null"]).expect("valid wildcard");
+        assert_eq!(
+            *h.gateway_cors.lock().unwrap(),
+            vec!["https://*.bzz.freedom.baby".to_string(), "null".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
+        let h = gateway_test_handle("gw-cors-bad-input");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+
+        let good = std::ffi::CString::new("null").unwrap();
+        let ptrs = [good.as_ptr(), std::ptr::null()];
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe { ant_set_gateway_cors(&raw const h, ptrs.as_ptr(), 2, &raw mut err) });
+        assert!(unsafe { take_err(err) }.contains("origin 1 is null"));
+
+        let bad = [0xffu8, 0];
+        let ptrs = [bad.as_ptr().cast::<c_char>()];
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe { ant_set_gateway_cors(&raw const h, ptrs.as_ptr(), 1, &raw mut err) });
+        assert!(unsafe { take_err(err) }.contains("not valid UTF-8"));
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(!unsafe {
+            ant_set_gateway_cors(std::ptr::null(), std::ptr::null(), 0, &raw mut err)
+        });
+        assert!(unsafe { take_err(err) }.contains("null handle"));
+
+        assert_eq!(
+            *h.gateway_cors.lock().unwrap(),
+            vec!["https://app.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn account_switch_parks_the_previous_accounts_state() {
+        let dir = scratch_dir("account-switch");
+        let a = [0xaau8; 20];
+        let b = [0xbbu8; 20];
+
+        // Account A runs once and leaves a plan + chequebook behind.
+        bind_account_state(&dir, &a).expect("bind A");
+        seed_account_state(&dir);
+
+        // Account B is restored onto the same device. None of A's state
+        // may still be at the canonical paths B's node reads.
+        bind_account_state(&dir, &b).expect("bind B");
+        for name in ACCOUNT_SCOPED_ENTRIES {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must not be visible to the new account",
+            );
+        }
+        // Parked, not destroyed: A can still be restored.
+        let parked = dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(a)));
+        assert!(parked.join("postage").join("batch.bin").exists());
+        assert!(parked.join("chequebook.json").exists());
+
+        // Switching back hands A its own state again, and parks B's.
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(!parked.exists(), "A's park dir is emptied on adopt");
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(b)))
+            .join("chequebook.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_account_does_not_inherit_the_previous_plan() {
+        // The path the node actually takes at startup, with a real
+        // postage store: account A's batch must not be reloaded into
+        // account B's issuer registry (B's key would sign stamps over a
+        // batch A owns, and every peer would drop them), and must come
+        // back intact when A is restored.
+        let dir = scratch_dir("account-issuers");
+        let (a, b) = ([0x44u8; 20], [0x55u8; 20]);
+        let batch = [0x66u8; 32];
+
+        bind_account_state(&dir, &a).expect("bind A");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).expect("create postage dir");
+        drop(
+            ant_postage::StampIssuer::open_or_new(
+                postage.join(format!("{}.bin", hex::encode(batch))),
+                batch,
+                20,
+                16,
+                false,
+            )
+            .expect("create batch store"),
+        );
+        assert!(drive::reload_persisted_issuers(&postage).contains_key(&batch));
+
+        bind_account_state(&dir, &b).expect("bind B");
+        assert!(
+            drive::reload_persisted_issuers(&postage).is_empty(),
+            "the restored account must not stamp against the previous account's batch",
+        );
+
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(
+            drive::reload_persisted_issuers(&postage).contains_key(&batch),
+            "restoring the original account must return its plan",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_account_restart_leaves_state_in_place() {
+        let dir = scratch_dir("account-restart");
+        let a = [0x11u8; 20];
+        bind_account_state(&dir, &a).expect("first start");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("restart");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "a plain restart must not move anything",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_data_dir_without_a_marker_keeps_its_state() {
+        // Upgrade path: state written before the marker existed belongs
+        // to the account starting now (that build had no way to change
+        // the key under a fixed data dir).
+        let dir = scratch_dir("account-legacy");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &[0x22u8; 20]).expect("adopt legacy state");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join(ACCOUNT_MARKER_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_marker_parks_state_as_unattributable() {
+        let dir = scratch_dir("account-corrupt");
+        seed_account_state(&dir);
+        std::fs::write(dir.join(ACCOUNT_MARKER_FILE), b"{ truncated").expect("corrupt marker");
+        bind_account_state(&dir, &[0x33u8; 20]).expect("bind over corrupt marker");
+        assert!(
+            !dir.join("chequebook.json").exists(),
+            "state we can't attribute must not be adopted",
+        );
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(UNKNOWN_ACCOUNT)
+            .join("chequebook.json")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_fails_the_start_instead_of_parking() {
+        // A read *failure* (as opposed to a marker whose contents are
+        // corrupt) says nothing about who the state belongs to. Parking
+        // it as unattributable would be one-way: adopt only ever looks
+        // at `accounts/<own address>`, so the account's own plan and
+        // chequebook would never come back, and the next buy would
+        // deploy a second chequebook. Fail the start; the next one can
+        // read the marker and comes up intact.
+        let dir = scratch_dir("account-unreadable");
+        seed_account_state(&dir);
+        // A directory where the marker belongs: `read` fails with
+        // EISDIR, not NotFound, on every platform we ship.
+        std::fs::create_dir(dir.join(ACCOUNT_MARKER_FILE)).expect("marker as a dir");
+
+        let err = bind_account_state(&dir, &[0x77u8; 20]).expect_err("must not succeed");
+        assert!(
+            err.to_string().contains("account marker"),
+            "unhelpful error: {err}",
+        );
+        assert!(
+            dir.join("chequebook.json").exists() && dir.join("postage").join("batch.bin").exists(),
+            "the account's own state must stay where it is",
+        );
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "nothing may be parked on an unreadable marker",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handle over `runtime` with everything else inert — enough for
+    /// the [`ant_shutdown`] contract, which only touches the runtime.
+    fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        AntHandle {
+            runtime,
+            cmd_tx,
+            status_rx,
+            progress: Mutex::new(DownloadProgressState::default()),
+            cancel_flag: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            verify_cancel: Arc::new(AtomicBool::new(false)),
+            signing_secret: [0u8; SECP256K1_SECRET_LEN],
+            eth: [0u8; 20],
+            data_dir: data_dir.to_path_buf(),
+            gateway_task: Mutex::new(None),
+            gateway_cors: Mutex::new(Vec::new()),
+            bench: Mutex::new(None),
+            #[cfg(feature = "chain")]
+            chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_return_while_a_task_is_still_persisting() {
+        // Restore is `ant_shutdown(A)` then `ant_init(B)` over one data
+        // dir. If a task of A's is still inside its checkpoint persist
+        // (`create_dir_all` + write + rename) when shutdown returns, it
+        // recreates A's canonical files *after* B's `bind_account_state`
+        // parked them: A's state is then attributed to B, and the next
+        // switch back to A aborts in `move_account_entries`.
+        let dir = scratch_dir("shutdown-drain");
+        let checkpoint = dir.join("postage").join("late.bin");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let target = checkpoint.clone();
+        runtime.spawn(async move {
+            // Sync from here on, exactly like the real persist: nothing
+            // for a cancel to land on until it has finished.
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("create dir");
+            std::fs::write(&target, b"late").expect("write checkpoint");
+        });
+        // Let the task reach the worker before we tear the runtime down.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let handle = Box::into_raw(Box::new(test_handle(runtime, &dir)));
+        unsafe { ant_shutdown(handle) };
+
+        assert!(
+            checkpoint.exists(),
+            "ant_shutdown returned while a task was still writing to the data dir",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Local pipeline mode (no `batch_id`): no gateway, no batch, no
+    /// network — the loop runs entirely on the runtime.
+    fn bench_config(label: &str, duration_s: u64) -> CString {
+        CString::new(format!(
+            r#"{{"label":"{label}","duration_s":{duration_s},"warmup_s":0,"segment_ms":200,"bitrate_kbps":64,"max_in_flight":2}}"#
+        ))
+        .expect("config json")
+    }
+
+    fn bench_slot(handle: *const AntHandle) -> Option<Arc<bench::BenchRun>> {
+        unsafe { &*handle }
+            .bench
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[test]
+    fn bench_stop_does_not_clear_a_run_it_did_not_stop() {
+        // `ant_bench_stop` waits for the cancelled run to settle and then
+        // frees the slot. If it frees whatever is *in* the slot rather
+        // than the run it stopped, a start that legitimately lands inside
+        // that wait (run 1 has settled, so the "already running" check
+        // passes) is orphaned: run 2 keeps publishing for its whole
+        // duration with nobody holding its handle, and the next start
+        // sees an empty slot and adds a second publisher on one uplink.
+        let dir = scratch_dir("bench-stop-race");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let handle = Box::into_raw(Box::new(test_handle(runtime, &dir)));
+
+        let first = bench_config("race-first", 30);
+        assert!(
+            unsafe { ant_bench_start(handle, first.as_ptr(), std::ptr::null_mut()) },
+            "first start",
+        );
+        let run1 = bench_slot(handle).expect("run 1 in the slot");
+
+        // The stopper cancels run 1 and then sits in its settle poll.
+        let stopper = {
+            let addr = handle as usize;
+            std::thread::spawn(move || {
+                let report =
+                    unsafe { ant_bench_stop(addr as *const AntHandle, std::ptr::null_mut()) };
+                assert!(!report.is_null(), "stop must return run 1's report");
+                unsafe { ant_free_string(report) };
+            })
+        };
+        // Give it time to take its clone of run 1 and cancel it. Run 1
+        // only settles at its next 200 ms segment boundary, so we are
+        // polling below well before it does.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The moment run 1 has settled, a second start is legitimate —
+        // and it lands inside the stopper's poll window.
+        while !run1.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = bench_config("race-second", 30);
+        assert!(
+            unsafe { ant_bench_start(handle, second.as_ptr(), std::ptr::null_mut()) },
+            "second start once run 1 settled",
+        );
+        let run2 = bench_slot(handle).expect("run 2 in the slot");
+        assert!(!Arc::ptr_eq(&run1, &run2), "run 2 must be a fresh run");
+
+        stopper.join().expect("stopper thread");
+
+        assert!(
+            bench_slot(handle).is_some_and(|cur| Arc::ptr_eq(&cur, &run2)),
+            "stop released the slot of a run it never stopped: run 2 is orphaned",
+        );
+        let third = bench_config("race-third", 30);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let admitted = unsafe { ant_bench_start(handle, third.as_ptr(), &raw mut err) };
+        if !err.is_null() {
+            unsafe { ant_free_string(err) };
+        }
+        assert!(
+            !admitted,
+            "a third start was admitted while run 2 is still publishing",
+        );
+
+        run2.cancel();
+        while !run2.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        unsafe { ant_shutdown(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ParsedRef doesn't derive Debug because [u8; 32] wouldn't print

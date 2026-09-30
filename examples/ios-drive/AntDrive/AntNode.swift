@@ -35,6 +35,10 @@ final class AntNode: ObservableObject {
     @Published private(set) var plan: StoragePlan?
     @Published private(set) var account: AccountInfo?
     @Published private(set) var settlement: SettlementInfo?
+    /// Whether the deployed chequebook actually backs its cheques.
+    /// Fetched on demand (`refreshSettlementDeposit`) since it reads
+    /// chain; `nil` until then.
+    @Published private(set) var settlementDeposit: SettlementDeposit?
     /// Remaining lifetime of the connected plan. Fetched on demand
     /// (`refreshValidity`) since it needs a chain RPC; `nil` until then.
     @Published private(set) var validity: StorageValidity?
@@ -580,6 +584,30 @@ final class AntNode: ObservableObject {
             let decoded = DriveDecoder.settlement(from: json)
             if decoded != settlement { settlement = decoded }
         }
+    }
+
+    /// Read from chain how much xBZZ stands behind the chequebook. Needs a
+    /// Gnosis RPC URL and a deployed chequebook; best-effort, so a flaky
+    /// RPC leaves the previous value rather than clearing the card.
+    func refreshSettlementDeposit(rpc: String) async {
+        guard let h = handle, !rpc.isEmpty, settlement?.enabled == true else { return }
+        if let json = try? await Self.string(name: "settlement deposit", { errPtr in
+            rpc.withCString { ant_storage_settlement_deposit(h, $0, errPtr) }
+        }), let d = DriveDecoder.settlementDeposit(from: json) {
+            settlementDeposit = d
+        }
+    }
+
+    /// Fund the chequebook up to the settlement deposit, paying with xDAI
+    /// (the node swaps for the xBZZ it needs). Spends real funds. Publishes
+    /// the refreshed deposit so the card updates in place.
+    func topUpSettlementDeposit(rpc: String) async throws {
+        guard let h = handle else { throw AntError.notReady }
+        let json = try await Self.string(name: "top up settlement deposit") { errPtr in
+            rpc.withCString { ant_storage_settlement_topup(h, $0, errPtr) }
+        }
+        if let d = DriveDecoder.settlementDeposit(from: json) { settlementDeposit = d }
+        await refreshAll()
     }
 
     // MARK: - Polling

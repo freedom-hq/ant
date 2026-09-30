@@ -115,6 +115,49 @@ pub fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>, Cheque
     Ok(Some(cb))
 }
 
+/// Like [`load_persisted_chequebook`], but only adopts the record when
+/// the `issuer` it names is `owner`.
+///
+/// A chequebook's issuer is baked into the contract on-chain: bee only
+/// accepts a cheque whose signature recovers to `chequebook.issuer()`,
+/// so a node that signs with a different key emits cheques every peer
+/// silently drops while its own settlement status reads "ready". A
+/// record can outlive the account that wrote it whenever the node key
+/// changes under a fixed data dir (a restore-from-backup-key flow), and
+/// the file already carries the owner, so callers that know their own
+/// EOA should use this rather than trusting the path. A foreign record
+/// reads as `Ok(None)` — "no chequebook for this account" — which is
+/// exactly what a fresh account is, so callers rediscover or deploy
+/// their own instead of failing.
+pub fn load_persisted_chequebook_for(
+    path: &Path,
+    owner: &[u8; 20],
+) -> Result<Option<[u8; 20]>, ChequebookError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ChequebookError::Read(path.display().to_string(), e))?;
+    let file: ChequebookFile = serde_json::from_str(&raw)
+        .map_err(|e| ChequebookError::Parse(path.display().to_string(), e))?;
+    let mut issuer = [0u8; 20];
+    hex::decode_to_slice(strip_0x(file.issuer.trim()), &mut issuer)
+        .map_err(|_| ChequebookError::Decode(file.issuer.clone()))?;
+    if issuer != *owner {
+        tracing::warn!(
+            path = %path.display(),
+            issuer = %format!("0x{}", hex::encode(issuer)),
+            owner = %format!("0x{}", hex::encode(owner)),
+            "ignoring chequebook association issued by a different account",
+        );
+        return Ok(None);
+    }
+    let mut cb = [0u8; 20];
+    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
+        .map_err(|_| ChequebookError::Decode(file.chequebook.clone()))?;
+    Ok(Some(cb))
+}
+
 /// Atomically persist the chequebook association (write-tmp + rename),
 /// so a crash mid-write can't leave a half-written file that a later
 /// start would reject.
@@ -333,6 +376,28 @@ mod tests {
         let cb = [0x11u8; 20];
         persist_chequebook(&path, &ChequebookFile::rediscovered(&cb, &[0x22u8; 20])).unwrap();
         assert_eq!(load_persisted_chequebook(&path).unwrap(), Some(cb));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn owner_checked_load_skips_another_accounts_chequebook() {
+        let dir = std::env::temp_dir().join(format!("ant-cb-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chequebook.json");
+        let cb = [0x11u8; 20];
+        let issuer = [0x22u8; 20];
+        persist_chequebook(&path, &ChequebookFile::rediscovered(&cb, &issuer)).unwrap();
+
+        // Its own issuer adopts it; anyone else sees "no chequebook" and
+        // deploys their own rather than signing cheques bee will drop.
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &issuer).unwrap(),
+            Some(cb)
+        );
+        assert_eq!(
+            load_persisted_chequebook_for(&path, &[0x33u8; 20]).unwrap(),
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

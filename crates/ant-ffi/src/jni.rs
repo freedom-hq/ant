@@ -75,8 +75,11 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeInit<'call
                 }
             };
             // No container-move rebase on Android (its app data dir is
-            // stable across updates), so no source root.
-            match init_inner(&PathBuf::from(path), None) {
+            // stable across updates), so no source root. The Android host
+            // doesn't hold the key yet either (the Keystore-backed
+            // counterpart of the iOS Keychain path is future work), so
+            // the identity still comes from the data dir.
+            match init_inner(&PathBuf::from(path), None, crate::IdentitySource::DataDir) {
                 Ok(handle) => Ok(Box::into_raw(Box::new(handle)) as jlong),
                 Err(e) => {
                     throw_ant_exception(env, &e.to_string());

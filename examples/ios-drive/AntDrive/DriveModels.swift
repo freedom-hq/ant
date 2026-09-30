@@ -320,6 +320,40 @@ struct SettlementInfo: Codable, Equatable {
     let chequebook: String?
 }
 
+/// What actually stands behind this account's cheques, as returned by
+/// `ant_storage_settlement_deposit`. `SettlementInfo` says a chequebook
+/// exists; this says whether it is funded. A chequebook deployed with no
+/// deposit signs cheques nobody can cash: uploads run clean until the
+/// peers' payment tolerance is used up, then collapse into pushsync
+/// timeouts — so the Storage tab detects that here and offers a top-up.
+struct SettlementDeposit: Codable, Equatable {
+    /// False when this account has no chequebook yet — nothing to top up
+    /// (buying or connecting a plan deploys one, funded).
+    let enabled: Bool
+    let chequebook: String?
+    /// xBZZ behind the chequebook right now, and the deposit we aim for.
+    let depositBzz: String
+    let targetBzz: String
+    /// What is still missing, and the single predicate ("is it short?")
+    /// the card and its button both read.
+    let shortfallBzz: String
+    let needsTopUp: Bool
+    /// Extra xDAI the account must receive before the top-up can run.
+    let xdaiToSendDisplay: String
+    let sufficientFunds: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case chequebook
+        case depositBzz = "deposit_bzz"
+        case targetBzz = "target_bzz"
+        case shortfallBzz = "shortfall_bzz"
+        case needsTopUp = "needs_top_up"
+        case xdaiToSendDisplay = "xdai_to_send_display"
+        case sufficientFunds = "sufficient_funds"
+    }
+}
+
 /// Deep read-back propagation result, as returned by
 /// `ant_storage_verify_propagation`. The daemon resolves the manifest,
 /// enumerates the file's chunk tree, fetches every interior node
@@ -581,6 +615,12 @@ struct StorageQuote: Codable, Equatable {
     let days: UInt64
     let amountPerChunk: String
     let totalCostBzz: String
+    /// One-time xBZZ this purchase also puts behind the node's chequebook
+    /// so its cheques are backed ("0" once it is funded). Part of the
+    /// all-in `xdaiToSendDisplay` the user is asked for, not of
+    /// `totalCostBzz`.
+    let settlementDepositPlur: String
+    let settlementDepositBzz: String
     let capacityBytes: UInt64
     let accountBzzDisplay: String
     let accountXdai: String
@@ -595,6 +635,8 @@ struct StorageQuote: Codable, Equatable {
         case days
         case amountPerChunk = "amount_per_chunk"
         case totalCostBzz = "total_cost_bzz"
+        case settlementDepositPlur = "settlement_deposit_plur"
+        case settlementDepositBzz = "settlement_deposit_bzz"
         case capacityBytes = "capacity_bytes"
         case accountBzzDisplay = "account_bzz_display"
         case accountXdai = "account_xdai"
@@ -632,6 +674,11 @@ enum DriveDecoder {
     static func settlement(from json: String) -> SettlementInfo? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(SettlementInfo.self, from: data)
+    }
+
+    static func settlementDeposit(from json: String) -> SettlementDeposit? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(SettlementDeposit.self, from: data)
     }
 
     static func propagation(from json: String) -> PropagationInfo? {

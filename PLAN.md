@@ -336,6 +336,18 @@ Each crate owns its data model and exposes a small API. `ant-node` is the only c
   - Android: StrongBox / Keystore (hardware-backed when available)
 - Rust library never persists raw private keys; it only holds public keys + signs through the callback.
 
+**Status (first step shipped, iOS).** `ant_identity_generate` /
+`ant_identity_from_key` / `ant_init_with_identity` let the host own the
+key *at rest*: `examples/ios-stream` (AntStream) creates the identity,
+keeps it in the Keychain wrapped by a Secure Enclave P-256 key, and
+passes it in at startup, so the library never writes `identity.json`.
+`ant_init` / `ant_init_with_options` (AntDrive, AntDownload, Android)
+keep the data-dir behaviour. The remaining half is the callback-based
+`KeyProvider` — the library still holds the raw secret in memory while
+running, because signing happens at six independent sites (BZZ
+handshake, postage stamps, SWAP cheques, Gnosis txs, ACT ECDH, gateway
+pubkey derivation) and ACT needs ECDH, not just ECDSA.
+
 ---
 
 ## 6. Data Model & Persistence

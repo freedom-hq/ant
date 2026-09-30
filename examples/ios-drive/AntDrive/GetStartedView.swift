@@ -215,6 +215,16 @@ struct GetStartedView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                if includesSettlementDeposit(quote) {
+                    // Say what the extra buys. The price also covers a
+                    // one-time deposit the node puts behind the account it
+                    // pays the network from — without it uploads stall
+                    // once peers stop extending credit.
+                    Text("Includes a one-time \(quote.settlementDepositBzz) xBZZ network deposit that keeps your uploads flowing.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                }
             }
         }
     }
@@ -335,6 +345,14 @@ struct GetStartedView: View {
             }
             if fresh.sufficientFunds { autoActivateIfFunded(); return }
         }
+    }
+
+    /// Whether this price carries the one-time settlement deposit — i.e.
+    /// the chequebook it deploys still needs funding. Zero once it is
+    /// funded, and the note is then left off rather than claiming a
+    /// charge that isn't there.
+    private func includesSettlementDeposit(_ quote: StorageQuote) -> Bool {
+        (UInt64(quote.settlementDepositPlur) ?? 0) > 0
     }
 
     /// Kick off activation the instant funds are detected, but only once per

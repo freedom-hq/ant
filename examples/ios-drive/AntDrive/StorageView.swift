@@ -27,6 +27,8 @@ struct StorageView: View {
                     if node.plan?.enabled == true {
                         if node.settlement?.enabled == false {
                             settlementWarningCard
+                        } else if node.settlementDeposit?.needsTopUp == true {
+                            settlementDepositCard
                         }
                     } else {
                         connectCard
@@ -43,6 +45,7 @@ struct StorageView: View {
             .refreshable {
                 await node.refreshAll()
                 await node.refreshValidity(rpc: rpc)
+                await node.refreshSettlementDeposit(rpc: activeRpc)
             }
         }
         .preferredColorScheme(.dark)
@@ -58,7 +61,18 @@ struct StorageView: View {
         .task {
             await node.refreshAll()
             await node.refreshValidity(rpc: rpc)
+            // Unlike the validity read, this one falls back to the public
+            // RPC: an unfunded chequebook is the state a user has no way
+            // of guessing at, and most installs never type an RPC in.
+            await node.refreshSettlementDeposit(rpc: activeRpc)
         }
+    }
+
+    /// The RPC the on-chain reads use: whatever the user configured, else
+    /// the public Gnosis endpoint (same fallback as the payment sheets).
+    private var activeRpc: String {
+        let r = rpc.trimmingCharacters(in: .whitespaces)
+        return r.isEmpty ? "https://rpc.gnosischain.com" : r
     }
 
     // MARK: header
@@ -161,6 +175,45 @@ struct StorageView: View {
                         flash("Send a little xDAI to your account (copied)")
                     }
                     pillButton("Run setup", icon: "arrow.clockwise") { showConnect = true }
+                }
+            }
+        }
+    }
+
+    // MARK: settlement deposit (top-up)
+
+    /// Shown when the chequebook is deployed but holds no (or too little)
+    /// xBZZ. Paying peers is what keeps uploads moving: an empty
+    /// chequebook signs cheques nobody can cash, so uploads run clean for
+    /// a while and then stall. Plans bought before this app funded the
+    /// chequebook are all in that state, hence the one-tap top-up.
+    private var settlementDepositCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Uploads will stall without a deposit", systemImage: "bolt.badge.clock")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("Your account pays the network as it uploads, and the account it pays from is empty. A one-time \(node.settlementDeposit?.targetBzz ?? "0.0010") xBZZ deposit keeps uploads flowing — it stays yours until it's spent.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                if node.settlementDeposit?.sufficientFunds == false,
+                   let send = node.settlementDeposit?.xdaiToSendDisplay {
+                    Text("Add about \(send) xDAI to your account first.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                HStack(spacing: 12) {
+                    if busy {
+                        ProgressView().tint(.white)
+                    } else {
+                        pillButton("Add deposit", icon: "arrow.up.circle") { topUpDeposit() }
+                    }
+                    if node.settlementDeposit?.sufficientFunds == false {
+                        pillButton("Add xDAI", icon: "plus") {
+                            if let addr = node.account?.ethAddress { copy(addr) }
+                            flash("Send a little xDAI to your account (copied)")
+                        }
+                    }
                 }
             }
         }
@@ -342,6 +395,21 @@ struct StorageView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .glassEffect(.regular.tint(.white.opacity(0.12)), in: .capsule)
+        }
+    }
+
+    /// Put the settlement deposit behind the chequebook. Spends real
+    /// funds, so it only ever runs from the card's explicit tap.
+    private func topUpDeposit() {
+        Task {
+            busy = true
+            defer { busy = false }
+            do {
+                try await node.topUpSettlementDeposit(rpc: activeRpc)
+                flash("Deposit added — uploads are paid for")
+            } catch {
+                flash(error.localizedDescription)
+            }
         }
     }
 

@@ -125,6 +125,13 @@ pub struct RunConfig {
     /// multiaddr for us, so operators behind NAT should set at least one
     /// dialable address here.
     pub external_addrs: Vec<Multiaddr>,
+    /// Dial peers' private / loopback / link-local underlays even when
+    /// this host isn't on the same subnet. Off by default: hive gossip is
+    /// full of Docker/Kubernetes pod addresses, and dialing them from a
+    /// hosted server trips provider netscan detection (issue #88). Only
+    /// for dev/test networks that live entirely on one private network or
+    /// on loopback. Same-LAN private peers are dialed regardless.
+    pub allow_private_dials: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
     pub status: Option<watch::Sender<StatusSnapshot>>,
@@ -400,9 +407,11 @@ fn is_loopback_multiaddr(addr: &Multiaddr) -> bool {
 }
 
 /// Bee's libp2p-go peerstore filters out unroutable addresses (loopback,
-/// RFC1918, link-local) when the peer is connected over a public transport.
-/// Before we promote an observed address to external we need it to pass the
-/// same filter, otherwise we just re-publish what bee will throw away.
+/// RFC1918, CGNAT, link-local, IPv6 ULA) when the peer is connected over a
+/// public transport. Before we promote an observed address to external we
+/// need it to pass the same filter, otherwise we just re-publish what bee
+/// will throw away. The IP classification is shared with the peer-underlay
+/// dial filter ([`crate::underlay::ip_scope`]).
 ///
 /// Also used as the ground truth for "would our libp2p-identify push help
 /// bee's peerstore" — see [`our_identify_useful_for_bee`].
@@ -412,16 +421,11 @@ fn is_globally_routable_multiaddr(addr: &Multiaddr) -> bool {
     let ok = addr.iter().all(|p| match p {
         Protocol::Ip4(ip) => {
             has_ip = true;
-            !ip.is_loopback()
-                && !ip.is_private()
-                && !ip.is_link_local()
-                && !ip.is_unspecified()
-                && !ip.is_broadcast()
-                && !ip.is_documentation()
+            crate::underlay::is_globally_routable_ip(ip.into())
         }
         Protocol::Ip6(ip) => {
             has_ip = true;
-            !ip.is_loopback() && !ip.is_unspecified()
+            crate::underlay::is_globally_routable_ip(ip.into())
         }
         _ => true,
     });
@@ -704,6 +708,26 @@ struct PeerFailure {
     at: Instant,
 }
 
+/// First retry delay after an outbound dial to a hinted peer fails at the
+/// transport level (no route / refused / timed out on every underlay).
+const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Ceiling for the doubling dial backoff.
+const DIAL_BACKOFF_MAX: Duration = Duration::from_mins(30);
+/// How long a [`LocalSubnets`](crate::underlay::LocalSubnets) snapshot is
+/// trusted before the interfaces are re-read (phone switching Wi-Fi ↔
+/// cellular changes which private underlays are same-LAN).
+const LOCAL_SUBNETS_TTL: Duration = Duration::from_secs(30);
+
+/// Per-peer backoff for dials we drive from hints (hive gossip, peerstore
+/// warm-up, neighbourhood / bin-balance dials). Without it a peer whose
+/// underlays are all dead is re-dialed on every top-up, every
+/// neighbourhood request and every bin-balance pass — a stream of
+/// unanswered SYNs that looks like scanning from the outside (issue #88).
+struct DialBackoff {
+    failures: u32,
+    until: Instant,
+}
+
 struct SwarmState {
     /// Peers we've dialed but haven't yet seen a `ConnectionEstablished` or
     /// `OutgoingConnectionError` for. Counting these against `target_peers`
@@ -745,6 +769,14 @@ struct SwarmState {
     /// repeatedly as every bootnode gossips its neighbourhood to us.
     seen_hints: HashSet<PeerId>,
     hint_queue: VecDeque<sinks::PeerHint>,
+    /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
+    allow_private_dials: bool,
+    /// Cached snapshot of this host's subnets for the same-LAN exception
+    /// of the underlay filter, with the time it was taken.
+    local_subnets: Option<(Instant, crate::underlay::LocalSubnets)>,
+    /// Hint-dial backoff for peers whose dials failed; cleared when a
+    /// connection to the peer is established. See [`DialBackoff`].
+    dial_backoff: HashMap<PeerId, DialBackoff>,
     target_peers: usize,
     /// Order in which peers first appeared in the pipeline. Used as the sort
     /// key in [`build_peer_pipeline_entries`] so new peers are appended to
@@ -967,6 +999,9 @@ impl SwarmState {
             known: KnownPeers::new(base_overlay),
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
+            allow_private_dials: false,
+            local_subnets: None,
+            dial_backoff: HashMap::new(),
             target_peers,
             peer_order: HashMap::new(),
             next_peer_order: 0,
@@ -1056,7 +1091,207 @@ impl SwarmState {
         self.dialing.len() + self.pending.len() + self.bzz_peers.len()
     }
 
-    fn enqueue_hint(&mut self, hint: sinks::PeerHint, local_peer_id: PeerId) {
+    /// Filter a peer's advertised underlays down to the ones worth dialing
+    /// from here — see [`crate::underlay::filter_dialable_underlays`].
+    ///
+    /// Called both when a hint is enqueued *and* again right before every
+    /// hint-driven dial: a same-LAN private underlay admitted on the home
+    /// Wi-Fi must not be dialed after the host moved to cellular.
+    fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+        if self.allow_private_dials {
+            return addrs.to_vec();
+        }
+        self.refresh_local_subnets();
+        let local = self
+            .local_subnets
+            .as_ref()
+            .map(|(_, l)| l)
+            .expect("refreshed above");
+        crate::underlay::filter_dialable_underlays(addrs, local, false)
+    }
+
+    /// Re-read the host's subnets once the cached snapshot is older than
+    /// [`LOCAL_SUBNETS_TTL`]. When they changed (Wi-Fi ↔ cellular, a new
+    /// LAN, a DHCP lease with a different address), every private underlay
+    /// cached in `known_dialable` / `hint_queue` was admitted against the
+    /// *old* network — possibly a different LAN that happens to use the
+    /// same `192.168.1.0/24` numbering — so drop them all. Hive gossip
+    /// re-teaches the ones that are same-LAN on the new network, and they
+    /// get filtered against the new snapshot on the way in.
+    ///
+    /// Residual gap: hopping between two LANs with identical numbering
+    /// *and* an identical local address within one TTL is not detectable
+    /// from interface data alone.
+    fn refresh_local_subnets(&mut self) {
+        let stale = self
+            .local_subnets
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= LOCAL_SUBNETS_TTL);
+        if !stale {
+            return;
+        }
+        match crate::underlay::LocalSubnets::from_interfaces() {
+            Some(fresh) => self.set_local_subnets(fresh),
+            // A failed interface read is not "no networks": keep trusting
+            // the previous snapshot for another TTL rather than purging the
+            // caches and rejecting every same-LAN underlay (then purging
+            // again once the next read succeeds).
+            None => self.interfaces_unreadable(),
+        }
+    }
+
+    /// Enumerating the host's interfaces failed. With a previous snapshot,
+    /// keep it (re-stamped, so the read is retried after another TTL rather
+    /// than on every dial). With none yet, fall back to an empty set — no
+    /// private underlay is admitted, the safe direction — and since nothing
+    /// private was cached against it, the change on the next good read
+    /// purges nothing.
+    fn interfaces_unreadable(&mut self) {
+        match self.local_subnets.as_mut() {
+            Some((at, _)) => *at = Instant::now(),
+            None => {
+                self.local_subnets =
+                    Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+            }
+        }
+    }
+
+    /// Install a new subnet snapshot, purging cached private underlays if
+    /// it differs from the previous one. See [`Self::refresh_local_subnets`].
+    fn set_local_subnets(&mut self, fresh: crate::underlay::LocalSubnets) {
+        let changed = self
+            .local_subnets
+            .as_ref()
+            .is_some_and(|(_, old)| !old.same_networks(&fresh));
+        self.local_subnets = Some((Instant::now(), fresh));
+        if changed {
+            self.purge_private_underlays();
+        }
+    }
+
+    /// Strip every private-scope underlay from the cached dial book and
+    /// queue, dropping hints left with nothing to dial. A queued hint that
+    /// is dropped also leaves `seen_hints`, so gossip can re-queue the peer
+    /// once it is reachable again (e.g. back on the same LAN) — otherwise
+    /// the dedup would keep it out of `fill_pipeline_from_hints` until a
+    /// `force_resume` / re-warm clears the whole set.
+    fn purge_private_underlays(&mut self) {
+        let strip = |hint: &mut sinks::PeerHint| {
+            hint.addrs.retain(|a| !crate::underlay::has_private_ip(a));
+            !hint.addrs.is_empty()
+        };
+        let before = self.known_dialable.len() + self.hint_queue.len();
+        self.known_dialable.retain(|_, hint| strip(hint));
+        let seen_hints = &mut self.seen_hints;
+        self.hint_queue.retain_mut(|hint| {
+            let keep = strip(hint);
+            if !keep {
+                seen_hints.remove(&hint.peer_id);
+            }
+            keep
+        });
+        let dropped = before - (self.known_dialable.len() + self.hint_queue.len());
+        debug!(
+            target: "ant_p2p",
+            dropped,
+            "local networks changed; dropped cached private underlays",
+        );
+    }
+
+    /// Re-filter a cached hint's underlays against the *current* networks
+    /// right before dialing it. Returns `None` (and forgets the peer's
+    /// cached dial info) when nothing dialable is left.
+    fn addrs_for_dial(&mut self, hint: &sinks::PeerHint) -> Option<Vec<Multiaddr>> {
+        let addrs = self.dialable_underlays(&hint.addrs);
+        if addrs.is_empty() {
+            self.known_dialable.remove(&hint.peer_id);
+            return None;
+        }
+        Some(addrs)
+    }
+
+    /// Is a hint-driven dial to `peer` currently suppressed by
+    /// [`DialBackoff`]?
+    fn dial_backed_off(&self, peer: &PeerId) -> bool {
+        self.dial_backoff
+            .get(peer)
+            .is_some_and(|b| b.until > Instant::now())
+    }
+
+    /// Record an outbound dial failure: double the peer's backoff (from
+    /// [`DIAL_BACKOFF_BASE`] up to [`DIAL_BACKOFF_MAX`]).
+    fn note_dial_failure(&mut self, peer: PeerId) {
+        let entry = self.dial_backoff.entry(peer).or_insert(DialBackoff {
+            failures: 0,
+            until: Instant::now(),
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        let delay = DIAL_BACKOFF_BASE
+            .saturating_mul(1u32 << entry.failures.saturating_sub(1).min(16))
+            .min(DIAL_BACKOFF_MAX);
+        entry.until = Instant::now() + delay;
+    }
+
+    /// Are we cut off ourselves? With no connected bzz peer at all, an
+    /// outbound dial failure says more about our own link (no network,
+    /// Wi-Fi ↔ cellular handover, the OS suspending sockets) than about
+    /// the remote peer, so it must not be charged to that peer.
+    fn own_connectivity_down(&self) -> bool {
+        self.bzz_peers.is_empty()
+    }
+
+    /// Clear the hint dedup and re-queue every peerstore entry. With
+    /// `clear_backoff`, also forget those peers' [`DialBackoff`] so the
+    /// re-warm actually redials them now instead of skipping every
+    /// known-good peer until its (up to [`DIAL_BACKOFF_MAX`]) window
+    /// expires. Returns the number of hints re-queued.
+    fn rewarm_from_peerstore(
+        &mut self,
+        peerstore: &PeerStore,
+        local_peer_id: PeerId,
+        clear_backoff: bool,
+    ) -> usize {
+        // Clear the dedup so peers we've connected to before can re-enter
+        // the queue; `enqueue_hint` still filters currently-live peers, so
+        // a wholesale clear doesn't disturb surviving connections.
+        self.seen_hints.clear();
+        let warm = peerstore.warm_hints();
+        let warmed = warm.len();
+        for hint in warm {
+            if clear_backoff {
+                self.dial_backoff.remove(&hint.peer_id);
+            }
+            self.enqueue_hint(hint, local_peer_id);
+        }
+        warmed
+    }
+
+    /// Pop the next queued hint worth dialing, skipping peers that are
+    /// already live / mid-pipeline / backed off. A backed-off peer is
+    /// dropped from the queue *and* from `seen_hints`: keeping it queued
+    /// would either spin the fill loop on it or need a second, time-ordered
+    /// queue, whereas forgetting the dedup lets the next hive gossip (or a
+    /// re-warm) re-queue it, and `enqueue_hint` → this check simply drops it
+    /// again until the backoff has expired. The peer's dial info stays in
+    /// `known_dialable` either way.
+    fn pop_dialable_hint(&mut self) -> Option<sinks::PeerHint> {
+        while let Some(hint) = self.hint_queue.pop_front() {
+            if self.bzz_peers.contains(&hint.peer_id)
+                || self.pending.contains_key(&hint.peer_id)
+                || self.dialing.contains(&hint.peer_id)
+            {
+                continue;
+            }
+            if self.dial_backed_off(&hint.peer_id) {
+                self.seen_hints.remove(&hint.peer_id);
+                continue;
+            }
+            return Some(hint);
+        }
+        None
+    }
+
+    fn enqueue_hint(&mut self, mut hint: sinks::PeerHint, local_peer_id: PeerId) {
         // Record the overlay in the known-peer book *before* the
         // dial-dedup early-returns below: every hive advert counts
         // toward "visible peers" even when we never dial it (the peer
@@ -1064,6 +1299,30 @@ impl SwarmState {
         // our own overlay.
         if hint.peer_id != local_peer_id {
             self.known.note(hint.overlay);
+        }
+        // Drop the underlays that only mean something inside the peer's
+        // own network (Docker/Kubernetes pod IPs, RFC1918, loopback, …)
+        // before the hint can reach any dial path — `fill_pipeline_from_hints`,
+        // `dial_toward_target` and bin balancing all dial `hint.addrs`
+        // (each re-filters against the current networks right before
+        // dialing, see `addrs_for_dial`). A peer with nothing dialable left
+        // is not queued at all: `DialOpts::peer_id(..).addresses(vec![])`
+        // does not extend the list through the behaviour, so the dial would
+        // only fail with `NoAddresses` and burn a pipeline slot.
+        let advertised = hint.addrs.len();
+        hint.addrs = self.dialable_underlays(&hint.addrs);
+        if hint.addrs.is_empty() {
+            if advertised > 0 {
+                trace!(
+                    target: "ant_p2p",
+                    peer = %hint.peer_id,
+                    advertised,
+                    "hint has no dialable underlay; skipping",
+                );
+            }
+            return;
+        }
+        if hint.peer_id != local_peer_id {
             // Retain the full dial info (addrs + overlay) so we can dial
             // *toward a chunk's neighbourhood* on demand later — even for
             // peers we don't dial now (peer set full / already seen).
@@ -1093,6 +1352,42 @@ impl SwarmState {
         }
         self.hint_queue.push_back(hint);
     }
+}
+
+/// Book-keeping for an `OutgoingConnectionError` on `peer`.
+///
+/// While our own connectivity is down (no connected bzz peer, see
+/// [`SwarmState::own_connectivity_down`]) the failure is not charged to the
+/// peer at all: neither the in-memory [`DialBackoff`] nor the peerstore's
+/// consecutive-failure count moves. Both would otherwise punish every peer
+/// we try during a local outage — the backoff by keeping known-good peers
+/// undialed for up to [`DIAL_BACKOFF_MAX`] once the link is back, and the
+/// peerstore (worse, and permanent) by evicting them after `MAX_FAIL_COUNT`
+/// failures, which empties exactly the list the post-outage re-warm dials
+/// from. The cost is that a genuinely dead peer tried during a cold start
+/// is only charged once some other peer has connected.
+fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p: PeerId) {
+    // `dial_started` is set by the two paths that *we* drive
+    // (bootstrap_dial, fill_pipeline_from_hints). Any other
+    // outbound dial — e.g. a libp2p-internal redial or a stray
+    // address book attempt — would otherwise pollute the
+    // pipeline with `Failed` rows the operator never asked for.
+    let was_tracked = state.dial_started.remove(&p).is_some();
+    state.dialing.remove(&p);
+    state.dial_hint_addr.remove(&p);
+    if was_tracked {
+        record_swarm_failure(state, p);
+    }
+    if state.own_connectivity_down() {
+        return;
+    }
+    if was_tracked {
+        state.note_dial_failure(p);
+    }
+    // Stored entries that go dud get evicted after
+    // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
+    // already noops for unknown peers.
+    peerstore.record_failure(&p);
 }
 
 fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
@@ -1233,6 +1528,12 @@ const PIPELINE_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
     const FAIL_TTL: Duration = Duration::from_mins(1);
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
+    // Forget backoffs that expired long ago so the map stays bounded; a
+    // peer failing again after that starts over at `DIAL_BACKOFF_BASE`.
+    let now = Instant::now();
+    state
+        .dial_backoff
+        .retain(|_, b| now.saturating_duration_since(b.until) < DIAL_BACKOFF_MAX);
     let Some(tx) = status else { return };
     let routing = routing_snapshot(&state.routing, &state.known);
     let retrieval = build_retrieval_info(state);
@@ -1400,6 +1701,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.peer_eth.clone(),
     );
     state.credit_ledger = credit_ledger;
+    state.allow_private_dials = cfg.allow_private_dials;
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
     // a public multiaddr for us. Without this bee's inbound handshake handler
@@ -6190,20 +6492,22 @@ fn derive_filename_from_path(path: &str) -> Option<String> {
 fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState) {
     let mut dialed = 0usize;
     while dialed < HINT_DIAL_BATCH && state.pipeline_size() < state.target_peers {
-        let Some(hint) = state.hint_queue.pop_front() else {
+        let Some(hint) = state.pop_dialable_hint() else {
             break;
         };
-        if state.bzz_peers.contains(&hint.peer_id)
-            || state.pending.contains_key(&hint.peer_id)
-            || state.dialing.contains(&hint.peer_id)
-        {
-            continue;
-        }
         if swarm.is_connected(&hint.peer_id) {
             continue;
         }
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            // Nothing dialable on the current networks (e.g. a same-LAN
+            // hint after moving to cellular, before the snapshot purge
+            // ran): forget the dedup so gossip can re-queue the peer once
+            // it is reachable again.
+            state.seen_hints.remove(&hint.peer_id);
+            continue;
+        };
         let opts = DialOpts::peer_id(hint.peer_id)
-            .addresses(hint.addrs.clone())
+            .addresses(addrs.clone())
             .build();
         let peer_id = hint.peer_id;
         match swarm.dial(opts) {
@@ -6211,14 +6515,14 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
                 state.failed.retain(|f| f.peer != peer_id);
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 dialed += 1;
                 debug!(
                     target: "ant_p2p",
                     peer = %peer_id,
-                    addrs = hint.addrs.len(),
+                    addrs = addrs.len(),
                     "dialing hive hint",
                 );
             }
@@ -6267,6 +6571,7 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
             !state.bzz_peers.contains(*pid)
                 && !state.dialing.contains(*pid)
                 && !state.pending.contains_key(*pid)
+                && !state.dial_backed_off(pid)
         })
         .map(|(pid, hint)| (*pid, crate::routing::proximity(&target, &hint.overlay)))
         .filter(|(_, po)| *po > best_connected_po)
@@ -6293,15 +6598,16 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
         if swarm.is_connected(&peer_id) {
             continue;
         }
-        let opts = DialOpts::peer_id(peer_id)
-            .addresses(hint.addrs.clone())
-            .build();
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            continue;
+        };
+        let opts = DialOpts::peer_id(peer_id).addresses(addrs.clone()).build();
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
                 state.failed.retain(|f| f.peer != peer_id);
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 debug!(
@@ -6355,13 +6661,11 @@ fn maybe_top_up_peers(
     // Clear the dedup so peers we've previously connected to (and lost) can
     // re-enter the queue. `enqueue_hint` still filters out peers that are
     // currently `bzz_peers` / `pending` / `dialing`, so a wholesale clear is
-    // safe — surviving connections aren't disturbed.
-    state.seen_hints.clear();
-    let warm = peerstore.warm_hints();
-    let warmed = warm.len();
-    for hint in warm {
-        state.enqueue_hint(hint, local_peer_id);
-    }
+    // safe — surviving connections aren't disturbed. After a full collapse
+    // (no bzz peer left) the backoffs were most likely earned while our own
+    // link was failing, so forget them for the peers being re-warmed.
+    let collapsed = state.bzz_peers.is_empty();
+    let warmed = state.rewarm_from_peerstore(peerstore, local_peer_id, collapsed);
     info!(
         target: "ant_p2p",
         peer_set_size = before,
@@ -6407,15 +6711,10 @@ fn force_resume(
     local_peer_id: PeerId,
     bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
 ) -> usize {
-    // Clear the dedup so peers we've connected to before can re-enter the
-    // queue; `enqueue_hint` still filters currently-live peers, so a
-    // wholesale clear doesn't disturb surviving connections.
-    state.seen_hints.clear();
-    let warm = peerstore.warm_hints();
-    let warmed = warm.len();
-    for hint in warm {
-        state.enqueue_hint(hint, local_peer_id);
-    }
+    // Re-queue the peerstore and forget those peers' dial backoff: an
+    // explicit resume after an outage must redial known-good peers now,
+    // not after backoffs earned while our own link was down expire.
+    let warmed = state.rewarm_from_peerstore(peerstore, local_peer_id, true);
     // Unpark the automatic guards: reset the bootstrap backoff and rewind
     // both cadence clocks so the loop-top maintenance can re-fire
     // immediately if this resume doesn't fully recover the set on its own.
@@ -6516,6 +6815,7 @@ fn maybe_balance_bins(
                 || state.dialing.contains(peer_id)
                 || state.closing.contains(peer_id)
                 || state.failed.iter().any(|f| f.peer == *peer_id)
+                || state.dial_backed_off(peer_id)
         },
     );
     if candidates.is_empty() {
@@ -6534,14 +6834,15 @@ fn maybe_balance_bins(
         if swarm.is_connected(&peer_id) {
             continue;
         }
-        let opts = DialOpts::peer_id(peer_id)
-            .addresses(hint.addrs.clone())
-            .build();
+        let Some(addrs) = state.addrs_for_dial(&hint) else {
+            continue;
+        };
+        let opts = DialOpts::peer_id(peer_id).addresses(addrs.clone()).build();
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.dial_started.insert(peer_id, Instant::now());
-                if let Some(a) = hint.addrs.first() {
+                if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
                 debug!(target: "ant_p2p", peer = %peer_id, bin, "dialing for bin balance");
@@ -6621,6 +6922,7 @@ fn handle_swarm_event(
             state.dialing.remove(&peer_id);
             state.dial_hint_addr.remove(&peer_id);
             state.failed.retain(|f| f.peer != peer_id);
+            state.dial_backoff.remove(&peer_id);
             // Only dialer connections need our outbound BZZ handshake — bee
             // initiates the handshake over the listener direction itself.
             let ConnectedPoint::Dialer { address, .. } = endpoint else {
@@ -6749,21 +7051,7 @@ fn handle_swarm_event(
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             if let Some(p) = peer_id {
-                // `dial_started` is set by the two paths that *we* drive
-                // (bootstrap_dial, fill_pipeline_from_hints). Any other
-                // outbound dial — e.g. a libp2p-internal redial or a stray
-                // address book attempt — would otherwise pollute the
-                // pipeline with `Failed` rows the operator never asked for.
-                let was_tracked = state.dial_started.remove(&p).is_some();
-                state.dialing.remove(&p);
-                state.dial_hint_addr.remove(&p);
-                if was_tracked {
-                    record_swarm_failure(state, p);
-                }
-                // Stored entries that go dud get evicted after
-                // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
-                // already noops for unknown peers.
-                peerstore.record_failure(&p);
+                note_outgoing_dial_error(state, peerstore, p);
             }
             // Bootnode dial failures are noisy during rotation; demote to
             // debug once we're past the cold start (peer set > 0).
@@ -7610,9 +7898,395 @@ mod tests {
         overlay[31] = discriminator;
         sinks::PeerHint {
             peer_id,
-            addrs: Vec::new(),
+            addrs: vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
             overlay,
         }
+    }
+
+    /// Issue #88: a hive hint's pod/RFC1918/loopback underlays must never
+    /// reach a dial path, and a hint left with nothing dialable is not
+    /// queued (nor kept for neighbourhood / bin-balance dials) — an empty
+    /// address list would let libp2p fall back to identify's cached,
+    /// unfiltered listen addrs.
+    #[tokio::test]
+    async fn enqueue_hint_filters_unroutable_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        // Pin an empty "local subnets" snapshot so the host's real
+        // interfaces can't make a private address look same-LAN.
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = PeerId::random();
+
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x80, 1);
+        hint.addrs = vec![
+            "/ip4/10.233.64.12/tcp/1634".parse().unwrap(),
+            "/ip4/172.17.0.3/tcp/1634".parse().unwrap(),
+            "/ip4/127.0.0.1/tcp/1634".parse().unwrap(),
+            "/ip4/1.2.3.4/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+
+        let private_only = PeerId::random();
+        let mut hint = hint_in_bin(private_only, 0x40, 2);
+        hint.addrs = vec![
+            "/ip4/10.42.0.7/tcp/1634".parse().unwrap(),
+            "/ip6/fd00::7/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+
+        assert_eq!(state.hint_queue.len(), 1);
+        let queued = &state.hint_queue[0];
+        assert_eq!(queued.peer_id, mixed);
+        assert_eq!(
+            queued.addrs,
+            vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+        assert_eq!(state.known_dialable[&mixed].addrs, queued.addrs);
+        assert!(!state.known_dialable.contains_key(&private_only));
+
+        // Same peer again, now "on its LAN": the private underlay is kept.
+        state.seen_hints.clear();
+        state.hint_queue.clear();
+        state.local_subnets = Some((
+            Instant::now(),
+            crate::underlay::LocalSubnets::from_nets(vec![("10.42.0.1".parse().unwrap(), 16)]),
+        ));
+        let mut hint = hint_in_bin(private_only, 0x40, 2);
+        hint.addrs = vec![
+            "/ip4/10.42.0.7/tcp/1634".parse().unwrap(),
+            "/ip6/fd00::7/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(
+            state.hint_queue[0].addrs,
+            vec!["/ip4/10.42.0.7/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+
+        // The escape hatch keeps every advertised underlay.
+        state.allow_private_dials = true;
+        state.seen_hints.clear();
+        state.hint_queue.clear();
+        let mut hint = hint_in_bin(private_only, 0x40, 2);
+        hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
+        state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// A same-LAN private underlay admitted on one network must not be
+    /// dialed after the host's networks change (Wi-Fi → cellular, or a
+    /// different LAN reusing the same numbering): the dial-time re-filter
+    /// drops it, and a changed subnet snapshot purges it from the caches.
+    #[tokio::test]
+    async fn network_change_drops_cached_private_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let home =
+            crate::underlay::LocalSubnets::from_nets(vec![("192.168.1.7".parse().unwrap(), 24)]);
+        state.local_subnets = Some((Instant::now(), home.clone()));
+        let local = PeerId::random();
+
+        let lan_only = PeerId::random();
+        let mut hint = hint_in_bin(lan_only, 0x80, 1);
+        hint.addrs = vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()];
+        state.enqueue_hint(hint, local);
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x40, 2);
+        hint.addrs = vec![
+            "/ip4/192.168.1.21/tcp/1634".parse().unwrap(),
+            "/ip4/1.2.3.4/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 2);
+        assert!(state.known_dialable.contains_key(&lan_only));
+
+        // Dial-time re-filter: moved to cellular (no private subnet), the
+        // cached LAN address is no longer offered to the dialer, even
+        // before any purge ran.
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let cached = state.known_dialable[&lan_only].clone();
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        assert!(!state.known_dialable.contains_key(&lan_only));
+        let cached = state.known_dialable[&mixed].clone();
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()]),
+        );
+
+        // Snapshot change purges the caches: a different LAN with the
+        // same 192.168.1.0/24 numbering (new lease) must not inherit the
+        // old LAN's addresses.
+        state.local_subnets = Some((Instant::now(), home));
+        state.set_local_subnets(crate::underlay::LocalSubnets::from_nets(vec![(
+            "192.168.1.33".parse().unwrap(),
+            24,
+        )]));
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].peer_id, mixed);
+        assert_eq!(
+            state.hint_queue[0].addrs,
+            vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+        assert_eq!(
+            state.known_dialable[&mixed].addrs,
+            vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()],
+        );
+        // R3-M1: the purged private-only hint left `seen_hints` with the
+        // queue, so gossip re-queues it once it is same-LAN again; the
+        // surviving mixed hint keeps its dedup entry.
+        assert!(!state.seen_hints.contains(&lan_only));
+        assert!(state.seen_hints.contains(&mixed));
+
+        // An unchanged snapshot purges nothing.
+        let mut hint = hint_in_bin(lan_only, 0x80, 1);
+        hint.addrs = vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()];
+        state.enqueue_hint(hint, local);
+        assert_eq!(state.hint_queue.len(), 2);
+        assert_eq!(state.hint_queue[1].peer_id, lan_only);
+        let same = state.local_subnets.as_ref().unwrap().1.clone();
+        state.set_local_subnets(same);
+        assert!(state.known_dialable.contains_key(&lan_only));
+
+        // R2-M1: a rotated temporary IPv6 address is not a network move.
+        let mut rotated = vec![("192.168.1.33".parse().unwrap(), 24)];
+        rotated.push(("2a01:4f8:1:2:cafe::1".parse().unwrap(), 64));
+        state.set_local_subnets(crate::underlay::LocalSubnets::from_nets(rotated));
+        assert!(state.known_dialable.contains_key(&lan_only));
+
+        // R2-M2: a failed interface read keeps the previous snapshot (and
+        // the cached same-LAN underlays) instead of acting as "no networks".
+        let before = state.local_subnets.as_ref().unwrap().1.clone();
+        state.local_subnets.as_mut().unwrap().0 =
+            Instant::now().checked_sub(LOCAL_SUBNETS_TTL).unwrap();
+        state.interfaces_unreadable();
+        let (at, kept) = state.local_subnets.as_ref().unwrap();
+        assert!(kept.same_networks(&before));
+        assert!(at.elapsed() < LOCAL_SUBNETS_TTL);
+        assert!(state.known_dialable.contains_key(&lan_only));
+        let cached = state.known_dialable[&lan_only].clone();
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec!["/ip4/192.168.1.20/tcp/1634".parse().unwrap()]),
+        );
+        // … and with no snapshot yet it falls back to the safe empty set.
+        state.local_subnets = None;
+        state.interfaces_unreadable();
+        assert!(state
+            .local_subnets
+            .as_ref()
+            .unwrap()
+            .1
+            .same_networks(&crate::underlay::LocalSubnets::default()));
+    }
+
+    /// Dead-underlay backoff (issue #88): repeated dial failures double the
+    /// suppression window up to the cap; a connection clears it.
+    #[test]
+    fn dial_backoff_doubles_and_caps() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let peer = PeerId::random();
+        assert!(!state.dial_backed_off(&peer));
+        state.note_dial_failure(peer);
+        assert!(state.dial_backed_off(&peer));
+        let first = state.dial_backoff[&peer].until - Instant::now();
+        assert!(first <= DIAL_BACKOFF_BASE && first > DIAL_BACKOFF_BASE / 2);
+        state.note_dial_failure(peer);
+        let second = state.dial_backoff[&peer].until - Instant::now();
+        assert!(second > DIAL_BACKOFF_BASE && second <= DIAL_BACKOFF_BASE * 2);
+        for _ in 0..40 {
+            state.note_dial_failure(peer);
+        }
+        let capped = state.dial_backoff[&peer].until - Instant::now();
+        assert!(capped <= DIAL_BACKOFF_MAX && capped > DIAL_BACKOFF_MAX / 2);
+        // An expired backoff no longer suppresses dials.
+        state.dial_backoff.get_mut(&peer).unwrap().until = Instant::now();
+        assert!(!state.dial_backed_off(&peer));
+    }
+
+    fn backoff_test_state() -> SwarmState {
+        SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        )
+    }
+
+    /// A real on-disk peerstore holding `peers` as known-good entries.
+    fn peerstore_with(dir: &std::path::Path, peers: &[PeerId]) -> PeerStore {
+        let mut store = PeerStore::load(dir.join("peers.json"));
+        for (i, p) in peers.iter().enumerate() {
+            store.record_success(
+                *p,
+                vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
+                [i as u8 + 1; 32],
+                0,
+                None,
+            );
+        }
+        store
+    }
+
+    /// Drive a tracked dial to `peer` failing through the same handler the
+    /// `OutgoingConnectionError` arm calls (backoff + peerstore).
+    fn fail_tracked_dial(state: &mut SwarmState, peerstore: &mut PeerStore, peer: PeerId) {
+        state.dialing.insert(peer);
+        state.dial_started.insert(peer, Instant::now());
+        note_outgoing_dial_error(state, peerstore, peer);
+    }
+
+    /// An explicit Resume after an outage must redial the peerstore's
+    /// known-good peers now, not skip them until backoffs earned during
+    /// the outage expire; the automatic top-up does the same only after a
+    /// full collapse. Backoffs of peers not being re-warmed are untouched.
+    #[tokio::test]
+    async fn rewarm_clears_backoff_for_rewarmed_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (known, stranger, live) = (pid(), pid(), pid());
+        let mut peerstore = peerstore_with(dir.path(), &[known]);
+        let local = pid();
+        let (tx, _rx) = mpsc::channel::<Multiaddr>(8);
+
+        // Backoff earned while connected (so the handler does charge it).
+        let mut state = backoff_test_state();
+        state.bzz_peers.insert(live);
+        fail_tracked_dial(&mut state, &mut peerstore, known);
+        fail_tracked_dial(&mut state, &mut peerstore, stranger);
+        assert!(state.dial_backed_off(&known) && state.dial_backed_off(&stranger));
+
+        // force_resume: known-good peer redialable and first out of the queue.
+        let mut backoff = MAX_BACKOFF;
+        let (mut last_bootstrap_at, mut last_top_up_at) = (Instant::now(), Instant::now());
+        let warmed = force_resume(
+            &[],
+            &mut state,
+            &peerstore,
+            &mut backoff,
+            &mut last_bootstrap_at,
+            &mut last_top_up_at,
+            local,
+            &tx,
+        );
+        assert_eq!(warmed, 1);
+        assert!(!state.dial_backed_off(&known));
+        assert!(
+            state.dial_backed_off(&stranger),
+            "only re-warmed peers are cleared"
+        );
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(known));
+
+        // maybe_top_up_peers below the floor but with a surviving peer:
+        // not a collapse, so backoffs stand and the hint is not dialed.
+        fail_tracked_dial(&mut state, &mut peerstore, known);
+        assert!(state.dial_backed_off(&known));
+        let mut last_top_up_at = Instant::now().checked_sub(PEER_TOP_UP_INTERVAL).unwrap();
+        maybe_top_up_peers(&[], &mut state, &peerstore, &mut last_top_up_at, local, &tx);
+        assert!(state.dial_backed_off(&known));
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), None);
+
+        // Full collapse: the re-warm clears the known-good peer's backoff.
+        state.bzz_peers.clear();
+        let mut last_top_up_at = Instant::now().checked_sub(PEER_TOP_UP_INTERVAL).unwrap();
+        maybe_top_up_peers(&[], &mut state, &peerstore, &mut last_top_up_at, local, &tx);
+        assert!(!state.dial_backed_off(&known));
+        assert!(state.dial_backed_off(&stranger));
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(known));
+    }
+
+    /// With no connected bzz peer our own link is the likely culprit, so a
+    /// dial failure must neither back the peer off nor count toward its
+    /// peerstore eviction — otherwise a local outage (no network, handover,
+    /// suspend) would back off, and eventually evict, every known-good peer.
+    #[test]
+    fn dial_failures_not_charged_while_own_connectivity_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = pid();
+        let mut peerstore = peerstore_with(dir.path(), &[peer]);
+        let mut state = backoff_test_state();
+
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, peer);
+        }
+        assert!(!state.dial_backed_off(&peer));
+        assert!(
+            peerstore.contains(&peer),
+            "outage must not evict known-good peers"
+        );
+        assert!(state.dialing.is_empty() && state.dial_started.is_empty());
+        assert!(
+            state.failed.iter().any(|f| f.peer == peer),
+            "the failed dial still shows in the pipeline"
+        );
+
+        // Connected again: failures are charged to the peer as before.
+        state.bzz_peers.insert(pid());
+        fail_tracked_dial(&mut state, &mut peerstore, peer);
+        assert!(state.dial_backed_off(&peer));
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, peer);
+        }
+        assert!(
+            !peerstore.contains(&peer),
+            "a genuinely dead peer is still evicted"
+        );
+    }
+
+    /// A backed-off hint popped by the fill loop must not be discarded
+    /// while its peer stays in `seen_hints` (which would keep gossip from
+    /// ever re-queueing it): it leaves the dedup, gossip re-queues it, and
+    /// it is dialed once the backoff has expired.
+    #[test]
+    fn backed_off_hint_leaves_dedup_for_requeue() {
+        let mut state = backoff_test_state();
+        state.bzz_peers.insert(pid());
+        let mut peerstore = PeerStore::disabled();
+        let local = pid();
+        let (dead, good) = (pid(), pid());
+        fail_tracked_dial(&mut state, &mut peerstore, dead);
+        assert!(state.dial_backed_off(&dead));
+
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        state.enqueue_hint(hint_in_bin(good, 0x40, 2), local);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(good));
+        assert!(state.hint_queue.is_empty());
+        assert!(!state.seen_hints.contains(&dead));
+        assert!(state.seen_hints.contains(&good));
+
+        // Gossip re-queues it; still backed off, so dropped again.
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), None);
+
+        // Backoff expired: the next gossip round gets it dialed.
+        state.dial_backoff.get_mut(&dead).unwrap().until = Instant::now();
+        state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
+        assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(dead));
     }
 
     /// `force_resume` is the post-suspension recovery lever, so its whole

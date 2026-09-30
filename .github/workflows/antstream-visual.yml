@@ -1,0 +1,170 @@
+# AntStream simulator evidence (issue #70).
+#
+# Builds the iOS example app for the simulator on a macOS runner, boots a
+# simulator, launches the app, and uploads screenshots + app log as
+# artifacts — so PRs touching examples/ios-stream get build verification
+# and visual evidence despite the orchestrator running on Linux.
+#
+# Device-only paths (camera/broadcast) and real iCloud Keychain sync are
+# out of scope — those stay manual.
+
+name: antstream-visual
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "examples/ios-stream/**"
+      - ".github/workflows/antstream-visual.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulator-evidence:
+    name: build AntStream + simulator screenshots
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: antstream-visual
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          xcodebuild -version
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          DEVICE=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | sed -E 's/^ +//; s/ \([-A-F0-9]+\).*$//')
+          if [ -z "$DEVICE" ]; then
+            echo "no iPhone simulator available"; xcrun simctl list devices; exit 1
+          fi
+          echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
+          echo "picked: $DEVICE"
+
+      - name: Build for simulator
+        working-directory: examples/ios-stream
+        run: |
+          xcodebuild -project AntStream.xcodeproj -scheme AntStream \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
+            -derivedDataPath build build
+
+      - name: Launch and capture screenshots
+        working-directory: examples/ios-stream
+        run: |
+          APP=$(find build/Build/Products -maxdepth 3 -name "AntStream.app" | head -1)
+          [ -n "$APP" ] || { echo "app not found"; exit 1; }
+          xcrun simctl boot "${{ steps.sim.outputs.device }}" || true
+          xcrun simctl bootstatus "${{ steps.sim.outputs.device }}" -b
+          xcrun simctl install booted "$APP"
+          xcrun simctl launch booted at.vibing.ant.stream
+          mkdir -p shots
+          # The app's first frame, before the node has settled: the Go
+          # live gate and the readiness checklist must agree here too,
+          # however far the setup got. (Peers land fast on a runner —
+          # airplane mode / zero peers stays a manual device check.)
+          sleep 3
+          xcrun simctl io booted screenshot shots/00-cold-start.png
+          sleep 17
+          xcrun simctl io booted screenshot shots/01-first-screen.png
+          sleep 25
+          xcrun simctl io booted screenshot shots/02-after-node-start.png
+          # Relaunch straight into the throughput-bench sheet (#67
+          # stage 1). iOS parses `-key value` launch arguments into
+          # UserDefaults, which is the only way to reach a sheet here:
+          # the runner has no tap driver, and a screenshot of the
+          # button alone doesn't show that the sheet renders.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstreamShowBench YES
+          sleep 12
+          xcrun simctl io booted screenshot shots/03-bench-sheet.png
+          # …and once more with a 60 s run started on appear, so the
+          # evidence covers the bench actually measuring (the whole
+          # FFI round trip: ant_bench_start -> _progress -> _stop) and
+          # not just the form that starts it. The simulator has no
+          # storage plan, so this is the no-network pipeline mode.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstreamShowBench YES -antstreamBenchSeconds 60
+          # The sheet waits for `ant_init` before starting (~20 s on a
+          # cold launch), so the first shot is ~25 s into the run and
+          # the second is after it has finished and reported.
+          sleep 45
+          xcrun simctl io booted screenshot shots/04-bench-running.png
+          sleep 60
+          xcrun simctl io booted screenshot shots/05-bench-report.png
+          # And the report state a stopped-too-early run reaches: the
+          # run is cut 3 s in, inside the 5 s warm-up, so the measured
+          # window is empty. The card has to say so instead of showing
+          # a 0.00 Mbit/s run as having sustained the rendition.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstreamShowBench YES -antstreamBenchSeconds 60 \
+            -antstreamBenchStopAfter 3
+          sleep 45
+          xcrun simctl io booted screenshot shots/06-bench-stopped-in-warmup.png
+          # --- Storage / settlement surfaces (PR #75) ---
+          # A screenshot captures only whatever the app opens *to*, and the
+          # runner has no tap driver, so each Storage surface is reached by
+          # its own launch argument (parsed once into RootView.shotArgs)
+          # rather than by driving the tab bar. See RootView.swift.
+          #
+          # 07 — Storage tab on a fresh account: the storage meter's
+          # no-plan state and the "Set up storage" card — whatever #75
+          # renders for settlement when the account has no plan yet.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-storage
+          sleep 22
+          xcrun simctl io booted screenshot shots/07-storage-overview.png
+          # 08 — the buy flow (Get Started) plan picker: the storage plans
+          # and their prices. Pricing needs the network; the layout renders
+          # regardless, so this honestly shows whatever the runner quotes
+          # from the public Gnosis RPC (a spinner/chevron if it can't).
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-getstarted
+          sleep 20
+          xcrun simctl io booted screenshot shots/08-storage-getstarted-plans.png
+          # 09 — the buy flow's payment step: the "Send xDAI" cost card and
+          # the new one-time settlement-deposit line #75 adds ("Includes a
+          # one-time … xBZZ network deposit …"). A live quote needs funds
+          # and a reachable chain, so this is driven with a representative
+          # quote to capture the deposit line the PR is about.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-getstarted -antstream-shot-getstarted-pay
+          sleep 20
+          xcrun simctl io booted screenshot shots/09-storage-getstarted-deposit.png
+          # 10 — the Storage tab's deposit-0 top-up card: #75's migration
+          # surface for installs whose chequebook was deployed unfunded
+          # ("Broadcasts will stall without a deposit" → Add deposit). A
+          # fresh simulator account has no chequebook to be under-funded,
+          # so representative sample state is published to reach the card.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-storage -antstream-shot-deposit
+          sleep 22
+          xcrun simctl io booted screenshot shots/10-storage-deposit-topup.png
+          xcrun simctl spawn booted log show --last 5m \
+            --predicate 'processImagePath contains "AntStream"' \
+            > shots/app-log.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: antstream-simulator-evidence
+          path: examples/ios-stream/shots/
+          if-no-files-found: error

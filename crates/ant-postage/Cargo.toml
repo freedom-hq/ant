@@ -1,11 +1,16 @@
 [package]
 name = "ant-postage"
-version = "0.5.43"
+version = "0.5.49"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 ant-crypto = { path = "../ant-crypto" }
+# Store lock (`acquire_store_lock`): `flock(2)` via rustix. std's
+# `File::try_lock` returns "try_lock() not supported" on Android with
+# older toolchains (reproduced on 1.94; issue #95), which made every
+# batch registration fail there.
+fs4 = "1.0.2"
 hex = { workspace = true }
 k256 = { workspace = true }
 # `bee-recover` only: read bee's `stamperstore` (a LevelDB) and msgpack-
