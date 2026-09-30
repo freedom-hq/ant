@@ -73,6 +73,11 @@ struct StampEntry {
     exists: bool,
     #[serde(rename = "batchTTL")]
     batch_ttl: i64,
+    /// Seconds since the node registered this batch at runtime (see
+    /// [`PostageStatusView::registered_secs_ago`]). Not part of bee's
+    /// shape; only used to gate [`Self::mark_not_on_chain`].
+    #[serde(skip)]
+    registered_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,7 +120,45 @@ impl StampEntry {
             immutable_flag: view.immutable,
             exists: true,
             batch_ttl: PLACEHOLDER_BATCH_TTL_SECS,
+            registered_secs_ago: view.registered_secs_ago,
         })
+    }
+
+    /// The chain confirms this batch does not exist — never created, or
+    /// expired and since evicted (`expireLimited`). Report it the way bee does
+    /// a batch missing from its batchstore (`exists: false`,
+    /// `batchTTL: -1`) and not `usable`, so a client learns it is dead
+    /// from the listing rather than from a peer rejecting its first
+    /// push. (`ant-ffi` also unregisters such a batch once it has an
+    /// RPC; this covers the window before that, and a batch that
+    /// expires while the node runs.)
+    fn mark_not_on_chain(&mut self) {
+        self.exists = false;
+        self.usable = false;
+        self.batch_ttl = -1;
+    }
+
+    /// Whether a "not on chain" read may be believed for this batch.
+    /// A batch the node registered at runtime (just bought / connected)
+    /// is exempt for [`FRESH_BATCH_GRACE`]: the buy was confirmed by
+    /// one RPC backend, and a load-balanced sibling that hasn't seen
+    /// the `BatchCreated` block yet reverts `remainingBalance` and
+    /// reads `batchOwner` as zero for it — exactly the not-on-chain
+    /// signature. Batches reloaded from disk have no registration age
+    /// and are checked immediately.
+    fn may_be_not_on_chain(&self) -> bool {
+        self.registered_secs_ago
+            .is_none_or(|age| age >= FRESH_BATCH_GRACE.as_secs())
+    }
+
+    /// Still on chain but `remainingBalance` reads `0`: expired, just
+    /// not evicted yet (the contract keeps `batchOwner` until someone
+    /// calls `expireLimited`). Storers already reject its stamps and it
+    /// can't be topped up, so it is not `usable`; bee reports such a
+    /// batch with `batchTTL: 0` while it still `exists`.
+    fn mark_expired(&mut self) {
+        self.usable = false;
+        self.batch_ttl = 0;
     }
 }
 
@@ -193,6 +236,13 @@ fn batch_ttl_secs(remaining: u128, price: u128) -> i64 {
     }
 }
 
+/// How long after a runtime registration (buy / connect) `/stamps`
+/// keeps trusting the node over a chain read that says the batch
+/// doesn't exist. RPC backends behind a load balancer lag each other
+/// by a few blocks (5 s each on Gnosis); five minutes is far past that
+/// while still surfacing a genuinely vanished batch promptly.
+const FRESH_BATCH_GRACE: Duration = Duration::from_secs(300);
+
 /// How long the per-batch chain enrichment may take before `/stamps`
 /// gives up and returns the placeholder `amount` / `batchTTL`. The
 /// listing must stay responsive even if the RPC is slow.
@@ -205,6 +255,15 @@ const STAMPS_ENRICH_TIMEOUT: Duration = Duration::from_secs(8);
 /// happy. `amount = remainingBalance + totalOutPayment` and
 /// `batchTTL = (remainingBalance / currentPrice) * blockTime`, matching
 /// bee.
+///
+/// A batch whose balance read fails *and* whose `batchOwner` reads as
+/// the zero address is one the chain doesn't hold: it is marked
+/// [`StampEntry::mark_not_on_chain`] — unless the node registered it
+/// within [`FRESH_BATCH_GRACE`], where a lagging RPC backend is the
+/// likelier explanation. A balance that reads `0` is an
+/// expired batch ([`StampEntry::mark_expired`]). Any other failure keeps
+/// the placeholders — an RPC hiccup must not make a funded batch look
+/// dead.
 async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
     let Some(chain) = handle.chain() else {
         return;
@@ -212,23 +271,45 @@ async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
     if stamps.is_empty() {
         return;
     }
-    let _ = tokio::time::timeout(STAMPS_ENRICH_TIMEOUT, async {
-        let price = chain.reader.current_price().await.unwrap_or(0);
-        let total_out = chain.reader.total_amount().await.unwrap_or(0);
-        for entry in stamps.iter_mut() {
-            let mut id = [0u8; 32];
-            if hex::decode_to_slice(&entry.batch_id, &mut id).is_err() {
-                continue;
-            }
-            let Ok(remaining) = chain.reader.batch_remaining_balance(id).await else {
-                continue;
-            };
-            // Normalised per-chunk balance bee reports as `amount`.
-            entry.amount = remaining.saturating_add(total_out).to_string();
-            entry.batch_ttl = batch_ttl_secs(remaining, price);
-        }
-    })
+    let _ = tokio::time::timeout(
+        STAMPS_ENRICH_TIMEOUT,
+        enrich_entries(stamps, chain.reader.as_ref()),
+    )
     .await;
+}
+
+async fn enrich_entries(stamps: &mut [StampEntry], reader: &dyn crate::ChainReader) {
+    let price = reader.current_price().await.unwrap_or(0);
+    let total_out = reader.total_amount().await.unwrap_or(0);
+    for entry in stamps.iter_mut() {
+        let mut id = [0u8; 32];
+        if hex::decode_to_slice(&entry.batch_id, &mut id).is_err() {
+            continue;
+        }
+        let Ok(remaining) = reader.batch_remaining_balance(id).await else {
+            // `remainingBalance` reverts for a batch the contract no
+            // longer holds; confirm with the owner view before calling
+            // it dead. One `batchOwner` call, not the four-view
+            // `batch_meta`: this runs under the shared enrichment timeout.
+            // A just-bought batch is exempt (lagging RPC backend; see
+            // `may_be_not_on_chain`).
+            if entry.may_be_not_on_chain()
+                && reader
+                    .batch_owner(id)
+                    .await
+                    .is_ok_and(|owner| owner == [0u8; 20])
+            {
+                entry.mark_not_on_chain();
+            }
+            continue;
+        };
+        // Normalised per-chunk balance bee reports as `amount`.
+        entry.amount = remaining.saturating_add(total_out).to_string();
+        entry.batch_ttl = batch_ttl_secs(remaining, price);
+        if remaining == 0 {
+            entry.mark_expired();
+        }
+    }
 }
 
 /// `GET /stamps/{id}`. Returns the registered batch whose id matches,
@@ -465,5 +546,152 @@ mod tests {
     fn astronomical_ttl_clamps_to_i64_max() {
         // Would overflow i64 → clamp instead of wrapping negative.
         assert_eq!(batch_ttl_secs(u128::MAX, 1), i64::MAX);
+    }
+
+    const LIVE: [u8; 32] = [0x11; 32];
+    const GONE: [u8; 32] = [0x22; 32];
+    const FLAKY: [u8; 32] = [0x33; 32];
+    const EXPIRED: [u8; 32] = [0x44; 32];
+
+    /// `LIVE` is funded; `GONE` is not on chain (`remainingBalance`
+    /// reverts, zero owner); `FLAKY`'s reads all fail; `EXPIRED` is
+    /// still owned but drained (`remainingBalance` 0). Counts
+    /// `batch_meta` calls, which enrichment must not need.
+    #[derive(Default)]
+    struct Chain {
+        meta_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChainReader for Chain {
+        async fn block_number(&self) -> Result<u64, String> {
+            Ok(1)
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            Ok(100)
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            Ok(7)
+        }
+        async fn bzz_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn native_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
+        async fn batch_remaining_balance(&self, id: [u8; 32]) -> Result<u128, String> {
+            match id {
+                LIVE => Ok(1_000),
+                EXPIRED => Ok(0),
+                GONE => Err("execution reverted: 0x4ee9bc0f".into()),
+                _ => Err("backend unavailable".into()),
+            }
+        }
+        async fn batch_owner(&self, id: [u8; 32]) -> Result<[u8; 20], String> {
+            match id {
+                GONE => Ok([0u8; 20]),
+                _ => Err("backend unavailable".into()),
+            }
+        }
+        async fn batch_meta(&self, _id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
+            self.meta_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("batch_meta is four eth_calls; enrichment must not use it".into())
+        }
+    }
+
+    fn entry(id: [u8; 32]) -> StampEntry {
+        StampEntry::from_view(&PostageStatusView {
+            usable: true,
+            enabled: true,
+            batch_id: format!("0x{}", hex::encode(id)),
+            batch_depth: 20,
+            bucket_depth: 16,
+            ..PostageStatusView::default()
+        })
+        .unwrap()
+    }
+
+    /// A batch the chain confirms is gone is reported dead (bee's
+    /// `exists: false` / `batchTTL: -1`, not `usable`) instead of green
+    /// until a peer rejects it; a batch whose reads merely fail keeps
+    /// the optimistic placeholders.
+    #[tokio::test]
+    async fn batch_missing_on_chain_is_not_usable() {
+        let chain = Chain::default();
+        let mut stamps = [entry(LIVE), entry(GONE), entry(FLAKY), entry(EXPIRED)];
+        enrich_entries(&mut stamps, &chain).await;
+        let [live, gone, flaky, expired] = &stamps;
+        assert_eq!(
+            chain.meta_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the gone-check reads only batchOwner",
+        );
+
+        assert!(live.usable && live.exists);
+        assert_eq!(live.amount, "1007");
+        assert_eq!(live.batch_ttl, 50);
+
+        assert!(!gone.usable, "a batch the chain doesn't hold is not usable");
+        assert!(!gone.exists);
+        assert_eq!(gone.batch_ttl, -1);
+
+        assert!(
+            flaky.usable && flaky.exists,
+            "a failed read is not a dead batch"
+        );
+        assert_eq!(flaky.batch_ttl, PLACEHOLDER_BATCH_TTL_SECS);
+
+        assert!(
+            !expired.usable,
+            "an expired (drained, not yet evicted) batch is not usable"
+        );
+        assert!(expired.exists, "still on chain until evicted");
+        assert_eq!(expired.batch_ttl, 0);
+    }
+
+    /// A batch the node registered at runtime moments ago (just bought)
+    /// is not declared dead on a not-on-chain read: a load-balanced RPC
+    /// backend may not have the `BatchCreated` block yet. Once the grace
+    /// window passes, the same read is believed again; a batch reloaded
+    /// from disk (no registration age) is checked immediately.
+    #[tokio::test]
+    async fn freshly_registered_batch_survives_lagging_rpc() {
+        let chain = Chain::default();
+        let fresh_view = |age| PostageStatusView {
+            usable: true,
+            enabled: true,
+            batch_id: format!("0x{}", hex::encode(GONE)),
+            batch_depth: 20,
+            bucket_depth: 16,
+            registered_secs_ago: Some(age),
+            ..PostageStatusView::default()
+        };
+        let mut stamps = [
+            StampEntry::from_view(&fresh_view(3)).unwrap(),
+            StampEntry::from_view(&fresh_view(FRESH_BATCH_GRACE.as_secs())).unwrap(),
+            entry(GONE),
+        ];
+        enrich_entries(&mut stamps, &chain).await;
+        let [fresh, stale, reloaded] = &stamps;
+
+        assert!(
+            fresh.usable && fresh.exists,
+            "just-bought batch stays usable"
+        );
+        assert_eq!(fresh.batch_ttl, PLACEHOLDER_BATCH_TTL_SECS);
+
+        assert!(!stale.usable && !stale.exists, "grace window elapsed");
+        assert_eq!(stale.batch_ttl, -1);
+
+        assert!(!reloaded.usable && !reloaded.exists);
+        assert_eq!(reloaded.batch_ttl, -1);
+
+        // `registeredSecsAgo` is internal, not part of bee's shape.
+        let json = serde_json::to_value(fresh).unwrap();
+        assert!(json.get("registered_secs_ago").is_none());
     }
 }

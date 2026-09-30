@@ -202,6 +202,11 @@ pub struct AntHandle {
     /// `host_ctx` the host has since freed.
     #[cfg(feature = "chain")]
     chain_transport: Arc<chain_transport::HostChainTransport>,
+    /// Postage batches reloaded from disk at init that the chain has not
+    /// confirmed yet (init has no RPC). [`ant_start_gateway`] checks
+    /// them once it has one and unregisters the ones the chain disowns.
+    #[cfg(feature = "chain")]
+    persisted_issuers: Arc<drive::PersistedIssuers>,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
@@ -799,9 +804,11 @@ fn init_inner(
     // Upload + postage wiring (`AntDrive`). The node wallet owns every
     // batch it stamps with, so a single `stamp_key` (the node signing
     // secret) signs for all of them. We reload any batch persisted from
-    // a previous run so the user's storage plan survives app restarts
-    // without re-reading the chain; new batches are registered at
-    // runtime by `ant_storage_connect_batch` (RegisterBatch). The
+    // a previous run so the user's storage plan survives app restarts;
+    // there is no RPC here to confirm them on-chain, so (with `chain`)
+    // they are tracked as unverified until `ant_start_gateway` brings
+    // one. New batches are registered at runtime by
+    // `ant_storage_connect_batch` (RegisterBatch). The
     // `UploadManager` drives `antctl upload`-style jobs through the same
     // PushChunk → postage → pushsync pipeline `antd` uses.
     let postage_dir = data_dir.join("postage");
@@ -812,6 +819,8 @@ fn init_inner(
         batch_owner: eth,
         postage_dir: postage_dir.clone(),
     });
+    #[cfg(feature = "chain")]
+    let persisted_issuers = Arc::new(drive::PersistedIssuers::new(Arc::clone(&upload_runtime)));
     let upload_manager = UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), None)
         .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?
         // Read the live status watch so the automatic post-upload heal can
@@ -935,6 +944,8 @@ fn init_inner(
         bench: Mutex::new(None),
         #[cfg(feature = "chain")]
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
+        #[cfg(feature = "chain")]
+        persisted_issuers,
     })
 }
 
@@ -4098,6 +4109,13 @@ mod tests {
             bench: Mutex::new(None),
             #[cfg(feature = "chain")]
             chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
+            #[cfg(feature = "chain")]
+            persisted_issuers: Arc::new(drive::PersistedIssuers::new(Arc::new(UploadRuntime {
+                issuers: Mutex::new(std::collections::HashMap::new()),
+                stamp_key: [0u8; SECP256K1_SECRET_LEN],
+                batch_owner: [0u8; 20],
+                postage_dir: data_dir.join("postage"),
+            }))),
         }
     }
 

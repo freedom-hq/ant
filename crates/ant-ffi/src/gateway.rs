@@ -10,8 +10,9 @@
 //! sandbox), so this is the in-process equivalent: the existing
 //! bee-HTTP Swift layer (`BeeAPIClient`, `BzzSchemeHandler`) points at
 //! `http://127.0.0.1:<port>` unchanged. There is exactly one gateway
-//! per handle; a second `ant_start_gateway` while one is running is a
-//! no-op success.
+//! per handle; a second `ant_start_gateway` while one is running
+//! succeeds without touching it (it only retries the persisted-batch
+//! check).
 //!
 //! CORS is off by default: the gateway has no auth, so any page a
 //! browser lets read its responses can read `/wallet`, `/addresses`,
@@ -61,6 +62,23 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (`antd`) parity. Only honoured when the crate is built with the
 /// `chain` feature; ignored otherwise.
 ///
+/// A `gnosis_rpc` also triggers the on-chain check of the postage
+/// batches [`crate::ant_init`] reloaded from `postage/*.bin` (it had no
+/// RPC to do it itself). It runs in the background right after the
+/// gateway starts: batches the chain reports as missing (evicted or
+/// never created), expired (`remainingBalance` 0) or owned by another
+/// key are unregistered — no longer listed by `GET /stamps`, no longer
+/// stampable — with a `WARN` naming the batch id; their files stay on
+/// disk. "Missing" must be read twice, 45 seconds apart, before it
+/// counts: a batch bought just before a relaunch can read as missing
+/// on an RPC backend that hasn't seen its creation block yet, so the
+/// first such read only schedules a background re-check (the batch
+/// stays registered meanwhile). A batch whose read fails
+/// stays registered and is re-checked by the next call with a
+/// `gnosis_rpc` — including an idempotent one that finds the gateway
+/// already running, so a host may simply re-call this (e.g. on
+/// foreground) to retry.
+///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
 /// [`crate::ant_set_chain_transport`] *before* this; installing one
@@ -82,7 +100,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
 /// (free with [`crate::ant_free_string`]). Idempotent: a second call
-/// while one is live is a no-op success.
+/// while one is live is a success that leaves the running gateway
+/// untouched — it keeps the CORS list and chain wiring it started with
+/// (a changed [`ant_set_gateway_cors`] list only applies after
+/// [`ant_stop_gateway`] + start) and only retries the pending
+/// persisted-batch check above.
 ///
 /// # Safety
 ///
@@ -160,6 +182,13 @@ pub unsafe extern "C" fn ant_start_gateway(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            // Still retry the persisted-batch check: a pass whose RPC
+            // read failed left batches pending, and re-calling start
+            // (e.g. on foreground) is how a host asks for that retry.
+            #[cfg(feature = "chain")]
+            if let Some(rpc) = gnosis_rpc {
+                spawn_persisted_issuer_check(handle, rpc);
+            }
             return true;
         }
         // A finished task (bind error / aborted) is cleared so a retry
@@ -236,7 +265,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 }
             };
             ant_gateway::chainreader::build_with_transport(
-                gnosis_rpc,
+                gnosis_rpc.clone(),
                 // No read-only fallback on mobile: chain reads stay gated
                 // on the host-supplied `gnosis_rpc` (this branch only runs
                 // when it's set), so behavior is unchanged.
@@ -308,8 +337,36 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
         });
         *slot = Some(task);
+
+        // First point an RPC is known: confirm the postage batches
+        // `ant_init` reloaded from disk and unregister the ones the chain
+        // disowns (expired / never created / foreign), as `antd` does at
+        // startup — otherwise `/stamps` keeps offering a dead batch until
+        // a peer rejects the first push. Off the caller's thread so the
+        // gateway start never waits on the RPC; batches whose read fails
+        // stay registered and are retried by the next call with an RPC.
+        #[cfg(feature = "chain")]
+        if let Some(rpc) = gnosis_rpc {
+            spawn_persisted_issuer_check(handle, rpc);
+        }
         true
     }
+}
+
+/// Run [`crate::drive::PersistedIssuers::verify_on_chain`] in the
+/// background against `rpc` (or the host transport, via
+/// `chain_client`). Passes are serialized inside `verify_on_chain`, and
+/// one with nothing pending issues no reads, so calling this on every
+/// `ant_start_gateway` is cheap.
+#[cfg(feature = "chain")]
+fn spawn_persisted_issuer_check(handle: &AntHandle, rpc: String) {
+    let chain = handle.chain_client(rpc);
+    let persisted = Arc::clone(&handle.persisted_issuers);
+    handle.runtime.spawn(async move {
+        persisted
+            .verify_on_chain(&chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await;
+    });
 }
 
 /// Set the CORS origins the in-process gateway allows. Takes effect at

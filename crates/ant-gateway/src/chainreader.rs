@@ -74,6 +74,12 @@ impl ChainReader for AntChainReader {
             .map_err(|e| e.to_string())
     }
 
+    async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
+        ant_chain::fetch_postage_batch_owner(&self.client, &self.postage_contract, &batch_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn batch_meta(&self, batch_id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
         let meta =
             ant_chain::fetch_postage_batch_meta(&self.client, &self.postage_contract, &batch_id)
