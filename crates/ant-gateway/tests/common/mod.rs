@@ -501,6 +501,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         ControlCommand::LurkerSubscribe {
             gsoc_addresses,
             pss_topics,
+            history,
             ack,
             ..
         } => {
@@ -527,7 +528,13 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 .send(ControlAck::LurkerMessage {
                     kind,
                     key,
-                    payload: b"fixture-lurker-payload".to_vec(),
+                    // Echo the mailbox flag so tests can see it reached
+                    // the node command (not just that the query parsed).
+                    payload: if history {
+                        b"fixture-lurker-payload+history".to_vec()
+                    } else {
+                        b"fixture-lurker-payload".to_vec()
+                    },
                 })
                 .await;
             // An all-0xCD address models a LIVE subscription: hold the

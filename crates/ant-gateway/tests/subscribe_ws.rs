@@ -67,6 +67,44 @@ async fn pss_subscribe_delivers_the_topic_message() {
     );
 }
 
+/// Mailbox mode: `?history=true` reaches the node as
+/// `LurkerSubscribe { history: true }` (the fixture echoes the flag into
+/// its payload), and is off by default — guards the query wiring end to
+/// end. The sweep itself is unit-tested in `ant_p2p` (`sweep_window`,
+/// the registry's ticket routing).
+#[tokio::test]
+async fn pss_subscribe_forwards_history_query_to_the_node() {
+    let base = serve().await;
+    for (query, expected) in [
+        ("?history=true", &b"fixture-lurker-payload+history"[..]),
+        ("?history=false", &b"fixture-lurker-payload"[..]),
+        ("", &b"fixture-lurker-payload"[..]),
+    ] {
+        let url = format!("{base}/pss/subscribe/test{query}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.expect("ws");
+        let frame = ws.next().await.expect("frame").expect("ok");
+        assert_eq!(
+            frame,
+            Message::Binary(expected.to_vec().into()),
+            "query {query:?}"
+        );
+    }
+}
+
+/// GSOC has no mailbox: the gateway never forwards `history` for it,
+/// even if a client appends `?history=true`.
+#[tokio::test]
+async fn gsoc_subscribe_never_requests_history() {
+    let base = serve().await;
+    let url = format!("{base}/gsoc/subscribe/{}?history=true", "ab".repeat(32));
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.expect("ws");
+    let frame = ws.next().await.expect("frame").expect("ok");
+    assert_eq!(
+        frame,
+        Message::Binary(b"fixture-lurker-payload".to_vec().into())
+    );
+}
+
 #[tokio::test]
 async fn capped_subscription_is_rejected_with_a_close_reason() {
     let base = serve().await;

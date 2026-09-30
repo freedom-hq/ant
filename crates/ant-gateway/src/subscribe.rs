@@ -51,6 +51,13 @@ pub struct PssSubscribeQuery {
     /// messages there. Absent ⇒ the node's own neighborhood (directed PSS
     /// to this node).
     neighborhood: Option<String>,
+    /// **Mailbox mode** (`?history=true`): on subscribe, sweep a bounded
+    /// recent window of the trojan-bin backlog so messages sent while
+    /// this client was offline are delivered to it (alongside live
+    /// traffic) — not just tail from now. Recent, not complete, on a busy
+    /// bin; see `ant_p2p::lurker::HISTORY_BACKLOG`.
+    #[serde(default)]
+    history: bool,
 }
 
 /// `GET /gsoc/subscribe/{address}` upgrade handler.
@@ -64,9 +71,14 @@ pub async fn gsoc_subscribe(
         return params_error(ParamKind::Path, reasons);
     };
     // Watch exactly this SOC address; reside in its neighborhood.
+    // GSOC has no mailbox mode (a SOC has a latest value, not a message
+    // backlog) — always live, even when it shares a lurker with a
+    // history PSS subscriber: sweeps only pull PSS bins, only emit PSS
+    // messages, and the registry routes backlog to the requesting
+    // subscriber alone.
     let cmd_target = address;
     ws.on_upgrade(move |socket| {
-        run_subscription(handle, socket, cmd_target, vec![address], Vec::new())
+        run_subscription(handle, socket, cmd_target, vec![address], Vec::new(), false)
     })
 }
 
@@ -90,7 +102,10 @@ pub async fn pss_subscribe(
         }
         None => [0u8; 32],
     };
-    ws.on_upgrade(move |socket| run_subscription(handle, socket, target, Vec::new(), vec![topic]))
+    let history = query.history;
+    ws.on_upgrade(move |socket| {
+        run_subscription(handle, socket, target, Vec::new(), vec![topic], history)
+    })
 }
 
 /// Drive one subscription: open the lurker on the node, forward each
@@ -102,12 +117,14 @@ async fn run_subscription(
     target: [u8; 32],
     gsoc_addresses: Vec<[u8; 32]>,
     pss_topics: Vec<[u8; 32]>,
+    history: bool,
 ) {
     let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(SUB_CHANNEL_CAP);
     let cmd = ControlCommand::LurkerSubscribe {
         target,
         gsoc_addresses,
         pss_topics,
+        history,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
