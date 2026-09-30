@@ -54,6 +54,7 @@ fn parse_pin_reference(s: &str) -> Result<Vec<u8>, Response> {
 }
 
 /// Dispatch a pin command and await its single ack.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn dispatch(
     handle: &GatewayHandle,
     headers: &HeaderMap,

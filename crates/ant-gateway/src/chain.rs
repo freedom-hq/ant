@@ -134,6 +134,7 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 /// Run a chain future under [`CHAIN_RPC_TIMEOUT`], mapping the error /
 /// timeout to a bee-shaped response so handlers stay terse.
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn guarded<F, T>(fut: F) -> Result<T, Response>
 where
     F: std::future::Future<Output = Result<T, String>>,
@@ -403,6 +404,7 @@ use axum::extract::{Path, Query};
 use std::collections::HashMap;
 
 /// Run a write (tx-submitting) chain future under [`CHAIN_TX_TIMEOUT`].
+#[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn guarded_tx<F, T>(fut: F) -> Result<T, Response>
 where
     F: std::future::Future<Output = Result<T, String>>,
