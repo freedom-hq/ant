@@ -100,6 +100,8 @@ async fn serve_gateway(log: Arc<Mutex<NodeLog>>) -> String {
         }
         .preset(),
         act_secret: Arc::new(SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
