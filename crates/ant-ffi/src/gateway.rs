@@ -11,8 +11,9 @@
 //! bee-HTTP Swift layer (`BeeAPIClient`, `BzzSchemeHandler`) points at
 //! `http://127.0.0.1:<port>` unchanged. There is exactly one gateway
 //! per handle; a second `ant_start_gateway` while one is running
-//! succeeds without touching it (it only retries the persisted-batch
-//! check).
+//! succeeds without touching it; with a `gnosis_rpc` it re-runs the
+//! chain startup work (persisted-batch check, owned-batch rediscovery,
+//! chequebook adoption) so a step that failed earlier is retried.
 //!
 //! CORS is off by default: the gateway has no auth, so any page a
 //! browser lets read its responses can read `/wallet`, `/addresses`,
@@ -23,7 +24,9 @@
 //! stop a page from *sending* a request: a CORS-simple request (a
 //! `POST` with no body or a form/text body and no custom headers) needs
 //! no preflight, so any page can still fire the state-changing routes —
-//! `POST /stamps/{amount}/{depth}` (buys a batch), `POST
+//! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
+//! `gnosis_rpc`, deploys and funds a chequebook if the account has none:
+//! deploy gas plus an xDAI→xBZZ swap and deposit transfer), `POST
 //! /chequebook/deposit` (moves xBZZ) — with `mode: 'no-cors'`, whatever
 //! the allow-list says. Those routes are unprotected against
 //! cross-site requests; see issue #105.
@@ -108,8 +111,9 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// none, so it sends no CORS headers and no page from another origin can
 /// read its responses. That does not stop a page from *sending*
 /// CORS-simple requests, which still execute — including spending ones
-/// like `POST /stamps/{amount}/{depth}` and `POST /chequebook/deposit`
-/// (see the module docs).
+/// like `POST /stamps/{amount}/{depth}` (which may also deploy and fund
+/// a chequebook, above) and `POST /chequebook/deposit` (see the module
+/// docs).
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -117,8 +121,9 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// while one is live is a success that leaves the running gateway
 /// untouched — it keeps the CORS list and chain wiring it started with
 /// (a changed [`ant_set_gateway_cors`] list only applies after
-/// [`ant_stop_gateway`] + start) and only retries the pending
-/// persisted-batch check above.
+/// [`ant_stop_gateway`] + start). With a `gnosis_rpc` it re-runs the
+/// chain startup work above — all three steps, so a failed batch check,
+/// rediscovery scan or chequebook adoption is retried.
 ///
 /// # Safety
 ///
@@ -446,9 +451,10 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 /// writes: a CORS-simple request needs no preflight, so any page can
 /// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
 /// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
-/// executes it — spending the wallet's xBZZ — even though the page
-/// cannot read the reply. Don't rely on this call to protect the
-/// wallet's funds.
+/// executes it — spending the wallet's xBZZ, and for `/stamps` also
+/// xDAI to deploy and fund a chequebook if there is none — even though
+/// the page cannot read the reply. Don't rely on this call to protect
+/// the wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a

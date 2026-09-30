@@ -751,15 +751,17 @@ void ant_free_string(char *ptr);
  * on that must now call ant_set_gateway_cors explicitly.)
  * CORS only stops reads: any page can still send CORS-simple requests,
  * which execute — including the spending routes POST
- * /stamps/{amount}/{depth} and POST /chequebook/deposit (see
- * ant_set_gateway_cors; issue #105).
+ * /stamps/{amount}/{depth} (which, as above, may also deploy and fund a
+ * chequebook: gas plus an xDAI->xBZZ swap and deposit) and POST
+ * /chequebook/deposit (see ant_set_gateway_cors; issue #105).
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
- * one is live is a success that leaves the gateway untouched (it only
- * retries the pending chain startup work above). Run off the main
- * thread.
+ * one is live is a success that leaves the gateway untouched; with a
+ * `gnosis_rpc` it re-runs all three chain startup steps above, so a
+ * failed batch check, rediscovery scan or chequebook adoption is
+ * retried. Run off the main thread.
  */
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
@@ -791,8 +793,9 @@ bool ant_start_gateway(const AntHandle *handle,
  * A CORS-simple request needs no preflight, so any page can still
  * fetch(url, {method: "POST", mode: "no-cors"}) against
  * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
- * gateway executes it, spending the wallet's xBZZ, even though the page
- * cannot read the reply. Do not rely on this call to protect funds.
+ * gateway executes it, spending the wallet's xBZZ (and, for /stamps
+ * with no chequebook yet, xDAI to deploy and fund one), even though the
+ * page cannot read the reply. Do not rely on this call to protect funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL or non-UTF-8 entry) returns false, leaves the stored list
