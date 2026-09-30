@@ -13,7 +13,8 @@
 //! per handle; a second `ant_start_gateway` while one is running
 //! succeeds without touching it; with a `gnosis_rpc` it re-runs the
 //! chain startup work (persisted-batch check, owned-batch rediscovery,
-//! chequebook adoption) so a step that failed earlier is retried.
+//! chequebook adoption) so a step that failed earlier is retried —
+//! a step that already succeeded is skipped.
 //!
 //! CORS is off by default: the gateway has no auth, so any page a
 //! browser lets read its responses can read `/wallet`, `/addresses`,
@@ -25,9 +26,11 @@
 //! `POST` with no body or a form/text body and no custom headers) needs
 //! no preflight, so any page can still fire the state-changing routes —
 //! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
-//! `gnosis_rpc`, deploys and funds a chequebook if the account has none:
-//! deploy gas plus an xDAI→xBZZ swap and deposit transfer), `POST
-//! /chequebook/deposit` (moves xBZZ) — with `mode: 'no-cors'`, whatever
+//! `gnosis_rpc`, then deploys a chequebook if the account has none —
+//! xDAI gas — and funds it, or tops up an existing one below the
+//! settlement-deposit target, by transferring the wallet's existing
+//! xBZZ; nothing is swapped), `POST /chequebook/deposit` (moves xBZZ) —
+//! with `mode: 'no-cors'`, whatever
 //! the allow-list says. Those routes are unprotected against
 //! cross-site requests; see issue #105.
 
@@ -93,8 +96,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// succeeded are not repeated.
 ///
 /// With a `gnosis_rpc`, a batch bought through `POST /stamps` also makes
-/// sure settlement is on afterwards, deploying and funding a chequebook
-/// if the account has none, as `ant_storage_buy` does.
+/// sure settlement is on afterwards, as `ant_storage_buy` does: it
+/// deploys a chequebook if the account has none (paying gas in xDAI)
+/// and brings the deposit of a new or existing chequebook up to the
+/// settlement target from the wallet's existing xBZZ (capped to what
+/// the wallet holds; nothing is swapped).
 ///
 /// The gateway's chain wiring is captured **here, once**. A host that
 /// serves chain reads itself must therefore call
@@ -111,9 +117,9 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// none, so it sends no CORS headers and no page from another origin can
 /// read its responses. That does not stop a page from *sending*
 /// CORS-simple requests, which still execute — including spending ones
-/// like `POST /stamps/{amount}/{depth}` (which may also deploy and fund
-/// a chequebook, above) and `POST /chequebook/deposit` (see the module
-/// docs).
+/// like `POST /stamps/{amount}/{depth}` (which may also deploy a
+/// chequebook and move xBZZ into a new or under-funded one, above) and
+/// `POST /chequebook/deposit` (see the module docs).
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
@@ -122,8 +128,12 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// untouched — it keeps the CORS list and chain wiring it started with
 /// (a changed [`ant_set_gateway_cors`] list only applies after
 /// [`ant_stop_gateway`] + start). With a `gnosis_rpc` it re-runs the
-/// chain startup work above — all three steps, so a failed batch check,
-/// rediscovery scan or chequebook adoption is retried.
+/// chain startup work above, retrying only what hasn't succeeded yet: a
+/// batch whose check failed or is still pending is re-read, and a
+/// rediscovery scan or chequebook adoption that failed is retried. A
+/// rediscovery scan or adoption that already succeeded is not repeated
+/// in this process — a batch bought on another device only shows up
+/// after a fresh `ant_init` or an explicit `ant_storage_discover`.
 ///
 /// # Safety
 ///
@@ -451,9 +461,11 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
 /// writes: a CORS-simple request needs no preflight, so any page can
 /// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
 /// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
-/// executes it — spending the wallet's xBZZ, and for `/stamps` also
-/// xDAI to deploy and fund a chequebook if there is none — even though
-/// the page cannot read the reply. Don't rely on this call to protect
+/// executes it — spending the wallet's xBZZ (for `/stamps` both the
+/// batch and a transfer into a new or under-funded chequebook's
+/// deposit) and, for `/stamps` with no chequebook yet, xDAI gas to
+/// deploy one; nothing is swapped — even though the page cannot read
+/// the reply. Don't rely on this call to protect
 /// the wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
