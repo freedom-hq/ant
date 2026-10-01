@@ -947,8 +947,11 @@ pub(crate) fn storage_connect_batch(
         // otherwise uploads stamp fine but never propagate (bee freezes
         // an unpaying node out past its payment threshold). Best-effort:
         // a thin wallet or flaky RPC just leaves settlement off, which
-        // the Storage UI surfaces via `settlement_status`.
-        ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+        // the Storage UI surfaces via `settlement_status`. The running
+        // gateway follows the outcome.
+        let chequebook =
+            ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+        sync_gateway_chequebook(&h.gateway_chequebook, &eth, chequebook);
         postage_status_json(&cmd_tx).await
     })
 }
@@ -990,7 +993,9 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
         // settlement is on so uploads against it actually reach the
         // network. Best-effort; never fails discovery.
         if !registered.is_empty() {
-            ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+            let chequebook =
+                ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+            sync_gateway_chequebook(&h.gateway_chequebook, &eth, chequebook);
         }
         let status = postage_status_json(&cmd_tx).await?;
         // `status` is already a JSON document; splice it in raw.
@@ -1401,13 +1406,14 @@ async fn activate_bought_batch(
         Some(new.block),
     )
     .await?;
-    ensure_settlement(
+    ensure_settlement_for_gateway(
         &h.cmd_tx,
         client,
         wallet,
         &h.data_dir,
         h.signing_secret,
         h.eth,
+        &h.gateway_chequebook,
     )
     .await;
     postage_status_json(&h.cmd_tx).await
@@ -1638,6 +1644,27 @@ pub(crate) fn sync_gateway_chequebook(
             }
         }
     }
+}
+
+/// [`ensure_settlement`] for a C-API storage call, then point the
+/// in-process gateway's chequebook `slot` at the outcome, as the
+/// gateway's own after-buy hook and chain init do. Without that, a
+/// chequebook set up by `ant_storage_buy*` stayed invisible to the
+/// running gateway's `/chequebook/*`, `/wallet` and
+/// `POST /chequebook/deposit` until the next `ant_start_gateway`.
+#[cfg(feature = "chain")]
+async fn ensure_settlement_for_gateway(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    secret: [u8; 32],
+    node_eth: [u8; 20],
+    slot: &ant_gateway::ChequebookSlot,
+) -> Option<[u8; 20]> {
+    let chequebook = ensure_settlement(cmd_tx, client, wallet, data_dir, secret, node_eth).await;
+    sync_gateway_chequebook(slot, &node_eth, chequebook);
+    chequebook
 }
 
 /// Switch outbound SWAP settlement off in the running node if it runs on
@@ -2079,8 +2106,12 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
         // may still be at deposit 0, so it's funded here too; this
         // checklist step means the same thing whichever branch produced
         // the address.
-        match setup_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, node_eth, true).await?
-        {
+        let chequebook =
+            setup_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, node_eth, true).await?;
+        // The running gateway follows, so `/chequebook/address` reports
+        // the new chequebook without another `ant_start_gateway`.
+        sync_gateway_chequebook(&h.gateway_chequebook, &node_eth, chequebook);
+        match chequebook {
             Some(chequebook) => to_json(&DeployedChequebook {
                 chequebook_address: format!("0x{}", hex::encode(chequebook)),
             }),
@@ -3613,6 +3644,37 @@ mod chain_tests {
             Some(CANDIDATE),
             "the corrupt record is rewritten",
         );
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chequebook a C-API storage call sets settlement up on reaches
+    /// the running gateway's slot at once (`/chequebook/address`,
+    /// `/wallet`), without another `ant_start_gateway`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_c_api_settlement_points_the_gateway_at_its_chequebook() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-capi-slot");
+        persist(&dir, CANDIDATE, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+        let slot = ant_gateway::ChequebookSlot::default();
+
+        let got = super::ensure_settlement_for_gateway(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            &slot,
+        )
+        .await;
+
+        assert_eq!(got, Some(CANDIDATE));
+        assert_eq!(slot.get(), Some(CANDIDATE), "the gateway reports it");
         assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
         std::fs::remove_dir_all(&dir).ok();
     }
