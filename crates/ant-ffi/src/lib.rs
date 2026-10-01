@@ -2514,9 +2514,10 @@ pub unsafe extern "C" fn ant_storage_discover(
 ///
 /// Returns a heap C string `{"chequebookAddress":"0x<40hex>"}` on success
 /// (free with [`ant_free_string`]), or `NULL` with an error written to
-/// `out_err`. The caller should restart the gateway afterwards (stop +
-/// start) so [`ant_start_gateway`] reloads the persisted chequebook into
-/// its `ChainContext` and `/chequebook/address` reflects it.
+/// `out_err`. A running in-process gateway picks the chequebook up at
+/// once: `/chequebook/address` and `/wallet` report it with no gateway
+/// restart. One the on-chain checks disqualify is cleared from them (and
+/// the call returns `NULL` with the reason).
 ///
 /// # Safety
 ///
