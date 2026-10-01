@@ -40,6 +40,9 @@ const CHAIN_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Read-only Gnosis views the chain-backed endpoints need. All amounts
 /// are PLUR/wei lower-128 bits (enough for any sane balance) returned as
 /// `u128`; the handlers stringify them into bee's bigint-as-string JSON.
+// `#[async_trait]` marks each boxed-future method `#[must_use]`, and
+// clippy 1.99's `double_must_use` flags that expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainReader: Send + Sync {
     async fn block_number(&self) -> Result<u64, String>;
@@ -91,6 +94,9 @@ pub struct BatchMetaView {
 /// handlers run under a longer timeout than the read path. `None` on the
 /// [`ChainContext`] when no funded wallet key is configured — the write
 /// endpoints then fall to `501`.
+// `#[async_trait]` marks each boxed-future method `#[must_use]`, and
+// clippy 1.99's `double_must_use` flags that expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainWriter: Send + Sync {
     /// `PostageStamp.createBatch` (after the BZZ `approve`). `amount` is

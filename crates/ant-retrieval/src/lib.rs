@@ -125,6 +125,9 @@ use tracing::{debug, trace};
 /// node can be retrieved in parallel without contention. Implementations
 /// that need to mutate per-call state (e.g. a peer blacklist) wrap it in
 /// interior mutability.
+// `#[async_trait]` marks each boxed-future method `#[must_use]`, and
+// clippy 1.99's `double_must_use` flags that expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChunkFetcher: Send + Sync {
     /// Fetch the wire bytes (`span (8 LE) || payload`) of the chunk at
@@ -457,7 +460,7 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let decoded: PbDelivery = read_delimited(&mut cur, DELIVERY_MAX).await.unwrap();
         assert_eq!(decoded.data, wire);
-        assert!(decoded.err.is_empty());
+        assert_eq!(decoded.err, "");
         assert!(cac_valid(&addr, &decoded.data));
     }
 

@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(result.chunks.len(), 1);
         assert_eq!(result.total_bytes, 0);
         let back = round_trip(b"").await.unwrap();
-        assert!(back.is_empty());
+        assert_eq!(back, [] as [u8; 0]);
     }
 
     /// 5 KiB → root has 2 leaf children, first 4 KiB and second 1 KiB.

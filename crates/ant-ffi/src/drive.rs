@@ -3148,7 +3148,7 @@ mod chain_tests {
             BTreeSet::from([lagging]),
             "the batch found on re-read is kept; the one still missing is dropped",
         );
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
         assert!(persisted.lock_not_found_since().is_empty());
         let queried = script.queried.lock().unwrap().clone();
         assert_eq!(
@@ -3236,7 +3236,7 @@ mod chain_tests {
         queried.sort_unstable();
         assert_eq!(queried, ids.to_vec(), "each batch is asked about once");
         assert!(upload.issuers.lock().unwrap().is_empty());
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3331,7 +3331,7 @@ mod chain_tests {
             .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         assert_eq!(registered(), BTreeSet::from([live, unreadable, bought]));
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
         assert!(script
             .queried
             .lock()
@@ -3751,7 +3751,7 @@ mod chain_tests {
             .expect_err("a disqualified chequebook must not be used");
 
             assert!(err.to_string().contains(why), "got {err}");
-            assert!(node.lock().unwrap().enabled.is_empty());
+            assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
             assert_eq!(
                 node.lock().unwrap().disabled,
                 vec![BAD],
@@ -3788,7 +3788,7 @@ mod chain_tests {
         .unwrap();
 
         assert_eq!(got, None);
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         for spend in [
             "eth_getBalance",
             "eth_getTransactionCount",
@@ -3908,7 +3908,7 @@ mod chain_tests {
         node.lock().unwrap().fail_registers = 1;
 
         init.rediscover_owned(&client(&script), &cmd_tx).await;
-        assert!(node.lock().unwrap().registered.is_empty());
+        assert_eq!(node.lock().unwrap().registered, [] as [[u8; 32]; 0]);
         assert!(!*init.batches_rediscovered.lock().await);
 
         init.rediscover_owned(&client(&script), &cmd_tx).await;
@@ -3956,7 +3956,7 @@ mod chain_tests {
         .expect("a lagging read is not a disqualification");
         assert_eq!(got, Some(FRESH));
         assert_eq!(node.lock().unwrap().enabled, vec![FRESH]);
-        assert!(node.lock().unwrap().disabled.is_empty());
+        assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert_eq!(script.seen("eth_getTransactionReceipt"), 1);
 
         // R2-M2: the same record long after the deploy: a backend
@@ -4109,7 +4109,7 @@ mod chain_tests {
             true,
         )
         .await;
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert!(!record.exists());
         assert!(dir.join("chequebook.json.unreadable").exists());
         assert!(script.seen("eth_getBalance") > 0, "deploy attempted");
@@ -4229,7 +4229,7 @@ mod chain_tests {
         assert_eq!(card["enabled"], true);
         assert_eq!(card["needs_top_up"], false);
         assert_eq!(script.seen("eth_sendRawTransaction"), 0);
-        assert!(node.lock().unwrap().disabled.is_empty());
+        assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4341,7 +4341,7 @@ mod chain_tests {
             }
             if just_deployed {
                 assert!(err.to_string().contains("hasn't caught up"), "got {err}");
-                assert!(node.lock().unwrap().disabled.is_empty());
+                assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
                 assert!(!super::is_disqualified(&eth, &CB));
             } else {
                 assert!(err.to_string().contains("not registered"), "got {err}");
@@ -4550,7 +4550,7 @@ mod chain_tests {
             err.to_string().contains("could not be re-verified"),
             "got {err}"
         );
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert_eq!(node.lock().unwrap().disabled, vec![CB]);
         assert!(super::is_disqualified(&eth, &CB));
         assert_eq!(script.seen("eth_sendRawTransaction"), 0);
@@ -4588,7 +4588,7 @@ mod chain_tests {
         .expect_err("rejected before the transfer");
 
         assert!(err.to_string().contains("not registered"), "got {err}");
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert_eq!(node.lock().unwrap().disabled, vec![CB]);
         assert!(super::is_disqualified(&eth, &CB));
         for spend in ["eth_getTransactionCount", "eth_sendRawTransaction"] {

@@ -36,8 +36,9 @@
 //! **A host must emit `-32000` only when its index cannot cover the
 //! request** — never as a generic failure code. geth and Nethermind use
 //! `-32000` as a catch-all for genuine, non-retryable failures as well:
-//! `nonce too low`, `already known`, `insufficient funds for gas * price
-//! + value`, `replacement transaction underpriced`, and on some backends
+//! `nonce too low`, `already known`,
+//! `insufficient funds for gas * price + value`,
+//! `replacement transaction underpriced`, and on some backends
 //! `execution reverted`. A host whose verified ladder bottoms out at an
 //! RPC-quorum stage and forwards backend replies verbatim therefore
 //! turns every one of those into can't-serve, and ant replays the

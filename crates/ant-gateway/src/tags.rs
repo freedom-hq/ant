@@ -384,7 +384,7 @@ mod tests {
         let view = reg.get(uid).expect("tag exists");
         assert_eq!(view.uid, 1);
         assert_eq!(view.split, 0);
-        assert!(!view.started_at.is_empty());
+        assert_ne!(view.started_at, "");
     }
 
     #[test]

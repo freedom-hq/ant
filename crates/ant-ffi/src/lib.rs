@@ -4606,7 +4606,10 @@ mod tests {
             nested_comment_openers("/* ok */\n/**\n * \"https://*.x\"\n */\n// a/*b\n"),
             vec![3]
         );
-        assert!(nested_comment_openers("/* a */ int x; /* b */\n/*/ c */\n").is_empty());
+        assert_eq!(
+            nested_comment_openers("/* a */ int x; /* b */\n/*/ c */\n"),
+            [] as [usize; 0]
+        );
     }
 
     /// 1-based line numbers where "/*" appears inside a block comment.

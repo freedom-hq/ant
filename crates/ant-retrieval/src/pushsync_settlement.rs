@@ -91,6 +91,9 @@ pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
 /// just because the settlement leg failed — we want best-effort
 /// emission, not "block uploads if cheques can't be sent". Errors are
 /// logged inside the implementation.
+// `#[async_trait]` marks each boxed-future method `#[must_use]`, and
+// clippy 1.99's `double_must_use` flags that expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PushsyncSettlement: Send + Sync {
     /// Called once per accepted pushsync receipt. `price` is the chunk

@@ -1221,7 +1221,7 @@ mod tests {
         })
         .await;
         assert!(!result.unwrap().needs_top_up());
-        assert!(sent.is_empty());
+        assert_eq!(sent, [] as [&str; 0]);
     }
 
     /// R1-F3: every paying path sizes its swap from the wallet's xBZZ. A

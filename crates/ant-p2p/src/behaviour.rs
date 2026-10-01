@@ -8028,13 +8028,16 @@ mod tests {
 
         // Marked unusable, probe scheduled but not yet due.
         assert!(rejected.lock().unwrap().contains_key(&batch));
-        assert!(due_batch_probes(&rejected, Instant::now()).is_empty());
+        assert_eq!(
+            due_batch_probes(&rejected, Instant::now()),
+            [] as [[u8; 32]; 0]
+        );
 
         // After the initial backoff the probe is due — and popping it
         // marks the flight so the next tick can't double-fire it.
         let later = Instant::now() + BATCH_PROBE_BACKOFF_INITIAL + Duration::from_millis(10);
         assert_eq!(due_batch_probes(&rejected, later), vec![batch]);
-        assert!(due_batch_probes(&rejected, later).is_empty());
+        assert_eq!(due_batch_probes(&rejected, later), [] as [[u8; 32]; 0]);
 
         // A successful probe clears the mark → /stamps flips usable.
         record_batch_probe_outcome(&rejected, batch, None);
@@ -8059,7 +8062,7 @@ mod tests {
         // within the flight lease → NO second probe fires.
         let mid_flight = t0 + 4 * BATCH_PROBE_BACKOFF_INITIAL;
         assert!(mid_flight < t0 + BATCH_PROBE_FLIGHT_LEASE);
-        assert!(due_batch_probes(&rejected, mid_flight).is_empty());
+        assert_eq!(due_batch_probes(&rejected, mid_flight), [] as [[u8; 32]; 0]);
 
         // The outcome lands (still rejected): flight released, backoff
         // doubled exactly ONCE, and the next probe fires on the new
