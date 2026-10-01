@@ -427,8 +427,17 @@ mod tests {
         let data = serialize_grantees(&[a, b]);
         assert_eq!(data.len(), 130);
         assert_eq!(deserialize_grantees(&data), vec![a, b]);
-        assert!(deserialize_grantees(&[0u8; 65]).is_empty());
-        assert!(deserialize_grantees(&data[..64]).is_empty());
-        assert!(deserialize_grantees(&[]).is_empty());
+        assert_eq!(
+            deserialize_grantees(&[0u8; 65]),
+            [] as [k256::elliptic_curve::PublicKey<k256::Secp256k1>; 0]
+        );
+        assert_eq!(
+            deserialize_grantees(&data[..64]),
+            [] as [k256::elliptic_curve::PublicKey<k256::Secp256k1>; 0]
+        );
+        assert_eq!(
+            deserialize_grantees(&[]),
+            [] as [k256::elliptic_curve::PublicKey<k256::Secp256k1>; 0]
+        );
     }
 }

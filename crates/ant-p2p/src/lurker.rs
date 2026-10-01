@@ -1576,7 +1576,7 @@ mod tests {
     /// upstream, but the function must not invent coverage).
     #[test]
     fn no_watch_no_bins() {
-        assert!(covering_bins(12, false, false).is_empty());
+        assert_eq!(covering_bins(12, false, false), [] as [u8; 0]);
     }
 
     /// Live pullers only ever tail from the cursor (history or not):

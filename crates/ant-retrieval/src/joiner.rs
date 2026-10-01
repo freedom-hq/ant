@@ -1835,7 +1835,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(inv.leaves, vec![addr]);
-        assert!(inv.intermediates.is_empty());
+        assert_eq!(inv.intermediates, [] as [[u8; 32]; 0]);
         assert_eq!(inv.total(), 1);
     }
 

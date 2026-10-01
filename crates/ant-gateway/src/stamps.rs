@@ -60,6 +60,14 @@ struct StampEntry {
     batch_id: String,
     utilization: u32,
     usable: bool,
+    /// Ant-specific, not in bee's shape (bee-js ignores it): `true`
+    /// while `usable` is `false` only because a batch this node just
+    /// bought is still propagating to the storers (bee's confirmation
+    /// window, about 70 s). Uploads with it are accepted and wait the
+    /// window out. `usable: false` with `propagating: false` means the
+    /// batch won't become usable by waiting: peers rejected it, or the
+    /// chain says it's gone or expired.
+    propagating: bool,
     label: String,
     depth: u8,
     /// Per-chunk balance as a string integer (PLUR). Not known locally
@@ -115,6 +123,7 @@ impl StampEntry {
             // itself (ant has no batchstore), so a batch is reported
             // usable only while the network isn't refuting it.
             usable: view.usable,
+            propagating: view.propagating,
             label: String::new(),
             depth: view.batch_depth,
             amount: "0".to_string(),
@@ -140,6 +149,7 @@ impl StampEntry {
     fn mark_not_on_chain(&mut self) {
         self.exists = false;
         self.usable = false;
+        self.propagating = false;
         self.batch_ttl = -1;
     }
 
@@ -163,6 +173,7 @@ impl StampEntry {
     /// batch with `batchTTL: 0` while it still `exists`.
     fn mark_expired(&mut self) {
         self.usable = false;
+        self.propagating = false;
         self.batch_ttl = 0;
     }
 }
@@ -656,6 +667,44 @@ mod tests {
         );
         assert!(expired.exists, "still on chain until evicted");
         assert_eq!(expired.batch_ttl, 0);
+    }
+
+    /// `propagating` tells a client a fresh batch (wait, or just upload:
+    /// pushes wait it out) from a dead one; both read `usable: false`.
+    /// A dead verdict from the chain clears it.
+    #[test]
+    fn stamps_say_when_a_batch_is_only_propagating() {
+        let view = PostageStatusView {
+            usable: false,
+            propagating: true,
+            enabled: true,
+            batch_id: format!("0x{}", hex::encode([0x43u8; 32])),
+            batch_depth: 20,
+            bucket_depth: 16,
+            ..PostageStatusView::default()
+        };
+        let fresh = StampEntry::from_view(&view).unwrap();
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(json["usable"], false);
+        assert_eq!(json["propagating"], true);
+        assert_eq!(json["exists"], true);
+
+        let rejected = StampEntry::from_view(&PostageStatusView {
+            propagating: false,
+            ..view.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&rejected).unwrap()["propagating"],
+            false
+        );
+
+        let mut gone = StampEntry::from_view(&view).unwrap();
+        gone.mark_not_on_chain();
+        assert!(!gone.propagating);
+        let mut expired = StampEntry::from_view(&view).unwrap();
+        expired.mark_expired();
+        assert!(!expired.propagating);
     }
 
     /// bee's `blockNumber`: the creation block of a batch the node

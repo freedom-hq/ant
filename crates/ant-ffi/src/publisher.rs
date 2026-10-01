@@ -2119,7 +2119,7 @@ mod tests {
         assert_eq!(report.segments_published, 3, "{report:?}");
         assert_eq!(report.segments_failed, 0);
         assert!(report.feed_updates > 0);
-        assert!(!report.channel_reference.is_empty());
+        assert_ne!(report.channel_reference, "");
         assert!(report.kept_up, "{report:?}");
         // The lag is an age and the duration a stopwatch, both frozen
         // with the run: asking again later must still describe the

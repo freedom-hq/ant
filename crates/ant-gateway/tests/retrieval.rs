@@ -517,7 +517,7 @@ async fn head_dispatches_head_only_flag() {
         "video/mp4",
     );
     let bytes = body_bytes(resp).await;
-    assert!(bytes.is_empty());
+    assert_eq!(bytes, [] as [u8; 0]);
     assert!(
         saw_head_only.load(Ordering::SeqCst),
         "HEAD must dispatch with head_only=true",

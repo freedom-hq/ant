@@ -663,9 +663,9 @@ mod tests {
         let decoded = Ack::decode(&buf[..]).unwrap();
         assert_eq!(decoded.nonce.len(), OVERLAY_NONCE_LEN);
         let addr = decoded.address.unwrap();
-        assert!(addr.nonce.is_empty());
+        assert_eq!(addr.nonce, [] as [u8; 0]);
         assert_eq!(addr.timestamp, 0);
-        assert!(addr.chequebook_address.is_empty());
+        assert_eq!(addr.chequebook_address, [] as [u8; 0]);
     }
 
     /// `HandshakeError` carries the field-length and timestamp-gate

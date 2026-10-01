@@ -947,8 +947,11 @@ pub(crate) fn storage_connect_batch(
         // otherwise uploads stamp fine but never propagate (bee freezes
         // an unpaying node out past its payment threshold). Best-effort:
         // a thin wallet or flaky RPC just leaves settlement off, which
-        // the Storage UI surfaces via `settlement_status`.
-        ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+        // the Storage UI surfaces via `settlement_status`. The running
+        // gateway follows the outcome.
+        let chequebook =
+            ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+        sync_gateway_chequebook(&h.gateway_chequebook, &eth, chequebook);
         postage_status_json(&cmd_tx).await
     })
 }
@@ -990,7 +993,9 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
         // settlement is on so uploads against it actually reach the
         // network. Best-effort; never fails discovery.
         if !registered.is_empty() {
-            ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+            let chequebook =
+                ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
+            sync_gateway_chequebook(&h.gateway_chequebook, &eth, chequebook);
         }
         let status = postage_status_json(&cmd_tx).await?;
         // `status` is already a JSON document; splice it in raw.
@@ -1401,13 +1406,14 @@ async fn activate_bought_batch(
         Some(new.block),
     )
     .await?;
-    ensure_settlement(
+    ensure_settlement_for_gateway(
         &h.cmd_tx,
         client,
         wallet,
         &h.data_dir,
         h.signing_secret,
         h.eth,
+        &h.gateway_chequebook,
     )
     .await;
     postage_status_json(&h.cmd_tx).await
@@ -1638,6 +1644,47 @@ pub(crate) fn sync_gateway_chequebook(
             }
         }
     }
+}
+
+/// [`ensure_settlement`] for a C-API storage call, then point the
+/// in-process gateway's chequebook `slot` at the outcome, as the
+/// gateway's own after-buy hook and chain init do. Without that, a
+/// chequebook set up by `ant_storage_buy*` stayed invisible to the
+/// running gateway's `/chequebook/*`, `/wallet` and
+/// `POST /chequebook/deposit` until the next `ant_start_gateway`.
+#[cfg(feature = "chain")]
+async fn ensure_settlement_for_gateway(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    secret: [u8; 32],
+    node_eth: [u8; 20],
+    slot: &ant_gateway::ChequebookSlot,
+) -> Option<[u8; 20]> {
+    let chequebook = ensure_settlement(cmd_tx, client, wallet, data_dir, secret, node_eth).await;
+    sync_gateway_chequebook(slot, &node_eth, chequebook);
+    chequebook
+}
+
+/// [`setup_settlement`] with spending allowed (`ant_deploy_chequebook`),
+/// then point the in-process gateway's chequebook `slot` at the outcome.
+/// The slot is synced on the error path too: a persisted chequebook the
+/// chain check disqualifies makes [`setup_settlement`] return `Err` (not
+/// `Ok(None)`), and the gateway must stop reporting and funding it.
+#[cfg(feature = "chain")]
+async fn setup_settlement_for_gateway(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    secret: [u8; 32],
+    node_eth: [u8; 20],
+    slot: &ant_gateway::ChequebookSlot,
+) -> Result<Option<[u8; 20]>, DriveError> {
+    let result = setup_settlement(cmd_tx, client, wallet, data_dir, secret, node_eth, true).await;
+    sync_gateway_chequebook(slot, &node_eth, result.as_ref().ok().copied().flatten());
+    result
 }
 
 /// Switch outbound SWAP settlement off in the running node if it runs on
@@ -1906,7 +1953,15 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
     let secret = h.signing_secret;
     let cmd_tx = h.cmd_tx.clone();
     h.runtime.block_on(async move {
-        settlement_topup_xdai_for(&cmd_tx, &h.chain_client(rpc), &data_dir, owner, secret).await
+        settlement_topup_xdai_for(
+            &cmd_tx,
+            &h.chain_client(rpc),
+            &data_dir,
+            owner,
+            secret,
+            &h.gateway_chequebook,
+        )
+        .await
     })
 }
 
@@ -1925,8 +1980,31 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
 /// (the gateway's `POST /v0/settlement/deposit` runs it too), which
 /// checks the chequebook again before its swap and right before the
 /// transfer; a refusal there goes through [`chequebook_refused`].
+///
+/// On a refusal the in-process gateway's chequebook `slot` follows: a
+/// chequebook disqualified here is cleared from it, so `/wallet` and
+/// `POST /chequebook/deposit` stop using it without a gateway restart.
 #[cfg(feature = "chain")]
 async fn settlement_topup_xdai_for(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: [u8; 20],
+    secret: [u8; 32],
+    slot: &ant_gateway::ChequebookSlot,
+) -> Result<String, DriveError> {
+    let result = settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret).await;
+    if result.is_err() {
+        // Clears the slot only if it holds a chequebook now in
+        // `DISQUALIFIED`; any other failure leaves it alone.
+        sync_gateway_chequebook(slot, &owner, None);
+    }
+    result
+}
+
+/// [`settlement_topup_xdai_for`] without the gateway-slot sync.
+#[cfg(feature = "chain")]
+async fn settlement_topup_xdai_checked(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
     data_dir: &std::path::Path,
@@ -2055,10 +2133,10 @@ pub(crate) async fn chequebook_refused(
 /// chequebook deployed now is used this session rather than from the
 /// next launch.
 ///
-/// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. The caller restarts
-/// the gateway afterwards so [`crate::ant_start_gateway`] reloads the
-/// persisted address into its `ChainContext` and `/chequebook/address`
-/// reports it.
+/// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. A running
+/// in-process gateway's `/chequebook/address` and `/wallet` report the
+/// chequebook at once (no gateway restart needed); one the chain check
+/// disqualified is cleared from them.
 #[cfg(feature = "chain")]
 pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
     let secret = h.signing_secret;
@@ -2079,8 +2157,20 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
         // may still be at deposit 0, so it's funded here too; this
         // checklist step means the same thing whichever branch produced
         // the address.
-        match setup_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, node_eth, true).await?
-        {
+        // The running gateway follows, so `/chequebook/address` reports
+        // the new chequebook without another `ant_start_gateway` (and
+        // drops one the chain check just disqualified).
+        let chequebook = setup_settlement_for_gateway(
+            &cmd_tx,
+            &client,
+            &wallet,
+            &data_dir,
+            secret,
+            node_eth,
+            &h.gateway_chequebook,
+        )
+        .await?;
+        match chequebook {
             Some(chequebook) => to_json(&DeployedChequebook {
                 chequebook_address: format!("0x{}", hex::encode(chequebook)),
             }),
@@ -3117,7 +3207,7 @@ mod chain_tests {
             BTreeSet::from([lagging]),
             "the batch found on re-read is kept; the one still missing is dropped",
         );
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
         assert!(persisted.lock_not_found_since().is_empty());
         let queried = script.queried.lock().unwrap().clone();
         assert_eq!(
@@ -3205,7 +3295,7 @@ mod chain_tests {
         queried.sort_unstable();
         assert_eq!(queried, ids.to_vec(), "each batch is asked about once");
         assert!(upload.issuers.lock().unwrap().is_empty());
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3300,7 +3390,7 @@ mod chain_tests {
             .verify_persisted(&client, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
         assert_eq!(registered(), BTreeSet::from([live, unreadable, bought]));
-        assert!(persisted.unverified().is_empty());
+        assert_eq!(persisted.unverified(), [] as [[u8; 32]; 0]);
         assert!(script
             .queried
             .lock()
@@ -3617,6 +3707,73 @@ mod chain_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A chequebook a C-API storage call sets settlement up on reaches
+    /// the running gateway's slot at once (`/chequebook/address`,
+    /// `/wallet`), without another `ant_start_gateway`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_c_api_settlement_points_the_gateway_at_its_chequebook() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-capi-slot");
+        persist(&dir, CANDIDATE, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+        let slot = ant_gateway::ChequebookSlot::default();
+
+        let got = super::ensure_settlement_for_gateway(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            &slot,
+        )
+        .await;
+
+        assert_eq!(got, Some(CANDIDATE));
+        assert_eq!(slot.get(), Some(CANDIDATE), "the gateway reports it");
+        assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-F1 (#109): `ant_deploy_chequebook`'s path on a persisted
+    /// chequebook the chain check disqualifies errors (not `Ok(None)`),
+    /// and the gateway slot that still held it is cleared all the same.
+    /// A usable one is written to the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deploy_chequebook_path_syncs_the_gateway_slot_on_error() {
+        const BAD: [u8; 20] = [0xdb; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-deploy-slot");
+        persist(&dir, BAD, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(BAD, (false, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, _node) = fake_node();
+        let slot = ant_gateway::ChequebookSlot::default();
+        slot.set(BAD);
+
+        let err = super::setup_settlement_for_gateway(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            &slot,
+        )
+        .await
+        .expect_err("a disqualified chequebook must not be used");
+
+        assert!(err.to_string().contains("not registered"), "got {err}");
+        assert_eq!(slot.get(), None, "the gateway stops reporting it");
+        assert_eq!(slot.refused(), Some(BAD));
+        super::lock_disqualified().remove(&(eth, BAD));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn persist(dir: &std::path::Path, cb: [u8; 20], issuer: [u8; 20]) {
         ant_chain::chequebook_store::persist_chequebook(
             &dir.join("chequebook.json"),
@@ -3689,7 +3846,7 @@ mod chain_tests {
             .expect_err("a disqualified chequebook must not be used");
 
             assert!(err.to_string().contains(why), "got {err}");
-            assert!(node.lock().unwrap().enabled.is_empty());
+            assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
             assert_eq!(
                 node.lock().unwrap().disabled,
                 vec![BAD],
@@ -3726,7 +3883,7 @@ mod chain_tests {
         .unwrap();
 
         assert_eq!(got, None);
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         for spend in [
             "eth_getBalance",
             "eth_getTransactionCount",
@@ -3846,7 +4003,7 @@ mod chain_tests {
         node.lock().unwrap().fail_registers = 1;
 
         init.rediscover_owned(&client(&script), &cmd_tx).await;
-        assert!(node.lock().unwrap().registered.is_empty());
+        assert_eq!(node.lock().unwrap().registered, [] as [[u8; 32]; 0]);
         assert!(!*init.batches_rediscovered.lock().await);
 
         init.rediscover_owned(&client(&script), &cmd_tx).await;
@@ -3894,7 +4051,7 @@ mod chain_tests {
         .expect("a lagging read is not a disqualification");
         assert_eq!(got, Some(FRESH));
         assert_eq!(node.lock().unwrap().enabled, vec![FRESH]);
-        assert!(node.lock().unwrap().disabled.is_empty());
+        assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert_eq!(script.seen("eth_getTransactionReceipt"), 1);
 
         // R2-M2: the same record long after the deploy: a backend
@@ -4047,7 +4204,7 @@ mod chain_tests {
             true,
         )
         .await;
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert!(!record.exists());
         assert!(dir.join("chequebook.json.unreadable").exists());
         assert!(script.seen("eth_getBalance") > 0, "deploy attempted");
@@ -4088,9 +4245,13 @@ mod chain_tests {
         assert_eq!(card["enabled"], false);
         assert_eq!(card["needs_top_up"], false);
         let (cmd_tx, _node) = fake_node();
-        let err = super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
-            .await
-            .expect_err("no deposit into a disqualified chequebook");
+        let slot = ant_gateway::ChequebookSlot::default();
+        slot.set(BAD);
+        let err =
+            super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY, &slot)
+                .await
+                .expect_err("no deposit into a disqualified chequebook");
+        assert_eq!(slot.get(), None, "the gateway stops reporting it");
         assert!(
             err.to_string().contains("failed its on-chain checks"),
             "got {err}"
@@ -4126,11 +4287,20 @@ mod chain_tests {
             let script = std::sync::Arc::new(script);
             let (cmd_tx, node) = fake_node();
             assert!(!super::lock_disqualified().contains(&(eth, BAD)));
+            // The gateway started with it (chain init not yet run).
+            let slot = ant_gateway::ChequebookSlot::default();
+            slot.set(BAD);
 
-            let err =
-                super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
-                    .await
-                    .expect_err("no deposit into a chequebook that fails its checks");
+            let err = super::settlement_topup_xdai_for(
+                &cmd_tx,
+                &client(&script),
+                &dir,
+                eth,
+                NODE_KEY,
+                &slot,
+            )
+            .await
+            .expect_err("no deposit into a chequebook that fails its checks");
 
             assert!(err.to_string().contains(why), "got {err}");
             assert_eq!(
@@ -4142,6 +4312,8 @@ mod chain_tests {
             assert_eq!(script.seen("eth_sendRawTransaction"), 0);
             assert!(super::lock_disqualified().contains(&(eth, BAD)));
             assert_eq!(node.lock().unwrap().disabled, vec![BAD]);
+            assert_eq!(slot.get(), None, "the gateway stops reporting it");
+            assert_eq!(slot.refused(), Some(BAD));
             super::lock_disqualified().remove(&(eth, BAD));
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -4159,16 +4331,20 @@ mod chain_tests {
         script.chequebooks.insert(GOOD, (true, eth));
         let script = std::sync::Arc::new(script);
         let (cmd_tx, node) = fake_node();
+        let slot = ant_gateway::ChequebookSlot::default();
+        slot.set(GOOD);
 
-        let card = super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
-            .await
-            .unwrap();
+        let card =
+            super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY, &slot)
+                .await
+                .unwrap();
         let card: serde_json::Value = serde_json::from_str(&card).unwrap();
         assert_eq!(card["enabled"], true);
         assert_eq!(card["needs_top_up"], false);
         assert_eq!(script.seen("eth_sendRawTransaction"), 0);
-        assert!(node.lock().unwrap().disabled.is_empty());
+        assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
+        assert_eq!(slot.get(), Some(GOOD));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4193,8 +4369,16 @@ mod chain_tests {
         let task = {
             let (script, dir) = (script.clone(), dir.clone());
             tokio::spawn(async move {
-                super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
-                    .await
+                let slot = ant_gateway::ChequebookSlot::default();
+                super::settlement_topup_xdai_for(
+                    &cmd_tx,
+                    &client(&script),
+                    &dir,
+                    eth,
+                    NODE_KEY,
+                    &slot,
+                )
+                .await
             })
         };
         // Wait (bounded, not a fixed sleep) for the two pre-lock
@@ -4268,23 +4452,33 @@ mod chain_tests {
             script.registered_reads = Some(1);
             let script = std::sync::Arc::new(script);
             let (cmd_tx, node) = fake_node();
+            let slot = ant_gateway::ChequebookSlot::default();
+            slot.set(CB);
 
-            let err =
-                super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY)
-                    .await
-                    .expect_err("refused before the transfer");
+            let err = super::settlement_topup_xdai_for(
+                &cmd_tx,
+                &client(&script),
+                &dir,
+                eth,
+                NODE_KEY,
+                &slot,
+            )
+            .await
+            .expect_err("refused before the transfer");
 
             for spend in ["eth_getTransactionCount", "eth_sendRawTransaction"] {
                 assert_eq!(script.seen(spend), 0, "{spend}: nothing may be sent");
             }
             if just_deployed {
                 assert!(err.to_string().contains("hasn't caught up"), "got {err}");
-                assert!(node.lock().unwrap().disabled.is_empty());
+                assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
                 assert!(!super::is_disqualified(&eth, &CB));
+                assert_eq!(slot.get(), Some(CB), "lag: the gateway keeps it");
             } else {
                 assert!(err.to_string().contains("not registered"), "got {err}");
                 assert_eq!(node.lock().unwrap().disabled, vec![CB]);
                 assert!(super::is_disqualified(&eth, &CB));
+                assert_eq!(slot.get(), None, "the gateway stops reporting it");
             }
             super::lock_disqualified().remove(&(eth, CB));
             std::fs::remove_dir_all(&dir).ok();
@@ -4488,7 +4682,7 @@ mod chain_tests {
             err.to_string().contains("could not be re-verified"),
             "got {err}"
         );
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert_eq!(node.lock().unwrap().disabled, vec![CB]);
         assert!(super::is_disqualified(&eth, &CB));
         assert_eq!(script.seen("eth_sendRawTransaction"), 0);
@@ -4526,7 +4720,7 @@ mod chain_tests {
         .expect_err("rejected before the transfer");
 
         assert!(err.to_string().contains("not registered"), "got {err}");
-        assert!(node.lock().unwrap().enabled.is_empty());
+        assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
         assert_eq!(node.lock().unwrap().disabled, vec![CB]);
         assert!(super::is_disqualified(&eth, &CB));
         for spend in ["eth_getTransactionCount", "eth_sendRawTransaction"] {

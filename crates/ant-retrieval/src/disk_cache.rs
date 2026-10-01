@@ -881,7 +881,7 @@ fn update_total(total: &AtomicU64, delta: i64) -> u64 {
         total.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
     } else {
         let abs = (-delta) as u64;
-        match total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        match total.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(abs))
         }) {
             Ok(prev) => prev.saturating_sub(abs),
@@ -948,7 +948,7 @@ fn evict_to_slack(
     // and the initial COUNT(*) backfill finishing — a write+eviction
     // racing the backfill must not underflow.
     let evicted = victim_addrs.len() as u64;
-    let _ = total_rows.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+    let _ = total_rows.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(evicted))
     });
     debug!(

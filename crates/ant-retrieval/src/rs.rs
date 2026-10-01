@@ -866,6 +866,6 @@ mod tests {
             // top bit of their first address byte.
             assert_ne!(addrs[0][0] >> 7, addrs[1][0] >> 7);
         }
-        assert!(replica_addresses(&base, 0).is_empty());
+        assert_eq!(replica_addresses(&base, 0), [] as [[u8; 32]; 0]);
     }
 }
