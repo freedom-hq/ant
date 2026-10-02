@@ -776,7 +776,10 @@ const HEADER_SNIFF_MAX_DEPTH: usize = 8;
 /// of the whole file. Every "can't tell" case answers `false` so the
 /// caller falls back to the full join exactly as before: a leftmost
 /// chunk that can't be fetched (the join may still recover it through
-/// erasure coding), a malformed tree, or a file shorter than a header.
+/// erasure coding) or a malformed tree. A file shorter than a node
+/// header counts as positively not a manifest (#115), so `/bzz/<ref>/`
+/// on a tiny raw `/bytes` upload serves the bytes instead of failing the
+/// lookup with `TooShort`.
 async fn leftmost_leaf_is_not_a_manifest(fetcher: &dyn ChunkFetcher, root_chunk: &[u8]) -> bool {
     let mut chunk = root_chunk.to_vec();
     for _ in 0..HEADER_SNIFF_MAX_DEPTH {
@@ -785,7 +788,12 @@ async fn leftmost_leaf_is_not_a_manifest(fetcher: &dyn ChunkFetcher, root_chunk:
         };
         let (_, plain) = crate::rs::decode_span(*span);
         if u64::from_le_bytes(plain) <= ant_crypto::CHUNK_SIZE as u64 {
-            return payload.len() >= NODE_HEADER_SIZE && !has_manifest_header(payload);
+            // A serialised node is never shorter than its header, so a
+            // leaf that can't hold one is just as positively raw bytes as
+            // one whose header carries the wrong version hash. (Only a
+            // single-chunk file can have a leftmost leaf this short: every
+            // leaf but the last of a split file is a full chunk.)
+            return payload.len() < NODE_HEADER_SIZE || !has_manifest_header(payload);
         }
         // Intermediate chunk: the first reference is the leftmost child
         // (parity references, if any, come after the data references).
@@ -1803,6 +1811,27 @@ mod tests {
         }
         let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
         assert!(matches!(err, ManifestError::NotAManifest), "got {err:?}");
+    }
+
+    /// A raw upload shorter than a node header (64 bytes) behind
+    /// `bzz://<ref>/` is raw bytes, not a malformed manifest: the lookup
+    /// must answer `NotAManifest` so the gateway falls back to serving the
+    /// bytes. Before the fix the sniff answered "can't tell" for it, and
+    /// the join + unmarshal surfaced `TooShort`, which the gateway turned
+    /// into a 404. Covers the empty file and the length just below the
+    /// header too.
+    #[tokio::test]
+    async fn raw_file_shorter_than_a_node_header_is_not_a_manifest() {
+        for len in [0usize, 1, 20, NODE_HEADER_SIZE - 1] {
+            let (addr, wire) = ant_crypto::cac_new(&raw_file(len)).unwrap();
+            let mut fetcher = MapFetcher::new();
+            fetcher.insert(addr, wire);
+            let err = lookup_path(&fetcher, &addr, "").await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::NotAManifest),
+                "len {len}: expected NotAManifest, got {err:?}",
+            );
+        }
     }
 
     /// A multi-chunk file that *starts* like a mantaray node is not
