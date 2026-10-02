@@ -107,6 +107,43 @@ const FETCH_FANOUT: usize = 16;
 /// descendant chunks are cached by `RoutingFetcher`, so retries normally
 /// jump straight to the missing tail.
 const SUBTREE_RETRY_ATTEMPTS: usize = 32;
+/// Erasure-recovery retries for one data child of a redundant node,
+/// when the recovery sweep came up short for want of reachable peers
+/// rather than because peers confirmed the shards missing
+/// ([`crate::rs::RecoveryError::transient`]). On a cold node the peer
+/// pool is overdraft-starved: a never-refreshed peer admits about five
+/// ~300k-unit chunks against its 1.69M limit and then only what
+/// pseudosettle restores (450k units/s, ~1.5 chunks/s per peer), so
+/// concurrent cold segments find every ranked peer overdraft-skipped
+/// and sweeps collect a fraction of their shards (issue #114). The
+/// content is fine; it just has to wait for credit. Once bytes have
+/// gone out the response can't restart, so this is retried in place,
+/// like [`SUBTREE_RETRY_ATTEMPTS`] does for plain fetch misses.
+///
+/// The bound is wall-clock: no new sweep starts once
+/// [`RECOVERY_RETRY_BUDGET`] has passed since this child's first fetch
+/// began (the attempt cap is a backstop). Back-off is
+/// `RECOVERY_RETRY_BACKOFF × attempt`, capped at
+/// [`RECOVERY_RETRY_BACKOFF_MAX`]. 60 s covers the credit a light node
+/// needs to pull several cold 1.6 MB segments at once at startup (on
+/// mainnet, 8 concurrent ones completed in 14–20 s and 12 in 19–28 s,
+/// where an 8-sweep / 14 s budget still truncated 6 of 16).
+///
+/// It is a budget on sweep *starts*, not a deadline: the last sweep may
+/// begin just inside the window and runs to completion (bounded only by
+/// the fetcher's own per-chunk limits), and each redundant level has its
+/// own window, so a data child that is itself an intermediate chunk of a
+/// redundant subtree can spend one window recovering and then its own
+/// child another, with no bytes emitted in between. So this is chosen
+/// to leave a single-level recovery comfortably inside the gateway's
+/// 90 s `BODY_STALL_TIMEOUT`, but does not guarantee it: a stuck nested
+/// recovery may end in the gateway's stall timeout instead of a join
+/// error. For the client the outcome is the same — a truncated body (or
+/// a 502 if nothing was sent yet).
+const RECOVERY_RETRY_ATTEMPTS: usize = 32;
+const RECOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+const RECOVERY_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4);
+const RECOVERY_RETRY_BUDGET: Duration = Duration::from_secs(60);
 /// Per-child output-channel depth for the streaming joiner. This is
 /// exactly bee's "moving window" knob: each in-flight sibling subtree
 /// has at most this many resolved 4 KiB chunks (≈ 256 KiB) buffered
@@ -153,8 +190,10 @@ pub enum JoinError {
     /// be fetched **and** Reed-Solomon recovery from the node's
     /// remaining shards + parities failed (more than `parityCnt` chunks
     /// of that node are unreachable, or the reconstruction output
-    /// failed CAC validation). Terminal: the recovery sweep already
-    /// re-tried every sibling, so retrying the subtree is pointless.
+    /// failed CAC validation). Terminal: a recovery that fell short only
+    /// for want of reachable peers has already been retried in place
+    /// with back-off before this is returned (issue #114), and one that
+    /// failed on confirmed-missing shards or a bad decode can't improve.
     #[error("erasure recovery failed: {detail}")]
     Recovery { detail: String },
     /// Encrypted chunks (64-byte refs) aren't supported. Only triggered
@@ -606,10 +645,7 @@ async fn fetch_child_chunk(
     addr: [u8; 32],
 ) -> Result<Vec<u8>, JoinError> {
     match decoder {
-        Some(d) => d
-            .fetch_data_shard(fetcher, index)
-            .await
-            .map_err(|detail| JoinError::Recovery { detail }),
+        Some(d) => fetch_shard_with_recovery_retries(fetcher, d, index).await,
         None => fetcher
             .fetch(addr)
             .await
@@ -618,6 +654,58 @@ async fn fetch_child_chunk(
                 source: e,
             }),
     }
+}
+
+/// Fetch data shard `index` through a redundant node's decoder,
+/// retrying a transient recovery failure with back-off within
+/// [`RECOVERY_RETRY_ATTEMPTS`] / [`RECOVERY_RETRY_BUDGET`]. Each retry
+/// starts with a fresh direct fetch and, if that misses, a fresh sweep
+/// (the decoder doesn't cache transient failures). A permanent failure,
+/// or a transient one that outlasts the budget, becomes a terminal
+/// [`JoinError::Recovery`].
+async fn fetch_shard_with_recovery_retries(
+    fetcher: &dyn ChunkFetcher,
+    decoder: &crate::rs::RsDecoder,
+    index: usize,
+) -> Result<Vec<u8>, JoinError> {
+    // The window opens when the first fetch starts, so the first sweep's
+    // own duration counts against it too.
+    let started = tokio::time::Instant::now();
+    for attempt in 1..=RECOVERY_RETRY_ATTEMPTS {
+        match decoder.fetch_data_shard(fetcher, index).await {
+            Ok(wire) => {
+                if attempt > 1 {
+                    tracing::debug!(
+                        target: "ant_retrieval::joiner",
+                        index,
+                        attempt,
+                        "erasure recovery succeeded on retry",
+                    );
+                }
+                return Ok(wire);
+            }
+            Err(e) => {
+                let backoff =
+                    (RECOVERY_RETRY_BACKOFF * attempt as u32).min(RECOVERY_RETRY_BACKOFF_MAX);
+                let retry = e.transient
+                    && attempt < RECOVERY_RETRY_ATTEMPTS
+                    && started.elapsed() + backoff < RECOVERY_RETRY_BUDGET;
+                if !retry {
+                    return Err(JoinError::Recovery { detail: e.detail });
+                }
+                tracing::debug!(
+                    target: "ant_retrieval::joiner",
+                    index,
+                    attempt,
+                    next_in_ms = backoff.as_millis() as u64,
+                    "transient erasure recovery failure, retrying: {}",
+                    e.detail,
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    unreachable!("retry loop returns on the final attempt");
 }
 
 /// Recursive joiner core. Returns `subtree_span` bytes worth of file data,
@@ -819,9 +907,9 @@ async fn join_child_to_sender(
 
 /// Streaming-path chunk fetch with in-place retries. Plain fetch misses
 /// are retried with backoff (the pre-RS behavior for transient mainnet
-/// misses); an erasure-recovery failure is terminal — the decoder's
-/// sweep already re-fetched every sibling of the node, so retrying
-/// can't add information.
+/// misses). Erasure-recovery failures are not retried here: a transient
+/// one was already retried by [`fetch_shard_with_recovery_retries`]
+/// within its own budget, and a permanent one can't improve.
 async fn fetch_child_with_retries(
     fetcher: &dyn ChunkFetcher,
     decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
@@ -1192,10 +1280,9 @@ fn join_encrypted_into<'a>(
                         source,
                     })?
             }
-            EncFetch::Shard(decoder, index) => decoder
-                .fetch_data_shard(fetcher, index)
-                .await
-                .map_err(|detail| JoinError::Recovery { detail })?,
+            EncFetch::Shard(decoder, index) => {
+                fetch_shard_with_recovery_retries(fetcher, &decoder, index).await?
+            }
         };
         let (span_raw, payload) = ant_crypto::decrypt_chunk_parts(&stored, &key).map_err(|e| {
             JoinError::MalformedChunk {
@@ -1320,11 +1407,19 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::ChunkFetcher for MapFetcher {
         async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            // Worded like `RoutingFetcher`'s give-up after peers answered
+            // bee's `storage: not found`, so the RS decoder reads an
+            // absent chunk as confirmed missing (permanent), not as a
+            // peer-pool shortage it should retry.
             self.chunks
                 .get(&addr)
                 .cloned()
                 .ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-                    format!("missing chunk {}", hex::encode(addr)).into()
+                    format!(
+                        "missing chunk {} (last: remote: storage: not found)",
+                        hex::encode(addr)
+                    )
+                    .into()
                 })
         }
     }
@@ -1688,6 +1783,231 @@ mod tests {
         .expect("over-loss join must fail promptly, not hang")
         .unwrap_err();
         assert!(matches!(err, JoinError::Recovery { .. }), "got {err:?}");
+    }
+
+    /// A cold node's view of the network (issue #114): chunks in
+    /// `starved` fail their first `starve_for` fetches the two ways a
+    /// `RoutingFetcher` with an exhausted pool does — first with one
+    /// peer's `storage: not found` and the rest overdraft-skipped
+    /// (`FetchExhausted { pool_starved: true }`), then with `no BZZ
+    /// peers available` — and serve normally after. Absent chunks
+    /// answer like peers confirmed them missing.
+    struct ColdPoolFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        starved: HashSet<[u8; 32]>,
+        starve_for: usize,
+        calls: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+    }
+
+    impl ColdPoolFetcher {
+        fn new(map: MapFetcher, starve_for: usize) -> Self {
+            Self {
+                chunks: map.chunks,
+                starved: HashSet::new(),
+                starve_for,
+                calls: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChunkFetcher for ColdPoolFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if self.starved.contains(&addr) {
+                let mut calls = self.calls.lock().unwrap();
+                let n = calls.entry(addr).or_insert(0);
+                *n += 1;
+                if *n <= self.starve_for {
+                    if *n == 1 {
+                        return Err(Box::new(crate::fetcher::FetchExhausted {
+                            message: format!(
+                                "all peers failed for chunk {} after 1 attempts \
+                                 (last: remote: retrieve chunk: storage: not found)",
+                                hex::encode(addr)
+                            ),
+                            pool_starved: true,
+                        }));
+                    }
+                    return Err("no BZZ peers available".into());
+                }
+            }
+            self.chunks
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+                    format!(
+                        "all peers failed for chunk {} after 3 attempts \
+                         (last: remote: retrieve chunk: storage: not found)",
+                        hex::encode(addr)
+                    )
+                    .into()
+                })
+        }
+    }
+
+    /// Issue #114: a recovery sweep that falls short only because the
+    /// peer pool was momentarily exhausted is retried with a fresh
+    /// sweep, and the join completes — through the streaming joiner
+    /// (what `/bytes` and `/bzz` serve), a range of it, and the
+    /// buffered joiner. Pre-fix the first sweep's failure was cached and
+    /// returned as a terminal `Recovery` error mid-stream.
+    // Paused clock: the retry back-off auto-advances.
+    #[tokio::test(start_paused = true)]
+    async fn transient_recovery_failure_is_retried_until_it_succeeds() {
+        let mut map = MapFetcher::new();
+        // 6 data + 4 parity shards.
+        let (root_wire, leaf_addrs, expected) = build_redundant_fixture(&mut map, 6, 100);
+        // One data leaf is really gone (recoverable from parities)...
+        map.chunks.remove(&leaf_addrs[2]);
+        // ...and on the first sweep every other shard is unreachable:
+        // `no BZZ peers available`, like the cold-node field case.
+        let shards: Vec<[u8; 32]> = map
+            .chunks
+            .keys()
+            .copied()
+            .filter(|a| !leaf_addrs.contains(a))
+            .chain(leaf_addrs.iter().copied().filter(|a| *a != leaf_addrs[2]))
+            .collect();
+
+        let cold = |starve_for| {
+            let mut m = MapFetcher::new();
+            m.chunks = map.chunks.clone();
+            let mut f = ColdPoolFetcher::new(m, starve_for);
+            f.starved = shards.iter().copied().collect();
+            f
+        };
+
+        // Streaming, whole body.
+        let fetcher = cold(2);
+        let (tx, mut rx) = mpsc::channel(256);
+        let (res, body) = tokio::join!(
+            join_to_sender(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                tx
+            ),
+            drain(&mut rx)
+        );
+        res.expect("streaming join must recover once the pool refills");
+        assert_eq!(body, expected);
+
+        // Streaming, a range that only touches the lost leaf.
+        let fetcher = cold(2);
+        let range = ByteRange::clamp(2 * 4096 + 10, 2 * 4096 + 99, expected.len() as u64).unwrap();
+        let (tx, mut rx) = mpsc::channel(256);
+        let (res, body) = tokio::join!(
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(range),
+                tx
+            ),
+            drain(&mut rx)
+        );
+        res.expect("range join must recover once the pool refills");
+        assert_eq!(body, expected[2 * 4096 + 10..2 * 4096 + 100]);
+
+        // Buffered.
+        let fetcher = cold(2);
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("buffered join must recover once the pool refills");
+        assert_eq!(out, expected);
+    }
+
+    /// A pool that never refills still fails, and within the recovery
+    /// budget rather than hanging the response.
+    #[tokio::test(start_paused = true)]
+    async fn transient_recovery_failure_gives_up_after_its_budget() {
+        let mut map = MapFetcher::new();
+        let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut map, 6, 100);
+        map.chunks.remove(&leaf_addrs[2]);
+        let starved: HashSet<[u8; 32]> = map.chunks.keys().copied().collect();
+        let mut fetcher = ColdPoolFetcher::new(map, usize::MAX);
+        fetcher.starved = starved;
+
+        let started = tokio::time::Instant::now();
+        let err = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JoinError::Recovery { .. }), "got {err:?}");
+        // Paused clock: only the retry back-off advances it.
+        assert!(
+            started.elapsed() <= RECOVERY_RETRY_BUDGET,
+            "gave up after {:?}, budget {RECOVERY_RETRY_BUDGET:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() >= RECOVERY_RETRY_BACKOFF,
+            "a transient failure must be retried before giving up"
+        );
+    }
+
+    /// Real data loss stays terminal: more shards confirmed missing than
+    /// the node has parities fails on the first sweep, with no retry
+    /// back-off, even though other shards were also starved of peers.
+    #[tokio::test]
+    async fn confirmed_shard_loss_fails_without_retrying() {
+        let mut map = MapFetcher::new();
+        let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut map, 6, 100);
+        // 5 of 10 shards confirmed missing; 4 parities can't cover it.
+        for addr in leaf_addrs.iter().take(5) {
+            map.chunks.remove(addr);
+        }
+        let starved: HashSet<[u8; 32]> = map.chunks.keys().copied().collect();
+        let mut fetcher = ColdPoolFetcher::new(map, 1);
+        fetcher.starved = starved;
+
+        let started = std::time::Instant::now();
+        let err = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JoinError::Recovery { .. }), "got {err:?}");
+        assert!(
+            started.elapsed() < RECOVERY_RETRY_BACKOFF,
+            "permanent loss must not wait out a retry back-off ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// A decode that fails after every shard arrived (here: a corrupted
+    /// parity makes the reconstructed chunk fail CAC validation) is
+    /// permanent too: one sweep, no retry.
+    #[tokio::test]
+    async fn failed_decode_after_full_sweep_is_terminal() {
+        let mut map = MapFetcher::new();
+        let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut map, 6, 100);
+        map.chunks.remove(&leaf_addrs[0]);
+        // Flip a byte in every parity chunk (served under its original
+        // address — the test fetcher doesn't validate).
+        for parity in map
+            .chunks
+            .iter_mut()
+            .filter(|(a, _)| !leaf_addrs.contains(a))
+        {
+            parity.1[100] ^= 0xff;
+        }
+        let fetcher = ColdPoolFetcher::new(map, 0);
+
+        let started = std::time::Instant::now();
+        let err = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        match &err {
+            JoinError::Recovery { detail } => {
+                assert!(detail.contains("CAC validation"), "got {detail}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < RECOVERY_RETRY_BACKOFF,
+            "a failed decode must not be retried ({:?})",
+            started.elapsed()
+        );
     }
 
     /// Compute the CAC address of a constructed intermediate chunk for

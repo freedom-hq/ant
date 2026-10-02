@@ -901,7 +901,7 @@ async fn classify_payload(
 /// propagate as [`FeedError::Fetch`] so the outer manifest-walk retry
 /// loop can refresh the peer snapshot and try again — see
 /// `ant-p2p::is_manifest_transient`.
-fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
+pub(crate) fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
     let msg = e.to_string().to_ascii_lowercase();
     msg.contains("not found") || msg.contains("no peer found")
 }
