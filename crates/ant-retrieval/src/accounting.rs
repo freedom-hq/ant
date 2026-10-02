@@ -100,7 +100,7 @@ use libp2p::PeerId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::fetcher::Overlay;
 
@@ -164,6 +164,26 @@ pub const HOT_DEBT_THRESHOLD: u64 = LIGHT_DISCONNECT_LIMIT / 2;
 /// pseudosettle has had a chance to clear its debt.
 pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 
+/// Longest a single [`crate::RoutingFetcher`] fetch waits, in total, for
+/// credit when every candidate peer is overdraft-skipped (issue #117).
+///
+/// Bee's `RetrieveChunk` waits for credit without a bound of its own:
+/// it sleeps [`OVERDRAFT_REFRESH`] and retries until the request context
+/// ends. We have no per-chunk context, so the wait gets its own bound,
+/// sized to fit inside every caller's budget:
+///
+/// - the gateway's 90 s `BODY_STALL_TIMEOUT` mid-body: a data child
+///   that waits this long and then falls into the joiner's 60 s
+///   recovery-retry window, whose last sweep can wait this long again,
+///   stalls the body for at most 60 s + 2 × 10 s = 80 s;
+/// - the 30 s `/bzz` and `/bytes` resolution budget: a starved root or
+///   manifest fetch still gets a second attempt inside it;
+/// - the chunk API's 60 s request timeout.
+///
+/// Feed probes past the anchor carry their own 800 ms deadline, which
+/// cuts a wait short exactly as it cuts a slow peer walk short.
+pub const CREDIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
 /// Per-peer mirror of bee's `accountingPeer`, restricted to the
 /// fields that affect admission control. We don't track
 /// `ghostBalance`, `paymentThresholdForPeer`, or any of bee's
@@ -218,6 +238,12 @@ pub struct Accounting {
     /// duplicates and respects the 1.1 s minimum spacing on
     /// bee's side.
     hot_hint: Option<mpsc::Sender<HotHint>>,
+    /// Wakes fetches waiting for credit ([`Accounting::wait_for_credit`])
+    /// when credit may have come free: a pseudosettle refresh landed
+    /// ([`Accounting::credit`]) or a reservation was released unused
+    /// ([`DebitGuard`] dropped without `apply`). Woken one at a time,
+    /// oldest first; see [`Accounting::pass_credit`].
+    credit_freed: Arc<Notify>,
 }
 
 /// Hint payload sent from the fetcher hot path into the
@@ -241,6 +267,7 @@ impl Accounting {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             hot_hint: None,
+            credit_freed: Arc::new(Notify::new()),
         }
     }
 
@@ -323,7 +350,40 @@ impl Accounting {
             applied: false,
             balances: self.peers.clone(),
             hot_hint: self.hot_hint.clone(),
+            credit_freed: self.credit_freed.clone(),
         })
+    }
+
+    /// Wait until credit may have come free, or `max` elapses, whichever
+    /// is first. Returns `true` when woken by freed credit.
+    ///
+    /// Used by [`crate::RoutingFetcher`] when every candidate peer for a
+    /// chunk is overdraft-skipped (issue #117), in place of bee's plain
+    /// `time.After(overDraftRefresh)` sleep in `RetrieveChunk`. The
+    /// caller passes [`OVERDRAFT_REFRESH`] (or less, near the end of its
+    /// [`CREDIT_WAIT_BUDGET`]) as `max`, so it still re-checks on bee's
+    /// cadence; that also catches credit that opens without an event
+    /// (the one-second refresh allowance, newly connected peers).
+    ///
+    /// No stampede: a refresh or a released reservation wakes exactly
+    /// one waiter, the one that has waited longest (`Notify::notify_one`
+    /// is FIFO), not every fetch parked on the pool. A woken waiter that
+    /// gets a reservation calls [`Accounting::pass_credit`] to wake the
+    /// next, since the credit may cover more than one chunk; one that
+    /// finds nothing goes back to waiting and wakes nobody. So a refill
+    /// admitting `k` chunks wakes `k + 1` waiters, not all of them. A
+    /// wake-up delivered while nobody waits is kept for the next waiter.
+    pub async fn wait_for_credit(&self, max: Duration) -> bool {
+        tokio::time::timeout(max, self.credit_freed.notified())
+            .await
+            .is_ok()
+    }
+
+    /// Hand a credit wake-up on to the next waiter. Called by a fetch
+    /// that was waiting for credit and just got a reservation; see
+    /// [`Accounting::wait_for_credit`].
+    pub fn pass_credit(&self) {
+        self.credit_freed.notify_one();
     }
 
     /// Credit a peer with the bee-side accepted refresh amount.
@@ -338,6 +398,10 @@ impl Accounting {
         entry.balance = entry.balance.saturating_sub(accepted);
         entry.time_settled = entry.time_settled.saturating_add(accepted);
         entry.last_refresh = Some(Instant::now());
+        drop(peers);
+        if accepted > 0 {
+            self.credit_freed.notify_one();
+        }
     }
 
     /// Drop all per-peer state for `peer`. Called when the swarm
@@ -393,6 +457,7 @@ pub struct DebitGuard {
     applied: bool,
     balances: SharedBalances,
     hot_hint: Option<mpsc::Sender<HotHint>>,
+    credit_freed: Arc<Notify>,
 }
 
 impl DebitGuard {
@@ -447,6 +512,10 @@ impl Drop for DebitGuard {
         if let Some(entry) = peers.get_mut(&self.peer) {
             entry.reserved = entry.reserved.saturating_sub(self.price);
         }
+        drop(peers);
+        // The released reserve is credit a fetch waiting on this peer
+        // can use now.
+        self.credit_freed.notify_one();
     }
 }
 
@@ -518,6 +587,60 @@ mod tests {
         assert_eq!(close_price, 10_000);
         // (MAX_PO - po + 1) * BASE_PRICE = (31 -  0 + 1) * 10_000 = 320_000.
         assert_eq!(far_price, 320_000);
+    }
+
+    /// Issue #117: a refill wakes one fetch waiting for credit, not
+    /// every fetch parked on the pool. Each woken waiter that got a
+    /// reservation passes the wake-up on (`pass_credit`), so a refill
+    /// covering `k` chunks wakes `k + 1` waiters in FIFO order.
+    #[tokio::test]
+    async fn freed_credit_wakes_one_waiter_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let acc = Arc::new(Accounting::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..20 {
+            let acc = acc.clone();
+            let woken = woken.clone();
+            waiters.push(tokio::spawn(async move {
+                if acc.wait_for_credit(Duration::from_mins(1)).await {
+                    woken.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        let settle = || tokio::time::sleep(Duration::from_millis(50));
+        settle().await;
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+
+        // A pseudosettle refresh lands: one waiter, not twenty.
+        let p = PeerId::random();
+        acc.credit(p, 450_000);
+        settle().await;
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            1,
+            "a refill must not stampede"
+        );
+
+        // That waiter got its reservation and hands the wake-up on.
+        acc.pass_credit();
+        settle().await;
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+
+        // A reservation released unused is freed credit too.
+        let g = acc.try_reserve(p, 240_000).expect("admits");
+        drop(g);
+        settle().await;
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
+
+        // An applied debit frees nothing and wakes nobody.
+        acc.try_reserve(p, 240_000).expect("admits").apply();
+        settle().await;
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
+
+        for w in waiters {
+            w.abort();
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
-use crate::accounting::{Accounting, DebitGuard};
+use crate::accounting::{Accounting, DebitGuard, CREDIT_WAIT_BUDGET, OVERDRAFT_REFRESH};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
 use crate::progress::ProgressTracker;
@@ -1420,14 +1420,20 @@ impl ChunkFetcher for RoutingFetcher {
                 false
             };
 
-        // Initial dispatch.
+        // Initial dispatch. With no peers at all there is nothing to
+        // wait for; with peers that are all overdraft-skipped, the loop
+        // below waits for credit (issue #117).
         match pick_next(&asked, &mut overdraft_skip) {
             Some((peer, guard)) => {
                 asked.push(peer);
                 in_flight.push(make_fut(peer, guard));
             }
-            None => return Err("no BZZ peers available".into()),
+            None if overdraft_skip.is_empty() => return Err("no BZZ peers available".into()),
+            None => {}
         }
+        // Total time this fetch has spent waiting for credit, against
+        // `CREDIT_WAIT_BUDGET`.
+        let mut credit_waited = Duration::ZERO;
 
         loop {
             // Loop exit when we've burned the error budget AND have
@@ -1437,11 +1443,64 @@ impl ChunkFetcher for RoutingFetcher {
                 break;
             }
             // No more candidates and nothing inflight → can't possibly
-            // succeed. This is bee's `topology.ErrNotFound` arm: it
-            // returns immediately with the underlying error rather
-            // than ticking against a frozen candidate list forever.
+            // succeed *now*. This is bee's `topology.ErrNotFound` arm.
+            // Bee then checks whether any of the peers it ran out of are
+            // only overdraft-skipped (`skip.PruneExpiresAfter(chunk,
+            // overDraftRefresh) != 0`); if so it sleeps
+            // `overDraftRefresh` and tries again, and it only gives up
+            // when every peer was really asked. We do the same while the
+            // pool is starved (the condition `FetchExhausted::pool_starved`
+            // reports), within `CREDIT_WAIT_BUDGET`: on a cold node
+            // every peer admits ~5 chunks before pseudosettle refills
+            // it, and giving up at once turned each such miss into an
+            // erasure-recovery sweep or a 502 (issue #117).
             if in_flight.is_empty() && !candidate_available(&asked, &overdraft_skip) {
-                break;
+                let starved = pool_starved(
+                    errors_left,
+                    self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p)),
+                    not_found_answers,
+                );
+                let Some(acc) = self.accounting.as_ref() else {
+                    break;
+                };
+                if !starved || credit_waited >= CREDIT_WAIT_BUDGET {
+                    break;
+                }
+                if credit_waited.is_zero() {
+                    debug!(
+                        target: "ant_retrieval::fetcher",
+                        chunk = %hex::encode(addr),
+                        asked = asked.len(),
+                        "every candidate peer overdraft-skipped; waiting for credit",
+                    );
+                }
+                let started = tokio::time::Instant::now();
+                acc.wait_for_credit(
+                    OVERDRAFT_REFRESH.min(CREDIT_WAIT_BUDGET.saturating_sub(credit_waited)),
+                )
+                .await;
+                credit_waited += started.elapsed();
+                // Every skip entry is due again: bee prunes them all
+                // before its retry, too.
+                overdraft_skip.clear();
+                if let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) {
+                    trace!(
+                        target: "ant_retrieval::fetcher",
+                        %peer,
+                        chunk = %hex::encode(addr),
+                        waited_ms = credit_waited.as_millis() as u64,
+                        "credit came free; dispatching",
+                    );
+                    // The credit may cover more than this chunk: wake
+                    // the next waiter (one, not all of them).
+                    acc.pass_credit();
+                    asked.push(peer);
+                    in_flight.push(make_fut(peer, guard));
+                    // The hedge timer ran down while we waited; don't
+                    // let it hedge the fresh dispatch at once.
+                    hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
+                }
+                continue;
             }
 
             tokio::select! {
@@ -1610,13 +1669,31 @@ impl ChunkFetcher for RoutingFetcher {
             self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p)),
             not_found_answers,
         );
-        Err(Box::new(FetchExhausted {
-            message: format!(
+        if credit_waited >= CREDIT_WAIT_BUDGET {
+            debug!(
+                target: "ant_retrieval::fetcher",
+                chunk = %hex::encode(addr),
+                asked = asked.len(),
+                pool_starved,
+                "credit wait budget exhausted; giving up",
+            );
+        }
+        // Never got a peer to ask: the pool stayed overdraft-skipped for
+        // the whole credit wait. Same message as the immediate
+        // no-candidate exit above, so the gateway and feed
+        // classification read it the same way.
+        let message = if asked.is_empty() {
+            "no BZZ peers available".to_string()
+        } else {
+            format!(
                 "all peers failed for chunk {} after {} attempts (last: {})",
                 hex::encode(addr),
                 asked.len(),
                 last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
-            ),
+            )
+        };
+        Err(Box::new(FetchExhausted {
+            message,
             pool_starved,
         }))
     }
@@ -2122,6 +2199,91 @@ mod tests {
         // satisfy `retrieve_chunk`.
         drop(hold);
         h.abort();
+    }
+
+    /// A fetcher with accounting over one peer whose credit is used up:
+    /// the returned guards hold the peer's whole overdraft allowance.
+    fn starved_fetcher(
+        addr: [u8; 32],
+    ) -> (RoutingFetcher, Arc<Accounting>, PeerId, Vec<DebitGuard>) {
+        let p = PeerId::random();
+        let o = [0x80u8; 32];
+        let acc = Arc::new(Accounting::new());
+        let price = Accounting::peer_price(&o, &addr);
+        let mut held = Vec::new();
+        while let Some(g) = acc.try_reserve(p, price) {
+            held.push(g);
+        }
+        assert!(!held.is_empty());
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
+            .with_accounting(acc.clone());
+        (fetcher, acc, p, held)
+    }
+
+    /// Issue #117: when every candidate is overdraft-skipped the fetch
+    /// waits for credit, as bee's `RetrieveChunk` sleeps
+    /// `overDraftRefresh`, instead of failing with `no BZZ peers
+    /// available` at once. Once the peer's credit comes free, the waiter
+    /// is woken (not left to its timer) and dispatches to that peer: its
+    /// reservation shows up in the accounting.
+    #[tokio::test]
+    async fn starved_fetch_waits_for_credit_then_asks_the_peer() {
+        let addr = [0x11u8; 32];
+        let (fetcher, acc, p, held) = starved_fetcher(addr);
+        let h = tokio::spawn(async move { fetcher.fetch(addr).await.map_err(|e| e.to_string()) });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !h.is_finished(),
+            "a fetch starved by accounting must wait for credit, got {:?}",
+            h.await.unwrap(),
+        );
+
+        let held_reserve = acc.debug_snapshot(&p).unwrap().1;
+        drop(held);
+        // Woken by the release, well before the 600 ms re-check.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, reserved) = acc.debug_snapshot(&p).unwrap();
+        assert!(
+            reserved > 0 && reserved < held_reserve,
+            "the fetch must have reserved credit and dispatched: reserved {reserved}",
+        );
+        h.abort();
+    }
+
+    /// The credit wait is bounded: a pool that never refills fails after
+    /// `CREDIT_WAIT_BUDGET` with the old message, flagged starved.
+    #[tokio::test(start_paused = true)]
+    async fn starved_fetch_gives_up_after_the_credit_wait_budget() {
+        let addr = [0x22u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(CREDIT_WAIT_BUDGET * 3, fetcher.fetch(addr))
+            .await
+            .expect("the credit wait must be bounded")
+            .expect_err("pool never refills");
+        let waited = started.elapsed();
+        assert!(
+            waited >= CREDIT_WAIT_BUDGET && waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            "waited {waited:?}",
+        );
+        assert_eq!(err.to_string(), "no BZZ peers available");
+        let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+        assert!(typed.pool_starved);
+    }
+
+    /// No peers at all is not starvation: nothing can refill, so the
+    /// fetch still fails at once.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_without_peers_fails_at_once() {
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), Vec::new())
+            .with_accounting(Arc::new(Accounting::new()));
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch([0x33u8; 32]).await.expect_err("no peers");
+        assert_eq!(err.to_string(), "no BZZ peers available");
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     /// Tier-2 short-circuit: a `fetch` whose chunk is already stored

@@ -622,6 +622,11 @@ impl RsDecoder {
     ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let total = self.addrs.len();
         let parity_cnt = total - self.shard_cnt;
+        tracing::debug!(
+            target: "ant_retrieval::rs",
+            shards = total,
+            "erasure recovery sweep started; trigger: {trigger}",
+        );
 
         // Sweep every sibling (the one that just failed included — the
         // fetcher may reach a different peer this time), bounded.
@@ -759,8 +764,9 @@ impl RsDecoder {
 /// [`crate::feed::is_chunk_not_found`])? Not when the fetcher reports
 /// its peer pool was starved ([`crate::fetcher::FetchExhausted`]): on a
 /// cold node one peer can answer "not found" and every other candidate
-/// be overdraft-skipped, which says nothing about the chunk.
-fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+/// be overdraft-skipped, which says nothing about the chunk. Also the
+/// test `ant-p2p`'s `/bytes` root retry uses to stop at a real miss.
+pub fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     if e.downcast_ref::<crate::fetcher::FetchExhausted>()
         .is_some_and(|x| x.pool_starved)
     {

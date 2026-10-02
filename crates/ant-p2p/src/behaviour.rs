@@ -4928,7 +4928,7 @@ async fn run_stream_bytes(
     head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx.clone())
         .with_cache(cache)
         .with_record_dir(record_dir)
         .with_progress(tracker.clone())
@@ -4949,16 +4949,48 @@ async fn run_stream_bytes(
     // Root fetch with dispersed-replica fallback: files uploaded with a
     // swarm-redundancy-level carry 2^level SOC replicas of their root at
     // addresses derivable from the root address alone.
-    let root = match ant_retrieval::fetch_root_with_replicas(&fetcher, reference).await {
-        Ok(root) => root,
-        Err(e) => {
-            let _ = ack
-                .send(ControlAck::Error {
-                    message: format!("fetch root chunk {}: {e}", hex::encode(reference)),
-                })
-                .await;
+    //
+    // Retried within `RESOLUTION_RETRY_BUDGET`, like `/bzz`'s
+    // pre-stream phase, so a `/bytes` request that lands before the
+    // peer pool is up doesn't answer a fast 502 (issue #117). That
+    // includes an empty peer set (a fresh node, or its only peer just
+    // dropped): unlike `/bzz`, which fails at once there, `/bytes` waits
+    // it out and only then reports `no peers available`. A miss peers
+    // confirmed (`not found` from an unstarved fetch) is final, so a
+    // missing reference still 404s as quickly as before.
+    let resolution_started = Instant::now();
+    let mut attempt = 0usize;
+    let root = loop {
+        attempt += 1;
+        let failure = if peers_rx.borrow().is_empty() {
+            None
+        } else {
+            match ant_retrieval::fetch_root_with_replicas(&fetcher, reference).await {
+                Ok(root) => break root,
+                Err(e) => Some(e),
+            }
+        };
+        let retry = failure
+            .as_ref()
+            .is_none_or(|e| is_bytes_root_transient(e.as_ref()))
+            && attempt < MAX_FETCH_ATTEMPTS
+            && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET;
+        let message = failure.map_or_else(
+            || "no peers available; wait for handshakes to complete".to_string(),
+            |e| format!("fetch root chunk {}: {e}", hex::encode(reference)),
+        );
+        if !retry {
+            let _ = ack.send(ControlAck::Error { message }).await;
             return;
         }
+        let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+        warn!(
+            target: "ant_p2p",
+            attempt,
+            next_in_ms = backoff.as_millis() as u64,
+            "stream_bytes root fetch failed, retrying: {message}",
+        );
+        tokio::time::sleep(backoff).await;
     };
     // Mask the RS level byte off the span before reporting
     // `total_bytes` so the gateway's `Content-Length` reflects the real
@@ -5580,6 +5612,15 @@ const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 64;
 /// noticeably stretch the user's wait, large enough that we don't
 /// re-flood the same overloaded forwarders the moment they shed us.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Should a failed `/bytes` root fetch be retried (`run_stream_bytes`)?
+/// Yes unless peers confirmed the chunk missing: an empty or
+/// overdraft-starved pool (`no BZZ peers available`, a starved `not
+/// found` tail), timeouts and dropped streams can all clear up within
+/// the resolution budget, a real miss can't (issue #117).
+fn is_bytes_root_transient(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    !ant_retrieval::rs::shard_confirmed_missing(e)
+}
 
 /// One pipeline attempt's outcome on failure. `Transient` failures
 /// (chunk fetch errors from peer / network flakes) should trigger a
@@ -8911,6 +8952,32 @@ mod tests {
     /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
     /// — even though the very next attempt could have a fresh peer
     /// snapshot that resolves the feed cleanly.
+    /// `/bytes` retries its root fetch through a cold or flaky pool but
+    /// not through a confirmed miss, so a missing reference still 404s
+    /// promptly (issue #117).
+    #[test]
+    fn bytes_root_retries_all_but_a_confirmed_miss() {
+        let err = |m: &str| -> Box<dyn std::error::Error + Send + Sync> { m.into() };
+        for transient in [
+            "no BZZ peers available",
+            "all peers failed for chunk ab after 3 attempts (last: open retrieval stream: \
+             failed to open stream: io error: oneshot canceled)",
+        ] {
+            assert!(
+                is_bytes_root_transient(err(transient).as_ref()),
+                "{transient}"
+            );
+        }
+        for miss in [
+            "all peers failed for chunk ab after 5 attempts (last: remote: retrieve chunk: \
+             storage: not found)",
+            "all peers failed for chunk ab after 5 attempts (last: remote: retrieve chunk: \
+             no peer found)",
+        ] {
+            assert!(!is_bytes_root_transient(err(miss).as_ref()), "{miss}");
+        }
+    }
+
     #[test]
     fn is_manifest_transient_classifies_feed_fetch_as_transient() {
         let inner: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
