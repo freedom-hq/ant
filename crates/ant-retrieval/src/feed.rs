@@ -560,6 +560,23 @@ async fn probe_once(
                 if is_chunk_not_found(e.as_ref()) {
                     return Ok(ProbeOutcome::Absent);
                 }
+                // A fetch that gave up on a starved pool has already
+                // waited out its own credit budget
+                // (`accounting::CREDIT_WAIT_BUDGET`) for peers to refill.
+                // Re-probing here would stack another full wait per
+                // retry — 4 × 10 s on the unbounded anchor probe, past
+                // the 30 s `/bzz` resolution budget it runs under — so
+                // hand the transient straight back and let the caller's
+                // resolution-level retry (fresh peer snapshot) decide.
+                if pool_starved(e.as_ref()) {
+                    debug!(
+                        target: "ant_retrieval::feed",
+                        index,
+                        attempts = attempt + 1,
+                        "probe fetch gave up on a starved peer pool; not retrying: {e}",
+                    );
+                    return Ok(ProbeOutcome::Transient(e));
+                }
                 if attempt >= PROBE_RETRIES {
                     debug!(
                         target: "ant_retrieval::feed",
@@ -580,6 +597,15 @@ async fn probe_once(
             }
         }
     }
+}
+
+/// Did the fetch end because its peer pool stayed overdraft-starved
+/// ([`crate::fetcher::FetchExhausted::pool_starved`])? Such a fetch has
+/// already spent its credit wait, so an immediate re-probe only waits
+/// again.
+fn pool_starved(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    e.downcast_ref::<crate::fetcher::FetchExhausted>()
+        .is_some_and(|x| x.pool_starved)
 }
 
 /// Same lookup as [`resolve_sequence_feed`] but returns the full update
@@ -1780,6 +1806,48 @@ mod tests {
             Err(FeedError::Fetch(_)) => {}
             other => panic!("expected Fetch error, got {other:?}"),
         }
+    }
+
+    /// A starved anchor fetch has already waited out its credit budget
+    /// inside the fetcher, so the anchor probe must not retry it
+    /// `PROBE_RETRIES` more times: 4 × 10 s would overrun the 30 s `/bzz`
+    /// resolution budget the walk runs under (PR #119 R3-F1). One fetch,
+    /// one budget, then `FeedError::Fetch` for the caller to retry.
+    #[tokio::test(start_paused = true)]
+    async fn starved_anchor_probe_is_not_retried() {
+        struct StarvedFetcher {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ChunkFetcher for StarvedFetcher {
+            async fn fetch(
+                &self,
+                _addr: [u8; 32],
+            ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(crate::accounting::CREDIT_WAIT_BUDGET).await;
+                Err(Box::new(crate::fetcher::FetchExhausted {
+                    message: "no BZZ peers available".into(),
+                    pool_starved: true,
+                }))
+            }
+        }
+        let secret: [u8; 32] = [16u8; 32];
+        let feed = Feed {
+            owner: deterministic_eth_address(&secret),
+            topic: [0x24u8; 32],
+            kind: FeedType::Sequence,
+        };
+        let fetcher = StarvedFetcher {
+            calls: AtomicUsize::new(0),
+        };
+        let started = tokio::time::Instant::now();
+        match resolve_sequence_feed_full(&fetcher, &feed).await {
+            Err(FeedError::Fetch(_)) => {}
+            other => panic!("expected Fetch error, got {other:?}"),
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < crate::accounting::CREDIT_WAIT_BUDGET * 2);
     }
 
     /// `feed_from_metadata` accepts the canonical mantaray feed layout

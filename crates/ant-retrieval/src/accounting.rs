@@ -182,7 +182,9 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// - the chunk API's 60 s request timeout.
 ///
 /// Feed probes past the anchor carry their own 800 ms deadline, which
-/// cuts a wait short exactly as it cuts a slow peer walk short. The
+/// cuts a wait short exactly as it cuts a slow peer walk short; the
+/// undeadlined anchor probe doesn't re-probe a starved fetch (that would
+/// stack one wait per probe retry), so it too ends after one budget. The
 /// root fetch's dispersed-replica probes don't wait at all
 /// ([`crate::ChunkFetcher::fetch_speculative`]), so a starved root
 /// fetch with its replica fallback still ends after one budget.
