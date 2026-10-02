@@ -828,7 +828,7 @@ impl ChunkFetcher for SniffedFetcher<'_> {
                     state.fetched.insert(addr, wire.clone());
                 }
                 Ok(_) => {}
-                Err(e) => state.failed = Some((addr, e.to_string().into())),
+                Err(e) => state.failed = Some((addr, replayable_err(e.as_ref()))),
             }
         }
         result
@@ -836,6 +836,18 @@ impl ChunkFetcher for SniffedFetcher<'_> {
 
     async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
         self.inner.put_recovered(addr, wire).await;
+    }
+}
+
+/// A copy of a fetch error the sniff can replay later. Boxed errors
+/// aren't `Clone`, so most are kept as their message — but a
+/// [`crate::fetcher::FetchExhausted`] keeps its type, because the RS
+/// decoder reads its `pool_starved` flag to tell a starved "not found"
+/// from a confirmed-missing shard (`rs::shard_confirmed_missing`).
+fn replayable_err(e: &(dyn std::error::Error + Send + Sync + 'static)) -> FetchErr {
+    match e.downcast_ref::<crate::fetcher::FetchExhausted>() {
+        Some(x) => Box::new(x.clone()),
+        None => e.to_string().into(),
     }
 }
 
@@ -1933,6 +1945,42 @@ mod tests {
         bare_log.sort_unstable();
         lookup_log.sort_unstable();
         assert_eq!(lookup_log, bare_log);
+    }
+
+    /// PR #116 R1-M3: a sniff miss replayed to the fallback join keeps
+    /// its `FetchExhausted` type, so a starved "not found" still reads as
+    /// unreached (not confirmed missing) when a recovery sweep is served
+    /// the replay. Other errors replay with their message.
+    #[tokio::test]
+    async fn sniff_replay_keeps_the_fetch_exhausted_type() {
+        struct Starved;
+        #[async_trait]
+        impl ChunkFetcher for Starved {
+            async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                if addr[0] == 1 {
+                    return Err(Box::new(crate::fetcher::FetchExhausted {
+                        message: "all peers failed for chunk 01 after 1 attempts \
+                                  (last: remote: retrieve chunk: storage: not found)"
+                            .into(),
+                        pool_starved: true,
+                    }));
+                }
+                Err("timeout".into())
+            }
+        }
+        for addr in [[1u8; 32], [2u8; 32]] {
+            let sniffed = SniffedFetcher::new(&Starved);
+            let first = sniffed.fetch(addr).await.unwrap_err();
+            sniffed.replay();
+            let replayed = sniffed.fetch(addr).await.unwrap_err();
+            assert_eq!(replayed.to_string(), first.to_string());
+            let typed = replayed.downcast_ref::<crate::fetcher::FetchExhausted>();
+            if addr[0] == 1 {
+                assert!(typed.is_some_and(|x| x.pool_starved));
+            } else {
+                assert!(typed.is_none());
+            }
+        }
     }
 
     /// Fetcher that records every requested address.

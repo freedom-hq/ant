@@ -120,15 +120,26 @@ const SUBTREE_RETRY_ATTEMPTS: usize = 32;
 /// gone out the response can't restart, so this is retried in place,
 /// like [`SUBTREE_RETRY_ATTEMPTS`] does for plain fetch misses.
 ///
-/// The bound is wall-clock: no new sweep once [`RECOVERY_RETRY_BUDGET`]
-/// has passed since this child's first failure (the attempt cap is a
-/// backstop). Back-off is `RECOVERY_RETRY_BACKOFF × attempt`, capped at
+/// The bound is wall-clock: no new sweep starts once
+/// [`RECOVERY_RETRY_BUDGET`] has passed since this child's first fetch
+/// began (the attempt cap is a backstop). Back-off is
+/// `RECOVERY_RETRY_BACKOFF × attempt`, capped at
 /// [`RECOVERY_RETRY_BACKOFF_MAX`]. 60 s covers the credit a light node
 /// needs to pull several cold 1.6 MB segments at once at startup (on
 /// mainnet, 8 concurrent ones completed in 14–20 s and 12 in 19–28 s,
-/// where an 8-sweep / 14 s budget still truncated 6 of 16) while
-/// staying inside the gateway's 90 s body-stall timeout, so a response
-/// that can't complete ends with an error rather than a stall.
+/// where an 8-sweep / 14 s budget still truncated 6 of 16).
+///
+/// It is a budget on sweep *starts*, not a deadline: the last sweep may
+/// begin just inside the window and runs to completion (bounded only by
+/// the fetcher's own per-chunk limits), and each redundant level has its
+/// own window, so a data child that is itself an intermediate chunk of a
+/// redundant subtree can spend one window recovering and then its own
+/// child another, with no bytes emitted in between. So this is chosen
+/// to leave a single-level recovery comfortably inside the gateway's
+/// 90 s `BODY_STALL_TIMEOUT`, but does not guarantee it: a stuck nested
+/// recovery may end in the gateway's stall timeout instead of a join
+/// error. For the client the outcome is the same — a truncated body (or
+/// a 502 if nothing was sent yet).
 const RECOVERY_RETRY_ATTEMPTS: usize = 32;
 const RECOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const RECOVERY_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4);
@@ -657,7 +668,9 @@ async fn fetch_shard_with_recovery_retries(
     decoder: &crate::rs::RsDecoder,
     index: usize,
 ) -> Result<Vec<u8>, JoinError> {
-    let mut first_failure: Option<tokio::time::Instant> = None;
+    // The window opens when the first fetch starts, so the first sweep's
+    // own duration counts against it too.
+    let started = tokio::time::Instant::now();
     for attempt in 1..=RECOVERY_RETRY_ATTEMPTS {
         match decoder.fetch_data_shard(fetcher, index).await {
             Ok(wire) => {
@@ -672,7 +685,6 @@ async fn fetch_shard_with_recovery_retries(
                 return Ok(wire);
             }
             Err(e) => {
-                let started = *first_failure.get_or_insert_with(tokio::time::Instant::now);
                 let backoff =
                     (RECOVERY_RETRY_BACKOFF * attempt as u32).min(RECOVERY_RETRY_BACKOFF_MAX);
                 let retry = e.transient

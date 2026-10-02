@@ -49,6 +49,26 @@ pub type Overlay = [u8; 32];
 /// certainly not retrievable from our connected set anyway.
 const MAX_ORIGIN_ERRORS: usize = 32;
 
+/// How many distinct peers may answer "not found" before a fetch that
+/// ended with ranked peers still unasked stops counting as
+/// [`FetchExhausted::pool_starved`]. On a cold node one or two peers
+/// answer `storage: not found` / `no peer found` for chunks that exist
+/// (issue #114); several independent closest-first answers agreeing is
+/// the network's answer, even if the rest of the pool was
+/// overdraft-skipped. Without this cap a busy node (where *some* ranked
+/// peer is nearly always overdraft-skipped) would class every genuinely
+/// lost shard as unreached and run the joiner's whole recovery-retry
+/// budget before failing.
+const STARVED_MAX_NOT_FOUND: usize = 2;
+
+/// Whether a fetch that gave up counts as starved by the peer pool
+/// rather than answered by the network: error budget left, ranked
+/// peers never asked (all overdraft-skipped), and no more than
+/// [`STARVED_MAX_NOT_FOUND`] peers saying the chunk is missing.
+const fn pool_starved(errors_left: usize, unasked_ranked: bool, not_found_answers: usize) -> bool {
+    errors_left > 0 && unasked_ranked && not_found_answers <= STARVED_MAX_NOT_FOUND
+}
+
 /// Idle hedge interval. If the active retrieval stream hasn't returned
 /// a delivery within this window we dispatch a single backup peer in
 /// parallel. Mirrors bee's `preemptiveInterval = time.Second` from
@@ -1153,10 +1173,11 @@ const fn accept_shallow_after(shallow_attempts: u32) -> bool {
 /// unchanged from the plain-string error it replaces; the type adds
 /// whether the loop ended because the peer pool was *starved*: ranked
 /// peers were left unasked because every one of them was
-/// overdraft-skipped. A `storage: not found` tail is then one peer's
+/// overdraft-skipped, and at most [`STARVED_MAX_NOT_FOUND`] of the peers
+/// that were asked answered "not found". A `storage: not found` tail is then one peer's
 /// answer, not the network's, so the RS decoder (`crate::rs`) must not
 /// read it as the chunk being confirmed missing (issue #114).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FetchExhausted {
     pub(crate) message: String,
     pub pool_starved: bool,
@@ -1274,6 +1295,9 @@ impl ChunkFetcher for RoutingFetcher {
         let mut asked: Vec<PeerId> = Vec::new();
         let mut errors_left = MAX_ORIGIN_ERRORS;
         let mut last_err: Option<RetrievalError> = None;
+        // Peers that answered "not found" / "no peer found" (see
+        // `pool_starved`).
+        let mut not_found_answers = 0usize;
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
         // Per-chunk overdraft skip: a peer landed here when
@@ -1544,6 +1568,9 @@ impl ChunkFetcher for RoutingFetcher {
                             if blacklist {
                                 self.blacklist_peer(peer);
                             }
+                            if crate::feed::is_chunk_not_found(&e) {
+                                not_found_answers += 1;
+                            }
                             last_err = Some(e);
                             errors_left = errors_left.saturating_sub(1);
                             if errors_left == 0 {
@@ -1575,11 +1602,14 @@ impl ChunkFetcher for RoutingFetcher {
         }
 
         // Starved: we stopped with error budget left and ranked peers we
-        // never asked — they were all overdraft-skipped. Whatever the
-        // peers we did ask answered, the pool, not the network, ended
-        // this fetch.
-        let pool_starved =
-            errors_left > 0 && self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p));
+        // never asked — they were all overdraft-skipped — and too few of
+        // the peers we did ask said "not found" to call it the network's
+        // answer. Then the pool, not the network, ended this fetch.
+        let pool_starved = pool_starved(
+            errors_left,
+            self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p)),
+            not_found_answers,
+        );
         Err(Box::new(FetchExhausted {
             message: format!(
                 "all peers failed for chunk {} after {} attempts (last: {})",
@@ -1822,6 +1852,29 @@ fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Starvation needs budget left *and* unasked ranked peers, and stops
+    /// counting once more than `STARVED_MAX_NOT_FOUND` peers agreed the
+    /// chunk is missing: a busy node where some ranked peer is always
+    /// overdraft-skipped must still report genuine loss as confirmed
+    /// (PR #116 R1-M1).
+    #[test]
+    fn pool_starved_yields_to_several_not_found_answers() {
+        // Cold node: one peer said "not found", the rest were skipped.
+        assert!(pool_starved(31, true, 1));
+        assert!(pool_starved(30, true, STARVED_MAX_NOT_FOUND));
+        // Busy node, real loss: ten peers said "not found".
+        assert!(!pool_starved(22, true, 10));
+        assert!(!pool_starved(29, true, STARVED_MAX_NOT_FOUND + 1));
+        // Every ranked peer asked, or the budget spent: not starved.
+        assert!(!pool_starved(31, false, 0));
+        assert!(!pool_starved(0, true, 0));
+        // And the classification it feeds: a peer's "not found" reply
+        // counts toward the cap.
+        assert!(crate::feed::is_chunk_not_found(&RetrievalError::Remote(
+            "retrieve chunk: storage: not found".into()
+        )));
+    }
 
     /// `is_peer_fatal` is the load-bearing classifier: it decides
     /// whether a per-chunk failure spreads into a request-wide
