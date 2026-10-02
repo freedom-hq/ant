@@ -260,7 +260,7 @@ impl ChainInit {
         let recheck_at = self
             .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
-        self.rediscover_owned(chain, cmd_tx).await;
+        self.rediscover_owned(chain, cmd_tx, data_dir).await;
         report(
             self.adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
                 .await,
@@ -324,27 +324,21 @@ impl ChainInit {
 
     /// `antd` step 3: register every funded batch this account owns
     /// on-chain that isn't registered yet (a reinstall or restore from
-    /// key leaves them on-chain but not on disk). Uses the same shared
-    /// scan as `antd` and `ant_storage_discover`. A new issuer starts at
+    /// key leaves them on-chain but not on disk). Uses the same saved
+    /// transfer scan as `antd` and `ant_storage_discover`, so only the
+    /// first start reads the full history (#118). A new issuer starts at
     /// index 0, as in `antd` without a bee `stamperstore`.
     async fn rediscover_owned(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
     ) {
         let mut rediscovered = self.batches_rediscovered.lock().await;
         if *rediscovered {
             return;
         }
-        let found = match ant_chain::discover::discover_owned_batches(
-            chain,
-            ant_chain::GNOSIS_POSTAGE_STAMP,
-            ant_chain::GNOSIS_BZZ_TOKEN,
-            &self.upload.batch_owner,
-            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
-        )
-        .await
-        {
+        let found = match owned_batches(chain, &self.upload.batch_owner, data_dir).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!(
@@ -956,8 +950,26 @@ pub(crate) fn storage_connect_batch(
     })
 }
 
+/// The funded postage batches `owner` holds on Gnosis, from the saved
+/// transfer scan in `data_dir` (brought up to the chain head first).
+#[cfg(feature = "chain")]
+async fn owned_batches(
+    chain: &ant_chain::ChainClient,
+    owner: &[u8; 20],
+    data_dir: &std::path::Path,
+) -> Result<Vec<ant_chain::discover::DiscoveredBatch>, ant_chain::RpcError> {
+    let scan = ant_chain::discover::refresh_transfer_scan(
+        chain,
+        ant_chain::GNOSIS_BZZ_TOKEN,
+        owner,
+        data_dir,
+    )
+    .await?;
+    ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan).await
+}
+
 /// Auto-discover every funded postage batch this account owns on Gnosis
-/// (a log scan from the xBZZ deploy block) and register each one.
+/// (the saved transfer scan, then the blocks since) and register each one.
 /// Returns `{"registered":[...],"status":<plan>}`.
 #[cfg(feature = "chain")]
 pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
@@ -967,15 +979,9 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let found = ant_chain::discover::discover_owned_batches(
-            &chain,
-            ant_chain::GNOSIS_POSTAGE_STAMP,
-            ant_chain::GNOSIS_BZZ_TOKEN,
-            &eth,
-            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
-        )
-        .await
-        .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
+        let found = owned_batches(&chain, &eth, &data_dir)
+            .await
+            .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
         let mut registered = Vec::new();
         for b in &found {
             register_batch(
@@ -2364,16 +2370,27 @@ async fn resolve_or_deploy_chequebook(
 
     // 2. Rediscover a chequebook this node EOA already owns on-chain
     //    (reinstall with a restored key). Adopt + persist it.
-    match ant_chain::discover::discover_owned_chequebook(
+    let owned = match ant_chain::discover::refresh_transfer_scan(
         client,
-        &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
-        ant_chain::GNOSIS_POSTAGE_STAMP,
         ant_chain::GNOSIS_BZZ_TOKEN,
         &node_eth,
-        ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+        data_dir,
     )
     .await
     {
+        Ok(scan) => {
+            ant_chain::discover::owned_chequebook_in(
+                client,
+                &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+                ant_chain::GNOSIS_POSTAGE_STAMP,
+                ant_chain::GNOSIS_BZZ_TOKEN,
+                &scan,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    match owned {
         Ok(Some(cb)) => {
             if let Err(e) = chequebook_store::persist_chequebook(
                 &persist_path,
@@ -4002,11 +4019,11 @@ mod chain_tests {
         let (cmd_tx, node) = fake_node();
         node.lock().unwrap().fail_registers = 1;
 
-        init.rediscover_owned(&client(&script), &cmd_tx).await;
+        init.rediscover_owned(&client(&script), &cmd_tx, &dir).await;
         assert_eq!(node.lock().unwrap().registered, [] as [[u8; 32]; 0]);
         assert!(!*init.batches_rediscovered.lock().await);
 
-        init.rediscover_owned(&client(&script), &cmd_tx).await;
+        init.rediscover_owned(&client(&script), &cmd_tx, &dir).await;
         assert_eq!(node.lock().unwrap().registered, vec![lost], "retried");
         assert!(*init.batches_rediscovered.lock().await);
         std::fs::remove_dir_all(&dir).ok();
