@@ -910,23 +910,51 @@ async fn join_child_to_sender(
 /// misses). Erasure-recovery failures are not retried here: a transient
 /// one was already retried by [`fetch_shard_with_recovery_retries`]
 /// within its own budget, and a permanent one can't improve.
+///
+/// A miss on an overdraft-starved pool ([`fetch_chunk_pool_starved`]) has
+/// already waited up to [`crate::accounting::CREDIT_WAIT_BUDGET`] for
+/// credit inside the fetcher, so 32 of them would stall the body for
+/// minutes. Such a miss is retried only while no more than
+/// [`RECOVERY_RETRY_BUDGET`] has passed since the first fetch began —
+/// the same window a redundant child's recovery retries get — so a
+/// starved plain child, too, stalls the body for at most 60 s + one
+/// credit wait.
 async fn fetch_child_with_retries(
     fetcher: &dyn ChunkFetcher,
     decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
     index: usize,
     addr: [u8; 32],
 ) -> Result<Vec<u8>, JoinError> {
+    let started = tokio::time::Instant::now();
     for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
         match fetch_child_chunk(fetcher, decoder, index, addr).await {
             Ok(chunk) => return Ok(chunk),
             Err(e @ JoinError::FetchChunk { .. }) if attempt < SUBTREE_RETRY_ATTEMPTS => {
-                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                let backoff = Duration::from_millis(250 * attempt as u64);
+                if fetch_chunk_pool_starved(&e)
+                    && started.elapsed() + backoff >= RECOVERY_RETRY_BUDGET
+                {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
                 drop(e);
             }
             Err(e) => return Err(e),
         }
     }
     unreachable!("retry loop returns on the final attempt");
+}
+
+/// Did a child fetch end because the fetcher's peer pool stayed
+/// overdraft-starved ([`crate::fetcher::FetchExhausted::pool_starved`])?
+/// Such a fetch has already spent its credit wait.
+fn fetch_chunk_pool_starved(err: &JoinError) -> bool {
+    match err {
+        JoinError::FetchChunk { source, .. } => source
+            .downcast_ref::<crate::fetcher::FetchExhausted>()
+            .is_some_and(|x| x.pool_starved),
+        _ => false,
+    }
 }
 
 /// Range-aware version of [`join_subtree_to_sender`].
@@ -1945,6 +1973,79 @@ mod tests {
             started.elapsed() >= RECOVERY_RETRY_BACKOFF,
             "a transient failure must be retried before giving up"
         );
+    }
+
+    /// A plain (non-redundant) child whose pool stays starved: every fetch
+    /// waits out its credit budget, so the 32 subtree retries would stall
+    /// the body for ~7 min. Starved misses are retried only inside
+    /// `RECOVERY_RETRY_BUDGET`, so the child gives up within 60 s + one
+    /// credit wait (PR #119 R5-M1) — and is still retried before that.
+    #[tokio::test(start_paused = true)]
+    async fn starved_plain_child_retries_stay_inside_the_recovery_window() {
+        struct StarvedFetcher {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ChunkFetcher for StarvedFetcher {
+            async fn fetch(
+                &self,
+                _addr: [u8; 32],
+            ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(crate::accounting::CREDIT_WAIT_BUDGET).await;
+                Err(Box::new(crate::fetcher::FetchExhausted {
+                    message: "no BZZ peers available".into(),
+                    pool_starved: true,
+                }))
+            }
+        }
+        let fetcher = StarvedFetcher {
+            calls: AtomicUsize::new(0),
+        };
+        let started = tokio::time::Instant::now();
+        let err = fetch_child_with_retries(&fetcher, None, 0, [7u8; 32])
+            .await
+            .unwrap_err();
+        assert!(fetch_chunk_pool_starved(&err), "got {err:?}");
+        assert!(
+            started.elapsed() <= RECOVERY_RETRY_BUDGET + crate::accounting::CREDIT_WAIT_BUDGET,
+            "starved child stalled {:?}",
+            started.elapsed()
+        );
+        let calls = fetcher.calls.load(Ordering::SeqCst);
+        assert!(
+            calls > 1 && calls < SUBTREE_RETRY_ATTEMPTS,
+            "{calls} fetches"
+        );
+    }
+
+    /// A non-starved miss keeps the full subtree retry count: a fast
+    /// failure costs no credit wait, so the window bound doesn't apply.
+    #[tokio::test(start_paused = true)]
+    async fn unstarved_plain_child_keeps_all_subtree_retries() {
+        struct MissFetcher {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ChunkFetcher for MissFetcher {
+            async fn fetch(
+                &self,
+                _addr: [u8; 32],
+            ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(Box::new(crate::fetcher::FetchExhausted {
+                    message: "timed out".into(),
+                    pool_starved: false,
+                }))
+            }
+        }
+        let fetcher = MissFetcher {
+            calls: AtomicUsize::new(0),
+        };
+        fetch_child_with_retries(&fetcher, None, 0, [7u8; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), SUBTREE_RETRY_ATTEMPTS);
     }
 
     /// Real data loss stays terminal: more shards confirmed missing than

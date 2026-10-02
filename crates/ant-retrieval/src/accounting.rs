@@ -177,8 +177,10 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 ///   direct fetch waits at most this long, and so does each recovery
 ///   retry's (the 60 s recovery-retry window opens with the first
 ///   fetch), while the recovery sweeps themselves never wait
-///   ([`crate::ChunkFetcher::fetch_speculative`]) — so a starved child
-///   stalls the body for at most 60 s + 10 s = 70 s;
+///   ([`crate::ChunkFetcher::fetch_speculative`]); a plain child's
+///   subtree retries re-fetch a starved miss only inside that same 60 s
+///   window — so a starved child, redundant or not, stalls the body for
+///   at most 60 s + 10 s = 70 s;
 /// - the 30 s `/bzz` and `/bytes` resolution budget: a starved root or
 ///   manifest fetch still gets a second attempt inside it;
 /// - the chunk API's 60 s request timeout.
