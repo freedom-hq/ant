@@ -136,6 +136,43 @@ pub trait ChunkFetcher: Send + Sync {
     /// failure here as a fatal error for the file.
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
 
+    /// Like [`ChunkFetcher::fetch`], but when every candidate peer is
+    /// overdraft-skipped, wait up to `credit_budget` in total for peer
+    /// credit to come free instead of failing at once (issue #117; bee's
+    /// `RetrieveChunk` sleeps `overDraftRefresh` and retries the same
+    /// way). Plain `fetch` never waits.
+    ///
+    /// Opt-in, because a wait inside a fan-out or a retry loop multiplies:
+    /// only callers that need the chunk, fetch it once per attempt, and
+    /// bound their retries by a window ([`crate::accounting::CreditWindow`])
+    /// use it. Those are the joiners' data-chunk fetches and the `/bytes`
+    /// / `/bzz` data-root fetch; see
+    /// [`crate::accounting::CREDIT_WAIT_BUDGET`] for the full list and
+    /// bounds. Default is plain `fetch`, right for every fetcher that has
+    /// no credit to wait for (and for wrappers that must not wait, like
+    /// the manifest sniff).
+    async fn fetch_waiting_for_credit(
+        &self,
+        addr: [u8; 32],
+        _credit_budget: Duration,
+    ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.fetch(addr).await
+    }
+
+    /// Does [`ChunkFetcher::fetch_waiting_for_credit`] actually wait for
+    /// peer credit on this fetcher? Retry loops bound a starved miss's
+    /// retries by their [`crate::accounting::CreditWindow`] only when it
+    /// does: that bound exists so credit waits can't stack, and a fetcher
+    /// that never waits has no wait to stack — its starved misses keep the
+    /// loop's full retry count, as before #117, so the retries themselves
+    /// are what gives pseudosettle time to refill the pool. Default
+    /// `false`, matching the default `fetch_waiting_for_credit`; an
+    /// implementation that overrides that to wait (or a wrapper that
+    /// forwards it) must say `true` here too.
+    fn waits_for_credit(&self) -> bool {
+        false
+    }
+
     /// Offer a chunk that was *reconstructed locally* (Reed-Solomon
     /// recovery of a missing data shard, or a root rebuilt from a
     /// dispersed replica) so the implementation can store it exactly
@@ -144,6 +181,25 @@ pub trait ChunkFetcher: Send + Sync {
     /// bytes are already CAC-validated against `addr` by the caller.
     /// Default is a no-op for map-backed test fetchers.
     async fn put_recovered(&self, _addr: [u8; 32], _wire: &[u8]) {}
+}
+
+/// A [`ChunkFetcher`] view that never waits for peer credit: it forwards
+/// `fetch` and `put_recovered`, and leaves
+/// [`ChunkFetcher::fetch_waiting_for_credit`] at the trait default
+/// (plain `fetch`). Wrap a fetcher in it before handing it to a joiner on
+/// a path that must stay non-waiting (manifest walks, traversal, ACT;
+/// see [`accounting::CREDIT_WAIT_BUDGET`]).
+pub struct NoCreditWait<'a>(pub &'a dyn ChunkFetcher);
+
+#[async_trait]
+impl ChunkFetcher for NoCreditWait<'_> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.0.fetch(addr).await
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.0.put_recovered(addr, wire).await;
+    }
 }
 
 /// Bee `pkg/retrieval` protocol id. Unchanged between bee 2.7.x and

@@ -779,6 +779,14 @@ type FetchErr = Box<dyn std::error::Error + Send + Sync>;
 /// starts from where the sniff left off instead of re-waiting for the
 /// same miss. Later requests for that address go to the network as
 /// usual, so the join's own retries are untouched.
+///
+/// It deliberately doesn't forward
+/// [`ChunkFetcher::fetch_waiting_for_credit`]: the trait default turns
+/// that into a plain `fetch`, so neither the sniff nor the fallback join
+/// of a manifest node ever waits for peer credit (issue #117). A node
+/// load is one step of a walk that runs inside the 30 s `/bzz`
+/// resolution budget; a starved node fails at once, as before #117, and
+/// the resolution loop retries the walk.
 struct SniffedFetcher<'a> {
     inner: &'a dyn ChunkFetcher,
     state: std::sync::Mutex<SniffState>,

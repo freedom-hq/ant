@@ -567,10 +567,17 @@ impl RsDecoder {
     /// shards peers confirmed missing already exceed the parity count,
     /// or when the shards were all there but reconstruction or CAC
     /// validation failed.
+    ///
+    /// The direct fetch waits up to `credit_budget` for peer credit
+    /// ([`ChunkFetcher::fetch_waiting_for_credit`]); the recovery sweep
+    /// never waits (issue #117): a starved shard counts as unreached, so
+    /// the sweep comes up short as `transient` and the caller's retry
+    /// window decides.
     pub async fn fetch_data_shard(
         &self,
         fetcher: &dyn ChunkFetcher,
         index: usize,
+        credit_budget: std::time::Duration,
     ) -> Result<Vec<u8>, RecoveryError> {
         let seen = {
             let state = self.recovered.lock().await;
@@ -582,7 +589,10 @@ impl RsDecoder {
             }
             state.sweeps
         };
-        match fetcher.fetch(self.addrs[index]).await {
+        match fetcher
+            .fetch_waiting_for_credit(self.addrs[index], credit_budget)
+            .await
+        {
             Ok(wire) => Ok(wire),
             Err(fetch_err) => {
                 let shards = self.recover(fetcher, &fetch_err.to_string(), seen).await?;
@@ -622,6 +632,11 @@ impl RsDecoder {
     ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let total = self.addrs.len();
         let parity_cnt = total - self.shard_cnt;
+        tracing::debug!(
+            target: "ant_retrieval::rs",
+            shards = total,
+            "erasure recovery sweep started; trigger: {trigger}",
+        );
 
         // Sweep every sibling (the one that just failed included — the
         // fetcher may reach a different peer this time), bounded.
@@ -759,8 +774,9 @@ impl RsDecoder {
 /// [`crate::feed::is_chunk_not_found`])? Not when the fetcher reports
 /// its peer pool was starved ([`crate::fetcher::FetchExhausted`]): on a
 /// cold node one peer can answer "not found" and every other candidate
-/// be overdraft-skipped, which says nothing about the chunk.
-fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+/// be overdraft-skipped, which says nothing about the chunk. Also the
+/// test `ant-p2p`'s `/bytes` root retry uses to stop at a real miss.
+pub fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     if e.downcast_ref::<crate::fetcher::FetchExhausted>()
         .is_some_and(|x| x.pool_starved)
     {
@@ -861,11 +877,17 @@ pub fn replica_identities(addr: &[u8; 32], level: u8) -> Vec<([u8; 32], [u8; 32]
 ///
 /// On total failure the *original* fetch error is returned, so callers'
 /// error messages still describe the direct root miss.
+///
+/// The direct fetch waits up to `credit_budget` for peer credit
+/// ([`ChunkFetcher::fetch_waiting_for_credit`]; zero means plain
+/// `fetch`). The replica probes never wait (issue #117): most replica
+/// addresses hold nothing, and up to 30 waits at fanout 4 would stack.
 pub async fn fetch_root_with_replicas(
     fetcher: &dyn ChunkFetcher,
     addr: [u8; 32],
+    credit_budget: std::time::Duration,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let direct_err = match fetcher.fetch(addr).await {
+    let direct_err = match fetcher.fetch_waiting_for_credit(addr, credit_budget).await {
         Ok(wire) => return Ok(wire),
         Err(e) => e,
     };

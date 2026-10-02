@@ -4928,7 +4928,7 @@ async fn run_stream_bytes(
     head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx.clone())
         .with_cache(cache)
         .with_record_dir(record_dir)
         .with_progress(tracker.clone())
@@ -4949,16 +4949,61 @@ async fn run_stream_bytes(
     // Root fetch with dispersed-replica fallback: files uploaded with a
     // swarm-redundancy-level carry 2^level SOC replicas of their root at
     // addresses derivable from the root address alone.
-    let root = match ant_retrieval::fetch_root_with_replicas(&fetcher, reference).await {
-        Ok(root) => root,
-        Err(e) => {
-            let _ = ack
-                .send(ControlAck::Error {
-                    message: format!("fetch root chunk {}: {e}", hex::encode(reference)),
-                })
-                .await;
+    //
+    // Retried within `RESOLUTION_RETRY_BUDGET`, like `/bzz`'s
+    // pre-stream phase, so a `/bytes` request that lands while the
+    // peer pool is still cold doesn't answer a fast 502 (issue #117).
+    // A peer set that is empty *at dispatch* never gets here: the
+    // `ControlCommand::StreamBytes` arm answers `no peers available` at
+    // once, as `/bzz` does. The empty-set branch below covers a pool
+    // that empties after dispatch (its only peer just dropped): `/bytes`
+    // waits that out and only then reports `no peers available`. A
+    // miss peers confirmed (`not found` from an unstarved fetch) is
+    // final, so a missing reference still 404s as quickly as before.
+    //
+    // The direct root fetch waits for peer credit, but never past the
+    // resolution budget (`credit_window`), so the attempts' waits can't
+    // stack (issue #117).
+    let resolution_started = Instant::now();
+    let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
+    let mut attempt = 0usize;
+    let root = loop {
+        attempt += 1;
+        let failure = if peers_rx.borrow().is_empty() {
+            None
+        } else {
+            match ant_retrieval::fetch_root_with_replicas(
+                &fetcher,
+                reference,
+                credit_window.budget(),
+            )
+            .await
+            {
+                Ok(root) => break root,
+                Err(e) => Some(e),
+            }
+        };
+        let retry = failure
+            .as_ref()
+            .is_none_or(|e| is_bytes_root_transient(e.as_ref()))
+            && attempt < MAX_FETCH_ATTEMPTS
+            && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET;
+        let message = failure.map_or_else(
+            || "no peers available; wait for handshakes to complete".to_string(),
+            |e| format!("fetch root chunk {}: {e}", hex::encode(reference)),
+        );
+        if !retry {
+            let _ = ack.send(ControlAck::Error { message }).await;
             return;
         }
+        let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+        warn!(
+            target: "ant_p2p",
+            attempt,
+            next_in_ms = backoff.as_millis() as u64,
+            "stream_bytes root fetch failed, retrying: {message}",
+        );
+        tokio::time::sleep(backoff).await;
     };
     // Mask the RS level byte off the span before reporting
     // `total_bytes` so the gateway's `Content-Length` reflects the real
@@ -5027,6 +5072,10 @@ async fn run_stream_bzz(
     // themselves, so the consumer sees a continuous stream.
     let mut last_error = None;
     let resolution_started = Instant::now();
+    // The bare-root and data-root fetches wait for peer credit, but never
+    // past the resolution budget, so the attempts' waits can't stack
+    // (issue #117). The manifest walk in between never waits.
+    let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
@@ -5061,7 +5110,12 @@ async fn run_stream_bzz(
         // request cache. A path implies a manifest, so it keeps the
         // plain walk.
         let looked_up = match (bare_root, <[u8; 32]>::try_from(reference.as_slice())) {
-            (true, Ok(root)) => match ant_retrieval::fetch_root_with_replicas(&fetcher, root).await
+            (true, Ok(root)) => match ant_retrieval::fetch_root_with_replicas(
+                &fetcher,
+                root,
+                credit_window.budget(),
+            )
+            .await
             {
                 Ok(_) => lookup_path(&fetcher, &reference, &path).await,
                 Err(source) => Err(ManifestError::Fetch(ant_retrieval::JoinError::FetchChunk {
@@ -5157,7 +5211,13 @@ async fn run_stream_bzz(
 
         // Data-root fetch with dispersed-replica fallback (see
         // `run_stream_bytes`).
-        let root = match ant_retrieval::fetch_root_with_replicas(&fetcher, data_ref).await {
+        let root = match ant_retrieval::fetch_root_with_replicas(
+            &fetcher,
+            data_ref,
+            credit_window.budget(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e)
                 if attempt < MAX_FETCH_ATTEMPTS
@@ -5271,17 +5331,18 @@ async fn stream_encrypted_body(
     // fetch falls back to the root's dispersed replicas (keyed on the
     // 32-byte address half; the replica wraps the *encrypted* root
     // chunk), like the buffered `join_encrypted` path.
-    let root_wire = match ant_retrieval::fetch_root_with_replicas(fetcher, addr).await {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = ack
-                .send(ControlAck::Error {
-                    message: format!("fetch encrypted data root {}: {e}", hex::encode(addr)),
-                })
-                .await;
-            return;
-        }
-    };
+    let root_wire =
+        match ant_retrieval::fetch_root_with_replicas(fetcher, addr, Duration::ZERO).await {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = ack
+                    .send(ControlAck::Error {
+                        message: format!("fetch encrypted data root {}: {e}", hex::encode(addr)),
+                    })
+                    .await;
+                return;
+            }
+        };
     let total_bytes = match ant_crypto::decrypt_chunk_parts(&root_wire, &key) {
         Ok((span, _)) => {
             let (_, plain) = ant_retrieval::rs::decode_span(span);
@@ -5552,6 +5613,12 @@ const MAX_FETCH_ATTEMPTS: usize = 10;
 /// that it only trips on a genuinely unreachable chunk.
 const RESOLUTION_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
+/// How long a buffered `GetBytes` / `GetBzz` request (`antctl get`, FFI
+/// `ant_get`) may wait for peer credit in total, across all its
+/// whole-join attempts (`RoutingFetcher::with_credit_deadline`). After
+/// it, a starved fetch fails at once as it did before issue #117.
+const BUFFERED_REQUEST_CREDIT_WINDOW: Duration = RESOLUTION_RETRY_BUDGET;
+
 /// Process-wide cap on concurrent `retrieve_chunk` calls (see
 /// `SwarmState::retrieval_inflight`). Bee's retrieval has no
 /// equivalent — it spawns one goroutine per chunk fetch and lets the
@@ -5580,6 +5647,15 @@ const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 64;
 /// noticeably stretch the user's wait, large enough that we don't
 /// re-flood the same overloaded forwarders the moment they shed us.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Should a failed `/bytes` root fetch be retried (`run_stream_bytes`)?
+/// Yes unless peers confirmed the chunk missing: an empty or
+/// overdraft-starved pool (`no BZZ peers available`, a starved `not
+/// found` tail), timeouts and dropped streams can all clear up within
+/// the resolution budget, a real miss can't (issue #117).
+fn is_bytes_root_transient(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    !ant_retrieval::rs::shard_confirmed_missing(e)
+}
 
 /// One pipeline attempt's outcome on failure. `Transient` failures
 /// (chunk fetch errors from peer / network flakes) should trigger a
@@ -5661,6 +5737,9 @@ async fn run_get_bytes(
     reference: [u8; 32],
     max_bytes: Option<u64>,
 ) -> ControlAck {
+    // Every attempt re-joins the whole file, so the attempts' credit
+    // waits share one deadline instead of stacking (issue #117).
+    let credit_deadline = tokio::time::Instant::now() + BUFFERED_REQUEST_CREDIT_WINDOW;
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
             return ControlAck::Error {
@@ -5677,7 +5756,8 @@ async fn run_get_bytes(
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
             .with_counters(counters.clone())
-            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP)
+            .with_credit_deadline(credit_deadline);
         if let Some(disk) = disk_cache.clone() {
             builder = builder.with_disk_cache(disk);
         }
@@ -5727,11 +5807,15 @@ async fn try_get_bytes(
 ) -> Result<Vec<u8>, AttemptError> {
     use ant_retrieval::join;
 
-    let root = ant_retrieval::fetch_root_with_replicas(fetcher, reference)
-        .await
-        .map_err(|e| {
-            AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
-        })?;
+    let root = ant_retrieval::fetch_root_with_replicas(
+        fetcher,
+        reference,
+        ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
+    )
+    .await
+    .map_err(|e| {
+        AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
+    })?;
     // The root chunk's span is the total file size (in bytes) of the
     // BMT-built tree below it, so we can finalize the progress totals
     // as soon as the root lands and the rest of the joiner can drive
@@ -6617,6 +6701,9 @@ async fn run_get_bzz(
     allow_degraded_redundancy: bool,
     max_bytes: Option<u64>,
 ) -> ControlAck {
+    // Every attempt re-joins the whole file, so the attempts' credit
+    // waits share one deadline instead of stacking (issue #117).
+    let credit_deadline = tokio::time::Instant::now() + BUFFERED_REQUEST_CREDIT_WINDOW;
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
             return ControlAck::Error {
@@ -6631,7 +6718,8 @@ async fn run_get_bzz(
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
             .with_counters(counters.clone())
-            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP)
+            .with_credit_deadline(credit_deadline);
         if let Some(disk) = disk_cache.clone() {
             builder = builder.with_disk_cache(disk);
         }
@@ -6748,11 +6836,15 @@ async fn try_get_bzz(
     // Reuse the same fetcher so the blacklist / peer ordering carries
     // over from the manifest walk into the file-body fetch. Data-root
     // fetch falls back to the dispersed replicas of redundant uploads.
-    let root = ant_retrieval::fetch_root_with_replicas(fetcher, data_ref)
-        .await
-        .map_err(|e| {
-            AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
-        })?;
+    let root = ant_retrieval::fetch_root_with_replicas(
+        fetcher,
+        data_ref,
+        ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
+    )
+    .await
+    .map_err(|e| {
+        AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
+    })?;
     // Manifest chunks already showed up in the tracker as raw bytes;
     // we only learn the *file*'s size once the data root lands. Set
     // it now so the client's progress bar gets a real denominator
@@ -8901,6 +8993,32 @@ mod tests {
             !state.bee_peerstore_stall_warning_emitted,
             "fast handshake must not arm the flag",
         );
+    }
+
+    /// `/bytes` retries its root fetch through a cold or flaky pool but
+    /// not through a confirmed miss, so a missing reference still 404s
+    /// promptly (issue #117).
+    #[test]
+    fn bytes_root_retries_all_but_a_confirmed_miss() {
+        let err = |m: &str| -> Box<dyn std::error::Error + Send + Sync> { m.into() };
+        for transient in [
+            "no BZZ peers available",
+            "all peers failed for chunk ab after 3 attempts (last: open retrieval stream: \
+             failed to open stream: io error: oneshot canceled)",
+        ] {
+            assert!(
+                is_bytes_root_transient(err(transient).as_ref()),
+                "{transient}"
+            );
+        }
+        for miss in [
+            "all peers failed for chunk ab after 5 attempts (last: remote: retrieve chunk: \
+             storage: not found)",
+            "all peers failed for chunk ab after 5 attempts (last: remote: retrieve chunk: \
+             no peer found)",
+        ] {
+            assert!(!is_bytes_root_transient(err(miss).as_ref()), "{miss}");
+        }
     }
 
     /// Pin the contract that `is_manifest_transient` treats a feed
