@@ -3,8 +3,9 @@
 # Parallel jobs, each modelling a piece of PLAN.md § 3
 # ("Per-PR (fast)" — clippy + rustfmt + cargo test on x86_64 Linux,
 #  cross-compile smoke-build on aarch64-linux-android and
-#  aarch64-apple-ios), plus a build with the declared minimum Rust. When the proper Phase-4 mobile artefact lands
-# this workflow grows release-build + bundletool size-check jobs;
+#  aarch64-apple-ios), plus a build with the declared minimum
+# Rust. When the proper Phase-4 mobile artefact lands this
+# workflow grows release-build + bundletool size-check jobs;
 # until then the smoke jobs only validate that the cross-compile
 # completes — they don't run the binary.
 #
