@@ -5057,15 +5057,19 @@ async fn run_stream_bzz(
         let lookup = match lookup_path(&fetcher, &reference, &path).await {
             Ok(r) => r,
             Err(ManifestError::NotAManifest) => {
-                let _ = ack
-                    .send(ControlAck::Error {
-                        message: format!(
-                            "{} is not a mantaray manifest; try /bytes",
-                            hex::encode(&reference)
-                        ),
-                    })
-                    .await;
-                return;
+                if let Some(raw) = raw_bytes_lookup(&reference, &path) {
+                    raw
+                } else {
+                    let _ = ack
+                        .send(ControlAck::Error {
+                            message: format!(
+                                "{} is not a mantaray manifest; try /bytes",
+                                hex::encode(&reference)
+                            ),
+                        })
+                        .await;
+                    return;
+                }
             }
             Err(e)
                 if is_manifest_transient(&e)
@@ -6740,6 +6744,23 @@ async fn try_get_bzz(
             }
         })?;
     Ok((data, lookup.content_type, filename))
+}
+
+/// Lookup for a `/bzz/<ref>` whose root is not a manifest: the
+/// reference itself is the data, served as `/bytes/<ref>` would serve
+/// it. Lets `bzz://<ref>/` load raw uploads in hosts that only proxy
+/// `/bzz/` (Freedom, #111). Only the bare reference qualifies; a path
+/// below raw bytes names nothing.
+fn raw_bytes_lookup(reference: &[u8], path: &str) -> Option<ant_retrieval::LookupResult> {
+    if !path.trim_matches('/').is_empty() {
+        return None;
+    }
+    Some(ant_retrieval::LookupResult {
+        data_ref: reference.to_vec(),
+        content_type: None,
+        metadata: HashMap::new(),
+        is_feed: false,
+    })
 }
 
 /// Heuristic fallback: if mantaray didn't carry a `Filename` metadata
@@ -9641,5 +9662,28 @@ mod tests {
         assert_eq!(propagation_wait(&rejected, Some(now), now), None);
         assert_eq!(propagation_wait(&rejected, None, now), None);
         assert_eq!(propagation_wait(&other, Some(later), now), None);
+    }
+
+    #[test]
+    fn raw_bytes_lookup_serves_the_bare_reference() {
+        let reference = vec![0xab; 32];
+        for path in ["", "/"] {
+            let lookup = raw_bytes_lookup(&reference, path).expect("bare reference");
+            assert_eq!(lookup.data_ref, reference);
+            assert_eq!(lookup.content_type, None);
+            assert!(lookup.metadata.is_empty());
+            assert!(!lookup.is_feed);
+        }
+        // Encrypted `address ‖ key` references pass through whole.
+        let encrypted = vec![0xcd; 64];
+        let lookup = raw_bytes_lookup(&encrypted, "").expect("bare reference");
+        assert_eq!(lookup.data_ref, encrypted);
+    }
+
+    #[test]
+    fn raw_bytes_lookup_refuses_a_path_below_raw_bytes() {
+        let reference = [0xab; 32];
+        assert!(raw_bytes_lookup(&reference, "index.html").is_none());
+        assert!(raw_bytes_lookup(&reference, "/a/b").is_none());
     }
 }
