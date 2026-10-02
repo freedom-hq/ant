@@ -1,9 +1,9 @@
 # Per-PR + per-merge-to-main CI for the ant workspace.
 #
-# Three parallel jobs, each modelling a piece of PLAN.md § 3
+# Parallel jobs, each modelling a piece of PLAN.md § 3
 # ("Per-PR (fast)" — clippy + rustfmt + cargo test on x86_64 Linux,
 #  cross-compile smoke-build on aarch64-linux-android and
-#  aarch64-apple-ios). When the proper Phase-4 mobile artefact lands
+#  aarch64-apple-ios), plus a build with the declared minimum Rust. When the proper Phase-4 mobile artefact lands
 # this workflow grows release-build + bundletool size-check jobs;
 # until then the smoke jobs only validate that the cross-compile
 # completes — they don't run the binary.
@@ -98,6 +98,46 @@ jobs:
         # verification) are compiled by the clippy step but never run
         # without this step.
         run: cargo test -p ant-ffi --features chain --lib
+
+  # -------------------------------------------------------------------
+  # Minimum supported Rust. The jobs here run whatever stable is
+  # current; consumers that build ant from source pin a toolchain
+  # (freedom-mobile-ffi, and through it freedom-browser-android). A
+  # std API newer than the declared `rust-version` (root Cargo.toml)
+  # must fail here, not in their builds: v0.5.52 used
+  # `AtomicU64::try_update` and broke freedom-mobile-ffi's 1.94 build.
+  # -------------------------------------------------------------------
+  msrv:
+    name: build with the declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the declared rust-version
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: cargo check (workspace, all targets)
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets
+
+      - name: cargo check (ant-ffi with chain and jni features)
+        # The default-off mobile features, as in the lint job.
+        run: |
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features chain --all-targets
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features jni --all-targets
 
   # -------------------------------------------------------------------
   # Android cross-compile smoke. Confirms `crates/ant-ffi/src/jni.rs`

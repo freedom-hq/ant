@@ -2,6 +2,7 @@
 name = "ant-ffi"
 version = "0.5.52"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # staticlib for the iOS simulator + device slices (linked into the Xcode

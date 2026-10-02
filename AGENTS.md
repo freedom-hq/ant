@@ -64,6 +64,17 @@
     a helper in those modules is used by only one entry point. If that's
     deliberate, add it to `ONE_SIDED` there with the reason; otherwise
     call it from the other side too.
+- **Minimum Rust (`rust-version` in the root `Cargo.toml`).** CI's lint
+ job runs the current stable, but freedom-mobile-ffi pins a toolchain
+ and builds ant from source, and freedom-browser-android builds that. So
+ code that needs a Rust newer than the declared `rust-version` (a std API
+ stabilised later, a new language feature) breaks their builds, as
+ v0.5.52's `AtomicU64::try_update` did at 1.94. CI's `msrv` job builds
+ with exactly the declared version; check locally with
+ `cargo +<rust-version> check --workspace --all-targets` (and `-p ant-ffi
+ --features chain` / `jni`). Raising it is a deliberate change: bump
+ `rust-version` in the same PR, tell the freedom-mobile-ffi maintainers,
+ and say so at the top of the next release's notes.
 - Bump the patch version (`x.y.Z` → `x.y.Z+1`) of every workspace
  crate whose Cargo.toml declares one — currently `antd`, `antctl`,
  `antop`, `ant-chain`, `ant-control`, `ant-crypto`, `ant-ffi`,
