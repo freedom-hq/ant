@@ -1228,9 +1228,16 @@ impl ChunkFetcher for RoutingFetcher {
     }
 
     /// Only a fetcher with accounting attached can be overdraft-starved,
-    /// and so wait for credit.
+    /// and so wait for credit — and only until its credit deadline
+    /// ([`RoutingFetcher::with_credit_deadline`]): past it,
+    /// `fetch_waiting_for_credit` fails at once like plain `fetch`, so a
+    /// later whole-join attempt has no wait to stack and its starved
+    /// misses keep their full subtree retries (PR #119 R2-M2).
     fn waits_for_credit(&self) -> bool {
         self.accounting.is_some()
+            && self
+                .credit_deadline
+                .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
     }
 
     /// Store a locally-reconstructed chunk (RS-recovered data shard or a
@@ -2582,13 +2589,18 @@ mod tests {
     }
 
     /// A fetcher's credit deadline cuts every credit wait short: the
-    /// buffered whole-request retries share one deadline this way.
+    /// buffered whole-request retries share one deadline this way. Past
+    /// it the fetcher no longer reports that it waits for credit, so a
+    /// later join's starved misses aren't cut off at the credit window
+    /// either (PR #119 R2-M2).
     #[tokio::test(start_paused = true)]
     async fn credit_deadline_caps_the_wait() {
         let addr = [0x23u8; 32];
         let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        assert!(fetcher.waits_for_credit());
         let deadline = Duration::from_secs(2);
         let fetcher = fetcher.with_credit_deadline(tokio::time::Instant::now() + deadline);
+        assert!(fetcher.waits_for_credit(), "deadline not yet reached");
         let started = tokio::time::Instant::now();
         fetcher
             .fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
@@ -2606,6 +2618,10 @@ mod tests {
             .await
             .expect_err("pool never refills");
         assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(
+            !fetcher.waits_for_credit(),
+            "past its deadline the fetcher no longer waits for credit",
+        );
     }
 
     /// No peers at all is not starvation: nothing can refill, so even a
