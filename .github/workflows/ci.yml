@@ -1,10 +1,11 @@
 # Per-PR + per-merge-to-main CI for the ant workspace.
 #
-# Three parallel jobs, each modelling a piece of PLAN.md § 3
+# Parallel jobs, each modelling a piece of PLAN.md § 3
 # ("Per-PR (fast)" — clippy + rustfmt + cargo test on x86_64 Linux,
 #  cross-compile smoke-build on aarch64-linux-android and
-#  aarch64-apple-ios). When the proper Phase-4 mobile artefact lands
-# this workflow grows release-build + bundletool size-check jobs;
+#  aarch64-apple-ios), plus a build with the declared minimum
+# Rust. When the proper Phase-4 mobile artefact lands this
+# workflow grows release-build + bundletool size-check jobs;
 # until then the smoke jobs only validate that the cross-compile
 # completes — they don't run the binary.
 #
@@ -98,6 +99,100 @@ jobs:
         # verification) are compiled by the clippy step but never run
         # without this step.
         run: cargo test -p ant-ffi --features chain --lib
+
+  # -------------------------------------------------------------------
+  # Declared Rust floor. ant tracks current stable Rust; `rust-version`
+  # (root Cargo.toml) is raised to the CI stable toolchain as a policy
+  # step, and this job keeps the declared floor honest. The other jobs
+  # run whatever stable is current; consumers that build ant from source
+  # pin a toolchain (freedom-mobile-ffi, and through it
+  # freedom-browser-android), so code needing a Rust newer than the
+  # declared one must fail here, not in their builds: v0.5.52 used
+  # `AtomicU64::try_update` and broke freedom-mobile-ffi's 1.94 build.
+  # -------------------------------------------------------------------
+  msrv:
+    name: build with the declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the declared rust-version
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          # For the Android check at the end of this job.
+          targets: aarch64-linux-android
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: cargo check (workspace, all targets)
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets
+
+      - name: cargo check (ant-ffi with chain and jni features)
+        # The default-off mobile features, as in the lint job.
+        run: |
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features chain --all-targets
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features jni --all-targets
+
+      # The host checks above never compile `#[cfg(target_os =
+      # "android")]` code (ant-ffi's logcat writer), and android-smoke
+      # builds it on current stable only. freedom-browser-android builds
+      # that code with the pinned toolchain, so check it here too, the
+      # way xtask builds the Android slice (`--features jni`, plus
+      # `chain`). `check` doesn't link, but build scripts (cc-rs) need
+      # the NDK's clang for the target.
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ndk;27.2.12479018
+
+      - name: cargo check (ant-ffi, aarch64-linux-android)
+        run: |
+          bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android${ANDROID_NDK_API_LEVEL}-clang"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --target aarch64-linux-android --features jni,chain
+
+  # The iOS half of the msrv check: `#[cfg(target_os = "ios")]` code at
+  # the declared rust-version, the way xtask builds the device slice
+  # (`--features chain`). Needs macOS: cc-rs build scripts locate the
+  # iOS SDK through xcrun.
+  msrv-ios:
+    name: build with the declared rust-version (aarch64-apple-ios)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the declared rust-version
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-ios
+
+      - name: cargo check (ant-ffi, aarch64-apple-ios)
+        run: cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --target aarch64-apple-ios --features chain
 
   # -------------------------------------------------------------------
   # Android cross-compile smoke. Confirms `crates/ant-ffi/src/jni.rs`

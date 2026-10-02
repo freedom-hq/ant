@@ -18,6 +18,13 @@ members = [
 
 [workspace.package]
 edition = "2021"
+# Policy, not a technical floor: ant tracks current stable Rust, and
+# `rust-version` is raised to the CI stable toolchain. CI's `msrv` job
+# builds with exactly this version, which keeps the declared floor honest.
+# freedom-mobile-ffi pins a toolchain and builds ant from source (and
+# freedom-browser-android builds that), so a bump is a deliberate policy
+# step coordinated with them: see AGENTS.md.
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/solardev-xyz/ant"
 
