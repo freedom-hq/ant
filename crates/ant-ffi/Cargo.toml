@@ -1,6 +1,6 @@
 [package]
 name = "ant-ffi"
-version = "0.5.54"
+version = "0.5.55"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
