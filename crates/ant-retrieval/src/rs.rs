@@ -439,10 +439,18 @@ fn recovered_wire_len(shard: &[u8]) -> Option<usize> {
 /// reconstruct the missing data shards.
 ///
 /// One decoder is created per redundant intermediate node and shared by
-/// that node's child fetches; the recovery sweep runs at most once and
-/// its outcome (all data shard wires, or a terminal error) is cached, so
-/// concurrent child misses coalesce and repeated fetches of recovered
-/// chunks are served from memory. Recovered chunks are CAC-validated
+/// that node's child fetches. Concurrent child misses coalesce onto one
+/// recovery sweep. A *final* outcome (all data shard wires, or a
+/// permanent [`RecoveryError`]) is cached, so repeated fetches of
+/// recovered chunks are served from memory and real data loss fails
+/// every sibling at once. A *transient* failure — too few shards
+/// arrived, but enough of the misses were the fetcher never reaching a
+/// peer (`no BZZ peers available`, timeouts) rather than peers
+/// answering "not found" — is not cached: it is handed to the callers
+/// that were waiting on that sweep, and the next call sweeps afresh
+/// (issue #114). Shards the failed sweep did fetch sit in the
+/// fetcher's caches, so a re-sweep only goes to the network for the
+/// rest. Recovered chunks are CAC-validated
 /// against their parent references (a mismatch would mean an RS matrix
 /// incompatibility or corrupted parities — never silently returned) and
 /// handed to [`ChunkFetcher::put_recovered`] so they land in the same
@@ -461,8 +469,57 @@ pub struct RsDecoder {
     /// cannot (and need not) drive a truncation like the plain path's
     /// [`recovered_wire_len`].
     encrypted: bool,
-    /// `None` until the recovery sweep runs; then the terminal outcome.
-    recovered: Mutex<Option<Result<Vec<Vec<u8>>, String>>>,
+    /// Outcome of the latest recovery sweep; see [`SweepState`].
+    recovered: Mutex<SweepState>,
+}
+
+/// A failed [`RsDecoder`] recovery. `transient` says whether the
+/// failure could clear on a later sweep (see
+/// [`RsDecoder::fetch_data_shard`]); callers retry those with back-off
+/// and treat the rest as final.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryError {
+    pub detail: String,
+    pub transient: bool,
+}
+
+impl RecoveryError {
+    fn permanent(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// What an [`RsDecoder`] remembers between calls.
+#[derive(Default)]
+struct SweepState {
+    /// How many sweeps have finished. A caller that read `n` before it
+    /// queued on the lock and finds `sweeps > n` knows a sweep finished
+    /// while it waited, and takes that sweep's outcome instead of
+    /// starting another one straight away.
+    sweeps: u64,
+    /// Outcome of the latest sweep. `Ok` and permanent errors are final;
+    /// a transient error is only kept to answer the callers that were
+    /// waiting on that sweep.
+    outcome: Option<Result<Vec<Vec<u8>>, RecoveryError>>,
+}
+
+impl SweepState {
+    /// The cached outcome if it is final (success or permanent error).
+    fn final_outcome(&self) -> Option<&Result<Vec<Vec<u8>>, RecoveryError>> {
+        match &self.outcome {
+            Some(Err(e)) if e.transient => None,
+            other => other.as_ref(),
+        }
+    }
 }
 
 impl RsDecoder {
@@ -475,7 +532,7 @@ impl RsDecoder {
             addrs,
             shard_cnt,
             encrypted: false,
-            recovered: Mutex::new(None),
+            recovered: Mutex::new(SweepState::default()),
         }
     }
 
@@ -494,48 +551,67 @@ impl RsDecoder {
             addrs,
             shard_cnt,
             encrypted: true,
-            recovered: Mutex::new(None),
+            recovered: Mutex::new(SweepState::default()),
         }
     }
 
     /// Fetch data shard `index` (< `shard_cnt`), recovering it from the
     /// node's parities when the direct fetch fails. Returns the exact
     /// wire bytes (`span ‖ payload`) the chunk was uploaded with.
+    ///
+    /// A recovery that came up short is `transient` when the shards that
+    /// failed for want of a reachable peer (anything but peers
+    /// confirming the chunk missing, see [`shard_confirmed_missing`]) would
+    /// have been enough to decode: a later call may succeed, so the
+    /// caller should back off and call again. It is permanent when the
+    /// shards peers confirmed missing already exceed the parity count,
+    /// or when the shards were all there but reconstruction or CAC
+    /// validation failed.
     pub async fn fetch_data_shard(
         &self,
         fetcher: &dyn ChunkFetcher,
         index: usize,
-    ) -> Result<Vec<u8>, String> {
-        {
-            let cached = self.recovered.lock().await;
-            if let Some(outcome) = cached.as_ref() {
+    ) -> Result<Vec<u8>, RecoveryError> {
+        let seen = {
+            let state = self.recovered.lock().await;
+            if let Some(outcome) = state.final_outcome() {
                 return match outcome {
                     Ok(shards) => Ok(shards[index].clone()),
                     Err(e) => Err(e.clone()),
                 };
             }
-        }
+            state.sweeps
+        };
         match fetcher.fetch(self.addrs[index]).await {
             Ok(wire) => Ok(wire),
             Err(fetch_err) => {
-                let shards = self.recover(fetcher, &fetch_err.to_string()).await?;
+                let shards = self.recover(fetcher, &fetch_err.to_string(), seen).await?;
                 Ok(shards[index].clone())
             }
         }
     }
 
-    /// Run (or join) the recovery sweep and return every data shard.
+    /// Run (or join) a recovery sweep and return every data shard.
+    /// `seen` is the sweep count the caller read before its direct
+    /// fetch: if a sweep finished since, its outcome is the answer.
     async fn recover(
         &self,
         fetcher: &dyn ChunkFetcher,
         trigger: &str,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        let mut guard = self.recovered.lock().await;
-        if let Some(outcome) = guard.as_ref() {
+        seen: u64,
+    ) -> Result<Vec<Vec<u8>>, RecoveryError> {
+        let mut state = self.recovered.lock().await;
+        if let Some(outcome) = state.final_outcome() {
             return outcome.clone();
         }
+        if state.sweeps > seen {
+            if let Some(outcome) = state.outcome.as_ref() {
+                return outcome.clone();
+            }
+        }
         let outcome = self.recover_inner(fetcher, trigger).await;
-        *guard = Some(outcome.clone());
+        state.sweeps += 1;
+        state.outcome = Some(outcome.clone());
         outcome
     }
 
@@ -543,38 +619,68 @@ impl RsDecoder {
         &self,
         fetcher: &dyn ChunkFetcher,
         trigger: &str,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let total = self.addrs.len();
         let parity_cnt = total - self.shard_cnt;
 
         // Sweep every sibling (the one that just failed included — the
         // fetcher may reach a different peer this time), bounded.
         let mut wires: Vec<Option<Vec<u8>>> = vec![None; total];
-        let fetched: Vec<(usize, Option<Vec<u8>>)> = stream::iter(
+        let fetched: Vec<(usize, Result<Vec<u8>, bool>)> = stream::iter(
             self.addrs
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(i, addr)| async move { (i, fetcher.fetch(addr).await.ok()) }),
+                .map(|(i, addr)| async move {
+                    // On failure keep only whether a peer confirmed the
+                    // chunk missing ("not found"), as opposed to the fetch
+                    // never getting an answer (no admissible peer, timeouts,
+                    // dropped streams).
+                    let r = fetcher
+                        .fetch(addr)
+                        .await
+                        .map_err(|e| shard_confirmed_missing(e.as_ref()));
+                    (i, r)
+                }),
         )
         .buffer_unordered(RECOVERY_FETCH_FANOUT)
         .collect()
         .await;
+        let mut not_found = 0usize;
+        let mut unreached = 0usize;
         for (i, wire) in fetched {
-            if let Some(w) = wire {
-                if w.len() <= CHUNK_WITH_SPAN_SIZE {
-                    wires[i] = Some(w);
-                }
+            match wire {
+                Ok(w) if w.len() <= CHUNK_WITH_SPAN_SIZE => wires[i] = Some(w),
+                // An oversized wire is not a shard of this node; no
+                // retry changes that.
+                Ok(_) | Err(true) => not_found += 1,
+                Err(false) => unreached += 1,
             }
         }
 
         let present = wires.iter().filter(|w| w.is_some()).count();
         if present < self.shard_cnt {
-            return Err(format!(
-                "erasure recovery impossible: {present} of {total} shards retrievable, \
-                 need {} ({} data + {parity_cnt} parity refs); trigger: {trigger}",
-                self.shard_cnt, self.shard_cnt,
-            ));
+            // Transient when the shards we never reached would make up
+            // the shortfall: the peer pool, not the content, is short.
+            let transient = present + unreached >= self.shard_cnt;
+            tracing::debug!(
+                target: "ant_retrieval::rs",
+                present,
+                not_found,
+                unreached,
+                need = self.shard_cnt,
+                transient,
+                "erasure recovery sweep came up short",
+            );
+            return Err(RecoveryError {
+                detail: format!(
+                    "erasure recovery impossible: {present} of {total} shards retrievable, \
+                     need {} ({} data + {parity_cnt} parity refs; {not_found} confirmed \
+                     missing, {unreached} unreached); trigger: {trigger}",
+                    self.shard_cnt, self.shard_cnt,
+                ),
+                transient,
+            });
         }
 
         let missing: Vec<usize> = (0..self.shard_cnt)
@@ -593,34 +699,42 @@ impl RsDecoder {
                 .collect();
             let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(self.shard_cnt, parity_cnt)
                 .map_err(|e| {
-                format!("reed-solomon init ({}+{parity_cnt}): {e}", self.shard_cnt)
+                RecoveryError::permanent(format!(
+                    "reed-solomon init ({}+{parity_cnt}): {e}",
+                    self.shard_cnt
+                ))
             })?;
             rs.reconstruct_data(&mut shards)
-                .map_err(|e| format!("reed-solomon reconstruct: {e}"))?;
+                .map_err(|e| RecoveryError::permanent(format!("reed-solomon reconstruct: {e}")))?;
 
             for &i in &missing {
-                let mut wire = shards[i]
-                    .take()
-                    .ok_or("reconstruct left a data shard empty")?;
+                let mut wire = shards[i].take().ok_or_else(|| {
+                    RecoveryError::permanent("reconstruct left a data shard empty".into())
+                })?;
                 if !self.encrypted {
                     // Plain trees: the shard was zero-padded to 4104 for
                     // the RS matrix; its own (plaintext) span says where
                     // the real chunk ends. Encrypted trees skip this —
                     // every stored ciphertext wire is exactly 4104 bytes
                     // and the span bytes are ciphertext.
-                    let len = recovered_wire_len(&wire)
-                        .ok_or_else(|| format!("recovered shard {i} has an undecodable span"))?;
+                    let len = recovered_wire_len(&wire).ok_or_else(|| {
+                        RecoveryError::permanent(format!(
+                            "recovered shard {i} has an undecodable span"
+                        ))
+                    })?;
                     if len > wire.len() {
-                        return Err(format!("recovered shard {i} shorter than its span implies"));
+                        return Err(RecoveryError::permanent(format!(
+                            "recovered shard {i} shorter than its span implies"
+                        )));
                     }
                     wire.truncate(len);
                 }
                 if !cac_valid(&self.addrs[i], &wire) {
-                    return Err(format!(
+                    return Err(RecoveryError::permanent(format!(
                         "recovered shard {i} failed CAC validation against {} \
                          (RS output does not match bee's encoding)",
                         hex::encode(self.addrs[i]),
-                    ));
+                    )));
                 }
                 fetcher.put_recovered(self.addrs[i], &wire).await;
                 tracing::debug!(
@@ -638,6 +752,21 @@ impl RsDecoder {
             .map(|w| w.expect("all data shards present after reconstruct"))
             .collect())
     }
+}
+
+/// Did a sweep's shard fetch fail because peers confirmed the chunk
+/// missing (`storage: not found` / `no peer found`,
+/// [`crate::feed::is_chunk_not_found`])? Not when the fetcher reports
+/// its peer pool was starved ([`crate::fetcher::FetchExhausted`]): on a
+/// cold node one peer can answer "not found" and every other candidate
+/// be overdraft-skipped, which says nothing about the chunk.
+fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if e.downcast_ref::<crate::fetcher::FetchExhausted>()
+        .is_some_and(|x| x.pool_starved)
+    {
+        return false;
+    }
+    crate::feed::is_chunk_not_found(e)
 }
 
 // --- dispersed replicas (bee pkg/replicas) -------------------------------
@@ -789,6 +918,33 @@ pub async fn fetch_root_with_replicas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shard counts as confirmed missing only when peers said so and
+    /// the fetcher wasn't cut short by an overdraft-starved pool.
+    #[test]
+    fn shard_confirmed_missing_needs_an_unstarved_not_found() {
+        let exhausted = |tail: &str, pool_starved| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(crate::fetcher::FetchExhausted {
+                message: format!("all peers failed for chunk ab after 3 attempts (last: {tail})"),
+                pool_starved,
+            })
+        };
+        let not_found = "remote: retrieve chunk: storage: not found";
+        assert!(shard_confirmed_missing(
+            exhausted(not_found, false).as_ref()
+        ));
+        assert!(shard_confirmed_missing(
+            exhausted("remote: retrieve chunk: no peer found", false).as_ref()
+        ));
+        assert!(!shard_confirmed_missing(
+            exhausted(not_found, true).as_ref()
+        ));
+        assert!(!shard_confirmed_missing(
+            exhausted("timeout", false).as_ref()
+        ));
+        let no_peers: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
+        assert!(!shard_confirmed_missing(no_peers.as_ref()));
+    }
 
     /// Level tables agree with bee's documented shape: parities for a
     /// full 128-slot chunk, and the derived max data shard counts.

@@ -5330,6 +5330,12 @@ async fn stream_encrypted_body(
     let body = match ant_retrieval::join_encrypted(fetcher, enc_ref, cap).await {
         Ok(b) => b,
         Err(e) => {
+            // `BzzStreamStart` is already out, so this fails a `200`.
+            warn!(
+                target: "ant_p2p",
+                reference = %hex::encode(addr),
+                "encrypted join failed after stream start, response truncated: {e}",
+            );
             let _ = ack
                 .send(ControlAck::Error {
                     message: format!("join encrypted {}: {e}", hex::encode(enc_ref)),
@@ -5434,6 +5440,16 @@ async fn stream_root_chunk_inner(
                             let _ = ack.send(ControlAck::StreamDone).await;
                         }
                         Err(e) => {
+                            // The stream-start ack (and the gateway's
+                            // `200` + Content-Length) went out before the
+                            // join began, so this error truncates the
+                            // body. The client only sees a short read;
+                            // make it visible here (issue #114).
+                            warn!(
+                                target: "ant_p2p",
+                                reference = %hex::encode(reference),
+                                "streaming join failed mid-body, response truncated: {e}",
+                            );
                             let _ = ack
                                 .send(ControlAck::Error {
                                     message: format!("join {}: {e}", hex::encode(reference)),

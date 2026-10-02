@@ -1148,6 +1148,28 @@ const fn accept_shallow_after(shallow_attempts: u32) -> bool {
     shallow_attempts >= RoutingFetcher::MAX_SHALLOW_ATTEMPTS
 }
 
+/// The error [`RoutingFetcher::fetch`] gives up with once its candidate
+/// loop ends (`all peers failed for chunk … (last: …)`). The message is
+/// unchanged from the plain-string error it replaces; the type adds
+/// whether the loop ended because the peer pool was *starved*: ranked
+/// peers were left unasked because every one of them was
+/// overdraft-skipped. A `storage: not found` tail is then one peer's
+/// answer, not the network's, so the RS decoder (`crate::rs`) must not
+/// read it as the chunk being confirmed missing (issue #114).
+#[derive(Debug)]
+pub struct FetchExhausted {
+    pub(crate) message: String,
+    pub pool_starved: bool,
+}
+
+impl std::fmt::Display for FetchExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for FetchExhausted {}
+
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
@@ -1552,13 +1574,21 @@ impl ChunkFetcher for RoutingFetcher {
             }
         }
 
-        Err(format!(
-            "all peers failed for chunk {} after {} attempts (last: {})",
-            hex::encode(addr),
-            asked.len(),
-            last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
-        )
-        .into())
+        // Starved: we stopped with error budget left and ranked peers we
+        // never asked — they were all overdraft-skipped. Whatever the
+        // peers we did ask answered, the pool, not the network, ended
+        // this fetch.
+        let pool_starved =
+            errors_left > 0 && self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p));
+        Err(Box::new(FetchExhausted {
+            message: format!(
+                "all peers failed for chunk {} after {} attempts (last: {})",
+                hex::encode(addr),
+                asked.len(),
+                last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
+            ),
+            pool_starved,
+        }))
     }
 
     /// Store a locally-reconstructed chunk (RS-recovered data shard or a
