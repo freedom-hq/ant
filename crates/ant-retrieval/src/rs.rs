@@ -641,8 +641,17 @@ impl RsDecoder {
                     // chunk missing ("not found"), as opposed to the fetch
                     // never getting an answer (no admissible peer, timeouts,
                     // dropped streams).
+                    //
+                    // Speculative: a sweep fetch never waits for peer
+                    // credit (issue #117). Up to 128 fetches at fanout 16
+                    // would otherwise stack one `CREDIT_WAIT_BUDGET` per
+                    // wave (~80 s) on a starved pool and take credit
+                    // wake-ups ahead of real data fetches. A starved shard
+                    // counts as unreached, so the sweep comes up short as
+                    // `transient` and the joiner's recovery retries (whose
+                    // direct fetch does wait) pick it up once credit returns.
                     let r = fetcher
-                        .fetch(addr)
+                        .fetch_speculative(addr)
                         .await
                         .map_err(|e| shard_confirmed_missing(e.as_ref()));
                     (i, r)

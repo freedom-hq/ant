@@ -173,10 +173,12 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// ends. We have no per-chunk context, so the wait gets its own bound,
 /// sized to fit inside every caller's budget:
 ///
-/// - the gateway's 90 s `BODY_STALL_TIMEOUT` mid-body: a data child
-///   that waits this long and then falls into the joiner's 60 s
-///   recovery-retry window, whose last sweep can wait this long again,
-///   stalls the body for at most 60 s + 2 × 10 s = 80 s;
+/// - the gateway's 90 s `BODY_STALL_TIMEOUT` mid-body: a data child's
+///   direct fetch waits at most this long, and so does each recovery
+///   retry's (the 60 s recovery-retry window opens with the first
+///   fetch), while the recovery sweeps themselves never wait
+///   ([`crate::ChunkFetcher::fetch_speculative`]) — so a starved child
+///   stalls the body for at most 60 s + 10 s = 70 s;
 /// - the 30 s `/bzz` and `/bytes` resolution budget: a starved root or
 ///   manifest fetch still gets a second attempt inside it;
 /// - the chunk API's 60 s request timeout.

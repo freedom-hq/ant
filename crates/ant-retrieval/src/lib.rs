@@ -139,15 +139,21 @@ pub trait ChunkFetcher: Send + Sync {
     /// Like [`ChunkFetcher::fetch`], for a *speculative* probe whose
     /// miss is expected and cheap to accept: the dispersed-replica
     /// fallback in [`crate::rs::fetch_root_with_replicas`] fans out up
-    /// to 30 such probes after the direct root fetch failed.
+    /// to 30 such probes after the direct root fetch failed, and an
+    /// erasure-recovery sweep ([`crate::rs::RsDecoder::fetch_data_shard`])
+    /// fans out up to 128 shard fetches after a data child's direct
+    /// fetch failed.
     ///
     /// An implementation that would otherwise wait for peer credit when
     /// its pool is overdraft-starved ([`crate::RoutingFetcher`], issue
     /// #117) must fail at once here instead: 30 probes × a 10 s credit
     /// wait at fanout 4 would hold a starved root fetch for ~50 s,
-    /// beyond the 30 s resolution budget, and the probes would spend
-    /// credit wake-ups that real data fetches are waiting for. Default
-    /// is plain `fetch`, right for every fetcher that never waits.
+    /// beyond the 30 s resolution budget, and 128 shards at fanout 16
+    /// would hold a recovery sweep for ~80 s, past the gateway's 90 s
+    /// body-stall timeout once the direct fetch's own wait is added;
+    /// either way the probes would spend credit wake-ups that real data
+    /// fetches are waiting for. Default is plain `fetch`, right for
+    /// every fetcher that never waits.
     async fn fetch_speculative(
         &self,
         addr: [u8; 32],

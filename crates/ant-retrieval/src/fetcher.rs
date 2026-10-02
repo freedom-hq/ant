@@ -2303,6 +2303,35 @@ mod tests {
         assert!(typed.pool_starved);
     }
 
+    /// R4-F1 on PR #119: an erasure-recovery sweep after a starved data
+    /// child's direct fetch must not wait for credit on each of its up
+    /// to 128 shard fetches. The direct fetch waits its
+    /// `CREDIT_WAIT_BUDGET`; the sweep's fetches are speculative and
+    /// fail at once (as unreached, so the failure is transient and the
+    /// joiner retries), so the attempt ends at the budget, not at ~90 s
+    /// (8 waves × 10 s at fanout 16, plus the direct wait).
+    #[tokio::test(start_paused = true)]
+    async fn starved_recovery_sweep_does_not_wait_per_shard() {
+        let addr = [0x66u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let decoder = crate::rs::RsDecoder::new(vec![addr; 128], 119);
+        let started = tokio::time::Instant::now();
+        let err = decoder
+            .fetch_data_shard(&fetcher, 0)
+            .await
+            .expect_err("pool never refills");
+        let waited = started.elapsed();
+        assert!(
+            waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            "direct fetch plus recovery sweep took {waited:?}",
+        );
+        assert!(
+            err.transient,
+            "a starved sweep is retryable: {}",
+            err.detail
+        );
+    }
+
     /// `fetch_speculative` on a starved pool fails at once.
     #[tokio::test(start_paused = true)]
     async fn speculative_fetch_never_waits_for_credit() {
