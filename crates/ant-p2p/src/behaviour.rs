@@ -5027,6 +5027,7 @@ async fn run_stream_bzz(
     // themselves, so the consumer sees a continuous stream.
     let mut last_error = None;
     let resolution_started = Instant::now();
+    let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
             let _ = ack
@@ -5054,7 +5055,23 @@ async fn run_stream_bzz(
         }
         let fetcher = builder;
 
-        let lookup = match lookup_path(&fetcher, &reference, &path).await {
+        // Bare `/bzz/<ref>/` may name raw bytes (#112), so its root gets
+        // the same dispersed-replica fallback `/bytes` gives it before
+        // the manifest walk; the walk then reads the root from the
+        // request cache. A path implies a manifest, so it keeps the
+        // plain walk.
+        let looked_up = match (bare_root, <[u8; 32]>::try_from(reference.as_slice())) {
+            (true, Ok(root)) => match ant_retrieval::fetch_root_with_replicas(&fetcher, root).await
+            {
+                Ok(_) => lookup_path(&fetcher, &reference, &path).await,
+                Err(source) => Err(ManifestError::Fetch(ant_retrieval::JoinError::FetchChunk {
+                    addr: hex::encode(root),
+                    source,
+                })),
+            },
+            _ => lookup_path(&fetcher, &reference, &path).await,
+        };
+        let lookup = match looked_up {
             Ok(r) => r,
             Err(ManifestError::NotAManifest) => {
                 if let Some(raw) = raw_bytes_lookup(&reference, &path) {
@@ -5062,17 +5079,14 @@ async fn run_stream_bzz(
                 } else {
                     let _ = ack
                         .send(ControlAck::Error {
-                            message: format!(
-                                "{} is not a mantaray manifest; try /bytes",
-                                hex::encode(&reference)
-                            ),
+                            message: path_below_raw_bytes_message(&reference, &path),
                         })
                         .await;
                     return;
                 }
             }
             Err(e)
-                if is_manifest_transient(&e)
+                if is_bzz_lookup_transient(&e, bare_root)
                     && attempt < MAX_FETCH_ATTEMPTS
                     && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET =>
             {
@@ -6746,13 +6760,52 @@ async fn try_get_bzz(
     Ok((data, lookup.content_type, filename))
 }
 
+/// `/bzz/<ref>` or `/bzz/<ref>/`: no path below the reference.
+fn is_bare_root_path(path: &str) -> bool {
+    path.trim_matches('/').is_empty()
+}
+
+/// Should `run_stream_bzz` retry this `lookup_path` failure?
+///
+/// Everything [`is_manifest_transient`] retries, plus — for a bare
+/// root only — an erasure-recovery failure. On a bare root that error
+/// comes from the walk still deciding whether the reference is a
+/// manifest at all, and a recovery that ran out of reachable shards
+/// (typically "no BZZ peers available" on a cold or thin peer set) is a
+/// fetch problem the next attempt can clear, not a property of the
+/// content. Answering it with an immediate 404 is what made Freedom's
+/// first `bzz://<raw-ref>/` load fail where `/bytes/<ref>` succeeded
+/// (#113). With a path, the reference must be a manifest and the
+/// existing classification (recovery failures are terminal) stands.
+fn is_bzz_lookup_transient(e: &ant_retrieval::ManifestError, bare_root: bool) -> bool {
+    is_manifest_transient(e)
+        || (bare_root
+            && matches!(
+                e,
+                ant_retrieval::ManifestError::Fetch(ant_retrieval::JoinError::Recovery { .. })
+            ))
+}
+
+/// Error for `/bzz/<raw-bytes-ref>/<path>`: raw bytes have no paths, so
+/// the path is not found. Phrased as a manifest path miss so the gateway
+/// answers bee's `404 "path address not found"` (`map_retrieval_error`)
+/// rather than a 502, which hosts like Freedom treat as retryable and
+/// retry for most of a minute (#113).
+fn path_below_raw_bytes_message(reference: &[u8], path: &str) -> String {
+    format!(
+        "path '{}' not found: {} is raw bytes, not a mantaray manifest",
+        path.trim_start_matches('/'),
+        hex::encode(reference)
+    )
+}
+
 /// Lookup for a `/bzz/<ref>` whose root is not a manifest: the
 /// reference itself is the data, served as `/bytes/<ref>` would serve
 /// it. Lets `bzz://<ref>/` load raw uploads in hosts that only proxy
 /// `/bzz/` (Freedom, #111). Only the bare reference qualifies; a path
 /// below raw bytes names nothing.
 fn raw_bytes_lookup(reference: &[u8], path: &str) -> Option<ant_retrieval::LookupResult> {
-    if !path.trim_matches('/').is_empty() {
+    if !is_bare_root_path(path) {
         return None;
     }
     Some(ant_retrieval::LookupResult {
@@ -9678,6 +9731,62 @@ mod tests {
         let encrypted = vec![0xcd; 64];
         let lookup = raw_bytes_lookup(&encrypted, "").expect("bare reference");
         assert_eq!(lookup.data_ref, encrypted);
+    }
+
+    /// #113: on a bare `/bzz/<ref>/` an erasure-recovery failure during
+    /// the manifest walk is retried like a chunk-fetch failure — it is
+    /// what a cold or thin peer set produces while the walk is still
+    /// deciding whether the reference is a manifest. With a path the
+    /// classification is unchanged: recovery failures and path misses
+    /// stay terminal, so a missing path in a real manifest 404s fast.
+    #[test]
+    fn bzz_lookup_retries_recovery_failures_on_a_bare_root_only() {
+        use ant_retrieval::{JoinError, ManifestError};
+        let recovery = || {
+            ManifestError::Fetch(JoinError::Recovery {
+                detail: "erasure recovery impossible: 95 of 128 shards retrievable, need 119 \
+                         (119 data + 9 parity refs); trigger: no BZZ peers available"
+                    .into(),
+            })
+        };
+        let fetch = || {
+            ManifestError::Fetch(JoinError::FetchChunk {
+                addr: "00".into(),
+                source: "no BZZ peers available".into(),
+            })
+        };
+        let path_miss = || ManifestError::NotFound {
+            path: "missing.html".into(),
+        };
+
+        assert!(is_bzz_lookup_transient(&recovery(), true));
+        assert!(!is_bzz_lookup_transient(&recovery(), false));
+        assert!(is_bzz_lookup_transient(&fetch(), true));
+        assert!(is_bzz_lookup_transient(&fetch(), false));
+        assert!(!is_bzz_lookup_transient(&path_miss(), false));
+        assert!(!is_bzz_lookup_transient(&path_miss(), true));
+        assert!(!is_bzz_lookup_transient(&ManifestError::NotAManifest, true));
+
+        for path in ["", "/", "//"] {
+            assert!(is_bare_root_path(path), "{path:?}");
+        }
+        for path in ["foo", "/foo", "a/b/"] {
+            assert!(!is_bare_root_path(path), "{path:?}");
+        }
+    }
+
+    /// #113: `/bzz/<raw-bytes-ref>/foo` is a path miss, worded so the
+    /// gateway's `map_retrieval_error` answers 404 "path address not
+    /// found" (its `"path '"` arm) instead of a retryable 502.
+    #[test]
+    fn path_below_raw_bytes_reads_as_a_path_miss() {
+        let message = path_below_raw_bytes_message(&[0xab; 32], "/seg/0.ts");
+        assert!(
+            message.starts_with("path 'seg/0.ts' not found"),
+            "{message}"
+        );
+        assert!(!message.contains("(root)"), "{message}");
+        assert!(message.contains(&"ab".repeat(32)), "{message}");
     }
 
     #[test]

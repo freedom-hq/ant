@@ -744,8 +744,175 @@ pub(crate) async fn load_node_ref(
             source: "chunk failed CAC validation".into(),
         }));
     }
-    let bytes = join(fetcher, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
+    // Rule out a raw file from its first data chunk before joining the
+    // whole thing: `/bzz/<ref>/` asks this of every raw `/bytes`
+    // reference (#112), and a full join of a multi-MiB file just to read
+    // its 64-byte header would make the answer depend on every chunk of
+    // the file arriving inside the manifest lookup (#113).
+    let sniffed = SniffedFetcher::new(fetcher);
+    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk).await {
+        debug!(
+            target: "ant_retrieval::mantaray",
+            root = %hex::encode(addr),
+            "mantaray: first data chunk has no manifest header, returning NotAManifest",
+        );
+        return Err(ManifestError::NotAManifest);
+    }
+    // The join reuses what the sniff already paid for (R2-M1, #115): the
+    // chunks it fetched, and its failed fetch counts as the join's first
+    // attempt at that chunk instead of being repeated before the join's
+    // own retries / erasure recovery.
+    sniffed.replay();
+    let bytes = join(&sniffed, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
     Node::unmarshal(&bytes)
+}
+
+/// Fetch error as handed out by [`ChunkFetcher::fetch`].
+type FetchErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// [`ChunkFetcher`] wrapper that lets the header sniff and the join in
+/// [`load_node_ref`] share their fetches. While recording (the sniff) it
+/// remembers every chunk fetched and the one failed fetch that ends a
+/// sniff; after [`Self::replay`] (the join) it serves those chunks from
+/// memory and answers the *first* request for the failed address with
+/// the sniff's error, so the join's retry back-off / erasure recovery
+/// starts from where the sniff left off instead of re-waiting for the
+/// same miss. Later requests for that address go to the network as
+/// usual, so the join's own retries are untouched.
+struct SniffedFetcher<'a> {
+    inner: &'a dyn ChunkFetcher,
+    state: std::sync::Mutex<SniffState>,
+}
+
+#[derive(Default)]
+struct SniffState {
+    replaying: bool,
+    fetched: HashMap<[u8; 32], Vec<u8>>,
+    failed: Option<([u8; 32], FetchErr)>,
+}
+
+impl<'a> SniffedFetcher<'a> {
+    fn new(inner: &'a dyn ChunkFetcher) -> Self {
+        Self {
+            inner,
+            state: std::sync::Mutex::new(SniffState::default()),
+        }
+    }
+
+    fn replay(&self) {
+        self.state.lock().expect("sniff state lock").replaying = true;
+    }
+}
+
+#[async_trait::async_trait]
+impl ChunkFetcher for SniffedFetcher<'_> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+        let replaying = {
+            let mut state = self.state.lock().expect("sniff state lock");
+            if state.replaying {
+                if let Some(wire) = state.fetched.get(&addr) {
+                    return Ok(wire.clone());
+                }
+                if state.failed.as_ref().is_some_and(|(a, _)| *a == addr) {
+                    let (_, err) = state.failed.take().expect("checked");
+                    return Err(err);
+                }
+            }
+            state.replaying
+        };
+        let result = self.inner.fetch(addr).await;
+        if !replaying {
+            let mut state = self.state.lock().expect("sniff state lock");
+            match &result {
+                Ok(wire) if cac_valid(&addr, wire) => {
+                    state.fetched.insert(addr, wire.clone());
+                }
+                Ok(_) => {}
+                Err(e) => state.failed = Some((addr, e.to_string().into())),
+            }
+        }
+        result
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.inner.put_recovered(addr, wire).await;
+    }
+}
+
+/// Deepest chunk tree [`leftmost_leaf_is_not_a_manifest`] descends.
+/// Seven intermediate levels already address more than any gateway cap
+/// (`128^7 × 4 KiB`); a deeper "tree" is malformed and left to the join.
+const HEADER_SNIFF_MAX_DEPTH: usize = 8;
+
+/// `true` only when the file rooted at `root_chunk` positively is **not**
+/// a mantaray node: its first data chunk is in hand, holds at least a
+/// node header, and that header's version hash isn't mantaray's.
+///
+/// A serialised node starts with its 64-byte header, so the leftmost
+/// leaf of the file's chunk tree decides the question; reaching it costs
+/// one fetch per tree level (two for a few-MiB file) instead of a join
+/// of the whole file. Every "can't tell" case answers `false` so the
+/// caller falls back to the full join exactly as before: a leftmost
+/// chunk that can't be fetched (the join may still recover it through
+/// erasure coding) or a malformed tree. A file shorter than a node
+/// header counts as positively not a manifest (#115), so `/bzz/<ref>/`
+/// on a tiny raw `/bytes` upload serves the bytes instead of failing the
+/// lookup with `TooShort`.
+async fn leftmost_leaf_is_not_a_manifest(fetcher: &dyn ChunkFetcher, root_chunk: &[u8]) -> bool {
+    let mut chunk = root_chunk.to_vec();
+    for _ in 0..HEADER_SNIFF_MAX_DEPTH {
+        let Some((span, payload)) = chunk.split_first_chunk::<8>() else {
+            return false;
+        };
+        let (_, plain) = crate::rs::decode_span(*span);
+        if u64::from_le_bytes(plain) <= ant_crypto::CHUNK_SIZE as u64 {
+            // A serialised node is never shorter than its header, so a
+            // leaf that can't hold one is just as positively raw bytes as
+            // one whose header carries the wrong version hash. (Only a
+            // single-chunk file can have a leftmost leaf this short: every
+            // leaf but the last of a split file is a full chunk.)
+            return payload.len() < NODE_HEADER_SIZE || !has_manifest_header(payload);
+        }
+        // Intermediate chunk: the first reference is the leftmost child
+        // (parity references, if any, come after the data references).
+        let Some(child) = payload.first_chunk::<32>().copied() else {
+            return false;
+        };
+        match fetcher.fetch(child).await {
+            Ok(wire) if cac_valid(&child, &wire) => chunk = wire,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Does `data` (the start of a serialised node) carry a mantaray
+/// version hash? The first 32 bytes are the obfuscation key, the next
+/// 31 the version hash `XOR`ed with it. Caller ensures
+/// `data.len() >= NODE_HEADER_SIZE`.
+fn has_manifest_header(data: &[u8]) -> bool {
+    let key = &data[..OBFUSCATION_KEY_SIZE];
+    let version_hash: Vec<u8> = data
+        [OBFUSCATION_KEY_SIZE..OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE]
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % OBFUSCATION_KEY_SIZE])
+        .collect();
+    is_mantaray_version_hash(&version_hash)
+}
+
+/// Is `version_hash` (31 bytes, de-obfuscated) one of the mantaray
+/// versions we parse? The Go constants are the full 32-byte
+/// keccak256 of "mantaray:0.2" / "mantaray:0.1"; bee writes only the
+/// first 31 bytes on the wire (see `versionHashSize = 31` and
+/// `copy(*bytes, b)` in `mantaray.initVersion`), so compare truncated.
+fn is_mantaray_version_hash(version_hash: &[u8]) -> bool {
+    [VERSION_02_HASH_HEX, VERSION_01_HASH_HEX]
+        .iter()
+        .any(|hex| {
+            let full = hex::decode(hex).expect("const");
+            version_hash == &full[..VERSION_HASH_SIZE]
+        })
 }
 
 /// In-memory representation of a mantaray node after unmarshalling.
@@ -805,17 +972,7 @@ impl Node {
 
     fn parse_decoded(data: &[u8]) -> Result<Self, ManifestError> {
         let version_hash = &data[OBFUSCATION_KEY_SIZE..OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE];
-        // The Go constants are the full 32-byte keccak256 of "mantaray:0.2"
-        // / "mantaray:0.1"; bee writes only the first 31 bytes on the wire
-        // (see `versionHashSize = 31` and `copy(*bytes, b)` in
-        // `mantaray.initVersion`). Truncate so the comparison matches.
-        let v01_full = hex::decode(VERSION_01_HASH_HEX).expect("const");
-        let v02_full = hex::decode(VERSION_02_HASH_HEX).expect("const");
-        let v01 = &v01_full[..VERSION_HASH_SIZE];
-        let v02 = &v02_full[..VERSION_HASH_SIZE];
-        let is_v02 = version_hash == v02;
-        let is_v01 = version_hash == v01;
-        if !is_v02 && !is_v01 {
+        if !is_mantaray_version_hash(version_hash) {
             // Most often this means the user passed a `/bytes/`
             // reference (raw file) where a `/bzz/` reference was
             // expected. Log the head so a debug-level run can tell
@@ -828,6 +985,8 @@ impl Node {
             );
             return Err(ManifestError::NotAManifest);
         }
+        let v01_full = hex::decode(VERSION_01_HASH_HEX).expect("const");
+        let is_v01 = version_hash == &v01_full[..VERSION_HASH_SIZE];
         let ref_size = data[OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE];
         if ref_size != 32 && ref_size != 64 && ref_size != 0 {
             return Err(ManifestError::InvalidRefLength(ref_size));
@@ -1592,6 +1751,247 @@ mod tests {
         assert_eq!(
             hex::encode(&z_fork.child_ref),
             "69892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b",
+        );
+    }
+
+    /// Fetcher that serves a fixed chunk set and counts every fetch, so
+    /// a test can tell a header sniff from a full join.
+    struct CountingFetcher {
+        inner: MapFetcher,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for CountingFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.fetch(addr).await
+        }
+    }
+
+    /// Every chunk of `chunks` keyed by address.
+    fn chunk_map(chunks: &[crate::SplitChunk]) -> HashMap<[u8; 32], Vec<u8>> {
+        chunks.iter().map(|c| (c.address, c.wire.clone())).collect()
+    }
+
+    /// The root-to-leftmost-leaf path of a split file, root first.
+    fn leftmost_path(all: &HashMap<[u8; 32], Vec<u8>>, root: [u8; 32]) -> Vec<[u8; 32]> {
+        let mut path = vec![root];
+        loop {
+            let wire = &all[path.last().unwrap()];
+            let (_, plain) = crate::rs::decode_span(wire[..8].try_into().unwrap());
+            if u64::from_le_bytes(plain) <= ant_crypto::CHUNK_SIZE as u64 {
+                return path;
+            }
+            path.push(wire[8..40].try_into().unwrap());
+        }
+    }
+
+    /// Bytes that are not a mantaray node: no version hash anywhere.
+    fn raw_file(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+    }
+
+    /// #113: deciding that a multi-chunk raw file (an HLS segment behind
+    /// `bzz://<ref>/`) is not a manifest must need only the root and the
+    /// leftmost leaf — not every chunk of the file. Before the fix the
+    /// lookup joined the whole file first, so here (every other chunk
+    /// absent, as on a cold or thin peer set) it failed with a fetch /
+    /// erasure-recovery error, which the gateway answered with a 404.
+    // Paused clock so the pre-fix full join's retry back-off on the
+    // absent chunks fails the test fast instead of after ~2 min.
+    #[tokio::test(start_paused = true)]
+    async fn raw_multi_chunk_file_is_not_a_manifest_from_its_first_leaf() {
+        // ~1.6 MB like the field's segments: a two-level tree. Both a
+        // plain and a redundancy-coded (level 1, parity refs, level-
+        // encoded spans) upload.
+        let data = raw_file(1_601_572);
+        for level in [0u8, 1] {
+            let split = crate::split_bytes_with_redundancy(&data, level);
+            let all = chunk_map(&split.chunks);
+            let path = leftmost_path(&all, split.root);
+            assert_eq!(path.len(), 3, "level {level}: root → intermediate → leaf");
+            let mut inner = MapFetcher::new();
+            for addr in &path {
+                inner.insert(*addr, all[addr].clone());
+            }
+            let fetcher = CountingFetcher {
+                inner,
+                fetches: 0.into(),
+            };
+            let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::NotAManifest),
+                "level {level}: expected NotAManifest, got {err:?}",
+            );
+            assert_eq!(
+                fetcher.fetches.load(std::sync::atomic::Ordering::Relaxed),
+                path.len(),
+                "level {level}: one fetch per tree level, nothing else",
+            );
+        }
+    }
+
+    /// A raw file larger than the manifest join cap (32 MiB) behind
+    /// `bzz://<ref>/` is recognised as raw bytes too. Before the sniff the
+    /// lookup's join refused the file's span (`TooLarge`) before it could
+    /// look at the header, which the gateway answered with a 404. The
+    /// tree here is just the leftmost path of a 40 MiB file.
+    #[tokio::test]
+    async fn raw_file_above_the_manifest_join_cap_is_not_a_manifest() {
+        let span = (40u64 << 20).to_le_bytes();
+        let chunk_with_span = |payload: &[u8]| {
+            let addr = ant_crypto::bmt_hash_with_span(&span, payload).unwrap();
+            let mut wire = span.to_vec();
+            wire.extend_from_slice(payload);
+            (addr, wire)
+        };
+        let (leaf, leaf_wire) = ant_crypto::cac_new(&raw_file(4096)).unwrap();
+        let (mid, mid_wire) = chunk_with_span(&leaf);
+        let (root, root_wire) = chunk_with_span(&mid);
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(leaf, leaf_wire);
+        fetcher.insert(mid, mid_wire);
+        fetcher.insert(root, root_wire);
+        let err = lookup_path(&fetcher, &root, "").await.unwrap_err();
+        assert!(matches!(err, ManifestError::NotAManifest), "got {err:?}");
+    }
+
+    /// The sniff only ever short-circuits on a *positive* "not a
+    /// manifest". When the leftmost leaf can't be fetched the lookup
+    /// falls back to the full join exactly as before, so its error (and
+    /// any erasure recovery the join can do) is unchanged.
+    // Paused clock: the join's per-subtree retry back-off (~2 min of
+    // sleeps on a missing chunk) auto-advances instead of stalling.
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_first_leaf_falls_back_to_the_full_join() {
+        let split = crate::split_bytes(&raw_file(64 * 1024));
+        let all = chunk_map(&split.chunks);
+        let path = leftmost_path(&all, split.root);
+        let mut fetcher = MapFetcher::new();
+        for (addr, wire) in &all {
+            if addr != path.last().unwrap() {
+                fetcher.insert(*addr, wire.clone());
+            }
+        }
+        let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Fetch(JoinError::FetchChunk { .. })),
+            "expected the join's fetch error, got {err:?}",
+        );
+
+        // With every chunk present the full join runs and still lands on
+        // NotAManifest.
+        let mut fetcher = MapFetcher::new();
+        for (addr, wire) in all {
+            fetcher.insert(addr, wire);
+        }
+        let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
+        assert!(matches!(err, ManifestError::NotAManifest), "got {err:?}");
+    }
+
+    /// R2-M1 (#115): when the sniff can't fetch the leftmost leaf, the
+    /// fallback join must not pay for that miss (or the chunks the sniff
+    /// already fetched) a second time. The lookup costs exactly what a
+    /// bare join of the same file costs: every chunk request, the leaf's
+    /// retries included, matches one-for-one. Before the fix the lookup
+    /// made one extra leaf fetch and re-fetched the whole leftmost path.
+    #[tokio::test(start_paused = true)]
+    async fn sniff_fetches_are_not_repeated_by_the_fallback_join() {
+        let split = crate::split_bytes(&raw_file(64 * 1024));
+        let all = chunk_map(&split.chunks);
+        let path = leftmost_path(&all, split.root);
+        let leaf = *path.last().unwrap();
+        let fetcher = || {
+            let mut inner = MapFetcher::new();
+            for (addr, wire) in &all {
+                if *addr != leaf {
+                    inner.insert(*addr, wire.clone());
+                }
+            }
+            LoggingFetcher {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+            }
+        };
+
+        let bare = fetcher();
+        let root_wire = all[&split.root].clone();
+        join(&bare, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        let mut bare_log = bare.log.into_inner().unwrap();
+        bare_log.insert(0, split.root); // the lookup fetches the root itself
+
+        let looked_up = fetcher();
+        lookup_path(&looked_up, &split.root, "").await.unwrap_err();
+        let mut lookup_log = looked_up.log.into_inner().unwrap();
+
+        let leaf_fetches = |log: &[[u8; 32]]| log.iter().filter(|a| **a == leaf).count();
+        assert_eq!(leaf_fetches(&lookup_log), leaf_fetches(&bare_log));
+        bare_log.sort_unstable();
+        lookup_log.sort_unstable();
+        assert_eq!(lookup_log, bare_log);
+    }
+
+    /// Fetcher that records every requested address.
+    struct LoggingFetcher {
+        inner: MapFetcher,
+        log: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for LoggingFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.log.lock().unwrap().push(addr);
+            self.inner.fetch(addr).await
+        }
+    }
+
+    /// A raw upload shorter than a node header (64 bytes) behind
+    /// `bzz://<ref>/` is raw bytes, not a malformed manifest: the lookup
+    /// must answer `NotAManifest` so the gateway falls back to serving the
+    /// bytes. Before the fix the sniff answered "can't tell" for it, and
+    /// the join + unmarshal surfaced `TooShort`, which the gateway turned
+    /// into a 404. Covers the empty file and the length just below the
+    /// header too.
+    #[tokio::test]
+    async fn raw_file_shorter_than_a_node_header_is_not_a_manifest() {
+        for len in [0usize, 1, 20, NODE_HEADER_SIZE - 1] {
+            let (addr, wire) = ant_crypto::cac_new(&raw_file(len)).unwrap();
+            let mut fetcher = MapFetcher::new();
+            fetcher.insert(addr, wire);
+            let err = lookup_path(&fetcher, &addr, "").await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::NotAManifest),
+                "len {len}: expected NotAManifest, got {err:?}",
+            );
+        }
+    }
+
+    /// A multi-chunk file that *starts* like a mantaray node is not
+    /// rejected by the sniff: the lookup goes on to join the whole node
+    /// (proved here by the join tripping over a missing later chunk).
+    // Paused clock: the join's per-subtree retry back-off (~2 min of
+    // sleeps on a missing chunk) auto-advances instead of stalling.
+    #[tokio::test(start_paused = true)]
+    async fn manifest_header_in_first_leaf_still_joins_the_node() {
+        let root_wire = hex::decode(ROOT_HEX).unwrap();
+        let mut node = root_wire[8..].to_vec();
+        node.resize(64 * 1024, 0);
+        assert!(has_manifest_header(&node));
+        let split = crate::split_bytes(&node);
+        let all = chunk_map(&split.chunks);
+        let path = leftmost_path(&all, split.root);
+        let mut fetcher = MapFetcher::new();
+        for addr in &path {
+            fetcher.insert(*addr, all[addr].clone());
+        }
+        let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Fetch(JoinError::FetchChunk { .. })),
+            "expected the full join to run, got {err:?}",
         );
     }
 }
