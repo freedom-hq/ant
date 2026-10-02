@@ -124,6 +124,8 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          # For the Android check at the end of this job.
+          targets: aarch64-linux-android
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -138,6 +140,25 @@ jobs:
         run: |
           cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features chain --all-targets
           cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --features jni --all-targets
+
+      # The host checks above never compile `#[cfg(target_os =
+      # "android")]` code (ant-ffi's logcat writer), and android-smoke
+      # builds it on current stable only. freedom-browser-android builds
+      # that code with the pinned toolchain, so check it here too, the
+      # way xtask builds the Android slice (`--features jni`, plus
+      # `chain`). `check` doesn't link, but build scripts (cc-rs) need
+      # the NDK's clang for the target.
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ndk;27.2.12479018
+
+      - name: cargo check (ant-ffi, aarch64-linux-android)
+        run: |
+          bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android${ANDROID_NDK_API_LEVEL}-clang"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          cargo +${{ steps.msrv.outputs.version }} check -p ant-ffi --target aarch64-linux-android --features jni,chain
 
   # -------------------------------------------------------------------
   # Android cross-compile smoke. Confirms `crates/ant-ffi/src/jni.rs`

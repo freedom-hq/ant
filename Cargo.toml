@@ -22,7 +22,7 @@ edition = "2021"
 # toolchain and builds ant from source (and freedom-browser-android
 # builds that), so raising this breaks their builds: see AGENTS.md.
 # CI's `msrv` job builds with exactly this version.
-rust-version = "1.99"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/solardev-xyz/ant"
 
