@@ -684,6 +684,61 @@ async fn chunks_404_on_missing_reference() {
     assert_eq!(json["code"], 404);
 }
 
+/// #113: the terminal `StreamBzz` errors `run_stream_bzz` emits for a
+/// raw `/bytes` reference behind `/bzz` are 404s, never a 502 that
+/// Freedom's `bzz://` handler retries for most of a minute. The
+/// messages are the node's exact shapes (`path_below_raw_bytes_message`
+/// and an exhausted bare-root lookup in `ant-p2p`'s `behaviour.rs`).
+#[tokio::test]
+async fn bzz_raw_bytes_misses_are_404_not_502() {
+    let raw = "6c63c82445b9d80000d22e3a6acad2af956920beb475f1b20abadc4ae8dc16b1";
+    let cases = [
+        (
+            format!("/bzz/{raw}/foo"),
+            format!("path 'foo' not found: {raw} is raw bytes, not a mantaray manifest"),
+            "path address not found",
+        ),
+        (
+            format!("/bzz/{raw}/"),
+            format!(
+                "manifest lookup '': fetch manifest node: fetch chunk {raw}: all peers failed \
+                 for chunk {raw} after 33 attempts (last: remote: retrieve chunk: storage: not found)"
+            ),
+            "Not Found",
+        ),
+        (
+            format!("/bzz/{raw}"),
+            "manifest lookup '': fetch manifest node: erasure recovery failed: erasure recovery \
+             impossible: 95 of 128 shards retrievable, need 119 (119 data + 9 parity refs); \
+             trigger: no BZZ peers available"
+                .to_string(),
+            "Not Found",
+        ),
+    ];
+    for (uri, message, want) in cases {
+        let router = router_with_dispatcher(move |cmd| {
+            let message = message.clone();
+            async move {
+                if let ControlCommand::StreamBzz { ack, .. } = cmd {
+                    let _ = ack.send(ControlAck::Error { message }).await;
+                }
+            }
+        });
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["message"], want, "{uri}");
+    }
+}
+
 /// Every content-addressed endpoint must emit the `Cache-Control:
 /// public, max-age=..., immutable` header so the browser can serve
 /// reloads from its own HTTP cache without re-walking the manifest.
