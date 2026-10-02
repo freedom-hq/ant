@@ -1,6 +1,6 @@
 [package]
 name = "ant-crypto"
-version = "0.5.53"
+version = "0.5.54"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
