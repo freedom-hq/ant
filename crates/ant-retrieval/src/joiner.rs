@@ -125,7 +125,7 @@ const SUBTREE_RETRY_ATTEMPTS: usize = 32;
 /// backstop). Back-off is `RECOVERY_RETRY_BACKOFF × attempt`, capped at
 /// [`RECOVERY_RETRY_BACKOFF_MAX`]. 60 s covers the credit a light node
 /// needs to pull several cold 1.6 MB segments at once at startup (on
-/// mainnet, 8 concurrent ones completed in 14–20 s and 12 in ~28 s,
+/// mainnet, 8 concurrent ones completed in 14–20 s and 12 in 19–28 s,
 /// where an 8-sweep / 14 s budget still truncated 6 of 16) while
 /// staying inside the gateway's 90 s body-stall timeout, so a response
 /// that can't complete ends with an error rather than a stall.
