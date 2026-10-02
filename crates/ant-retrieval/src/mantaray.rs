@@ -749,7 +749,8 @@ pub(crate) async fn load_node_ref(
     // reference (#112), and a full join of a multi-MiB file just to read
     // its 64-byte header would make the answer depend on every chunk of
     // the file arriving inside the manifest lookup (#113).
-    if leftmost_leaf_is_not_a_manifest(fetcher, &root_chunk).await {
+    let sniffed = SniffedFetcher::new(fetcher);
+    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk).await {
         debug!(
             target: "ant_retrieval::mantaray",
             root = %hex::encode(addr),
@@ -757,8 +758,85 @@ pub(crate) async fn load_node_ref(
         );
         return Err(ManifestError::NotAManifest);
     }
-    let bytes = join(fetcher, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
+    // The join reuses what the sniff already paid for (R2-M1, #115): the
+    // chunks it fetched, and its failed fetch counts as the join's first
+    // attempt at that chunk instead of being repeated before the join's
+    // own retries / erasure recovery.
+    sniffed.replay();
+    let bytes = join(&sniffed, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
     Node::unmarshal(&bytes)
+}
+
+/// Fetch error as handed out by [`ChunkFetcher::fetch`].
+type FetchErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// [`ChunkFetcher`] wrapper that lets the header sniff and the join in
+/// [`load_node_ref`] share their fetches. While recording (the sniff) it
+/// remembers every chunk fetched and the one failed fetch that ends a
+/// sniff; after [`Self::replay`] (the join) it serves those chunks from
+/// memory and answers the *first* request for the failed address with
+/// the sniff's error, so the join's retry back-off / erasure recovery
+/// starts from where the sniff left off instead of re-waiting for the
+/// same miss. Later requests for that address go to the network as
+/// usual, so the join's own retries are untouched.
+struct SniffedFetcher<'a> {
+    inner: &'a dyn ChunkFetcher,
+    state: std::sync::Mutex<SniffState>,
+}
+
+#[derive(Default)]
+struct SniffState {
+    replaying: bool,
+    fetched: HashMap<[u8; 32], Vec<u8>>,
+    failed: Option<([u8; 32], FetchErr)>,
+}
+
+impl<'a> SniffedFetcher<'a> {
+    fn new(inner: &'a dyn ChunkFetcher) -> Self {
+        Self {
+            inner,
+            state: std::sync::Mutex::new(SniffState::default()),
+        }
+    }
+
+    fn replay(&self) {
+        self.state.lock().expect("sniff state lock").replaying = true;
+    }
+}
+
+#[async_trait::async_trait]
+impl ChunkFetcher for SniffedFetcher<'_> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+        let replaying = {
+            let mut state = self.state.lock().expect("sniff state lock");
+            if state.replaying {
+                if let Some(wire) = state.fetched.get(&addr) {
+                    return Ok(wire.clone());
+                }
+                if state.failed.as_ref().is_some_and(|(a, _)| *a == addr) {
+                    let (_, err) = state.failed.take().expect("checked");
+                    return Err(err);
+                }
+            }
+            state.replaying
+        };
+        let result = self.inner.fetch(addr).await;
+        if !replaying {
+            let mut state = self.state.lock().expect("sniff state lock");
+            match &result {
+                Ok(wire) if cac_valid(&addr, wire) => {
+                    state.fetched.insert(addr, wire.clone());
+                }
+                Ok(_) => {}
+                Err(e) => state.failed = Some((addr, e.to_string().into())),
+            }
+        }
+        result
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.inner.put_recovered(addr, wire).await;
+    }
 }
 
 /// Deepest chunk tree [`leftmost_leaf_is_not_a_manifest`] descends.
@@ -1811,6 +1889,64 @@ mod tests {
         }
         let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
         assert!(matches!(err, ManifestError::NotAManifest), "got {err:?}");
+    }
+
+    /// R2-M1 (#115): when the sniff can't fetch the leftmost leaf, the
+    /// fallback join must not pay for that miss (or the chunks the sniff
+    /// already fetched) a second time. The lookup costs exactly what a
+    /// bare join of the same file costs: every chunk request, the leaf's
+    /// retries included, matches one-for-one. Before the fix the lookup
+    /// made one extra leaf fetch and re-fetched the whole leftmost path.
+    #[tokio::test(start_paused = true)]
+    async fn sniff_fetches_are_not_repeated_by_the_fallback_join() {
+        let split = crate::split_bytes(&raw_file(64 * 1024));
+        let all = chunk_map(&split.chunks);
+        let path = leftmost_path(&all, split.root);
+        let leaf = *path.last().unwrap();
+        let fetcher = || {
+            let mut inner = MapFetcher::new();
+            for (addr, wire) in &all {
+                if *addr != leaf {
+                    inner.insert(*addr, wire.clone());
+                }
+            }
+            LoggingFetcher {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+            }
+        };
+
+        let bare = fetcher();
+        let root_wire = all[&split.root].clone();
+        join(&bare, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        let mut bare_log = bare.log.into_inner().unwrap();
+        bare_log.insert(0, split.root); // the lookup fetches the root itself
+
+        let looked_up = fetcher();
+        lookup_path(&looked_up, &split.root, "").await.unwrap_err();
+        let mut lookup_log = looked_up.log.into_inner().unwrap();
+
+        let leaf_fetches = |log: &[[u8; 32]]| log.iter().filter(|a| **a == leaf).count();
+        assert_eq!(leaf_fetches(&lookup_log), leaf_fetches(&bare_log));
+        bare_log.sort_unstable();
+        lookup_log.sort_unstable();
+        assert_eq!(lookup_log, bare_log);
+    }
+
+    /// Fetcher that records every requested address.
+    struct LoggingFetcher {
+        inner: MapFetcher,
+        log: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for LoggingFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.log.lock().unwrap().push(addr);
+            self.inner.fetch(addr).await
+        }
     }
 
     /// A raw upload shorter than a node header (64 bytes) behind
