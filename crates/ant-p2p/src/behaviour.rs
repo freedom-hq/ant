@@ -8946,14 +8946,6 @@ mod tests {
         );
     }
 
-    /// Pin the contract that `is_manifest_transient` treats a feed
-    /// dereference whose underlying chunk fetch failed as transient.
-    /// This is the read-path equivalent of marking a normal manifest
-    /// node fetch failure transient: without it, "no BZZ peers
-    /// available" raised inside `resolve_sequence_feed` escapes the
-    /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
-    /// — even though the very next attempt could have a fresh peer
-    /// snapshot that resolves the feed cleanly.
     /// `/bytes` retries its root fetch through a cold or flaky pool but
     /// not through a confirmed miss, so a missing reference still 404s
     /// promptly (issue #117).
@@ -8980,6 +8972,14 @@ mod tests {
         }
     }
 
+    /// Pin the contract that `is_manifest_transient` treats a feed
+    /// dereference whose underlying chunk fetch failed as transient.
+    /// This is the read-path equivalent of marking a normal manifest
+    /// node fetch failure transient: without it, "no BZZ peers
+    /// available" raised inside `resolve_sequence_feed` escapes the
+    /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
+    /// — even though the very next attempt could have a fresh peer
+    /// snapshot that resolves the feed cleanly.
     #[test]
     fn is_manifest_transient_classifies_feed_fetch_as_transient() {
         let inner: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
