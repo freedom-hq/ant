@@ -209,7 +209,11 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// and their fallback join), feed probes, replica probes, recovery
 /// sweeps, the encrypted joiner (in-order and buffered, so one wait per
 /// chunk would add up within one body stall), pin / stewardship /
-/// verify, traversal, ACT, and the SOC / chunk API.
+/// verify, traversal, ACT, and the SOC / chunk API. A joiner run on one
+/// of these (a fetcher whose [`crate::ChunkFetcher::waits_for_credit`]
+/// is `false`) has no wait to bound, so its windows don't cut off a
+/// starved child's subtree retries either: it keeps all of them, as
+/// before #117.
 pub const CREDIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// A retry loop's credit window: the bound on how long the credit waits

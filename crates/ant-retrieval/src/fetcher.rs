@@ -1227,6 +1227,12 @@ impl ChunkFetcher for RoutingFetcher {
         self.fetch_within(addr, credit_budget).await
     }
 
+    /// Only a fetcher with accounting attached can be overdraft-starved,
+    /// and so wait for credit.
+    fn waits_for_credit(&self) -> bool {
+        self.accounting.is_some()
+    }
+
     /// Store a locally-reconstructed chunk (RS-recovered data shard or a
     /// root rebuilt from a dispersed replica) in the same cache tiers a
     /// successful network fetch would land in, so subsequent fetches —

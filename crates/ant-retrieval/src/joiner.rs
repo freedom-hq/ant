@@ -157,6 +157,9 @@ const STREAM_CREDIT_WINDOW: Duration = RECOVERY_RETRY_BUDGET;
 /// one credit wait, after which a starved miss isn't retried in place
 /// and goes back to the caller's whole-request retry (whose fetcher
 /// carries its own credit deadline, `RoutingFetcher::with_credit_deadline`).
+/// Binds only a fetcher that waits ([`ChunkFetcher::waits_for_credit`]);
+/// a never-waiting buffered join (manifest fallback join, traversal)
+/// keeps every subtree retry for a starved miss ([`retry_child_miss`]).
 const BUFFERED_CREDIT_WINDOW: Duration = CREDIT_WAIT_BUDGET;
 /// Per-child output-channel depth for the streaming joiner. This is
 /// exactly bee's "moving window" knob: each in-flight sibling subtree
@@ -952,7 +955,7 @@ async fn fetch_child_with_retries(
             Ok(chunk) => return Ok(chunk),
             Err(e @ JoinError::FetchChunk { .. }) => {
                 let backoff = subtree_retry_backoff(attempt);
-                if !retry_child_miss(&e, attempt, &window, backoff) {
+                if !retry_child_miss(fetcher, &e, attempt, &window, backoff) {
                     return Err(e);
                 }
                 drop(e);
@@ -976,7 +979,16 @@ fn subtree_retry_backoff(attempt: usize) -> Duration {
 /// pool ([`fetch_chunk_pool_starved`]) only while the retry still starts
 /// inside the child's credit `window` — that fetch already waited for
 /// credit, and retrying it past the window would stack another wait.
+///
+/// The window bound applies only when `fetcher` actually waits for
+/// credit ([`ChunkFetcher::waits_for_credit`]). A never-waiting fetcher
+/// (the manifest sniff's [`crate::mantaray`] fallback join, traversal's
+/// [`crate::NoCreditWait`]) has no wait to stack, so its starved misses
+/// keep all [`SUBTREE_RETRY_ATTEMPTS`] retries, as before #117 — capping
+/// them at the window would leave a starved pool only a few seconds of
+/// back-off to refill in, with no credit wait to make up for it.
 fn retry_child_miss(
+    fetcher: &dyn ChunkFetcher,
     err: &JoinError,
     attempt: usize,
     window: &CreditWindow,
@@ -984,7 +996,9 @@ fn retry_child_miss(
 ) -> bool {
     matches!(err, JoinError::FetchChunk { .. })
         && attempt < SUBTREE_RETRY_ATTEMPTS
-        && (!fetch_chunk_pool_starved(err) || window.allows_retry(backoff))
+        && (!fetcher.waits_for_credit()
+            || !fetch_chunk_pool_starved(err)
+            || window.allows_retry(backoff))
 }
 
 /// Did a child fetch end because the fetcher's peer pool stayed
@@ -1156,7 +1170,7 @@ async fn join_child_with_retries(
             Ok(child) => return Ok(child),
             Err(e) => {
                 let backoff = subtree_retry_backoff(attempt);
-                if !retry_child_miss(&e, attempt, &window, backoff) {
+                if !retry_child_miss(fetcher, &e, attempt, &window, backoff) {
                     return Err(e);
                 }
                 tokio::time::sleep(backoff).await;
@@ -2073,6 +2087,9 @@ mod tests {
                 tokio::time::sleep(credit_budget).await;
                 Err(starved())
             }
+            fn waits_for_credit(&self) -> bool {
+                true
+            }
         }
         let fetcher = StarvedFetcher {
             calls: AtomicUsize::new(0),
@@ -2092,6 +2109,75 @@ mod tests {
             calls > 1 && calls < SUBTREE_RETRY_ATTEMPTS,
             "{calls} fetches"
         );
+    }
+
+    /// A fetcher that never waits for credit (the manifest sniff's
+    /// fallback join, traversal's `NoCreditWait`) has no wait to stack,
+    /// so a starved miss keeps every subtree retry, as before #117, in
+    /// the buffered joiner as in the streaming one (PR #119 R1-M1) —
+    /// rather than being cut off at `BUFFERED_CREDIT_WINDOW` after a few
+    /// seconds of back-off. A waiting fetcher is still cut off there.
+    #[tokio::test(start_paused = true)]
+    async fn never_waiting_starved_child_keeps_all_subtree_retries() {
+        struct StarvedFetcher {
+            calls: AtomicUsize,
+        }
+        fn starved() -> Box<dyn Error + Send + Sync> {
+            Box::new(crate::fetcher::FetchExhausted {
+                message: "no BZZ peers available".into(),
+                pool_starved: true,
+            })
+        }
+        #[async_trait::async_trait]
+        impl ChunkFetcher for StarvedFetcher {
+            async fn fetch(
+                &self,
+                _addr: [u8; 32],
+            ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(starved())
+            }
+            async fn fetch_waiting_for_credit(
+                &self,
+                _addr: [u8; 32],
+                credit_budget: Duration,
+            ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(credit_budget).await;
+                Err(starved())
+            }
+            fn waits_for_credit(&self) -> bool {
+                true
+            }
+        }
+
+        // Never waiting: all retries, in both joiners.
+        let inner = StarvedFetcher {
+            calls: AtomicUsize::new(0),
+        };
+        let fetcher = crate::NoCreditWait(&inner);
+        let started = tokio::time::Instant::now();
+        let err = join_child_with_retries(&fetcher, None, 0, [7u8; 32], 8192, 0)
+            .await
+            .unwrap_err();
+        assert!(fetch_chunk_pool_starved(&err), "got {err:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), SUBTREE_RETRY_ATTEMPTS);
+        assert!(started.elapsed() > BUFFERED_CREDIT_WINDOW);
+        inner.calls.store(0, Ordering::SeqCst);
+        fetch_child_with_retries(&fetcher, None, 0, [7u8; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(inner.calls.load(Ordering::SeqCst), SUBTREE_RETRY_ATTEMPTS);
+
+        // Waiting: the buffered child gives up by its window's end.
+        inner.calls.store(0, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        join_child_with_retries(&inner, None, 0, [7u8; 32], 8192, 0)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() <= BUFFERED_CREDIT_WINDOW);
+        let calls = inner.calls.load(Ordering::SeqCst);
+        assert!(calls < SUBTREE_RETRY_ATTEMPTS, "{calls} fetches");
     }
 
     /// A non-starved miss keeps the full subtree retry count: a fast

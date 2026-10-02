@@ -159,6 +159,20 @@ pub trait ChunkFetcher: Send + Sync {
         self.fetch(addr).await
     }
 
+    /// Does [`ChunkFetcher::fetch_waiting_for_credit`] actually wait for
+    /// peer credit on this fetcher? Retry loops bound a starved miss's
+    /// retries by their [`crate::accounting::CreditWindow`] only when it
+    /// does: that bound exists so credit waits can't stack, and a fetcher
+    /// that never waits has no wait to stack — its starved misses keep the
+    /// loop's full retry count, as before #117, so the retries themselves
+    /// are what gives pseudosettle time to refill the pool. Default
+    /// `false`, matching the default `fetch_waiting_for_credit`; an
+    /// implementation that overrides that to wait (or a wrapper that
+    /// forwards it) must say `true` here too.
+    fn waits_for_credit(&self) -> bool {
+        false
+    }
+
     /// Offer a chunk that was *reconstructed locally* (Reed-Solomon
     /// recovery of a missing data shard, or a root rebuilt from a
     /// dispersed replica) so the implementation can store it exactly
