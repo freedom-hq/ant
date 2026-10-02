@@ -165,34 +165,92 @@ pub const HOT_DEBT_THRESHOLD: u64 = LIGHT_DISCONNECT_LIMIT / 2;
 /// pseudosettle has had a chance to clear its debt.
 pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 
-/// Longest a single [`crate::RoutingFetcher`] fetch waits, in total, for
-/// credit when every candidate peer is overdraft-skipped (issue #117).
+/// Longest one credit-waiting fetch
+/// ([`crate::ChunkFetcher::fetch_waiting_for_credit`]) waits, in total,
+/// for credit while every candidate peer is overdraft-skipped (issue
+/// #117).
 ///
 /// Bee's `RetrieveChunk` waits for credit without a bound of its own:
 /// it sleeps [`OVERDRAFT_REFRESH`] and retries until the request context
-/// ends. We have no per-chunk context, so the wait gets its own bound,
-/// sized to fit inside every caller's budget:
+/// ends. We have no per-chunk context, so here the wait is opt-in and
+/// bounded. Plain [`crate::ChunkFetcher::fetch`] never waits: a fetch
+/// whose candidates are all overdraft-skipped fails at once as
+/// `FetchExhausted { pool_starved: true }`, as before #117.
 ///
-/// - the gateway's 90 s `BODY_STALL_TIMEOUT` mid-body: a data child's
-///   direct fetch waits at most this long, and so does each recovery
-///   retry's (the 60 s recovery-retry window opens with the first
-///   fetch), while the recovery sweeps themselves never wait
-///   ([`crate::ChunkFetcher::fetch_speculative`]); a plain child's
-///   subtree retries re-fetch a starved miss only inside that same 60 s
-///   window — so a starved child, redundant or not, stalls the body for
-///   at most 60 s + 10 s = 70 s;
-/// - the 30 s `/bzz` and `/bytes` resolution budget: a starved root or
-///   manifest fetch still gets a second attempt inside it;
-/// - the chunk API's 60 s request timeout.
+/// Only the fetches below wait. Each sits in a retry loop that passes
+/// every attempt what is left of the loop's [`CreditWindow`] (at most
+/// this budget) and retries a starved miss only inside that window, so
+/// the waits of one loop never add up past its window:
 ///
-/// Feed probes past the anchor carry their own 800 ms deadline, which
-/// cuts a wait short exactly as it cuts a slow peer walk short; the
-/// undeadlined anchor probe doesn't re-probe a starved fetch (that would
-/// stack one wait per probe retry), so it too ends after one budget. The
-/// root fetch's dispersed-replica probes don't wait at all
-/// ([`crate::ChunkFetcher::fetch_speculative`]), so a starved root
-/// fetch with its replica fallback still ends after one budget.
+/// - **Streaming and range joiner data chunks** (`/bytes`, `/bzz`
+///   bodies). Each data child has a 60 s window opened by its first
+///   fetch: a plain child's subtree retries and a redundant child's
+///   recovery retries both live inside it. Recovery sweeps never wait.
+///   A starved child therefore stalls the body for at most 60 s plus the
+///   last attempt's network time, under the gateway's 90 s
+///   `BODY_STALL_TIMEOUT`. That bound is per tree level: once a child
+///   has arrived, its own children get their own windows.
+/// - **Buffered joiner data chunks** (`GetBytes` / `GetBzz`: `antctl
+///   get`, FFI `ant_get`). Each child has a 10 s window (one wait). A
+///   redundant child's recovery retries keep their 60 s window. The
+///   request's whole-join retries share a 30 s deadline
+///   (`RoutingFetcher::with_credit_deadline`), so a request spends at
+///   most 30 s waiting for credit, across all of its attempts.
+/// - **The data-root fetch of `/bytes` and `/bzz`**, plus the buffered
+///   requests' data roots. This is the direct fetch only: dispersed-replica
+///   probes never wait. A `/bytes` or `/bzz` root waits at most this long
+///   and never past the 30 s resolution budget. A `/bzz` attempt waits
+///   for at most two roots (a bare root and the data root behind its
+///   index document; the manifest walk between them never waits), so a
+///   starved first attempt ends by ~20 s and a second attempt still
+///   fits inside the budget.
+///
+/// Nothing else waits. That covers manifest walks (sniff, node loads,
+/// and their fallback join), feed probes, replica probes, recovery
+/// sweeps, the encrypted joiner (in-order and buffered, so one wait per
+/// chunk would add up within one body stall), pin / stewardship /
+/// verify, traversal, ACT, and the SOC / chunk API.
 pub const CREDIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
+/// A retry loop's credit window: the bound on how long the credit waits
+/// of all its attempts may run (see [`CREDIT_WAIT_BUDGET`]).
+///
+/// Opened when the loop's first fetch starts. Each attempt passes
+/// [`CreditWindow::budget`] to
+/// [`crate::ChunkFetcher::fetch_waiting_for_credit`], so no wait runs
+/// past the window, and retries an overdraft-starved miss only while
+/// [`CreditWindow::allows_retry`] holds. Once the window has passed,
+/// attempts don't wait at all, exactly like plain `fetch`.
+#[derive(Debug, Clone, Copy)]
+pub struct CreditWindow {
+    started: tokio::time::Instant,
+    window: Duration,
+}
+
+impl CreditWindow {
+    /// Open a window of `window` now.
+    #[must_use]
+    pub fn new(window: Duration) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            window,
+        }
+    }
+
+    /// Credit budget for the next attempt: [`CREDIT_WAIT_BUDGET`], cut
+    /// to what is left of the window (zero once it has passed).
+    #[must_use]
+    pub fn budget(&self) -> Duration {
+        CREDIT_WAIT_BUDGET.min(self.window.saturating_sub(self.started.elapsed()))
+    }
+
+    /// May a starved miss be retried after sleeping `backoff`? Only if
+    /// the retry would still start inside the window.
+    #[must_use]
+    pub fn allows_retry(&self, backoff: Duration) -> bool {
+        self.started.elapsed() + backoff < self.window
+    }
+}
 
 /// Per-peer mirror of bee's `accountingPeer`, restricted to the
 /// fields that affect admission control. We don't track
@@ -373,11 +431,12 @@ impl Accounting {
     /// Wait until credit may have come free, or `max` elapses, whichever
     /// is first. Returns `true` when woken by freed credit.
     ///
-    /// Used by [`crate::RoutingFetcher`] when every candidate peer for a
-    /// chunk is overdraft-skipped (issue #117), in place of bee's plain
-    /// `time.After(overDraftRefresh)` sleep in `RetrieveChunk`. The
-    /// caller passes [`OVERDRAFT_REFRESH`] (or less, near the end of its
-    /// [`CREDIT_WAIT_BUDGET`]) as `max`, so it still re-checks on bee's
+    /// Used by [`crate::RoutingFetcher`]'s credit-waiting fetches when
+    /// every candidate peer for a chunk is overdraft-skipped (issue
+    /// #117), in place of bee's plain `time.After(overDraftRefresh)`
+    /// sleep in `RetrieveChunk`. The caller passes [`OVERDRAFT_REFRESH`]
+    /// (or less, near the end of its credit budget) as `max`, so it
+    /// still re-checks on bee's
     /// cadence; that also catches credit that opens without an event
     /// (the one-second refresh allowance, newly connected peers).
     ///

@@ -18,7 +18,7 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
-use crate::accounting::{Accounting, DebitGuard, CREDIT_WAIT_BUDGET, OVERDRAFT_REFRESH};
+use crate::accounting::{Accounting, DebitGuard, OVERDRAFT_REFRESH};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
 use crate::progress::ProgressTracker;
@@ -185,6 +185,9 @@ pub struct RoutingFetcher {
     /// when the daemon's accounting hasn't been constructed
     /// (legacy `antctl get` paths).
     accounting: Option<Arc<Accounting>>,
+    /// No credit-waiting fetch through this fetcher waits past this
+    /// instant ([`RoutingFetcher::with_credit_deadline`]).
+    credit_deadline: Option<tokio::time::Instant>,
     /// Process-wide cumulative counters. Bumped on every chunk the
     /// fetcher hands back (network or cache); read by the status
     /// publisher to populate `StatusSnapshot::retrieval` so `antctl
@@ -274,6 +277,7 @@ impl RoutingFetcher {
             request_inflight_limit: None,
             payment_notify: None,
             accounting: None,
+            credit_deadline: None,
             counters: None,
             pushsync_settlement: None,
             push_skip: None,
@@ -386,6 +390,18 @@ impl RoutingFetcher {
     #[must_use]
     pub fn with_accounting(mut self, accounting: Arc<Accounting>) -> Self {
         self.accounting = Some(accounting);
+        self
+    }
+
+    /// Cap every credit wait of this fetcher
+    /// ([`ChunkFetcher::fetch_waiting_for_credit`]) at `deadline`: past
+    /// it, a starved fetch fails at once as plain `fetch` does. For a
+    /// request that retries a whole buffered join, so its attempts can't
+    /// stack one credit wait each (see
+    /// [`crate::accounting::CREDIT_WAIT_BUDGET`]).
+    #[must_use]
+    pub fn with_credit_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.credit_deadline = Some(deadline);
         self
     }
 
@@ -1194,17 +1210,21 @@ impl StdError for FetchExhausted {}
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        self.fetch_within(addr, CREDIT_WAIT_BUDGET).await
+        self.fetch_within(addr, Duration::ZERO).await
     }
 
-    /// A speculative probe (a dispersed-replica candidate) never waits
-    /// for credit: on a starved pool it fails at once, as every fetch
-    /// did before issue #117.
-    async fn fetch_speculative(
+    async fn fetch_waiting_for_credit(
         &self,
         addr: [u8; 32],
+        credit_budget: Duration,
     ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        self.fetch_within(addr, Duration::ZERO).await
+        let credit_budget = match self.credit_deadline {
+            Some(deadline) => {
+                credit_budget.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            }
+            None => credit_budget,
+        };
+        self.fetch_within(addr, credit_budget).await
     }
 
     /// Store a locally-reconstructed chunk (RS-recovered data shard or a
@@ -1228,8 +1248,10 @@ impl ChunkFetcher for RoutingFetcher {
 }
 
 impl RoutingFetcher {
-    /// [`ChunkFetcher::fetch`], waiting at most `credit_budget` in total
-    /// for credit while every candidate peer is overdraft-skipped.
+    /// The fetch itself, waiting at most `credit_budget` in total for
+    /// credit while every candidate peer is overdraft-skipped: zero for
+    /// [`ChunkFetcher::fetch`], the caller's budget for
+    /// [`ChunkFetcher::fetch_waiting_for_credit`].
     async fn fetch_within(
         &self,
         addr: [u8; 32],
@@ -1463,7 +1485,9 @@ impl RoutingFetcher {
 
         // Initial dispatch. With no peers at all there is nothing to
         // wait for; with peers that are all overdraft-skipped, the loop
-        // below waits for credit (issue #117).
+        // below waits for credit if this fetch has a credit budget
+        // (issue #117), and otherwise fails at once as a starved
+        // `FetchExhausted`.
         match pick_next(&asked, &mut overdraft_skip) {
             Some((peer, guard)) => {
                 asked.push(peer);
@@ -1494,10 +1518,12 @@ impl RoutingFetcher {
             // `overDraftRefresh` and tries again, and it only gives up
             // when every peer was really asked. We do the same while the
             // pool is starved (the condition `FetchExhausted::pool_starved`
-            // reports), within `CREDIT_WAIT_BUDGET`: on a cold node
-            // every peer admits ~5 chunks before pseudosettle refills
-            // it, and giving up at once turned each such miss into an
-            // erasure-recovery sweep or a 502 (issue #117).
+            // reports), within `credit_budget`: on a cold node every
+            // peer admits ~5 chunks before pseudosettle refills it, and
+            // giving up at once turned each such miss into an
+            // erasure-recovery sweep or a 502 (issue #117). The budget
+            // is zero for plain `fetch`, which never waits; only
+            // `fetch_waiting_for_credit` callers opt in.
             if in_flight.is_empty() && !candidate_available(&asked, &overdraft_skip) {
                 let starved = pool_starved(
                     errors_left,
@@ -1975,6 +2001,7 @@ fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounting::CREDIT_WAIT_BUDGET;
     use std::time::Duration;
 
     /// Starvation needs budget left *and* unasked ranked peers, and stops
@@ -2278,23 +2305,54 @@ mod tests {
         (fetcher, p, held)
     }
 
+    /// Wire bytes of a plain two-leaf intermediate root (span 8 KiB)
+    /// whose children are both `child`.
+    fn two_leaf_root(child: [u8; 32]) -> Vec<u8> {
+        let mut root = 8192u64.to_le_bytes().to_vec();
+        root.extend_from_slice(&child);
+        root.extend_from_slice(&child);
+        root
+    }
+
+    /// Issue #117 redesign on PR #119: plain `fetch` never waits for
+    /// credit. A pool whose every candidate is overdraft-skipped fails
+    /// at t = 0, typed as a starved `FetchExhausted`, as on `main`.
+    #[tokio::test(start_paused = true)]
+    async fn plain_fetch_on_a_starved_pool_fails_at_once() {
+        let addr = [0x55u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch(addr).await.expect_err("starved");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(err.to_string(), "no BZZ peers available");
+        let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+        assert!(typed.pool_starved);
+        // A path that must never wait stays non-waiting even when it
+        // asks for a credit wait.
+        let err = crate::NoCreditWait(&fetcher)
+            .fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+            .await
+            .expect_err("starved");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(err.to_string(), "no BZZ peers available");
+    }
+
     /// R1-F1 on PR #119: the dispersed-replica fallback after a starved
     /// root fetch must not wait for credit on each of its ~30 probes.
     /// The direct fetch waits its `CREDIT_WAIT_BUDGET`; the replica
-    /// probes are speculative and fail at once, so the whole root fetch
-    /// ends at the budget, not at ~50 s (8 waves × 10 s at fanout 4)
-    /// past the 30 s resolution budget.
+    /// probes use plain `fetch` and fail at once, so the whole root fetch
+    /// ends at the budget, not at ~50 s (8 waves × 10 s at fanout 4).
     #[tokio::test(start_paused = true)]
     async fn starved_root_fetch_does_not_wait_per_replica() {
         let addr = [0x44u8; 32];
         let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
         let started = tokio::time::Instant::now();
-        let err = crate::rs::fetch_root_with_replicas(&fetcher, addr)
+        let err = crate::rs::fetch_root_with_replicas(&fetcher, addr, CREDIT_WAIT_BUDGET)
             .await
             .expect_err("pool never refills");
         let waited = started.elapsed();
         assert!(
-            waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            waited >= CREDIT_WAIT_BUDGET && waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
             "root fetch with replica fallback took {waited:?}",
         );
         // The direct fetch's error is what the caller sees.
@@ -2303,13 +2361,36 @@ mod tests {
         assert!(typed.pool_starved);
     }
 
+    /// R3-F1 on PR #119: a feed anchor probe on a starved pool must not
+    /// wait for credit per probe retry (4 × 10 s, past the 30 s `/bzz`
+    /// resolution budget). Feed probes use plain `fetch`, so the probe
+    /// gives up after its own 3 × 200 ms retry delays, as on `main`.
+    #[tokio::test(start_paused = true)]
+    async fn starved_feed_anchor_probe_does_not_wait_for_credit() {
+        let feed = crate::feed::Feed {
+            owner: [0x24u8; 20],
+            topic: [0x42u8; 32],
+            kind: crate::feed::FeedType::Sequence,
+        };
+        let addr = crate::feed::sequence_update_address(&feed, 0);
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let started = tokio::time::Instant::now();
+        let r = crate::feed::resolve_sequence_feed_after(&fetcher, &feed, 0).await;
+        let waited = started.elapsed();
+        assert!(r.is_err(), "pool never refills: {r:?}");
+        assert!(
+            waited < Duration::from_secs(1),
+            "starved anchor probe took {waited:?}",
+        );
+    }
+
     /// R4-F1 on PR #119: an erasure-recovery sweep after a starved data
     /// child's direct fetch must not wait for credit on each of its up
-    /// to 128 shard fetches. The direct fetch waits its
-    /// `CREDIT_WAIT_BUDGET`; the sweep's fetches are speculative and
-    /// fail at once (as unreached, so the failure is transient and the
-    /// joiner retries), so the attempt ends at the budget, not at ~90 s
-    /// (8 waves × 10 s at fanout 16, plus the direct wait).
+    /// to 128 shard fetches. The direct fetch waits its budget; the
+    /// sweep's fetches are plain and fail at once (as unreached, so the
+    /// failure is transient and the joiner retries), so the attempt ends
+    /// at the budget, not at ~90 s (8 waves × 10 s at fanout 16, plus the
+    /// direct wait).
     #[tokio::test(start_paused = true)]
     async fn starved_recovery_sweep_does_not_wait_per_shard() {
         let addr = [0x66u8; 32];
@@ -2317,12 +2398,12 @@ mod tests {
         let decoder = crate::rs::RsDecoder::new(vec![addr; 128], 119);
         let started = tokio::time::Instant::now();
         let err = decoder
-            .fetch_data_shard(&fetcher, 0)
+            .fetch_data_shard(&fetcher, 0, CREDIT_WAIT_BUDGET)
             .await
             .expect_err("pool never refills");
         let waited = started.elapsed();
         assert!(
-            waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            waited >= CREDIT_WAIT_BUDGET && waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
             "direct fetch plus recovery sweep took {waited:?}",
         );
         assert!(
@@ -2332,15 +2413,66 @@ mod tests {
         );
     }
 
-    /// `fetch_speculative` on a starved pool fails at once.
+    /// R6-F1 on PR #119: the buffered joiner must not re-fetch a starved
+    /// child 32 times, each waiting the full credit budget (~444 s). Its
+    /// child gets one credit window (10 s): the first fetch waits it out
+    /// and the starved miss isn't retried in place, so the join fails at
+    /// the budget for the caller's whole-request retry to take over.
     #[tokio::test(start_paused = true)]
-    async fn speculative_fetch_never_waits_for_credit() {
-        let addr = [0x55u8; 32];
+    async fn starved_buffered_join_waits_one_credit_window_per_child() {
+        let addr = [0x77u8; 32];
         let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
         let started = tokio::time::Instant::now();
-        let err = fetcher.fetch_speculative(addr).await.expect_err("starved");
-        assert_eq!(started.elapsed(), Duration::ZERO);
-        assert_eq!(err.to_string(), "no BZZ peers available");
+        let err = crate::join(&fetcher, &two_leaf_root(addr), 1 << 20)
+            .await
+            .expect_err("pool never refills");
+        let waited = started.elapsed();
+        assert!(
+            waited >= CREDIT_WAIT_BUDGET && waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            "buffered join of a starved child took {waited:?}",
+        );
+        assert!(err.to_string().contains("no BZZ peers available"), "{err}");
+    }
+
+    /// Issue #117: the opted-in data path (the streaming joiner's child
+    /// fetches) waits for credit instead of failing on a starved pool,
+    /// and once the peer's credit comes free it is woken (not left to
+    /// its 600 ms timer) and dispatches to that peer: its reservation
+    /// shows up in the accounting.
+    #[tokio::test]
+    async fn streaming_join_waits_for_credit_then_asks_the_peer() {
+        let addr = [0x88u8; 32];
+        let (fetcher, acc, p, held) = starved_fetcher(addr);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let h = tokio::spawn(async move {
+            crate::join_to_sender(
+                &fetcher,
+                &two_leaf_root(addr),
+                1 << 20,
+                crate::JoinOptions::default(),
+                tx,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !h.is_finished(),
+            "the streaming joiner must wait for credit on a starved pool, got {:?}",
+            h.await.unwrap(),
+        );
+
+        let held_reserve = acc.debug_snapshot(&p).unwrap().1;
+        drop(held);
+        // Woken by the release, well before the 600 ms re-check.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, reserved) = acc.debug_snapshot(&p).unwrap();
+        assert!(
+            reserved > 0 && reserved < held_reserve,
+            "the joiner's fetch must have reserved credit and dispatched: reserved {reserved}",
+        );
+        h.abort();
     }
 
     /// R1-M2 on PR #119: a credit wake-up the oldest waiter can't use
@@ -2353,11 +2485,19 @@ mod tests {
         let acc = Arc::new(Accounting::new());
         // Oldest waiter: its only peer stays starved.
         let (a, _pa, _held_a) = starved_fetcher_on(acc.clone(), addr);
-        let ha = tokio::spawn(async move { a.fetch(addr).await.map_err(|e| e.to_string()) });
+        let ha = tokio::spawn(async move {
+            a.fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+                .await
+                .map_err(|e| e.to_string())
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         // Younger waiter: its peer gets one chunk's credit back.
         let (b, pb, mut held_b) = starved_fetcher_on(acc.clone(), addr);
-        let hb = tokio::spawn(async move { b.fetch(addr).await.map_err(|e| e.to_string()) });
+        let hb = tokio::spawn(async move {
+            b.fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+                .await
+                .map_err(|e| e.to_string())
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ha.is_finished() && !hb.is_finished(), "both must wait");
 
@@ -2376,22 +2516,26 @@ mod tests {
         hb.abort();
     }
 
-    /// Issue #117: when every candidate is overdraft-skipped the fetch
-    /// waits for credit, as bee's `RetrieveChunk` sleeps
-    /// `overDraftRefresh`, instead of failing with `no BZZ peers
-    /// available` at once. Once the peer's credit comes free, the waiter
-    /// is woken (not left to its timer) and dispatches to that peer: its
-    /// reservation shows up in the accounting.
+    /// Issue #117: a credit-waiting fetch on a starved pool waits for
+    /// credit, as bee's `RetrieveChunk` sleeps `overDraftRefresh`,
+    /// instead of failing with `no BZZ peers available` at once. Once
+    /// the peer's credit comes free, the waiter is woken (not left to its
+    /// timer) and dispatches to that peer.
     #[tokio::test]
     async fn starved_fetch_waits_for_credit_then_asks_the_peer() {
         let addr = [0x11u8; 32];
         let (fetcher, acc, p, held) = starved_fetcher(addr);
-        let h = tokio::spawn(async move { fetcher.fetch(addr).await.map_err(|e| e.to_string()) });
+        let h = tokio::spawn(async move {
+            fetcher
+                .fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+                .await
+                .map_err(|e| e.to_string())
+        });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !h.is_finished(),
-            "a fetch starved by accounting must wait for credit, got {:?}",
+            "a credit-waiting fetch starved by accounting must wait, got {:?}",
             h.await.unwrap(),
         );
 
@@ -2408,16 +2552,19 @@ mod tests {
     }
 
     /// The credit wait is bounded: a pool that never refills fails after
-    /// `CREDIT_WAIT_BUDGET` with the old message, flagged starved.
+    /// the caller's budget with the old message, flagged starved.
     #[tokio::test(start_paused = true)]
     async fn starved_fetch_gives_up_after_the_credit_wait_budget() {
         let addr = [0x22u8; 32];
         let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
         let started = tokio::time::Instant::now();
-        let err = tokio::time::timeout(CREDIT_WAIT_BUDGET * 3, fetcher.fetch(addr))
-            .await
-            .expect("the credit wait must be bounded")
-            .expect_err("pool never refills");
+        let err = tokio::time::timeout(
+            CREDIT_WAIT_BUDGET * 3,
+            fetcher.fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET),
+        )
+        .await
+        .expect("the credit wait must be bounded")
+        .expect_err("pool never refills");
         let waited = started.elapsed();
         assert!(
             waited >= CREDIT_WAIT_BUDGET && waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
@@ -2428,15 +2575,45 @@ mod tests {
         assert!(typed.pool_starved);
     }
 
-    /// No peers at all is not starvation: nothing can refill, so the
-    /// fetch still fails at once.
+    /// A fetcher's credit deadline cuts every credit wait short: the
+    /// buffered whole-request retries share one deadline this way.
+    #[tokio::test(start_paused = true)]
+    async fn credit_deadline_caps_the_wait() {
+        let addr = [0x23u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let deadline = Duration::from_secs(2);
+        let fetcher = fetcher.with_credit_deadline(tokio::time::Instant::now() + deadline);
+        let started = tokio::time::Instant::now();
+        fetcher
+            .fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+            .await
+            .expect_err("pool never refills");
+        let waited = started.elapsed();
+        assert!(
+            waited >= deadline && waited < deadline + OVERDRAFT_REFRESH,
+            "waited {waited:?}",
+        );
+        // Past the deadline a credit-waiting fetch fails at once.
+        let started = tokio::time::Instant::now();
+        fetcher
+            .fetch_waiting_for_credit(addr, CREDIT_WAIT_BUDGET)
+            .await
+            .expect_err("pool never refills");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// No peers at all is not starvation: nothing can refill, so even a
+    /// credit-waiting fetch fails at once.
     #[tokio::test(start_paused = true)]
     async fn fetch_without_peers_fails_at_once() {
         let behaviour = libp2p_stream::Behaviour::default();
         let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), Vec::new())
             .with_accounting(Arc::new(Accounting::new()));
         let started = tokio::time::Instant::now();
-        let err = fetcher.fetch([0x33u8; 32]).await.expect_err("no peers");
+        let err = fetcher
+            .fetch_waiting_for_credit([0x33u8; 32], CREDIT_WAIT_BUDGET)
+            .await
+            .expect_err("no peers");
         assert_eq!(err.to_string(), "no BZZ peers available");
         assert_eq!(started.elapsed(), Duration::ZERO);
     }

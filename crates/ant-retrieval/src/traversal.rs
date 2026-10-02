@@ -53,6 +53,8 @@ pub async fn traverse_chunk_addresses(
     root: [u8; 32],
     max_bytes: usize,
 ) -> Result<Vec<[u8; 32]>, TraversalError> {
+    // Traversal (pin, stewardship) never waits for peer credit (#117).
+    let fetcher = &crate::NoCreditWait(fetcher);
     let root_wire = fetcher
         .fetch(root)
         .await
@@ -217,6 +219,8 @@ pub async fn traverse_encrypted_chunk_addresses(
     root_ref: [u8; ENC_REF_SIZE],
     max_bytes: usize,
 ) -> Result<Vec<[u8; 32]>, TraversalError> {
+    // Traversal (pin, stewardship) never waits for peer credit (#117).
+    let fetcher = &crate::NoCreditWait(fetcher);
     let mut out = Vec::new();
     let mut emitted = HashSet::new();
 

@@ -567,10 +567,17 @@ impl RsDecoder {
     /// shards peers confirmed missing already exceed the parity count,
     /// or when the shards were all there but reconstruction or CAC
     /// validation failed.
+    ///
+    /// The direct fetch waits up to `credit_budget` for peer credit
+    /// ([`ChunkFetcher::fetch_waiting_for_credit`]); the recovery sweep
+    /// never waits (issue #117): a starved shard counts as unreached, so
+    /// the sweep comes up short as `transient` and the caller's retry
+    /// window decides.
     pub async fn fetch_data_shard(
         &self,
         fetcher: &dyn ChunkFetcher,
         index: usize,
+        credit_budget: std::time::Duration,
     ) -> Result<Vec<u8>, RecoveryError> {
         let seen = {
             let state = self.recovered.lock().await;
@@ -582,7 +589,10 @@ impl RsDecoder {
             }
             state.sweeps
         };
-        match fetcher.fetch(self.addrs[index]).await {
+        match fetcher
+            .fetch_waiting_for_credit(self.addrs[index], credit_budget)
+            .await
+        {
             Ok(wire) => Ok(wire),
             Err(fetch_err) => {
                 let shards = self.recover(fetcher, &fetch_err.to_string(), seen).await?;
@@ -641,17 +651,8 @@ impl RsDecoder {
                     // chunk missing ("not found"), as opposed to the fetch
                     // never getting an answer (no admissible peer, timeouts,
                     // dropped streams).
-                    //
-                    // Speculative: a sweep fetch never waits for peer
-                    // credit (issue #117). Up to 128 fetches at fanout 16
-                    // would otherwise stack one `CREDIT_WAIT_BUDGET` per
-                    // wave (~80 s) on a starved pool and take credit
-                    // wake-ups ahead of real data fetches. A starved shard
-                    // counts as unreached, so the sweep comes up short as
-                    // `transient` and the joiner's recovery retries (whose
-                    // direct fetch does wait) pick it up once credit returns.
                     let r = fetcher
-                        .fetch_speculative(addr)
+                        .fetch(addr)
                         .await
                         .map_err(|e| shard_confirmed_missing(e.as_ref()));
                     (i, r)
@@ -876,11 +877,17 @@ pub fn replica_identities(addr: &[u8; 32], level: u8) -> Vec<([u8; 32], [u8; 32]
 ///
 /// On total failure the *original* fetch error is returned, so callers'
 /// error messages still describe the direct root miss.
+///
+/// The direct fetch waits up to `credit_budget` for peer credit
+/// ([`ChunkFetcher::fetch_waiting_for_credit`]; zero means plain
+/// `fetch`). The replica probes never wait (issue #117): most replica
+/// addresses hold nothing, and up to 30 waits at fanout 4 would stack.
 pub async fn fetch_root_with_replicas(
     fetcher: &dyn ChunkFetcher,
     addr: [u8; 32],
+    credit_budget: std::time::Duration,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let direct_err = match fetcher.fetch(addr).await {
+    let direct_err = match fetcher.fetch_waiting_for_credit(addr, credit_budget).await {
         Ok(wire) => return Ok(wire),
         Err(e) => e,
     };
@@ -902,9 +909,7 @@ pub async fn fetch_root_with_replicas(
     );
 
     let mut attempts = stream::iter(candidates.into_iter().map(|soc_addr| async move {
-        // Speculative: most replica addresses hold nothing, and on a
-        // starved pool none of them should wait for credit (issue #117).
-        let wire = fetcher.fetch_speculative(soc_addr).await.ok()?;
+        let wire = fetcher.fetch(soc_addr).await.ok()?;
         if !soc_valid(&soc_addr, &wire) || wire.len() <= SOC_HEADER_SIZE {
             return None;
         }

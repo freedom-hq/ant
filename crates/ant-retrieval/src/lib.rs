@@ -136,27 +136,25 @@ pub trait ChunkFetcher: Send + Sync {
     /// failure here as a fatal error for the file.
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
 
-    /// Like [`ChunkFetcher::fetch`], for a *speculative* probe whose
-    /// miss is expected and cheap to accept: the dispersed-replica
-    /// fallback in [`crate::rs::fetch_root_with_replicas`] fans out up
-    /// to 30 such probes after the direct root fetch failed, and an
-    /// erasure-recovery sweep ([`crate::rs::RsDecoder::fetch_data_shard`])
-    /// fans out up to 128 shard fetches after a data child's direct
-    /// fetch failed.
+    /// Like [`ChunkFetcher::fetch`], but when every candidate peer is
+    /// overdraft-skipped, wait up to `credit_budget` in total for peer
+    /// credit to come free instead of failing at once (issue #117; bee's
+    /// `RetrieveChunk` sleeps `overDraftRefresh` and retries the same
+    /// way). Plain `fetch` never waits.
     ///
-    /// An implementation that would otherwise wait for peer credit when
-    /// its pool is overdraft-starved ([`crate::RoutingFetcher`], issue
-    /// #117) must fail at once here instead: 30 probes × a 10 s credit
-    /// wait at fanout 4 would hold a starved root fetch for ~50 s,
-    /// beyond the 30 s resolution budget, and 128 shards at fanout 16
-    /// would hold a recovery sweep for ~80 s, past the gateway's 90 s
-    /// body-stall timeout once the direct fetch's own wait is added;
-    /// either way the probes would spend credit wake-ups that real data
-    /// fetches are waiting for. Default is plain `fetch`, right for
-    /// every fetcher that never waits.
-    async fn fetch_speculative(
+    /// Opt-in, because a wait inside a fan-out or a retry loop multiplies:
+    /// only callers that need the chunk, fetch it once per attempt, and
+    /// bound their retries by a window ([`crate::accounting::CreditWindow`])
+    /// use it. Those are the joiners' data-chunk fetches and the `/bytes`
+    /// / `/bzz` data-root fetch; see
+    /// [`crate::accounting::CREDIT_WAIT_BUDGET`] for the full list and
+    /// bounds. Default is plain `fetch`, right for every fetcher that has
+    /// no credit to wait for (and for wrappers that must not wait, like
+    /// the manifest sniff).
+    async fn fetch_waiting_for_credit(
         &self,
         addr: [u8; 32],
+        _credit_budget: Duration,
     ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
         self.fetch(addr).await
     }
@@ -169,6 +167,25 @@ pub trait ChunkFetcher: Send + Sync {
     /// bytes are already CAC-validated against `addr` by the caller.
     /// Default is a no-op for map-backed test fetchers.
     async fn put_recovered(&self, _addr: [u8; 32], _wire: &[u8]) {}
+}
+
+/// A [`ChunkFetcher`] view that never waits for peer credit: it forwards
+/// `fetch` and `put_recovered`, and leaves
+/// [`ChunkFetcher::fetch_waiting_for_credit`] at the trait default
+/// (plain `fetch`). Wrap a fetcher in it before handing it to a joiner on
+/// a path that must stay non-waiting (manifest walks, traversal, ACT;
+/// see [`accounting::CREDIT_WAIT_BUDGET`]).
+pub struct NoCreditWait<'a>(pub &'a dyn ChunkFetcher);
+
+#[async_trait]
+impl ChunkFetcher for NoCreditWait<'_> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.0.fetch(addr).await
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.0.put_recovered(addr, wire).await;
+    }
 }
 
 /// Bee `pkg/retrieval` protocol id. Unchanged between bee 2.7.x and
