@@ -893,7 +893,9 @@ pub async fn fetch_root_with_replicas(
     );
 
     let mut attempts = stream::iter(candidates.into_iter().map(|soc_addr| async move {
-        let wire = fetcher.fetch(soc_addr).await.ok()?;
+        // Speculative: most replica addresses hold nothing, and on a
+        // starved pool none of them should wait for credit (issue #117).
+        let wire = fetcher.fetch_speculative(soc_addr).await.ok()?;
         if !soc_valid(&soc_addr, &wire) || wire.len() <= SOC_HEADER_SIZE {
             return None;
         }

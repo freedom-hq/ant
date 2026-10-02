@@ -98,6 +98,7 @@
 
 use libp2p::PeerId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -181,7 +182,10 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// - the chunk API's 60 s request timeout.
 ///
 /// Feed probes past the anchor carry their own 800 ms deadline, which
-/// cuts a wait short exactly as it cuts a slow peer walk short.
+/// cuts a wait short exactly as it cuts a slow peer walk short. The
+/// root fetch's dispersed-replica probes don't wait at all
+/// ([`crate::ChunkFetcher::fetch_speculative`]), so a starved root
+/// fetch with its replica fallback still ends after one budget.
 pub const CREDIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// Per-peer mirror of bee's `accountingPeer`, restricted to the
@@ -244,6 +248,10 @@ pub struct Accounting {
     /// ([`DebitGuard`] dropped without `apply`). Woken one at a time,
     /// oldest first; see [`Accounting::pass_credit`].
     credit_freed: Arc<Notify>,
+    /// Count of credit releases (each `credit_freed` event), so a woken
+    /// waiter can tell a release it hasn't looked at yet from one it
+    /// already has; see [`Accounting::credit_epoch`].
+    credit_epoch: Arc<AtomicU64>,
 }
 
 /// Hint payload sent from the fetcher hot path into the
@@ -268,6 +276,7 @@ impl Accounting {
             peers: Arc::new(Mutex::new(HashMap::new())),
             hot_hint: None,
             credit_freed: Arc::new(Notify::new()),
+            credit_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -351,6 +360,7 @@ impl Accounting {
             balances: self.peers.clone(),
             hot_hint: self.hot_hint.clone(),
             credit_freed: self.credit_freed.clone(),
+            credit_epoch: self.credit_epoch.clone(),
         })
     }
 
@@ -369,10 +379,16 @@ impl Accounting {
     /// one waiter, the one that has waited longest (`Notify::notify_one`
     /// is FIFO), not every fetch parked on the pool. A woken waiter that
     /// gets a reservation calls [`Accounting::pass_credit`] to wake the
-    /// next, since the credit may cover more than one chunk; one that
-    /// finds nothing goes back to waiting and wakes nobody. So a refill
-    /// admitting `k` chunks wakes `k + 1` waiters, not all of them. A
-    /// wake-up delivered while nobody waits is kept for the next waiter.
+    /// next, since the credit may cover more than one chunk. One that
+    /// can't use the credit (it's on a peer this waiter has no use for)
+    /// passes it on too, unless it already looked at the pool after that
+    /// release ([`Accounting::credit_epoch`] unchanged); since waiters
+    /// re-queue at the back, an unusable wake-up visits each waiter at
+    /// most once and then stops. A waiter whose wait ended on its timer
+    /// passes nothing. So a refill admitting `k` chunks wakes the
+    /// waiters up to the `k`-th one that can use it, plus one, not all
+    /// of them. A wake-up delivered while nobody waits is kept for the
+    /// next waiter.
     pub async fn wait_for_credit(&self, max: Duration) -> bool {
         tokio::time::timeout(max, self.credit_freed.notified())
             .await
@@ -384,6 +400,22 @@ impl Accounting {
     /// [`Accounting::wait_for_credit`].
     pub fn pass_credit(&self) {
         self.credit_freed.notify_one();
+    }
+
+    /// How many times credit has been released so far (pseudosettle
+    /// refreshes and unused reservations dropped). A woken waiter
+    /// compares it against the value it last saw to tell whether the
+    /// wake-up carries a release it hasn't looked at yet; see
+    /// [`Accounting::wait_for_credit`].
+    #[must_use]
+    pub fn credit_epoch(&self) -> u64 {
+        self.credit_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record a credit release and wake one waiter.
+    fn release_credit(epoch: &AtomicU64, notify: &Notify) {
+        epoch.fetch_add(1, Ordering::SeqCst);
+        notify.notify_one();
     }
 
     /// Credit a peer with the bee-side accepted refresh amount.
@@ -400,7 +432,7 @@ impl Accounting {
         entry.last_refresh = Some(Instant::now());
         drop(peers);
         if accepted > 0 {
-            self.credit_freed.notify_one();
+            Self::release_credit(&self.credit_epoch, &self.credit_freed);
         }
     }
 
@@ -458,6 +490,7 @@ pub struct DebitGuard {
     balances: SharedBalances,
     hot_hint: Option<mpsc::Sender<HotHint>>,
     credit_freed: Arc<Notify>,
+    credit_epoch: Arc<AtomicU64>,
 }
 
 impl DebitGuard {
@@ -515,7 +548,7 @@ impl Drop for DebitGuard {
         drop(peers);
         // The released reserve is credit a fetch waiting on this peer
         // can use now.
-        self.credit_freed.notify_one();
+        Accounting::release_credit(&self.credit_epoch, &self.credit_freed);
     }
 }
 

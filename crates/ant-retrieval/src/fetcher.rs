@@ -1194,6 +1194,47 @@ impl StdError for FetchExhausted {}
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.fetch_within(addr, CREDIT_WAIT_BUDGET).await
+    }
+
+    /// A speculative probe (a dispersed-replica candidate) never waits
+    /// for credit: on a starved pool it fails at once, as every fetch
+    /// did before issue #117.
+    async fn fetch_speculative(
+        &self,
+        addr: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.fetch_within(addr, Duration::ZERO).await
+    }
+
+    /// Store a locally-reconstructed chunk (RS-recovered data shard or a
+    /// root rebuilt from a dispersed replica) in the same cache tiers a
+    /// successful network fetch would land in, so subsequent fetches —
+    /// including retries of the same request — are served locally.
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        if let Some(cache) = self.cache.as_ref() {
+            cache.put(addr, wire.to_vec());
+        }
+        if let Some(disk) = self.disk_cache.as_ref() {
+            if let Err(e) = disk.put(addr, wire.to_vec()).await {
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    chunk = %hex::encode(addr),
+                    "disk cache write of recovered chunk failed: {e}",
+                );
+            }
+        }
+    }
+}
+
+impl RoutingFetcher {
+    /// [`ChunkFetcher::fetch`], waiting at most `credit_budget` in total
+    /// for credit while every candidate peer is overdraft-skipped.
+    async fn fetch_within(
+        &self,
+        addr: [u8; 32],
+        credit_budget: Duration,
+    ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
         if let Some(cache) = self.cache.as_ref() {
             if let Some(bytes) = cache.get(&addr) {
                 trace!(
@@ -1432,8 +1473,11 @@ impl ChunkFetcher for RoutingFetcher {
             None => {}
         }
         // Total time this fetch has spent waiting for credit, against
-        // `CREDIT_WAIT_BUDGET`.
+        // `credit_budget`.
         let mut credit_waited = Duration::ZERO;
+        // The credit-release count (`Accounting::credit_epoch`) this
+        // fetch last looked at the pool after; see the hand-off below.
+        let mut seen_epoch: Option<u64> = None;
 
         loop {
             // Loop exit when we've burned the error budget AND have
@@ -1463,7 +1507,7 @@ impl ChunkFetcher for RoutingFetcher {
                 let Some(acc) = self.accounting.as_ref() else {
                     break;
                 };
-                if !starved || credit_waited >= CREDIT_WAIT_BUDGET {
+                if !starved || credit_waited >= credit_budget {
                     break;
                 }
                 if credit_waited.is_zero() {
@@ -1475,15 +1519,40 @@ impl ChunkFetcher for RoutingFetcher {
                     );
                 }
                 let started = tokio::time::Instant::now();
-                acc.wait_for_credit(
-                    OVERDRAFT_REFRESH.min(CREDIT_WAIT_BUDGET.saturating_sub(credit_waited)),
-                )
-                .await;
+                let woken = acc
+                    .wait_for_credit(
+                        OVERDRAFT_REFRESH.min(credit_budget.saturating_sub(credit_waited)),
+                    )
+                    .await;
                 credit_waited += started.elapsed();
+                // Has credit been released since this fetch last looked?
+                // Read before `pick_next`, so a release racing the pick
+                // counts as unseen next time.
+                let epoch = acc.credit_epoch();
+                let unseen = seen_epoch != Some(epoch);
+                seen_epoch = Some(epoch);
                 // Every skip entry is due again: bee prunes them all
                 // before its retry, too.
                 overdraft_skip.clear();
-                if let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) {
+                let picked = pick_next(&asked, &mut overdraft_skip);
+                // Hand the wake-up on (one waiter, not all of them) only
+                // if this fetch was actually woken by it; one that woke
+                // on its own timer holds no wake-up to pass, and passing
+                // one would store a spurious permit for the next waiter.
+                //  - Got a reservation: the credit may cover more than
+                //    this chunk.
+                //  - Couldn't use it (the freed peer isn't one of our
+                //    candidates, or was already asked for this chunk):
+                //    someone behind us may be able to, so don't swallow
+                //    it. But only for a release we haven't looked at
+                //    yet: waiters re-queue at the back, so a wake-up
+                //    nobody can use goes round each waiter once and then
+                //    stops, instead of ping-ponging until the budget
+                //    runs out.
+                if woken && (picked.is_some() || unseen) {
+                    acc.pass_credit();
+                }
+                if let Some((peer, guard)) = picked {
                     trace!(
                         target: "ant_retrieval::fetcher",
                         %peer,
@@ -1491,9 +1560,6 @@ impl ChunkFetcher for RoutingFetcher {
                         waited_ms = credit_waited.as_millis() as u64,
                         "credit came free; dispatching",
                     );
-                    // The credit may cover more than this chunk: wake
-                    // the next waiter (one, not all of them).
-                    acc.pass_credit();
                     asked.push(peer);
                     in_flight.push(make_fut(peer, guard));
                     // The hedge timer ran down while we waited; don't
@@ -1669,7 +1735,7 @@ impl ChunkFetcher for RoutingFetcher {
             self.ranked(&addr).iter().any(|(p, _)| !asked.contains(p)),
             not_found_answers,
         );
-        if credit_waited >= CREDIT_WAIT_BUDGET {
+        if !credit_waited.is_zero() && credit_waited >= credit_budget {
             debug!(
                 target: "ant_retrieval::fetcher",
                 chunk = %hex::encode(addr),
@@ -1696,25 +1762,6 @@ impl ChunkFetcher for RoutingFetcher {
             message,
             pool_starved,
         }))
-    }
-
-    /// Store a locally-reconstructed chunk (RS-recovered data shard or a
-    /// root rebuilt from a dispersed replica) in the same cache tiers a
-    /// successful network fetch would land in, so subsequent fetches —
-    /// including retries of the same request — are served locally.
-    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
-        if let Some(cache) = self.cache.as_ref() {
-            cache.put(addr, wire.to_vec());
-        }
-        if let Some(disk) = self.disk_cache.as_ref() {
-            if let Err(e) = disk.put(addr, wire.to_vec()).await {
-                warn!(
-                    target: "ant_retrieval::fetcher",
-                    chunk = %hex::encode(addr),
-                    "disk cache write of recovered chunk failed: {e}",
-                );
-            }
-        }
     }
 }
 
@@ -2206,9 +2253,19 @@ mod tests {
     fn starved_fetcher(
         addr: [u8; 32],
     ) -> (RoutingFetcher, Arc<Accounting>, PeerId, Vec<DebitGuard>) {
+        let acc = Arc::new(Accounting::new());
+        let (fetcher, p, held) = starved_fetcher_on(acc.clone(), addr);
+        (fetcher, acc, p, held)
+    }
+
+    /// [`starved_fetcher`] over a caller-supplied (possibly shared)
+    /// [`Accounting`], with a fresh peer of its own.
+    fn starved_fetcher_on(
+        acc: Arc<Accounting>,
+        addr: [u8; 32],
+    ) -> (RoutingFetcher, PeerId, Vec<DebitGuard>) {
         let p = PeerId::random();
         let o = [0x80u8; 32];
-        let acc = Arc::new(Accounting::new());
         let price = Accounting::peer_price(&o, &addr);
         let mut held = Vec::new();
         while let Some(g) = acc.try_reserve(p, price) {
@@ -2217,8 +2274,77 @@ mod tests {
         assert!(!held.is_empty());
         let behaviour = libp2p_stream::Behaviour::default();
         let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
-            .with_accounting(acc.clone());
-        (fetcher, acc, p, held)
+            .with_accounting(acc);
+        (fetcher, p, held)
+    }
+
+    /// R1-F1 on PR #119: the dispersed-replica fallback after a starved
+    /// root fetch must not wait for credit on each of its ~30 probes.
+    /// The direct fetch waits its `CREDIT_WAIT_BUDGET`; the replica
+    /// probes are speculative and fail at once, so the whole root fetch
+    /// ends at the budget, not at ~50 s (8 waves × 10 s at fanout 4)
+    /// past the 30 s resolution budget.
+    #[tokio::test(start_paused = true)]
+    async fn starved_root_fetch_does_not_wait_per_replica() {
+        let addr = [0x44u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let started = tokio::time::Instant::now();
+        let err = crate::rs::fetch_root_with_replicas(&fetcher, addr)
+            .await
+            .expect_err("pool never refills");
+        let waited = started.elapsed();
+        assert!(
+            waited < CREDIT_WAIT_BUDGET + OVERDRAFT_REFRESH,
+            "root fetch with replica fallback took {waited:?}",
+        );
+        // The direct fetch's error is what the caller sees.
+        assert_eq!(err.to_string(), "no BZZ peers available");
+        let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+        assert!(typed.pool_starved);
+    }
+
+    /// `fetch_speculative` on a starved pool fails at once.
+    #[tokio::test(start_paused = true)]
+    async fn speculative_fetch_never_waits_for_credit() {
+        let addr = [0x55u8; 32];
+        let (fetcher, _acc, _p, _held) = starved_fetcher(addr);
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch_speculative(addr).await.expect_err("starved");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(err.to_string(), "no BZZ peers available");
+    }
+
+    /// R1-M2 on PR #119: a credit wake-up the oldest waiter can't use
+    /// (the credit is on a peer it has no use for) is handed on, not
+    /// swallowed: a later waiter that can use it dispatches at once
+    /// instead of sleeping out its `OVERDRAFT_REFRESH` timer.
+    #[tokio::test]
+    async fn unusable_credit_wake_up_is_passed_on() {
+        let addr = [0x66u8; 32];
+        let acc = Arc::new(Accounting::new());
+        // Oldest waiter: its only peer stays starved.
+        let (a, _pa, _held_a) = starved_fetcher_on(acc.clone(), addr);
+        let ha = tokio::spawn(async move { a.fetch(addr).await.map_err(|e| e.to_string()) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Younger waiter: its peer gets one chunk's credit back.
+        let (b, pb, mut held_b) = starved_fetcher_on(acc.clone(), addr);
+        let hb = tokio::spawn(async move { b.fetch(addr).await.map_err(|e| e.to_string()) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!ha.is_finished() && !hb.is_finished(), "both must wait");
+
+        // One release on `pb`: wakes the oldest waiter (`a`) first,
+        // which can't use it and must pass it on to `b`.
+        let before = acc.debug_snapshot(&pb).unwrap().1;
+        drop(held_b.pop());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (_, reserved) = acc.debug_snapshot(&pb).unwrap();
+        assert_eq!(
+            reserved, before,
+            "the younger waiter must have re-reserved the freed credit \
+             well before its 600 ms re-check",
+        );
+        ha.abort();
+        hb.abort();
     }
 
     /// Issue #117: when every candidate is overdraft-skipped the fetch

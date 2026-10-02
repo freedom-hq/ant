@@ -136,6 +136,25 @@ pub trait ChunkFetcher: Send + Sync {
     /// failure here as a fatal error for the file.
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
 
+    /// Like [`ChunkFetcher::fetch`], for a *speculative* probe whose
+    /// miss is expected and cheap to accept: the dispersed-replica
+    /// fallback in [`crate::rs::fetch_root_with_replicas`] fans out up
+    /// to 30 such probes after the direct root fetch failed.
+    ///
+    /// An implementation that would otherwise wait for peer credit when
+    /// its pool is overdraft-starved ([`crate::RoutingFetcher`], issue
+    /// #117) must fail at once here instead: 30 probes × a 10 s credit
+    /// wait at fanout 4 would hold a starved root fetch for ~50 s,
+    /// beyond the 30 s resolution budget, and the probes would spend
+    /// credit wake-ups that real data fetches are waiting for. Default
+    /// is plain `fetch`, right for every fetcher that never waits.
+    async fn fetch_speculative(
+        &self,
+        addr: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.fetch(addr).await
+    }
+
     /// Offer a chunk that was *reconstructed locally* (Reed-Solomon
     /// recovery of a missing data shard, or a root rebuilt from a
     /// dispersed replica) so the implementation can store it exactly

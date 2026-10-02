@@ -807,6 +807,22 @@ impl<'a> SniffedFetcher<'a> {
 #[async_trait::async_trait]
 impl ChunkFetcher for SniffedFetcher<'_> {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+        self.sniffed_fetch(addr, false).await
+    }
+
+    async fn fetch_speculative(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+        self.sniffed_fetch(addr, true).await
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.inner.put_recovered(addr, wire).await;
+    }
+}
+
+impl SniffedFetcher<'_> {
+    /// [`ChunkFetcher::fetch`] (or, for `speculative`, `fetch_speculative`)
+    /// through the sniff's record/replay.
+    async fn sniffed_fetch(&self, addr: [u8; 32], speculative: bool) -> Result<Vec<u8>, FetchErr> {
         let replaying = {
             let mut state = self.state.lock().expect("sniff state lock");
             if state.replaying {
@@ -820,7 +836,11 @@ impl ChunkFetcher for SniffedFetcher<'_> {
             }
             state.replaying
         };
-        let result = self.inner.fetch(addr).await;
+        let result = if speculative {
+            self.inner.fetch_speculative(addr).await
+        } else {
+            self.inner.fetch(addr).await
+        };
         if !replaying {
             let mut state = self.state.lock().expect("sniff state lock");
             match &result {
@@ -832,10 +852,6 @@ impl ChunkFetcher for SniffedFetcher<'_> {
             }
         }
         result
-    }
-
-    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
-        self.inner.put_recovered(addr, wire).await;
     }
 }
 

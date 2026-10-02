@@ -4951,13 +4951,15 @@ async fn run_stream_bytes(
     // addresses derivable from the root address alone.
     //
     // Retried within `RESOLUTION_RETRY_BUDGET`, like `/bzz`'s
-    // pre-stream phase, so a `/bytes` request that lands before the
-    // peer pool is up doesn't answer a fast 502 (issue #117). That
-    // includes an empty peer set (a fresh node, or its only peer just
-    // dropped): unlike `/bzz`, which fails at once there, `/bytes` waits
-    // it out and only then reports `no peers available`. A miss peers
-    // confirmed (`not found` from an unstarved fetch) is final, so a
-    // missing reference still 404s as quickly as before.
+    // pre-stream phase, so a `/bytes` request that lands while the
+    // peer pool is still cold doesn't answer a fast 502 (issue #117).
+    // A peer set that is empty *at dispatch* never gets here: the
+    // `ControlCommand::StreamBytes` arm answers `no peers available` at
+    // once, as `/bzz` does. The empty-set branch below covers a pool
+    // that empties after dispatch (its only peer just dropped): `/bytes`
+    // waits that out and only then reports `no peers available`. A
+    // miss peers confirmed (`not found` from an unstarved fetch) is
+    // final, so a missing reference still 404s as quickly as before.
     let resolution_started = Instant::now();
     let mut attempt = 0usize;
     let root = loop {
