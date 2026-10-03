@@ -4065,6 +4065,17 @@ new joiner drives:
   32 in flight gives ~128 successful refreshes per second — enough
   to cycle a 100-peer warm set every ~0.8 s.
 
+Superseded by issue #129: the driver now follows bee's dialer rules.
+It refreshes a peer only at bee's settle trigger
+(`Accounting::refresh_due`), one refresh per peer at a time,
+`MIN_REFRESH_INTERVAL = 1 s` after the previous one *completed*. A
+refresh starts only with a free in-flight slot, most indebted peer
+first, and a failed peer is backed off 1 → 16 s. Refreshing every
+peer every 1.1 s from dispatch had sent zero-accepted refreshes,
+which restart bee's allowance clock. It had also let refreshes
+overlap and queue behind the slot cap, so they went out late to
+closed connections.
+
 ### G.4 The ghost-overdraw discovery (why `HEDGE_DELAY = 4 s`)
 
 The first pass of the new fetcher used a 1 s preemptive ticker

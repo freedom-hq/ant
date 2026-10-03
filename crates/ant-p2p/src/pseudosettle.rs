@@ -62,15 +62,14 @@
 //!    refresh amount, reads the `PaymentAck`. Returns the accepted amount
 //!    and the bee-side timestamp, or an error on stream / framing failure.
 //!
-//! 3. **Driver task** ([`run_driver`]). A background tokio task. The
-//!    fetcher hot path notifies it of every peer we successfully fetched a
-//!    chunk from via an mpsc channel (bounded; drops on backpressure).
-//!    The driver tracks the last refresh time per peer and, every
-//!    [`REFRESH_TICK`], walks the active set and dispatches a
-//!    [`refresh_peer`] for any peer whose elapsed time since last refresh
-//!    is at least [`MIN_REFRESH_INTERVAL`]. Refreshes run concurrently on
-//!    spawned tasks but are bounded by [`MAX_INFLIGHT_REFRESHES`] so a
-//!    burst of new peers can't starve the libp2p control of stream slots.
+//! 3. **Driver task** ([`run_driver`]). A background tokio task that
+//!    follows bee's dialer rules (`Accounting.settle`, `pseudosettle.Pay`):
+//!    it refreshes a peer only when the accounting mirror says we owe it
+//!    enough to be worth it ([`Accounting::refresh_due`]), one refresh per
+//!    peer at a time, [`MIN_REFRESH_INTERVAL`] after the previous one
+//!    completed, bounded by [`MAX_INFLIGHT_REFRESHES`] with no queue behind
+//!    the bound, and backs off after a failure. See [`run_driver`] for why
+//!    each rule matters (issue #129).
 
 use crate::sinks::{HEADERS_MAX, STREAM_TIMEOUT};
 use ant_retrieval::accounting::{Accounting, HotHint};
@@ -99,31 +98,41 @@ pub const PROTOCOL_PSEUDOSETTLE: &str = "/swarm/pseudosettle/1.0.0/pseudosettle"
 /// clamp to the actual elapsed.
 pub const LIGHT_REFRESH_RATE_UNITS_PER_SEC: u64 = 450_000;
 
-/// How often [`run_driver`] wakes to scan active peers. Bee's per-peer
-/// allowance grows at `LIGHT_REFRESH_RATE_UNITS_PER_SEC` per second,
-/// but hot peers may need a refresh sooner than that — so we tick at
-/// 100 ms and rely on the per-peer `MIN_REFRESH_INTERVAL` to keep us
-/// from spamming refreshes faster than bee will accept them.
-///
-/// The 100 ms cadence lets a `HotHint` from the fetcher (fired when
-/// a peer's mirrored debt crosses [`crate::accounting::HOT_DEBT_THRESHOLD`])
-/// land on the next tick instead of waiting up to a full second for
-/// the periodic walk. That closes the gap to bee's settlement
-/// reactivity, where bee's `pkg/accounting/accounting.go::settle()`
-/// fires `RefreshFunc` synchronously from `PrepareCredit` /
-/// `creditAction.Apply` — i.e. zero scheduling latency between the
-/// debt build-up and the refresh attempt.
+/// How often [`run_driver`] wakes to start the refreshes that are due.
+/// Bee settles synchronously from `PrepareCredit` / `creditAction.Apply`
+/// (`pkg/accounting/accounting.go::settle()`), the moment a debit takes
+/// the debt past its trigger; the 100 ms tick keeps our scheduling
+/// latency to the same order. A `HotHint` from the mirror (fired when a
+/// peer's debt crosses [`ant_retrieval::accounting::HOT_DEBT_THRESHOLD`])
+/// registers the peer with the driver; whether a refresh is due is read
+/// from the mirror on the tick.
 const REFRESH_TICK: Duration = Duration::from_millis(100);
 
-/// Minimum spacing between successive pseudosettle calls to the same peer.
-/// Bee's `peerAllowance` clamps the accepted amount to
-/// `lightRefreshRate * (now - lastTimestamp_seconds)`, with second-level
-/// granularity, so settling more often than once a second is wasted
-/// effort: bee will accept `0` for the in-second second call.
-/// 1 s is the floor; gateway-scale streaming bumps a hot peer's debt
-/// at 100k+ units/s, and the available `lightRefreshRate` (450k units/s)
-/// can keep up only if we collect every wall-clock second's allowance.
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(1100);
+/// Minimum spacing between the *completion* of one pseudosettle to a
+/// peer and the start of the next (bee's dialer waits until "last
+/// refreshment finished at least 1000 milliseconds ago",
+/// `Accounting.settle`). Bee answers with its Unix second `T` and refuses
+/// a second refresh in the same second (`peerAllowance`:
+/// `ErrSettlementTooSoon`, stream reset). Starting a full second after
+/// the ack arrived means the next request reaches bee after `T + 1`
+/// whatever the latency, so it is never refused for being too soon.
+/// Measuring from dispatch instead (as before issue #129) let a slow
+/// refresh and the next one land in the same second.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Back-off before retrying a peer whose refresh failed, doubled per
+/// consecutive failure up to [`MAX_FAILED_REFRESH_BACKOFF`]. Measured on
+/// mainnet (issue #129), a failure is almost always a connection that is
+/// closing or that bee no longer serves: bee resets every stream on a
+/// connection it hasn't registered, e.g. after our reconnect raced its
+/// teardown of the old one (`peers.addIfNotExists` → "peer already
+/// exists"). Retrying such a peer every second only adds failures. Bee
+/// itself disconnects a peer whose refresh failed
+/// (`NotifyRefreshmentSent`: blocklist for 1 s).
+const FAILED_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Cap on the [`FAILED_REFRESH_BACKOFF`] doubling.
+const MAX_FAILED_REFRESH_BACKOFF: Duration = Duration::from_secs(16);
 
 /// Maximum window we ever ask bee to clear in a single pseudosettle.
 /// Mostly cosmetic — bee clamps internally — but keeps the wire amount
@@ -135,10 +144,10 @@ const MAX_REFRESH_WINDOW_SECS: u64 = 60;
 /// libp2p stream and waits up to [`STREAM_TIMEOUT`] for the round trip,
 /// so a hard cap protects the libp2p control's stream queue from a
 /// gateway burst that touches hundreds of new peers in a few seconds.
-/// Sized to keep up with a 100-peer warm set settling every
-/// [`MIN_REFRESH_INTERVAL`]: at ~250 ms RTT/refresh, 32 in flight gives
-/// us ~128 successful refreshes per second — enough to maintain a
-/// 1.1 s cadence on every hot peer simultaneously.
+/// At ~250 ms RTT/refresh, 32 in flight gives ~128 refreshes per second,
+/// enough for every indebted peer of a 100-peer set once a second. A due
+/// refresh that finds no free slot waits for the next tick (most indebted
+/// peer first) rather than queueing behind the cap.
 const MAX_INFLIGHT_REFRESHES: usize = 32;
 
 /// Bound on the "I just fetched from X" channel into the driver. Drops
@@ -394,24 +403,77 @@ async fn drain_inbound(mut stream: Stream) -> std::io::Result<()> {
 }
 
 /// Per-peer state held by the driver. Tracking the last refresh
-/// success at all means we can space refreshes correctly even when the
+/// at all means we can space refreshes correctly even when the
 /// fetcher streams hundreds of "I just used peer X" notifications in
 /// quick succession.
 #[derive(Debug, Clone, Copy)]
 struct PeerState {
-    /// When `run_driver` last attempted a refresh for this peer. Used to
-    /// avoid hammering bee with same-second pseudosettles
-    /// (`ErrSettlementTooSoon`).
-    last_refresh: Option<Instant>,
-    /// Last time the fetcher said it succeeded with this peer. Drives
-    /// pruning: peers we haven't used in a while drop out of the active
-    /// set and stop generating refresh attempts.
+    /// A refresh to this peer is in flight (bee's `refreshOngoing`): at
+    /// most one at a time, so two can't reach bee in the same second.
+    in_flight: bool,
+    /// Earliest time the next refresh may start: [`MIN_REFRESH_INTERVAL`]
+    /// after the previous one *completed* (bee's
+    /// `refreshTimestampMilliseconds`, set when the refresh concludes),
+    /// or the failure back-off.
+    next_at: Option<Instant>,
+    /// Consecutive failed refreshes, for the [`FAILED_REFRESH_BACKOFF`]
+    /// doubling. Reset by any answered refresh.
+    failures: u32,
+    /// Last time the fetcher said it succeeded with this peer (or the
+    /// mirror said we owe it). Drives pruning: peers we haven't used in a
+    /// while drop out of the active set once they leave the routing set.
     last_used: Instant,
-    /// Set when a [`HotHint`] arrives. Hot peers are processed before
-    /// the regular periodic walk on the next tick. Cleared once a
-    /// refresh dispatch fires for the peer (whether it's accepted by
-    /// bee or not — the hint is one-shot).
-    hot: bool,
+}
+
+impl PeerState {
+    fn new(now: Instant) -> Self {
+        Self {
+            in_flight: false,
+            next_at: None,
+            failures: 0,
+            last_used: now,
+        }
+    }
+
+    /// Whether a refresh may start now. `debt` is what the accounting
+    /// mirror says a refresh would clear when one is due by debt
+    /// ([`Accounting::refresh_due`]), `None` when it isn't; with no
+    /// mirror attached (`has_mirror == false`) every notified peer is
+    /// refreshed on the interval, as before the mirror existed.
+    fn due(&self, now: Instant, has_mirror: bool, debt: Option<u64>) -> bool {
+        !self.in_flight
+            && self.next_at.is_none_or(|at| now >= at)
+            && (!has_mirror || debt.is_some())
+    }
+
+    /// Record the end of a refresh: the next one may start
+    /// [`MIN_REFRESH_INTERVAL`] from now, or after the back-off when it
+    /// failed.
+    fn finish(&mut self, now: Instant, answered: bool) {
+        self.in_flight = false;
+        if answered {
+            self.failures = 0;
+            self.next_at = Some(now + MIN_REFRESH_INTERVAL);
+        } else {
+            self.failures = self.failures.saturating_add(1);
+            let backoff = FAILED_REFRESH_BACKOFF
+                .saturating_mul(1 << (self.failures - 1).min(4))
+                .min(MAX_FAILED_REFRESH_BACKOFF);
+            self.next_at = Some(now + backoff);
+        }
+    }
+}
+
+/// Outcome of one dispatched refresh, reported back to the driver loop.
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    /// Bee answered with a `PaymentAck` for this many units.
+    Accepted(u64),
+    /// The stream failed before an ack (open, headers, reset — bee resets
+    /// the stream on a refusal such as `ErrSettlementTooSoon`).
+    Failed,
+    /// No ack within [`STREAM_TIMEOUT`].
+    TimedOut,
 }
 
 /// Aggregate counters surfaced periodically by the driver so an
@@ -419,34 +481,101 @@ struct PeerState {
 /// per-peer trace logging. Cumulative since process start.
 #[derive(Debug, Default, Clone, Copy)]
 struct DriverMetrics {
-    /// Refresh round trips that bee accepted (any non-error reply,
-    /// including `accepted = 0` when our debt was already zero).
-    ok: u64,
-    /// Refreshes that bee acknowledged with a non-zero `accepted`.
-    /// Useful as a cheap signal of "pseudosettle is actually clearing
-    /// debt, not just `NAKing`".
-    ok_nonzero: u64,
-    /// Sum of `accepted` units across all successful round trips.
+    /// Refreshes bee acknowledged with a non-zero amount.
+    accepted: u64,
+    /// Refreshes bee acknowledged with zero: it saw no debt to clear.
+    /// (Bee's refusals proper, such as `ErrSettlementTooSoon`, reset the
+    /// stream and count as `failed`.)
+    accepted_zero: u64,
+    /// Sum of `accepted` units across all acknowledged refreshes.
     units_accepted: u128,
     /// Refreshes that errored before reaching a `PaymentAck` — most
-    /// commonly because the peer disconnected between notify and dial.
+    /// commonly because the peer disconnected, or bee reset the stream.
     failed: u64,
     /// Refreshes that hit [`STREAM_TIMEOUT`] before completing.
     timed_out: u64,
 }
 
+impl DriverMetrics {
+    fn record(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Accepted(0) => self.accepted_zero += 1,
+            Outcome::Accepted(units) => {
+                self.accepted += 1;
+                self.units_accepted = self.units_accepted.saturating_add(u128::from(units));
+            }
+            Outcome::Failed => self.failed += 1,
+            Outcome::TimedOut => self.timed_out += 1,
+        }
+    }
+
+    fn attempts(&self) -> u64 {
+        self.accepted + self.accepted_zero + self.failed + self.timed_out
+    }
+}
+
+/// Pick the refreshes to start this tick, most indebted peer first, at
+/// most `permits` of them, and mark them in flight. A peer that is due
+/// but doesn't get a permit stays due and is reconsidered on the next
+/// tick; nothing queues behind the in-flight cap, so a refresh never
+/// starts late against a peer that has gone or a debt that has changed.
+fn pick_refreshes(
+    state: &mut HashMap<PeerId, PeerState>,
+    live: &HashSet<PeerId>,
+    debts: &HashMap<PeerId, u64>,
+    has_mirror: bool,
+    now: Instant,
+    permits: usize,
+) -> Vec<PeerId> {
+    let mut due: Vec<(u64, PeerId)> = state
+        .iter()
+        .filter(|(peer, s)| {
+            live.contains(*peer) && s.due(now, has_mirror, debts.get(*peer).copied())
+        })
+        .map(|(peer, _)| (debts.get(peer).copied().unwrap_or(0), *peer))
+        .collect();
+    due.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    due.truncate(permits);
+    due.into_iter()
+        .map(|(_, peer)| {
+            if let Some(s) = state.get_mut(&peer) {
+                s.in_flight = true;
+            }
+            peer
+        })
+        .collect()
+}
+
 /// Run the driver loop forever. Reads from `notify_rx` (peers we've
-/// just fetched chunks from) and periodically (every [`REFRESH_TICK`])
-/// dispatches a [`refresh_peer`] to any peer whose last refresh is
-/// older than [`MIN_REFRESH_INTERVAL`].
+/// just fetched chunks from) and `hot_rx` (peers whose mirrored debt
+/// crossed the hot threshold), and every [`REFRESH_TICK`] starts a
+/// [`refresh_peer`] for each peer a refresh is due to.
+///
+/// The rules are bee's dialer side (`Accounting.settle`,
+/// `pseudosettle.Pay`):
+///
+/// - **Only when owed.** With the accounting mirror attached, a refresh
+///   is due only once the mirror's debt to the peer reaches bee's settle
+///   trigger ([`Accounting::refresh_due`]). Bee answers a refresh with
+///   `min(asked, elapsed × lightRefreshRate, our debt)` and restarts the
+///   peer's allowance clock even when that is zero, so refreshing a peer
+///   we owe nothing wastes a stream and the allowance it had built up.
+/// - **One at a time, a second apart.** At most one refresh per peer is
+///   in flight, and the next starts [`MIN_REFRESH_INTERVAL`] after the
+///   previous one completed. Bee refuses a second refresh within the
+///   same Unix second (`ErrSettlementTooSoon`) by resetting the stream.
+/// - **No backlog.** A refresh starts only with a free in-flight permit
+///   ([`MAX_INFLIGHT_REFRESHES`]); the most indebted due peers go first,
+///   the rest wait for the next tick instead of queueing.
+/// - **Back off after a failure** ([`FAILED_REFRESH_BACKOFF`], doubling),
+///   so a connection bee no longer serves isn't hit every second.
 ///
 /// `peers_rx` carries the routing-table snapshot — the peers we've
 /// completed the BZZ handshake with and can actually open substreams
 /// to. The driver consults it every tick and skips refreshes for
 /// peers that are no longer in the snapshot, so long-lived gateway
 /// load (where the routing set churns through thousands of peers per
-/// hour) doesn't burn the whole `MAX_INFLIGHT_REFRESHES` budget on
-/// `no addresses for peer` errors.
+/// hour) doesn't spend refreshes on `no addresses for peer` errors.
 pub async fn run_driver(
     control: Control,
     mut notify_rx: mpsc::Receiver<PeerId>,
@@ -456,10 +585,11 @@ pub async fn run_driver(
 ) {
     let mut state: HashMap<PeerId, PeerState> = HashMap::new();
     let semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_REFRESHES));
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(PeerId, Outcome)>();
     let mut tick = tokio::time::interval(REFRESH_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let metrics = Arc::new(std::sync::Mutex::new(DriverMetrics::default()));
+    let mut metrics = DriverMetrics::default();
     // Log a summary roughly once per minute. At ~1 refresh / peer / 2 s
     // and ~150 active peers during a busy fetch, this is ~4500 events
     // per summary — granular enough to spot a regression, sparse enough
@@ -468,74 +598,55 @@ pub async fn run_driver(
     let mut last_summary = Instant::now();
     let mut last_metrics = DriverMetrics::default();
 
+    let touch = |state: &mut HashMap<PeerId, PeerState>, peer: PeerId, now: Instant| {
+        state
+            .entry(peer)
+            .and_modify(|s| s.last_used = now)
+            .or_insert_with(|| PeerState::new(now));
+    };
+
     loop {
         tokio::select! {
             biased;
+            Some((peer, outcome)) = done_rx.recv() => {
+                metrics.record(outcome);
+                let now = Instant::now();
+                if let Some(s) = state.get_mut(&peer) {
+                    s.finish(now, matches!(outcome, Outcome::Accepted(_)));
+                }
+            }
             recv = notify_rx.recv() => {
                 let Some(peer) = recv else {
                     debug!(target: "ant_p2p::pseudosettle", "notify channel closed; driver exiting");
                     return;
                 };
-                let now = Instant::now();
-                state
-                    .entry(peer)
-                    .and_modify(|s| s.last_used = now)
-                    .or_insert(PeerState {
-                        last_refresh: None,
-                        last_used: now,
-                        hot: false,
-                    });
+                touch(&mut state, peer, Instant::now());
             }
-            recv = hot_rx.recv() => {
-                let Some(hint) = recv else {
-                    // Hot channel closed but notify channel might still be live;
-                    // keep running on time-driven refreshes only.
-                    continue;
-                };
-                let now = Instant::now();
-                state
-                    .entry(hint.peer)
-                    .and_modify(|s| {
-                        s.last_used = now;
-                        s.hot = true;
-                    })
-                    .or_insert(PeerState {
-                        last_refresh: None,
-                        last_used: now,
-                        hot: true,
-                    });
+            Some(hint) = hot_rx.recv() => {
+                // A hot hint only says "this peer's debt just went up";
+                // whether a refresh is due is read from the mirror on the
+                // next tick (at most `REFRESH_TICK` away).
+                touch(&mut state, hint.peer, Instant::now());
             }
             _ = tick.tick() => {
                 let now = Instant::now();
-                // Drain the notify queue opportunistically — if the
-                // fetcher is hot and the receive future above keeps
+                // Drain the notify queues opportunistically — if the
+                // fetcher is hot and the receive futures above keep
                 // losing the select race, this catches up so we don't
                 // starve out new peers indefinitely.
                 while let Ok(peer) = notify_rx.try_recv() {
-                    state
-                        .entry(peer)
-                        .and_modify(|s| s.last_used = now)
-                        .or_insert(PeerState {
-                            last_refresh: None,
-                            last_used: now,
-                            hot: false,
-                        });
+                    touch(&mut state, peer, now);
                 }
-                // Same opportunistic drain for hot hints, so a burst
-                // of crossings between two ticks all set the hot flag
-                // before the dispatch walk consults it.
                 while let Ok(hint) = hot_rx.try_recv() {
-                    state
-                        .entry(hint.peer)
-                        .and_modify(|s| {
-                            s.last_used = now;
-                            s.hot = true;
-                        })
-                        .or_insert(PeerState {
-                            last_refresh: None,
-                            last_used: now,
-                            hot: true,
-                        });
+                    touch(&mut state, hint.peer, now);
+                }
+                // What the mirror says is owed, per peer, right now.
+                let debts = accounting
+                    .as_ref()
+                    .map(|acc| acc.refresh_due())
+                    .unwrap_or_default();
+                for peer in debts.keys() {
+                    touch(&mut state, *peer, now);
                 }
                 // Snapshot the live routing set once per tick. Reading
                 // the watch is cheap (Arc clone of the inner Vec), and
@@ -548,15 +659,20 @@ pub async fn run_driver(
                     .collect();
 
                 // Drop peers we haven't seen on the routing watch for
-                // a tick. Without this filter the gateway-style load
+                // a while. Without this filter the gateway-style load
                 // (BZZ-streaming a big file pulls chunks from peers
                 // that subsequently disconnect) leaves thousands of
-                // stale entries that never refresh successfully and
-                // starve the live ones out of the in-flight budget.
+                // stale entries. A refresh in flight keeps its entry
+                // until it reports back.
                 state.retain(|peer, s| {
-                    if live.contains(peer) {
+                    if live.contains(peer) || s.in_flight {
                         return true;
                     }
+                    // Off the routing set: if it comes back, it's a new
+                    // connection, which bee serves afresh, so the failure
+                    // back-off doesn't carry over (the interval does).
+                    s.failures = 0;
+                    s.next_at = s.next_at.map(|at| at.min(now + MIN_REFRESH_INTERVAL));
                     // Brief grace period so a peer that flapped the
                     // connection between the fetcher's notify and
                     // this tick still gets one shot at a refresh —
@@ -565,61 +681,36 @@ pub async fn run_driver(
                     now.duration_since(s.last_used) < Duration::from_secs(5)
                 });
 
-                // Walk active peers and dispatch refreshes for those
-                // that are past `MIN_REFRESH_INTERVAL`. Hot peers
-                // (those whose mirrored debt crossed
-                // `HOT_DEBT_THRESHOLD` since the last tick) go first
-                // so a burst of saturation events doesn't queue
-                // behind unrelated low-debt peers in the
-                // `HashMap` iteration order.
-                //
-                // Spawn detached tasks gated by the semaphore: a
-                // refresh that takes a long time mustn't stall the
-                // driver's tick.
-                let mut walk: Vec<PeerId> = state.keys().copied().collect();
-                walk.sort_by_key(|p| {
-                    state
-                        .get(p)
-                        .map_or(1, |s| u8::from(!s.hot))
-                });
-                for peer in walk {
-                    if !live.contains(&peer) {
-                        continue;
-                    }
-                    let Some(s) = state.get_mut(&peer) else {
+                let picked = pick_refreshes(
+                    &mut state,
+                    &live,
+                    &debts,
+                    accounting.is_some(),
+                    now,
+                    semaphore.available_permits(),
+                );
+                for peer in picked {
+                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                        // Can't happen (we picked at most the free
+                        // permits and nothing else takes them); undo.
+                        if let Some(s) = state.get_mut(&peer) {
+                            s.in_flight = false;
+                        }
                         continue;
                     };
-                    let due = match s.last_refresh {
-                        None => true,
-                        Some(last) => now.duration_since(last) >= MIN_REFRESH_INTERVAL,
-                    };
-                    if !due {
-                        continue;
-                    }
-                    s.last_refresh = Some(now);
-                    s.hot = false;
                     let mut control = control.clone();
-                    let sem = semaphore.clone();
-                    let metrics = metrics.clone();
                     let accounting = accounting.clone();
+                    let done_tx = done_tx.clone();
                     tokio::spawn(async move {
-                        let Ok(_permit) = sem.acquire_owned().await else {
-                            return;
-                        };
+                        let _permit = permit;
                         let result = tokio::time::timeout(
                             STREAM_TIMEOUT,
                             refresh_peer(&mut control, peer),
                         )
                         .await;
-                        let mut m = metrics.lock().expect("metrics mutex poisoned");
-                        match result {
+                        let outcome = match result {
                             Ok(Ok(ok)) => {
-                                m.ok += 1;
                                 if ok.accepted > 0 {
-                                    m.ok_nonzero += 1;
-                                    m.units_accepted = m
-                                        .units_accepted
-                                        .saturating_add(u128::from(ok.accepted));
                                     if let Some(acc) = accounting.as_ref() {
                                         acc.credit(peer, ok.accepted);
                                     }
@@ -631,25 +722,27 @@ pub async fn run_driver(
                                     timestamp = ok.timestamp,
                                     "refresh ok",
                                 );
+                                Outcome::Accepted(ok.accepted)
                             }
                             Ok(Err(e)) => {
-                                m.failed += 1;
                                 debug!(
                                     target: "ant_p2p::pseudosettle",
                                     %peer,
                                     "refresh failed: {e}",
                                 );
+                                Outcome::Failed
                             }
                             Err(_) => {
-                                m.timed_out += 1;
                                 debug!(
                                     target: "ant_p2p::pseudosettle",
                                     %peer,
                                     "refresh timed out after {}s",
                                     STREAM_TIMEOUT.as_secs(),
                                 );
+                                Outcome::TimedOut
                             }
-                        }
+                        };
+                        let _ = done_tx.send((peer, outcome));
                     });
                 }
 
@@ -657,20 +750,19 @@ pub async fn run_driver(
                 // something this window, otherwise an idle daemon would
                 // fill its log with empty status lines.
                 if now.duration_since(last_summary) >= summary_every {
-                    let snap = *metrics.lock().expect("metrics mutex poisoned");
-                    let delta_ok = snap.ok.saturating_sub(last_metrics.ok);
-                    let delta_failed = snap.failed.saturating_sub(last_metrics.failed);
-                    let delta_timed_out = snap.timed_out.saturating_sub(last_metrics.timed_out);
+                    let snap = metrics;
+                    let delta = |f: fn(&DriverMetrics) -> u64| f(&snap).saturating_sub(f(&last_metrics));
                     let delta_units = snap
                         .units_accepted
                         .saturating_sub(last_metrics.units_accepted);
-                    if delta_ok + delta_failed + delta_timed_out > 0 {
+                    if snap.attempts() > last_metrics.attempts() {
                         info!(
                             target: "ant_p2p::pseudosettle",
                             active_peers = state.len(),
-                            ok = delta_ok,
-                            failed = delta_failed,
-                            timed_out = delta_timed_out,
+                            accepted = delta(|m| m.accepted),
+                            accepted_zero = delta(|m| m.accepted_zero),
+                            failed = delta(|m| m.failed),
+                            timed_out = delta(|m| m.timed_out),
                             units_accepted = delta_units as u64,
                             "refresh summary (last {}s)",
                             summary_every.as_secs(),
@@ -710,6 +802,313 @@ mod tests {
                 assert!(bytes.is_empty(), "zero must encode empty");
             }
         }
+    }
+
+    use libp2p::swarm::SwarmEvent;
+    use libp2p::{noise, tcp, yamux, Multiaddr, Swarm, SwarmBuilder};
+    use std::sync::Mutex;
+
+    /// Bee's pseudosettle listener (`pseudosettle.go::handler`) reduced to
+    /// what the driver can observe: it accepts
+    /// `min(asked, (now − last) × lightRefreshRate, debt)` with `now` in
+    /// Unix seconds, refuses a second refresh in the same second by
+    /// resetting the stream (`ErrSettlementTooSoon`), and restarts its
+    /// allowance clock on every refresh it answers, zero included.
+    #[derive(Default)]
+    struct FakeBee {
+        /// What bee thinks we owe it.
+        debt: u64,
+        /// Unix second of the last answered refresh (0: never).
+        last_ts: u64,
+        /// Amount of every answered refresh, in order.
+        acks: Vec<u64>,
+        /// Refreshes refused for arriving in the same second.
+        too_soon: u32,
+        /// Streams opened to it.
+        streams: u32,
+        in_flight: u32,
+        max_in_flight: u32,
+        /// Reset every stream before the headers (a connection bee hasn't
+        /// registered: `overlay address for peer not found`).
+        reset_all: bool,
+        /// Delay before answering the headers (a slow peer).
+        delay: Duration,
+    }
+
+    fn unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    async fn serve_fake_bee(mut stream: Stream, bee: Arc<Mutex<FakeBee>>) {
+        let (reset_all, delay) = {
+            let mut b = bee.lock().unwrap();
+            b.streams += 1;
+            b.in_flight += 1;
+            b.max_in_flight = b.max_in_flight.max(b.in_flight);
+            (b.reset_all, b.delay)
+        };
+        let done = |bee: &Arc<Mutex<FakeBee>>| bee.lock().unwrap().in_flight -= 1;
+        if reset_all {
+            done(&bee);
+            return; // dropped: the dialer sees the stream end
+        }
+        tokio::time::sleep(delay).await;
+        if read_delimited(&mut stream, HEADERS_MAX).await.is_err()
+            || write_empty_headers(&mut stream).await.is_err()
+        {
+            done(&bee);
+            return;
+        }
+        let Ok(raw) = read_delimited(&mut stream, 256).await else {
+            done(&bee);
+            return;
+        };
+        let asked = parse_be_u64(&PaymentPb::decode(raw.as_slice()).unwrap().amount).unwrap();
+        let ack = {
+            let mut b = bee.lock().unwrap();
+            let now = unix_secs();
+            if now == b.last_ts {
+                b.too_soon += 1;
+                None
+            } else {
+                let allowance = now
+                    .saturating_sub(b.last_ts)
+                    .saturating_mul(LIGHT_REFRESH_RATE_UNITS_PER_SEC);
+                let accepted = asked.min(allowance).min(b.debt);
+                b.debt -= accepted;
+                b.last_ts = now;
+                b.acks.push(accepted);
+                Some(PaymentAckPb {
+                    amount: big_int_be_bytes(accepted),
+                    timestamp: now as i64,
+                })
+            }
+        };
+        if let Some(ack) = ack {
+            let _ = write_delimited(&mut stream, &ack).await;
+            let _ = stream.close().await;
+        }
+        done(&bee);
+    }
+
+    fn stream_swarm() -> Swarm<libp2p_stream::Behaviour> {
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::default())
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build()
+    }
+
+    /// A fake bee peer connected to a node running the real [`run_driver`],
+    /// wired as `behaviour.rs` wires it: the accounting mirror's hot hints
+    /// feed the driver. Returns the mirror, the bee's peer id and state.
+    async fn driver_against_fake_bee(
+        bee: FakeBee,
+    ) -> (Arc<Accounting>, PeerId, Arc<Mutex<FakeBee>>) {
+        let bee = Arc::new(Mutex::new(bee));
+        let mut bee_swarm = stream_swarm();
+        let bee_peer = *bee_swarm.local_peer_id();
+        let mut incoming = bee_swarm
+            .behaviour()
+            .new_control()
+            .accept(StreamProtocol::new(PROTOCOL_PSEUDOSETTLE))
+            .unwrap();
+        bee_swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = bee_swarm.select_next_some().await {
+                break address;
+            }
+        };
+        tokio::spawn(async move {
+            loop {
+                bee_swarm.select_next_some().await;
+            }
+        });
+        let served = bee.clone();
+        tokio::spawn(async move {
+            while let Some((_, stream)) = incoming.next().await {
+                tokio::spawn(serve_fake_bee(stream, served.clone()));
+            }
+        });
+
+        let mut node = stream_swarm();
+        let control = node.behaviour().new_control();
+        node.dial(addr).unwrap();
+        loop {
+            if let SwarmEvent::ConnectionEstablished { .. } = node.select_next_some().await {
+                break;
+            }
+        }
+        tokio::spawn(async move {
+            loop {
+                node.select_next_some().await;
+            }
+        });
+
+        let (_notify_tx, notify_rx) = mpsc::channel(NOTIFY_CHANNEL_CAP);
+        let (hot_tx, hot_rx) = mpsc::channel(HOT_HINT_CHANNEL_CAP);
+        let accounting = Arc::new(Accounting::new().with_hot_hint(hot_tx));
+        let mirror = accounting.clone();
+        let (peers_tx, peers_rx) = watch::channel(vec![(bee_peer, [0u8; 32])]);
+        tokio::spawn(async move {
+            run_driver(control, notify_rx, hot_rx, peers_rx, Some(accounting)).await;
+            drop((_notify_tx, peers_tx));
+        });
+        (mirror, bee_peer, bee)
+    }
+
+    /// Issue #129: a refresh only when the mirror says we owe the peer,
+    /// one at a time. On `main` the driver refreshed every tracked peer
+    /// every 1.1 s from dispatch, owed or not: against a slow peer two
+    /// refreshes overlapped, and once the debt was paid every further
+    /// refresh was answered with zero (and restarted bee's allowance
+    /// clock). Here the one debt is cleared by one refresh and nothing
+    /// else is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refreshes_only_what_is_owed_one_at_a_time() {
+        let bee = FakeBee {
+            debt: 1_200_000,
+            delay: Duration::from_millis(1_500),
+            ..FakeBee::default()
+        };
+        let (accounting, bee_peer, bee) = driver_against_fake_bee(bee).await;
+        accounting.debit(bee_peer, 1_200_000);
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let b = bee.lock().unwrap();
+        assert_eq!(b.max_in_flight, 1, "refreshes to one peer overlapped");
+        assert_eq!(b.too_soon, 0, "a refresh was refused as too soon");
+        assert_eq!(b.acks, vec![1_200_000], "refreshes answered: {:?}", b.acks);
+        assert_eq!(accounting.debug_snapshot(&bee_peer), Some((0, 0)));
+    }
+
+    /// Issue #129: a failing peer is backed off, not hit every 1.1 s.
+    /// Bee resets every stream on a connection it hasn't registered;
+    /// `main` kept refreshing such a peer every 1.1 s (5–6 attempts in
+    /// 6.5 s). Doubling from 1 s, the driver tries at ~0, 1, 3 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_refreshes_back_off() {
+        let bee = FakeBee {
+            reset_all: true,
+            ..FakeBee::default()
+        };
+        let (accounting, bee_peer, bee) = driver_against_fake_bee(bee).await;
+        accounting.debit(bee_peer, 1_200_000);
+
+        tokio::time::sleep(Duration::from_millis(6_500)).await;
+        let streams = bee.lock().unwrap().streams;
+        assert!(
+            (2..=4).contains(&streams),
+            "{streams} refresh attempts on a failing peer in 6.5 s"
+        );
+    }
+
+    /// The bee rules don't starve a steadily indebted peer: debt growing
+    /// at 1 M units/s (faster than the 450 k/s refresh rate) is refreshed
+    /// every second, never refused as too soon, never answered with zero,
+    /// and the refresh keeps up with bee's allowance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_debt_is_refreshed_every_second() {
+        let (accounting, bee_peer, bee) = driver_against_fake_bee(FakeBee::default()).await;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            bee.lock().unwrap().debt += 100_000;
+            accounting.debit(bee_peer, 100_000);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let b = bee.lock().unwrap();
+        assert_eq!(b.too_soon, 0, "a refresh was refused as too soon");
+        assert!(
+            !b.acks.contains(&0),
+            "a refresh was answered with zero: {:?}",
+            b.acks
+        );
+        assert!(
+            b.acks.len() >= 3,
+            "only {} refreshes in 5 s: {:?}",
+            b.acks.len(),
+            b.acks
+        );
+        // First refresh: bee's clock starts at 0, so the whole debt;
+        // then up to one or two seconds of allowance each.
+        let accepted: u64 = b.acks.iter().sum();
+        assert!(
+            accepted >= 2_500_000,
+            "accepted {accepted} of ~5 M: {:?}",
+            b.acks
+        );
+    }
+
+    #[test]
+    fn peer_state_spaces_from_completion_and_backs_off() {
+        let t0 = Instant::now();
+        let mut s = PeerState::new(t0);
+        assert!(s.due(t0, true, Some(1)));
+        assert!(!s.due(t0, true, None), "nothing owed, nothing due");
+        assert!(s.due(t0, false, None), "without a mirror: on the interval");
+        s.in_flight = true;
+        assert!(
+            !s.due(t0 + Duration::from_secs(5), true, Some(1)),
+            "one at a time"
+        );
+        // Completed 2 s after it started: the next one is a second after
+        // the completion, not after the start.
+        let done = t0 + Duration::from_secs(2);
+        s.finish(done, true);
+        assert!(!s.due(done + Duration::from_millis(999), true, Some(1)));
+        assert!(s.due(done + MIN_REFRESH_INTERVAL, true, Some(1)));
+        // Failures double the back-off up to the cap; an answer resets it.
+        let mut at = done;
+        for expect in [1, 2, 4, 8, 16, 16] {
+            s.finish(at, false);
+            let wait = Duration::from_secs(expect);
+            assert!(!s.due(at + wait - Duration::from_millis(1), true, Some(1)));
+            assert!(s.due(at + wait, true, Some(1)));
+            at += wait;
+        }
+        s.finish(at, true);
+        assert!(s.due(at + MIN_REFRESH_INTERVAL, true, Some(1)));
+    }
+
+    #[test]
+    fn picks_most_indebted_live_due_peers_up_to_the_free_permits() {
+        let now = Instant::now();
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        let mut state: HashMap<PeerId, PeerState> =
+            peers.iter().map(|p| (*p, PeerState::new(now))).collect();
+        let live: HashSet<PeerId> = peers[..3].iter().copied().collect();
+        let debts: HashMap<PeerId, u64> = [
+            (peers[0], 500_000),
+            (peers[1], 900_000),
+            (peers[3], 2_000_000), // not live
+        ]
+        .into_iter()
+        .collect();
+        // peers[2] is live but owes nothing.
+        assert_eq!(
+            pick_refreshes(&mut state, &live, &debts, true, now, 1),
+            vec![peers[1]]
+        );
+        assert!(state[&peers[1]].in_flight);
+        assert_eq!(
+            pick_refreshes(&mut state, &live, &debts, true, now, 8),
+            vec![peers[0]],
+            "in-flight and nothing-owed peers are skipped"
+        );
+        assert!(pick_refreshes(&mut state, &live, &debts, true, now, 8).is_empty());
     }
 
     #[test]
