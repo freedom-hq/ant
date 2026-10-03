@@ -189,8 +189,11 @@ pub trait ChunkFetcher: Send + Sync {
 /// `fetch` and `put_recovered`, and leaves
 /// [`ChunkFetcher::fetch_waiting_for_credit`] at the trait default
 /// (plain `fetch`). Wrap a fetcher in it before handing it to a joiner on
-/// a path that must stay non-waiting (manifest walks, traversal, ACT;
-/// see [`accounting::CREDIT_WAIT_BUDGET`]).
+/// a path that must stay non-waiting: the encrypted joiner (including an
+/// encrypted manifest node's join, even inside the `/bzz` walk, whose
+/// plain node loads do wait), traversal, ACT; see
+/// [`accounting::CREDIT_WAIT_BUDGET`]. Manifest walks outside `/bzz`
+/// don't need it — they use the non-waiting [`mantaray::lookup_path`].
 pub struct NoCreditWait<'a>(pub &'a dyn ChunkFetcher);
 
 #[async_trait]

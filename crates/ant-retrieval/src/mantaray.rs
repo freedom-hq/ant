@@ -272,7 +272,11 @@ pub async fn lookup_path(
 /// runs at a time, so together they wait no longer than what is left of
 /// the window, and a caller that shares one window across its retries
 /// and its other waiting fetches (the `/bzz` resolution loop) can't
-/// stack waits past it. Everything else stays non-waiting, as in
+/// stack waits past it. One attempt can wait more than once: on each
+/// starved node of the literal walk, and again when a starved node in
+/// the directory-redirect check falls through and the index-document
+/// retry loads the same node — but all of it comes out of the same
+/// window. Everything else stays non-waiting, as in
 /// [`lookup_path`]: the fallback join of a multi-chunk node, feed
 /// probes, and the decrypting join of an encrypted node.
 pub async fn lookup_path_with_credit(
