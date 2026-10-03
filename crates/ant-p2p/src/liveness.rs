@@ -199,6 +199,15 @@ impl Liveness {
             || self.suspect_since.is_some_and(|s| proof < s)
     }
 
+    /// Did a suspected network change ([`Self::suspect_network`] or a loop
+    /// stall) happen at or after `at`? Then something begun at `at` (a
+    /// dial) ran on the network as it was before the change, and its
+    /// failure says nothing about the remote side, even if the link has
+    /// been proven again since.
+    pub(crate) fn suspected_since(&self, at: Instant) -> bool {
+        self.suspect_since.is_some_and(|s| at <= s)
+    }
+
     /// The swarm was asked to close `conn`; see [`Conn::closing`].
     pub(crate) fn on_closing(&mut self, conn: ConnectionId) {
         if let Some(c) = self.conns.get_mut(&conn) {

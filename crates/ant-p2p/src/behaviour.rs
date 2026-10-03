@@ -775,6 +775,11 @@ struct SwarmState {
     dialing: HashSet<PeerId>,
     /// Wall time when `dialing.insert` happened (outbound dials only).
     dial_started: HashMap<PeerId, Instant>,
+    /// Tracked dials (subset of `dial_started`'s keys) that started while
+    /// our own connectivity was down ([`SwarmState::own_connectivity_down`]).
+    /// Their failure is never charged to the peer, even when it only
+    /// arrives (OS SYN timeout, ~75-127 s) after the link is proven again.
+    dial_started_unproven: HashSet<PeerId>,
     /// A representative dial address for `antctl` (first hint / bootnode multiaddr).
     dial_hint_addr: HashMap<PeerId, Multiaddr>,
     /// `disconnect_peer_id` was called; connection not fully torn down yet.
@@ -1056,6 +1061,7 @@ impl SwarmState {
         Self {
             dialing: HashSet::new(),
             dial_started: HashMap::new(),
+            dial_started_unproven: HashSet::new(),
             dial_hint_addr: HashMap::new(),
             closing: HashSet::new(),
             failed: Vec::new(),
@@ -1321,6 +1327,18 @@ impl SwarmState {
         self.bzz_peers.is_empty() || self.liveness.network_unproven(Instant::now())
     }
 
+    /// Record that we just started a tracked outbound dial to `peer`, and
+    /// whether our own link was down at that moment (see
+    /// [`note_outgoing_dial_error`]).
+    fn note_dial_started(&mut self, peer: PeerId) {
+        self.dial_started.insert(peer, Instant::now());
+        if self.own_connectivity_down() {
+            self.dial_started_unproven.insert(peer);
+        } else {
+            self.dial_started_unproven.remove(&peer);
+        }
+    }
+
     /// Clear the hint dedup and re-queue every peerstore entry. With
     /// `clear_backoff`, also forget those peers' [`DialBackoff`] so the
     /// re-warm actually redials them now instead of skipping every
@@ -1449,19 +1467,35 @@ impl SwarmState {
 /// from. The cost is that a genuinely dead peer isn't charged for the
 /// attempts that fail during a cold start, or after a `Resume` before any
 /// connection has answered again.
+///
+/// A tracked dial is judged by the link's state when it *started* as well:
+/// one begun while connectivity was down, or before a later suspected
+/// network change (`Resume`, self-heal, loop stall), isn't charged even if
+/// its failure arrives after the link is proven again.
 fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p: PeerId) {
     // `dial_started` is set by the two paths that *we* drive
     // (bootstrap_dial, fill_pipeline_from_hints). Any other
     // outbound dial — e.g. a libp2p-internal redial or a stray
     // address book attempt — would otherwise pollute the
     // pipeline with `Failed` rows the operator never asked for.
-    let was_tracked = state.dial_started.remove(&p).is_some();
+    let started = state.dial_started.remove(&p);
+    let started_unproven = state.dial_started_unproven.remove(&p);
+    let was_tracked = started.is_some();
     state.dialing.remove(&p);
     state.dial_hint_addr.remove(&p);
     if was_tracked {
         record_swarm_failure(state, p);
     }
-    if state.own_connectivity_down() {
+    // Judge the link both now and as it was when the dial started: a SYN
+    // sent during the zombie / post-`Resume` window (or before a later
+    // suspected network change) only fails after the OS SYN timeout
+    // (~75 s iOS, ~127 s Linux; the swarm sets no dial timeout), by which
+    // time a new link may already have answered a ping. That failure is
+    // still about our old link, not the peer.
+    if state.own_connectivity_down()
+        || started_unproven
+        || started.is_some_and(|t| state.liveness.suspected_since(t))
+    {
         return;
     }
     if was_tracked {
@@ -7327,7 +7361,7 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.dial_started.insert(peer_id, Instant::now());
+                state.note_dial_started(peer_id);
                 state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
@@ -7419,7 +7453,7 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.dial_started.insert(peer_id, Instant::now());
+                state.note_dial_started(peer_id);
                 state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
@@ -7660,7 +7694,7 @@ fn maybe_balance_bins(
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.dial_started.insert(peer_id, Instant::now());
+                state.note_dial_started(peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
@@ -7764,6 +7798,7 @@ fn handle_swarm_event(
                 .dial_started
                 .remove(&peer_id)
                 .map(|t| t.elapsed().as_millis() as u64);
+            state.dial_started_unproven.remove(&peer_id);
             state.pending.insert(
                 peer_id,
                 PendingPhase::AwaitingIdentify {
@@ -8604,7 +8639,7 @@ fn handle_bootnode_dial(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState,
     match swarm.dial(opts) {
         Ok(()) => {
             state.dialing.insert(peer);
-            state.dial_started.insert(peer, Instant::now());
+            state.note_dial_started(peer);
             state.failed.retain(|f| f.peer != peer);
             state.dial_hint_addr.insert(peer, addr);
             info!(target: "ant_p2p", peer=%peer, "dialing bootnode");
@@ -9741,7 +9776,7 @@ mod tests {
     /// `OutgoingConnectionError` arm calls (backoff + peerstore).
     fn fail_tracked_dial(state: &mut SwarmState, peerstore: &mut PeerStore, peer: PeerId) {
         state.dialing.insert(peer);
-        state.dial_started.insert(peer, Instant::now());
+        state.note_dial_started(peer);
         note_outgoing_dial_error(state, peerstore, peer);
     }
 
@@ -9918,6 +9953,67 @@ mod tests {
         }
         assert!(state.dial_backed_off(&other));
         assert!(!peerstore.contains(&other), "a dead peer is still evicted");
+    }
+
+    /// A dial fired during the zombie / post-`Resume` window often fails
+    /// only after the OS SYN timeout (~75-127 s), by which time the new
+    /// link has long answered a ping. Its failure is still about our old
+    /// link: no backoff, no peerstore strike. Same for a dial started on a
+    /// proven link just before a `Resume`. Dials started once the link is
+    /// proven again are charged as usual.
+    #[tokio::test]
+    async fn late_dial_failures_judged_by_link_state_at_dial_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (early, before_resume, after_proof) = (pid(), pid(), pid());
+        let mut peerstore = peerstore_with(dir.path(), &[early, before_resume, after_proof]);
+        let mut state = backoff_test_state();
+        let local = pid();
+        let (tx, _rx) = mpsc::channel::<Multiaddr>(8);
+
+        // Proven link; a dial starts, then the host resumes after a
+        // handover before that dial resolves.
+        let live = connect_answering(&mut state, pid());
+        state.dialing.insert(before_resume);
+        state.note_dial_started(before_resume);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let mut backoff = MAX_BACKOFF;
+        let (mut last_bootstrap_at, mut last_top_up_at) = (Instant::now(), Instant::now());
+        force_resume(
+            &[],
+            &mut state,
+            &peerstore,
+            &mut backoff,
+            &mut last_bootstrap_at,
+            &mut last_top_up_at,
+            local,
+            &tx,
+        );
+        // Re-warm dial fired while the link is unproven.
+        state.dialing.insert(early);
+        state.note_dial_started(early);
+
+        // The new link answers; only afterwards do the stale SYNs time out.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        state.liveness.on_pong(live, Instant::now());
+        assert!(!state.own_connectivity_down());
+        for p in [early, before_resume] {
+            note_outgoing_dial_error(&mut state, &mut peerstore, p);
+            assert!(!state.dial_backed_off(&p), "late failure not backed off");
+        }
+        assert!(state.dial_started_unproven.is_empty());
+        // No strikes either: four more charged failures would evict after
+        // MAX_FAIL_COUNT (5) only if the stale one had counted.
+        for _ in 0..4 {
+            fail_tracked_dial(&mut state, &mut peerstore, early);
+        }
+        assert!(
+            peerstore.contains(&early),
+            "the stale failure must not count toward eviction"
+        );
+
+        // A dial started on the proven link is charged as before.
+        fail_tracked_dial(&mut state, &mut peerstore, after_proof);
+        assert!(state.dial_backed_off(&after_proof));
     }
 
     /// A backed-off hint popped by the fill loop must not be discarded
