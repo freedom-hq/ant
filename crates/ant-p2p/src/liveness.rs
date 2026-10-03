@@ -22,6 +22,12 @@
 //! * the ping handler's own failure report (two consecutive failed pings)
 //!   closes the connection at once.
 //!
+//! A close on a dead link finishes within `bounded_close::CLOSE_TIMEOUT`
+//! even when unsent data fills the socket's send buffer (the muxer's
+//! graceful flush is abandoned then), so `ConnectionClosed` and its peer
+//! teardown follow the close by at most that long. A connection being
+//! closed counts as stale and is closed only once.
+//!
 //! **Freezes.** After the process was frozen (iOS / Android background
 //! suspension), every pong is old, live sockets included: the pings that
 //! would have refreshed them never ran. [`Liveness::tick`] notices the swarm
@@ -94,6 +100,12 @@ struct Conn {
     /// The remote doesn't speak `/ipfs/ping/1.0.0`: we can't judge it,
     /// so it is always counted and never closed by this module.
     ping_unsupported: bool,
+    /// We already asked the swarm to close it; its `ConnectionClosed` is
+    /// pending (bounded by `bounded_close::CLOSE_TIMEOUT`). Not named
+    /// again by [`Liveness::dead_connections`] /
+    /// [`Liveness::stale_connections`], so the pass doesn't re-issue the
+    /// close every 500 ms.
+    closing: bool,
 }
 
 /// Per-connection ping bookkeeping, owned by the swarm loop.
@@ -125,6 +137,7 @@ impl Liveness {
                 peer,
                 last_ok: now,
                 ping_unsupported: false,
+                closing: false,
             },
         );
     }
@@ -136,6 +149,13 @@ impl Liveness {
     pub(crate) fn on_pong(&mut self, conn: ConnectionId, now: Instant) {
         if let Some(c) = self.conns.get_mut(&conn) {
             c.last_ok = now;
+        }
+    }
+
+    /// The swarm was asked to close `conn`; see [`Conn::closing`].
+    pub(crate) fn on_closing(&mut self, conn: ConnectionId) {
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.closing = true;
         }
     }
 
@@ -174,7 +194,7 @@ impl Liveness {
     }
 
     fn is_live(&self, c: &Conn, now: Instant) -> bool {
-        self.deadline(c).is_none_or(|d| now <= d)
+        !c.closing && self.deadline(c).is_none_or(|d| now <= d)
     }
 
     /// Peers with at least one connection and no live one. These are not
@@ -198,8 +218,10 @@ impl Liveness {
         self.conns
             .iter()
             .filter(|(_, c)| {
-                self.deadline(c)
-                    .is_some_and(|d| now > d + self.cfg.close_grace)
+                !c.closing
+                    && self
+                        .deadline(c)
+                        .is_some_and(|d| now > d + self.cfg.close_grace)
             })
             .map(|(id, c)| (*id, c.peer))
             .collect()
@@ -211,7 +233,7 @@ impl Liveness {
     pub(crate) fn stale_connections(&self, now: Instant) -> Vec<(ConnectionId, PeerId)> {
         self.conns
             .iter()
-            .filter(|(_, c)| !self.is_live(c, now))
+            .filter(|(_, c)| !c.closing && !self.is_live(c, now))
             .map(|(id, c)| (*id, c.peer))
             .collect()
     }
@@ -294,6 +316,21 @@ mod tests {
         // `a` keeps answering and is fine on the normal window again.
         l.on_pong(conn(1), dead_at);
         assert!(!l.stale_peers(dead_at).contains(&a));
+    }
+
+    #[test]
+    fn a_closing_connection_is_named_once() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(CFG, t0);
+        let a = PeerId::random();
+        l.on_established(conn(1), a, t0);
+        let now = t0 + CFG.live_window + CFG.close_grace + Duration::from_secs(1);
+        assert_eq!(l.dead_connections(now), vec![(conn(1), a)]);
+        l.on_closing(conn(1));
+        assert_eq!(l.dead_connections(now), vec![]);
+        assert_eq!(l.stale_connections(now), vec![]);
+        // Still uncounted until `ConnectionClosed` removes it.
+        assert_eq!(l.stale_peers(now), HashSet::from([a]));
     }
 
     #[test]

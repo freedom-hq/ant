@@ -1,5 +1,6 @@
 //! Tokio libp2p swarm: dial bootnodes, open `/swarm/handshake/14.0.0/handshake` via `libp2p_stream`, Identify + Ping.
 
+use crate::bounded_close::BoundedClose;
 use crate::dial::endpoint_host;
 use crate::dnsaddr;
 use crate::handshake::{
@@ -25,6 +26,8 @@ use ant_retrieval::{ChunkFetcher, ProgressTracker, RetrievalCounters, DEFAULT_CA
 use futures::StreamExt;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::Transport as _;
 use libp2p::identify;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
@@ -7813,7 +7816,9 @@ fn handle_ping_event(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, ev
                 peer = %ev.peer,
                 "closing dead connection: two pings in a row failed ({e})",
             );
-            swarm.close_connection(ev.connection);
+            if swarm.close_connection(ev.connection) {
+                state.liveness.on_closing(ev.connection);
+            }
         }
     }
 }
@@ -7856,7 +7861,9 @@ fn maintain_liveness(
         state.retrieval_counters.reset_link_failure_streak();
         let stale = state.liveness.stale_connections(now);
         for (conn, _) in &stale {
-            swarm.close_connection(*conn);
+            if swarm.close_connection(*conn) {
+                state.liveness.on_closing(*conn);
+            }
         }
         info!(
             target: "ant_p2p",
@@ -7879,9 +7886,15 @@ fn maintain_liveness(
 }
 
 /// Close every connection [`Liveness::dead_connections`] names.
-fn close_dead_connections(swarm: &mut Swarm<AntBehaviour>, state: &SwarmState, now: Instant) {
+///
+/// Each is closed once: `close_connection` only *starts* the close, and
+/// the connection stays in the swarm until the muxer's close finishes
+/// (bounded by [`crate::bounded_close::CLOSE_TIMEOUT`]), so the
+/// connection is marked closing rather than named again next pass.
+fn close_dead_connections(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, now: Instant) {
     for (conn, peer) in state.liveness.dead_connections(now) {
         if swarm.close_connection(conn) {
+            state.liveness.on_closing(conn);
             info!(
                 target: "ant_p2p",
                 %peer,
@@ -8538,11 +8551,19 @@ fn build_swarm(
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
+        // What `.with_tcp(tcp::Config::default(), noise::Config::new,
+        // yamux::Config::default)` builds, plus `BoundedClose` around the
+        // muxer: a close on a dead link must not wait ~15 min for the
+        // kernel before `ConnectionClosed` fires (issue #83).
+        .with_other_transport(|key| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                tcp::tokio::Transport::new(tcp::Config::default())
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(noise::Config::new(key)?)
+                    .multiplex(yamux::Config::default())
+                    .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(BoundedClose::new(muxer)))),
+            )
+        })
         .map_err(|e| std::io::Error::other(format!("tcp/noise/yamux: {e}")))?
         .with_dns_config(resolver_config(), dns::ResolverOpts::default())
         .with_behaviour(|_| behaviour)
@@ -8690,7 +8711,29 @@ mod tests {
     /// its timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frozen_peer_is_uncounted_then_disconnected() {
+        frozen_peer_scenario(0, Duration::ZERO).await;
+    }
+
+    /// Issue #83, PR #133 R1-F1: the same, with uploads in flight when
+    /// the link dies — enough of them to fill the TCP send buffer. A
+    /// graceful yamux close then can't flush, and without
+    /// `BoundedClose` `ConnectionClosed` (and the peer teardown hanging
+    /// off it) waited for the kernel's ETIMEDOUT (~15 min); the liveness
+    /// pass re-issued the close every pass meanwhile. Now the close gives
+    /// up after `CLOSE_TIMEOUT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn frozen_peer_with_a_full_send_buffer_is_still_disconnected() {
+        frozen_peer_scenario(64, crate::bounded_close::CLOSE_TIMEOUT).await;
+    }
+
+    /// Drive [`frozen_peer_is_uncounted_then_disconnected`]'s scenario.
+    /// With `streams > 0`, that many streams to the remote are opened
+    /// while it answers and each writes 1 MiB once the link is frozen;
+    /// `extra_close` is the extra time the close may then take.
+    async fn frozen_peer_scenario(streams: usize, extra_close: Duration) {
+        use futures::AsyncWriteExt as _;
         let cfg = FAST_LIVENESS;
+        let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
         // Remote: a plain node of ours on loopback, frozen on demand.
         let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
         remote
@@ -8701,6 +8744,21 @@ mod tests {
                 break address;
             }
         };
+        // The remote drains every stream it is offered (until the freeze
+        // stops anything reaching it).
+        let mut incoming = remote
+            .behaviour()
+            .stream
+            .new_control()
+            .accept(proto.clone())
+            .unwrap();
+        tokio::spawn(async move {
+            while let Some((_, mut s)) = incoming.next().await {
+                tokio::spawn(async move {
+                    let _ = futures::io::copy(&mut s, &mut futures::io::sink()).await;
+                });
+            }
+        });
         tokio::spawn(async move {
             loop {
                 remote.select_next_some().await;
@@ -8731,18 +8789,23 @@ mod tests {
 
         let started = Instant::now();
         let mut established_at = None;
+        let mut remote_peer = None;
+        let mut opened = Vec::new();
         let mut frozen_at = None;
         let mut uncounted_at = None;
         let mut pass = tokio::time::interval(Duration::from_millis(50));
         let closed_at = loop {
             assert!(
-                started.elapsed() < Duration::from_secs(20),
+                started.elapsed() < Duration::from_secs(20) + extra_close,
                 "frozen peer never disconnected (frozen {:?} ago)",
                 frozen_at.map(|t: Instant| t.elapsed()),
             );
             tokio::select! {
                 ev = ours.select_next_some() => {
                     let established = matches!(ev, SwarmEvent::ConnectionEstablished { .. });
+                    if let SwarmEvent::ConnectionEstablished { peer_id, .. } = &ev {
+                        remote_peer = Some(*peer_id);
+                    }
                     let closed = matches!(ev, SwarmEvent::ConnectionClosed { .. });
                     observe_event(Some(&status_tx), &mut agents, &ev);
                     handle_swarm_event(
@@ -8751,6 +8814,14 @@ mod tests {
                     );
                     if established {
                         established_at = Some(Instant::now());
+                        let peer = remote_peer.unwrap();
+                        for _ in 0..streams {
+                            let mut c = control.clone();
+                            let proto = proto.clone();
+                            opened.push(tokio::spawn(async move {
+                                c.open_stream(peer, proto).await.unwrap()
+                            }));
+                        }
                     }
                     if closed {
                         break Instant::now();
@@ -8771,8 +8842,19 @@ mod tests {
                             assert_eq!((listed, counted), (1, 1), "a live peer is counted");
                             // Answering for 3 whole windows: kept open.
                             if t.elapsed() > 3 * (cfg.live_window + cfg.close_grace) {
+                                let mut ready = Vec::new();
+                                for o in opened.drain(..) {
+                                    ready.push(o.await.unwrap());
+                                }
                                 freeze.store(true, std::sync::atomic::Ordering::SeqCst);
                                 frozen_at = Some(Instant::now());
+                                // Uploads in flight on the dead link.
+                                for mut st in ready {
+                                    tokio::spawn(async move {
+                                        let _ = st.write_all(&vec![0u8; 1 << 20]).await;
+                                        std::future::pending::<()>().await;
+                                    });
+                                }
                             }
                         }
                     } else if listed == 1 && counted == 0 && uncounted_at.is_none() {
@@ -8793,7 +8875,7 @@ mod tests {
             uncounted_at - frozen_at
         );
         assert!(
-            closed_at - frozen_at <= cfg.live_window + cfg.close_grace + slack,
+            closed_at - frozen_at <= cfg.live_window + cfg.close_grace + extra_close + slack,
             "{:?}",
             closed_at - frozen_at,
         );
