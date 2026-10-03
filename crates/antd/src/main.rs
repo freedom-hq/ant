@@ -258,13 +258,12 @@ struct Opt {
 
     /// 20-byte chequebook contract address (`0x` + 40 hex). When set
     /// alongside `--swap-key`, the daemon enables outbound SWAP
-    /// settlement (Phase 7b): every successful pushsync push accrues
-    /// debt against the receiver's beneficiary EOA, and an EIP-712
-    /// cheque is emitted automatically once the per-peer debt crosses
-    /// `LIGHT_PAYMENT_THRESHOLD / 2` (≈ 675 K PLUR). Required for
-    /// sustained uploads — without it pushsync stalls after a few
-    /// hundred chunks per peer (bee paymentTolerance). Falls back to
-    /// `CHEQUEBOOK_ADDRESS` env. The chequebook's on-chain
+    /// settlement: pushsync and retrieval debt share one balance per
+    /// peer, as in bee, and once it reaches half the peer's payment
+    /// threshold (after the free pseudosettle refresh) an EIP-712 cheque
+    /// worth `units × exchange + deduction` at bee's oracle rate pays it,
+    /// while `--swap-enable` is on and the chequebook has funds. Falls
+    /// back to `CHEQUEBOOK_ADDRESS` env. The chequebook's on-chain
     /// `issuer()` view must return the EOA derived from `--swap-key`.
     #[arg(long)]
     chequebook: Option<String>,
@@ -315,14 +314,58 @@ struct Opt {
     /// zero) deposit rather than a failed transfer. Default 0.001 xBZZ,
     /// shared with `ant-ffi`
     /// (`ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`).
-    /// Ignored for a manually supplied chequebook. Falls back to
-    /// `CHEQUEBOOK_DEPOSIT_PLUR` env.
+    /// Ignored for a manually supplied chequebook. A host adds more on
+    /// demand with `POST /v0/settlement/deposit?amount=<PLUR>`. Falls
+    /// back to `CHEQUEBOOK_DEPOSIT_PLUR` env.
     #[arg(
         long,
         env = "CHEQUEBOOK_DEPOSIT_PLUR",
         default_value_t = ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR
     )]
     chequebook_deposit_plur: u128,
+
+    /// SWAP settlement on or off for the node: bee's `swap-enable`
+    /// (also read from the `--config` file's `swap-enable` key; the flag
+    /// wins). On (the default), downloads (issue #121) and uploads
+    /// (issue #127) pay peers with SWAP cheques from the chequebook once
+    /// the debt to a peer reaches half its payment threshold, after the
+    /// free pseudosettle refresh, as bee does: one balance per peer,
+    /// cheques worth `units × exchange + deduction` at bee's oracle rate
+    /// (about 0.75 xBZZ per fully paid GB), never more than the
+    /// chequebook holds. That lifts downloads past the free tier's ~5-6
+    /// Mbit/s ceiling. Needs a funded chequebook and a Gnosis RPC to read
+    /// its balance; without them it does nothing. `false` keeps both on
+    /// the free tier even with a funded chequebook. The default differs
+    /// from bee's, which is `false` (`cmd/bee/cmd/cmd.go`): a bee config
+    /// that leaves the key out pays here, so set `swap-enable: false` to
+    /// match it. Also readable and settable at runtime over the API
+    /// (`GET`/`PUT /v0/settlement/swap`). Falls back to
+    /// `ANT_SWAP_ENABLE` env.
+    #[arg(
+        long = "swap-enable",
+        env = "ANT_SWAP_ENABLE",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_name = "BOOL"
+    )]
+    swap_enable: bool,
+
+    /// Confirm the outstanding liability of a chequebook (`0x…`) whose
+    /// cheque figures were lost with an unparseable outbound ledger, and
+    /// let the node pay cheques from it again, for downloads and uploads
+    /// alike. While the ledger's `.lost` marker names a loss, the node pays
+    /// no cheques (downloads or uploads) from any chequebook that used
+    /// the file (the node logs it, and `/chequebook/balance` reports
+    /// `chequeLedgerLost`). Confirming accepts that peers paid before the
+    /// loss hold cheques the node can't see: they may refuse new cheques,
+    /// and disconnect the node, until its restarted cumulatives pass what
+    /// they hold. An unparseable marker is replaced by one confirming only
+    /// this chequebook (every other one stays lost), so it never has to be
+    /// deleted by hand. A chequebook deployed after the loss, and one whose
+    /// ledger was open when the file was lost, need no confirmation.
+    /// Repeatable; applied at start, before the node runs.
+    #[arg(long = "confirm-cheque-liability", value_name = "CHEQUEBOOK")]
+    confirm_cheque_liability: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +418,9 @@ async fn main() -> Result<()> {
     let _instance_lock = acquire_instance_lock(&data_dir.join("antd.lock"))?;
 
     raise_nofile_soft_limit();
+
+    // Under the instance lock, before the node opens the ledger.
+    confirm_cheque_liabilities(&data_dir, &opt.confirm_cheque_liability)?;
 
     let id_path = data_dir.join("identity.json");
     let key_path = opt
@@ -476,6 +522,7 @@ async fn main() -> Result<()> {
         // real value as soon as it starts, and flips it to `true` when
         // the `LateChainInit` lands.
         chain_ready: false,
+        settlement: ant_control::SettlementInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -685,6 +732,7 @@ async fn main() -> Result<()> {
             .with_disk_cache(disk_cache)
             .with_swap(Some(swap_cfg))
             .with_upload_manager(Some(upload_manager))
+            .with_swap_enabled(opt.swap_enable)
             .with_late_chain(Some(late_chain_rx)),
     ));
 
@@ -825,12 +873,16 @@ async fn main() -> Result<()> {
     // Capacity-1 channel and a single send: this never blocks. A send
     // error means the node loop already exited — its JoinHandle in the
     // select below will surface the reason.
+    let settling_on = pushsync_swap_cfg.as_ref().map(|c| c.chequebook);
     let _ = late_chain_tx
         .send(ant_node::LateChainInit {
             upload,
             pushsync_swap: pushsync_swap_cfg,
         })
         .await;
+    if let Some(chequebook) = settling_on {
+        spawn_retrieval_funds_watch(&opt, chequebook, cmd_tx.clone());
+    }
 
     // Chain context for the gateway's wallet / chequebook / status /
     // chainstate endpoints (PLAN.md J.5 A2/A3/D1/D2). Built only when a
@@ -1267,6 +1319,11 @@ fn apply_config_file(
         if !from_cli("log_level") {
             if let Some(level) = cfg.log_level() {
                 opt.log_level = level;
+            }
+        }
+        if !from_cli("swap_enable") {
+            if let Some(on) = cfg.swap_enable {
+                opt.swap_enable = on;
             }
         }
     }
@@ -2073,6 +2130,15 @@ async fn resolve_chequebook(
     wallet.note_deploy_attempt(&deployed);
     match deployed {
         Ok(cb) => {
+            // Brand new, so it has issued no cheques: a lost outbound
+            // ledger on record doesn't apply to it (PR #126 R1-M3).
+            if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
+                tracing::warn!(
+                    target: "antd",
+                    "can't record the new chequebook in the lost-ledger marker: {e}; \
+                     downloads and uploads stay on the free tier until confirmed",
+                );
+            }
             // Freshly factory-deployed, so it's registered by construction
             // — skip the redundant `deployedContracts` round-trip.
             let pushsync = ant_p2p::PushsyncSwapConfig::new(
@@ -2491,6 +2557,7 @@ impl SettlementOnBuy {
                 _ => {}
             }
         }
+        stop_retrieval_funds_watch(chequebook);
         self.refuse_in_gateway(chequebook);
     }
 
@@ -2620,6 +2687,7 @@ impl SettlementOnBuy {
                     chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
                     "outbound SWAP settlement enabled after a stamp buy — pushsync will emit cheques",
                 );
+                spawn_retrieval_funds_watch(&self.opt, cfg.chequebook, self.commands.clone());
                 Some(Settlement::of(&self.opt, Some(&cfg)))
             }
             Ok(ControlAck::Error { message }) => {
@@ -2632,6 +2700,119 @@ impl SettlementOnBuy {
             _ => None,
         }
     }
+}
+
+/// Apply `--confirm-cheque-liability`: clear the lost-figures state of
+/// each named chequebook in the data dir's outbound ledger (see
+/// `ant_p2p::swap::confirm_cheque_liability`). Fails on a malformed
+/// address or a marker it can't update, so a typo isn't mistaken for a
+/// confirmation.
+fn confirm_cheque_liabilities(data_dir: &Path, chequebooks: &[String]) -> Result<()> {
+    let ledger = data_dir.join("pushsync_outbound.json");
+    for raw in chequebooks {
+        let mut chequebook = [0u8; 20];
+        hex::decode_to_slice(raw.trim().trim_start_matches("0x"), &mut chequebook).with_context(
+            || format!("--confirm-cheque-liability {raw:?}: not a 20-byte address"),
+        )?;
+        let cleared = ant_p2p::swap::confirm_cheque_liability(&ledger, chequebook)
+            .with_context(|| format!("--confirm-cheque-liability {raw}"))?;
+        if !cleared {
+            tracing::info!(
+                target: "antd",
+                chequebook = %raw,
+                "--confirm-cheque-liability: no lost cheque figures on record for this chequebook",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Keep the node's view of what `chequebook` can pay for downloads and
+/// uploads current (issues #121, #127): run the shared
+/// `ant_chain::chequebook_store::watch_retrieval_funds` (as `ant-ffi`
+/// does), publishing each read into `ControlCommand::SetRetrievalFunds`.
+/// Reads go to `--gnosis-rpc-url`, else the public logs RPC (as the
+/// gateway's reads do). Without either nothing runs and downloads and
+/// uploads stay on the free tier. It runs whatever `--swap-enable` says, so switching
+/// SWAP on at runtime (`ControlCommand::SetSwapEnabled`) finds the funds
+/// already known; the node applies the switch.
+///
+/// One watch per process: starting one for another chequebook stops the
+/// previous one (else a disabled chequebook's watch would keep
+/// overwriting the node's funds with its own, switching payments off
+/// until the new one's next read), and a repeat for the same chequebook
+/// keeps the running one.
+fn spawn_retrieval_funds_watch(
+    opt: &Opt,
+    chequebook: [u8; 20],
+    commands: mpsc::Sender<ControlCommand>,
+) {
+    let mut watch = RETRIEVAL_FUNDS_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((running, task)) = watch.as_ref() {
+        if *running == chequebook && !task.is_finished() {
+            return;
+        }
+    }
+    if let Some((_, task)) = watch.take() {
+        task.abort();
+    }
+    let Some(rpc) = configured_rpc_url(opt).or_else(|| resolve_logs_rpc(opt)) else {
+        tracing::info!(
+            target: "antd",
+            "no Gnosis RPC to read the chequebook balance from; downloads and uploads stay on \
+             the free tier",
+        );
+        return;
+    };
+    let task = tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
+        ant_chain::ChainClient::new(rpc),
+        chequebook,
+        move |funds| publish_retrieval_funds(commands.clone(), chequebook, funds),
+    ));
+    *watch = Some((chequebook, task.abort_handle()));
+}
+
+/// The retrieval-funds watch [`spawn_retrieval_funds_watch`] runs, and
+/// its chequebook.
+static RETRIEVAL_FUNDS_WATCH: std::sync::Mutex<Option<([u8; 20], tokio::task::AbortHandle)>> =
+    std::sync::Mutex::new(None);
+
+/// Stop the retrieval-funds watch if it is `chequebook`'s: settlement
+/// no longer runs on it.
+fn stop_retrieval_funds_watch(chequebook: [u8; 20]) {
+    let mut watch = RETRIEVAL_FUNDS_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if watch
+        .as_ref()
+        .is_some_and(|(running, _)| *running == chequebook)
+    {
+        if let Some((_, task)) = watch.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Hand one [`ant_chain::chequebook_store::RetrievalFunds`] read to the
+/// node. `false` once the node is gone, which ends the watch.
+async fn publish_retrieval_funds(
+    commands: mpsc::Sender<ControlCommand>,
+    chequebook: [u8; 20],
+    funds: ant_chain::chequebook_store::RetrievalFunds,
+) -> bool {
+    let (ack, ack_rx) = oneshot::channel();
+    let sent = commands
+        .send(ControlCommand::SetRetrievalFunds {
+            chequebook,
+            deposited_plur: funds.deposited_plur,
+            exchange_rate_plur: funds.exchange_rate_plur,
+            deduction_plur: funds.deduction_plur,
+            ack,
+        })
+        .await;
+    sent.is_ok() && ack_rx.await.is_ok()
 }
 
 /// Run the startup `factory.deployedContracts(chequebook)` check and,
@@ -2822,6 +3003,60 @@ mod tests {
     use super::*;
     use ant_chain::chequebook_store::ChequebookError;
     use std::sync::atomic::Ordering;
+
+    /// Parse `args` the way `main` does and merge the config file.
+    fn opt_from(args: &[&str]) -> Opt {
+        let matches = Opt::command().try_get_matches_from(args).unwrap();
+        let mut opt = Opt::from_arg_matches(&matches).unwrap();
+        apply_config_file(&mut opt, &matches).unwrap();
+        opt
+    }
+
+    /// Bee's `swap-enable` is honoured as the node's settlement switch
+    /// (PR #126): on by default, off from the config file's key, and the
+    /// `--swap-enable` flag wins over the file either way.
+    #[test]
+    fn swap_enable_comes_from_the_flag_then_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let off = dir.path().join("off.yaml");
+        std::fs::write(&off, "swap-enable: false\n").unwrap();
+        let on = dir.path().join("on.yaml");
+        std::fs::write(&on, "swap-enable: true\n").unwrap();
+        let off = off.to_str().unwrap();
+        let on = on.to_str().unwrap();
+
+        assert!(opt_from(&["antd"]).swap_enable, "default on");
+        assert!(!opt_from(&["antd", "--config", off]).swap_enable);
+        assert!(opt_from(&["antd", "--config", on]).swap_enable);
+        assert!(!opt_from(&["antd", "--swap-enable", "false"]).swap_enable);
+        assert!(
+            opt_from(&["antd", "--config", off, "--swap-enable", "true"]).swap_enable,
+            "the flag wins over the file"
+        );
+        assert!(!opt_from(&["antd", "--config", on, "--swap-enable", "false"]).swap_enable);
+    }
+
+    /// `--confirm-cheque-liability` clears exactly the named chequebook's
+    /// lost-ledger state and refuses a malformed address.
+    #[test]
+    fn confirm_cheque_liability_flag_clears_only_the_named_chequebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("pushsync_outbound.json");
+        std::fs::write(&ledger, b"{ not json").unwrap();
+        let a = ant_p2p::swap::OutboundLedger::open(Some(ledger.clone()), [0xaa; 20]);
+        let b = ant_p2p::swap::OutboundLedger::open(Some(ledger), [0xbb; 20]);
+        assert!(a.lost_figures().is_some() && b.lost_figures().is_some());
+
+        assert!(confirm_cheque_liabilities(dir.path(), &["0xaabb".into()]).is_err());
+        assert!(
+            a.lost_figures().is_some(),
+            "a malformed address confirms nothing"
+        );
+        confirm_cheque_liabilities(dir.path(), &[format!("0x{}", hex::encode([0xaa; 20]))])
+            .unwrap();
+        assert!(a.lost_figures().is_none());
+        assert!(b.lost_figures().is_some());
+    }
 
     fn coord_after_none_scan() -> WalletCoord {
         let coord = WalletCoord::default();

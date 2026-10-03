@@ -17,7 +17,9 @@ use axum::http::{Method, Request, StatusCode};
 use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router,
     status_router_recording_registrations, status_router_with_chain,
-    status_router_with_chain_and_hook, status_router_with_chain_hooks_and_cors,
+    status_router_with_chain_and_failing_snapshot, status_router_with_chain_and_hook,
+    status_router_with_chain_and_issued, status_router_with_chain_and_issued_by,
+    status_router_with_chain_and_lost_ledger, status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -44,6 +46,9 @@ impl ChainReader for FakeChain {
     }
     async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
         Ok(42_000_000)
+    }
+    async fn chequebook_total_paid_out(&self, _cb: [u8; 20]) -> Result<u128, String> {
+        Ok(3_000_000)
     }
 }
 
@@ -230,6 +235,137 @@ async fn chequebook_balance_real_then_zero() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(None));
     let (_, json) = get(router, "/chequebook/balance").await;
     assert_eq!(json["totalBalance"], "0");
+}
+
+/// `availableBalance` is bee's `AvailableBalance`: balance + cashed out
+/// − every cheque the node issued, so download and upload cheques show
+/// up in it before any peer cashes them (issue #121). Without outbound
+/// settlement nothing is issued and it is the balance.
+#[tokio::test]
+async fn chequebook_available_balance_deducts_issued_cheques() {
+    let cb = [0xCD; 20];
+    // 42 M balance + 3 M cashed out − 30 M issued.
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "15000000");
+
+    // Issued past the funds: nothing available, not a wrap-around.
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(50_000_000),
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "0");
+
+    let router =
+        status_router_with_chain_and_issued(snapshot_with_one_peer(), chain_ctx(Some(cb)), None);
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "42000000");
+}
+
+/// The balance read alone answers `/chequebook/balance` (PR #126
+/// R1-M3): when the node's snapshot fails, `totalBalance` still comes
+/// back, with `availableBalance` at that upper bound and flagged.
+#[tokio::test]
+async fn chequebook_balance_survives_a_failed_node_snapshot() {
+    let router = status_router_with_chain_and_failing_snapshot(
+        snapshot_with_one_peer(),
+        chain_ctx(Some([0xCD; 20])),
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "42000000");
+    assert!(json["availableBalanceError"].is_string(), "{json}");
+
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some([0xCD; 20])),
+        Some(30_000_000),
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert!(json.get("availableBalanceError").is_none(), "{json}");
+}
+
+/// The node's issued total belongs to the chequebook its snapshot names
+/// (PR #126 R2-M1): it comes off this chequebook's balance only when
+/// that is this chequebook; another chequebook's total, or an
+/// unreadable ledger, leaves `availableBalance` at the balance, flagged.
+#[tokio::test]
+async fn chequebook_available_balance_counts_only_its_own_cheques() {
+    let cb = [0xCD; 20];
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "15000000");
+    assert!(json.get("availableBalanceError").is_none(), "{json}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        [0xEF; 20],
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["availableBalance"], "42000000");
+    let err = json["availableBalanceError"].as_str().expect("flagged");
+    assert!(err.contains("efefef"), "{err}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        None,
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "42000000");
+    assert!(json["availableBalanceError"].is_string(), "{json}");
+}
+
+/// A chequebook whose cheque figures the node lost (its outbound ledger
+/// was moved aside, PR #126 R4-M1) says so: `chequeLedgerLost` carries
+/// the node's reason, and `availableBalance` isn't computed from a total
+/// that misses the earlier cheques.
+#[tokio::test]
+async fn chequebook_balance_flags_a_lost_cheque_ledger() {
+    let cb = [0xCD; 20];
+    let router = status_router_with_chain_and_lost_ledger(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        30_000_000,
+        cb,
+        "moved aside; confirm with --confirm-cheque-liability",
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "42000000");
+    assert_eq!(
+        json["chequeLedgerLost"],
+        "moved aside; confirm with --confirm-cheque-liability"
+    );
+    assert!(json["availableBalanceError"].is_string(), "{json}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert!(json.get("chequeLedgerLost").is_none(), "{json}");
 }
 
 #[tokio::test]
@@ -591,8 +727,14 @@ impl ChainWriter for FundingWriter {
             funding: QUOTED_FUNDING,
         })
     }
-    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
-        self.record("fund_deposit_with_xdai".into());
+    async fn fund_deposit_with_xdai(
+        &self,
+        amount: Option<u128>,
+    ) -> Result<DepositView, FundingFailure> {
+        self.record(match amount {
+            None => "fund_deposit_with_xdai".into(),
+            Some(a) => format!("fund_deposit_with_xdai amount={a}"),
+        });
         if let Some(refusal) = self.refuse_deposit {
             return Err(FundingFailure::ChequebookRefused {
                 chequebook: [0xCB; 20],
@@ -806,6 +948,42 @@ async fn v0_settlement_deposit_reports_and_tops_up() {
     assert_eq!(json["needsTopUp"], false);
     assert_eq!(json["xdaiToSendWei"], "0");
     assert_eq!(writer.calls(), ["fund_deposit_with_xdai"]);
+}
+
+/// `?amount=` (Freedom's "add browsing credit") reaches the writer as
+/// an explicit deposit; a zero or non-numeric amount is refused before
+/// the writer is called, and the web-page guard still applies.
+#[tokio::test]
+async fn v0_settlement_deposit_takes_an_optional_amount() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let (status, _) = req(
+        router.clone(),
+        Method::POST,
+        "/v0/settlement/deposit?amount=50000000000000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for bad in ["0", "lots", "-1"] {
+        let (status, json) = req(
+            router.clone(),
+            Method::POST,
+            &format!("/v0/settlement/deposit?amount={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "amount={bad}: {json}");
+    }
+    let page = Request::builder()
+        .method(Method::POST)
+        .uri("/v0/settlement/deposit?amount=50000000000000")
+        .header("origin", "null")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(router, page).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        writer.calls(),
+        ["fund_deposit_with_xdai amount=50000000000000"]
+    );
 }
 
 /// One on-chain write at a time: while a buy runs, other writes (new

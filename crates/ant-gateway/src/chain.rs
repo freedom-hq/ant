@@ -51,6 +51,9 @@ pub trait ChainReader: Send + Sync {
     async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn chequebook_balance(&self, chequebook: [u8; 20]) -> Result<u128, String>;
+    /// The chequebook's `totalPaidOut()`: PLUR its beneficiaries have
+    /// cashed so far.
+    async fn chequebook_total_paid_out(&self, chequebook: [u8; 20]) -> Result<u128, String>;
     /// `PostageStamp.remainingBalance(batchId)` — per-chunk balance left
     /// on a batch. Used to enrich `GET /stamps` with bee's `amount` /
     /// `batchTTL`. Defaulted to "unsupported" so non-chain readers (test
@@ -161,9 +164,13 @@ pub trait ChainWriter: Send + Sync {
     async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
-    /// Top the chequebook's deposit up to its target, swapping xDAI for
-    /// the xBZZ it needs. Returns the status afterwards.
-    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+    /// Top the chequebook's deposit up to its target, or with `amount`
+    /// grow it by that many PLUR, swapping xDAI for the xBZZ it needs.
+    /// Returns the status afterwards.
+    async fn fund_deposit_with_xdai(
+        &self,
+        _amount: Option<u128>,
+    ) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
 }
@@ -536,18 +543,52 @@ struct ChequebookBalanceBody {
     total_balance: String,
     #[serde(rename = "availableBalance")]
     available_balance: String,
+    /// Set when `availableBalance` couldn't be worked out (the node's
+    /// issued-cheques total or the chequebook's `totalPaidOut()` didn't
+    /// come back): `availableBalance` is then `totalBalance`, an upper
+    /// bound, and this says why. Not a bee field.
+    #[serde(
+        rename = "availableBalanceError",
+        skip_serializing_if = "Option::is_none"
+    )]
+    available_balance_error: Option<String>,
+    /// Set while this chequebook's cheque figures are lost — the node's
+    /// outbound ledger was unparseable and moved aside, and no operator
+    /// has confirmed the outstanding liability since — saying so and how
+    /// to clear it. Downloads don't pay from the chequebook meanwhile.
+    /// Not a bee field.
+    #[serde(rename = "chequeLedgerLost", skip_serializing_if = "Option::is_none")]
+    cheque_ledger_lost: Option<String>,
 }
 
-/// `GET /chequebook/balance`. Reports the chequebook contract's xBZZ
-/// balance (bee's `Balance()` is just `BZZ.balanceOf(chequebook)`).
-/// `availableBalance` mirrors it because `antd` doesn't draw down the
-/// chequebook on-chain mid-session. Zeros when no chequebook is
+/// `GET /chequebook/balance`. `totalBalance` is the chequebook
+/// contract's xBZZ balance (bee's `Balance()` is just
+/// `BZZ.balanceOf(chequebook)`). `availableBalance` is bee's
+/// `AvailableBalance`: that balance plus what beneficiaries already
+/// cashed (`totalPaidOut()`) minus every cheque the node has issued, so
+/// it drops as soon as uploads or downloads (issue #121) pay with
+/// cheques, not only once peers cash them. The node's total is for the
+/// chequebook its snapshot names (the running settlement's, or the last
+/// one switched off); it is only subtracted when that is this
+/// chequebook. While outbound settlement has never run the node has
+/// issued nothing it can count, and `availableBalance` is the balance. Zeros when no chequebook is
 /// configured (PLAN.md D2).
+///
+/// Only the balance read is required: when the node's snapshot or the
+/// `totalPaidOut()` read fails, the snapshot counts another chequebook,
+/// or the node's outbound ledger is unreadable, the response still carries
+/// `totalBalance`, with `availableBalance` set to it and
+/// `availableBalanceError` saying it isn't the real figure. The same
+/// holds when the ledger lost this chequebook's figures (moved aside as
+/// unparseable, PR #126 R4-M1); `chequeLedgerLost` then says so and how
+/// an operator clears it.
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
     let zero = || {
         Json(ChequebookBalanceBody {
             total_balance: "0".into(),
             available_balance: "0".into(),
+            available_balance_error: None,
+            cheque_ledger_lost: None,
         })
         .into_response()
     };
@@ -564,9 +605,61 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => v,
         Err(r) => return r,
     };
+    let mut cheque_ledger_lost = None;
+    let available: Result<u128, String> = async {
+        let snapshot = crate::settlements::fetch_snapshot(&handle)
+            .await
+            .map_err(|_| "the node's issued-cheques total is unavailable".to_string())?;
+        // The total belongs to one chequebook; it only comes off this
+        // one's balance if they are the same.
+        let issued = match snapshot.cheques_issued_chequebook.as_deref() {
+            // Outbound settlement never ran: nothing issued to count.
+            None if snapshot.cheques_issued_plur.is_none() => return Ok(bal),
+            Some(theirs) if !theirs.eq_ignore_ascii_case(&hex::encode(cb)) => {
+                return Err(format!(
+                    "the node's issued-cheques total is for chequebook 0x{theirs}, not 0x{}",
+                    hex::encode(cb),
+                ));
+            }
+            // `None` with a total: a node from before the field.
+            None | Some(_) => snapshot.cheques_issued_plur,
+        };
+        let Some(issued) = issued else {
+            return Err("the node's outbound cheque ledger is unreadable".to_string());
+        };
+        // Lost figures: the total counts only cheques since the loss.
+        if let Some(lost) = snapshot.cheques_ledger_lost {
+            cheque_ledger_lost = Some(lost);
+            return Err(
+                "the node's outbound cheque ledger lost this chequebook's earlier cheques \
+                 (see chequeLedgerLost)"
+                    .to_string(),
+            );
+        }
+        let paid_out = tokio::time::timeout(
+            CHAIN_RPC_TIMEOUT,
+            chain.reader.chequebook_total_paid_out(cb),
+        )
+        .await
+        .map_err(|_| "chequebook.totalPaidOut timed out".to_string())?
+        .map_err(|e| format!("chequebook.totalPaidOut: {e}"))?;
+        // More issued than u128 holds is more than any chequebook.
+        let issued = issued.parse::<u128>().unwrap_or(u128::MAX);
+        Ok(bal.saturating_add(paid_out).saturating_sub(issued))
+    }
+    .await;
+    let (available, available_balance_error) = match available {
+        Ok(v) => (v, None),
+        Err(e) => {
+            tracing::warn!(target: "ant_gateway", "chequebook availableBalance: {e}");
+            (bal, Some(e))
+        }
+    };
     Json(ChequebookBalanceBody {
         total_balance: bal.to_string(),
-        available_balance: bal.to_string(),
+        available_balance: available.to_string(),
+        available_balance_error,
+        cheque_ledger_lost,
     })
     .into_response()
 }
@@ -1363,22 +1456,38 @@ pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response
 /// its target, paid from the node wallet's xDAI. A no-op when it's
 /// already there. Returns the status afterwards.
 ///
+/// `?amount=<PLUR>` deposits that much more instead, whatever the
+/// target: a host topping up browsing credit beyond the node's default
+/// deposit (`--chequebook-deposit-plur`). Same guards and the same
+/// product flow (the xDAI→xBZZ swap covers only what the wallet lacks);
+/// a missing, non-numeric or zero amount is a `400`.
+///
 /// The deposit and balances are read under the [`WalletTxLock`], so a
 /// background top-up that just landed isn't paid twice. Nothing is
 /// spent on a chequebook the chain rejects (`ant_chain::funding`); such
 /// a refusal goes to [`GatewayHandle::on_chequebook_refused`] once the
 /// lock is released, and the embedder decides whether it stands (and
 /// switches settlement off) or is an RPC that hasn't seen its deploy.
-pub async fn settlement_fund_deposit(State(handle): State<GatewayHandle>) -> Response {
+pub async fn settlement_fund_deposit(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let (chain, w) = match writer(&handle) {
         Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let amount = match param::<u128>(&q, "amount") {
+        Ok(Some(0)) => {
+            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
+        }
+        Ok(a) => a,
         Err(r) => return r,
     };
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
     let tx = chain.tx_lock.lock().await;
-    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai()).await;
+    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai(amount)).await;
     drop(tx);
     match funded {
         Ok(Ok(d)) => deposit_response(chain.wallet_eth, &d),

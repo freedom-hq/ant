@@ -161,6 +161,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
         control_socket: "/tmp/antd.sock".to_string(),
         retrieval: RetrievalInfo::default(),
         chain_ready: true,
+        settlement: ant_control::SettlementInfo::default(),
     }
 }
 
@@ -206,6 +207,47 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         cors: Arc::new(CorsConfig::default()),
         chain_state: GatewayChainState {
             light_mode: false,
+            chain: None,
+        }
+        .preset(),
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
+    };
+    build_router(handle)
+}
+
+/// A light node whose loop answers `SetSwapEnabled` as the production
+/// loop does: publish the switch into `StatusSnapshot::settlement`, then
+/// ack. For the `swap-enable` route and `/node` capability tests. Pages
+/// from `cors` origins are allowed through the switch's guard.
+pub fn swap_switch_router(snapshot: StatusSnapshot, cors: CorsConfig) -> Router {
+    let (status_tx, status_rx) = watch::channel(snapshot);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::SetSwapEnabled { enabled, ack } = cmd {
+                status_tx.send_modify(|s| {
+                    s.settlement.swap_enabled = enabled;
+                    s.settlement.paying = enabled && s.settlement.chequebook.is_some();
+                });
+                let _ = ack.send(ControlAck::Ok {
+                    message: "switched (fixture)".into(),
+                });
+            }
+        }
+    });
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/test".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(test_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(cors),
+        chain_state: GatewayChainState {
+            light_mode: true,
             chain: None,
         }
         .preset(),
@@ -270,6 +312,83 @@ pub fn status_router_with_chain_hooks_and_cors(
         on_chequebook_refused,
         cors,
         None,
+        Ok((None, None, None)),
+    )
+}
+
+/// [`status_router_with_chain`] whose node answers `AccountingSnapshot`
+/// with `issued` as the PLUR its chequebook has promised in cheques
+/// (`None`: outbound settlement not running).
+pub fn status_router_with_chain_and_issued(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: Option<u128>,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Ok((issued, None, None)),
+    )
+}
+
+/// [`status_router_with_chain_and_issued`] whose snapshot names the
+/// chequebook the issued total counts (`issued: None` with a chequebook
+/// is an unreadable outbound ledger).
+pub fn status_router_with_chain_and_issued_by(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: Option<u128>,
+    chequebook: [u8; 20],
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Ok((issued, Some(chequebook), None)),
+    )
+}
+
+/// [`status_router_with_chain_and_issued_by`] whose snapshot also says
+/// the chequebook's cheque figures were lost (`lost`).
+pub fn status_router_with_chain_and_lost_ledger(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: u128,
+    chequebook: [u8; 20],
+    lost: &str,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Ok((Some(issued), Some(chequebook), Some(lost.to_string()))),
+    )
+}
+
+/// [`status_router_with_chain`] whose node fails every
+/// `AccountingSnapshot`.
+pub fn status_router_with_chain_and_failing_snapshot(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Err("snapshot fixture fails".into()),
     )
 }
 
@@ -291,9 +410,14 @@ pub fn status_router_recording_registrations(
         None,
         CorsConfig::default(),
         Some(seen.clone()),
+        Ok((None, None, None)),
     );
     (router, seen)
 }
+
+/// What the chain test router's node answers `AccountingSnapshot` with:
+/// `(issued total, its chequebook, lost-ledger reason)`, or an error.
+type SnapshotFixture = Result<(Option<u128>, Option<[u8; 20]>, Option<String>), String>;
 
 fn chain_router(
     snapshot: StatusSnapshot,
@@ -302,6 +426,7 @@ fn chain_router(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
     registrations: Option<Registrations>,
+    issued: SnapshotFixture,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -312,6 +437,22 @@ fn chain_router(
     // exercise the node loop).
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::AccountingSnapshot { ack } = cmd {
+                let _ = ack.send(match &issued {
+                    Ok((issued, chequebook, lost)) => {
+                        ControlAck::Accounting(ant_control::AccountingSnapshotView {
+                            peers: Vec::new(),
+                            cheques_issued_plur: issued.map(|i| i.to_string()),
+                            cheques_issued_chequebook: chequebook.map(hex::encode),
+                            cheques_ledger_lost: lost.clone(),
+                        })
+                    }
+                    Err(message) => ControlAck::Error {
+                        message: message.clone(),
+                    },
+                });
+                continue;
+            }
             if let ControlCommand::RegisterBatch {
                 batch_id,
                 depth,
@@ -956,6 +1097,12 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         ControlCommand::DisablePushsyncSwap { ack, .. } => {
             let _ = ack.send(ControlAck::Ok {
                 message: "settlement disable ignored (test fixture)".into(),
+            });
+        }
+        ControlCommand::SetRetrievalFunds { ack, .. }
+        | ControlCommand::SetSwapEnabled { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "retrieval payments ignored (test fixture)".into(),
             });
         }
         // Read-back propagation check. The fixture has a single source

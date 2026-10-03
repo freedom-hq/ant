@@ -499,6 +499,29 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountingSnapshotView {
     pub peers: Vec<PeerAccountingView>,
+    /// PLUR promised in every cheque this node has issued from its
+    /// chequebook, for pushsync and retrieval alike (bee's
+    /// `totalIssued`, the sum of the outbound ledger's cumulatives),
+    /// decimal, for the chequebook in [`Self::cheques_issued_chequebook`].
+    /// `None` when outbound settlement has never run in this process, or
+    /// when the outbound ledger file can't be read (the total is
+    /// unknown). Feeds `/chequebook/balance`'s `availableBalance`.
+    #[serde(default)]
+    pub cheques_issued_plur: Option<String>,
+    /// Chequebook (lowercase hex, no `0x`) whose cheques
+    /// `cheques_issued_plur` counts: the running outbound settlement's,
+    /// or the last one switched off by `DisablePushsyncSwap`. `None`
+    /// when outbound settlement has never run in this process.
+    #[serde(default)]
+    pub cheques_issued_chequebook: Option<String>,
+    /// Set when that chequebook's figures were lost — the outbound
+    /// ledger file was unparseable and moved aside, and no operator has
+    /// confirmed the chequebook's outstanding liability since — saying
+    /// so and how to clear it. `cheques_issued_plur` then counts only
+    /// the cheques issued after the loss, and downloads don't pay from
+    /// this chequebook (PR #126 R4-M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheques_ledger_lost: Option<String>,
 }
 
 /// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying
@@ -681,6 +704,43 @@ pub struct StatusSnapshot {
     /// default is `true`.
     #[serde(default = "chain_ready_missing_default")]
     pub chain_ready: bool,
+    /// The node's SWAP settlement switch and whether it pays (issues
+    /// #121, #127). Published by the node loop whenever the switch, the
+    /// chequebook or its funds change. Old daemons leave this at the
+    /// `#[serde(default)]` value.
+    #[serde(default)]
+    pub settlement: SettlementInfo,
+}
+
+/// Node-wide SWAP settlement state: bee's `swap-enable` switch, read by
+/// the gateway's `GET /node` and `GET /v0/settlement/swap` and by
+/// ant-ffi's `ant_swap_status`, so hosts needn't probe for support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementInfo {
+    /// Bee's `swap-enable`: SWAP cheques may pay peers, for downloads and
+    /// uploads alike. Changed at runtime by `SetSwapEnabled`
+    /// (`PUT /v0/settlement/swap`, `ant_set_swap_enabled`, the control
+    /// socket).
+    pub swap_enabled: bool,
+    /// The chequebook outbound settlement runs on (`0x` + 40 hex), if
+    /// any.
+    #[serde(default)]
+    pub chequebook: Option<String>,
+    /// Cheques are being paid now: the switch is on and the chequebook
+    /// has funds the node has read from the chain and not yet spent, with
+    /// its cheque ledger known. `false` means the free pseudosettle tier.
+    #[serde(default)]
+    pub paying: bool,
+}
+
+impl Default for SettlementInfo {
+    fn default() -> Self {
+        Self {
+            swap_enabled: true,
+            chequebook: None,
+            paying: false,
+        }
+    }
 }
 
 /// Missing-field default for [`StatusSnapshot::chain_ready`]: a daemon

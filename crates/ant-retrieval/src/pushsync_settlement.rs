@@ -22,31 +22,23 @@
 //! The fetcher knows nothing about chequebooks, EIP-712, libp2p swap
 //! streams, or chain ids; it just calls
 //! [`PushsyncSettlement::note_pushsync`] right after every accepted
-//! pushsync receipt. The implementation in `ant-p2p::pushsync_swap`:
-//!
-//! 1. Tracks per-peer cumulative debt (in PLUR units) and adds `price`.
-//! 2. If the new total crosses the (configurable, default ½×bee's
-//!    `lightPaymentThreshold`) trigger, looks up the peer's beneficiary
-//!    EOA from the [BZZ handshake info](`ant_p2p::HandshakeInfo`)
-//!    cache, builds + signs an EIP-712 cheque against our chequebook for
-//!    `cumulative_debit + safety_margin`, opens a swap stream and emits
-//!    it via [`ant_p2p::swap::issue_and_emit`].
-//! 3. On a successful emit, zeros the local debt counter (the receiver
-//!    has now been paid up to the cumulative amount we recorded in the
-//!    [`ant_p2p::swap::OutboundLedger`]).
+//! pushsync receipt (`price` in accounting units, bee's
+//! `pricer.PeerPrice`). The implementation in
+//! `ant-p2p::push_pseudosettle` debits it to the shared
+//! [`Accounting`](crate::accounting::Accounting) mirror — bee's one
+//! balance per peer for every protocol — which settles it like
+//! retrieval debt: the free pseudosettle refresh first, then, with a
+//! payer installed (a funded chequebook with `swap-enable` on), a cheque
+//! priced `units × exchange + deduction` once the debt reaches the
+//! early-payment threshold (issue #127).
 //!
 //! # Failure mode
 //!
-//! Settlement is best-effort. A failure to emit the cheque (peer
-//! disconnect mid-stream, swap protocol Reset, signature mismatch) does
-//! NOT fail the upload. Instead, the next `note_pushsync` for the same
-//! peer re-evaluates: if the debt is still over the trigger, we try to
-//! emit again with the *new* (unchanged) cumulative payout. Because
-//! cheques are cumulative the retry is idempotent — bee accepts the
-//! highest cumulative it has seen and ignores duplicates. If a peer
-//! refuses every cheque, the fetcher's per-peer skip list will eventually
-//! blacklist it, exactly as today; we just stop wasting stream opens
-//! against a settled-but-still-rejecting peer.
+//! Settlement is best-effort. A failed payment (peer disconnect
+//! mid-stream, swap protocol Reset, timeout) does NOT fail the upload;
+//! the mirror keeps the debt, backs off for
+//! [`FAILED_SETTLEMENT_INTERVAL`](crate::accounting::FAILED_SETTLEMENT_INTERVAL)
+//! and leaves it to the refresh meanwhile.
 //!
 //! # Live integration
 //!

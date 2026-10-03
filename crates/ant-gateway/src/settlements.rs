@@ -55,7 +55,9 @@ const ERR_NO_SETTLEMENTS: &str = "no settlements for peer";
 
 /// Fetch the settlement/balance snapshot from the node loop.
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
-async fn fetch_snapshot(handle: &GatewayHandle) -> Result<AccountingSnapshotView, Response> {
+pub(crate) async fn fetch_snapshot(
+    handle: &GatewayHandle,
+) -> Result<AccountingSnapshotView, Response> {
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
     if handle
         .commands

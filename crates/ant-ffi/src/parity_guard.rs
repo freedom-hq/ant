@@ -63,12 +63,21 @@ const FFI_SOURCES: &[&str] = &[
 
 /// Orchestration helpers deliberately used by only one entry point:
 /// `(helper, the side that uses it, why the other side doesn't)`.
-const ONE_SIDED: &[(&str, Side, &str)] = &[(
-    "top_up_batch",
-    Side::Antd,
-    "bee's `PATCH /stamps/topup` pays from the wallet's xBZZ; the C API only extends with \
-     xDAI, through `extend_with_xdai`, which calls it",
-)];
+const ONE_SIDED: &[(&str, Side, &str)] = &[
+    (
+        "top_up_batch",
+        Side::Antd,
+        "bee's `PATCH /stamps/topup` pays from the wallet's xBZZ; the C API only extends with \
+         xDAI, through `extend_with_xdai`, which calls it",
+    ),
+    (
+        "read_retrieval_funds",
+        Side::Ffi,
+        "the C API's deposit top-up re-reads the funds once and starts the funds watch, since \
+         `ant_init` reloads a chequebook without an RPC and starts none; `antd` starts its watch \
+         (`watch_retrieval_funds`, which reads through this) with settlement at startup",
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {

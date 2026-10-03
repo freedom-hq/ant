@@ -382,6 +382,31 @@ pub enum ControlCommand {
         chequebook: [u8; 20],
         ack: oneshot::Sender<ControlAck>,
     },
+    /// What `chequebook` can put into retrieval cheques, and at which
+    /// rates (issue #121), as read from the chain by
+    /// `ant_chain::chequebook_store::watch_retrieval_funds`. Kept for
+    /// `chequebook` and applied to the outbound SWAP service whenever it
+    /// runs on that chequebook (now, or once it starts). Acks `Ok`.
+    SetRetrievalFunds {
+        chequebook: [u8; 20],
+        /// xBZZ ever deposited and not withdrawn, PLUR.
+        deposited_plur: u128,
+        /// Bee's oracle exchange rate, PLUR per accounting unit.
+        exchange_rate_plur: u128,
+        /// Bee's oracle deduction, PLUR.
+        deduction_plur: u128,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Bee's node-wide SWAP settlement switch (`swap-enable`), changed at
+    /// runtime (a superset of bee, which reads it at start). `true` (the
+    /// default) pays peers with SWAP cheques for downloads (issue #121)
+    /// and uploads (issue #127) alike past the early-payment threshold
+    /// once a funded chequebook backs settlement, as bee does; `false`
+    /// keeps both on the free pseudosettle tier even with one. Acks `Ok`.
+    SetSwapEnabled {
+        enabled: bool,
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Create a new upload job. The node loop forwards to its
     /// `UploadManager`, which writes the persistent manifest, spawns
     /// the driver task, and acks with the assigned job id.

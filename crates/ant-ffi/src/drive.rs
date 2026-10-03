@@ -753,6 +753,28 @@ pub(crate) fn wake(h: &AntHandle) -> Result<String, DriveError> {
     })
 }
 
+/// Bee's node-wide `swap-enable` switch, which governs retrieval payments
+/// (issue #121). Backs [`crate::ant_set_swap_enabled`].
+pub(crate) fn set_swap_enabled(h: &AntHandle, enabled: bool) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(
+            &cmd_tx,
+            ControlCommand::SetSwapEnabled {
+                enabled,
+                ack: ack_tx,
+            },
+        )
+        .await?;
+        match recv_oneshot(ack_rx).await? {
+            ControlAck::Ok { message } => Ok(message),
+            ControlAck::Error { message } => Err(DriveError::Op(message)),
+            other => Err(unexpected(&other)),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Storage plan
 // ---------------------------------------------------------------------------
@@ -1562,7 +1584,113 @@ pub(crate) async fn setup_settlement(
         }
     }
     enable_settlement(cmd_tx, resolved.address, swap_secret, data_dir).await;
+    watch_retrieval_funds(cmd_tx, client, resolved.address);
     Ok(Some(resolved.address))
+}
+
+/// The retrieval-funds watch running for this process, if any: the
+/// chequebook, the node it publishes to, and its task.
+#[cfg(feature = "chain")]
+type FundsWatch = (
+    [u8; 20],
+    mpsc::Sender<ControlCommand>,
+    tokio::task::AbortHandle,
+);
+
+/// Keep the node's view of what `chequebook` can pay for downloads and
+/// uploads current (issues #121, #127): run the shared
+/// `ant_chain::chequebook_store::watch_retrieval_funds` (as `antd`
+/// does), publishing each read into `ControlCommand::SetRetrievalFunds`,
+/// over `client` (so through the host chain transport when one is
+/// installed). Started by every successful [`setup_settlement`] and
+/// every successful deposit top-up ([`refresh_retrieval_funds`]); one
+/// watch per node, replaced when its chequebook changes.
+///
+/// `ant_init` reloads a persisted chequebook without an RPC, so until the
+/// first settlement setup or top-up after it (the gateway-start chain
+/// init, a storage call, `ant_deploy_chequebook`,
+/// `ant_storage_settlement_topup*`) the node knows no funds and
+/// downloads and uploads stay on the free tier.
+#[cfg(feature = "chain")]
+fn watch_retrieval_funds(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    chequebook: [u8; 20],
+) {
+    static WATCHES: std::sync::Mutex<Vec<FundsWatch>> = std::sync::Mutex::new(Vec::new());
+    let mut watches = WATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watches.retain(|(_, _, task)| !task.is_finished());
+    if let Some(at) = watches
+        .iter()
+        .position(|(_, tx, _)| tx.same_channel(cmd_tx))
+    {
+        if watches[at].0 == chequebook {
+            return;
+        }
+        watches.swap_remove(at).2.abort();
+    }
+    let commands = cmd_tx.clone();
+    let task = tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
+        client.clone(),
+        chequebook,
+        move |funds| {
+            let commands = commands.clone();
+            async move { publish_retrieval_funds(&commands, chequebook, funds).await }
+        },
+    ));
+    watches.push((chequebook, cmd_tx.clone(), task.abort_handle()));
+}
+
+/// Hand one read of `chequebook`'s funds to the node
+/// (`ControlCommand::SetRetrievalFunds`). `false` once the node is gone.
+#[cfg(feature = "chain")]
+async fn publish_retrieval_funds(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    chequebook: [u8; 20],
+    funds: ant_chain::chequebook_store::RetrievalFunds,
+) -> bool {
+    let (ack, ack_rx) = oneshot::channel();
+    let sent = send(
+        cmd_tx,
+        ControlCommand::SetRetrievalFunds {
+            chequebook,
+            deposited_plur: funds.deposited_plur,
+            exchange_rate_plur: funds.exchange_rate_plur,
+            deduction_plur: funds.deduction_plur,
+            ack,
+        },
+    )
+    .await;
+    sent.is_ok() && recv_oneshot(ack_rx).await.is_ok()
+}
+
+/// After a deposit into `chequebook` (PR #126 R1-M3): tell the node its
+/// new funds now, rather than at the watch's next read up to
+/// [`ant_chain::chequebook_store::RETRIEVAL_FUNDS_REFRESH`] later (a
+/// payer removed for exhausted credit comes back at once), and make sure
+/// the funds watch runs. `ant_init` reloads a persisted chequebook
+/// without an RPC and starts no watch, so without this a host that only
+/// tops up would never get the node paying. A failed read publishes
+/// nothing (the node keeps what it knew); the watch retries it.
+#[cfg(feature = "chain")]
+async fn refresh_retrieval_funds(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    chequebook: [u8; 20],
+) {
+    match ant_chain::chequebook_store::read_retrieval_funds(client, &chequebook).await {
+        Ok(funds) => {
+            publish_retrieval_funds(cmd_tx, chequebook, funds).await;
+        }
+        Err(e) => tracing::debug!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            "funds not re-read after the deposit (the watch retries): {e}",
+        ),
+    }
+    watch_retrieval_funds(cmd_tx, client, chequebook);
 }
 
 /// One [`ant_gateway::WalletTxLock`] per node account, process-wide.
@@ -1946,20 +2074,30 @@ async fn settlement_deposit_for(
 /// refreshed [`settlement_deposit`] JSON. Submits real Gnosis
 /// transactions and spends real funds, so the app gates it behind an
 /// explicit confirmation.
+///
+/// With `amount`, deposits that many PLUR more instead, whatever the
+/// target (a host topping up browsing credit beyond the default
+/// deposit); the gateway's `POST /v0/settlement/deposit?amount=` runs
+/// the same shared step.
 #[cfg(feature = "chain")]
-pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+pub(crate) fn settlement_topup_xdai(
+    h: &AntHandle,
+    rpc: String,
+    amount: Option<u128>,
+) -> Result<String, DriveError> {
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
     let secret = h.signing_secret;
     let cmd_tx = h.cmd_tx.clone();
     h.runtime.block_on(async move {
-        settlement_topup_xdai_for(
+        settlement_topup_xdai_adding(
             &cmd_tx,
             &h.chain_client(rpc),
             &data_dir,
             owner,
             secret,
             &h.gateway_chequebook,
+            amount,
         )
         .await
     })
@@ -1984,7 +2122,7 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
 /// On a refusal the in-process gateway's chequebook `slot` follows: a
 /// chequebook disqualified here is cleared from it, so `/wallet` and
 /// `POST /chequebook/deposit` stop using it without a gateway restart.
-#[cfg(feature = "chain")]
+#[cfg(all(feature = "chain", test))]
 async fn settlement_topup_xdai_for(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
@@ -1993,7 +2131,23 @@ async fn settlement_topup_xdai_for(
     secret: [u8; 32],
     slot: &ant_gateway::ChequebookSlot,
 ) -> Result<String, DriveError> {
-    let result = settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret).await;
+    settlement_topup_xdai_adding(cmd_tx, client, data_dir, owner, secret, slot, None).await
+}
+
+/// [`settlement_topup_xdai_for`] with an optional explicit amount (see
+/// [`settlement_topup_xdai`]).
+#[cfg(feature = "chain")]
+async fn settlement_topup_xdai_adding(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: [u8; 20],
+    secret: [u8; 32],
+    slot: &ant_gateway::ChequebookSlot,
+    amount: Option<u128>,
+) -> Result<String, DriveError> {
+    let result =
+        settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret, amount).await;
     if result.is_err() {
         // Clears the slot only if it holds a chequebook now in
         // `DISQUALIFIED`; any other failure leaves it alone.
@@ -2010,6 +2164,7 @@ async fn settlement_topup_xdai_checked(
     data_dir: &std::path::Path,
     owner: [u8; 20],
     secret: [u8; 32],
+    amount: Option<u128>,
 ) -> Result<String, DriveError> {
     let cb = persisted_chequebook(data_dir, &owner).ok_or_else(|| {
         DriveError::Op(
@@ -2050,10 +2205,13 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR).await
+        funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR, amount).await
     };
     match funded {
-        Ok(status) => to_json(&SettlementDeposit::of(&status)),
+        Ok(status) => {
+            refresh_retrieval_funds(cmd_tx, client, cb).await;
+            to_json(&SettlementDeposit::of(&status))
+        }
         Err(
             e @ funding::FundingError::ChequebookRefused {
                 chequebook,
@@ -2498,11 +2656,24 @@ async fn resolve_or_deploy_chequebook(
         .await
     };
     match deployed {
-        Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
-            address: cb,
-            deployed: true,
-            verified: true,
-        })),
+        Ok(cb) => {
+            // Brand new, so it has issued no cheques: a lost outbound
+            // ledger on record doesn't apply to it (PR #126 R1-M3).
+            if let Err(e) =
+                ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
+            {
+                tracing::warn!(
+                    target: "ant-ffi",
+                    "can't record the new chequebook in the lost-ledger marker: {e}; \
+                     downloads and uploads stay on the free tier until confirmed",
+                );
+            }
+            Ok(Resolution::Use(ResolvedChequebook {
+                address: cb,
+                deployed: true,
+                verified: true,
+            }))
+        }
         Err(ChequebookError::InsufficientGas { need, .. }) => {
             tracing::warn!(
                 target: "ant-ffi",
@@ -3498,8 +3669,21 @@ mod chain_tests {
                     .unwrap_or(super::DEPOSIT_TARGET_PLUR);
                 return Some(json!(format!("0x{bal:064x}")));
             }
+            if to
+                == format!(
+                    "0x{}",
+                    hex::encode(ant_chain::chequebook::GNOSIS_SWAP_PRICE_ORACLE)
+                )
+            {
+                // getPrice(): bee's mainnet oracle, 100 000 PLUR/unit, 100.
+                return Some(json!(format!("0x{:064x}{:064x}", 100_000, 100)));
+            }
             hex::decode_to_slice(to.trim_start_matches("0x"), &mut addr).unwrap();
             let (_, issuer) = self.chequebooks.get(&addr)?;
+            if sel[2..] == hex::encode(ant_chain::chequebook::chequebook_total_paid_out_selector())
+            {
+                return Some(json!(word_hex(&[0])));
+            }
             Some(json!(word_hex(issuer)))
         }
     }
@@ -3596,6 +3780,8 @@ mod chain_tests {
         registered: Vec<[u8; 32]>,
         enabled: Vec<[u8; 20]>,
         disabled: Vec<[u8; 20]>,
+        /// `SetRetrievalFunds`: `(chequebook, deposited, exchange rate)`.
+        funds: Vec<([u8; 20], u128, u128)>,
         /// Fail this many `RegisterBatch` commands before accepting.
         fail_registers: usize,
     }
@@ -3639,6 +3825,22 @@ mod chain_tests {
                         sink.lock().unwrap().enabled.push(chequebook);
                         let _ = ack.send(ControlAck::Ok {
                             message: "enabled".into(),
+                        });
+                    }
+                    ControlCommand::SetRetrievalFunds {
+                        chequebook,
+                        deposited_plur,
+                        exchange_rate_plur,
+                        ack,
+                        ..
+                    } => {
+                        sink.lock().unwrap().funds.push((
+                            chequebook,
+                            deposited_plur,
+                            exchange_rate_plur,
+                        ));
+                        let _ = ack.send(ControlAck::Ok {
+                            message: "funds".into(),
                         });
                     }
                     other => panic!("unexpected command {other:?}"),
@@ -3704,6 +3906,43 @@ mod chain_tests {
             "the corrupt record is rewritten",
         );
         assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #121: once settlement runs on a chequebook, the node learns
+    /// what it can pay for downloads (deposit and oracle rates, read over
+    /// the same chain client) through the shared funds watch, as `antd`'s
+    /// does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settlement_setup_tells_the_node_its_retrieval_funds() {
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-funds");
+        let mut script = ChainScript::new(eth);
+        script.transfers.push((CANDIDATE, [0x71; 32]));
+        script.chequebooks.insert(CANDIDATE, (true, eth));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+
+        let got = super::setup_settlement(
+            &cmd_tx,
+            &client(&script),
+            &wallet,
+            &dir,
+            NODE_KEY,
+            eth,
+            false,
+        )
+        .await
+        .expect("adopted");
+        assert_eq!(got, Some(CANDIDATE));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while node.lock().unwrap().funds.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            node.lock().unwrap().funds.first().copied(),
+            Some((CANDIDATE, super::DEPOSIT_TARGET_PLUR, 100_000)),
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4345,6 +4584,22 @@ mod chain_tests {
         assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
         assert_eq!(slot.get(), Some(GOOD));
+        // PR #126 R1-M3: the top-up tells the node its funds at once (no
+        // settlement setup ran before it, as after a bare `ant_init`),
+        // and leaves the funds watch running.
+        assert_eq!(
+            node.lock().unwrap().funds.first().copied(),
+            Some((GOOD, super::DEPOSIT_TARGET_PLUR, 100_000)),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while node.lock().unwrap().funds.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            node.lock().unwrap().funds.len(),
+            2,
+            "the watch's first read"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

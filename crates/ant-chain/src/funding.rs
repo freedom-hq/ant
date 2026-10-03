@@ -771,7 +771,14 @@ async fn status_for(
 /// chequebook through the shared
 /// [`top_up_chequebook`](crate::chequebook_store::top_up_chequebook).
 /// A no-op when the deposit is already at its target. Returns the
-/// deposit as the chain reports it afterwards.
+/// deposit as the chain reports it afterwards, measured against
+/// `target`.
+///
+/// With `add`, the deposit grows by that many PLUR instead, whatever
+/// `target` is: the goal becomes the deposit read here (under the
+/// caller's wallet lock) plus `add`. This is how a host buys more
+/// browsing credit than the node's default deposit target (Freedom's
+/// wallet UI). `Some(0)` is refused.
 ///
 /// Nothing is spent on a chequebook the chain rejects: before a swap
 /// the chequebook's checks (factory registration, `issuer()` is the
@@ -792,9 +799,21 @@ pub async fn fund_deposit_with_xdai(
     payer: &Payer<'_>,
     chequebook: &[u8; 20],
     target: u128,
+    add: Option<u128>,
 ) -> Result<DepositStatus, FundingError> {
     let deposited = chequebook_deposit(payer, chequebook).await?;
-    let short = target.saturating_sub(deposited);
+    let goal = match add {
+        None => target,
+        Some(0) => {
+            return Err(FundingError::Invalid(
+                "a deposit amount must be more than 0 PLUR".into(),
+            ))
+        }
+        Some(add) => deposited.checked_add(add).ok_or_else(|| {
+            FundingError::Invalid(format!("a deposit of {add} PLUR is out of range"))
+        })?,
+    };
+    let short = goal.saturating_sub(deposited);
     if short == 0 {
         return status_for(payer, chequebook, deposited, target).await;
     }
@@ -808,7 +827,7 @@ pub async fn fund_deposit_with_xdai(
         payer.wallet,
         payer.owner(),
         chequebook,
-        target,
+        goal,
     )
     .await
     {
@@ -1149,11 +1168,18 @@ mod tests {
     async fn fund_deposit_with(
         chain: ScriptedChain,
     ) -> (Result<DepositStatus, FundingError>, Vec<&'static str>) {
+        fund_deposit_adding(chain, None).await
+    }
+
+    async fn fund_deposit_adding(
+        chain: ScriptedChain,
+        add: Option<u128>,
+    ) -> (Result<DepositStatus, FundingError>, Vec<&'static str>) {
         let chain = std::sync::Arc::new(chain);
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
         let payer = Payer::gnosis(&client, &wallet);
-        let result = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET).await;
+        let result = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, add).await;
         let sent = chain.sent.lock().unwrap().clone();
         (result, sent)
     }
@@ -1224,6 +1250,40 @@ mod tests {
         assert_eq!(sent, [] as [&str; 0]);
     }
 
+    /// An explicit amount (Freedom's "add browsing credit") deposits that
+    /// much more even when the deposit already meets the node's target,
+    /// swapping only what the wallet lacks, through the same checked
+    /// top-up; a zero amount is refused before anything is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deposit_amount_grows_the_deposit_past_its_target() {
+        let full = || ScriptedChain {
+            chequebook_bzz: TARGET,
+            wallet_xdai: WEI_PER_XDAI,
+            registered: true,
+            issuer: node_eth(),
+            ..ScriptedChain::default()
+        };
+        let (result, sent) = fund_deposit_adding(
+            ScriptedChain {
+                wallet_bzz: 5 * TARGET,
+                ..full()
+            },
+            Some(5 * TARGET),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(sent, ["transfer"], "the wallet holds it: no swap");
+        let (result, sent) = fund_deposit_adding(full(), Some(5 * TARGET)).await;
+        result.unwrap();
+        assert_eq!(sent, ["swap", "transfer"]);
+        let (result, sent) = fund_deposit_adding(full(), Some(0)).await;
+        assert!(
+            matches!(result, Err(FundingError::Invalid(_))),
+            "{result:?}"
+        );
+        assert!(sent.is_empty(), "nothing may be sent: {sent:?}");
+    }
+
     /// R1-F3: every paying path sizes its swap from the wallet's xBZZ. A
     /// failed read of it fails the operation before anything is sent,
     /// rather than reading as "no xBZZ" and swapping again for xBZZ a
@@ -1265,7 +1325,7 @@ mod tests {
         let c = chain();
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
         let payer = Payer::gnosis(&client, &wallet);
-        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET).await;
+        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, None).await;
         assert!(
             matches!(r, Err(FundingError::Read { .. })),
             "deposit: {r:?}"

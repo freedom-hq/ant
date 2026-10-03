@@ -457,6 +457,118 @@ pub async fn top_up_chequebook(
     })
 }
 
+/// What a node's chequebook can put into SWAP cheques, and at which
+/// rates: for downloads (issue #121) and uploads (issue #127) alike,
+/// since both pay through the one shared payer. (The `Retrieval` in the
+/// name predates #127.) Read with [`read_retrieval_funds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalFunds {
+    /// xBZZ ever deposited and not withdrawn, in PLUR: the chequebook's
+    /// balance plus what beneficiaries have already cashed
+    /// (`totalPaidOut`). Bee's `AvailableBalance` is this minus every
+    /// cheque issued so far, which only the issuing node knows.
+    pub deposited_plur: u128,
+    /// Bee's oracle exchange rate, PLUR per accounting unit.
+    pub exchange_rate_plur: u128,
+    /// Bee's oracle deduction, PLUR, added to the first cheque to a peer.
+    pub deduction_plur: u128,
+}
+
+/// How often the entry points re-read [`RetrievalFunds`] while
+/// settlement runs ([`watch_retrieval_funds`]), so a deposit made by any
+/// path (a buy, a top-up, `POST /chequebook/deposit`, someone else's
+/// transfer) starts paying for downloads and uploads (pushsync) within
+/// this long.
+#[cfg(feature = "chain-rpc")]
+pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read [`RetrievalFunds`] for `chequebook`: its xBZZ balance, its
+/// `totalPaidOut()`, and bee's price oracle (`getPrice()`). Any failed
+/// read is an error, never a zero: the caller keeps what it knew.
+#[cfg(feature = "chain-rpc")]
+pub async fn read_retrieval_funds(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<RetrievalFunds, ChequebookError> {
+    use crate::chequebook::{
+        chequebook_total_paid_out_selector, price_oracle_get_price_selector,
+        GNOSIS_SWAP_PRICE_ORACLE,
+    };
+    let word = |v: &[u8], at: usize, what: &str| -> Result<u128, ChequebookError> {
+        let w = v
+            .get(at..at + 32)
+            .ok_or_else(|| ChequebookError::Chain(format!("{what} returned {} bytes", v.len())))?;
+        if w[..16].iter().any(|&b| b != 0) {
+            return Err(ChequebookError::Chain(format!("{what} overflows u128")));
+        }
+        Ok(u128::from_be_bytes(w[16..].try_into().expect("16 bytes")))
+    };
+    let balance = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, chequebook)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read chequebook balance: {e}")))?;
+    let paid_out = client
+        .eth_call(
+            &format!("0x{}", hex::encode(chequebook)),
+            &format!("0x{}", hex::encode(chequebook_total_paid_out_selector())),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("chequebook.totalPaidOut eth_call: {e}")))?;
+    let paid_out = word(&paid_out, 0, "chequebook.totalPaidOut")?;
+    let price = client
+        .eth_call(
+            &format!("0x{}", hex::encode(GNOSIS_SWAP_PRICE_ORACLE)),
+            &format!("0x{}", hex::encode(price_oracle_get_price_selector())),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("priceOracle.getPrice eth_call: {e}")))?;
+    Ok(RetrievalFunds {
+        deposited_plur: balance.saturating_add(paid_out),
+        exchange_rate_plur: word(&price, 0, "priceOracle.getPrice")?,
+        deduction_plur: word(&price, 32, "priceOracle.getPrice")?,
+    })
+}
+
+/// Keep the node's view of `chequebook`'s [`RetrievalFunds`] current:
+/// read them now and every [`RETRIEVAL_FUNDS_REFRESH`], handing each
+/// successful read to `publish`. A failed read publishes nothing, so the
+/// node keeps its last good value (a hiccup doesn't read as "empty").
+/// Returns when `publish` returns `false` (the node is gone).
+///
+/// Both `antd` and `ant-ffi` run this for the chequebook settlement runs
+/// on, publishing into `ControlCommand::SetRetrievalFunds`, so SWAP
+/// payments for downloads (issue #121) and uploads (issue #127) spend at
+/// most what the chequebook holds, on either entry point. Each keeps one
+/// watch per node and aborts it when settlement moves to another
+/// chequebook (or, in `antd`, is switched off): the node accepts funds
+/// for any chequebook, so a stale watch would otherwise keep overwriting
+/// the current one's.
+#[cfg(feature = "chain-rpc")]
+pub async fn watch_retrieval_funds<F, Fut>(
+    client: crate::ChainClient,
+    chequebook: [u8; 20],
+    mut publish: F,
+) where
+    F: FnMut(RetrievalFunds) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        match read_retrieval_funds(&client, &chequebook).await {
+            Ok(funds) => {
+                if !publish(funds).await {
+                    return;
+                }
+            }
+            Err(e) => tracing::debug!(
+                target: "ant_chain::chequebook_store",
+                chequebook = %hex::encode(chequebook),
+                "retrieval funds not refreshed: {e}",
+            ),
+        }
+        tokio::time::sleep(RETRIEVAL_FUNDS_REFRESH).await;
+    }
+}
+
 /// Run the chequebook checks against the chain: factory registration,
 /// then `issuer()` as `issuer_read` allows. Shared by `antd` (every
 /// chequebook it adopts at startup) and `ant-ffi` (a persisted
@@ -817,6 +929,98 @@ mod tests {
         .await;
         let others = *script.other_calls.lock().unwrap();
         (result, others)
+    }
+
+    /// A scripted chain for [`read_retrieval_funds`]: the chequebook's
+    /// xBZZ balance, its `totalPaidOut()` and the price oracle. `None`
+    /// answers an RPC error.
+    #[cfg(feature = "chain-rpc")]
+    struct FundsChain {
+        balance: Option<u128>,
+        paid_out: Option<u128>,
+        price: Option<(u128, u128)>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for FundsChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let to = req["params"][0]["to"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            let data = req["params"][0]["data"].as_str().unwrap_or_default();
+            let answer = if data.starts_with("0x70a08231") {
+                self.balance.map(|b| format!("0x{b:064x}"))
+            } else if to == format!("0x{}", hex::encode(CHEQUEBOOK)) {
+                assert_eq!(
+                    &data[2..10],
+                    hex::encode(crate::chequebook::chequebook_total_paid_out_selector())
+                );
+                self.paid_out.map(|p| format!("0x{p:064x}"))
+            } else {
+                assert_eq!(
+                    to,
+                    format!(
+                        "0x{}",
+                        hex::encode(crate::chequebook::GNOSIS_SWAP_PRICE_ORACLE)
+                    )
+                );
+                self.price.map(|(r, d)| format!("0x{r:064x}{d:064x}"))
+            };
+            Some(
+                match answer {
+                    Some(w) => serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": w}),
+                    None => serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                        "error": {"code": -32603, "message": "backend unavailable"}}),
+                }
+                .to_string(),
+            )
+        }
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    async fn funds_from(chain: FundsChain) -> Result<RetrievalFunds, ChequebookError> {
+        let client = crate::ChainClient::new("http://127.0.0.1:1")
+            .with_transport(Some(std::sync::Arc::new(chain)));
+        read_retrieval_funds(&client, &CHEQUEBOOK).await
+    }
+
+    /// The funds are the deposit ever made (balance + cashed out), at the
+    /// oracle's rates; any read that fails is an error, never a zero
+    /// (issue #121).
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn retrieval_funds_add_cashed_out_to_the_balance() {
+        let full = || FundsChain {
+            balance: Some(15_000_000_000_000),
+            paid_out: Some(5_000_000_000_000),
+            price: Some((100_000, 100)),
+        };
+        assert_eq!(
+            funds_from(full()).await.unwrap(),
+            RetrievalFunds {
+                deposited_plur: 20_000_000_000_000,
+                exchange_rate_plur: 100_000,
+                deduction_plur: 100,
+            }
+        );
+        for broken in [
+            FundsChain {
+                balance: None,
+                ..full()
+            },
+            FundsChain {
+                paid_out: None,
+                ..full()
+            },
+            FundsChain {
+                price: None,
+                ..full()
+            },
+        ] {
+            assert!(funds_from(broken).await.is_err());
+        }
     }
 
     #[cfg(feature = "chain-rpc")]

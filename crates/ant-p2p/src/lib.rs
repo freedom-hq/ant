@@ -25,8 +25,8 @@ pub use handshake::{
     PROTOCOL_HANDSHAKE, PROTOCOL_HANDSHAKE_V14, PROTOCOL_HANDSHAKE_V15,
 };
 pub use pushsync_swap::{
-    NoopPushsyncSettlement, PeerEthMap, PushsyncSwap, PushsyncSwapConfig, DEFAULT_CHEQUE_TRIGGER,
-    LIGHT_PAYMENT_THRESHOLD,
+    NoopPushsyncSettlement, PeerEthMap, PushsyncSwap, PushsyncSwapConfig, RetrievalSwapPolicy,
+    DELIVERY_GRACE,
 };
 pub use routing::{proximity, RoutingTable, NUM_BINS, OVERLAY_LEN};
 

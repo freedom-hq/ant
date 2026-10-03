@@ -554,6 +554,8 @@ const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
     "chequebook.json",
     "swap_credits.json",
     "pushsync_outbound.json",
+    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it.
+    "pushsync_outbound.json.lost",
 ];
 
 /// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
@@ -776,6 +778,7 @@ fn init_inner(
         // The FFI path resolves chain state before starting the loop
         // (no late-chain channel), so it is ready by construction.
         chain_ready: true,
+        settlement: ant_control::SettlementInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -1350,6 +1353,183 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
             }
             Err(_) => {
                 write_out_err(out_err, "panic in ant_resume");
+                -2
+            }
+        }
+    }
+}
+
+/// Bee's `swap-enable`: switch SWAP settlement on or off for the running
+/// node, for downloads (issue #121) and uploads (issue #127) alike. On
+/// (the default), the node pays peers with SWAP cheques from its
+/// chequebook once the debt to a peer reaches half its payment threshold,
+/// after the free pseudosettle refresh, as bee does: one balance per
+/// peer, cheques worth `units × exchange + deduction` at bee's oracle
+/// rate (up to ~0.75 xBZZ per GB), never more than the chequebook holds.
+/// That lifts downloads past the free tier's ~5-6 Mbit/s. Off keeps
+/// downloads and uploads on the free tier even with a funded chequebook.
+///
+/// Payments also need a chequebook with funds the node has read from the
+/// chain: they start after the first settlement setup that has an RPC
+/// (`ant_start_gateway`'s chain init, a storage call,
+/// [`ant_deploy_chequebook`]), not at `ant_init`. The switch is not
+/// persisted; set it after every `ant_init`.
+///
+/// Returns `0` on success, `-1` on a null handle, `-2` if the node loop
+/// didn't ack (already shut down); in the `-2` case an allocated error
+/// string is written into `*out_err` (free with [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_swap_enabled(
+    handle: *const AntHandle,
+    enabled: bool,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_set_swap_enabled: null handle");
+            return -1;
+        };
+        match catch_unwind(AssertUnwindSafe(|| {
+            drive::set_swap_enabled(handle, enabled)
+        })) {
+            Ok(Ok(msg)) => {
+                tracing::info!(target: "ant-ffi", "{msg}");
+                0
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_set_swap_enabled");
+                -2
+            }
+        }
+    }
+}
+
+/// The node's SWAP settlement state as JSON — what the gateway's `GET
+/// /v0/settlement/swap` and `GET /node`'s `settlement` report, for a host
+/// that doesn't run the gateway:
+///
+/// `{"supported":bool,"swap_switch":true,"swap_enabled":bool,
+///   "paying":bool,"chequebook":"0x…"|null,"persisted":false}`
+///
+/// `supported`: this build pays peers with SWAP cheques once a funded
+/// chequebook backs settlement (the `chain` feature). `swap_switch`: the
+/// switch can be changed at runtime ([`ant_set_swap_enabled`]).
+/// `swap_enabled`: bee's `swap-enable` as the node runs it now, for
+/// downloads and uploads alike. `paying`: cheques are being paid right
+/// now (switch on, chequebook funds read from the chain and not spent),
+/// otherwise the free pseudosettle tier. `persisted`: always `false`, the
+/// switch resets at `ant_init`. Never blocks on the network.
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_swap_status(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_swap_status", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let s = h.status_rx.borrow().settlement.clone();
+            serde_json::to_string(&serde_json::json!({
+                "supported": cfg!(feature = "chain"),
+                "swap_switch": true,
+                "swap_enabled": s.swap_enabled,
+                "paying": s.paying,
+                "chequebook": s.chequebook,
+                "persisted": false,
+            }))
+            .map_err(|e| format!("serialize swap status: {e}"))
+        })
+    }
+}
+
+/// Confirm the outstanding liability of `chequebook` (`0x…` hex, NUL
+/// terminated) after its cheque figures were lost, and let the node pay
+/// cheques from it again, for downloads and uploads alike. When the
+/// node's outbound cheque ledger (`pushsync_outbound.json`) is found
+/// unparseable it is moved aside and a `.lost` marker is left; while that
+/// marker names a loss, the node pays no cheques (downloads or uploads;
+/// both stay on the free pseudosettle tier) from any chequebook that
+/// used the file (logged at warn,
+/// and `/chequebook/balance` reports `chequeLedgerLost`). Only this call
+/// (or `antd --confirm-cheque-liability`) clears it, never time or a
+/// restart. Confirming accepts that peers paid before the loss hold
+/// cheques the node can't see: they may refuse new cheques, and
+/// disconnect the node, until its restarted cumulatives pass what they
+/// hold. A running node picks it up at its next chequebook-funds read
+/// (within a minute). A marker that can't be parsed is replaced by one
+/// that confirms only this chequebook (every other one stays lost), so
+/// it never has to be deleted by hand. A chequebook deployed after the
+/// loss, and one whose ledger was open when the file was lost, aren't
+/// affected and need no confirmation.
+///
+/// Returns `0` once confirmed, `1` when there was nothing to confirm (no
+/// loss on record, or this chequebook already confirmed), `-1` on a null
+/// handle or a malformed `chequebook`, `-2` if the marker can't be read
+/// (an I/O error, not a parse error) or written; on `-1`/`-2` an allocated error string is written into
+/// `*out_err` (free with [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `chequebook` must be a valid NUL-terminated C string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_confirm_cheque_liability(
+    handle: *const AntHandle,
+    chequebook: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_confirm_cheque_liability: null handle");
+            return -1;
+        };
+        let parsed = (!chequebook.is_null())
+            .then(|| CStr::from_ptr(chequebook).to_str().ok())
+            .flatten()
+            .and_then(|s| {
+                let mut cb = [0u8; 20];
+                hex::decode_to_slice(s.trim().trim_start_matches("0x"), &mut cb)
+                    .ok()
+                    .map(|()| cb)
+            });
+        let Some(cb) = parsed else {
+            write_out_err(
+                out_err,
+                "ant_confirm_cheque_liability: chequebook must be a 0x-prefixed 20-byte hex address",
+            );
+            return -1;
+        };
+        let ledger = handle.data_dir.join("pushsync_outbound.json");
+        match catch_unwind(AssertUnwindSafe(|| {
+            ant_p2p::swap::confirm_cheque_liability(&ledger, cb)
+        })) {
+            Ok(Ok(true)) => 0,
+            Ok(Ok(false)) => 1,
+            Ok(Err(e)) => {
+                write_out_err(out_err, &format!("ant_confirm_cheque_liability: {e}"));
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_confirm_cheque_liability");
                 -2
             }
         }
@@ -2235,7 +2415,11 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// spending, and again right before the transfer — a deposit there would
 /// back cheques peers drop — or those checks can't be read, or a
 /// chequebook deployed moments ago isn't visible to the RPC yet (retry
-/// later; nothing was spent). Returns the refreshed
+/// later; nothing was spent). On success the node re-reads the
+/// chequebook's funds over `gnosis_rpc` and pays cheques from them at
+/// once ([`ant_swap_status`] `paying`, when the switch is on), and keeps
+/// re-reading them every minute, even after an `ant_init` that reloaded
+/// the chequebook without an RPC. Returns the refreshed
 /// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
 /// and spends real funds** and **blocks** until they confirm, so the app
 /// gates it behind explicit confirmation. Requires the `chain` build
@@ -2260,11 +2444,69 @@ pub unsafe extern "C" fn ant_storage_settlement_topup(
                 if rpc.trim().is_empty() {
                     return Err("ant_storage_settlement_topup: gnosis_rpc required".to_string());
                 }
-                drive::settlement_topup_xdai(h, rpc).map_err(|e| e.to_string())
+                drive::settlement_topup_xdai(h, rpc, None).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
                 let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Like [`ant_storage_settlement_topup`], but deposits `amount_plur` more
+/// (a decimal PLUR string, 1 xBZZ = 10^16 PLUR) whatever the deposit's
+/// target: how a host tops up browsing credit beyond the node's default
+/// deposit (Freedom's wallet UI). The same product flow and guards: the
+/// chain checks run before anything is spent, and the node swaps xDAI
+/// only for the xBZZ the wallet lacks. Errors on an amount that isn't a
+/// positive integer. Mirrors the gateway's `POST
+/// /v0/settlement/deposit?amount=`. Returns the refreshed
+/// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
+/// and spends real funds** and **blocks** until they confirm. Requires
+/// the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_plur` must be valid
+/// NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    amount_plur: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_topup_amount", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_plur)?;
+            let amount = match amount.trim().parse::<u128>() {
+                Ok(a) if a > 0 => a,
+                _ => {
+                    return Err(format!(
+                        "ant_storage_settlement_topup_amount: amount_plur must be a positive \
+                         integer, got {amount:?}"
+                    ))
+                }
+            };
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err(
+                        "ant_storage_settlement_topup_amount: gnosis_rpc required".to_string()
+                    );
+                }
+                drive::settlement_topup_xdai(h, rpc, Some(amount)).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, amount);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -4444,6 +4686,69 @@ mod tests {
             #[cfg(feature = "chain")]
             gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         }
+    }
+
+    /// A host without the gateway reads the node's settlement state —
+    /// capability, the `swap-enable` switch, whether it pays — from
+    /// `ant_swap_status` (Freedom's wallet UI), live from the status the
+    /// node loop publishes; a deposit amount that isn't a positive integer
+    /// is refused before anything touches the chain.
+    #[test]
+    fn swap_status_and_deposit_amount_for_hosts() {
+        let dir = scratch_dir("swap-status");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let mut h = test_handle(runtime, &dir);
+        let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        h.status_rx = status_rx;
+        let handle = Box::into_raw(Box::new(h));
+        let read = || -> serde_json::Value {
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe { ant_swap_status(handle, &raw mut err) };
+            assert!(!raw.is_null());
+            let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+            unsafe { ant_free_string(raw) };
+            serde_json::from_str(&json).unwrap()
+        };
+        let v = read();
+        assert_eq!(v["swap_switch"], true);
+        assert_eq!(v["swap_enabled"], true, "bee's switch, on by default");
+        assert_eq!(v["paying"], false);
+        assert_eq!(v["persisted"], false);
+        assert_eq!(v["supported"], cfg!(feature = "chain"));
+        status_tx.send_modify(|s| {
+            s.settlement = ant_control::SettlementInfo {
+                swap_enabled: false,
+                chequebook: Some("0xcb".into()),
+                paying: false,
+            };
+        });
+        let v = read();
+        assert_eq!(v["swap_enabled"], false);
+        assert_eq!(v["chequebook"], "0xcb");
+
+        let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        for bad in ["0", "abc", "-5", ""] {
+            let amount = CString::new(bad).unwrap();
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe {
+                ant_storage_settlement_topup_amount(
+                    handle,
+                    rpc.as_ptr(),
+                    amount.as_ptr(),
+                    &raw mut err,
+                )
+            };
+            assert!(raw.is_null(), "{bad:?} accepted");
+            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+            unsafe { ant_free_string(err) };
+            assert!(msg.contains("positive integer"), "{bad:?}: {msg}");
+        }
+        unsafe { ant_shutdown(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
