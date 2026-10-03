@@ -5233,7 +5233,7 @@ async fn run_stream_bzz(
     head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    use ant_retrieval::{lookup_path, ManifestError};
+    use ant_retrieval::{lookup_path_with_credit, ManifestError};
 
     // Reuse the same retry envelope as `run_get_bzz` for the manifest
     // walk. Once the data root has landed and we've emitted
@@ -5244,9 +5244,10 @@ async fn run_stream_bzz(
     let resolution_started = Instant::now();
     // The bare-root and data-root fetches wait for peer credit, but never
     // past the resolution budget, so the attempts' waits can't stack
-    // (issue #117). So do a bare root's raw-bytes sniff fetches (issue
-    // #122), from the same window. The rest of the manifest walk, and the
-    // sniff's fallback join, never wait.
+    // (issue #117). So do the manifest walk's node loads (issue #130) and
+    // a bare root's raw-bytes sniff fetches (issue #122), one at a time,
+    // from the same window. Feed probes, and the fallback join of a
+    // multi-chunk node, never wait.
     let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
@@ -5282,8 +5283,10 @@ async fn run_stream_bzz(
         // request cache. Its root → leftmost-leaf sniff waits for credit
         // too (#122), so a raw ref is recognised and streamed like
         // `/bytes` instead of falling into the sniff's full, non-waiting
-        // fallback join on a starved pool. A path implies a manifest, so
-        // it keeps the plain walk.
+        // fallback join on a starved pool. Every request's walk loads its
+        // nodes waiting for credit (#130), so a site lookup queues for
+        // credit behind concurrent body fetches instead of failing and
+        // backing off.
         let looked_up = match (bare_root, <[u8; 32]>::try_from(reference.as_slice())) {
             (true, Ok(root)) => match ant_retrieval::fetch_root_with_replicas(
                 &fetcher,
@@ -5292,21 +5295,13 @@ async fn run_stream_bzz(
             )
             .await
             {
-                Ok(_) => {
-                    ant_retrieval::lookup_path_with_sniff_credit(
-                        &fetcher,
-                        &reference,
-                        &path,
-                        &credit_window,
-                    )
-                    .await
-                }
+                Ok(_) => lookup_path_with_credit(&fetcher, &reference, &path, &credit_window).await,
                 Err(source) => Err(ManifestError::Fetch(ant_retrieval::JoinError::FetchChunk {
                     addr: hex::encode(root),
                     source,
                 })),
             },
-            _ => lookup_path(&fetcher, &reference, &path).await,
+            _ => lookup_path_with_credit(&fetcher, &reference, &path, &credit_window).await,
         };
         let lookup = match looked_up {
             Ok(r) => r,

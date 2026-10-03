@@ -2624,7 +2624,7 @@ mod tests {
                 let credit = crate::accounting::CreditWindow::new(window);
                 tokio::time::advance(window.saturating_sub(left)).await;
                 let started = tokio::time::Instant::now();
-                let r = crate::lookup_path_with_sniff_credit(&fetcher, &root, "", &credit).await;
+                let r = crate::lookup_path_with_credit(&fetcher, &root, "", &credit).await;
                 drop(held);
                 assert!(r.is_err(), "pool never refills");
                 started.elapsed()
@@ -2643,6 +2643,133 @@ mod tests {
                  {extra:?} more than the non-waiting {non_waiting:?}",
             );
         }
+    }
+
+    /// A one-page site's manifest (`index.html` as index document) for
+    /// the walk tests below: its root node, and every node below the
+    /// root, which a cold walk must fetch. Returns `(root, root wire,
+    /// cheapest node below the root)`; a pool starved at that node's
+    /// price is starved for every node (a peer's price only rises with
+    /// distance), so wherever the walk goes next it finds no credit.
+    fn one_page_site() -> ([u8; 32], Vec<u8>, [u8; 32]) {
+        use crate::manifest_writer::{build_collection_manifest, IndexAnchor, ManifestFile};
+        let page = crate::split_bytes(b"<html>hi</html>");
+        let manifest = build_collection_manifest(
+            &[ManifestFile {
+                path: "index.html".into(),
+                content_type: Some("text/html".into()),
+                data_ref: page.root.to_vec(),
+            }],
+            Some("index.html"),
+            IndexAnchor::ZeroEntry,
+        )
+        .unwrap();
+        let root_wire = manifest
+            .chunks
+            .iter()
+            .find(|c| c.address == manifest.root)
+            .unwrap()
+            .wire
+            .clone();
+        let o = [0x80u8; 32];
+        let cheapest = manifest
+            .chunks
+            .iter()
+            .map(|c| c.address)
+            .filter(|a| *a != manifest.root)
+            .min_by_key(|a| Accounting::peer_price(&o, a))
+            .expect("a node below the root");
+        (manifest.root, root_wire, cheapest)
+    }
+
+    /// Issue #130: the `/bzz` walk's node loads wait for credit on a
+    /// starved pool (real `RoutingFetcher`), but only inside the
+    /// resolution window. The site's root is in the request cache; the
+    /// node below it is starved and never refills. Measured against the
+    /// same lookup with the window already spent (exactly the pre-#130,
+    /// non-waiting walk, which fails at once), the walk adds one capped
+    /// wait (10 s from a fresh 30 s window), what is left of a nearly
+    /// spent window (5 s), and nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn starved_manifest_walk_waits_only_inside_its_window() {
+        let (root, root_wire, starved) = one_page_site();
+        let window = Duration::from_secs(30);
+        for path in ["", "index.html"] {
+            let lookup = |left: Duration| {
+                let root_wire = root_wire.clone();
+                async move {
+                    let (fetcher, _acc, _p, held) = starved_fetcher(starved);
+                    let cache = Arc::new(InMemoryChunkCache::new(8));
+                    cache.put(root, root_wire);
+                    let fetcher = fetcher.with_cache(cache);
+                    let credit = crate::accounting::CreditWindow::new(window);
+                    tokio::time::advance(window.saturating_sub(left)).await;
+                    let started = tokio::time::Instant::now();
+                    let r = crate::lookup_path_with_credit(&fetcher, &root, path, &credit).await;
+                    drop(held);
+                    let err = r.expect_err("pool never refills");
+                    assert!(
+                        err.to_string().contains("no BZZ peers available"),
+                        "{path:?}: {err}",
+                    );
+                    started.elapsed()
+                }
+            };
+            let non_waiting = lookup(Duration::ZERO).await;
+            assert_eq!(
+                non_waiting,
+                Duration::ZERO,
+                "{path:?}: a plain walk fails at once"
+            );
+            for (left, walk_wait) in [
+                (window, CREDIT_WAIT_BUDGET),
+                (Duration::from_secs(5), Duration::from_secs(5)),
+            ] {
+                let took = lookup(left).await;
+                assert!(
+                    took >= walk_wait && took < walk_wait + OVERDRAFT_REFRESH,
+                    "{path:?}, {left:?} left in the window: lookup took {took:?}",
+                );
+            }
+        }
+    }
+
+    /// Issue #130: a site lookup queues for credit like the body fetches
+    /// it competes with. Its walk, starved below the cached root, waits
+    /// instead of failing, and once the peer's credit comes free it is
+    /// woken (not left to its 600 ms timer) and asks that peer: its
+    /// reservation shows up in the accounting.
+    #[tokio::test]
+    async fn starved_manifest_walk_waits_for_credit_then_asks_the_peer() {
+        let (root, root_wire, starved) = one_page_site();
+        let (fetcher, acc, p, held) = starved_fetcher(starved);
+        let cache = Arc::new(InMemoryChunkCache::new(8));
+        cache.put(root, root_wire);
+        let fetcher = fetcher.with_cache(cache);
+        let h = tokio::spawn(async move {
+            let credit = crate::accounting::CreditWindow::new(Duration::from_secs(30));
+            crate::lookup_path_with_credit(&fetcher, &root, "", &credit)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !h.is_finished(),
+            "the walk must wait for credit on a starved pool, got {:?}",
+            h.await.unwrap(),
+        );
+
+        let held_reserve = acc.debug_snapshot(&p).unwrap().1;
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, reserved) = acc.debug_snapshot(&p).unwrap();
+        assert!(
+            reserved > 0 && reserved < held_reserve,
+            "the walk's node fetch must have reserved credit and dispatched: reserved {reserved}",
+        );
+        h.abort();
     }
 
     /// Issue #117: the opted-in data path (the streaming joiner's child

@@ -195,17 +195,18 @@ pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    resolve_feed_root_sniffing(fetcher, root_ref, None).await
+    resolve_feed_root_with_credit(fetcher, root_ref, None).await
 }
 
-/// [`resolve_feed_root`] whose root-node load hands `sniff_credit` to
-/// the header sniff (see [`lookup_path_with_sniff_credit`]).
-async fn resolve_feed_root_sniffing(
+/// [`resolve_feed_root`] whose root-node load may wait for peer credit
+/// within `credit` (see [`lookup_path_with_credit`]). The feed probes
+/// never wait.
+async fn resolve_feed_root_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
-    sniff_credit: Option<&CreditWindow>,
+    credit: Option<&CreditWindow>,
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    let root_node = load_node_ref_sniffing(fetcher, root_ref, sniff_credit).await?;
+    let root_node = load_node_ref_with_credit(fetcher, root_ref, credit).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
@@ -254,46 +255,48 @@ pub async fn lookup_path(
     root_ref: &[u8],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_sniffing(fetcher, root_ref, path, None).await
+    lookup_path_inner(fetcher, root_ref, path, None).await
 }
 
-/// [`lookup_path`] whose raw-bytes sniff on `root_ref` may wait for
-/// peer credit, within `sniff_credit` (issue #122).
+/// [`lookup_path`] whose manifest walk may wait for peer credit, within
+/// `credit` (issues #122, #130). Used by the `/bzz` resolution loop.
 ///
-/// For a bare `/bzz/<ref>/` (#112), whose reference may name raw bytes:
-/// the root → leftmost-leaf fetches that tell a raw file from a manifest
-/// node (normally two for a few-MiB file, none for a single-chunk
-/// manifest) use [`ChunkFetcher::fetch_waiting_for_credit`], each with
-/// [`CreditWindow::budget`]. These are sequential, so together they wait
-/// no longer than what is left of the window, and a caller that shares
-/// one window across its retries and its other waiting fetches (the
-/// `/bzz` resolution loop) can't stack waits past it. Everything else
-/// stays non-waiting, as in [`lookup_path`]: the fallback join of the
-/// node when the sniff can't tell, feed probes, and every other node of
-/// the walk.
-pub async fn lookup_path_with_sniff_credit(
+/// The walk is sequential: it loads one node per trie level (the root,
+/// a feed's target root, then each fork's child, and the same again for
+/// the directory-redirect check and the index / error-document
+/// retries). Each node load fetches its root chunk with
+/// [`ChunkFetcher::fetch_waiting_for_credit`] and
+/// [`CreditWindow::budget`]; so do the header sniff's root →
+/// leftmost-leaf fetches below it (normally two for a few-MiB raw file
+/// behind a bare `/bzz/<ref>/`, none for a single-chunk node). One fetch
+/// runs at a time, so together they wait no longer than what is left of
+/// the window, and a caller that shares one window across its retries
+/// and its other waiting fetches (the `/bzz` resolution loop) can't
+/// stack waits past it. Everything else stays non-waiting, as in
+/// [`lookup_path`]: the fallback join of a multi-chunk node, feed
+/// probes, and the decrypting join of an encrypted node.
+pub async fn lookup_path_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     path: &str,
-    sniff_credit: &CreditWindow,
+    credit: &CreditWindow,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_sniffing(fetcher, root_ref, path, Some(sniff_credit)).await
+    lookup_path_inner(fetcher, root_ref, path, Some(credit)).await
 }
 
-async fn lookup_path_sniffing(
+async fn lookup_path_inner(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     path: &str,
-    sniff_credit: Option<&CreditWindow>,
+    credit: Option<&CreditWindow>,
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
-    // Only the user's own reference is sniffed with credit: that is where
-    // a raw `/bytes` reference shows up. (`load_node_ref` below reloads
-    // the same node for a non-feed manifest from the request's cache.)
+    // `load_node_ref_with_credit` below reloads the same node for a
+    // non-feed manifest from the request's cache.
     let (effective_root, is_feed) =
-        resolve_feed_root_sniffing(fetcher, root_ref, sniff_credit).await?;
-    let root_node = load_node_ref(fetcher, &effective_root).await?;
+        resolve_feed_root_with_credit(fetcher, root_ref, credit).await?;
+    let root_node = load_node_ref_with_credit(fetcher, &effective_root, credit).await?;
     debug!(
         target: "ant_retrieval::mantaray",
         root = %hex::encode(root_ref),
@@ -319,7 +322,7 @@ async fn lookup_path_sniffing(
     // This matches what `bee/pkg/api/bzz.go` does for `bzz://<ref>/`.
     if path.is_empty() {
         if let Some(idx) = &index_doc {
-            if let Some(mut result) = try_walk(fetcher, &root_node, idx).await? {
+            if let Some(mut result) = try_walk(fetcher, &root_node, idx, credit).await? {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -336,7 +339,7 @@ async fn lookup_path_sniffing(
     }
 
     // Non-empty path: try the literal path first.
-    if let Some(mut result) = try_walk(fetcher, &root_node, path).await? {
+    if let Some(mut result) = try_walk(fetcher, &root_node, path, credit).await? {
         result.is_feed = is_feed;
         return Ok(result);
     }
@@ -349,7 +352,7 @@ async fn lookup_path_sniffing(
     // prefix-walk failure (unfetchable node) falls through like bee's
     // `err == nil && exists` guard.
     let dir_path = format!("{path}/");
-    if let Ok(true) = has_prefix(fetcher, &root_node, dir_path.as_bytes()).await {
+    if let Ok(true) = has_prefix(fetcher, &root_node, dir_path.as_bytes(), credit).await {
         return Err(ManifestError::Directory {
             path: path.to_string(),
         });
@@ -363,7 +366,7 @@ async fn lookup_path_sniffing(
     if let Some(idx) = &index_doc {
         if !path.ends_with(idx.as_str()) {
             let with_index = join_index_document(path, idx);
-            if let Some(mut result) = try_walk(fetcher, &root_node, &with_index).await? {
+            if let Some(mut result) = try_walk(fetcher, &root_node, &with_index, credit).await? {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -373,7 +376,7 @@ async fn lookup_path_sniffing(
     // Final fallback: the error document (Bee's `website-error-document`).
     if let Some(err) = &error_doc {
         if path != err {
-            if let Some(mut result) = try_walk(fetcher, &root_node, err).await? {
+            if let Some(mut result) = try_walk(fetcher, &root_node, err, credit).await? {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -394,12 +397,14 @@ async fn try_walk(
     fetcher: &dyn ChunkFetcher,
     root_node: &Node,
     effective_path: &str,
+    credit: Option<&CreditWindow>,
 ) -> Result<Option<LookupResult>, ManifestError> {
     match walk(
         fetcher,
         root_node.clone(),
         effective_path.as_bytes(),
         effective_path,
+        credit,
     )
     .await
     {
@@ -418,6 +423,7 @@ async fn has_prefix(
     fetcher: &dyn ChunkFetcher,
     root_node: &Node,
     path: &[u8],
+    credit: Option<&CreditWindow>,
 ) -> Result<bool, ManifestError> {
     let mut node = root_node.clone();
     let mut remaining = path;
@@ -444,7 +450,7 @@ async fn has_prefix(
         if remaining.is_empty() {
             return Ok(true);
         }
-        node = load_node_ref(fetcher, &child_ref).await?;
+        node = load_node_ref_with_credit(fetcher, &child_ref, credit).await?;
     }
 }
 
@@ -566,6 +572,7 @@ fn walk<'a>(
     node: Node,
     remaining: &'a [u8],
     full_path: &'a str,
+    credit: Option<&'a CreditWindow>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<LookupResult, ManifestError>> + Send + 'a>,
 > {
@@ -625,7 +632,7 @@ fn walk<'a>(
             child_ref = %hex::encode(&fork.child_ref),
             "descending into fork",
         );
-        let mut child_node = load_node_ref(fetcher, &fork.child_ref).await?;
+        let mut child_node = load_node_ref_with_credit(fetcher, &fork.child_ref, credit).await?;
         // Merge fork-level metadata onto the child. In bee's wire format
         // (mantaray 0.2) per-file Content-Type / Filename are stored on
         // the parent fork, not on the child node's own bytes — yet bee's
@@ -634,7 +641,7 @@ fn walk<'a>(
         for (k, v) in fork.metadata {
             child_node.metadata.entry(k).or_insert(v);
         }
-        walk(fetcher, child_node, next_remaining, full_path).await
+        walk(fetcher, child_node, next_remaining, full_path, credit).await
     })
 }
 
@@ -766,15 +773,18 @@ pub(crate) async fn load_node_ref(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
 ) -> Result<Node, ManifestError> {
-    load_node_ref_sniffing(fetcher, node_ref, None).await
+    load_node_ref_with_credit(fetcher, node_ref, None).await
 }
 
-/// [`load_node_ref`] whose header sniff waits for peer credit within
-/// `sniff_credit`, if given (issue #122). The fallback join never waits.
-async fn load_node_ref_sniffing(
+/// [`load_node_ref`] whose root-chunk fetch (issue #130) and header
+/// sniff (issue #122) wait for peer credit within `credit`, if given:
+/// one fetch at a time, each with [`CreditWindow::budget`]. The fallback
+/// join of a multi-chunk node and the decrypting join of an encrypted
+/// node never wait.
+async fn load_node_ref_with_credit(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
-    sniff_credit: Option<&CreditWindow>,
+    credit: Option<&CreditWindow>,
 ) -> Result<Node, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
@@ -787,7 +797,13 @@ async fn load_node_ref_sniffing(
     // The node is itself a Swarm file: fetch the root chunk, then join.
     // For tiny manifests (< 4 KiB) the root chunk's payload is already
     // the entire serialised node.
-    let root_chunk = fetcher.fetch(addr).await.map_err(|e| {
+    let budget = credit.map_or(std::time::Duration::ZERO, CreditWindow::budget);
+    let root_chunk = if budget.is_zero() {
+        fetcher.fetch(addr).await
+    } else {
+        fetcher.fetch_waiting_for_credit(addr, budget).await
+    };
+    let root_chunk = root_chunk.map_err(|e| {
         ManifestError::Fetch(JoinError::FetchChunk {
             addr: hex::encode(addr),
             source: e,
@@ -807,7 +823,7 @@ async fn load_node_ref_sniffing(
     // its 64-byte header would make the answer depend on every chunk of
     // the file arriving inside the manifest lookup (#113).
     let sniffed = SniffedFetcher::new(fetcher);
-    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk, sniff_credit).await {
+    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk, credit).await {
         debug!(
             target: "ant_retrieval::mantaray",
             root = %hex::encode(addr),
@@ -840,12 +856,12 @@ type FetchErr = Box<dyn std::error::Error + Send + Sync>;
 /// It deliberately doesn't forward
 /// [`ChunkFetcher::fetch_waiting_for_credit`]: the trait default turns
 /// that into a plain `fetch`, so the fallback join of a manifest node
-/// never waits for peer credit (issue #117). A node load is one step of
-/// a walk that runs inside the 30 s `/bzz` resolution budget; a starved
-/// node fails at once, as before #117, and the resolution loop retries
-/// the walk. The one waiting fetch is the sniff's own
-/// [`Self::sniff_fetch`], and only when its caller hands it a credit
-/// window (a bare `/bzz/<ref>/` root, issue #122).
+/// never waits for peer credit (issue #117): it fetches the rest of a
+/// multi-chunk node, many chunks per node, and a starved one fails at
+/// once, as before #117, for the resolution loop to retry the walk. The
+/// one waiting fetch here is the sniff's own [`Self::sniff_fetch`], and
+/// only when its caller hands it a credit window (the `/bzz` resolution
+/// loop's walk, issues #122, #130).
 struct SniffedFetcher<'a> {
     inner: &'a dyn ChunkFetcher,
     state: std::sync::Mutex<SniffState>,
@@ -967,7 +983,7 @@ const HEADER_SNIFF_MAX_DEPTH: usize = 8;
 ///
 /// With a `credit` window each level's fetch may wait for peer credit
 /// within what is left of it (issue #122, see
-/// [`lookup_path_with_sniff_credit`]); without one they are plain.
+/// [`lookup_path_with_credit`]); without one they are plain.
 async fn leftmost_leaf_is_not_a_manifest(
     fetcher: &SniffedFetcher<'_>,
     root_chunk: &[u8],
@@ -2165,16 +2181,13 @@ mod tests {
             assert_eq!(path.len(), 3, "level {level}: root → intermediate → leaf");
 
             // The root is already in the request cache (`run_stream_bzz`
-            // fetched it, waiting); everything else needs credit.
+            // fetched it, waiting, so the walk's waiting root load is a
+            // cache hit); everything else needs credit.
             let fetcher = CreditGatedFetcher::new(all.clone(), &[split.root]);
-            let err = lookup_path_with_sniff_credit(
-                &fetcher,
-                &split.root,
-                "",
-                &CreditWindow::new(window),
-            )
-            .await
-            .unwrap_err();
+            let err =
+                lookup_path_with_credit(&fetcher, &split.root, "", &CreditWindow::new(window))
+                    .await
+                    .unwrap_err();
             assert!(
                 matches!(err, ManifestError::NotAManifest),
                 "level {level}: expected NotAManifest, got {err:?}",
@@ -2182,8 +2195,8 @@ mod tests {
             let budget = crate::accounting::CREDIT_WAIT_BUDGET;
             assert_eq!(
                 fetcher.waits(),
-                vec![(path[1], budget), (path[2], budget)],
-                "level {level}: one waiting fetch per tree level below the root",
+                vec![(path[0], budget), (path[1], budget), (path[2], budget)],
+                "level {level}: one waiting fetch per tree level",
             );
 
             let fetcher = CreditGatedFetcher::new(all, &[split.root]);
@@ -2216,7 +2229,7 @@ mod tests {
         let path = leftmost_path(&all, split.root);
         assert_eq!(path.len(), 2, "root → leaf");
         let fetcher = CreditGatedFetcher::new(all, &[split.root]);
-        let err = lookup_path_with_sniff_credit(
+        let err = lookup_path_with_credit(
             &fetcher,
             &split.root,
             "",
@@ -2228,11 +2241,85 @@ mod tests {
             matches!(err, ManifestError::Fetch(JoinError::FetchChunk { .. })),
             "expected the non-waiting full join to run and fail, got {err:?}",
         );
+        let budget = crate::accounting::CREDIT_WAIT_BUDGET;
         assert_eq!(
             fetcher.waits(),
-            vec![(path[1], crate::accounting::CREDIT_WAIT_BUDGET)],
-            "the sniff's leaf fetch waits; the fallback join's fetches don't",
+            vec![(path[0], budget), (path[1], budget)],
+            "the node's root and the sniff's leaf fetch wait; the fallback join's fetches don't",
         );
+    }
+
+    /// Issue #130: on a starved pool, the `/bzz` walk's node loads wait
+    /// for credit (one fetch per trie level, each given the window's
+    /// budget), so a site's index and a path inside it resolve instead
+    /// of failing for the resolution loop to back off and retry. The
+    /// plain `lookup_path` (every other caller) still never waits and
+    /// fails at once on the same pool.
+    #[tokio::test(start_paused = true)]
+    async fn starved_manifest_walk_waits_for_credit_on_every_node() {
+        let (site, root, refs) = website_fetcher(&[
+            "index.html",
+            "developer/index.html",
+            "developer/deep/index.html",
+        ]);
+        let nodes: HashSet<[u8; 32]> = site
+            .chunks
+            .keys()
+            .copied()
+            .filter(|a| !refs.values().any(|r| r == a))
+            .collect();
+        let window = std::time::Duration::from_secs(30);
+        let budget = crate::accounting::CREDIT_WAIT_BUDGET;
+        for (path, file) in [
+            ("", "index.html"),
+            ("developer/deep/index.html", "developer/deep/index.html"),
+            ("developer/", "developer/index.html"),
+        ] {
+            // Nothing is cached: every node load needs credit.
+            let fetcher = CreditGatedFetcher::new(site.chunks.clone(), &[]);
+            let found = lookup_path_with_credit(&fetcher, &root, path, &CreditWindow::new(window))
+                .await
+                .unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
+            assert_eq!(found.data_ref, refs[file].to_vec(), "{path:?}");
+            let waits = fetcher.waits();
+            assert!(waits.len() >= 2, "{path:?}: root and a child: {waits:?}");
+            assert!(
+                waits.iter().all(|(a, b)| nodes.contains(a) && *b == budget),
+                "{path:?}: only manifest nodes are fetched, each with the budget: {waits:?}",
+            );
+
+            let fetcher = CreditGatedFetcher::new(site.chunks.clone(), &[]);
+            let err = lookup_path(&fetcher, &root, path).await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Fetch(_)),
+                "{path:?}: a non-waiting walk fails on a starved pool: {err:?}",
+            );
+            assert!(fetcher.waits().is_empty(), "{path:?}: lookup_path waited");
+        }
+
+        // The walk's waits come out of one window: with 4 s of it left,
+        // every node load gets 4 s; once it has passed, none waits and
+        // the walk fails as `lookup_path` does.
+        for (left, expected) in [
+            (
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(4),
+            ),
+            (std::time::Duration::ZERO, std::time::Duration::ZERO),
+        ] {
+            let credit = CreditWindow::new(window);
+            tokio::time::advance(window.saturating_sub(left)).await;
+            let fetcher = CreditGatedFetcher::new(site.chunks.clone(), &[]);
+            let r = lookup_path_with_credit(&fetcher, &root, "developer/index.html", &credit).await;
+            let waits = fetcher.waits();
+            // A spent window falls back to plain `fetch`.
+            assert_eq!(waits.is_empty(), expected.is_zero(), "{left:?} left");
+            assert!(
+                waits.iter().all(|(_, b)| *b == expected),
+                "{left:?} left: {waits:?}",
+            );
+            assert_eq!(r.is_ok(), !expected.is_zero(), "{left:?} left: {r:?}");
+        }
     }
 
     /// Fetcher that records every requested address.
