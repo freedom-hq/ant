@@ -499,6 +499,13 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountingSnapshotView {
     pub peers: Vec<PeerAccountingView>,
+    /// PLUR promised in every cheque this node has issued from its
+    /// chequebook, for pushsync and retrieval alike (bee's
+    /// `totalIssued`, the sum of the outbound ledger's cumulatives),
+    /// decimal. `None` when outbound settlement isn't running. Feeds
+    /// `/chequebook/balance`'s `availableBalance`.
+    #[serde(default)]
+    pub cheques_issued_plur: Option<String>,
 }
 
 /// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying

@@ -256,6 +256,9 @@ pub struct RunConfig {
     /// `None` keeps the constructor-provided `upload` /
     /// `pushsync_swap` as the final word, exactly as before.
     pub late_chain_rx: Option<mpsc::Receiver<LateChainInit>>,
+    /// The node-level switch for retrieval payments (issue #121); see
+    /// `ant_node::NodeConfig::retrieval_payments`.
+    pub retrieval_payments: bool,
 }
 
 /// Chain-derived swarm inputs delivered through
@@ -941,6 +944,14 @@ struct SwarmState {
     /// in which case every received-side field is absent — honest:
     /// without a ledger we accept no cheques.
     credit_ledger: Option<Arc<crate::swap::CreditLedger>>,
+    /// Retrieval payments switch (issue #121): `false` keeps downloads
+    /// on the free tier whatever the chequebook holds.
+    retrieval_payments: bool,
+    /// Latest `SetRetrievalFunds` and the chequebook it's for. Applied to
+    /// the outbound SWAP service whenever it runs on that chequebook, so
+    /// funds read before the service starts (antd's late chain init) are
+    /// not lost.
+    retrieval_funds: Option<([u8; 20], crate::RetrievalSwapPolicy)>,
     /// Process-wide push-side peer skip cache. Cloned into every
     /// `RoutingFetcher` built for `PushChunk` / `PushSoc` so a peer
     /// that just bounced a pushsync on chunk N is excluded from
@@ -1064,6 +1075,8 @@ impl SwarmState {
             peer_eth,
             pushsync_swap: None,
             credit_ledger: None,
+            retrieval_payments: true,
+            retrieval_funds: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1746,6 +1759,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     );
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
+    state.retrieval_payments = cfg.retrieval_payments;
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
     // a public multiaddr for us. Without this bee's inbound handshake handler
@@ -1835,6 +1849,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
         );
         state.pushsync_swap = Some(svc);
+        sync_retrieval_payment(&state);
     } else if cfg.late_chain_rx.is_some() {
         // Chain init is still resolving concurrently with bootstrap;
         // the DISABLED/enabled verdict is logged when the
@@ -2106,6 +2121,44 @@ async fn recv_late_chain(rx: Option<&mut mpsc::Receiver<LateChainInit>>) -> Opti
     }
 }
 
+/// Bring retrieval payments (issue #121) in line with the node's state:
+/// the outbound SWAP service gets the retrieval policy for its chequebook
+/// (the latest `SetRetrievalFunds` for it, unless the switch is off), and
+/// retrieval accounting pays through that service only while it has
+/// funds under that policy. Otherwise accounting has no payer and debt is
+/// settled by the pseudosettle refresh alone, exactly as without a
+/// chequebook. Called after every change to any of those inputs, so
+/// retrieval pays from the same chequebook, ledger and service that
+/// pushsync uses, and only while it runs.
+fn sync_retrieval_payment(state: &SwarmState) {
+    let Some(accounting) = state.accounting.as_ref() else {
+        return;
+    };
+    let payer = state.pushsync_swap.as_ref().and_then(|svc| {
+        let policy = state
+            .retrieval_funds
+            .filter(|(chequebook, _)| state.retrieval_payments && *chequebook == svc.chequebook())
+            .map(|(_, policy)| policy);
+        svc.set_retrieval_policy(policy);
+        svc.pays_retrieval()
+            .then(|| svc.clone() as Arc<dyn ant_retrieval::accounting::RetrievalPayment>)
+    });
+    let paying = payer.is_some();
+    if paying != accounting.pays_with_swap() {
+        info!(
+            target: "ant_p2p::pushsync_swap",
+            paying,
+            "retrieval settlement: {}",
+            if paying {
+                "downloads pay peers with SWAP cheques past the early-payment threshold"
+            } else {
+                "downloads use the free pseudosettle tier"
+            },
+        );
+    }
+    accounting.set_payment(payer);
+}
+
 /// Install the chain-derived inputs once `antd`'s startup Gnosis reads
 /// complete: fill the upload-runtime slot consulted by
 /// `handle_control_command` (`PushChunk`, postage commands) and build
@@ -2143,6 +2196,7 @@ fn apply_late_chain_init(
                 "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
             );
             state.pushsync_swap = Some(Arc::new(svc));
+            sync_retrieval_payment(state);
         }
         None => {
             info!(
@@ -3497,6 +3551,7 @@ fn handle_control_command(
                 svc = svc.with_hot_hint(tx);
             }
             state.pushsync_swap = Some(Arc::new(svc));
+            sync_retrieval_payment(state);
             info!(
                 target: "ant_p2p::pushsync_swap",
                 chequebook = %hex::encode(chequebook),
@@ -3509,6 +3564,36 @@ fn handle_control_command(
                 ),
             });
         }
+        ControlCommand::SetRetrievalFunds {
+            chequebook,
+            deposited_plur,
+            exchange_rate_plur,
+            deduction_plur,
+            ack,
+        } => {
+            state.retrieval_funds = Some((
+                chequebook,
+                crate::RetrievalSwapPolicy {
+                    deposited_plur: deposited_plur.into(),
+                    max_exchange_rate: exchange_rate_plur.into(),
+                    max_deduction: deduction_plur.into(),
+                },
+            ));
+            sync_retrieval_payment(state);
+            let _ = ack.send(ControlAck::Ok {
+                message: format!(
+                    "retrieval funds for chequebook 0x{}: {deposited_plur} PLUR deposited",
+                    hex::encode(chequebook),
+                ),
+            });
+        }
+        ControlCommand::SetRetrievalPayments { enabled, ack } => {
+            state.retrieval_payments = enabled;
+            sync_retrieval_payment(state);
+            let _ = ack.send(ControlAck::Ok {
+                message: format!("retrieval payments {}", if enabled { "on" } else { "off" }),
+            });
+        }
         ControlCommand::DisablePushsyncSwap { chequebook, ack } => {
             let running = state
                 .pushsync_swap
@@ -3516,6 +3601,7 @@ fn handle_control_command(
                 .is_some_and(|s| s.chequebook() == chequebook);
             let message = if running {
                 state.pushsync_swap = None;
+                sync_retrieval_payment(state);
                 warn!(
                     target: "ant_p2p::pushsync_swap",
                     chequebook = %hex::encode(chequebook),
@@ -3944,7 +4030,13 @@ fn build_accounting_snapshot(state: &SwarmState) -> AccountingSnapshotView {
     }
     // Stable order so repeated snapshots render identically.
     rows.sort_by(|a, b| a.peer.cmp(&b.peer));
-    AccountingSnapshotView { peers: rows }
+    AccountingSnapshotView {
+        peers: rows,
+        cheques_issued_plur: state
+            .pushsync_swap
+            .as_ref()
+            .map(|svc| svc.outbound_ledger().total_issued().to_string()),
+    }
 }
 
 /// Cap on how many bytes any single file span inside a stewardship
@@ -9694,6 +9786,100 @@ mod tests {
     /// chequebook — the path `ant-ffi` takes when the chain disqualifies
     /// the chequebook `ant_init` enabled unchecked — and leaves a service
     /// on any other chequebook alone.
+    /// Issue #121 wiring: retrieval accounting pays through the outbound
+    /// SWAP service only with funds known for the chequebook that
+    /// service runs on, while the switch is on; funds that arrive before
+    /// the service starts are applied once it does. Everything else
+    /// (no chequebook, unknown or zero funds, another chequebook's funds,
+    /// switch off, settlement disabled) leaves downloads on the free tier.
+    #[tokio::test]
+    async fn retrieval_pays_only_with_funds_for_the_running_chequebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let accounting = Arc::new(ant_retrieval::accounting::Accounting::new());
+        state.accounting = Some(accounting.clone());
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (cb, other) = ([0xcbu8; 20], [0x0cu8; 20]);
+        let mut send = |state: &mut SwarmState, cmd| {
+            handle_control_command(state, &mut peerstore, &control, None, 0, cmd);
+        };
+        let funds = |state: &mut SwarmState,
+                     send: &mut dyn FnMut(&mut SwarmState, ControlCommand),
+                     chequebook,
+                     deposited| {
+            let (ack, _rx) = oneshot::channel();
+            send(
+                state,
+                ControlCommand::SetRetrievalFunds {
+                    chequebook,
+                    deposited_plur: deposited,
+                    exchange_rate_plur: 100_000,
+                    deduction_plur: 100,
+                    ack,
+                },
+            );
+        };
+
+        // Funds before settlement runs: kept, nothing to pay with yet.
+        funds(&mut state, &mut send, cb, 10_000_000_000_000);
+        assert!(!accounting.pays_with_swap());
+
+        let (ack, _rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::EnablePushsyncSwap {
+                chequebook: cb,
+                swap_secret: [3u8; 32],
+                chain_id: 100,
+                outbound_ledger_path: dir.path().join("out.json").to_string_lossy().into(),
+                ack,
+            },
+        );
+        assert!(accounting.pays_with_swap(), "earlier funds apply on enable");
+
+        let (ack, _rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::SetRetrievalPayments {
+                enabled: false,
+                ack,
+            },
+        );
+        assert!(!accounting.pays_with_swap(), "switch off: free tier");
+        let (ack, _rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::SetRetrievalPayments { enabled: true, ack },
+        );
+        assert!(accounting.pays_with_swap());
+
+        funds(&mut state, &mut send, other, 10_000_000_000_000);
+        assert!(!accounting.pays_with_swap(), "another chequebook's funds");
+        funds(&mut state, &mut send, cb, 0);
+        assert!(!accounting.pays_with_swap(), "an empty chequebook");
+        funds(&mut state, &mut send, cb, 10_000_000_000_000);
+        assert!(accounting.pays_with_swap());
+
+        let (ack, _rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: cb,
+                ack,
+            },
+        );
+        assert!(!accounting.pays_with_swap(), "settlement off");
+    }
+
     #[tokio::test]
     async fn disable_pushsync_swap_only_stops_the_named_chequebook() {
         let dir = tempfile::tempdir().unwrap();

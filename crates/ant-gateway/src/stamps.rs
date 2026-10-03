@@ -598,6 +598,9 @@ mod tests {
         async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
             Ok(0)
         }
+        async fn chequebook_total_paid_out(&self, _cb: [u8; 20]) -> Result<u128, String> {
+            Ok(0)
+        }
         async fn batch_remaining_balance(&self, id: [u8; 32]) -> Result<u128, String> {
             match id {
                 LIVE => Ok(1_000),

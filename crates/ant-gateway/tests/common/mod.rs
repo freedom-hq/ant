@@ -270,6 +270,26 @@ pub fn status_router_with_chain_hooks_and_cors(
         on_chequebook_refused,
         cors,
         None,
+        None,
+    )
+}
+
+/// [`status_router_with_chain`] whose node answers `AccountingSnapshot`
+/// with `issued` as the PLUR its chequebook has promised in cheques
+/// (`None`: outbound settlement not running).
+pub fn status_router_with_chain_and_issued(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: Option<u128>,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        issued,
     )
 }
 
@@ -291,6 +311,7 @@ pub fn status_router_recording_registrations(
         None,
         CorsConfig::default(),
         Some(seen.clone()),
+        None,
     );
     (router, seen)
 }
@@ -302,6 +323,7 @@ fn chain_router(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
     registrations: Option<Registrations>,
+    issued: Option<u128>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -312,6 +334,15 @@ fn chain_router(
     // exercise the node loop).
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::AccountingSnapshot { ack } = cmd {
+                let _ = ack.send(ControlAck::Accounting(
+                    ant_control::AccountingSnapshotView {
+                        peers: Vec::new(),
+                        cheques_issued_plur: issued.map(|i| i.to_string()),
+                    },
+                ));
+                continue;
+            }
             if let ControlCommand::RegisterBatch {
                 batch_id,
                 depth,
@@ -956,6 +987,12 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         ControlCommand::DisablePushsyncSwap { ack, .. } => {
             let _ = ack.send(ControlAck::Ok {
                 message: "settlement disable ignored (test fixture)".into(),
+            });
+        }
+        ControlCommand::SetRetrievalFunds { ack, .. }
+        | ControlCommand::SetRetrievalPayments { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "retrieval payments ignored (test fixture)".into(),
             });
         }
         // Read-back propagation check. The fixture has a single source

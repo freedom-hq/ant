@@ -1356,6 +1356,61 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
     }
 }
 
+/// Switch retrieval payments (issue #121) on or off for the running
+/// node. On (the default), downloads pay peers with SWAP cheques from the
+/// node's chequebook once the debt to a peer reaches half its payment
+/// threshold, after the free pseudosettle refresh, as bee does; that lifts
+/// downloads past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB
+/// (bee's oracle rate), never more than the chequebook holds. Off keeps
+/// downloads on the free tier even with a funded chequebook, for hosts
+/// that fund it for publishing only. Uploads' settlement is unaffected.
+///
+/// Payments also need a chequebook with funds the node has read from the
+/// chain: they start after the first settlement setup that has an RPC
+/// (`ant_start_gateway`'s chain init, a storage call,
+/// [`ant_deploy_chequebook`]), not at `ant_init`. The switch is not
+/// persisted; set it after every `ant_init`.
+///
+/// Returns `0` on success, `-1` on a null handle, `-2` if the node loop
+/// didn't ack (already shut down); in the `-2` case an allocated error
+/// string is written into `*out_err` (free with [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_retrieval_payments(
+    handle: *const AntHandle,
+    enabled: bool,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_set_retrieval_payments: null handle");
+            return -1;
+        };
+        match catch_unwind(AssertUnwindSafe(|| {
+            drive::set_retrieval_payments(handle, enabled)
+        })) {
+            Ok(Ok(msg)) => {
+                tracing::info!(target: "ant-ffi", "{msg}");
+                0
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_set_retrieval_payments");
+                -2
+            }
+        }
+    }
+}
+
 /// System-suspend the upload subsystem — call when the app is moving to
 /// the background or the device just went offline. Every in-flight
 /// upload is paused with the "resumes automatically" marker (a job the

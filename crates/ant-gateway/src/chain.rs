@@ -51,6 +51,9 @@ pub trait ChainReader: Send + Sync {
     async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn chequebook_balance(&self, chequebook: [u8; 20]) -> Result<u128, String>;
+    /// The chequebook's `totalPaidOut()`: PLUR its beneficiaries have
+    /// cashed so far.
+    async fn chequebook_total_paid_out(&self, chequebook: [u8; 20]) -> Result<u128, String>;
     /// `PostageStamp.remainingBalance(batchId)` — per-chunk balance left
     /// on a batch. Used to enrich `GET /stamps` with bee's `amount` /
     /// `batchTTL`. Defaulted to "unsupported" so non-chain readers (test
@@ -538,10 +541,15 @@ struct ChequebookBalanceBody {
     available_balance: String,
 }
 
-/// `GET /chequebook/balance`. Reports the chequebook contract's xBZZ
-/// balance (bee's `Balance()` is just `BZZ.balanceOf(chequebook)`).
-/// `availableBalance` mirrors it because `antd` doesn't draw down the
-/// chequebook on-chain mid-session. Zeros when no chequebook is
+/// `GET /chequebook/balance`. `totalBalance` is the chequebook
+/// contract's xBZZ balance (bee's `Balance()` is just
+/// `BZZ.balanceOf(chequebook)`). `availableBalance` is bee's
+/// `AvailableBalance`: that balance plus what beneficiaries already
+/// cashed (`totalPaidOut()`) minus every cheque the node has issued, so
+/// it drops as soon as uploads or downloads (issue #121) pay with
+/// cheques, not only once peers cash them. While outbound settlement
+/// isn't running the node has issued nothing it can count, and
+/// `availableBalance` is the balance. Zeros when no chequebook is
 /// configured (PLAN.md D2).
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
     let zero = || {
@@ -564,9 +572,25 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => v,
         Err(r) => return r,
     };
+    let issued = match crate::settlements::fetch_snapshot(&handle).await {
+        Ok(snapshot) => snapshot.cheques_issued_plur,
+        Err(r) => return r,
+    };
+    let available = match issued {
+        None => bal,
+        Some(issued) => {
+            let paid_out = match guarded(chain.reader.chequebook_total_paid_out(cb)).await {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            // More issued than u128 holds is more than any chequebook.
+            let issued = issued.parse::<u128>().unwrap_or(u128::MAX);
+            bal.saturating_add(paid_out).saturating_sub(issued)
+        }
+    };
     Json(ChequebookBalanceBody {
         total_balance: bal.to_string(),
-        available_balance: bal.to_string(),
+        available_balance: available.to_string(),
     })
     .into_response()
 }

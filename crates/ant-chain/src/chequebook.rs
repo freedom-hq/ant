@@ -241,6 +241,23 @@ pub fn chequebook_balance_selector() -> [u8; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
+/// Bee's SWAP price oracle on Gnosis mainnet
+/// (`pkg/config/chain.go`, `SwapPriceOracleAddress`). Its `getPrice()`
+/// returns the exchange rate (PLUR per accounting unit) and the one-off
+/// deduction (PLUR) every bee node uses to price a cheque, and sends in
+/// its swap response headers.
+pub const GNOSIS_SWAP_PRICE_ORACLE: [u8; 20] = [
+    0xa5, 0x7a, 0x50, 0xa8, 0x31, 0xb3, 0x1c, 0x90, 0x4a, 0x77, 0x0e, 0xdb, 0xcb, 0x70, 0x6e, 0x03,
+    0xaf, 0xcd, 0xbd, 0x94,
+];
+
+/// `PriceOracle.getPrice()` selector: `(uint256 price, uint256 deduction)`.
+#[must_use]
+pub fn price_oracle_get_price_selector() -> [u8; 4] {
+    let h = keccak(b"getPrice()");
+    [h[0], h[1], h[2], h[3]]
+}
+
 /// `Chequebook.chequeHash(address chequebook, address beneficiary, uint256 cumulativePayout)`
 /// view — recomputes the EIP-712 digest exactly the way the contract
 /// does internally before recovering the issuer in

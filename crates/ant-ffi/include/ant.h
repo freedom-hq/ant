@@ -197,6 +197,29 @@ int ant_peer_count(const AntHandle *handle);
 int ant_resume(const AntHandle *handle, char **out_err);
 
 /*
+ * Switch retrieval payments (issue #121) on or off for the running node.
+ * On (the default), downloads pay peers with SWAP cheques from the
+ * node's chequebook once the debt to a peer reaches half its payment
+ * threshold, after the free pseudosettle refresh, as bee does; that
+ * lifts downloads past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ
+ * per GB (bee's oracle rate), never more than the chequebook holds. Off
+ * keeps downloads on the free tier even with a funded chequebook, for
+ * hosts that fund it for publishing only. Uploads' settlement is
+ * unaffected.
+ *
+ * Payments also need a chequebook with funds the node has read from the
+ * chain: they start after the first settlement setup that has an RPC
+ * (ant_start_gateway's chain init, a storage call,
+ * ant_deploy_chequebook), not at ant_init. The switch is not persisted;
+ * set it after every ant_init.
+ *
+ * Returns 0 on success, -1 if `handle` is NULL, and -2 if the node loop
+ * didn't ack (already shut down) — in which case an allocated error
+ * string is written into *out_err (free with ant_free_string).
+ */
+int ant_set_retrieval_payments(const AntHandle *handle, bool enabled, char **out_err);
+
+/*
  * System-suspend the upload subsystem — call when the app is moving to
  * the background or the device just went offline. Every in-flight
  * upload is paused with the "resumes automatically" marker (a job the

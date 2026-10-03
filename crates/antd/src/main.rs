@@ -323,6 +323,25 @@ struct Opt {
         default_value_t = ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR
     )]
     chequebook_deposit_plur: u128,
+
+    /// Pay peers for downloads with SWAP cheques from the chequebook
+    /// once the debt to a peer reaches half its payment threshold, after
+    /// the free pseudosettle refresh, as bee does (issue #121). Lifts
+    /// downloads past the free tier's ~5-6 Mbit/s ceiling, at about
+    /// 0.75 xBZZ per fully paid GB (bee's oracle rate); never spends more
+    /// than the chequebook holds. `false` keeps downloads on the free
+    /// tier even with a funded chequebook (uploads' settlement is
+    /// unaffected). Needs a chequebook and a Gnosis RPC to read its
+    /// balance; does nothing without one. Falls back to
+    /// `ANT_RETRIEVAL_PAYMENTS` env.
+    #[arg(
+        long,
+        env = "ANT_RETRIEVAL_PAYMENTS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_name = "BOOL"
+    )]
+    retrieval_payments: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -685,6 +704,7 @@ async fn main() -> Result<()> {
             .with_disk_cache(disk_cache)
             .with_swap(Some(swap_cfg))
             .with_upload_manager(Some(upload_manager))
+            .with_retrieval_payments(opt.retrieval_payments)
             .with_late_chain(Some(late_chain_rx)),
     ));
 
@@ -825,12 +845,16 @@ async fn main() -> Result<()> {
     // Capacity-1 channel and a single send: this never blocks. A send
     // error means the node loop already exited — its JoinHandle in the
     // select below will surface the reason.
+    let settling_on = pushsync_swap_cfg.as_ref().map(|c| c.chequebook);
     let _ = late_chain_tx
         .send(ant_node::LateChainInit {
             upload,
             pushsync_swap: pushsync_swap_cfg,
         })
         .await;
+    if let Some(chequebook) = settling_on {
+        spawn_retrieval_funds_watch(&opt, chequebook, cmd_tx.clone());
+    }
 
     // Chain context for the gateway's wallet / chequebook / status /
     // chainstate endpoints (PLAN.md J.5 A2/A3/D1/D2). Built only when a
@@ -2620,6 +2644,7 @@ impl SettlementOnBuy {
                     chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
                     "outbound SWAP settlement enabled after a stamp buy — pushsync will emit cheques",
                 );
+                spawn_retrieval_funds_watch(&self.opt, cfg.chequebook, self.commands.clone());
                 Some(Settlement::of(&self.opt, Some(&cfg)))
             }
             Ok(ControlAck::Error { message }) => {
@@ -2632,6 +2657,55 @@ impl SettlementOnBuy {
             _ => None,
         }
     }
+}
+
+/// Keep the node's view of what `chequebook` can pay for downloads
+/// current (issue #121): run the shared
+/// `ant_chain::chequebook_store::watch_retrieval_funds` (as `ant-ffi`
+/// does), publishing each read into `ControlCommand::SetRetrievalFunds`.
+/// Reads go to `--gnosis-rpc-url`, else the public logs RPC (as the
+/// gateway's reads do). Without either, or with `--retrieval-payments
+/// false`, nothing runs and downloads stay on the free tier.
+fn spawn_retrieval_funds_watch(
+    opt: &Opt,
+    chequebook: [u8; 20],
+    commands: mpsc::Sender<ControlCommand>,
+) {
+    if !opt.retrieval_payments {
+        return;
+    }
+    let Some(rpc) = configured_rpc_url(opt).or_else(|| resolve_logs_rpc(opt)) else {
+        tracing::info!(
+            target: "antd",
+            "no Gnosis RPC to read the chequebook balance from; downloads stay on the free tier",
+        );
+        return;
+    };
+    tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
+        ant_chain::ChainClient::new(rpc),
+        chequebook,
+        move |funds| publish_retrieval_funds(commands.clone(), chequebook, funds),
+    ));
+}
+
+/// Hand one [`ant_chain::chequebook_store::RetrievalFunds`] read to the
+/// node. `false` once the node is gone, which ends the watch.
+async fn publish_retrieval_funds(
+    commands: mpsc::Sender<ControlCommand>,
+    chequebook: [u8; 20],
+    funds: ant_chain::chequebook_store::RetrievalFunds,
+) -> bool {
+    let (ack, ack_rx) = oneshot::channel();
+    let sent = commands
+        .send(ControlCommand::SetRetrievalFunds {
+            chequebook,
+            deposited_plur: funds.deposited_plur,
+            exchange_rate_plur: funds.exchange_rate_plur,
+            deduction_plur: funds.deduction_plur,
+            ack,
+        })
+        .await;
+    sent.is_ok() && ack_rx.await.is_ok()
 }
 
 /// Run the startup `factory.deployedContracts(chequebook)` check and,

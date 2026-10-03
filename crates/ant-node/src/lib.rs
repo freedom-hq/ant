@@ -118,6 +118,12 @@ pub struct NodeConfig {
     /// of the bootstrap dial (they were costing ~3 s of
     /// `time_to_first_peer_s`). See [`ant_p2p::RunConfig::late_chain_rx`].
     pub late_chain: Option<mpsc::Receiver<LateChainInit>>,
+    /// Pay peers for downloads with SWAP cheques once a funded
+    /// chequebook backs outbound settlement (issue #121), as bee does.
+    /// `true` by default; `false` keeps downloads on the free
+    /// pseudosettle tier. Switchable at runtime with
+    /// `ControlCommand::SetRetrievalPayments`.
+    pub retrieval_payments: bool,
 }
 
 impl NodeConfig {
@@ -150,6 +156,7 @@ impl NodeConfig {
             pushsync_swap: None,
             upload_manager: None,
             late_chain: None,
+            retrieval_payments: true,
         }
     }
 
@@ -256,6 +263,12 @@ impl NodeConfig {
     }
 
     #[must_use]
+    pub const fn with_retrieval_payments(mut self, enabled: bool) -> Self {
+        self.retrieval_payments = enabled;
+        self
+    }
+
+    #[must_use]
     pub fn with_late_chain(mut self, rx: Option<mpsc::Receiver<LateChainInit>>) -> Self {
         self.late_chain = rx;
         self
@@ -312,6 +325,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         }),
         peer_eth,
         late_chain_rx: cfg.late_chain,
+        retrieval_payments: cfg.retrieval_payments,
     })
     .await?;
     Ok(())

@@ -71,6 +71,27 @@ impl ChainReader for AntChainReader {
             .map_err(|e| e.to_string())
     }
 
+    async fn chequebook_total_paid_out(&self, chequebook: [u8; 20]) -> Result<u128, String> {
+        let selector = ant_chain::chequebook::chequebook_total_paid_out_selector();
+        let out = self
+            .client
+            .eth_call(
+                &format!("0x{}", hex::encode(chequebook)),
+                &format!("0x{}", hex::encode(selector)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let word = out
+            .get(..32)
+            .ok_or_else(|| format!("totalPaidOut returned {} bytes", out.len()))?;
+        if word[..16].iter().any(|&b| b != 0) {
+            return Err("totalPaidOut overflows u128".into());
+        }
+        Ok(u128::from_be_bytes(
+            word[16..].try_into().expect("16 bytes"),
+        ))
+    }
+
     async fn batch_remaining_balance(&self, batch_id: [u8; 32]) -> Result<u128, String> {
         self.client
             .postage_remaining_balance(&self.postage_contract, &batch_id)

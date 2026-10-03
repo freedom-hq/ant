@@ -82,6 +82,19 @@
 //! next driver tick (100 ms) instead of waiting for the 1 s
 //! periodic walk.
 //!
+//! # Paying with SWAP (issue #121)
+//!
+//! With a [`RetrievalPayment`] installed (a funded chequebook, retrieval
+//! payments on), debt is settled in two steps, as bee's
+//! `Accounting.settle` does. The free pseudosettle refresh stays first
+//! (the driver above). Once the expected debt to a peer reaches
+//! [`EARLY_PAYMENT_THRESHOLD`] (half the peer's payment threshold), the
+//! debt the refresh isn't expected to cover is paid with a cheque
+//! (`PeerBalance::cheque_due`), one payment per peer at a time, at least
+//! [`MINIMUM_PAYMENT`], with [`FAILED_SETTLEMENT_INTERVAL`] of back-off
+//! after a failure. A paid debt frees credit like a refresh does. Without
+//! a payer nothing here runs, and the mirror behaves as before.
+//!
 //! # Conservatism
 //!
 //! Our mirror is intentionally conservative: we only ever
@@ -96,16 +109,22 @@
 //! `creditAction.Cleanup`); only successful applies stay on the
 //! books until pseudosettle clears them.
 
+use async_trait::async_trait;
 use libp2p::PeerId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
 use crate::fetcher::Overlay;
 
 type SharedBalances = Arc<Mutex<HashMap<PeerId, PeerBalance>>>;
+
+/// The slot holding the node's [`RetrievalPayment`], shared by the
+/// [`Accounting`] and every [`DebitGuard`] it hands out so a payer
+/// installed (or removed) at runtime takes effect on the next settle.
+type PaymentSlot = Arc<RwLock<Option<Arc<dyn RetrievalPayment>>>>;
 
 /// Bee's `lightDisconnectLimit` for a peer that declares itself
 /// `full_node = false` in the BZZ handshake. Computed by bee as
@@ -155,6 +174,49 @@ pub const OVERDRAFT_LIMIT: u64 = LIGHT_DISCONNECT_LIMIT;
 /// 50 % of `LIGHT_DISCONNECT_LIMIT` matches bee's
 /// `earlyPayment = 50 %` constant in `pkg/accounting/accounting.go`.
 pub const HOT_DEBT_THRESHOLD: u64 = LIGHT_DISCONNECT_LIMIT / 2;
+
+/// Bee's `lightPaymentThreshold`: the payment threshold a bee peer
+/// announces to a light node (`paymentThreshold / lightFactor` =
+/// 13.5 M / 10 units, `pkg/node/node.go`).
+pub const LIGHT_PAYMENT_THRESHOLD: u64 = 1_350_000;
+
+/// Expected debt to a peer at which retrieval settles with money (issue
+/// #121): bee's `earlyPayment`, `--payment-early-percent 50` of the
+/// peer's payment threshold (`accounting.go::PrepareCredit`, where it
+/// "pays early to avoid needlessly blocking requests later when
+/// concurrent requests occur").
+pub const EARLY_PAYMENT_THRESHOLD: u64 = LIGHT_PAYMENT_THRESHOLD / 2;
+
+/// Smallest SWAP payment worth a cheque: bee's `minimumPayment =
+/// refreshRate / minimumPaymentDivisor` (5), with a light node's refresh
+/// rate.
+pub const MINIMUM_PAYMENT: u64 = LIGHT_REFRESH_RATE_PER_SEC / 5;
+
+/// After a failed SWAP payment to a peer, no new one to that peer for
+/// this long: bee's `failedSettlementInterval` (10 s). The pseudosettle
+/// refresh keeps running meanwhile.
+pub const FAILED_SETTLEMENT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Pays a peer for retrieval debt with money: the second step of bee's
+/// `Accounting.settle` (`payFunction` = `swap.Pay`), after the free
+/// pseudosettle refresh. Implemented over the node's chequebook in
+/// `ant-p2p` (`PushsyncSwap`); installed with
+/// [`Accounting::set_payment`]. Without one, retrieval settles with the
+/// refresh alone, as before issue #121.
+// `#[async_trait]` marks the boxed-future method `#[must_use]`; clippy
+// 1.99's `double_must_use` flags that expansion (as on `ChunkFetcher`).
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait RetrievalPayment: Send + Sync {
+    /// Send `peer` a SWAP cheque worth `amount` accounting units of debt.
+    /// `Ok` once the peer has processed the cheque (credited it, when it
+    /// accepted it); [`Accounting`] then lowers its mirrored debt by
+    /// `amount`. `Err` (no beneficiary, no
+    /// chequebook credit left, stream failure, unacceptable rates) leaves
+    /// the debt to the refresh and backs off for
+    /// [`FAILED_SETTLEMENT_INTERVAL`].
+    async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String>;
+}
 
 /// Per-chunk skip TTL for peers that fail [`Accounting::try_reserve`].
 ///
@@ -287,6 +349,19 @@ struct PeerBalance {
     /// mirror's connection-scoped lifetime — unlike bee, which
     /// persists totals in its statestore.
     time_settled: u64,
+    /// SWAP payments sent but not finished yet, in accounting units
+    /// (bee's `shadowReservedBalance`). Debt they will clear is not paid
+    /// twice.
+    shadow_reserved: u64,
+    /// A SWAP payment to this peer is in flight (bee's `paymentOngoing`):
+    /// at most one at a time.
+    payment_ongoing: bool,
+    /// When the last SWAP payment to this peer failed, for the
+    /// [`FAILED_SETTLEMENT_INTERVAL`] back-off.
+    last_payment_failure: Option<Instant>,
+    /// Debt cleared by SWAP cheques since the connection was established,
+    /// in accounting units.
+    swap_settled: u64,
 }
 
 impl Default for PeerBalance {
@@ -297,7 +372,60 @@ impl Default for PeerBalance {
             last_refresh: None,
             last_used: Instant::now(),
             time_settled: 0,
+            shadow_reserved: 0,
+            payment_ongoing: false,
+            last_payment_failure: None,
+            swap_settled: 0,
         }
+    }
+}
+
+impl PeerBalance {
+    /// The money half of bee's `Accounting.settle`: how much of this
+    /// peer's debt to pay with a SWAP cheque now, if any. `expected_debt`
+    /// is the debt once every reservation in flight is applied
+    /// (`balance + reserved`, plus the price being reserved).
+    ///
+    /// Pays only when the expected debt, less payments already in
+    /// flight, has reached [`EARLY_PAYMENT_THRESHOLD`], the settled debt
+    /// is at least one second of refresh, no payment is in flight and the
+    /// last failure is more than [`FAILED_SETTLEMENT_INTERVAL`] ago. The
+    /// amount is the debt the pseudosettle refresh is not expected to
+    /// cover (`balance − refreshDue − shadowReserved`, where `refreshDue`
+    /// is a light refresh rate per whole second since the last accepted
+    /// refresh) and must be at least [`MINIMUM_PAYMENT`]. A peer never
+    /// refreshed has, as in bee (zero refresh timestamp), everything
+    /// still due to the refresh, so it's not paid.
+    ///
+    /// On `Some(amount)` the payment is marked in flight and `amount` is
+    /// shadow-reserved; the caller must report the outcome with
+    /// [`Accounting::payment_done`].
+    fn cheque_due(&mut self, expected_debt: u64, now: Instant) -> Option<u64> {
+        if self.balance == 0
+            || expected_debt.saturating_sub(self.shadow_reserved) < EARLY_PAYMENT_THRESHOLD
+            || self.balance.saturating_sub(self.shadow_reserved) < LIGHT_REFRESH_RATE_PER_SEC
+            || self.payment_ongoing
+        {
+            return None;
+        }
+        if self
+            .last_payment_failure
+            .is_some_and(|failed| now.duration_since(failed) <= FAILED_SETTLEMENT_INTERVAL)
+        {
+            return None;
+        }
+        let since_refresh = now.duration_since(self.last_refresh?).as_secs();
+        let refresh_due = since_refresh.saturating_mul(LIGHT_REFRESH_RATE_PER_SEC);
+        let amount = self
+            .balance
+            .saturating_sub(refresh_due)
+            .saturating_sub(self.shadow_reserved);
+        if amount < MINIMUM_PAYMENT {
+            return None;
+        }
+        self.payment_ongoing = true;
+        self.shadow_reserved = self.shadow_reserved.saturating_add(amount);
+        Some(amount)
     }
 }
 
@@ -330,6 +458,11 @@ pub struct Accounting {
     /// waiter can tell a release it hasn't looked at yet from one it
     /// already has; see [`Accounting::credit_epoch`].
     credit_epoch: Arc<AtomicU64>,
+    /// Pays retrieval debt with SWAP cheques once it reaches
+    /// [`EARLY_PAYMENT_THRESHOLD`] (issue #121). Empty on a node without
+    /// a funded chequebook, or with retrieval payments switched off:
+    /// debt is then settled by the pseudosettle refresh alone.
+    payment: PaymentSlot,
 }
 
 /// Hint payload sent from the fetcher hot path into the
@@ -355,7 +488,23 @@ impl Accounting {
             hot_hint: None,
             credit_freed: Arc::new(Notify::new()),
             credit_epoch: Arc::new(AtomicU64::new(0)),
+            payment: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Install (`Some`) or remove (`None`) the payer that settles
+    /// retrieval debt with SWAP cheques. Takes effect for the next
+    /// settlement; payments already in flight finish.
+    pub fn set_payment(&self, payment: Option<Arc<dyn RetrievalPayment>>) {
+        if let Ok(mut slot) = self.payment.write() {
+            *slot = payment;
+        }
+    }
+
+    /// Whether retrieval debt is currently settled with SWAP cheques.
+    #[must_use]
+    pub fn pays_with_swap(&self) -> bool {
+        self.payment.read().is_ok_and(|slot| slot.is_some())
     }
 
     #[must_use]
@@ -397,6 +546,7 @@ impl Accounting {
     /// `pkg/retrieval/retrieval.go::case ErrOverdraft` arm.
     #[must_use]
     pub fn try_reserve(&self, peer: PeerId, price: u64) -> Option<DebitGuard> {
+        let payer = current_payer(&self.payment);
         let mut peers = self.peers.lock().ok()?;
         let now = Instant::now();
         let entry = peers.entry(peer).or_insert_with(|| PeerBalance {
@@ -426,11 +576,24 @@ impl Accounting {
             .balance
             .saturating_add(entry.reserved)
             .saturating_add(price);
-        if next > limit {
+        // Bee's `PrepareCredit` settles first when this reservation
+        // takes the expected debt to the early-payment threshold, then
+        // checks the overdraft limit. The payment runs in the background,
+        // so (as in bee) it frees credit for later reservations, not this
+        // one.
+        let cheque = payer.as_ref().and_then(|_| entry.cheque_due(next, now));
+        let admitted = next <= limit;
+        if admitted {
+            entry.reserved = entry.reserved.saturating_add(price);
+            entry.last_used = now;
+        }
+        drop(peers);
+        if let (Some(payer), Some(amount)) = (payer, cheque) {
+            self.spawn_payment(payer, peer, amount);
+        }
+        if !admitted {
             return None;
         }
-        entry.reserved = entry.reserved.saturating_add(price);
-        entry.last_used = now;
         Some(DebitGuard {
             peer,
             price,
@@ -439,7 +602,52 @@ impl Accounting {
             hot_hint: self.hot_hint.clone(),
             credit_freed: self.credit_freed.clone(),
             credit_epoch: self.credit_epoch.clone(),
+            payment: self.payment.clone(),
         })
+    }
+
+    fn spawn_payment(&self, payer: Arc<dyn RetrievalPayment>, peer: PeerId, amount: u64) {
+        spawn_payment(
+            payer,
+            peer,
+            amount,
+            self.peers.clone(),
+            self.credit_freed.clone(),
+            self.credit_epoch.clone(),
+        );
+    }
+
+    /// Record the outcome of a SWAP payment of `amount` started by
+    /// [`PeerBalance::cheque_due`] (bee's `NotifyPaymentSent`): release
+    /// the shadow reservation, and on success lower the debt by `amount`
+    /// and wake a fetch waiting for credit; on failure start the
+    /// [`FAILED_SETTLEMENT_INTERVAL`] back-off.
+    fn payment_done(
+        balances: &SharedBalances,
+        epoch: &AtomicU64,
+        notify: &Notify,
+        peer: PeerId,
+        amount: u64,
+        ok: bool,
+    ) {
+        let Ok(mut peers) = balances.lock() else {
+            return;
+        };
+        // A peer forgotten (disconnected) meanwhile starts afresh, on
+        // bee's side too.
+        let Some(entry) = peers.get_mut(&peer) else {
+            return;
+        };
+        entry.payment_ongoing = false;
+        entry.shadow_reserved = entry.shadow_reserved.saturating_sub(amount);
+        if !ok {
+            entry.last_payment_failure = Some(Instant::now());
+            return;
+        }
+        entry.balance = entry.balance.saturating_sub(amount);
+        entry.swap_settled = entry.swap_settled.saturating_add(amount);
+        drop(peers);
+        Self::release_credit(epoch, notify);
     }
 
     /// Wait until credit may have come free, or `max` elapses, whichever
@@ -527,6 +735,25 @@ impl Accounting {
         peers.remove(peer);
     }
 
+    /// Debt to `peer` cleared by SWAP cheques since it connected, in
+    /// accounting units (0 for an unknown peer).
+    #[must_use]
+    pub fn swap_settled(&self, peer: &PeerId) -> u64 {
+        self.peers
+            .lock()
+            .ok()
+            .and_then(|peers| peers.get(peer).map(|b| b.swap_settled))
+            .unwrap_or(0)
+    }
+
+    /// Move `peer`'s last accepted refresh `by` into the past.
+    #[cfg(test)]
+    fn backdate_refresh(&self, peer: &PeerId, by: Duration) {
+        let mut peers = self.peers.lock().unwrap();
+        let entry = peers.get_mut(peer).unwrap();
+        entry.last_refresh = entry.last_refresh.and_then(|t| t.checked_sub(by));
+    }
+
     /// Snapshot a peer's balance for diagnostic logging. Returns
     /// `(balance, reserved)`. Cheap (single lock acquisition).
     #[must_use]
@@ -570,6 +797,7 @@ pub struct DebitGuard {
     hot_hint: Option<mpsc::Sender<HotHint>>,
     credit_freed: Arc<Notify>,
     credit_epoch: Arc<AtomicU64>,
+    payment: PaymentSlot,
 }
 
 impl DebitGuard {
@@ -580,7 +808,8 @@ impl DebitGuard {
     /// next 100 ms tick rather than waiting for the periodic
     /// walk.
     pub fn apply(mut self) {
-        let crossed = {
+        let payer = current_payer(&self.payment);
+        let (crossed, cheque) = {
             let Ok(mut peers) = self.balances.lock() else {
                 return;
             };
@@ -588,9 +817,28 @@ impl DebitGuard {
             entry.reserved = entry.reserved.saturating_sub(self.price);
             let prev_balance = entry.balance;
             entry.balance = entry.balance.saturating_add(self.price);
-            prev_balance < HOT_DEBT_THRESHOLD && entry.balance >= HOT_DEBT_THRESHOLD
+            // Bee's `creditAction.Apply` settles once the expected debt
+            // is past the early-payment threshold.
+            let expected = entry.balance.saturating_add(entry.reserved);
+            let cheque = payer
+                .as_ref()
+                .and_then(|_| entry.cheque_due(expected, Instant::now()));
+            (
+                prev_balance < HOT_DEBT_THRESHOLD && entry.balance >= HOT_DEBT_THRESHOLD,
+                cheque,
+            )
         };
         self.applied = true;
+        if let (Some(payer), Some(amount)) = (payer, cheque) {
+            spawn_payment(
+                payer,
+                self.peer,
+                amount,
+                self.balances.clone(),
+                self.credit_freed.clone(),
+                self.credit_epoch.clone(),
+            );
+        }
         if crossed {
             if let Some(tx) = &self.hot_hint {
                 let _ = tx.try_send(HotHint { peer: self.peer });
@@ -631,6 +879,41 @@ impl Drop for DebitGuard {
     }
 }
 
+fn current_payer(slot: &PaymentSlot) -> Option<Arc<dyn RetrievalPayment>> {
+    slot.read().ok().and_then(|p| p.clone())
+}
+
+/// Run one SWAP payment in the background (bee's `go a.payFunction`)
+/// and record its outcome.
+fn spawn_payment(
+    payer: Arc<dyn RetrievalPayment>,
+    peer: PeerId,
+    amount: u64,
+    balances: SharedBalances,
+    credit_freed: Arc<Notify>,
+    credit_epoch: Arc<AtomicU64>,
+) {
+    tokio::spawn(async move {
+        let result = payer.pay(peer, amount).await;
+        if let Err(e) = &result {
+            tracing::debug!(
+                target: "ant_retrieval::accounting",
+                %peer,
+                amount,
+                "retrieval SWAP payment failed: {e}",
+            );
+        }
+        Accounting::payment_done(
+            &balances,
+            &credit_epoch,
+            &credit_freed,
+            peer,
+            amount,
+            result.is_ok(),
+        );
+    });
+}
+
 /// XOR-distance proximity order between two 32-byte addresses,
 /// matching `bee/pkg/swarm/swarm.go::Proximity`. Returns the
 /// number of leading zero bits in `a XOR b`, capped at `MAX_PO =
@@ -658,6 +941,185 @@ fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A [`RetrievalPayment`] that records every call and answers with
+    /// `ok`, after `gate` opens if one is set.
+    #[derive(Default)]
+    struct Payer {
+        calls: Mutex<Vec<(PeerId, u64)>>,
+        fail: bool,
+        gate: Option<Arc<Notify>>,
+    }
+
+    #[async_trait]
+    impl RetrievalPayment for Payer {
+        async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String> {
+            self.calls.lock().unwrap().push((peer, amount));
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            if self.fail {
+                Err("refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Payer {
+        fn calls(&self) -> Vec<(PeerId, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// Reserve and apply `n` chunks of `price` against `peer`.
+    fn take(acc: &Accounting, peer: PeerId, n: usize, price: u64) {
+        for _ in 0..n {
+            acc.try_reserve(peer, price).expect("admitted").apply();
+        }
+    }
+
+    /// Let spawned payments run to completion.
+    async fn settle_payments() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn paying(payer: &Arc<Payer>) -> Accounting {
+        let acc = Accounting::new();
+        acc.set_payment(Some(payer.clone() as Arc<dyn RetrievalPayment>));
+        acc
+    }
+
+    /// Issue #121, bee's `settle`: once the debt reaches the early-payment
+    /// threshold, the debt the refresh won't cover is paid with one cheque,
+    /// and the debt drops by it, which frees credit for waiting fetches.
+    #[tokio::test]
+    async fn debt_past_early_payment_is_paid_by_cheque() {
+        let payer = Arc::new(Payer::default());
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0); // a refresh has been accepted just now
+        take(&acc, peer, 2, 300_000);
+        settle_payments().await;
+        assert!(
+            payer.calls().is_empty(),
+            "600 k is below the 675 k early payment"
+        );
+
+        let epoch = acc.credit_epoch();
+        // As in bee's `PrepareCredit`, the reservation that takes the
+        // expected debt to 900 k settles the 600 k already owed.
+        // Refreshed under a second ago, nothing of it is due to the
+        // refresh yet, so all of it goes into the cheque.
+        take(&acc, peer, 1, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls(), vec![(peer, 600_000)]);
+        assert_eq!(acc.debug_snapshot(&peer), Some((300_000, 0)));
+        assert_eq!(acc.swap_settled(&peer), 600_000);
+        assert!(acc.credit_epoch() > epoch, "a paid debt frees credit");
+    }
+
+    /// The cheque covers only what the refresh is not expected to: a
+    /// light refresh rate per whole second since the last accepted
+    /// refresh comes off it, and less than bee's `minimumPayment` is not
+    /// worth a cheque.
+    #[tokio::test]
+    async fn cheque_leaves_the_refresh_its_share() {
+        let payer = Arc::new(Payer::default());
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        acc.backdate_refresh(&peer, Duration::from_millis(1_500));
+        take(&acc, peer, 3, 300_000);
+        settle_payments().await;
+        assert_eq!(
+            payer.calls(),
+            vec![(peer, 600_000 - LIGHT_REFRESH_RATE_PER_SEC)]
+        );
+        assert_eq!(acc.debug_snapshot(&peer), Some((750_000, 0)));
+
+        // 2 s since the refresh: 900 k due to it, nothing left to pay.
+        let other = PeerId::random();
+        acc.credit(other, 0);
+        acc.backdate_refresh(&other, Duration::from_millis(2_100));
+        take(&acc, other, 3, 300_000);
+        // 1 s: 450 k due, 50 k left, under the 90 k minimum payment.
+        let third = PeerId::random();
+        acc.credit(third, 0);
+        acc.backdate_refresh(&third, Duration::from_millis(1_100));
+        take(&acc, third, 1, 500_000);
+        drop(acc.try_reserve(third, 175_000));
+        settle_payments().await;
+        assert_eq!(payer.calls().len(), 1, "{:?}", payer.calls());
+    }
+
+    /// A peer never refreshed has its whole debt still due to the refresh
+    /// (bee's zero refresh timestamp): no cheque.
+    #[tokio::test]
+    async fn never_refreshed_peer_is_not_paid() {
+        let payer = Arc::new(Payer::default());
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        take(&acc, peer, 5, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls(), Vec::new());
+    }
+
+    /// One payment per peer at a time; while it runs its amount is not
+    /// paid again. A failed payment leaves the debt and backs off for
+    /// `FAILED_SETTLEMENT_INTERVAL`.
+    #[tokio::test]
+    async fn one_payment_at_a_time_and_back_off_after_a_failure() {
+        let gate = Arc::new(Notify::new());
+        let payer = Arc::new(Payer {
+            fail: true,
+            gate: Some(gate.clone()),
+            ..Payer::default()
+        });
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        take(&acc, peer, 3, 300_000);
+        settle_payments().await;
+        take(&acc, peer, 1, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls(), vec![(peer, 600_000)], "one in flight");
+
+        gate.notify_one();
+        settle_payments().await;
+        assert_eq!(
+            acc.debug_snapshot(&peer),
+            Some((1_200_000, 0)),
+            "failed: debt stays"
+        );
+        take(&acc, peer, 1, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls().len(), 1, "backing off after the failure");
+    }
+
+    /// Without a payer (no funded chequebook, or the switch off) the
+    /// accounting behaves exactly as before issue #121: debt only moves
+    /// with refreshes, and admission stops at the same point.
+    #[tokio::test]
+    async fn without_a_payer_debt_waits_for_the_refresh() {
+        let payer = Arc::new(Payer::default());
+        let acc = paying(&payer);
+        acc.set_payment(None);
+        assert!(!acc.pays_with_swap());
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        let mut admitted = 0;
+        while let Some(g) = acc.try_reserve(peer, 300_000) {
+            g.apply();
+            admitted += 1;
+        }
+        settle_payments().await;
+        assert_eq!(payer.calls(), Vec::new());
+        assert_eq!(admitted, OVERDRAFT_LIMIT / 300_000);
+        assert_eq!(acc.swap_settled(&peer), 0);
+    }
 
     fn addr(b: u8) -> [u8; 32] {
         let mut a = [0u8; 32];

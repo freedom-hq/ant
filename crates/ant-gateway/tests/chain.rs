@@ -17,7 +17,8 @@ use axum::http::{Method, Request, StatusCode};
 use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router,
     status_router_recording_registrations, status_router_with_chain,
-    status_router_with_chain_and_hook, status_router_with_chain_hooks_and_cors,
+    status_router_with_chain_and_hook, status_router_with_chain_and_issued,
+    status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -44,6 +45,9 @@ impl ChainReader for FakeChain {
     }
     async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
         Ok(42_000_000)
+    }
+    async fn chequebook_total_paid_out(&self, _cb: [u8; 20]) -> Result<u128, String> {
+        Ok(3_000_000)
     }
 }
 
@@ -230,6 +234,39 @@ async fn chequebook_balance_real_then_zero() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(None));
     let (_, json) = get(router, "/chequebook/balance").await;
     assert_eq!(json["totalBalance"], "0");
+}
+
+/// `availableBalance` is bee's `AvailableBalance`: balance + cashed out
+/// − every cheque the node issued, so download and upload cheques show
+/// up in it before any peer cashes them (issue #121). Without outbound
+/// settlement nothing is issued and it is the balance.
+#[tokio::test]
+async fn chequebook_available_balance_deducts_issued_cheques() {
+    let cb = [0xCD; 20];
+    // 42 M balance + 3 M cashed out − 30 M issued.
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "15000000");
+
+    // Issued past the funds: nothing available, not a wrap-around.
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(50_000_000),
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "0");
+
+    let router =
+        status_router_with_chain_and_issued(snapshot_with_one_peer(), chain_ctx(Some(cb)), None);
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "42000000");
 }
 
 #[tokio::test]

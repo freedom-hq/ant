@@ -49,9 +49,12 @@
 //! the only place that knows about EIP-712 / `OutboundLedger` /
 //! `issue_and_emit`.
 
-use crate::swap::{issue_and_emit, OutboundLedger, SwapError};
+use crate::swap::{
+    await_processed, issue_cheque, open_settlement, write_cheque, OutboundLedger, SettlementRates,
+    SwapError,
+};
 use ant_crypto::SECP256K1_SECRET_LEN;
-use ant_retrieval::accounting::HotHint;
+use ant_retrieval::accounting::{HotHint, RetrievalPayment};
 use ant_retrieval::PushsyncSettlement;
 use libp2p::PeerId;
 use libp2p_stream::Control;
@@ -59,6 +62,7 @@ use primitive_types::U256;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace};
 
@@ -75,6 +79,36 @@ pub const LIGHT_PAYMENT_THRESHOLD: u64 = 1_350_000;
 /// even thinks we're a slow payer, leaving plenty of headroom for the
 /// stream to be accepted.
 pub const DEFAULT_CHEQUE_TRIGGER: u64 = LIGHT_PAYMENT_THRESHOLD / 2;
+
+/// How long one retrieval payment may take, from opening the swap stream
+/// to the recipient finishing with the cheque: bee's
+/// `swapprotocol.EmitCheque` timeout.
+pub const RETRIEVAL_PAYMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What retrieval payments (issue #121) may spend, and at which rates.
+/// Read from the chain by the entry points
+/// (`ant_chain::chequebook_store::watch_retrieval_funds`) and installed
+/// with [`PushsyncSwap::set_retrieval_policy`]; without one, downloads
+/// stay on the free pseudosettle tier.
+///
+/// Bee pays a peer `units × exchange + deduction` PLUR, with both rates
+/// read from the recipient's swap response headers and required to equal
+/// its own price oracle's. Ant takes the oracle's values as ceilings, so
+/// a peer can't name its own price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetrievalSwapPolicy {
+    /// xBZZ ever deposited into the chequebook and not withdrawn, in
+    /// PLUR (balance + `totalPaidOut`). Every cheque issued so far (the
+    /// outbound ledger's total) comes off it, as in bee's
+    /// `AvailableBalance`: cheques never exceed the chequebook, which is
+    /// bee's only cap too. Once it's spent, downloads settle with the
+    /// free refresh alone.
+    pub deposited_plur: U256,
+    /// Highest `exchange` header accepted, PLUR per accounting unit.
+    pub max_exchange_rate: U256,
+    /// Highest `deduction` header accepted, PLUR.
+    pub max_deduction: U256,
+}
 
 /// Shared `peer_id -> ethereum_address` registry, populated by the
 /// BZZ-handshake handler and consumed by [`PushsyncSwap`] to find the
@@ -207,6 +241,19 @@ struct EmitCore {
     /// so the brief lock window doesn't span the swap stream's
     /// network roundtrip.
     pending_debt: Mutex<HashMap<PeerId, u64>>,
+    /// One lock per beneficiary, held from reading the last cumulative
+    /// to recording the new one, so two cheques to the same peer (a
+    /// pushsync and a retrieval one) can't both build on the same
+    /// previous cumulative. Bee holds its chequebook lock across the
+    /// same span (`chequebook.Issue`).
+    beneficiary_locks: Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>,
+    /// Retrieval payments' funds and rates; `None` keeps downloads on
+    /// the free tier.
+    retrieval: Mutex<Option<RetrievalSwapPolicy>>,
+    /// Held from checking the funds left to recording a retrieval
+    /// cheque in the ledger, so two payments to different peers can't
+    /// both pass the check on the same funds.
+    issue_gate: Mutex<()>,
 }
 
 /// Live SWAP settlement service. One per process; shared with the
@@ -288,6 +335,14 @@ impl EmitCore {
         }
     }
 
+    fn beneficiary_lock(&self, beneficiary: [u8; 20]) -> Arc<tokio::sync::Mutex<()>> {
+        let mut g = match self.beneficiary_locks.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entry(beneficiary).or_default().clone()
+    }
+
     async fn emit_for(&self, peer: PeerId, amount: u64) -> Result<U256, SwapError> {
         let beneficiary = self
             .cfg
@@ -296,7 +351,9 @@ impl EmitCore {
             .ok_or_else(|| SwapError::Rejected("no eoa for peer".into()))?;
         let amount_u256 = U256::from(amount);
         let mut control = self.control_clone();
-        let new_cum = issue_and_emit(
+        let lock = self.beneficiary_lock(beneficiary);
+        let _issuing = lock.lock().await;
+        let new_cum = crate::swap::issue_and_emit(
             &mut control,
             peer,
             &self.cfg.swap_secret,
@@ -317,6 +374,150 @@ impl EmitCore {
         );
         Ok(new_cum)
     }
+
+    fn retrieval_policy(&self) -> Option<RetrievalSwapPolicy> {
+        match self.retrieval.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    /// PLUR the chequebook can still put into cheques under `policy`:
+    /// the deposit less every cheque issued (bee's `AvailableBalance`).
+    fn available(&self, policy: &RetrievalSwapPolicy) -> U256 {
+        policy
+            .deposited_plur
+            .saturating_sub(self.outbound_ledger.total_issued())
+    }
+
+    /// Record `beneficiary`'s cheque at `new_cumulative` (worth `amount`)
+    /// as issued if the funds left cover it, or refuse. Check and record
+    /// are one step, so concurrent payments can't overdraw.
+    fn issue_within_funds(
+        &self,
+        policy: &RetrievalSwapPolicy,
+        beneficiary: &[u8; 20],
+        new_cumulative: U256,
+        amount: U256,
+    ) -> Result<(), SwapError> {
+        let _gate = match self.issue_gate.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let left = self.available(policy);
+        if left < amount {
+            return Err(SwapError::Rejected(format!(
+                "chequebook credit exhausted: cheque of {amount} PLUR, {left} left",
+            )));
+        }
+        if let Err(e) = self
+            .outbound_ledger
+            .record_issued(beneficiary, new_cumulative)
+        {
+            // The in-memory record holds it, so this process doesn't
+            // overdraw; a restart would forget the cheque, and the next
+            // one to this peer would not increase (refused by the peer,
+            // not overpaid).
+            tracing::warn!(
+                target: "ant_p2p::pushsync_swap",
+                beneficiary = %hex::encode(beneficiary),
+                "outbound ledger persist failed for a retrieval cheque: {e}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Pay `units` of retrieval debt to `peer` (issue #121): bee's
+    /// `swap.Pay` → `swapprotocol.EmitCheque`. Reads the recipient's
+    /// rates, checks them against the policy, records a cheque for the
+    /// previous cumulative plus `units × rate + deduction` if the funds
+    /// left cover it, sends it and waits until the recipient has
+    /// processed it. Returns the PLUR paid.
+    async fn pay_retrieval(&self, peer: PeerId, units: u64) -> Result<U256, SwapError> {
+        let policy = self
+            .retrieval_policy()
+            .ok_or_else(|| SwapError::Rejected("retrieval payments are off".into()))?;
+        // Most this payment can cost; refuse before touching the network
+        // when even that isn't covered.
+        let most = SettlementRates {
+            exchange_rate: policy.max_exchange_rate,
+            deduction: policy.max_deduction,
+        }
+        .cheque_amount(units)
+        .ok_or_else(|| SwapError::Rejected("cheque amount overflow".into()))?;
+        if self.available(&policy) < most {
+            return Err(SwapError::Rejected(format!(
+                "chequebook credit exhausted: {} PLUR left",
+                self.available(&policy)
+            )));
+        }
+        let beneficiary = self
+            .cfg
+            .peer_eth
+            .get(&peer)
+            .ok_or_else(|| SwapError::Rejected("no eoa for peer".into()))?;
+        let lock = self.beneficiary_lock(beneficiary);
+        let _issuing = lock.lock().await;
+        let mut control = self.control_clone();
+        let (mut stream, rates) = open_settlement(&mut control, peer).await?;
+        check_rates(&rates, &policy)?;
+        let amount = rates
+            .cheque_amount(units)
+            .ok_or_else(|| SwapError::Rejected("cheque amount overflow".into()))?;
+        let new_cum = self
+            .outbound_ledger
+            .cumulative_for(&beneficiary)
+            .checked_add(amount)
+            .ok_or_else(|| SwapError::Rejected("cumulative overflow".into()))?;
+        let signed = issue_cheque(
+            &self.cfg.swap_secret,
+            self.cfg.chequebook,
+            beneficiary,
+            new_cum,
+            self.cfg.chain_id,
+        )?;
+        // Recorded as issued before a byte is written, and never taken
+        // back: if this future is dropped (timeout) or the write fails
+        // halfway, the recipient may still hold the cheque. The ledger's
+        // total is the chequebook's liability, and it never outgrows the
+        // deposit; the next cheque to this beneficiary builds on it, so
+        // nothing is paid twice either.
+        self.issue_within_funds(&policy, &beneficiary, new_cum, amount)?;
+        write_cheque(&mut stream, &signed).await?;
+        let processed = await_processed(stream).await;
+        info!(
+            target: "ant_p2p::pushsync_swap",
+            %peer,
+            processed = processed.is_ok(),
+            beneficiary = %hex::encode(beneficiary),
+            units,
+            plur = %amount,
+            exchange_rate = %rates.exchange_rate,
+            deduction = %rates.deduction,
+            new_cumulative = %new_cum,
+            "emitted retrieval cheque",
+        );
+        processed.map(|()| amount)
+    }
+}
+
+/// Refuse rates a peer names above the policy's ceilings (bee refuses
+/// any that differ from its oracle: `ErrNegotiateRate`,
+/// `ErrNegotiateDeduction`), and a zero rate, which would credit nothing.
+fn check_rates(rates: &SettlementRates, policy: &RetrievalSwapPolicy) -> Result<(), SwapError> {
+    if rates.exchange_rate.is_zero() || rates.exchange_rate > policy.max_exchange_rate {
+        return Err(SwapError::Rejected(format!(
+            "peer's exchange rate {} PLUR/unit is outside 1..={}",
+            rates.exchange_rate, policy.max_exchange_rate
+        )));
+    }
+    if rates.deduction > policy.max_deduction {
+        return Err(SwapError::Rejected(format!(
+            "peer's deduction {} PLUR is above {}",
+            rates.deduction, policy.max_deduction
+        )));
+    }
+    Ok(())
 }
 
 impl PushsyncSwap {
@@ -333,6 +534,9 @@ impl PushsyncSwap {
                 outbound_ledger,
                 control: Mutex::new(control),
                 pending_debt: Mutex::new(HashMap::new()),
+                beneficiary_locks: Mutex::new(HashMap::new()),
+                retrieval: Mutex::new(None),
+                issue_gate: Mutex::new(()),
             }),
             hot_hint: None,
         }
@@ -394,6 +598,43 @@ impl PushsyncSwap {
     /// the background.
     pub async fn emit_for(&self, peer: PeerId, amount: u64) -> Result<U256, SwapError> {
         self.core.emit_for(peer, amount).await
+    }
+
+    /// Install (`Some`) or remove (`None`) the retrieval payment policy
+    /// (issue #121).
+    pub fn set_retrieval_policy(&self, policy: Option<RetrievalSwapPolicy>) {
+        match self.core.retrieval.lock() {
+            Ok(mut g) => *g = policy,
+            Err(p) => *p.into_inner() = policy,
+        }
+    }
+
+    /// Whether this service pays retrieval debt now: a policy is
+    /// installed and the chequebook has funds left under it.
+    #[must_use]
+    pub fn pays_retrieval(&self) -> bool {
+        self.core
+            .retrieval_policy()
+            .is_some_and(|p| !self.core.available(&p).is_zero())
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrievalPayment for PushsyncSwap {
+    async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String> {
+        match tokio::time::timeout(
+            RETRIEVAL_PAYMENT_TIMEOUT,
+            self.core.pay_retrieval(peer, amount),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!(
+                "timed out after {}s",
+                RETRIEVAL_PAYMENT_TIMEOUT.as_secs()
+            )),
+        }
     }
 }
 
@@ -518,6 +759,83 @@ mod tests {
         );
         assert_eq!(cfg.cheque_trigger_plur, DEFAULT_CHEQUE_TRIGGER);
         assert_eq!(DEFAULT_CHEQUE_TRIGGER, LIGHT_PAYMENT_THRESHOLD / 2);
+    }
+
+    fn service(dir: &std::path::Path) -> PushsyncSwap {
+        PushsyncSwap::new(
+            PushsyncSwapConfig::new(
+                [0xcb; 20],
+                random_secp256k1_secret(),
+                100,
+                dir.join("out.json"),
+                PeerEthMap::new(),
+            ),
+            libp2p_stream::Behaviour::default().new_control(),
+        )
+    }
+
+    fn policy(deposited: u64) -> RetrievalSwapPolicy {
+        RetrievalSwapPolicy {
+            deposited_plur: U256::from(deposited),
+            max_exchange_rate: U256::from(100_000u64),
+            max_deduction: U256::from(100u64),
+        }
+    }
+
+    /// Retrieval cheques (issue #121) never take the chequebook's
+    /// liability past its deposit: every cheque already issued, pushsync
+    /// ones included, comes off it (bee's `AvailableBalance`), and the
+    /// check holds across beneficiaries.
+    #[test]
+    fn retrieval_cheques_stay_within_the_deposit() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        assert!(!svc.pays_retrieval(), "no funds known: free tier");
+        svc.set_retrieval_policy(Some(policy(1_000)));
+        assert!(svc.pays_retrieval());
+
+        let (a, b) = ([0xaa; 20], [0xbb; 20]);
+        // A pushsync cheque issued earlier counts against the deposit.
+        svc.outbound_ledger()
+            .record_issued(&a, U256::from(300u64))
+            .unwrap();
+        let p = policy(1_000);
+        svc.core
+            .issue_within_funds(&p, &b, U256::from(600u64), U256::from(600u64))
+            .unwrap();
+        let refused = svc
+            .core
+            .issue_within_funds(&p, &a, U256::from(400u64), U256::from(101u64))
+            .unwrap_err();
+        assert!(refused.to_string().contains("exhausted"), "{refused}");
+        assert_eq!(svc.outbound_ledger().cumulative_for(&a), U256::from(300u64));
+        svc.core
+            .issue_within_funds(&p, &a, U256::from(400u64), U256::from(100u64))
+            .unwrap();
+        assert_eq!(svc.outbound_ledger().total_issued(), U256::from(1_000u64));
+        assert!(
+            !svc.pays_retrieval(),
+            "deposit spent: back to the free tier"
+        );
+        svc.set_retrieval_policy(None);
+        assert!(!svc.pays_retrieval());
+    }
+
+    /// A peer can't name its own price: rates above the oracle's are
+    /// refused (bee: `ErrNegotiateRate`/`ErrNegotiateDeduction`), and so
+    /// is a zero rate, which would credit nothing.
+    #[test]
+    fn retrieval_rates_above_the_oracle_are_refused() {
+        let p = policy(1_000);
+        let rates = |exchange: u64, deduction: u64| SettlementRates {
+            exchange_rate: U256::from(exchange),
+            deduction: U256::from(deduction),
+        };
+        assert!(check_rates(&rates(100_000, 100), &p).is_ok());
+        assert!(check_rates(&rates(100_000, 0), &p).is_ok());
+        assert!(check_rates(&rates(100_001, 100), &p).is_err());
+        assert!(check_rates(&rates(100_000, 101), &p).is_err());
+        assert!(check_rates(&rates(0, 0), &p).is_err());
     }
 
     /// `note_pushsync` below the trigger only accrues; never emits.

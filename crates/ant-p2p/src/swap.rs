@@ -26,9 +26,15 @@
 //!
 //! ```text
 //! dialer → listener : varint + Headers pb (empty)            // bee headers preamble
-//! listener → dialer : varint + Headers pb (empty)
+//! listener → dialer : varint + Headers pb { exchange, deduction }
 //! dialer → listener : varint + EmitCheque{ Cheque: bytes }   // JSON-encoded SignedCheque
+//! listener          : FullClose when it accepted the cheque, Reset when not
 //! ```
+//!
+//! The listener's response headers carry its price oracle's `exchange`
+//! rate (PLUR per accounting unit) and `deduction` (PLUR). Bee pays
+//! `debt × exchange + deduction` and credits `(paid − deduction) /
+//! exchange` units ([`SettlementRates`], used by retrieval payments).
 //!
 //! `EmitCheque.Cheque` is **bee's `chequebook.SignedCheque`
 //! JSON-marshalled** (NOT the binary cheque encoding); see
@@ -40,7 +46,7 @@
 //! {
 //!   "Chequebook": "0x...",        // 0x-hex 20 bytes (geth common.Address)
 //!   "Beneficiary": "0x...",
-//!   "CumulativePayout": "12345",  // decimal string (big.Int via TextMarshaler)
+//!   "CumulativePayout": 12345,    // bare number (big.Int's MarshalJSON)
 //!   "Signature": "..."            // base64 65-byte r ‖ s ‖ v (default []byte JSON)
 //! }
 //! ```
@@ -79,9 +85,11 @@
 //!   the cheque. The operator can pull a snapshot from the ledger
 //!   and call [`ant_chain::chequebook::cash_cheque_beneficiary_calldata`]
 //!   manually.
-//! - Settlement triggering. Hooking outbound debit to "issue cheque
-//!   when threshold crossed" needs to plumb through
-//!   [`ant_retrieval::accounting`] — left for a follow-up.
+//!
+//! Settlement triggering lives with the callers: pushsync debt in
+//! [`crate::pushsync_swap`], retrieval debt in
+//! [`ant_retrieval::accounting`] paying through it (issue #121), with
+//! [`open_settlement`], [`write_cheque`] and [`await_processed`].
 //!
 //! Everything here is wire-compatible with bee: a cheque we emit
 //! reaches bee's `s.swap.ReceiveCheque` and would be accepted modulo
@@ -156,9 +164,13 @@ pub struct EmitChequePb {
 ///
 /// - `Chequebook` / `Beneficiary`: 0x-prefixed hex (geth's
 ///   `common.Address.MarshalJSON`).
-/// - `CumulativePayout`: quoted decimal string (geth's `big.Int`
-///   takes the `encoding.TextMarshaler` path under JSON, which
-///   yields the unquoted decimal; json wraps it in quotes).
+/// - `CumulativePayout`: a bare JSON number. Go's `*big.Int` implements
+///   `json.Marshaler` (`MarshalJSON` writes the decimal digits
+///   unquoted), and its `UnmarshalJSON` refuses a quoted string
+///   (`math/big: cannot unmarshal "\"123\"" into a *big.Int`), so bee's
+///   swap handler resets the stream on a quoted payout and never
+///   credits the cheque (issue #121). Decoding also accepts the quoted
+///   form, which earlier Ant versions sent.
 /// - `Signature`: base64 standard-padding (geth `[]byte` default).
 #[derive(Debug, Serialize, Deserialize)]
 struct SignedChequeJson {
@@ -167,7 +179,7 @@ struct SignedChequeJson {
     #[serde(rename = "Beneficiary")]
     beneficiary: String,
     #[serde(rename = "CumulativePayout")]
-    cumulative_payout: String,
+    cumulative_payout: Box<serde_json::value::RawValue>,
     #[serde(rename = "Signature")]
     signature: String,
 }
@@ -180,18 +192,31 @@ pub fn encode_signed_cheque_json(signed: &SignedCheque) -> Vec<u8> {
     let body = SignedChequeJson {
         chequebook: format!("0x{}", hex::encode(signed.cheque.chequebook)),
         beneficiary: format!("0x{}", hex::encode(signed.cheque.beneficiary)),
-        cumulative_payout: signed.cheque.cumulative_payout.to_string(),
+        cumulative_payout: serde_json::value::RawValue::from_string(
+            signed.cheque.cumulative_payout.to_string(),
+        )
+        .expect("decimal digits are a JSON number"),
         signature: BASE64.encode(signed.signature),
     };
     serde_json::to_vec(&body).expect("SignedChequeJson serialises")
 }
 
-/// Decode the JSON `SignedCheque` carried in `EmitCheque.Cheque`.
+/// Decode bee-shape JSON back into a [`SignedCheque`].
 pub fn decode_signed_cheque_json(bytes: &[u8]) -> Result<SignedCheque, SwapError> {
     let body: SignedChequeJson = serde_json::from_slice(bytes)?;
     let chequebook = parse_addr_0x(&body.chequebook)?;
     let beneficiary = parse_addr_0x(&body.beneficiary)?;
-    let cumulative_payout = U256::from_dec_str(body.cumulative_payout.trim())
+    let payout = body.cumulative_payout.get().trim();
+    let payout = payout
+        .strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .unwrap_or(payout);
+    if payout.is_empty() || !payout.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SwapError::Decimal(format!(
+            "cumulative_payout: not a decimal integer: {payout}"
+        )));
+    }
+    let cumulative_payout = U256::from_dec_str(payout)
         .map_err(|e| SwapError::Decimal(format!("cumulative_payout: {e}")))?;
     let sig_bytes = BASE64.decode(body.signature.trim())?;
     if sig_bytes.len() != 65 {
@@ -528,6 +553,15 @@ impl OutboundLedger {
         self.recorded_for(beneficiary).unwrap_or(U256::zero())
     }
 
+    /// Sum of every beneficiary's cumulative: all PLUR this chequebook
+    /// has promised in cheques from this node (bee's `totalIssued`).
+    pub fn total_issued(&self) -> U256 {
+        let guard = self.inner.lock().expect("outbound ledger poisoned");
+        guard
+            .values()
+            .fold(U256::zero(), |acc, v| acc.saturating_add(*v))
+    }
+
     /// Like [`Self::cumulative_for`] but distinguishes "no cheque ever
     /// issued" (`None`) from a recorded cumulative. The accounting
     /// snapshot needs the difference: bee's `/settlements/{peer}`
@@ -827,6 +861,133 @@ pub async fn issue_and_emit(
     Ok(new_cum)
 }
 
+/// Bee's settlement response headers (`pkg/settlement/swap/headers`):
+/// the cheque recipient's `exchange` rate (PLUR per accounting unit, from
+/// the swap price oracle) and the one-off `deduction` (PLUR), both
+/// big-endian unsigned integers. Bee's `swapprotocol.EmitCheque` reads
+/// them before it signs and pays `amount × exchange + deduction`; the
+/// recipient credits `(paid − deduction) / exchange` units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementRates {
+    pub exchange_rate: U256,
+    pub deduction: U256,
+}
+
+impl SettlementRates {
+    /// PLUR a cheque must carry to clear `units` of accounting debt at
+    /// these rates.
+    #[must_use]
+    pub fn cheque_amount(&self, units: u64) -> Option<U256> {
+        U256::from(units)
+            .checked_mul(self.exchange_rate)?
+            .checked_add(self.deduction)
+    }
+}
+
+/// Bee `internal/headers/pb::Header`.
+#[derive(Clone, PartialEq, Eq, Message)]
+struct HeaderPb {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
+/// Bee `internal/headers/pb::Headers`.
+#[derive(Clone, PartialEq, Eq, Message)]
+struct HeadersPb {
+    #[prost(message, repeated, tag = "1")]
+    headers: Vec<HeaderPb>,
+}
+
+/// Decode the swap listener's response headers into [`SettlementRates`],
+/// like bee's `ParseSettlementResponseHeaders`: `exchange` is required,
+/// a missing `deduction` is zero (bee's `ErrNoDeductionHeader` path).
+pub fn parse_settlement_headers(bytes: &[u8]) -> Result<SettlementRates, SwapError> {
+    let headers = HeadersPb::decode(bytes)?;
+    let field = |name: &str| {
+        headers
+            .headers
+            .iter()
+            .find(|h| h.key == name)
+            .map(|h| h.value.as_slice())
+    };
+    let big = |v: &[u8]| -> Result<U256, SwapError> {
+        if v.len() > 32 {
+            return Err(SwapError::Rejected(format!(
+                "settlement header of {} bytes",
+                v.len()
+            )));
+        }
+        Ok(U256::from_big_endian(v))
+    };
+    let exchange_rate =
+        big(field("exchange").ok_or_else(|| SwapError::Rejected("no exchange header".into()))?)?;
+    let deduction = match field("deduction") {
+        Some(v) => big(v)?,
+        None => U256::zero(),
+    };
+    Ok(SettlementRates {
+        exchange_rate,
+        deduction,
+    })
+}
+
+/// Open a swap stream to `peer` and read the recipient's
+/// [`SettlementRates`] from its response headers: the first half of bee's
+/// `swapprotocol.EmitCheque`. Finish with [`write_cheque`] once the
+/// cheque for those rates is signed, or drop the stream to abandon it.
+pub async fn open_settlement(
+    control: &mut Control,
+    peer: PeerId,
+) -> Result<(Stream, SettlementRates), SwapError> {
+    let proto = StreamProtocol::new(PROTOCOL_SWAP);
+    let mut stream = control
+        .open_stream(peer, proto)
+        .await
+        .map_err(|e| std::io::Error::other(format!("open swap stream: {e}")))?;
+    write_empty_headers(&mut stream).await?;
+    let headers = read_delimited(&mut stream, HEADERS_MAX).await?;
+    let rates = parse_settlement_headers(&headers)?;
+    Ok((stream, rates))
+}
+
+/// Write `signed` on a stream from [`open_settlement`] and close our
+/// side. The recipient may hold the cheque from here on (and even if
+/// this fails halfway), so the caller counts it as issued before calling
+/// this; [`await_processed`] tells when the recipient is done with it.
+pub async fn write_cheque(stream: &mut Stream, signed: &SignedCheque) -> Result<(), SwapError> {
+    let body = encode_signed_cheque_json(signed);
+    write_delimited(stream, &EmitChequePb { cheque: body }).await?;
+    stream.close().await?;
+    Ok(())
+}
+
+/// Wait for the recipient of a cheque from [`write_cheque`] to finish
+/// with the stream.
+///
+/// Bee's swap handler runs `ReceiveCheque` (signature, chequebook and
+/// balance checks, then `NotifyPaymentReceived`) before it closes the
+/// stream, so once the stream has ended bee has credited an accepted
+/// cheque. Only then may the payer lower its own view of the debt:
+/// lowering it as soon as the cheque is written lets new requests
+/// through while the recipient still counts the old debt, which takes the
+/// recipient past its disconnect limit, and bee blocklists the payer
+/// (`debitAction.Apply`).
+///
+/// Bee ends the stream with `FullClose` on acceptance and `Reset` on a
+/// refusal, but rust-yamux reports a remote reset as end of stream too,
+/// so this can't tell the two apart; `Err` means only that the stream
+/// failed some other way.
+pub async fn await_processed(mut stream: Stream) -> Result<(), SwapError> {
+    let mut rest = Vec::new();
+    stream
+        .read_to_end(&mut rest)
+        .await
+        .map_err(|e| SwapError::Rejected(format!("cheque stream failed: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1004,42 @@ mod tests {
     fn eoa(secret: &[u8; SECP256K1_SECRET_LEN]) -> [u8; 20] {
         let sk = SigningKey::from_bytes(secret.into()).unwrap();
         ethereum_address_from_public_key(sk.verifying_key())
+    }
+
+    /// Bee's settlement response headers decode to the rates the
+    /// cheque amount is computed from; a missing deduction is zero, a
+    /// missing exchange rate is refused.
+    #[test]
+    fn settlement_headers_decode_like_bee() {
+        let enc = |h: Vec<(&str, Vec<u8>)>| {
+            HeadersPb {
+                headers: h
+                    .into_iter()
+                    .map(|(k, v)| HeaderPb {
+                        key: k.into(),
+                        value: v,
+                    })
+                    .collect(),
+            }
+            .encode_to_vec()
+        };
+        // Mainnet oracle at the time of writing: 100 000 PLUR/unit, 100 PLUR.
+        let rates = parse_settlement_headers(&enc(vec![
+            ("exchange", vec![0x01, 0x86, 0xa0]),
+            ("deduction", vec![0x64]),
+        ]))
+        .unwrap();
+        assert_eq!(rates.exchange_rate, U256::from(100_000u64));
+        assert_eq!(rates.deduction, U256::from(100u64));
+        assert_eq!(
+            rates.cheque_amount(675_000),
+            Some(U256::from(67_500_000_100u64))
+        );
+        let no_deduction =
+            parse_settlement_headers(&enc(vec![("exchange", vec![0x01, 0x86, 0xa0])])).unwrap();
+        assert_eq!(no_deduction.deduction, U256::zero());
+        assert!(parse_settlement_headers(&enc(vec![])).is_err());
+        assert!(parse_settlement_headers(&[0u8; 0]).is_err());
     }
 
     /// JSON encoder / decoder round-trip.
@@ -881,12 +1078,41 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains(r#""Chequebook":"0x11111111111111111111111111111111111111aa""#));
         assert!(s.contains(r#""Beneficiary":"0x22222222222222222222222222222222222222bb""#));
-        assert!(s.contains(r#""CumulativePayout":"987654""#));
+        // A bare number, as go's `json.Marshal(*big.Int)` writes it: bee's
+        // `UnmarshalJSON` refuses the quoted form (issue #121).
+        assert!(s.contains(r#""CumulativePayout":987654,"#));
         // base64 of 65 bytes 0xcd = "zc3N…" repeated.
         assert!(s.contains(r#""Signature":"#));
         // Round-trip back, ensuring even the high-bit byte parses.
         let back = decode_signed_cheque_json(&bytes).unwrap();
         assert_eq!(back, signed);
+    }
+
+    /// Decoding takes the bare number bee sends, a payout past `u64`
+    /// without losing digits, and the quoted form older Ant versions
+    /// sent; it refuses a payout that isn't a decimal integer.
+    #[test]
+    fn cumulative_payout_decodes_bare_and_quoted() {
+        let body = |payout: &str| {
+            format!(
+                r#"{{"Chequebook":"0x11111111111111111111111111111111111111aa","Beneficiary":"0x22222222222222222222222222222222222222bb","CumulativePayout":{payout},"Signature":"{}"}}"#,
+                BASE64.encode([0xcdu8; 65])
+            )
+        };
+        let big = "123456789012345678901234567890";
+        for payout in [big.to_string(), format!("\"{big}\"")] {
+            let decoded = decode_signed_cheque_json(body(&payout).as_bytes()).unwrap();
+            assert_eq!(
+                decoded.cheque.cumulative_payout,
+                U256::from_dec_str(big).unwrap()
+            );
+        }
+        for bad in ["-1", "1.5", "1e3", "\"0x10\"", "null"] {
+            assert!(
+                decode_signed_cheque_json(body(bad).as_bytes()).is_err(),
+                "{bad} must be refused"
+            );
+        }
     }
 
     /// Ledger accepts a valid first cheque, then a strictly-larger
