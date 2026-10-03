@@ -2117,10 +2117,11 @@ mod tests {
         async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
             match self.chunks.get(&addr) {
                 Some(wire) if self.plain_ok.contains(&addr) => Ok(wire.clone()),
-                _ => Err(Box::new(crate::fetcher::FetchExhausted {
-                    message: "no BZZ peers available".into(),
-                    pool_starved: true,
-                })),
+                _ => Err(Box::new(crate::fetcher::FetchExhausted::new(
+                    "no BZZ peers available",
+                    true,
+                    false,
+                ))),
             }
         }
 
