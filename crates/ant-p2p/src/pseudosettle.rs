@@ -534,7 +534,7 @@ fn pick_refreshes(
         })
         .map(|(peer, _)| (debts.get(peer).copied().unwrap_or(0), *peer))
         .collect();
-    due.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    due.sort_unstable_by_key(|(debt, _)| std::cmp::Reverse(*debt));
     due.truncate(permits);
     due.into_iter()
         .map(|(_, peer)| {
@@ -957,14 +957,14 @@ mod tests {
             }
         });
 
-        let (_notify_tx, notify_rx) = mpsc::channel(NOTIFY_CHANNEL_CAP);
+        let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_CHANNEL_CAP);
         let (hot_tx, hot_rx) = mpsc::channel(HOT_HINT_CHANNEL_CAP);
         let accounting = Arc::new(Accounting::new().with_hot_hint(hot_tx));
         let mirror = accounting.clone();
         let (peers_tx, peers_rx) = watch::channel(vec![(bee_peer, [0u8; 32])]);
         tokio::spawn(async move {
             run_driver(control, notify_rx, hot_rx, peers_rx, Some(accounting)).await;
-            drop((_notify_tx, peers_tx));
+            drop((notify_tx, peers_tx));
         });
         (mirror, bee_peer, bee)
     }
@@ -1075,7 +1075,8 @@ mod tests {
         for expect in [1, 2, 4, 8, 16, 16] {
             s.finish(at, false);
             let wait = Duration::from_secs(expect);
-            assert!(!s.due(at + wait - Duration::from_millis(1), true, Some(1)));
+            let just_before = (at + wait).checked_sub(Duration::from_millis(1)).unwrap();
+            assert!(!s.due(just_before, true, Some(1)));
             assert!(s.due(at + wait, true, Some(1)));
             at += wait;
         }
@@ -1108,7 +1109,10 @@ mod tests {
             vec![peers[0]],
             "in-flight and nothing-owed peers are skipped"
         );
-        assert!(pick_refreshes(&mut state, &live, &debts, true, now, 8).is_empty());
+        assert_eq!(
+            pick_refreshes(&mut state, &live, &debts, true, now, 8),
+            Vec::<PeerId>::new()
+        );
     }
 
     #[test]
