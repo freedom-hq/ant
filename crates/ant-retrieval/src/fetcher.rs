@@ -1193,10 +1193,55 @@ const fn accept_shallow_after(shallow_attempts: u32) -> bool {
 /// that were asked answered "not found". A `storage: not found` tail is then one peer's
 /// answer, not the network's, so the RS decoder (`crate::rs`) must not
 /// read it as the chunk being confirmed missing (issue #114).
+///
+/// It also records, typed, whether the last peer answer was a miss
+/// ([`RetrievalError::is_chunk_not_found`]: `storage: not found` *or*
+/// `no peer found`), so callers can tell a confirmed miss
+/// ([`Self::confirmed_missing`]) from a transport failure without
+/// matching on the message (issue #123).
 #[derive(Debug, Clone)]
 pub struct FetchExhausted {
     pub(crate) message: String,
     pub pool_starved: bool,
+    /// The last peer that answered said the chunk is missing.
+    pub last_not_found: bool,
+}
+
+impl FetchExhausted {
+    /// Build one by hand, for fetchers other than [`RoutingFetcher`]
+    /// and for tests that stand in for it.
+    #[must_use]
+    pub fn new(message: impl Into<String>, pool_starved: bool, last_not_found: bool) -> Self {
+        Self {
+            message: message.into(),
+            pool_starved,
+            last_not_found,
+        }
+    }
+
+    /// Peers confirmed the chunk missing: the last answer was a miss and
+    /// the fetch wasn't cut short by an overdraft-starved pool. This is
+    /// the network's answer, not one cold peer's (issue #114), so it is
+    /// final, and the gateway answers bee's 404 for it (issue #123).
+    #[must_use]
+    pub const fn confirmed_missing(&self) -> bool {
+        self.last_not_found && !self.pool_starved
+    }
+
+    /// The `FetchExhausted` behind `e`, found by walking its `source()`
+    /// chain, so it is still found when wrapped (`JoinError::FetchChunk`,
+    /// `ManifestError::Fetch`, …).
+    #[must_use]
+    pub fn find<'a>(e: &'a (dyn StdError + 'static)) -> Option<&'a Self> {
+        let mut cur = Some(e);
+        while let Some(err) = cur {
+            if let Some(x) = err.downcast_ref::<Self>() {
+                return Some(x);
+            }
+            cur = err.source();
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for FetchExhausted {
@@ -1732,7 +1777,7 @@ impl RoutingFetcher {
                             if blacklist {
                                 self.blacklist_peer(peer);
                             }
-                            if crate::feed::is_chunk_not_found(&e) {
+                            if e.is_chunk_not_found() {
                                 not_found_answers += 1;
                             }
                             last_err = Some(e);
@@ -1783,24 +1828,41 @@ impl RoutingFetcher {
                 "credit wait budget exhausted; giving up",
             );
         }
-        // Never got a peer to ask: the pool stayed overdraft-skipped for
-        // the whole credit wait. Same message as the immediate
-        // no-candidate exit above, so the gateway and feed
-        // classification read it the same way.
-        let message = if asked.is_empty() {
-            "no BZZ peers available".to_string()
-        } else {
-            format!(
-                "all peers failed for chunk {} after {} attempts (last: {})",
-                hex::encode(addr),
-                asked.len(),
-                last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
-            )
-        };
-        Err(Box::new(FetchExhausted {
-            message,
+        Err(Box::new(exhausted(
+            addr,
+            asked.len(),
+            last_err,
             pool_starved,
-        }))
+        )))
+    }
+}
+
+/// The error a fetch that asked `asked` peers gives up with. Never got a
+/// peer to ask (the pool stayed overdraft-skipped for the whole credit
+/// wait): same message as the immediate no-candidate exit, so the
+/// gateway and feed classification read it the same way.
+pub(crate) fn exhausted(
+    addr: [u8; 32],
+    asked: usize,
+    last_err: Option<RetrievalError>,
+    pool_starved: bool,
+) -> FetchExhausted {
+    let last_not_found = last_err
+        .as_ref()
+        .is_some_and(RetrievalError::is_chunk_not_found);
+    let message = if asked == 0 {
+        "no BZZ peers available".to_string()
+    } else {
+        format!(
+            "all peers failed for chunk {} after {asked} attempts (last: {})",
+            hex::encode(addr),
+            last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
+        )
+    };
+    FetchExhausted {
+        message,
+        pool_starved,
+        last_not_found,
     }
 }
 
@@ -2016,6 +2078,43 @@ mod tests {
     use super::*;
     use crate::accounting::CREDIT_WAIT_BUDGET;
     use std::time::Duration;
+
+    /// Issue #123: both of bee's miss answers — `storage: not found` and
+    /// `no peer found` — are typed as a miss on the error the fetch gives
+    /// up with, so a fetch that ran out on either is confirmed missing
+    /// (unless the pool was starved), with its message unchanged.
+    #[test]
+    fn exhausted_types_both_miss_tails() {
+        let addr = [0xab; 32];
+        for tail in [
+            "retrieve chunk: storage: not found",
+            "retrieve chunk: no peer found",
+        ] {
+            let e = exhausted(addr, 34, Some(RetrievalError::Remote(tail.into())), false);
+            assert!(e.last_not_found, "{tail}");
+            assert!(e.confirmed_missing(), "{tail}");
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "all peers failed for chunk {} after 34 attempts (last: remote: {tail})",
+                    hex::encode(addr)
+                )
+            );
+            // Starved: one cold peer's answer, never a confirmed miss (#114).
+            let e = exhausted(addr, 1, Some(RetrievalError::Remote(tail.into())), true);
+            assert!(e.last_not_found && !e.confirmed_missing(), "{tail}");
+        }
+        for last in [
+            Some(RetrievalError::Timeout(Duration::from_secs(5))),
+            Some(RetrievalError::Remote("retrieve chunk: forbidden".into())),
+            Some(RetrievalError::OpenStream("no addresses: not found".into())),
+            None,
+        ] {
+            let e = exhausted(addr, 3, last, false);
+            assert!(!e.confirmed_missing(), "{e}");
+        }
+        assert!(!exhausted(addr, 0, None, false).confirmed_missing());
+    }
 
     /// Starvation needs budget left *and* unasked ranked peers, and stops
     /// counting once more than `STARVED_MAX_NOT_FOUND` peers agreed the

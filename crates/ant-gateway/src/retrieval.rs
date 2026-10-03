@@ -3284,6 +3284,18 @@ async fn consume_stream_prologue(
                     );
                 }
             }
+            // Peers confirmed the chunk missing (issue #123): bee's
+            // `jsonhttp.NotFound(w, nil)`, the same 404 a `storage: not
+            // found` tail already got through `map_retrieval_error`.
+            Ok(Some(ControlAck::NotFound { message })) => {
+                debug!(target: "ant_gateway", %message, "retrieval: chunk not found");
+                return Err(status_text_error(StatusCode::NOT_FOUND));
+            }
+            // A miss from a starved peer pool: not the network's answer
+            // (#114), so a retryable 503 rather than a 404.
+            Ok(Some(ControlAck::NotReady { message })) => {
+                return Err(json_error(StatusCode::SERVICE_UNAVAILABLE, message));
+            }
             Ok(Some(ControlAck::Error { message })) => {
                 return Err(map_retrieval_error(message));
             }
@@ -3396,7 +3408,11 @@ async fn consume_stream_prologue(
 /// - a manifest path miss (`"path '…' not found"` and friends) → bee's
 ///   `404 "path address not found"`;
 /// - any other miss (`"not found"` from the joiner / fetcher) → bee's
-///   `jsonhttp.NotFound(w, nil)` = `404 "Not Found"`;
+///   `jsonhttp.NotFound(w, nil)` = `404 "Not Found"`. A `/bytes` or
+///   `/bzz` root the network confirmed missing doesn't come through
+///   here: the node sends it typed as `ControlAck::NotFound`, whichever
+///   miss tail (`storage: not found` / `no peer found`) it ended in
+///   (issue #123);
 /// - the rest are bad-gateway conditions where the message stays —
 ///   bee has no equivalent failure (it *is* the network) and operators
 ///   debug through this body today.

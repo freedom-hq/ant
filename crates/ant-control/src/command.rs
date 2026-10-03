@@ -810,6 +810,16 @@ pub enum ControlAck {
     NotReady {
         message: String,
     },
+    /// A retrieval the network answered: peers confirmed the chunk
+    /// missing (`ant_retrieval::fetcher::FetchExhausted::confirmed_missing`,
+    /// i.e. a `storage: not found` *or* `no peer found` last answer from
+    /// a fetch whose peer pool wasn't starved). Distinct from
+    /// [`Self::Error`] so the gateway answers bee's `404` without
+    /// substring-matching the message, whichever of the two tails it
+    /// ends in (issue #123). Only sent before a stream starts.
+    NotFound {
+        message: String,
+    },
     Error {
         message: String,
     },

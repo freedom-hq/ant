@@ -2065,6 +2065,7 @@ mod tests {
                                   (last: remote: retrieve chunk: storage: not found)"
                             .into(),
                         pool_starved: true,
+                        last_not_found: true,
                     }));
                 }
                 Err("timeout".into())

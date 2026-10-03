@@ -770,19 +770,20 @@ impl RsDecoder {
 }
 
 /// Did a sweep's shard fetch fail because peers confirmed the chunk
-/// missing (`storage: not found` / `no peer found`,
-/// [`crate::feed::is_chunk_not_found`])? Not when the fetcher reports
-/// its peer pool was starved ([`crate::fetcher::FetchExhausted`]): on a
-/// cold node one peer can answer "not found" and every other candidate
-/// be overdraft-skipped, which says nothing about the chunk. Also the
-/// test `ant-p2p`'s `/bytes` root retry uses to stop at a real miss.
+/// missing (`storage: not found` / `no peer found`)? For the fetcher's
+/// own error this is the typed
+/// [`crate::fetcher::FetchExhausted::confirmed_missing`]: not when its
+/// peer pool was starved, since on a cold node one peer can answer "not
+/// found" and every other candidate be overdraft-skipped, which says
+/// nothing about the chunk (issue #114). Other fetchers' errors fall
+/// back to the message ([`crate::feed::is_chunk_not_found`]). Also the
+/// test `ant-p2p`'s `/bytes` and `/bzz` root retries use to stop at a
+/// real miss.
 pub fn shard_confirmed_missing(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    if e.downcast_ref::<crate::fetcher::FetchExhausted>()
-        .is_some_and(|x| x.pool_starved)
-    {
-        return false;
+    match crate::fetcher::FetchExhausted::find(e) {
+        Some(x) => x.confirmed_missing(),
+        None => crate::feed::is_chunk_not_found(e),
     }
-    crate::feed::is_chunk_not_found(e)
 }
 
 // --- dispersed replicas (bee pkg/replicas) -------------------------------
@@ -942,30 +943,55 @@ mod tests {
     use super::*;
 
     /// A shard counts as confirmed missing only when peers said so and
-    /// the fetcher wasn't cut short by an overdraft-starved pool.
+    /// the fetcher wasn't cut short by an overdraft-starved pool. Both of
+    /// bee's miss answers count (issue #123), read from the typed error
+    /// the fetcher builds from the peer's last answer.
     #[test]
     fn shard_confirmed_missing_needs_an_unstarved_not_found() {
         let exhausted = |tail: &str, pool_starved| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(crate::fetcher::FetchExhausted {
-                message: format!("all peers failed for chunk ab after 3 attempts (last: {tail})"),
+            Box::new(crate::fetcher::exhausted(
+                [0xab; 32],
+                3,
+                Some(crate::RetrievalError::Remote(tail.to_string())),
                 pool_starved,
-            })
+            ))
         };
-        let not_found = "remote: retrieve chunk: storage: not found";
-        assert!(shard_confirmed_missing(
-            exhausted(not_found, false).as_ref()
-        ));
-        assert!(shard_confirmed_missing(
-            exhausted("remote: retrieve chunk: no peer found", false).as_ref()
-        ));
+        for tail in [
+            "retrieve chunk: storage: not found",
+            "retrieve chunk: no peer found",
+        ] {
+            assert!(
+                shard_confirmed_missing(exhausted(tail, false).as_ref()),
+                "{tail}"
+            );
+            assert!(
+                !shard_confirmed_missing(exhausted(tail, true).as_ref()),
+                "{tail}"
+            );
+        }
         assert!(!shard_confirmed_missing(
-            exhausted(not_found, true).as_ref()
+            exhausted("retrieve chunk: forbidden", false).as_ref()
         ));
-        assert!(!shard_confirmed_missing(
-            exhausted("timeout", false).as_ref()
-        ));
+        let timeout: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(crate::fetcher::exhausted(
+                [0xab; 32],
+                3,
+                Some(crate::RetrievalError::Timeout(
+                    std::time::Duration::from_secs(5),
+                )),
+                false,
+            ));
+        assert!(!shard_confirmed_missing(timeout.as_ref()));
         let no_peers: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
         assert!(!shard_confirmed_missing(no_peers.as_ref()));
+        // Still found when wrapped, as the joiner and manifest walk do.
+        let wrapped = crate::JoinError::FetchChunk {
+            addr: "ab".into(),
+            source: exhausted("retrieve chunk: no peer found", false),
+        };
+        let wrapped: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(crate::ManifestError::Fetch(wrapped));
+        assert!(shard_confirmed_missing(wrapped.as_ref()));
     }
 
     /// Level tables agree with bee's documented shape: parities for a

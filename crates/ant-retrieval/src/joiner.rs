@@ -1928,6 +1928,7 @@ mod tests {
                                 hex::encode(addr)
                             ),
                             pool_starved: true,
+                            last_not_found: true,
                         }));
                     }
                     return Err("no BZZ peers available".into());
@@ -2067,6 +2068,7 @@ mod tests {
             Box::new(crate::fetcher::FetchExhausted {
                 message: "no BZZ peers available".into(),
                 pool_starved: true,
+                last_not_found: false,
             })
         }
         #[async_trait::async_trait]
@@ -2126,6 +2128,7 @@ mod tests {
             Box::new(crate::fetcher::FetchExhausted {
                 message: "no BZZ peers available".into(),
                 pool_starved: true,
+                last_not_found: false,
             })
         }
         #[async_trait::async_trait]
@@ -2197,6 +2200,7 @@ mod tests {
                 Err(Box::new(crate::fetcher::FetchExhausted {
                     message: "timed out".into(),
                     pool_starved: false,
+                    last_not_found: false,
                 }))
             }
         }

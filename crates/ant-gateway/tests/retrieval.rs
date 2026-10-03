@@ -688,7 +688,10 @@ async fn chunks_404_on_missing_reference() {
 /// raw `/bytes` reference behind `/bzz` are 404s, never a 502 that
 /// Freedom's `bzz://` handler retries for most of a minute. The
 /// messages are the node's exact shapes (`path_below_raw_bytes_message`
-/// and an exhausted bare-root lookup in `ant-p2p`'s `behaviour.rs`).
+/// and an exhausted bare-root lookup in `ant-p2p`'s `behaviour.rs`). A
+/// lookup whose typed fetcher error confirms the miss now arrives as
+/// `ControlAck::NotFound` instead (#123, next test); these pin the
+/// message mapping for an untyped `ControlAck::Error`.
 #[tokio::test]
 async fn bzz_raw_bytes_misses_are_404_not_502() {
     let raw = "6c63c82445b9d80000d22e3a6acad2af956920beb475f1b20abadc4ae8dc16b1";
@@ -736,6 +739,98 @@ async fn bzz_raw_bytes_misses_are_404_not_502() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["message"], want, "{uri}");
+    }
+}
+
+/// #123: a root the network confirmed missing reaches the gateway typed
+/// as `ControlAck::NotFound` (`pre_stream_failure_ack` in `ant-p2p`'s
+/// `behaviour.rs`) and answers bee's `404 "Not Found"` on `/bytes` and
+/// `/bzz`, whichever miss tail the fetch ended in. The `no peer found`
+/// tail used to come through as a plain error and answer 502, which
+/// Freedom retries for ~50 s. A miss from a starved peer pool comes as
+/// `NotReady` and stays retryable (503), never a 404 (#114).
+#[tokio::test]
+async fn confirmed_missing_root_is_404_and_starved_miss_is_503() {
+    let missing = "8bb914d8c06c185734f5853acc4b10746d1ccec7462dac2d94b57612f2acbe74";
+    let exhausted = |tail: &str| {
+        format!(
+            "all peers failed for chunk {missing} after 34 attempts (last: remote: retrieve chunk: {tail})"
+        )
+    };
+    let uris = [
+        format!("/bytes/{missing}"),
+        format!("/bzz/{missing}/"),
+        format!("/bzz/{missing}/index.html"),
+    ];
+    for uri in &uris {
+        for tail in ["no peer found", "storage: not found"] {
+            for method in [Method::GET, Method::HEAD] {
+                let message = if uri.starts_with("/bytes") {
+                    format!("fetch root chunk {missing}: {}", exhausted(tail))
+                } else {
+                    format!(
+                        "manifest lookup '': fetch chunk {missing}: {}",
+                        exhausted(tail)
+                    )
+                };
+                let router = router_with_dispatcher(move |cmd| {
+                    let message = message.clone();
+                    async move {
+                        if let ControlCommand::StreamBytes { ack, .. }
+                        | ControlCommand::StreamBzz { ack, .. } = cmd
+                        {
+                            let _ = ack.send(ControlAck::NotFound { message }).await;
+                        }
+                    }
+                });
+                let resp = send(
+                    router,
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {uri} ({tail})"
+                );
+                if method == Method::GET {
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                    assert_eq!(json["code"], 404, "{uri} ({tail})");
+                    assert_eq!(json["message"], "Not Found", "{uri} ({tail})");
+                }
+            }
+        }
+
+        let message = exhausted("storage: not found");
+        let router = router_with_dispatcher(move |cmd| {
+            let message = message.clone();
+            async move {
+                if let ControlCommand::StreamBytes { ack, .. }
+                | ControlCommand::StreamBzz { ack, .. } = cmd
+                {
+                    let _ = ack.send(ControlAck::NotReady { message }).await;
+                }
+            }
+        });
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} (starved)"
+        );
     }
 }
 

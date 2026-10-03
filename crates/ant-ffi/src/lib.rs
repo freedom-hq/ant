@@ -1223,7 +1223,9 @@ async fn attempt_download(
             Ok(Some(ControlAck::Bytes { data } | ControlAck::BzzBytes { data, .. })) => {
                 return Ok(data)
             }
-            Ok(Some(ControlAck::Error { message })) => return Err(FfiError::Download(message)),
+            Ok(Some(ControlAck::Error { message } | ControlAck::NotFound { message })) => {
+                return Err(FfiError::Download(message))
+            }
             Ok(Some(ControlAck::Progress(p))) => {
                 if let Ok(mut slot) = progress_slot.lock() {
                     slot.apply(&p);
