@@ -2617,7 +2617,7 @@ Single capability: a bee-shaped read-only HTTP surface on `127.0.0.1:1633`, suff
 | Endpoint | Source |
 |---|---|
 | `GET /health` | static — version from `env!("CARGO_PKG_VERSION")` |
-| `GET /readiness` | `ant-p2p` routing snapshot: ≥ 1 serving (non-bootnode) BZZ peer (#78) |
+| `GET /readiness` | `ant-p2p` routing snapshot: ≥ 1 serving BZZ peer — not stale, and a bootnode only after 5 s in the table (#78) |
 | `GET /node` | hardcoded `{beeMode:"ultra-light", chequebookEnabled:false, swapEnabled:false}` |
 | `GET /addresses` | existing identity in `antd::main` (overlay, ethereum, libp2p public key) |
 | `GET /peers` | `ant-p2p` peer snapshot |

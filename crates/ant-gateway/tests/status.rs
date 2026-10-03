@@ -75,14 +75,19 @@ async fn readiness_503_when_no_peers() {
 
 /// Issue #83: a handshaked peer whose connection stopped answering
 /// pings (`stale`) doesn't make the node ready — that was the probe gate
-/// hosts were lied to by while every retrieval hung.
+/// hosts were lied to by while every retrieval hung. The gateway can't
+/// see staleness itself: it answers from the published
+/// `RoutingInfo::serving`, which the node loop's `serving_peer_count`
+/// computes without stale peers. That half is covered by
+/// `ant_p2p`'s `serving_peer_count_skips_stale_peers`; this test pins the
+/// gateway half: a stale-only snapshot, as the node loop publishes it,
+/// answers 503.
 #[tokio::test]
-async fn readiness_503_when_the_only_peer_is_stale() {
+async fn readiness_503_for_a_stale_only_snapshot() {
     let mut snap = snapshot_with_one_peer();
     snap.peers.connected_peers[0].stale = true;
     snap.peers.connected = 0;
-    // The node loop's `serving_peer_count` skips stale routing peers
-    // (#78), so this is what it publishes for a stale-only table.
+    // What `serving_peer_count` publishes for a stale-only table.
     snap.peers.routing.serving = 0;
     let router = status_only_router(snap);
     let resp = send(

@@ -52,9 +52,11 @@ pub async fn health(State(handle): State<GatewayHandle>) -> Response {
 }
 
 /// `GET /readiness`. `200` once the node can serve a retrieval — a
-/// BZZ-handshaked, non-bootnode peer in its routing table
-/// ([`ant_control::PeerInfo::can_retrieve`]) — and `503` until then, or
-/// again if every such peer drops. Until #78 a bare libp2p connection
+/// BZZ-handshaked peer in its routing table that isn't stale, where a
+/// bootnode counts only after a 5 s grace in the table (so a private
+/// network whose only peer is its bootnode still turns ready;
+/// [`ant_control::PeerInfo::can_retrieve`], `RoutingInfo::serving`) —
+/// and `503` until then, or again if every such peer drops. Until #78 a bare libp2p connection
 /// counted, so a cold node reported ready ~50–250 ms after start on its
 /// first bootnode connection, which resets right after the handshake;
 /// when the bootnodes kept doing that, every `/bzz` answered 502 "no

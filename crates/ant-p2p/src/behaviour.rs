@@ -9835,8 +9835,8 @@ mod tests {
     /// `/readiness` (#78) counts routing peers that can serve: a bootnode
     /// counts only after `BOOTNODE_SERVING_GRACE` in the table (mainnet
     /// bootnodes reset the connection milliseconds after the handshake),
-    /// any other routing peer at once, and neither a forgotten peer nor a
-    /// stale one (#83).
+    /// any other routing peer at once, and never a forgotten peer. Stale
+    /// peers: `serving_peer_count_skips_stale_peers`.
     #[test]
     fn serving_peer_count_skips_fresh_bootnodes() {
         let mut state = SwarmState::new(
@@ -9877,9 +9877,25 @@ mod tests {
         state.routing.forget(&peer);
         state.routing_admitted_at.remove(&peer);
         assert_eq!(serving_peer_count(&state, t0), 0);
+    }
 
-        // A routing peer whose connection stopped answering pings (#83)
-        // doesn't count while it waits to be closed as dead.
+    /// A routing peer whose connection stopped answering pings (#83)
+    /// doesn't count toward `RoutingInfo::serving` while it waits to be
+    /// closed as dead — the staleness half of `/readiness`. The gateway
+    /// only reads the published `serving` figure, so this is the one test
+    /// that catches `serving_peer_count` counting a stale peer.
+    #[test]
+    fn serving_peer_count_skips_stale_peers() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let t0 = Instant::now();
         let quiet = pid();
         state.routing.admit(quiet, [3u8; 32]);
         state.routing_admitted_at.insert(quiet, t0);
@@ -9889,11 +9905,19 @@ mod tests {
         assert_eq!(serving_peer_count(&state, t0), 1, "answering pings");
         let silent = t0 + LivenessConfig::DEFAULT.live_window + Duration::from_secs(1);
         assert!(state.liveness.stale_peers(silent).contains(&quiet));
+        assert_eq!(serving_peer_count(&state, silent), 0, "stale-only table");
+        let snap = routing_snapshot(&state, silent);
         assert_eq!(
-            serving_peer_count(&state, silent),
-            1,
-            "only the bootnode, past its grace, still serves",
+            (snap.size, snap.serving),
+            (1, 0),
+            "in the table, not serving"
         );
+
+        // A live peer alongside it still serves; the stale one stays out.
+        let live = pid();
+        state.routing.admit(live, [4u8; 32]);
+        state.routing_admitted_at.insert(live, silent);
+        assert_eq!(serving_peer_count(&state, silent), 1);
     }
 
     /// A warm start dials stored peers from the hint queue before the
