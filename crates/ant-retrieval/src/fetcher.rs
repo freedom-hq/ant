@@ -199,7 +199,8 @@ pub struct RoutingFetcher {
     /// one shared `Arc` into every fetcher.
     counters: Option<Arc<RetrievalCounters>>,
     /// Optional pushsync-side settlement hook. When `Some`, every
-    /// accepted pushsync receipt is reported via
+    /// pushsync receipt — deep or shallow, and one that arrives after
+    /// the walk moved on (a losing hedge, a dropped push) — is reported via
     /// [`PushsyncSettlement::note_pushsync`] so the implementation
     /// can decide whether the per-peer outbound debt has crossed a
     /// SWAP-cheque trigger. The fetcher itself stays ignorant of
@@ -361,8 +362,9 @@ impl RoutingFetcher {
         self
     }
 
-    /// Attach a pushsync-side settlement hook. After every accepted
-    /// pushsync receipt we call `settlement.note_pushsync(peer, price)`
+    /// Attach a pushsync-side settlement hook. After every pushsync
+    /// receipt, deep or shallow, accepted or not (the storer debits us
+    /// for each one it writes), we call `settlement.note_pushsync(peer, price)`
     /// so the hook can decide whether to emit a SWAP cheque before the
     /// next push lands. The hook is best-effort: a settlement failure
     /// does not fail the upload, just causes the next pushsync against
@@ -753,7 +755,9 @@ impl RoutingFetcher {
     ///   peer and, every [`PREEMPTIVE_INTERVAL`] (bee `preemptiveInterval`),
     ///   fan out to one more closest peer *concurrently* — bee's
     ///   "preemptive" early-replication hedge. The first valid receipt
-    ///   wins; remaining attempts are dropped.
+    ///   wins; the remaining attempts are handed to a detached drain
+    ///   ([`PushInFlight`]) that records the debit of any receipt they
+    ///   still return.
     /// * **Shallow receipts are not failures.** A shallow receipt proves a
     ///   storer ran its reserve-put + sign path (so the chunk is stored
     ///   and will be pull-synced through the neighbourhood); it just
@@ -762,7 +766,9 @@ impl RoutingFetcher {
     ///   retry for a deeper storer up to [`MAX_SHALLOW_ATTEMPTS`] (bee
     ///   `DefaultRetryCount`) and then **accept** it — bee reports the
     ///   chunk `ChunkSynced` rather than ever failing the upload on a
-    ///   shallow receipt. Under [`Self::with_require_deep`] (the upload-
+    ///   shallow receipt. Every shallow receipt is debited to the
+    ///   settlement mirror, not just the accepted one: the storer
+    ///   applied the debit when it wrote it. Under [`Self::with_require_deep`] (the upload-
     ///   job path) the exhausted hunt returns
     ///   [`PushSyncError::ShallowReceipt`] instead of accepting, so the
     ///   caller's retry queue keeps working the chunk until it lands
@@ -828,12 +834,13 @@ impl RoutingFetcher {
         let mut last_err: Option<PushSyncError> = None;
 
         // In-flight pushsync attempts. Each yields
-        // `(peer, overlay, chunk_price, result)`.
-        type Attempt = (PeerId, Overlay, u64, Result<(), PushSyncError>);
-        let inflight = FuturesUnordered::<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Attempt> + Send>>,
-        >::new();
-        let mut inflight = inflight;
+        // `(peer, overlay, chunk_price, result)`. Whatever is still in
+        // flight when this function returns (a winner beat the hedges, the
+        // walk gave up, or the caller dropped us) goes to a detached drain
+        // that records the debit of every receipt that still arrives:
+        // the storer debits us once it has written a receipt, whether or
+        // not we are still listening.
+        let mut inflight = PushInFlight::new(self.pushsync_settlement.clone());
 
         // `want` is bee's `retryC`: how many fresh attempts to dispatch to
         // the next-closest peers. Seed with one; the preemptive ticker and
@@ -872,7 +879,7 @@ impl RoutingFetcher {
                 if let Some(load) = push_load.as_ref() {
                     load.begin(peer);
                 }
-                inflight.push(Box::pin(async move {
+                inflight.futs.push(Box::pin(async move {
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
@@ -915,7 +922,7 @@ impl RoutingFetcher {
                 want -= 1;
             }
 
-            if inflight.is_empty() {
+            if inflight.futs.is_empty() {
                 // Nothing pending and no candidates left to dial.
                 break;
             }
@@ -923,7 +930,7 @@ impl RoutingFetcher {
             tokio::select! {
                 // Prefer draining results over firing more hedges.
                 biased;
-                Some((peer, overlay, price, res)) = inflight.next() => {
+                Some((peer, overlay, price, res)) = inflight.futs.next() => {
                     match res {
                         Ok(()) => {
                             if let Some(s) = self.pushsync_settlement.as_ref() {
@@ -945,6 +952,13 @@ impl RoutingFetcher {
                             // receipt now. Do NOT cool-down a shallow peer;
                             // it's a fine storer for chunks in its own
                             // neighbourhood.
+                            // The storer debits us once it has written a
+                            // receipt, shallow or deep, so every one is
+                            // real debt the mirror must record — not just
+                            // the one we finally accept (PR #134 R3-M1).
+                            if let Some(s) = self.pushsync_settlement.as_ref() {
+                                s.note_pushsync(peer, price).await;
+                            }
                             shallow_attempts += 1;
                             shallow_seen = true;
                             last_shallow = (po, storage_radius);
@@ -961,10 +975,7 @@ impl RoutingFetcher {
                                 // the caller's retry queue instead of
                                 // accepting a placement the routed network
                                 // can't see (see `with_require_deep`). The
-                                // storer did settle-worthy work either way.
-                                if let Some(s) = self.pushsync_settlement.as_ref() {
-                                    s.note_pushsync(peer, price).await;
-                                }
+                                // debit was recorded above either way.
                                 if require_deep {
                                     warn!(
                                         target: "ant_retrieval::fetcher",
@@ -2102,6 +2113,70 @@ fn spawn_drain_losers<S>(
     });
 }
 
+/// One pushsync attempt's outcome: `(peer, overlay, chunk_price, result)`.
+type PushAttempt = (
+    PeerId,
+    Overlay,
+    u64,
+    Result<(), crate::pushsync::PushSyncError>,
+);
+
+/// A boxed, detachable pushsync attempt.
+type PushAttemptFuture = std::pin::Pin<Box<dyn std::future::Future<Output = PushAttempt> + Send>>;
+
+/// `push_stamped_chunk`'s in-flight attempts. On drop (the walk returned
+/// with hedges still running, or the caller dropped the push), whatever is
+/// still in flight goes to a detached drain that records the debit of
+/// every receipt that still arrives — deep or shallow — in the pushsync
+/// settlement mirror. A storer applies the debit once it has written its
+/// receipt, whether or not we read it, and the pseudosettle driver only
+/// refreshes a peer once its *mirrored* debt is due, so a dropped receipt
+/// is debt bee holds and nothing ever clears. Each attempt is bounded by
+/// `DEFAULT_PUSHSYNC_TIMEOUT`, so the drain is too.
+struct PushInFlight {
+    futs: FuturesUnordered<PushAttemptFuture>,
+    settlement: Option<Arc<dyn PushsyncSettlement>>,
+}
+
+impl PushInFlight {
+    fn new(settlement: Option<Arc<dyn PushsyncSettlement>>) -> Self {
+        Self {
+            futs: FuturesUnordered::new(),
+            settlement,
+        }
+    }
+}
+
+impl Drop for PushInFlight {
+    fn drop(&mut self) {
+        if self.futs.is_empty() {
+            return;
+        }
+        let futs = std::mem::take(&mut self.futs);
+        // Without a settlement hook there is nothing to record; dropping
+        // the attempts just closes their streams, as before.
+        let Some(settlement) = self.settlement.clone() else {
+            return;
+        };
+        // A drop outside any runtime (process teardown) has nowhere to
+        // spawn to; the requests die with the runtime anyway.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut futs = futs;
+            while let Some((peer, _overlay, price, res)) = futs.next().await {
+                if matches!(
+                    res,
+                    Ok(()) | Err(crate::pushsync::PushSyncError::ShallowReceipt { .. })
+                ) {
+                    settlement.note_pushsync(peer, price).await;
+                }
+            }
+        });
+    }
+}
+
 /// The in-flight set of one [`RoutingFetcher::fetch_within`] call, which
 /// is never simply dropped while requests are still running.
 ///
@@ -2248,6 +2323,62 @@ fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records every `note_pushsync` call.
+    #[derive(Default)]
+    struct RecordingSettlement(Mutex<Vec<(PeerId, u64)>>);
+
+    #[async_trait]
+    impl PushsyncSettlement for RecordingSettlement {
+        async fn note_pushsync(&self, peer: PeerId, price: u64) {
+            self.0.lock().unwrap().push((peer, price));
+        }
+        fn forget(&self, _peer: &PeerId) {}
+    }
+
+    /// Pushes still in flight when `push_stamped_chunk` returns (a winner
+    /// beat the hedges) or is dropped keep running in a detached drain,
+    /// and every receipt that still arrives — deep or shallow — is debited
+    /// to the mirror: the storer debited us when it wrote it. Failed
+    /// attempts record nothing (PR #134 R3-M1).
+    #[tokio::test(start_paused = true)]
+    async fn dropped_push_attempts_still_record_late_receipts() {
+        use crate::pushsync::PushSyncError;
+        let rec = Arc::new(RecordingSettlement::default());
+        let (deep, shallow, failed) = (PeerId::random(), PeerId::random(), PeerId::random());
+        {
+            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            for (peer, price, delay, res) in [
+                (deep, 110_000u64, 3u64, Ok(())),
+                (
+                    shallow,
+                    220_000,
+                    5,
+                    Err(PushSyncError::ShallowReceipt {
+                        po: 3,
+                        storage_radius: 8,
+                    }),
+                ),
+                (
+                    failed,
+                    330_000,
+                    1,
+                    Err(PushSyncError::Remote("nope".into())),
+                ),
+            ] {
+                inflight.futs.push(Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    (peer, [0u8; 32], price, res)
+                }));
+            }
+            // Dropped with all three still pending.
+        }
+        assert!(rec.0.lock().unwrap().is_empty(), "nothing has answered yet");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut got = rec.0.lock().unwrap().clone();
+        got.sort_by_key(|(_, p)| *p);
+        assert_eq!(got, vec![(deep, 110_000), (shallow, 220_000)]);
+    }
     use crate::accounting::CREDIT_WAIT_BUDGET;
     use std::time::Duration;
 

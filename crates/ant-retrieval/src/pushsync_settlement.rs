@@ -21,8 +21,10 @@
 //! Decouples the pushsync hot path from the SWAP / cheque issuance code.
 //! The fetcher knows nothing about chequebooks, EIP-712, libp2p swap
 //! streams, or chain ids; it just calls
-//! [`PushsyncSettlement::note_pushsync`] right after every accepted
-//! pushsync receipt (`price` in accounting units, bee's
+//! [`PushsyncSettlement::note_pushsync`] right after every pushsync
+//! receipt it reads — deep or shallow, from the winner or from a hedge
+//! drained after the walk returned — since the storer debits us for
+//! each receipt it writes (`price` in accounting units, bee's
 //! `pricer.PeerPrice`). The implementation in
 //! `ant-p2p::push_pseudosettle` debits it to the shared
 //! [`Accounting`](crate::accounting::Accounting) mirror — bee's one
@@ -72,7 +74,7 @@ pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
 ///
 /// Implemented by `ant-p2p::pushsync_swap::PushsyncSwap`. The fetcher
 /// holds an `Arc<dyn PushsyncSettlement>` and calls `note_pushsync`
-/// after every accepted pushsync receipt; if the implementation decides
+/// after every pushsync receipt (deep or shallow); if the implementation decides
 /// it's time to emit a cheque, it does so synchronously *inside*
 /// `note_pushsync` so the next `push_stamped_chunk` call observes the
 /// peer paid up.
@@ -88,7 +90,8 @@ pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PushsyncSettlement: Send + Sync {
-    /// Called once per accepted pushsync receipt. `price` is the chunk
+    /// Called once per pushsync receipt read, deep or shallow, plus a
+    /// `price == 0` pre-flight before each dispatch. `price` is the chunk
     /// price in PLUR (typically [`peer_chunk_price`] of `peer_overlay`
     /// vs `chunk_addr`). Implementations that want richer state can
     /// recover the chunk address and overlay from prior calls; for
