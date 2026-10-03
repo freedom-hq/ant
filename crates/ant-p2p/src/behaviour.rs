@@ -783,6 +783,14 @@ struct SwarmState {
     failed: Vec<PeerFailure>,
     pending: HashMap<PeerId, PendingPhase>,
     bzz_peers: HashSet<PeerId>,
+    /// Peer ids we dialed as bootnodes ([`handle_bootnode_dial`]). They
+    /// count toward `RoutingInfo::serving` (`/readiness`) only after
+    /// [`BOOTNODE_SERVING_GRACE`] in the routing table — see
+    /// [`serving_peer_count`].
+    bootnode_peers: HashSet<PeerId>,
+    /// When each routing-table entry was admitted. Removed with the entry
+    /// on `ConnectionClosed`.
+    routing_admitted_at: HashMap<PeerId, Instant>,
     /// Total cold-start time (dial + identify + handshake, in ms) for each
     /// peer that has reached `Ready`. Surfaced as `ready_in_ms` on the
     /// pipeline rows so `antop` can show the column and rank slow
@@ -1061,6 +1069,8 @@ impl SwarmState {
             failed: Vec::new(),
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
+            bootnode_peers: HashSet::new(),
+            routing_admitted_at: HashMap::new(),
             ready_in_ms: HashMap::new(),
             routing: RoutingTable::new(base_overlay),
             known: KnownPeers::new(base_overlay),
@@ -1608,7 +1618,7 @@ fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mu
         .dial_backoff
         .retain(|_, b| now.saturating_duration_since(b.until) < DIAL_BACKOFF_MAX);
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(&state.routing, &state.known);
+    let routing = routing_snapshot(state, Instant::now());
     let retrieval = build_retrieval_info(state);
     tx.send_modify(|st| {
         st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
@@ -1665,30 +1675,61 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
 }
 
 /// Build a `RoutingInfo` that mirrors the live routing table for the
-/// control snapshot. Cheap (32 entries) so we recompute on every pipeline
-/// sync rather than try to track deltas.
-fn routing_snapshot(table: &RoutingTable, known: &KnownPeers) -> RoutingInfo {
+/// control snapshot. Cheap (32 entries plus one pass over the table) so
+/// we recompute on every pipeline sync rather than try to track deltas.
+fn routing_snapshot(state: &SwarmState, now: Instant) -> RoutingInfo {
+    let table = &state.routing;
+    let known = &state.known;
     let counts = table.bin_counts();
     let known_counts = known.bin_counts();
     RoutingInfo {
         base_overlay: format!("0x{}", hex::encode(table.base())),
         size: table.len() as u32,
         bins: counts.iter().map(|c| u32::from(*c)).collect(),
+        serving: serving_peer_count(state, now),
         known_size: known.len() as u32,
         known_bins: known_counts.to_vec(),
     }
 }
 
+/// How long a bootnode must stay in the routing table before it counts as
+/// a serving peer (`RoutingInfo::serving`, `/readiness`). Mainnet
+/// bootnodes run bee's bootnode mode: they hand out peers and reset the
+/// connection 3–600 ms after the handshake (#78), so they never get
+/// here. A bootnode that does stay — a private network's only node,
+/// which ant does route through — makes the node ready after this.
+const BOOTNODE_SERVING_GRACE: Duration = Duration::from_secs(5);
+
+/// Routing-table peers the node can serve retrievals through at `now`:
+/// every entry except one whose connections stopped answering pings
+/// ([`Liveness::stale_peers`], #83) and a bootnode admitted less than
+/// [`BOOTNODE_SERVING_GRACE`] ago. The pipeline sync (every
+/// [`PIPELINE_SYNC_INTERVAL`]) republishes it, so a peer going stale, or
+/// a bootnode that stays, is reflected within one tick.
+fn serving_peer_count(state: &SwarmState, now: Instant) -> u32 {
+    let stale = state.liveness.stale_peers(now);
+    state
+        .routing
+        .snapshot()
+        .iter()
+        .filter(|(peer, _)| !stale.contains(peer))
+        .filter(|(peer, _)| {
+            !state.bootnode_peers.contains(peer)
+                || state
+                    .routing_admitted_at
+                    .get(peer)
+                    .is_some_and(|at| now.saturating_duration_since(*at) >= BOOTNODE_SERVING_GRACE)
+        })
+        .count() as u32
+}
+
 /// Push a routing-only update to the status snapshot. Used right after
-/// `routing.admit` so `antop` reflects new peers without waiting for
-/// the next pipeline-sync tick.
-fn sync_routing_snapshot(
-    status: Option<&watch::Sender<StatusSnapshot>>,
-    table: &RoutingTable,
-    known: &KnownPeers,
-) {
+/// `routing.admit` and `routing.forget` so `antop` and the gateway's
+/// `/readiness` (`PeerInfo::can_retrieve`) reflect the table without
+/// waiting for the next pipeline-sync tick.
+fn sync_routing_snapshot(status: Option<&watch::Sender<StatusSnapshot>>, state: &SwarmState) {
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(table, known);
+    let routing = routing_snapshot(state, Instant::now());
     tx.send_modify(|st| st.peers.routing = routing);
 }
 
@@ -7730,6 +7771,7 @@ fn handle_swarm_event(
             // forwarder would keep picking a peer we have no live
             // connection to.
             state.routing.forget(&peer_id);
+            state.routing_admitted_at.remove(&peer_id);
             // Drop the accounting mirror for this peer too: bee's
             // `notifyPeerConnect` resets the `accountingPeer` on
             // reconnect, so our balance must reset alongside.
@@ -7748,6 +7790,10 @@ fn handle_swarm_event(
             // check). Idempotent on peers we never had a handshake for.
             state.peer_eth.forget(&peer_id);
             state.publish_peers();
+            // Keep the status snapshot's routing size in step with the
+            // table: `/readiness` reads it, and must go back to 503 as
+            // soon as the last peer drops, not at the next pipeline tick.
+            sync_routing_snapshot(status, state);
             if was_bzz {
                 info!(
                     target: "ant_p2p",
@@ -7985,6 +8031,10 @@ fn handle_drive_outcome(
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.
             state.routing.admit(peer, info.remote_overlay);
+            state
+                .routing_admitted_at
+                .entry(peer)
+                .or_insert_with(Instant::now);
             // A connected peer is also a known peer (so population is
             // always >= connected). Idempotent if hive already noted it.
             state.known.note(info.remote_overlay);
@@ -8012,7 +8062,7 @@ fn handle_drive_outcome(
                 &info,
                 peer_agents.get(&peer).cloned(),
             );
-            sync_routing_snapshot(cfg.status.as_ref(), &state.routing, &state.known);
+            sync_routing_snapshot(cfg.status.as_ref(), state);
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive
@@ -8475,6 +8525,7 @@ fn handle_bootnode_dial(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState,
     let Some(peer) = crate::dial::extract_peer_id(&addr) else {
         return;
     };
+    state.bootnode_peers.insert(peer);
     if swarm.is_connected(&peer) || state.dialing.contains(&peer) {
         return;
     }
@@ -9750,6 +9801,70 @@ mod tests {
         assert!(
             bin_balance_candidates(&base, &saturated, &known, |_| false).is_empty(),
             "balanced table must produce no dials",
+        );
+    }
+
+    /// `/readiness` (#78) counts routing peers that can serve: a bootnode
+    /// counts only after `BOOTNODE_SERVING_GRACE` in the table (mainnet
+    /// bootnodes reset the connection milliseconds after the handshake),
+    /// any other routing peer at once, and neither a forgotten peer nor a
+    /// stale one (#83).
+    #[test]
+    fn serving_peer_count_skips_fresh_bootnodes() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let t0 = Instant::now();
+        let boot = pid();
+        state.bootnode_peers.insert(boot);
+        state.routing.admit(boot, [1u8; 32]);
+        state.routing_admitted_at.insert(boot, t0);
+        assert_eq!(serving_peer_count(&state, t0), 0, "fresh bootnode");
+        let snap = routing_snapshot(&state, t0);
+        assert_eq!((snap.size, snap.serving), (1, 0));
+        assert_eq!(
+            serving_peer_count(
+                &state,
+                t0 + BOOTNODE_SERVING_GRACE.saturating_sub(Duration::from_millis(1))
+            ),
+            0,
+        );
+        assert_eq!(
+            serving_peer_count(&state, t0 + BOOTNODE_SERVING_GRACE),
+            1,
+            "a bootnode that stays (private network) counts after the grace",
+        );
+
+        let peer = pid();
+        state.routing.admit(peer, [2u8; 32]);
+        state.routing_admitted_at.insert(peer, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1, "gossiped peer at once");
+
+        state.routing.forget(&peer);
+        state.routing_admitted_at.remove(&peer);
+        assert_eq!(serving_peer_count(&state, t0), 0);
+
+        // A routing peer whose connection stopped answering pings (#83)
+        // doesn't count while it waits to be closed as dead.
+        let quiet = pid();
+        state.routing.admit(quiet, [3u8; 32]);
+        state.routing_admitted_at.insert(quiet, t0);
+        state
+            .liveness
+            .on_established(libp2p::swarm::ConnectionId::new_unchecked(1), quiet, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1, "answering pings");
+        let silent = t0 + LivenessConfig::DEFAULT.live_window + Duration::from_secs(1);
+        assert!(state.liveness.stale_peers(silent).contains(&quiet));
+        assert_eq!(
+            serving_peer_count(&state, silent),
+            1,
+            "only the bootnode, past its grace, still serves",
         );
     }
 

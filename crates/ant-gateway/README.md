@@ -21,7 +21,7 @@ and the work breakdown is in [PLAN.md Appendix D][appx-d].
 | Path                         | Method     | Tier | Notes                                                                |
 | ---------------------------- | ---------- | ---- | -------------------------------------------------------------------- |
 | `/health`                    | GET        | A    | `{status, version, apiVersion}`. Constant after bind.                |
-| `/readiness`                 | GET        | A    | 200 once a BZZ peer is handshaked, 503 otherwise.                    |
+| `/readiness`                 | GET        | A    | 200 once a non-bootnode BZZ peer is in the routing table, 503 otherwise (#78). |
 | `/node`                      | GET        | A    | `beeMode: "ultra-light"`, swap/chequebook flagged off.               |
 | `/addresses`                 | GET        | A    | Static identity — overlay (bare hex), ethereum (`0x…`), publicKey.   |
 | `/peers`                     | GET        | A    | BZZ-handshaked peers by overlay; pre-handshake peers omitted.        |

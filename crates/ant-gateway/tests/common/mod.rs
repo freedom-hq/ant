@@ -154,6 +154,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
                     bins[5] = 1;
                     bins
                 },
+                serving: 1,
                 ..Default::default()
             },
         },
