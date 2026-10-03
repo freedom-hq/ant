@@ -954,6 +954,7 @@ mod tests {
                 3,
                 Some(crate::RetrievalError::Remote(tail.to_string())),
                 pool_starved,
+                1,
             ))
         };
         for tail in [
@@ -980,6 +981,7 @@ mod tests {
                     std::time::Duration::from_secs(5),
                 )),
                 false,
+                0,
             ));
         assert!(!shard_confirmed_missing(timeout.as_ref()));
         let no_peers: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();

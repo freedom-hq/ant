@@ -1205,18 +1205,33 @@ pub struct FetchExhausted {
     pub pool_starved: bool,
     /// The last peer that answered said the chunk is missing.
     pub last_not_found: bool,
+    /// How many distinct peers answered that the chunk is missing.
+    /// Tells a miss the network corroborated
+    /// ([`Self::corroborated_missing`]) from a cold node's one or two
+    /// "not found" answers, which can also be [`Self::confirmed_missing`]
+    /// when those were the only ranked peers.
+    pub not_found_answers: usize,
 }
 
 impl FetchExhausted {
     /// Build one by hand, for fetchers other than [`RoutingFetcher`]
-    /// and for tests that stand in for it.
+    /// and for tests that stand in for it. A miss counts as one peer's
+    /// answer; see [`Self::with_not_found_answers`].
     #[must_use]
     pub fn new(message: impl Into<String>, pool_starved: bool, last_not_found: bool) -> Self {
         Self {
             message: message.into(),
             pool_starved,
             last_not_found,
+            not_found_answers: usize::from(last_not_found),
         }
+    }
+
+    /// Set how many peers answered "not found" ([`Self::not_found_answers`]).
+    #[must_use]
+    pub const fn with_not_found_answers(mut self, n: usize) -> Self {
+        self.not_found_answers = n;
+        self
     }
 
     /// Peers confirmed the chunk missing: the last answer was a miss and
@@ -1226,6 +1241,19 @@ impl FetchExhausted {
     #[must_use]
     pub const fn confirmed_missing(&self) -> bool {
         self.last_not_found && !self.pool_starved
+    }
+
+    /// [`Self::confirmed_missing`], and by more than
+    /// [`STARVED_MAX_NOT_FOUND`] peers. Only this is safe to stop a
+    /// retry loop on at once: a cold node with one or two peers in its
+    /// table can have every ranked peer asked (so not starved) and still
+    /// hear `no peer found` for a chunk that exists (issue #114), which a
+    /// retry with a fresher peer set can serve. A confirmed miss that is
+    /// not corroborated is still the answer to report once the retries
+    /// run out.
+    #[must_use]
+    pub const fn corroborated_missing(&self) -> bool {
+        self.confirmed_missing() && self.not_found_answers > STARVED_MAX_NOT_FOUND
     }
 
     /// The `FetchExhausted` behind `e`, found by walking its `source()`
@@ -1833,6 +1861,7 @@ impl RoutingFetcher {
             asked.len(),
             last_err,
             pool_starved,
+            not_found_answers,
         )))
     }
 }
@@ -1846,6 +1875,7 @@ pub(crate) fn exhausted(
     asked: usize,
     last_err: Option<RetrievalError>,
     pool_starved: bool,
+    not_found_answers: usize,
 ) -> FetchExhausted {
     let last_not_found = last_err
         .as_ref()
@@ -1863,6 +1893,7 @@ pub(crate) fn exhausted(
         message,
         pool_starved,
         last_not_found,
+        not_found_answers,
     }
 }
 
@@ -2090,9 +2121,16 @@ mod tests {
             "retrieve chunk: storage: not found",
             "retrieve chunk: no peer found",
         ] {
-            let e = exhausted(addr, 34, Some(RetrievalError::Remote(tail.into())), false);
+            let e = exhausted(
+                addr,
+                34,
+                Some(RetrievalError::Remote(tail.into())),
+                false,
+                34,
+            );
             assert!(e.last_not_found, "{tail}");
             assert!(e.confirmed_missing(), "{tail}");
+            assert!(e.corroborated_missing(), "{tail}");
             assert_eq!(
                 e.to_string(),
                 format!(
@@ -2101,8 +2139,20 @@ mod tests {
                 )
             );
             // Starved: one cold peer's answer, never a confirmed miss (#114).
-            let e = exhausted(addr, 1, Some(RetrievalError::Remote(tail.into())), true);
+            let e = exhausted(addr, 1, Some(RetrievalError::Remote(tail.into())), true, 1);
             assert!(e.last_not_found && !e.confirmed_missing(), "{tail}");
+            assert!(!e.corroborated_missing(), "{tail}");
+            // R1-M2 on PR #124: a cold node's only peer (every ranked
+            // peer asked, so not starved) answering a miss is confirmed —
+            // the answer once retries run out — but not corroborated, so
+            // retry loops don't stop on it at once.
+            for n in 1..=STARVED_MAX_NOT_FOUND {
+                let e = exhausted(addr, n, Some(RetrievalError::Remote(tail.into())), false, n);
+                assert!(
+                    e.confirmed_missing() && !e.corroborated_missing(),
+                    "{tail} x{n}"
+                );
+            }
         }
         for last in [
             Some(RetrievalError::Timeout(Duration::from_secs(5))),
@@ -2110,10 +2160,10 @@ mod tests {
             Some(RetrievalError::OpenStream("no addresses: not found".into())),
             None,
         ] {
-            let e = exhausted(addr, 3, last, false);
-            assert!(!e.confirmed_missing(), "{e}");
+            let e = exhausted(addr, 3, last, false, 3);
+            assert!(!e.confirmed_missing() && !e.corroborated_missing(), "{e}");
         }
-        assert!(!exhausted(addr, 0, None, false).confirmed_missing());
+        assert!(!exhausted(addr, 0, None, false, 0).confirmed_missing());
     }
 
     /// Starvation needs budget left *and* unasked ranked peers, and stops

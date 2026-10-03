@@ -1929,6 +1929,7 @@ mod tests {
                             ),
                             pool_starved: true,
                             last_not_found: true,
+                            not_found_answers: 1,
                         }));
                     }
                     return Err("no BZZ peers available".into());
@@ -2069,6 +2070,7 @@ mod tests {
                 message: "no BZZ peers available".into(),
                 pool_starved: true,
                 last_not_found: false,
+                not_found_answers: 0,
             })
         }
         #[async_trait::async_trait]
@@ -2129,6 +2131,7 @@ mod tests {
                 message: "no BZZ peers available".into(),
                 pool_starved: true,
                 last_not_found: false,
+                not_found_answers: 0,
             })
         }
         #[async_trait::async_trait]
@@ -2201,6 +2204,7 @@ mod tests {
                     message: "timed out".into(),
                     pool_starved: false,
                     last_not_found: false,
+                    not_found_answers: 0,
                 }))
             }
         }

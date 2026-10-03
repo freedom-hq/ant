@@ -2066,6 +2066,7 @@ mod tests {
                             .into(),
                         pool_starved: true,
                         last_not_found: true,
+                        not_found_answers: 1,
                     }));
                 }
                 Err("timeout".into())

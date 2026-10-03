@@ -185,7 +185,12 @@ pub enum ControlCommand {
     /// Gateway-only streaming `/bytes/{ref}` path. Sends
     /// [`ControlAck::BytesStreamStart`], zero or more
     /// [`ControlAck::BytesChunk`] messages, then [`ControlAck::StreamDone`]
-    /// or [`ControlAck::Error`]. The JSON control socket does not expose
+    /// or [`ControlAck::Error`]. Before the stream starts (instead of
+    /// `BytesStreamStart`) the single terminal ack can also be
+    /// [`ControlAck::NotFound`] (peers confirmed the root missing) or
+    /// [`ControlAck::NotReady`] (no peers, or a miss from a starved peer
+    /// pool); a consumer must treat both as final, like `Error`, or it
+    /// waits for a stream that never comes. The JSON control socket does not expose
     /// this command; it exists so `ant-gateway` can behave like Bee and
     /// write the HTTP body while the joiner is still retrieving.
     ///
@@ -209,7 +214,10 @@ pub enum ControlCommand {
     /// does. Sends [`ControlAck::BzzStreamStart`] (with content type +
     /// filename + total size), zero or more
     /// [`ControlAck::BytesChunk`] messages, then
-    /// [`ControlAck::StreamDone`] or [`ControlAck::Error`].
+    /// [`ControlAck::StreamDone`] or [`ControlAck::Error`]. As with
+    /// `StreamBytes`, a failure before the stream starts can instead end
+    /// in [`ControlAck::NotFound`] (the manifest root or data root
+    /// confirmed missing) or [`ControlAck::NotReady`]; both are terminal.
     ///
     /// `range` and `head_only` behave identically to `StreamBytes`.
     /// `head_only` is what backs `HEAD /bzz/{ref}/{path}`: the daemon
@@ -803,7 +811,12 @@ pub enum ControlAck {
     /// without substring-matching an error message.
     FeedNotFound,
     /// The node loop accepted the command but isn't ready to serve it
-    /// (most commonly: zero connected peers). Distinct from
+    /// (most commonly: zero connected peers). `StreamBytes` /
+    /// `StreamBzz` also send it, before their stream starts, when a root
+    /// fetch's last answer was a miss but the peer pool was starved
+    /// (`FetchExhausted::pool_starved`): one cold peer's "not found" is
+    /// not the network's answer (issue #114), so it is a 503 to retry,
+    /// never a 404. Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for
     /// genuine I/O failures.
