@@ -573,9 +573,11 @@ pub fn issue_cheque(
 /// are exempt without an operator, since their figures are known
 /// (PR #126 R1-M3): one deployed after the loss
 /// ([`note_fresh_chequebook`]), which has never issued a cheque, and one
-/// whose ledger was open in this process when the file was lost — its
-/// cumulatives survived in memory, so it is exempt at once for this run
-/// and for good once it has written them to the new file.
+/// whose ledger was open in this process, with its figures known, when
+/// the file was lost — its cumulatives survived in memory, so it is
+/// exempt at once for this run and for good once it has written them to
+/// the new file. A ledger still lost to an earlier loss holds only what
+/// it issued since, so a new loss doesn't exempt it (PR #126 R2-F1).
 #[derive(Clone)]
 pub struct OutboundLedger {
     chequebook: [u8; 20],
@@ -685,21 +687,35 @@ fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
         .collect()
 }
 
-/// Flag every live ledger on `path` whose figures were loaded as
-/// having survived its loss (see [`OutboundShared::survived_loss`]).
-/// Caller holds [`OUTBOUND_FILE_LOCK`] and not [`OUTBOUND_LEDGERS`].
-fn flag_survivors(path: &Path) {
+/// The live ledgers on `path` whose figures are complete in memory right
+/// now, so a loss of the file about to happen spares them (see
+/// [`OutboundShared::survived_loss`]): loaded from the file, *and* not
+/// already lost to an earlier, unconfirmed loss — a ledger loaded after
+/// that loss holds only what it issued since, and must stay lost through
+/// the next one (PR #126 R2-F1). Call before recording the new loss;
+/// flag the result with [`flag_survivors`] once it is recorded. Caller
+/// holds [`OUTBOUND_FILE_LOCK`] and not [`OUTBOUND_LEDGERS`].
+fn known_survivors(path: &Path) -> Vec<Arc<OutboundShared>> {
     let reg = OUTBOUND_LEDGERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for ((p, _), w) in reg.iter() {
-        if p == path {
-            if let Some(shared) = w.upgrade() {
-                if shared.loaded.load(Ordering::SeqCst) {
-                    shared.survived_loss.store(true, Ordering::SeqCst);
-                }
-            }
-        }
+    reg.iter()
+        .filter(|((p, _), _)| p == path)
+        .filter_map(|((_, chequebook), w)| {
+            let shared = w.upgrade()?;
+            let known = shared.loaded.load(Ordering::SeqCst)
+                && (shared.survived_loss.load(Ordering::SeqCst)
+                    || lost_figures_at(path, chequebook).is_none());
+            known.then_some(shared)
+        })
+        .collect()
+}
+
+/// Mark `survivors` (from [`known_survivors`]) as having survived the
+/// loss just recorded.
+fn flag_survivors(survivors: &[Arc<OutboundShared>]) {
+    for shared in survivors {
+        shared.survived_loss.store(true, Ordering::SeqCst);
     }
 }
 
@@ -753,12 +769,13 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
     // The marker goes first: a move without it would let retrieval
     // pay from figures we just lost. If it can't be written the file
     // stays where it is, unread, and the move is retried later.
+    let survivors = known_survivors(path);
     mark_figures_lost(path, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't record that its figures are lost: {e}"
         ))
     })?;
-    flag_survivors(path);
+    flag_survivors(&survivors);
     std::fs::rename(path, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't be moved aside: {e}"
@@ -2278,6 +2295,51 @@ mod tests {
                 .lost_figures()
                 .is_some());
         }
+    }
+
+    /// A ledger still lost to an earlier loss holds only what it issued
+    /// since, so a second loss under it must not count it as a survivor
+    /// (PR #126 R2-F1): retrieval would then pay its peers from a
+    /// restarted cumulative they refuse.
+    #[test]
+    fn a_second_loss_does_not_exempt_a_still_lost_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xb1u8; 20];
+        let peer = [0x22u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&peer, U256::from(900u64)).unwrap();
+        drop(l);
+
+        // Loss 1, then a restart: lost, and pushsync issues from zero.
+        std::fs::write(&path, b"{ not json").unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some());
+        l.record_issued(&peer, U256::from(100u64)).unwrap();
+        assert!(l.lost_figures().is_some());
+
+        // Loss 2 while it runs: still lost, now and after its next write.
+        std::fs::write(&path, b"{ broken again").unwrap();
+        let other = OutboundLedger::open(Some(path.clone()), [0xb2u8; 20]);
+        assert!(other.lost_figures().is_some());
+        assert!(l.lost_figures().is_some(), "not a survivor of loss 2");
+        l.record_issued(&peer, U256::from(200u64)).unwrap();
+        assert!(l.lost_figures().is_some());
+        let marker: LostMarker =
+            serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
+        assert!(marker.known.is_empty(), "{:?}", marker.known);
+        drop((l, other));
+        assert!(OutboundLedger::open(Some(path.clone()), cb)
+            .lost_figures()
+            .is_some());
+
+        // Once confirmed, its figures are known again and survive a loss.
+        confirm_cheque_liability(&path, cb).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_none());
+        std::fs::write(&path, b"{ broken a third time").unwrap();
+        drop(OutboundLedger::open(Some(path.clone()), [0xb3u8; 20]));
+        assert!(l.lost_figures().is_none(), "known figures survive");
     }
 
     /// The marker is re-read when it changes, including by hand, though
