@@ -2665,7 +2665,7 @@ async fn resolve_or_deploy_chequebook(
                 tracing::warn!(
                     target: "ant-ffi",
                     "can't record the new chequebook in the lost-ledger marker: {e}; \
-                     it stays on the free tier for downloads until confirmed",
+                     downloads and uploads stay on the free tier until confirmed",
                 );
             }
             Ok(Resolution::Use(ResolvedChequebook {

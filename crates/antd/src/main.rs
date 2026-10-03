@@ -2136,7 +2136,7 @@ async fn resolve_chequebook(
                 tracing::warn!(
                     target: "antd",
                     "can't record the new chequebook in the lost-ledger marker: {e}; \
-                     it stays on the free tier for downloads until confirmed",
+                     downloads and uploads stay on the free tier until confirmed",
                 );
             }
             // Freshly factory-deployed, so it's registered by construction
