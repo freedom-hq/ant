@@ -1915,6 +1915,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
     };
+    // Know the bootnodes before the first warm dial: a stored bootnode is
+    // dialed from the hint queue long before `/dnsaddr/` resolution (if
+    // it succeeds at all) tags it in `handle_bootnode_dial`.
+    seed_bootnode_tags(&mut state, &peerstore, &cfg.bootnodes);
     // Warm the dial pipeline from the on-disk snapshot before the bootnode
     // dial fires. The bootnode dial still runs as a fallback — if every
     // stored peer is dead, the bootnodes carry us back into the network.
@@ -2073,6 +2077,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 state.enqueue_hint(hint, local_peer_id);
             }
             Some(addr) = bootnode_dial_rx.recv() => {
+                if let Some(peer) = crate::dial::extract_peer_id(&addr) {
+                    // Already handshaked from a warm hint: flag the stored
+                    // entry now, the handshake that would flag it is past.
+                    peerstore.mark_bootnode(&peer);
+                }
                 handle_bootnode_dial(&mut swarm, &mut state, addr);
             }
             Some(target) = neighborhood_dial_rx.recv() => {
@@ -8082,6 +8091,9 @@ fn handle_drive_outcome(
                 bzz_ts,
                 info.remote_chequebook,
             );
+            if state.bootnode_peers.contains(&peer) {
+                peerstore.mark_bootnode(&peer);
+            }
         }
         DriveOutcome::OpenFailed(e) => {
             debug!(target: "ant_p2p", %peer, "open handshake stream: {e}");
@@ -8515,6 +8527,20 @@ fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr
             }
         }
     });
+}
+
+/// Tag every peer known to be a bootnode before any dial goes out: the
+/// configured bootnode multiaddrs that carry a `/p2p/` id, and the stored
+/// peers a previous run dialed as bootnodes ([`PeerStore::bootnodes`]).
+/// `/dnsaddr/` entries are tagged later, as their leaves resolve
+/// ([`handle_bootnode_dial`]); without this a warm-started node dials a
+/// stored bootnode from the hint queue first and, if resolution is slow or
+/// fails, counts it as a serving peer for `/readiness` at once (#78).
+fn seed_bootnode_tags(state: &mut SwarmState, peerstore: &PeerStore, bootnodes: &[Multiaddr]) {
+    state
+        .bootnode_peers
+        .extend(bootnodes.iter().filter_map(crate::dial::extract_peer_id));
+    state.bootnode_peers.extend(peerstore.bootnodes());
 }
 
 /// Drain one bootnode multiaddr from the channel and dial it from the
@@ -9868,6 +9894,65 @@ mod tests {
             1,
             "only the bootnode, past its grace, still serves",
         );
+    }
+
+    /// A warm start dials stored peers from the hint queue before the
+    /// `/dnsaddr/` bootnode list resolves (or when it never does). A
+    /// bootnode the previous run persisted must still be tagged, so it
+    /// doesn't make `/readiness` 200 on its own (#78): `seed_bootnode_tags`
+    /// reads the flag back from `peers.json` and the configured `/p2p/`
+    /// ids, with this run's resolution failing outright.
+    #[test]
+    fn warm_start_tags_stored_bootnodes_without_dnsaddr_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let boot = pid();
+        let gossiped = pid();
+        {
+            // Previous run: both handshaked, `boot` dialed as a bootnode.
+            let mut store = PeerStore::load(path.clone());
+            let addr: Multiaddr = "/ip4/192.0.2.1/tcp/1634".parse().unwrap();
+            store.record_success(boot, vec![addr.clone()], [1u8; 32], 0, None);
+            store.record_success(gossiped, vec![addr], [2u8; 32], 0, None);
+            store.mark_bootnode(&boot);
+            store.flush();
+        }
+        let peerstore = PeerStore::load(path);
+        let static_boot = pid();
+        let bootnodes: Vec<Multiaddr> = vec![
+            "/dnsaddr/nonexistent.invalid".parse().unwrap(),
+            format!("/ip4/192.0.2.2/tcp/1634/p2p/{static_boot}")
+                .parse()
+                .unwrap(),
+        ];
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        seed_bootnode_tags(&mut state, &peerstore, &bootnodes);
+        assert!(state.bootnode_peers.contains(&boot), "stored bootnode");
+        assert!(
+            state.bootnode_peers.contains(&static_boot),
+            "configured /p2p/ id"
+        );
+        assert!(!state.bootnode_peers.contains(&gossiped));
+
+        let t0 = Instant::now();
+        state.routing.admit(boot, [1u8; 32]);
+        state.routing_admitted_at.insert(boot, t0);
+        assert_eq!(
+            serving_peer_count(&state, t0),
+            0,
+            "a warm-dialed stored bootnode alone is not ready",
+        );
+        state.routing.admit(gossiped, [2u8; 32]);
+        state.routing_admitted_at.insert(gossiped, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1);
     }
 
     /// Pin the contract that `publish_peers` actually republishes the
