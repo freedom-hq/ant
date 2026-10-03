@@ -84,8 +84,8 @@
 //!
 //! # Paying with SWAP (issue #121)
 //!
-//! With a [`RetrievalPayment`] installed (a funded chequebook, retrieval
-//! payments on), debt is settled in two steps, as bee's
+//! With a [`RetrievalPayment`] installed (a funded chequebook, `swap-enable`
+//! on), debt is settled in two steps, as bee's
 //! `Accounting.settle` does. The free pseudosettle refresh stays first
 //! (the driver above). Once the expected debt to a peer reaches
 //! [`EARLY_PAYMENT_THRESHOLD`] (half the peer's payment threshold), the
@@ -94,6 +94,10 @@
 //! [`MINIMUM_PAYMENT`], with [`FAILED_SETTLEMENT_INTERVAL`] of back-off
 //! after a failure. A paid debt frees credit like a refresh does. Without
 //! a payer nothing here runs, and the mirror behaves as before.
+//!
+//! The mirror is bee's one balance per peer: pushsync debits land in it
+//! too (`ant_p2p::push_pseudosettle`), so uploads are settled — and paid
+//! for — exactly like downloads (issue #127).
 //!
 //! # Conservatism
 //!
@@ -923,7 +927,7 @@ fn spawn_payment(
                 target: "ant_retrieval::accounting",
                 %peer,
                 amount,
-                "retrieval SWAP payment failed: {e}",
+                "SWAP payment failed (debt kept, retried after the back-off): {e}",
             );
         }
         Accounting::payment_done(

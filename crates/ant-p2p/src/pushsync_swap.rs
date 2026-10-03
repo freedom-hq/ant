@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::info;
 
 /// How long one SWAP payment may take, from opening the swap stream to
 /// the recipient finishing with the cheque: bee's
@@ -354,8 +354,24 @@ impl EmitCore {
     /// (`(paid − deduction) / exchange`). A cheque that was recorded but
     /// then failed, timed out, or ended with its connection stays issued
     /// liability in the ledger (the next cheque to the beneficiary builds
-    /// on it, so nothing is paid twice), but lowers no debt.
-    async fn pay(&self, peer: PeerId, units: u64) -> Result<U256, SwapError> {
+    /// on it, so nothing is paid twice), but lowers no debt. Every cheque
+    /// recorded is logged with its amount, whatever its outcome, so the
+    /// log adds up to the ledger.
+    ///
+    /// The whole payment must finish by `deadline` (bee's 5 s
+    /// `EmitCheque` timeout); past it the cheque counts as undelivered.
+    async fn pay(
+        &self,
+        peer: PeerId,
+        units: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<U256, SwapError> {
+        let timed_out = || {
+            SwapError::Rejected(format!(
+                "timed out after {}s",
+                RETRIEVAL_PAYMENT_TIMEOUT.as_secs()
+            ))
+        };
         let policy = self
             .retrieval_policy()
             .ok_or_else(|| SwapError::Rejected("SWAP payments are off".into()))?;
@@ -389,9 +405,14 @@ impl EmitCore {
             .session(&peer)
             .ok_or_else(|| SwapError::Rejected("no eoa for peer".into()))?;
         let lock = self.outbound_ledger.beneficiary_lock(beneficiary);
-        let _issuing = lock.lock().await;
+        let _issuing = tokio::time::timeout_at(deadline, lock.lock())
+            .await
+            .map_err(|_| timed_out())?;
         let mut control = self.control_clone();
-        let (mut stream, rates) = open_settlement(&mut control, peer).await?;
+        let (mut stream, rates) =
+            tokio::time::timeout_at(deadline, open_settlement(&mut control, peer))
+                .await
+                .map_err(|_| timed_out())??;
         check_rates(&rates, &policy)?;
         let amount = rates
             .cheque_amount(units)
@@ -415,11 +436,13 @@ impl EmitCore {
         // deposit; the next cheque to this beneficiary builds on it, so
         // nothing is paid twice either.
         self.issue_within_funds(&policy, &beneficiary, new_cum, amount)?;
-        write_cheque(&mut stream, &signed).await?;
-        let delivered = match await_processed(stream).await {
-            Ok(()) => self.connection_held(peer, session).await,
-            Err(e) => Err(e),
-        };
+        let delivered = tokio::time::timeout_at(deadline, async {
+            write_cheque(&mut stream, &signed).await?;
+            await_processed(stream).await?;
+            self.connection_held(peer, session).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(timed_out()));
         info!(
             target: "ant_p2p::pushsync_swap",
             %peer,
@@ -532,23 +555,12 @@ impl PushsyncSwap {
 #[async_trait::async_trait]
 impl RetrievalPayment for PushsyncSwap {
     async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String> {
-        match tokio::time::timeout(RETRIEVAL_PAYMENT_TIMEOUT, self.core.pay(peer, amount)).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => {
-                debug!(
-                    target: "ant_p2p::pushsync_swap",
-                    %peer,
-                    units = amount,
-                    "SWAP payment timed out; a cheque already recorded stays issued, \
-                     not counted as delivered",
-                );
-                Err(format!(
-                    "timed out after {}s",
-                    RETRIEVAL_PAYMENT_TIMEOUT.as_secs()
-                ))
-            }
-        }
+        let deadline = tokio::time::Instant::now() + RETRIEVAL_PAYMENT_TIMEOUT;
+        self.core
+            .pay(peer, amount, deadline)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -643,7 +655,12 @@ mod tests {
         // Gone before the cheque: no session to pay against.
         eth.forget(&peer);
         svc.set_retrieval_policy(Some(policy(1_000_000_000)));
-        let err = svc.core.pay(peer, 1).await.unwrap_err().to_string();
+        let err = svc
+            .core
+            .pay(peer, 1, deadline())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no eoa"), "{err}");
     }
 
@@ -662,6 +679,10 @@ mod tests {
             ),
             libp2p_stream::Behaviour::default().new_control(),
         )
+    }
+
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + RETRIEVAL_PAYMENT_TIMEOUT
     }
 
     fn policy(deposited: u64) -> RetrievalSwapPolicy {
@@ -805,7 +826,7 @@ mod tests {
         assert!(!svc.pays_retrieval());
         let err = svc
             .core
-            .pay(PeerId::random(), 1)
+            .pay(PeerId::random(), 1, deadline())
             .await
             .unwrap_err()
             .to_string();
