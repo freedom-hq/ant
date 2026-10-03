@@ -457,8 +457,10 @@ pub async fn top_up_chequebook(
     })
 }
 
-/// What a node's chequebook can put into retrieval cheques, and at
-/// which rates (issue #121). Read with [`read_retrieval_funds`].
+/// What a node's chequebook can put into SWAP cheques, and at which
+/// rates: for downloads (issue #121) and uploads (issue #127) alike,
+/// since both pay through the one shared payer. (The `Retrieval` in the
+/// name predates #127.) Read with [`read_retrieval_funds`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrievalFunds {
     /// xBZZ ever deposited and not withdrawn, in PLUR: the chequebook's
@@ -475,7 +477,8 @@ pub struct RetrievalFunds {
 /// How often the entry points re-read [`RetrievalFunds`] while
 /// settlement runs ([`watch_retrieval_funds`]), so a deposit made by any
 /// path (a buy, a top-up, `POST /chequebook/deposit`, someone else's
-/// transfer) starts paying for downloads within this long.
+/// transfer) starts paying for downloads and uploads (pushsync) within
+/// this long.
 #[cfg(feature = "chain-rpc")]
 pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -533,9 +536,9 @@ pub async fn read_retrieval_funds(
 /// Returns when `publish` returns `false` (the node is gone).
 ///
 /// Both `antd` and `ant-ffi` run this for the chequebook settlement runs
-/// on, publishing into `ControlCommand::SetRetrievalFunds`, so retrieval
-/// payments (issue #121) spend at most what the chequebook holds, on
-/// either entry point. Each keeps one watch per node and aborts it when
+/// on, publishing into `ControlCommand::SetRetrievalFunds`, so SWAP
+/// payments for downloads (issue #121) and uploads (issue #127) spend at
+/// most what the chequebook holds, on either entry point. Each keeps one watch per node and aborts it when
 /// settlement moves to another chequebook (or, in `antd`, is switched
 /// off): the node accepts funds for any chequebook, so a stale watch
 /// would otherwise keep overwriting the current one's.
