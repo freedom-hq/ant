@@ -19,7 +19,7 @@ use common::{
     status_router_recording_registrations, status_router_with_chain,
     status_router_with_chain_and_failing_snapshot, status_router_with_chain_and_hook,
     status_router_with_chain_and_issued, status_router_with_chain_and_issued_by,
-    status_router_with_chain_hooks_and_cors,
+    status_router_with_chain_and_lost_ledger, status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -332,6 +332,40 @@ async fn chequebook_available_balance_counts_only_its_own_cheques() {
     let (_, json) = get(router, "/chequebook/balance").await;
     assert_eq!(json["availableBalance"], "42000000");
     assert!(json["availableBalanceError"].is_string(), "{json}");
+}
+
+/// A chequebook whose cheque figures the node lost (its outbound ledger
+/// was moved aside, PR #126 R4-M1) says so: `chequeLedgerLost` carries
+/// the node's reason, and `availableBalance` isn't computed from a total
+/// that misses the earlier cheques.
+#[tokio::test]
+async fn chequebook_balance_flags_a_lost_cheque_ledger() {
+    let cb = [0xCD; 20];
+    let router = status_router_with_chain_and_lost_ledger(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        30_000_000,
+        cb,
+        "moved aside; confirm with --confirm-cheque-liability",
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "42000000");
+    assert_eq!(
+        json["chequeLedgerLost"],
+        "moved aside; confirm with --confirm-cheque-liability"
+    );
+    assert!(json["availableBalanceError"].is_string(), "{json}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert!(json.get("chequeLedgerLost").is_none(), "{json}");
 }
 
 #[tokio::test]

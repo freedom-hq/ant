@@ -397,12 +397,15 @@ pub enum ControlCommand {
         deduction_plur: u128,
         ack: oneshot::Sender<ControlAck>,
     },
-    /// The node-level switch for retrieval payments (issue #121):
-    /// `false` keeps downloads on the free pseudosettle tier even with a
-    /// funded chequebook; `true` (the default) pays peers with SWAP
-    /// cheques past the early-payment threshold, as bee does. Uploads'
-    /// settlement is unaffected. Acks `Ok`.
-    SetRetrievalPayments {
+    /// Bee's node-wide SWAP settlement switch (`swap-enable`), changed at
+    /// runtime (a superset of bee, which reads it at start). It governs
+    /// retrieval payments (issue #121) today: `true` (the default) pays
+    /// peers for downloads with SWAP cheques past the early-payment
+    /// threshold once a funded chequebook backs settlement, as bee does;
+    /// `false` keeps downloads on the free pseudosettle tier even with
+    /// one. Upload (pushsync) cheques are not governed by it yet; #127
+    /// makes them pay at bee's rate under this same switch. Acks `Ok`.
+    SetSwapEnabled {
         enabled: bool,
         ack: oneshot::Sender<ControlAck>,
     },

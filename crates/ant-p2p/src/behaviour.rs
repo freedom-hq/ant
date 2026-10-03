@@ -256,9 +256,9 @@ pub struct RunConfig {
     /// `None` keeps the constructor-provided `upload` /
     /// `pushsync_swap` as the final word, exactly as before.
     pub late_chain_rx: Option<mpsc::Receiver<LateChainInit>>,
-    /// The node-level switch for retrieval payments (issue #121); see
-    /// `ant_node::NodeConfig::retrieval_payments`.
-    pub retrieval_payments: bool,
+    /// Bee's node-wide `swap-enable` switch, which governs retrieval
+    /// payments (issue #121); see `ant_node::NodeConfig::swap_enabled`.
+    pub swap_enabled: bool,
 }
 
 /// Chain-derived swarm inputs delivered through
@@ -949,9 +949,9 @@ struct SwarmState {
     /// in which case every received-side field is absent — honest:
     /// without a ledger we accept no cheques.
     credit_ledger: Option<Arc<crate::swap::CreditLedger>>,
-    /// Retrieval payments switch (issue #121): `false` keeps downloads
-    /// on the free tier whatever the chequebook holds.
-    retrieval_payments: bool,
+    /// `swap-enable` (issue #121): `false` keeps downloads on the free
+    /// tier whatever the chequebook holds.
+    swap_enabled: bool,
     /// Latest `SetRetrievalFunds` and the chequebook it's for. Applied to
     /// the outbound SWAP service whenever it runs on that chequebook, so
     /// funds read before the service starts (antd's late chain init) are
@@ -1081,7 +1081,7 @@ impl SwarmState {
             pushsync_swap: None,
             retired_outbound: None,
             credit_ledger: None,
-            retrieval_payments: true,
+            swap_enabled: true,
             retrieval_funds: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
@@ -1765,7 +1765,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     );
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
-    state.retrieval_payments = cfg.retrieval_payments;
+    state.swap_enabled = cfg.swap_enabled;
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
     // a public multiaddr for us. Without this bee's inbound handshake handler
@@ -2143,7 +2143,7 @@ fn sync_retrieval_payment(state: &SwarmState) {
     let payer = state.pushsync_swap.as_ref().and_then(|svc| {
         let policy = state
             .retrieval_funds
-            .filter(|(chequebook, _)| state.retrieval_payments && *chequebook == svc.chequebook())
+            .filter(|(chequebook, _)| state.swap_enabled && *chequebook == svc.chequebook())
             .map(|(_, policy)| policy);
         svc.set_retrieval_policy(policy);
         svc.pays_retrieval()
@@ -2161,6 +2161,15 @@ fn sync_retrieval_payment(state: &SwarmState) {
                 "downloads use the free pseudosettle tier"
             },
         );
+        if !paying {
+            if let Some(why) = state
+                .pushsync_swap
+                .as_ref()
+                .and_then(|svc| svc.outbound_ledger().lost_figures())
+            {
+                warn!(target: "ant_p2p::pushsync_swap", "{why}");
+            }
+        }
     }
     accounting.set_payment(payer);
 }
@@ -3593,11 +3602,14 @@ fn handle_control_command(
                 ),
             });
         }
-        ControlCommand::SetRetrievalPayments { enabled, ack } => {
-            state.retrieval_payments = enabled;
+        ControlCommand::SetSwapEnabled { enabled, ack } => {
+            state.swap_enabled = enabled;
             sync_retrieval_payment(state);
             let _ = ack.send(ControlAck::Ok {
-                message: format!("retrieval payments {}", if enabled { "on" } else { "off" }),
+                message: format!(
+                    "swap settlement {} (retrieval payments)",
+                    if enabled { "on" } else { "off" }
+                ),
             });
         }
         ControlCommand::DisablePushsyncSwap { chequebook, ack } => {
@@ -4054,6 +4066,7 @@ fn build_accounting_snapshot(state: &SwarmState) -> AccountingSnapshotView {
                 .map(|()| l.total_issued().to_string())
         }),
         cheques_issued_chequebook: outbound.map(|l| hex::encode(l.chequebook())),
+        cheques_ledger_lost: outbound.and_then(crate::swap::OutboundLedger::lost_figures),
     }
 }
 
@@ -9867,7 +9880,7 @@ mod tests {
         let (ack, _rx) = oneshot::channel();
         send(
             &mut state,
-            ControlCommand::SetRetrievalPayments {
+            ControlCommand::SetSwapEnabled {
                 enabled: false,
                 ack,
             },
@@ -9876,7 +9889,7 @@ mod tests {
         let (ack, _rx) = oneshot::channel();
         send(
             &mut state,
-            ControlCommand::SetRetrievalPayments { enabled: true, ack },
+            ControlCommand::SetSwapEnabled { enabled: true, ack },
         );
         assert!(accounting.pays_with_swap());
 

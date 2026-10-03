@@ -554,6 +554,8 @@ const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
     "chequebook.json",
     "swap_credits.json",
     "pushsync_outbound.json",
+    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it.
+    "pushsync_outbound.json.lost",
 ];
 
 /// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
@@ -1356,14 +1358,16 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
     }
 }
 
-/// Switch retrieval payments (issue #121) on or off for the running
-/// node. On (the default), downloads pay peers with SWAP cheques from the
-/// node's chequebook once the debt to a peer reaches half its payment
-/// threshold, after the free pseudosettle refresh, as bee does; that lifts
-/// downloads past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB
-/// (bee's oracle rate), never more than the chequebook holds. Off keeps
-/// downloads on the free tier even with a funded chequebook, for hosts
-/// that fund it for publishing only. Uploads' settlement is unaffected.
+/// Bee's `swap-enable`: switch SWAP settlement on or off for the running
+/// node. Today it governs retrieval payments (issue #121). On (the
+/// default), downloads pay peers with SWAP cheques from the node's
+/// chequebook once the debt to a peer reaches half its payment threshold,
+/// after the free pseudosettle refresh, as bee does; that lifts downloads
+/// past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB (bee's
+/// oracle rate), never more than the chequebook holds. Off keeps
+/// downloads on the free tier even with a funded chequebook. Upload
+/// (pushsync) cheques are not governed by it yet: #127 makes them pay at
+/// bee's rate under this same switch.
 ///
 /// Payments also need a chequebook with funds the node has read from the
 /// chain: they start after the first settlement setup that has an RPC
@@ -1381,7 +1385,7 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
 ///   to [`ant_shutdown`].
 /// * `out_err` must point at a writable `*mut c_char` slot, or be null.
 #[no_mangle]
-pub unsafe extern "C" fn ant_set_retrieval_payments(
+pub unsafe extern "C" fn ant_set_swap_enabled(
     handle: *const AntHandle,
     enabled: bool,
     out_err: *mut *mut c_char,
@@ -1389,11 +1393,11 @@ pub unsafe extern "C" fn ant_set_retrieval_payments(
     unsafe {
         clear_out_err(out_err);
         let Some(handle) = handle.as_ref() else {
-            write_out_err(out_err, "ant_set_retrieval_payments: null handle");
+            write_out_err(out_err, "ant_set_swap_enabled: null handle");
             return -1;
         };
         match catch_unwind(AssertUnwindSafe(|| {
-            drive::set_retrieval_payments(handle, enabled)
+            drive::set_swap_enabled(handle, enabled)
         })) {
             Ok(Ok(msg)) => {
                 tracing::info!(target: "ant-ffi", "{msg}");
@@ -1404,7 +1408,79 @@ pub unsafe extern "C" fn ant_set_retrieval_payments(
                 -2
             }
             Err(_) => {
-                write_out_err(out_err, "panic in ant_set_retrieval_payments");
+                write_out_err(out_err, "panic in ant_set_swap_enabled");
+                -2
+            }
+        }
+    }
+}
+
+/// Confirm the outstanding liability of `chequebook` (`0x…` hex, NUL
+/// terminated) after its cheque figures were lost, and let downloads pay
+/// from it again. When the node's outbound cheque ledger
+/// (`pushsync_outbound.json`) is found unparseable it is moved aside and a
+/// `.lost` marker is left; while that marker names a loss, retrieval
+/// doesn't pay from any chequebook that used the file (logged at warn,
+/// and `/chequebook/balance` reports `chequeLedgerLost`). Only this call
+/// (or `antd --confirm-cheque-liability`) clears it, never time or a
+/// restart. Confirming accepts that peers paid before the loss hold
+/// cheques the node can't see: they may refuse new cheques, and
+/// disconnect the node, until its restarted cumulatives pass what they
+/// hold. A running node picks it up at its next chequebook-funds read
+/// (within a minute).
+///
+/// Returns `0` once confirmed, `1` when there was nothing to confirm (no
+/// loss on record, or this chequebook already confirmed), `-1` on a null
+/// handle or a malformed `chequebook`, `-2` if the marker can't be read
+/// or written; on `-1`/`-2` an allocated error string is written into
+/// `*out_err` (free with [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `chequebook` must be a valid NUL-terminated C string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_confirm_cheque_liability(
+    handle: *const AntHandle,
+    chequebook: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_confirm_cheque_liability: null handle");
+            return -1;
+        };
+        let parsed = (!chequebook.is_null())
+            .then(|| CStr::from_ptr(chequebook).to_str().ok())
+            .flatten()
+            .and_then(|s| {
+                let mut cb = [0u8; 20];
+                hex::decode_to_slice(s.trim().trim_start_matches("0x"), &mut cb)
+                    .ok()
+                    .map(|()| cb)
+            });
+        let Some(cb) = parsed else {
+            write_out_err(
+                out_err,
+                "ant_confirm_cheque_liability: chequebook must be a 0x-prefixed 20-byte hex address",
+            );
+            return -1;
+        };
+        let ledger = handle.data_dir.join("pushsync_outbound.json");
+        match catch_unwind(AssertUnwindSafe(|| {
+            ant_p2p::swap::confirm_cheque_liability(&ledger, cb)
+        })) {
+            Ok(Ok(true)) => 0,
+            Ok(Ok(false)) => 1,
+            Ok(Err(e)) => {
+                write_out_err(out_err, &format!("ant_confirm_cheque_liability: {e}"));
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_confirm_cheque_liability");
                 -2
             }
         }

@@ -514,6 +514,14 @@ pub struct AccountingSnapshotView {
     /// when outbound settlement has never run in this process.
     #[serde(default)]
     pub cheques_issued_chequebook: Option<String>,
+    /// Set when that chequebook's figures were lost — the outbound
+    /// ledger file was unparseable and moved aside, and no operator has
+    /// confirmed the chequebook's outstanding liability since — saying
+    /// so and how to clear it. `cheques_issued_plur` then counts only
+    /// the cheques issued after the loss, and downloads don't pay from
+    /// this chequebook (PR #126 R4-M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheques_ledger_lost: Option<String>,
 }
 
 /// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying

@@ -549,16 +549,24 @@ pub fn issue_cheque(
 /// `<name>.corrupt-<unix secs>[-n]` and every chequebook in it starts
 /// from zero: its figures can't be recovered by reading it again, and
 /// refusing every cheque until someone repairs it by hand would stop
-/// uploads and paid downloads for good. Nothing is paid twice by
-/// restarting — a peer only credits a cheque above the cumulative it
-/// already holds — but that is also the cost: a peer this chequebook
-/// had paid up to `C` refuses each new cheque until the restarted
-/// cumulative passes `C`. The payer can't see those refusals (bee
-/// resets the stream, which rust-yamux reports as a clean end, see
-/// [`await_processed`]), so it lowers its debt mirror as if paid, runs
-/// up real debt with that peer, and is disconnected or blocklisted by
-/// it until the new cumulative passes `C` (PR #126 R4-M1). Peers it had
-/// never paid are unaffected, and so is pushsync to other peers.
+/// uploads for good. Nothing is paid twice by restarting — a peer only
+/// credits a cheque above the cumulative it already holds — but a peer
+/// this chequebook had paid up to `C` refuses each new cheque until the
+/// restarted cumulative passes `C`. The payer can't see those refusals
+/// (bee resets the stream, which rust-yamux reports as a clean end, see
+/// [`await_processed`]), so it would lower its debt mirror as if paid,
+/// run up real debt with that peer, and be disconnected or blocklisted
+/// by the very peers it paid — which also costs it their free tier.
+///
+/// So a move aside also leaves a marker, `<name>.lost`, and while it
+/// exists every chequebook on the file counts as having lost its
+/// figures ([`Self::lost_figures`]): its issued total is unknown,
+/// retrieval doesn't pay from it (`PushsyncSwap::pays_retrieval`) and
+/// `/chequebook/balance` says so. Pushsync cheques go on as before. The
+/// marker never clears by itself, only by an operator confirming the
+/// chequebook's outstanding liability ([`confirm_cheque_liability`]:
+/// `antd --confirm-cheque-liability`, `ant_confirm_cheque_liability`)
+/// (PR #126 R4-M1).
 #[derive(Clone)]
 pub struct OutboundLedger {
     chequebook: [u8; 20],
@@ -706,6 +714,14 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
                 "unparseable ({parse_error}) and no free name to move it aside to"
             ))
         })?;
+    // The marker goes first: a move without it would let retrieval
+    // pay from figures we just lost. If it can't be written the file
+    // stays where it is, unread, and the move is retried later.
+    mark_figures_lost(path, &aside).map_err(|e| {
+        std::io::Error::other(format!(
+            "unparseable ({parse_error}) and can't record that its figures are lost: {e}"
+        ))
+    })?;
     std::fs::rename(path, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't be moved aside: {e}"
@@ -715,11 +731,123 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
         target: "ant_p2p::swap",
         file = %path.display(),
         moved_to = %aside.display(),
-        "outbound ledger is unparseable ({parse_error}); moved it aside and \
-         starting its chequebooks' cheque totals from zero — peers paid \
-         before refuse new cheques until the new totals pass what they hold",
+        "outbound ledger is unparseable ({parse_error}); moved it aside. Its \
+         chequebooks' cheque totals are lost: uploads' cheques restart from \
+         zero, and downloads stay on the free tier for every chequebook that \
+         used this file until an operator confirms its outstanding \
+         liability (antd --confirm-cheque-liability <chequebook>, or \
+         ant_confirm_cheque_liability)",
     );
     Ok(())
+}
+
+/// The marker [`quarantine_outbound_file`] leaves next to a ledger file
+/// whose figures were lost: `<name>.lost`.
+fn lost_marker_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lost");
+    path.with_file_name(name)
+}
+
+/// The `<name>.lost` marker: where the lost figures were moved, and the
+/// chequebooks whose outstanding liability an operator has confirmed
+/// since the last loss.
+#[derive(Default, Serialize, Deserialize)]
+struct LostMarker {
+    moved_aside: Vec<String>,
+    confirmed: Vec<String>,
+}
+
+/// Read the marker. `Ok(None)` when there is none.
+fn read_lost_marker(path: &Path) -> std::io::Result<Option<LostMarker>> {
+    match std::fs::read(lost_marker_path(path)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_lost_marker(path: &Path, marker: &LostMarker) -> std::io::Result<()> {
+    use std::io::Write;
+    let marker_path = lost_marker_path(path);
+    let mut tmp_name = marker_path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = marker_path.with_file_name(tmp_name);
+    let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, marker_path)
+}
+
+/// Record that `path`'s figures were lost (moved to `aside`): every
+/// chequebook on it is unknown again, including ones confirmed after an
+/// earlier loss. An unreadable earlier marker is replaced — the new one
+/// confirms nothing either, so that only ever widens the loss.
+fn mark_figures_lost(path: &Path, aside: &Path) -> std::io::Result<()> {
+    let mut marker = read_lost_marker(path).ok().flatten().unwrap_or_default();
+    marker.moved_aside.push(aside.display().to_string());
+    marker.confirmed.clear();
+    write_lost_marker(path, &marker)
+}
+
+/// Why `chequebook`'s figures in the ledger at `path` are unknown, or
+/// `None` if they are known. A marker that can't be read counts as a
+/// loss: the answer gates money.
+fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
+    let key = hex::encode(chequebook);
+    match read_lost_marker(path) {
+        Ok(None) => None,
+        Ok(Some(m)) if m.confirmed.iter().any(|c| c.eq_ignore_ascii_case(&key)) => None,
+        Ok(Some(m)) => Some(format!(
+            "the outbound cheque ledger was unparseable and moved aside ({}), so the \
+             cheques chequebook 0x{key} issued before are unknown; downloads stay on \
+             the free tier until an operator confirms its outstanding liability \
+             (antd --confirm-cheque-liability 0x{key}, or ant_confirm_cheque_liability)",
+            m.moved_aside.join(", "),
+        )),
+        Err(e) => Some(format!(
+            "can't read the lost-ledger marker {}: {e}",
+            lost_marker_path(path).display(),
+        )),
+    }
+}
+
+/// The operator's confirmation that `chequebook`'s cheques issued before
+/// the ledger at `path` was lost are outstanding liability the node can
+/// no longer see — peers it paid before may refuse new cheques, and
+/// disconnect it, until the restarted cumulatives pass what they hold —
+/// and that retrieval may pay from it again. Clears the chequebook's
+/// lost state ([`OutboundLedger::lost_figures`]) until the next loss.
+/// Returns `false` when there was nothing to confirm (no loss on record,
+/// or this chequebook already confirmed). A running node picks it up at
+/// its next retrieval-funds read.
+pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::Result<bool> {
+    let _file = lock_file();
+    let Some(mut marker) = read_lost_marker(path)? else {
+        return Ok(false);
+    };
+    let key = hex::encode(chequebook);
+    if marker
+        .confirmed
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&key))
+    {
+        return Ok(false);
+    }
+    marker.confirmed.push(key.clone());
+    write_lost_marker(path, &marker)?;
+    warn!(
+        target: "ant_p2p::swap",
+        chequebook = %format!("0x{key}"),
+        "operator confirmed the outstanding liability of cheques lost with the \
+         outbound ledger; downloads may pay from this chequebook again",
+    );
+    Ok(true)
 }
 
 /// Read `path` (caller holds [`OUTBOUND_FILE_LOCK`]), adopting a file
@@ -801,6 +929,9 @@ impl OutboundLedger {
                             "outbound ledger unreadable: {e}; no cheques until it can be read",
                         );
                         st.unread = Some(e.to_string());
+                    }
+                    if let Some(why) = lost_figures_at(p, &chequebook) {
+                        warn!(target: "ant_p2p::swap", "{why}");
                     }
                     let shared = Arc::new(OutboundShared {
                         state: Mutex::new(st),
@@ -888,6 +1019,19 @@ impl OutboundLedger {
                 Err(e)
             }
         }
+    }
+
+    /// Why this chequebook's figures are unknown — the ledger file was
+    /// unparseable and moved aside, and no operator has confirmed the
+    /// chequebook's outstanding liability since (see the type docs) —
+    /// or `None` while they are known. Retrieval doesn't pay while this
+    /// is `Some`; pushsync still does. Read from disk on every call, so a
+    /// loss or a confirmation shows at once in every ledger on the file.
+    #[must_use]
+    pub fn lost_figures(&self) -> Option<String> {
+        let path = self.persist_path.as_ref()?;
+        let _file = lock_file();
+        lost_figures_at(path, &self.chequebook)
     }
 
     /// Last cumulative we issued to `beneficiary` (zero if none).
@@ -1776,6 +1920,69 @@ mod tests {
         assert_eq!(reopened.cumulative_for(&peer), U256::from(70u64));
     }
 
+    /// Moving a ledger aside loses its chequebooks' figures (PR #126
+    /// R4-M1): every chequebook on the file reports them lost — across a
+    /// restart, since only an operator clears it — until its liability is
+    /// confirmed, one chequebook at a time; a later loss makes every
+    /// chequebook unknown again. Ledgers on other files are untouched.
+    #[test]
+    fn a_lost_ledger_stays_lost_until_the_operator_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (a, b) = ([0xa0u8; 20], [0xb0u8; 20]);
+        let peer = [0x11u8; 20];
+        let fresh = OutboundLedger::open(Some(path.clone()), a);
+        assert!(fresh.lost_figures().is_none(), "no loss without a move");
+        fresh.record_issued(&peer, U256::from(500u64)).unwrap();
+        drop(fresh);
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        let la = OutboundLedger::open(Some(path.clone()), a);
+        let why = la.lost_figures().expect("a's figures are lost");
+        assert!(why.contains(&hex::encode(a)), "{why}");
+        assert!(why.contains("--confirm-cheque-liability"), "{why}");
+        let lb = OutboundLedger::open(Some(path.clone()), b);
+        assert!(lb.lost_figures().is_some(), "so are b's");
+        // Pushsync still works on the restarted figures.
+        la.record_issued(&peer, U256::from(10u64)).unwrap();
+        assert!(la.lost_figures().is_some(), "a write doesn't clear it");
+        drop((la, lb));
+        let la = OutboundLedger::open(Some(path.clone()), a);
+        assert!(la.lost_figures().is_some(), "a restart doesn't clear it");
+
+        assert!(confirm_cheque_liability(&path, a).unwrap());
+        assert!(la.lost_figures().is_none());
+        assert!(
+            !confirm_cheque_liability(&path, a).unwrap(),
+            "already confirmed"
+        );
+        let lb = OutboundLedger::open(Some(path.clone()), b);
+        assert!(lb.lost_figures().is_some(), "only the confirmed chequebook");
+
+        let other = dir.path().join("other.json");
+        assert!(
+            !confirm_cheque_liability(&other, a).unwrap(),
+            "nothing lost there"
+        );
+        assert!(OutboundLedger::open(Some(other), a)
+            .lost_figures()
+            .is_none());
+
+        // A second loss makes the confirmed chequebook unknown again.
+        drop((la, lb));
+        std::fs::write(&path, b"{ broken again").unwrap();
+        let la = OutboundLedger::open(Some(path.clone()), a);
+        assert!(la.lost_figures().is_some());
+        let marker: LostMarker =
+            serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
+        assert_eq!(marker.moved_aside.len(), 2, "both copies are named");
+
+        // A marker that can't be parsed counts as a loss.
+        std::fs::write(lost_marker_path(&path), b"garbage").unwrap();
+        assert!(confirm_cheque_liability(&path, a).is_err());
+        assert!(la.lost_figures().is_some());
+    }
+
     /// Moving a broken ledger aside never replaces an earlier copy (PR
     /// #126 R4-M2): a name already taken for this second gets a suffix.
     #[test]
@@ -1804,7 +2011,7 @@ mod tests {
         let mut kept: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p != &path)
+            .filter(|p| p != &path && *p != lost_marker_path(&path))
             .map(|p| std::fs::read_to_string(p).unwrap())
             .collect();
         kept.sort();

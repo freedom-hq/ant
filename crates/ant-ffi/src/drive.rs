@@ -753,15 +753,15 @@ pub(crate) fn wake(h: &AntHandle) -> Result<String, DriveError> {
     })
 }
 
-/// The node-level switch for retrieval payments (issue #121). Backs
-/// [`crate::ant_set_retrieval_payments`].
-pub(crate) fn set_retrieval_payments(h: &AntHandle, enabled: bool) -> Result<String, DriveError> {
+/// Bee's node-wide `swap-enable` switch, which governs retrieval payments
+/// (issue #121). Backs [`crate::ant_set_swap_enabled`].
+pub(crate) fn set_swap_enabled(h: &AntHandle, enabled: bool) -> Result<String, DriveError> {
     let cmd_tx = h.cmd_tx.clone();
     h.runtime.block_on(async move {
         let (ack_tx, ack_rx) = oneshot::channel();
         send(
             &cmd_tx,
-            ControlCommand::SetRetrievalPayments {
+            ControlCommand::SetSwapEnabled {
                 enabled,
                 ack: ack_tx,
             },

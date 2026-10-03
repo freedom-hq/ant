@@ -548,6 +548,13 @@ struct ChequebookBalanceBody {
         skip_serializing_if = "Option::is_none"
     )]
     available_balance_error: Option<String>,
+    /// Set while this chequebook's cheque figures are lost — the node's
+    /// outbound ledger was unparseable and moved aside, and no operator
+    /// has confirmed the outstanding liability since — saying so and how
+    /// to clear it. Downloads don't pay from the chequebook meanwhile.
+    /// Not a bee field.
+    #[serde(rename = "chequeLedgerLost", skip_serializing_if = "Option::is_none")]
+    cheque_ledger_lost: Option<String>,
 }
 
 /// `GET /chequebook/balance`. `totalBalance` is the chequebook
@@ -567,13 +574,17 @@ struct ChequebookBalanceBody {
 /// `totalPaidOut()` read fails, the snapshot counts another chequebook,
 /// or the node's outbound ledger is unreadable, the response still carries
 /// `totalBalance`, with `availableBalance` set to it and
-/// `availableBalanceError` saying it isn't the real figure.
+/// `availableBalanceError` saying it isn't the real figure. The same
+/// holds when the ledger lost this chequebook's figures (moved aside as
+/// unparseable, PR #126 R4-M1); `chequeLedgerLost` then says so and how
+/// an operator clears it.
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
     let zero = || {
         Json(ChequebookBalanceBody {
             total_balance: "0".into(),
             available_balance: "0".into(),
             available_balance_error: None,
+            cheque_ledger_lost: None,
         })
         .into_response()
     };
@@ -590,6 +601,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => v,
         Err(r) => return r,
     };
+    let mut cheque_ledger_lost = None;
     let available: Result<u128, String> = async {
         let snapshot = crate::settlements::fetch_snapshot(&handle)
             .await
@@ -611,6 +623,15 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         let Some(issued) = issued else {
             return Err("the node's outbound cheque ledger is unreadable".to_string());
         };
+        // Lost figures: the total counts only cheques since the loss.
+        if let Some(lost) = snapshot.cheques_ledger_lost {
+            cheque_ledger_lost = Some(lost);
+            return Err(
+                "the node's outbound cheque ledger lost this chequebook's earlier cheques \
+                 (see chequeLedgerLost)"
+                    .to_string(),
+            );
+        }
         let paid_out = tokio::time::timeout(
             CHAIN_RPC_TIMEOUT,
             chain.reader.chequebook_total_paid_out(cb),
@@ -634,6 +655,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         total_balance: bal.to_string(),
         available_balance: available.to_string(),
         available_balance_error,
+        cheque_ledger_lost,
     })
     .into_response()
 }

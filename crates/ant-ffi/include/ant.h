@@ -197,15 +197,16 @@ int ant_peer_count(const AntHandle *handle);
 int ant_resume(const AntHandle *handle, char **out_err);
 
 /*
- * Switch retrieval payments (issue #121) on or off for the running node.
- * On (the default), downloads pay peers with SWAP cheques from the
- * node's chequebook once the debt to a peer reaches half its payment
- * threshold, after the free pseudosettle refresh, as bee does; that
- * lifts downloads past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ
- * per GB (bee's oracle rate), never more than the chequebook holds. Off
- * keeps downloads on the free tier even with a funded chequebook, for
- * hosts that fund it for publishing only. Uploads' settlement is
- * unaffected.
+ * Bee's swap-enable: switch SWAP settlement on or off for the running
+ * node. Today it governs retrieval payments (issue #121). On (the
+ * default), downloads pay peers with SWAP cheques from the node's
+ * chequebook once the debt to a peer reaches half its payment threshold,
+ * after the free pseudosettle refresh, as bee does; that lifts downloads
+ * past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB (bee's
+ * oracle rate), never more than the chequebook holds. Off keeps
+ * downloads on the free tier even with a funded chequebook. Upload
+ * (pushsync) cheques are not governed by it yet: #127 makes them pay at
+ * bee's rate under this same switch.
  *
  * Payments also need a chequebook with funds the node has read from the
  * chain: they start after the first settlement setup that has an RPC
@@ -217,7 +218,29 @@ int ant_resume(const AntHandle *handle, char **out_err);
  * didn't ack (already shut down) — in which case an allocated error
  * string is written into *out_err (free with ant_free_string).
  */
-int ant_set_retrieval_payments(const AntHandle *handle, bool enabled, char **out_err);
+int ant_set_swap_enabled(const AntHandle *handle, bool enabled, char **out_err);
+
+/*
+ * Confirm the outstanding liability of `chequebook` ("0x…" hex) after
+ * its cheque figures were lost, and let downloads pay from it again.
+ * When the node's outbound cheque ledger (pushsync_outbound.json) is
+ * found unparseable it is moved aside and a ".lost" marker is left;
+ * while that marker names a loss, retrieval doesn't pay from any
+ * chequebook that used the file (logged at warn, and /chequebook/balance
+ * reports chequeLedgerLost). Only this call (or antd
+ * --confirm-cheque-liability) clears it, never time or a restart.
+ * Confirming accepts that peers paid before the loss hold cheques the
+ * node can't see: they may refuse new cheques, and disconnect the node,
+ * until its restarted cumulatives pass what they hold. A running node
+ * picks it up at its next chequebook-funds read (within a minute).
+ *
+ * Returns 0 once confirmed, 1 when there was nothing to confirm (no loss
+ * on record, or this chequebook already confirmed), -1 if `handle` is
+ * NULL or `chequebook` is malformed, -2 if the marker can't be read or
+ * written; on -1/-2 an allocated error string is written into *out_err
+ * (free with ant_free_string).
+ */
+int ant_confirm_cheque_liability(const AntHandle *handle, const char *chequebook, char **out_err);
 
 /*
  * System-suspend the upload subsystem — call when the app is moving to

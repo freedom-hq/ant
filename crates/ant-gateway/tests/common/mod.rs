@@ -270,7 +270,7 @@ pub fn status_router_with_chain_hooks_and_cors(
         on_chequebook_refused,
         cors,
         None,
-        Ok((None, None)),
+        Ok((None, None, None)),
     )
 }
 
@@ -289,7 +289,7 @@ pub fn status_router_with_chain_and_issued(
         None,
         CorsConfig::default(),
         None,
-        Ok((issued, None)),
+        Ok((issued, None, None)),
     )
 }
 
@@ -309,7 +309,27 @@ pub fn status_router_with_chain_and_issued_by(
         None,
         CorsConfig::default(),
         None,
-        Ok((issued, Some(chequebook))),
+        Ok((issued, Some(chequebook), None)),
+    )
+}
+
+/// [`status_router_with_chain_and_issued_by`] whose snapshot also says
+/// the chequebook's cheque figures were lost (`lost`).
+pub fn status_router_with_chain_and_lost_ledger(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: u128,
+    chequebook: [u8; 20],
+    lost: &str,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Ok((Some(issued), Some(chequebook), Some(lost.to_string()))),
     )
 }
 
@@ -348,10 +368,14 @@ pub fn status_router_recording_registrations(
         None,
         CorsConfig::default(),
         Some(seen.clone()),
-        Ok((None, None)),
+        Ok((None, None, None)),
     );
     (router, seen)
 }
+
+/// What the chain test router's node answers `AccountingSnapshot` with:
+/// `(issued total, its chequebook, lost-ledger reason)`, or an error.
+type SnapshotFixture = Result<(Option<u128>, Option<[u8; 20]>, Option<String>), String>;
 
 fn chain_router(
     snapshot: StatusSnapshot,
@@ -360,7 +384,7 @@ fn chain_router(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
     registrations: Option<Registrations>,
-    issued: Result<(Option<u128>, Option<[u8; 20]>), String>,
+    issued: SnapshotFixture,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -373,11 +397,12 @@ fn chain_router(
         while let Some(cmd) = cmd_rx.recv().await {
             if let ControlCommand::AccountingSnapshot { ack } = cmd {
                 let _ = ack.send(match &issued {
-                    Ok((issued, chequebook)) => {
+                    Ok((issued, chequebook, lost)) => {
                         ControlAck::Accounting(ant_control::AccountingSnapshotView {
                             peers: Vec::new(),
                             cheques_issued_plur: issued.map(|i| i.to_string()),
                             cheques_issued_chequebook: chequebook.map(hex::encode),
+                            cheques_ledger_lost: lost.clone(),
                         })
                     }
                     Err(message) => ControlAck::Error {
@@ -1033,7 +1058,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             });
         }
         ControlCommand::SetRetrievalFunds { ack, .. }
-        | ControlCommand::SetRetrievalPayments { ack, .. } => {
+        | ControlCommand::SetSwapEnabled { ack, .. } => {
             let _ = ack.send(ControlAck::Ok {
                 message: "retrieval payments ignored (test fixture)".into(),
             });

@@ -427,6 +427,11 @@ impl EmitCore {
         self.outbound_ledger
             .ensure_readable()
             .map_err(|e| SwapError::Rejected(format!("outbound ledger unreadable: {e}")))?;
+        // Nor one whose figures were lost: cheques peers refuse would get
+        // the node disconnected by the peers it pays (PR #126 R4-M1).
+        if let Some(why) = self.outbound_ledger.lost_figures() {
+            return Err(SwapError::Rejected(why));
+        }
         // Most this payment can cost; refuse before touching the network
         // when even that isn't covered.
         let most = SettlementRates {
@@ -602,12 +607,16 @@ impl PushsyncSwap {
 
     /// Whether this service pays retrieval debt now: a policy is
     /// installed, the outbound ledger is readable (so what the
-    /// chequebook already owes is known; this retries a failed read)
-    /// and the chequebook has funds left under the policy.
+    /// chequebook already owes is known; this retries a failed read),
+    /// its figures weren't lost to a moved-aside file without an
+    /// operator confirming the liability since
+    /// ([`crate::swap::OutboundLedger::lost_figures`]), and the
+    /// chequebook has funds left under the policy.
     #[must_use]
     pub fn pays_retrieval(&self) -> bool {
         self.core.retrieval_policy().is_some_and(|p| {
             self.core.outbound_ledger.ensure_readable().is_ok()
+                && self.core.outbound_ledger.lost_figures().is_none()
                 && !self.core.available(&p).is_zero()
         })
     }
@@ -895,6 +904,38 @@ mod tests {
         svc.set_retrieval_policy(Some(policy(1_000)));
         assert!(!svc.pays_retrieval());
         set_mode(0o600).unwrap();
+        assert!(svc.pays_retrieval());
+    }
+
+    /// A ledger moved aside as unparseable lost what the chequebook owes
+    /// (PR #126 R4-M1): retrieval stays on the free tier — no payer, and
+    /// a payment that races in is refused before any stream opens — even
+    /// after a restart, until the operator confirms the liability.
+    /// Pushsync cheques keep their behaviour: the ledger still records.
+    #[tokio::test]
+    async fn a_lost_ledger_keeps_retrieval_off_until_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let svc = service(dir.path());
+        svc.set_retrieval_policy(Some(policy(1_000_000)));
+        assert!(!svc.pays_retrieval());
+        let err = svc
+            .core
+            .pay_retrieval(PeerId::random(), 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("confirm"), "{err}");
+        svc.outbound_ledger()
+            .record_issued(&[0x11; 20], U256::from(5u64))
+            .unwrap();
+        drop(svc);
+
+        let svc = service(dir.path());
+        svc.set_retrieval_policy(Some(policy(1_000_000)));
+        assert!(!svc.pays_retrieval(), "a restart doesn't clear it");
+        assert!(crate::swap::confirm_cheque_liability(&path, [0xcb; 20]).unwrap());
         assert!(svc.pays_retrieval());
     }
 
