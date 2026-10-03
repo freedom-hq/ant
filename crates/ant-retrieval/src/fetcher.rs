@@ -33,6 +33,7 @@ use libp2p_stream::Control;
 use std::cmp::Ordering;
 use std::error::Error as StdError;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -169,12 +170,14 @@ pub struct RoutingFetcher {
     /// ([`acquire_request_permit`], issue #46).
     request_inflight_limit: Option<Arc<Semaphore>>,
     /// Notification channel into the pseudosettle driver. When set, every
-    /// successful chunk fetch sends the source peer's id; the driver
-    /// uses that to schedule periodic
-    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes and keep our
-    /// per-peer debt below bee's light-mode `disconnectLimit`. Omitted in
-    /// unit tests (no real bee on the other end means there's no debt to
-    /// settle).
+    /// successful chunk fetch sends the source peer's id, which registers
+    /// the peer with the driver. It does not schedule a refresh: with the
+    /// accounting mirror attached (as in the daemon), the driver refreshes
+    /// a peer only once the mirror's debt to it reaches bee's settle
+    /// trigger (`Accounting::refresh_due`), so the debit recorded through
+    /// `accounting` is what keeps our per-peer debt below bee's light-mode
+    /// `disconnectLimit`. Omitted in unit tests (no real bee on the other
+    /// end means there's no debt to settle).
     payment_notify: Option<mpsc::Sender<PeerId>>,
     /// Optional client-side accounting mirror. When set, every
     /// chunk fetch dispatch goes through
@@ -199,7 +202,8 @@ pub struct RoutingFetcher {
     /// one shared `Arc` into every fetcher.
     counters: Option<Arc<RetrievalCounters>>,
     /// Optional pushsync-side settlement hook. When `Some`, every
-    /// accepted pushsync receipt is reported via
+    /// pushsync receipt — deep or shallow, and one that arrives after
+    /// the walk moved on (a losing hedge, a dropped push) — is reported via
     /// [`PushsyncSettlement::note_pushsync`] so the implementation
     /// can decide whether the per-peer outbound debt has crossed a
     /// SWAP-cheque trigger. The fetcher itself stays ignorant of
@@ -361,8 +365,9 @@ impl RoutingFetcher {
         self
     }
 
-    /// Attach a pushsync-side settlement hook. After every accepted
-    /// pushsync receipt we call `settlement.note_pushsync(peer, price)`
+    /// Attach a pushsync-side settlement hook. After every pushsync
+    /// receipt, deep or shallow, accepted or not (the storer debits us
+    /// for each one it writes), we call `settlement.note_pushsync(peer, price)`
     /// so the hook can decide whether to emit a SWAP cheque before the
     /// next push lands. The hook is best-effort: a settlement failure
     /// does not fail the upload, just causes the next pushsync against
@@ -503,13 +508,17 @@ impl RoutingFetcher {
 
     /// Wire this fetcher to the daemon's pseudosettle driver. On every
     /// successful chunk fetch, the source peer's id is sent on
-    /// `notify_tx`; the driver uses that as a heartbeat to schedule
-    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes. Without this,
-    /// debt accumulates on every peer that serves us until bee's
-    /// `disconnectLimit` kicks in (~7-30 chunks per peer in light mode)
-    /// — see the 0.3.0 streaming-regression appendix in `PLAN.md` for the
-    /// full analysis. The channel is bounded; if it backs up the fetcher
-    /// drops the notification rather than blocking the hot path.
+    /// `notify_tx`, registering the peer with the driver. With the
+    /// accounting mirror attached ([`Self::with_accounting`]) that is all
+    /// it does: the driver refreshes
+    /// (`/swarm/pseudosettle/1.0.0/pseudosettle`) a peer only once the
+    /// mirror's debt to it reaches bee's settle trigger, so the mirror,
+    /// not this channel, keeps debt below bee's `disconnectLimit` (~7-30
+    /// chunks per peer in light mode — see the 0.3.0 streaming-regression
+    /// appendix in `PLAN.md`). Without a mirror a notified peer is
+    /// refreshed on the driver's interval. The channel is bounded; if it
+    /// backs up the fetcher drops the notification rather than blocking
+    /// the hot path.
     #[must_use]
     pub fn with_payment_notify(mut self, notify_tx: mpsc::Sender<PeerId>) -> Self {
         self.payment_notify = Some(notify_tx);
@@ -757,7 +766,9 @@ impl RoutingFetcher {
     ///   peer and, every [`PREEMPTIVE_INTERVAL`] (bee `preemptiveInterval`),
     ///   fan out to one more closest peer *concurrently* — bee's
     ///   "preemptive" early-replication hedge. The first valid receipt
-    ///   wins; remaining attempts are dropped.
+    ///   wins; the remaining attempts are handed to a detached drain
+    ///   ([`PushInFlight`]) that records the debit of any receipt they
+    ///   still return.
     /// * **Shallow receipts are not failures.** A shallow receipt proves a
     ///   storer ran its reserve-put + sign path (so the chunk is stored
     ///   and will be pull-synced through the neighbourhood); it just
@@ -766,7 +777,9 @@ impl RoutingFetcher {
     ///   retry for a deeper storer up to [`MAX_SHALLOW_ATTEMPTS`] (bee
     ///   `DefaultRetryCount`) and then **accept** it — bee reports the
     ///   chunk `ChunkSynced` rather than ever failing the upload on a
-    ///   shallow receipt. Under [`Self::with_require_deep`] (the upload-
+    ///   shallow receipt. Every shallow receipt is debited to the
+    ///   settlement mirror, not just the accepted one: the storer
+    ///   applied the debit when it wrote it. Under [`Self::with_require_deep`] (the upload-
     ///   job path) the exhausted hunt returns
     ///   [`PushSyncError::ShallowReceipt`] instead of accepting, so the
     ///   caller's retry queue keeps working the chunk until it lands
@@ -832,12 +845,13 @@ impl RoutingFetcher {
         let mut last_err: Option<PushSyncError> = None;
 
         // In-flight pushsync attempts. Each yields
-        // `(peer, overlay, chunk_price, result)`.
-        type Attempt = (PeerId, Overlay, u64, Result<(), PushSyncError>);
-        let inflight = FuturesUnordered::<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Attempt> + Send>>,
-        >::new();
-        let mut inflight = inflight;
+        // `(peer, overlay, chunk_price, result)`. Whatever is still in
+        // flight when this function returns (a winner beat the hedges, the
+        // walk gave up, or the caller dropped us) goes to a detached drain
+        // that records the debit of every receipt that still arrives:
+        // the storer debits us once it has written a receipt, whether or
+        // not we are still listening.
+        let mut inflight = PushInFlight::new(self.pushsync_settlement.clone());
 
         // `want` is bee's `retryC`: how many fresh attempts to dispatch to
         // the next-closest peers. Seed with one; the preemptive ticker and
@@ -871,12 +885,13 @@ impl RoutingFetcher {
                 let delay_ms: u64 = $delay_ms;
                 // Load-book the dispatch SYNCHRONOUSLY so the very next
                 // `next_push_peer` (for a concurrent chunk) already sees
-                // this peer's in-flight count (Experiment 2).
-                let push_load = self.push_load.clone();
-                if let Some(load) = push_load.as_ref() {
-                    load.begin(peer);
-                }
-                inflight.push(Box::pin(async move {
+                // this peer's in-flight count (Experiment 2). The guard
+                // moves into the attempt, so the slot is released however
+                // the attempt ends — finished, drained, or dropped
+                // unfinished (no settlement hook to drain into) — instead
+                // of leaking whenever the future is discarded (R4-M1).
+                let load_guard = self.push_load.as_ref().map(|l| l.book(peer));
+                inflight.futs.push(Box::pin(async move {
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
@@ -891,8 +906,8 @@ impl RoutingFetcher {
                         DEFAULT_PUSHSYNC_TIMEOUT,
                     )
                     .await;
-                    if let Some(load) = push_load.as_ref() {
-                        load.end(&peer, started.elapsed());
+                    if let Some(g) = load_guard {
+                        g.finish(started.elapsed());
                     }
                     (peer, overlay, price, r)
                 }));
@@ -919,7 +934,7 @@ impl RoutingFetcher {
                 want -= 1;
             }
 
-            if inflight.is_empty() {
+            if inflight.futs.is_empty() {
                 // Nothing pending and no candidates left to dial.
                 break;
             }
@@ -927,7 +942,7 @@ impl RoutingFetcher {
             tokio::select! {
                 // Prefer draining results over firing more hedges.
                 biased;
-                Some((peer, overlay, price, res)) = inflight.next() => {
+                Some((peer, overlay, price, res)) = inflight.futs.next() => {
                     match res {
                         Ok(()) => {
                             if let Some(s) = self.pushsync_settlement.as_ref() {
@@ -949,6 +964,13 @@ impl RoutingFetcher {
                             // receipt now. Do NOT cool-down a shallow peer;
                             // it's a fine storer for chunks in its own
                             // neighbourhood.
+                            // The storer debits us once it has written a
+                            // receipt, shallow or deep, so every one is
+                            // real debt the mirror must record — not just
+                            // the one we finally accept (PR #134 R3-M1).
+                            if let Some(s) = self.pushsync_settlement.as_ref() {
+                                s.note_pushsync(peer, price).await;
+                            }
                             shallow_attempts += 1;
                             shallow_seen = true;
                             last_shallow = (po, storage_radius);
@@ -965,10 +987,7 @@ impl RoutingFetcher {
                                 // the caller's retry queue instead of
                                 // accepting a placement the routed network
                                 // can't see (see `with_require_deep`). The
-                                // storer did settle-worthy work either way.
-                                if let Some(s) = self.pushsync_settlement.as_ref() {
-                                    s.note_pushsync(peer, price).await;
-                                }
+                                // debit was recorded above either way.
                                 if require_deep {
                                     warn!(
                                         target: "ant_retrieval::fetcher",
@@ -1458,7 +1477,22 @@ impl RoutingFetcher {
         // Peers that answered "not found" / "no peer found" (see
         // `pool_starved`).
         let mut not_found_answers = 0usize;
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        // Dispatched requests. If this fetch is dropped mid-flight (an
+        // outer `timeout` — a feed probe deadline, `verify_chunks_present`'s
+        // per-chunk cap — or a gateway client going away), the guard hands
+        // whatever is still in flight to the loser drain instead of
+        // dropping it: bee may already have applied the debit for a
+        // delivery it is writing, and the mirror must record it (see
+        // `InFlight`).
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut in_flight = InFlight::new(
+            addr,
+            abandoned.clone(),
+            self.cache.clone(),
+            self.disk_cache.clone(),
+            self.record_dir.clone(),
+            self.payment_notify.clone(),
+        );
         let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
         // Per-chunk overdraft skip: a peer landed here when
         // `Accounting::try_reserve` refused to admit the dispatch.
@@ -1476,6 +1510,7 @@ impl RoutingFetcher {
             let sem = self.inflight_limit.clone();
             let request_sem = self.request_inflight_limit.clone();
             let tracker = self.progress.clone();
+            let abandoned = abandoned.clone();
             async move {
                 let _request_permit = match request_sem {
                     Some(s) => acquire_request_permit(s).await,
@@ -1485,6 +1520,14 @@ impl RoutingFetcher {
                     Some(s) => Some(s.acquire_owned().await.expect("retrieval semaphore closed")),
                     None => None,
                 };
+                // Still queued at a semaphore when the fetch was won or
+                // dropped: nothing reached bee yet, so don't send it now.
+                // The reservation releases with the guard. (Only the
+                // drain ever sees this error; it discards it.)
+                if abandoned.load(AtomicOrdering::Acquire) {
+                    let e = RetrievalError::OpenStream("abandoned before dispatch".into());
+                    return (peer, Err(e), guard);
+                }
                 // Count "in flight" only after both semaphore permits
                 // are held — fetches still queued at the semaphore are
                 // not yet consuming network bandwidth.
@@ -1743,14 +1786,7 @@ impl RoutingFetcher {
                             // notifies pseudosettle for every success,
                             // so hot peers stay debt-cleared even when
                             // they lose the race.
-                            spawn_drain_losers(
-                                in_flight,
-                                addr,
-                                self.cache.clone(),
-                                self.disk_cache.clone(),
-                                self.record_dir.clone(),
-                                self.payment_notify.clone(),
-                            );
+                            in_flight.drain_in_background();
                             let mut wire = Vec::with_capacity(8 + chunk.payload().len());
                             wire.extend_from_slice(&chunk.span_bytes());
                             wire.extend_from_slice(chunk.payload());
@@ -1788,13 +1824,14 @@ impl RoutingFetcher {
                             if let Some(counters) = self.counters.as_ref() {
                                 counters.record_chunk(wire.len() as u64, crate::ChunkSource::Network);
                             }
-                            // Heartbeat into the pseudosettle driver. We
-                            // use `try_send` to keep the hot path
-                            // strictly non-blocking: if the driver
-                            // hasn't drained the bounded channel yet,
-                            // missing one notification just delays the
-                            // next refresh by at most one driver tick
-                            // (~1 s) and is harmless.
+                            // Register the peer with the pseudosettle
+                            // driver. `try_send` keeps the hot path
+                            // strictly non-blocking; a dropped
+                            // notification is harmless with the mirror
+                            // attached, since the driver schedules
+                            // refreshes off the mirror's debt (the
+                            // debit applied above), not off this
+                            // channel.
                             if let Some(notify) = self.payment_notify.as_ref() {
                                 let _ = notify.try_send(peer);
                             }
@@ -2041,11 +2078,14 @@ const fn is_link_failure(err: &RetrievalError) -> bool {
 ///   - **Cache write-through.** The loser already paid for the bytes;
 ///     caching them is free and a sibling fetch (or a future request
 ///     for the same chunk) skips the network entirely.
-///   - **Pseudosettle notify.** The chunk price was applied as a real
-///     debit on bee's accounting, so the pseudosettle driver needs to
-///     know we owe this peer. Without this notify, debt would still
-///     accumulate and we'd just trade ghost-overdraw blocklists for
-///     `lightDisconnectLimit` blocklists.
+///   - **Debit apply + pseudosettle notify.** The chunk price was applied
+///     as a real debit on bee's accounting, so it must land in our
+///     mirror too: the pseudosettle driver refreshes a peer only once
+///     the mirror's debt to it is due (`Accounting::refresh_due`), so a
+///     debit we skipped here would accumulate on bee's side unseen and
+///     we'd just trade ghost-overdraw blocklists for
+///     `lightDisconnectLimit` blocklists. The notify only registers the
+///     peer with the driver.
 ///   - **`record_chunk`** if recording is enabled.
 ///
 /// Errors from losing fetches are silently discarded — the winner has
@@ -2146,6 +2186,192 @@ fn spawn_drain_losers<S>(
     });
 }
 
+/// One pushsync attempt's outcome: `(peer, overlay, chunk_price, result)`.
+type PushAttempt = (
+    PeerId,
+    Overlay,
+    u64,
+    Result<(), crate::pushsync::PushSyncError>,
+);
+
+/// A boxed, detachable pushsync attempt.
+type PushAttemptFuture = std::pin::Pin<Box<dyn std::future::Future<Output = PushAttempt> + Send>>;
+
+/// `push_stamped_chunk`'s in-flight attempts. On drop (the walk returned
+/// with hedges still running, or the caller dropped the push), whatever is
+/// still in flight goes to a detached drain that records the debit of
+/// every receipt that still arrives — deep or shallow — in the pushsync
+/// settlement mirror. A storer applies the debit once it has written its
+/// receipt, whether or not we read it, and the pseudosettle driver only
+/// refreshes a peer once its *mirrored* debt is due, so a dropped receipt
+/// is debt bee holds and nothing ever clears. Each attempt is bounded by
+/// `DEFAULT_PUSHSYNC_TIMEOUT`, so the drain is too.
+///
+/// Cost of the drain: a losing hedge's stream now stays open until its
+/// receipt (or the up-to-45s timeout) instead of closing the moment the
+/// walk returns, so a push's streams can outlive the upload's concurrency
+/// window, and those attempts keep their [`crate::PushLoadGuard`] slot
+/// (counting toward the peer's push cap) until they end. Without a
+/// settlement hook nothing is drained: the attempts are dropped, which
+/// closes their streams and — via the guard — frees their load slots.
+struct PushInFlight {
+    futs: FuturesUnordered<PushAttemptFuture>,
+    settlement: Option<Arc<dyn PushsyncSettlement>>,
+}
+
+impl PushInFlight {
+    fn new(settlement: Option<Arc<dyn PushsyncSettlement>>) -> Self {
+        Self {
+            futs: FuturesUnordered::new(),
+            settlement,
+        }
+    }
+}
+
+impl Drop for PushInFlight {
+    fn drop(&mut self) {
+        if self.futs.is_empty() {
+            return;
+        }
+        let futs = std::mem::take(&mut self.futs);
+        // Without a settlement hook there is nothing to record; dropping
+        // the attempts closes their streams, and each attempt's
+        // `PushLoadGuard` frees its push-load slot on drop (R4-M1).
+        let Some(settlement) = self.settlement.clone() else {
+            return;
+        };
+        // A drop outside any runtime (process teardown) has nowhere to
+        // spawn to; the requests die with the runtime anyway.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut futs = futs;
+            while let Some((peer, _overlay, price, res)) = futs.next().await {
+                if matches!(
+                    res,
+                    Ok(()) | Err(crate::pushsync::PushSyncError::ShallowReceipt { .. })
+                ) {
+                    settlement.note_pushsync(peer, price).await;
+                }
+            }
+        });
+    }
+}
+
+/// The in-flight set of one [`RoutingFetcher::fetch_within`] call, which
+/// is never simply dropped while requests are still running.
+///
+/// Bee applies a retrieval debit when it writes the delivery
+/// (`creditAction.Apply`), so a request dropped after that point leaves
+/// debt at bee the accounting mirror never records — and pseudosettle
+/// refreshes only off the mirror (`Accounting::refresh_due`), so that debt
+/// would only clear incidentally. A fetch can end with requests still in
+/// flight in two ways:
+///
+/// - it is won: the losers are handed off explicitly
+///   ([`InFlight::drain_in_background`]);
+/// - its future is dropped by the caller (an outer `tokio::time::timeout`
+///   such as the feed look-ahead deadline or `verify_chunks_present`'s
+///   per-chunk cap, or a gateway request whose client disconnected): the
+///   [`Drop`] impl does the same hand-off.
+///
+/// Either way [`spawn_drain_losers`] reads each remaining request to
+/// completion (bounded by `retrieve_chunk`'s own `RETRIEVE_TIMEOUT`) and
+/// applies its debit on a delivery. Requests still queued at a retrieval
+/// semaphore have sent nothing; the shared `abandoned` flag stops them
+/// from being sent at all.
+struct InFlight<F: std::future::Future<Output = DrainItem> + Send + 'static> {
+    futures: Option<FuturesUnordered<F>>,
+    addr: [u8; 32],
+    abandoned: Arc<AtomicBool>,
+    cache: Option<Arc<InMemoryChunkCache>>,
+    disk_cache: Option<Arc<DiskChunkCache>>,
+    record_dir: Option<PathBuf>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+}
+
+/// What one dispatched retrieval resolves to.
+type DrainItem = (
+    PeerId,
+    Result<RetrievedChunk, RetrievalError>,
+    Option<DebitGuard>,
+);
+
+impl<F: std::future::Future<Output = DrainItem> + Send + 'static> InFlight<F> {
+    fn new(
+        addr: [u8; 32],
+        abandoned: Arc<AtomicBool>,
+        cache: Option<Arc<InMemoryChunkCache>>,
+        disk_cache: Option<Arc<DiskChunkCache>>,
+        record_dir: Option<PathBuf>,
+        payment_notify: Option<mpsc::Sender<PeerId>>,
+    ) -> Self {
+        Self {
+            futures: Some(FuturesUnordered::new()),
+            addr,
+            abandoned,
+            cache,
+            disk_cache,
+            record_dir,
+            payment_notify,
+        }
+    }
+
+    fn set(&mut self) -> &mut FuturesUnordered<F> {
+        self.futures
+            .as_mut()
+            .expect("in-flight set already drained")
+    }
+
+    fn push(&mut self, fut: F) {
+        self.set().push(fut);
+    }
+
+    fn len(&self) -> usize {
+        self.futures.as_ref().map_or(0, FuturesUnordered::len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    async fn next(&mut self) -> Option<DrainItem> {
+        self.set().next().await
+    }
+
+    /// Hand every request still in flight to a detached drain task. No-op
+    /// if none are (or the set was already handed off).
+    fn drain_in_background(&mut self) {
+        let Some(futures) = self.futures.take() else {
+            return;
+        };
+        if futures.is_empty() {
+            return;
+        }
+        self.abandoned.store(true, AtomicOrdering::Release);
+        // A drop outside any runtime (process teardown) has nowhere to
+        // spawn to; the requests die with the runtime anyway.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        spawn_drain_losers(
+            futures,
+            self.addr,
+            self.cache.clone(),
+            self.disk_cache.clone(),
+            self.record_dir.clone(),
+            self.payment_notify.clone(),
+        );
+    }
+}
+
+impl<F: std::future::Future<Output = DrainItem> + Send + 'static> Drop for InFlight<F> {
+    fn drop(&mut self) {
+        self.drain_in_background();
+    }
+}
+
 /// Best-effort dump of a CAC-validated chunk's wire bytes to
 /// `<dir>/<hex_addr>.bin`. Used by the daemon's `--record-chunks`
 /// flag to capture a fixture of every chunk a successful `antctl
@@ -2179,6 +2405,97 @@ fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records every `note_pushsync` call.
+    #[derive(Default)]
+    struct RecordingSettlement(Mutex<Vec<(PeerId, u64)>>);
+
+    #[async_trait]
+    impl PushsyncSettlement for RecordingSettlement {
+        async fn note_pushsync(&self, peer: PeerId, price: u64) {
+            self.0.lock().unwrap().push((peer, price));
+        }
+        fn forget(&self, _peer: &PeerId) {}
+    }
+
+    /// Pushes still in flight when `push_stamped_chunk` returns (a winner
+    /// beat the hedges) or is dropped keep running in a detached drain,
+    /// and every receipt that still arrives — deep or shallow — is debited
+    /// to the mirror: the storer debited us when it wrote it. Failed
+    /// attempts record nothing (PR #134 R3-M1).
+    #[tokio::test(start_paused = true)]
+    async fn dropped_push_attempts_still_record_late_receipts() {
+        use crate::pushsync::PushSyncError;
+        let rec = Arc::new(RecordingSettlement::default());
+        let (deep, shallow, failed) = (PeerId::random(), PeerId::random(), PeerId::random());
+        {
+            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            for (peer, price, delay, res) in [
+                (deep, 110_000u64, 3u64, Ok(())),
+                (
+                    shallow,
+                    220_000,
+                    5,
+                    Err(PushSyncError::ShallowReceipt {
+                        po: 3,
+                        storage_radius: 8,
+                    }),
+                ),
+                (
+                    failed,
+                    330_000,
+                    1,
+                    Err(PushSyncError::Remote("nope".into())),
+                ),
+            ] {
+                inflight.futs.push(Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    (peer, [0u8; 32], price, res)
+                }));
+            }
+            // Dropped with all three still pending.
+        }
+        assert!(rec.0.lock().unwrap().is_empty(), "nothing has answered yet");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut got = rec.0.lock().unwrap().clone();
+        got.sort_by_key(|(_, p)| *p);
+        assert_eq!(got, vec![(deep, 110_000), (shallow, 220_000)]);
+    }
+
+    /// With no settlement hook (`ANT_PUSH_PSEUDOSETTLE=0`) unfinished
+    /// attempts are dropped, not drained — and must still free the
+    /// push-load slot they booked at dispatch, or every discarded hedge
+    /// ratchets its peer toward `at_cap` for good (PR #134 R4-M1). With a
+    /// hook, the drained attempt holds its slot until it really ends.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_push_attempts_release_push_load() {
+        let load = Arc::new(crate::PushLoadTracker::new(1));
+        let peer = PeerId::random();
+        let attempt = |load: &Arc<crate::PushLoadTracker>| -> PushAttemptFuture {
+            let guard = load.book(peer);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                guard.finish(Duration::from_secs(5));
+                (peer, [0u8; 32], 1, Ok(()))
+            })
+        };
+        {
+            let inflight = PushInFlight::new(None);
+            inflight.futs.push(attempt(&load));
+            assert!(load.at_cap(&peer));
+        }
+        assert!(!load.at_cap(&peer), "dropped attempt leaked its slot");
+
+        let rec = Arc::new(RecordingSettlement::default());
+        {
+            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            inflight.futs.push(attempt(&load));
+        }
+        assert!(load.at_cap(&peer), "drained attempt is still in flight");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!load.at_cap(&peer));
+        assert_eq!(rec.0.lock().unwrap().len(), 1);
+    }
     use crate::accounting::CREDIT_WAIT_BUDGET;
     use std::time::Duration;
 
@@ -2507,6 +2824,75 @@ mod tests {
         // satisfy `retrieve_chunk`.
         drop(hold);
         h.abort();
+    }
+
+    /// R2-M1 on PR #134: an [`InFlight`] set dropped with a request still
+    /// running (the caller's future was cancelled by an outer timeout)
+    /// hands it to the loser drain, so a late delivery still applies its
+    /// debit to the mirror instead of releasing the reservation unpaid.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_in_flight_set_still_applies_a_late_debit() {
+        let acc = Arc::new(Accounting::new());
+        let p = PeerId::random();
+        let addr = [0x5au8; 32];
+        let guard = acc.try_reserve(p, 1_000).expect("fresh peer admits");
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut set = InFlight::new(addr, abandoned.clone(), None, None, None, None);
+        set.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let chunk = RetrievedChunk {
+                address: addr,
+                data: vec![0u8; 8],
+            };
+            (p, Ok(chunk), Some(guard))
+        }));
+        assert_eq!(acc.debug_snapshot(&p), Some((0, 1_000)));
+        drop(set);
+        assert!(abandoned.load(AtomicOrdering::Acquire));
+        // Still reserved while the drain waits for the delivery…
+        assert_eq!(acc.debug_snapshot(&p), Some((0, 1_000)));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        // …and applied once it lands.
+        assert_eq!(acc.debug_snapshot(&p), Some((1_000, 0)));
+    }
+
+    /// R2-M1 on PR #134, through the real `fetch`: cancelling it with an
+    /// outer timeout (the feed look-ahead deadline, verify's per-chunk
+    /// cap) no longer drops the dispatched request and its reservation.
+    /// The request here is parked at the retrieval semaphore; once a slot
+    /// frees, the drain sees the fetch was abandoned and releases the
+    /// reservation without sending anything.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_fetch_keeps_its_request_for_the_drain() {
+        let acc = Arc::new(Accounting::new());
+        let p = PeerId::random();
+        let o = [0x80u8; 32];
+        let addr = [0x3cu8; 32];
+        let sem = Arc::new(Semaphore::new(1));
+        let hold = sem.clone().acquire_owned().await.unwrap();
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
+            .with_accounting(acc.clone())
+            .with_inflight_limit(sem.clone());
+        let r = tokio::time::timeout(Duration::from_millis(500), fetcher.fetch(addr)).await;
+        assert!(
+            r.is_err(),
+            "the fetch must still be parked at the semaphore"
+        );
+        let price = Accounting::peer_price(&o, &addr);
+        assert_eq!(
+            acc.debug_snapshot(&p),
+            Some((0, price)),
+            "the cancelled fetch's request must survive in the drain",
+        );
+        drop(hold);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            acc.debug_snapshot(&p),
+            Some((0, 0)),
+            "an abandoned request that never reached bee releases its reservation",
+        );
+        assert_eq!(sem.available_permits(), 1);
     }
 
     /// A fetcher with accounting over one peer whose credit is used up:

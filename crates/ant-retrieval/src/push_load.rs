@@ -128,6 +128,35 @@ impl PushLoadTracker {
         }
     }
 
+    /// Book a dispatch to `peer` and return a guard that un-books it.
+    ///
+    /// The guard records completion via [`Self::end`] when the attempt
+    /// finishes ([`PushLoadGuard::finish`]) and, if the attempt is dropped
+    /// unfinished (a losing hedge whose future is discarded, a caller
+    /// that drops the push), still releases the in-flight slot on drop —
+    /// without folding a latency sample, since a cancelled attempt says
+    /// nothing about the peer's speed. A bare `begin` with the matching
+    /// `end` only inside the attempt's future leaks the slot whenever
+    /// that future is dropped, permanently inflating the peer's count
+    /// toward [`Self::at_cap`] (PR #134 R4-M1).
+    #[must_use]
+    pub fn book(self: &std::sync::Arc<Self>, peer: PeerId) -> PushLoadGuard {
+        self.begin(peer);
+        PushLoadGuard {
+            tracker: std::sync::Arc::clone(self),
+            peer,
+            done: false,
+        }
+    }
+
+    /// Release one in-flight slot for `peer` without an EWMA sample.
+    fn release(&self, peer: &PeerId) {
+        let mut peers = self.peers.lock().expect("push load mutex");
+        if let Some(l) = peers.get_mut(peer) {
+            l.inflight = l.inflight.saturating_sub(1);
+        }
+    }
+
     /// Note that the ranking had to re-admit at-cap peers (all ranked
     /// candidates saturated).
     pub fn note_saturated_fallthrough(&self) {
@@ -138,6 +167,31 @@ impl PushLoadTracker {
     #[must_use]
     pub fn saturated_fallthroughs(&self) -> u64 {
         self.saturated_fallthroughs.load(Ordering::Relaxed)
+    }
+}
+
+/// One booked in-flight push (see [`PushLoadTracker::book`]). Releases its
+/// slot exactly once: on [`Self::finish`] with a latency sample, or on drop
+/// without one.
+pub struct PushLoadGuard {
+    tracker: std::sync::Arc<PushLoadTracker>,
+    peer: PeerId,
+    done: bool,
+}
+
+impl PushLoadGuard {
+    /// The attempt completed (any outcome) after `latency`.
+    pub fn finish(mut self, latency: Duration) {
+        self.done = true;
+        self.tracker.end(&self.peer, latency);
+    }
+}
+
+impl Drop for PushLoadGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.tracker.release(&self.peer);
+        }
     }
 }
 
@@ -184,5 +238,26 @@ mod tests {
             peers.get(&peer).unwrap().ewma_micros,
             LATENCY_FOLD_CAP.as_micros() as u64
         );
+    }
+
+    /// A booked push releases its slot however it ends: `finish` folds the
+    /// latency, a guard dropped unfinished (a discarded hedge) only frees
+    /// the slot. Before R4-M1 the slot leaked on drop, ratcheting the peer
+    /// toward `at_cap` for the rest of the process.
+    #[test]
+    fn dropped_guard_releases_slot_without_sample() {
+        let t = std::sync::Arc::new(PushLoadTracker::new(1));
+        let peer = PeerId::random();
+        let g = t.book(peer);
+        assert!(t.at_cap(&peer));
+        drop(g);
+        assert!(!t.at_cap(&peer), "dropped attempt must free its slot");
+        assert_eq!(t.peers.lock().unwrap().get(&peer).unwrap().ewma_micros, 0);
+        let g = t.book(peer);
+        g.finish(Duration::from_millis(50));
+        assert!(!t.at_cap(&peer));
+        let peers = t.peers.lock().unwrap();
+        let l = peers.get(&peer).unwrap();
+        assert_eq!((l.inflight, l.ewma_micros), (0, 50_000));
     }
 }

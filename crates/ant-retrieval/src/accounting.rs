@@ -76,11 +76,11 @@
 //! that would cross it.
 //!
 //! [`HOT_DEBT_THRESHOLD`] is set at 50 % of the disconnect limit
-//! (≈ 850 k units), matching bee's `earlyPayment = 50 %` in
-//! `accounting.go::PrepareCredit`. Crossing it triggers a hot hint
-//! into the pseudosettle driver, which dispatches a refresh on the
-//! next driver tick (100 ms) instead of waiting for the 1 s
-//! periodic walk.
+//! (≈ 850 k units). Crossing it sends a hot hint to the pseudosettle
+//! driver, which registers the peer with it. The driver refreshes a peer
+//! once [`Accounting::refresh_due`] says so: bee's settle trigger, an
+//! expected debt of [`EARLY_PAYMENT_THRESHOLD`] with at least one second
+//! of refresh ([`LIGHT_REFRESH_RATE_PER_SEC`]) applied (issue #129).
 //!
 //! # Paying with SWAP (issue #121)
 //!
@@ -170,13 +170,13 @@ pub const LIGHT_REFRESH_RATE_PER_SEC: u64 = 450_000;
 /// indistinguishable from a stall on bee's end.
 pub const OVERDRAFT_LIMIT: u64 = LIGHT_DISCONNECT_LIMIT;
 
-/// Threshold at which the fetcher hints to the pseudosettle driver
-/// that a peer's debt is approaching the limit and a refresh
-/// should fire on the next tick rather than waiting for the
-/// periodic walk.
+/// Threshold at which the mirror hints to the pseudosettle driver that
+/// a peer's debt is approaching the limit, so the driver tracks the peer
+/// even when no fetch has notified it (pushsync debt). The refresh itself
+/// is due earlier, at [`EARLY_PAYMENT_THRESHOLD`]
+/// ([`Accounting::refresh_due`]).
 ///
-/// 50 % of `LIGHT_DISCONNECT_LIMIT` matches bee's
-/// `earlyPayment = 50 %` constant in `pkg/accounting/accounting.go`.
+/// 50 % of `LIGHT_DISCONNECT_LIMIT`.
 pub const HOT_DEBT_THRESHOLD: u64 = LIGHT_DISCONNECT_LIMIT / 2;
 
 /// Bee's `lightPaymentThreshold`: the payment threshold a bee peer
@@ -422,6 +422,29 @@ impl Default for PeerBalance {
 }
 
 impl PeerBalance {
+    /// The refresh half of bee's `Accounting.settle`: the debt a
+    /// pseudosettle refresh to this peer should clear now, if one is due
+    /// by debt. Bee calls `settle` once the expected debt less payments in
+    /// flight reaches the early-payment threshold (`PrepareCredit`,
+    /// `creditAction.Apply`), and `settle` refreshes only when the
+    /// applied debt less payments in flight (`shadowBalance`) is at least
+    /// one second of refresh (`paymentAmount >= refreshRate`, "to avoid
+    /// ineffective use of refreshments").
+    ///
+    /// Below that, a refresh would be accepted for little or nothing,
+    /// and bee still restarts its per-peer allowance clock on every
+    /// refresh it answers (`lastTime.Timestamp = timestamp`, even for a
+    /// zero amount), so the allowance that had built up is lost.
+    fn refresh_due(&self) -> Option<u64> {
+        let expected = self
+            .balance
+            .saturating_add(self.reserved)
+            .saturating_sub(self.shadow_reserved);
+        let refreshable = self.balance.saturating_sub(self.shadow_reserved);
+        (expected >= EARLY_PAYMENT_THRESHOLD && refreshable >= LIGHT_REFRESH_RATE_PER_SEC)
+            .then_some(refreshable)
+    }
+
     /// The money half of bee's `Accounting.settle`: how much of this
     /// peer's debt to pay with a SWAP cheque now, if any. `expected_debt`
     /// is the debt once every reservation in flight is applied
@@ -499,10 +522,9 @@ static NEXT_PAYMENT_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Accounting {
     peers: SharedBalances,
     /// Channel into the pseudosettle driver. Each event is a
-    /// peer that has just crossed [`HOT_DEBT_THRESHOLD`] and
-    /// needs an out-of-band refresh ASAP. The driver coalesces
-    /// duplicates and respects the 1.1 s minimum spacing on
-    /// bee's side.
+    /// peer that has just crossed [`HOT_DEBT_THRESHOLD`]; the driver
+    /// coalesces duplicates and refreshes the peer when
+    /// [`Accounting::refresh_due`] lists it.
     hot_hint: Option<mpsc::Sender<HotHint>>,
     /// Wakes fetches waiting for credit ([`Accounting::wait_for_credit`])
     /// when credit may have come free: a pseudosettle refresh landed
@@ -886,6 +908,21 @@ impl Accounting {
         peers.get(peer).map(|b| (b.balance, b.reserved))
     }
 
+    /// Every peer a pseudosettle refresh is due to by debt, with the debt
+    /// it would clear (bee's `shadowBalance`). Read by the pseudosettle
+    /// driver on every tick; see `PeerBalance::refresh_due` for the rule.
+    /// Cheap (single lock acquisition).
+    #[must_use]
+    pub fn refresh_due(&self) -> HashMap<PeerId, u64> {
+        let Ok(peers) = self.peers.lock() else {
+            return HashMap::new();
+        };
+        peers
+            .iter()
+            .filter_map(|(peer, b)| b.refresh_due().map(|debt| (*peer, debt)))
+            .collect()
+    }
+
     /// Enumerate every tracked peer as `(peer, balance,
     /// time_settled)` — the outstanding debt we owe the peer and the
     /// cumulative pseudosettle amount it has accepted from us. Backs
@@ -928,9 +965,7 @@ impl DebitGuard {
     /// Mark the debit as applied. Moves `price` from `reserved`
     /// into `balance`. If the new `balance` crosses
     /// [`HOT_DEBT_THRESHOLD`], fire a [`HotHint`] into the
-    /// pseudosettle driver so it can dispatch a refresh on the
-    /// next 100 ms tick rather than waiting for the periodic
-    /// walk.
+    /// pseudosettle driver so it tracks the peer.
     pub fn apply(mut self) {
         let payer = current_payer(&self.payment);
         let (crossed, cheque) = {
@@ -1484,6 +1519,34 @@ mod tests {
         acc.credit(p, 300_000);
         let snap = acc.debug_snapshot(&p).unwrap();
         assert_eq!(snap, (200_000, 0));
+    }
+
+    /// Issue #129: a refresh is due only at bee's settle trigger — expected
+    /// debt (reservations included) at the early-payment threshold, and at
+    /// least one second of refresh applied — and is sized from the applied
+    /// debt.
+    #[test]
+    fn refresh_due_follows_bees_settle_trigger() {
+        let acc = Accounting::new();
+        let p = PeerId::random();
+        assert!(acc.refresh_due().is_empty(), "unknown peer");
+        acc.try_reserve(p, 600_000).unwrap().apply();
+        assert!(acc.refresh_due().is_empty(), "600 k < early payment");
+        // A reservation in flight lifts the expected debt past 675 k; the
+        // applied 600 k is at least one second of refresh.
+        let g = acc.try_reserve(p, 100_000).unwrap();
+        assert_eq!(acc.refresh_due().get(&p), Some(&600_000));
+        drop(g);
+        assert!(acc.refresh_due().is_empty());
+        // Expected debt past the threshold but less than a second of it
+        // applied: not worth a refresh yet.
+        acc.credit(p, 300_000);
+        let g = acc.try_reserve(p, 400_000).unwrap();
+        assert!(acc.refresh_due().is_empty(), "300 k applied < 450 k");
+        g.apply();
+        assert_eq!(acc.refresh_due().get(&p), Some(&700_000));
+        acc.credit(p, 700_000);
+        assert!(acc.refresh_due().is_empty(), "paid off");
     }
 
     #[test]

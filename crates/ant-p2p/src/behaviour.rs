@@ -1799,10 +1799,14 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     }
 
     // Pseudosettle driver: keeps our per-peer debt below bee's
-    // light-mode `disconnectLimit` by periodically opening
+    // light-mode `disconnectLimit` by opening
     // `/swarm/pseudosettle/1.0.0/pseudosettle` and asking bee to clear
-    // the time-based allowance worth. The fetcher feeds this driver
-    // via `payment_notify` (see [`RoutingFetcher::with_payment_notify`]).
+    // the time-based allowance worth. Refreshes are scheduled off the
+    // accounting mirror below (`Accounting::refresh_due`, bee's settle
+    // trigger): a peer is refreshed only once its mirrored debt is due.
+    // The fetcher's `payment_notify` (see
+    // [`RoutingFetcher::with_payment_notify`]) and the hot hints only
+    // register peers with the driver; neither schedules a refresh.
     // The driver also subscribes to `peers_watch` so it skips
     // refreshes for peers we no longer have a direct connection to —
     // critical for gateway loads where the routing set churns through
@@ -1811,10 +1815,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // The shared `Accounting` mirror is the same one we hand to every
     // `RoutingFetcher` we build below; it gives the fetcher's hot path
     // admission control (refuse to dispatch to peers near
-    // `lightDisconnectLimit`) and the driver a way to credit peers
-    // back as bee accepts our refresh attempts. The driver also
-    // listens for `HotHint`s on a separate channel so a debt crossing
-    // can leapfrog the periodic walk.
+    // `lightDisconnectLimit`) and the driver both its refresh trigger
+    // and a way to credit peers back as bee accepts our refresh
+    // attempts.
     let (payment_notify_for_state, payment_notify_rx) =
         mpsc::channel::<PeerId>(crate::pseudosettle::NOTIFY_CHANNEL_CAP);
     let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
@@ -6324,6 +6327,7 @@ async fn probe_leaf_sources(
     probes: usize,
     probe_timeout: std::time::Duration,
     net: &VerifyNet,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> LeafProbe {
     use ant_retrieval::accounting::Accounting;
 
@@ -6343,6 +6347,7 @@ async fn probe_leaf_sources(
         let mut control = control.clone();
         let accounting = net.accounting.clone();
         let payment_notify = net.payment_notify.clone();
+        let cancel = cancel.clone();
         async move {
             let guard = match accounting.as_ref() {
                 Some(acc) => {
@@ -6356,22 +6361,24 @@ async fn probe_leaf_sources(
                 }
                 None => None,
             };
-            let hit = matches!(
-                tokio::time::timeout(
-                    probe_timeout,
-                    ant_retrieval::retrieve_chunk(&mut control, peer, addr),
-                )
-                .await,
-                Ok(Ok(_))
-            );
-            if hit {
+            let fetch = async move {
+                ant_retrieval::retrieve_chunk(&mut control, peer, addr)
+                    .await
+                    .is_ok()
+            };
+            // On a delivery, in time or late, bee has applied the debit:
+            // record it in the mirror, which is what schedules the
+            // pseudosettle refresh that clears it.
+            let on_delivered = move || {
                 if let Some(g) = guard {
                     g.apply();
                 }
                 if let Some(tx) = payment_notify.as_ref() {
                     let _ = tx.try_send(peer);
                 }
-            }
+            };
+            let hit =
+                probe_draining_late_delivery(fetch, probe_timeout, cancel, on_delivered).await;
             // We reached the peer (reservation succeeded), so this is a
             // definitive answer regardless of hit/miss.
             (hit, true)
@@ -6383,6 +6390,87 @@ async fn probe_leaf_sources(
         answered: results.iter().filter(|(_, answered)| *answered).count() as u32,
     }
 }
+
+/// Run one billable probe fetch with a `timeout` on the *answer* but not
+/// on the request: if `fetch` hasn't resolved by then the probe counts as
+/// a miss, but the request is not dropped, and `on_delivered` still runs
+/// if bee delivers late. Dropping the request at the timeout would lose a
+/// debit bee may already have applied (`creditAction.Apply` runs when it
+/// writes the delivery), and since pseudosettle refreshes are scheduled
+/// only off the accounting mirror (`Accounting::refresh_due`), debt the
+/// mirror never sees is cleared only incidentally.
+///
+/// The late request is waited for *in place*, bounded by
+/// `retrieve_chunk`'s own `RETRIEVE_TIMEOUT` (30 s), so it keeps holding
+/// its caller's slot: a verify's per-leaf `CONCURRENCY` stays the real
+/// bound on its open retrieval streams and on the reservations those
+/// hold, and a timed-out probe can't pile up behind later leaves (where
+/// its held reservation would make `try_reserve` refuse the same peer and
+/// turn their probes into "unknown"). The cost is wall-clock: a leaf with
+/// a slow closest peer finishes when that request does — up to 30 s
+/// instead of `timeout` — though its verdict is still fixed at `timeout`.
+///
+/// Once `cancel` is set (the user cancelled the verify), the caller is
+/// released at once and the request is handed to a detached task instead
+/// (the fetcher's loser drain, `spawn_drain_losers`, for the probe path).
+/// That is the one case where a request outlives the verify: it still
+/// has to be read to the end to record its debit, and it ends within
+/// `RETRIEVE_TIMEOUT` of having been sent. `cancel` is polled every
+/// [`PROBE_CANCEL_POLL`].
+///
+/// Returns whether `fetch` delivered within `timeout`. `on_delivered`
+/// runs at most once, on an in-time or late delivery, never on a failure.
+async fn probe_draining_late_delivery<F, D>(
+    fetch: F,
+    timeout: std::time::Duration,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    on_delivered: D,
+) -> bool
+where
+    F: std::future::Future<Output = bool> + Send + 'static,
+    D: FnOnce() + Send + 'static,
+{
+    let mut fetch = Box::pin(fetch);
+    match tokio::time::timeout(timeout, &mut fetch).await {
+        Ok(true) => {
+            on_delivered();
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            let cancelled = async {
+                loop {
+                    if cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(PROBE_CANCEL_POLL).await;
+                }
+            };
+            tokio::select! {
+                delivered = &mut fetch => {
+                    if delivered {
+                        on_delivered();
+                    }
+                }
+                () = cancelled => {
+                    tokio::spawn(async move {
+                        if fetch.await {
+                            on_delivered();
+                        }
+                    });
+                }
+            }
+            false
+        }
+    }
+}
+
+/// How often a probe waiting out a late request checks the verify's
+/// cancel flag ([`probe_draining_late_delivery`]).
+const PROBE_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Read back a specific set of chunk addresses network-only and return
 /// the subset that could not be retrieved. Uses the cache-free
@@ -6397,6 +6485,12 @@ async fn verify_chunks_present(
     use futures::stream::StreamExt;
 
     const CONCURRENCY: usize = 16;
+    // A chunk that hits this cap is reported unreachable, but the
+    // fetcher's in-flight requests are not dropped with it: they finish
+    // in the fetcher's loser drain (within `RETRIEVE_TIMEOUT`) so a late
+    // delivery's debit still reaches the accounting mirror. They keep
+    // their process-wide retrieval permits (`VerifyNet::inflight`) until
+    // then, which is what bounds them once outside `CONCURRENCY`.
     const PER_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
     futures::stream::iter(addresses.iter().copied().map(|addr| async move {
@@ -6502,8 +6596,16 @@ async fn verify_chunks_present_deep(
                     // clean (discarded by the caller on cancel anyway).
                     return (addr, true);
                 }
-                let probe =
-                    probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT, net).await;
+                let probe = probe_leaf_sources(
+                    control,
+                    peers,
+                    addr,
+                    probes,
+                    PROBE_TIMEOUT,
+                    net,
+                    cancel.clone(),
+                )
+                .await;
                 if let Some(tx) = &progress {
                     let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
                     let _ = tx.send(
@@ -6860,6 +6962,7 @@ async fn verify_propagation_deep(
                     probes,
                     probe_timeout,
                     net_ref,
+                    cancel_ref.clone(),
                 )
                 .await;
                 if let Some(tx) = progress_ref {
@@ -9045,6 +9148,128 @@ mod tests {
             rejections: 1,
             sample: "batchstore get: not found".into(),
         }
+    }
+
+    /// PR #134 R1-M2: a probe that times out must not lose the debit of a
+    /// delivery bee makes after the timeout — the mirror is what schedules
+    /// the pseudosettle refresh, so unmirrored debt would go uncleared.
+    /// R2-M2: the late request is waited for in place, so it keeps the
+    /// caller's concurrency slot (and its reservation) instead of running
+    /// on outside the verify's bound.
+    #[tokio::test(start_paused = true)]
+    async fn probe_records_late_delivery_debit_in_mirror() {
+        use ant_retrieval::accounting::Accounting;
+        use std::time::Duration;
+        let acc = Arc::new(Accounting::new());
+        let peer = pid();
+        let guard = acc.try_reserve(peer, 1_000).expect("reserve");
+        let fetch = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            true
+        };
+        let started = tokio::time::Instant::now();
+        let probe = tokio::spawn(probe_draining_late_delivery(
+            fetch,
+            Duration::from_secs(10),
+            None,
+            move || guard.apply(),
+        ));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(
+            !probe.is_finished(),
+            "a timed-out probe holds its slot until the request ends",
+        );
+        // Still in flight: reserved, not yet applied.
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, 1_000)));
+        let hit = probe.await.unwrap();
+        assert!(!hit, "a late delivery is still a probe miss");
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert_eq!(
+            acc.debug_snapshot(&peer),
+            Some((1_000, 0)),
+            "late delivery's debit must land in the mirror",
+        );
+    }
+
+    /// PR #134 R2-M2: cancelling the verify releases a probe that is
+    /// waiting out a late request at once; the request is detached so its
+    /// debit still lands in the mirror.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_probe_detaches_its_late_request() {
+        use ant_retrieval::accounting::Accounting;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let acc = Arc::new(Accounting::new());
+        let peer = pid();
+        let guard = acc.try_reserve(peer, 1_000).expect("reserve");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let fetch = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            true
+        };
+        let started = tokio::time::Instant::now();
+        let probe = tokio::spawn(probe_draining_late_delivery(
+            fetch,
+            Duration::from_secs(10),
+            Some(cancel.clone()),
+            move || guard.apply(),
+        ));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(!probe.is_finished());
+        cancel.store(true, Ordering::Relaxed);
+        let hit = probe.await.unwrap();
+        assert!(!hit);
+        assert!(
+            started.elapsed() <= Duration::from_secs(12) + PROBE_CANCEL_POLL,
+            "cancel must release the probe within one poll, took {:?}",
+            started.elapsed(),
+        );
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, 1_000)));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            acc.debug_snapshot(&peer),
+            Some((1_000, 0)),
+            "the detached request's debit must still land in the mirror",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_releases_reservation_when_late_fetch_fails() {
+        use ant_retrieval::accounting::Accounting;
+        use std::time::Duration;
+        let acc = Arc::new(Accounting::new());
+        let peer = pid();
+        let guard = acc.try_reserve(peer, 1_000).expect("reserve");
+        let fetch = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            false
+        };
+        let hit = probe_draining_late_delivery(fetch, Duration::from_secs(10), None, move || {
+            guard.apply();
+        })
+        .await;
+        assert!(!hit);
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, 0)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_applies_in_time_delivery_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let hit = probe_draining_late_delivery(
+            async { true },
+            Duration::from_secs(10),
+            None,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(hit);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Issue #52 regression: a peer-rejected batch must carry a probe
