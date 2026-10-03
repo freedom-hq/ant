@@ -7784,9 +7784,21 @@ fn handle_swarm_event(
             state.dial_backoff.remove(&peer_id);
             // Only dialer connections need our outbound BZZ handshake — bee
             // initiates the handshake over the listener direction itself.
+            // An inbound connection leaves `dial_started` alone: a tracked
+            // dial of ours still in flight resolves with its own
+            // `ConnectionEstablished { Dialer }` or `OutgoingConnectionError`,
+            // and that event clears it.
             let ConnectedPoint::Dialer { address, .. } = endpoint else {
                 return;
             };
+            // Our dial resolved: drop its start markers before any early
+            // return, so a stale `dial_started_unproven` / start time can't
+            // later exempt an unrelated (untracked) dial failure to this peer.
+            let dial_ms = state
+                .dial_started
+                .remove(&peer_id)
+                .map(|t| t.elapsed().as_millis() as u64);
+            state.dial_started_unproven.remove(&peer_id);
             if state.bzz_peers.contains(&peer_id) || state.pending.contains_key(&peer_id) {
                 // Duplicate connection (race with a hint or a bootnode retry);
                 // keep the existing pipeline entry and let the new connection
@@ -7794,11 +7806,6 @@ fn handle_swarm_event(
                 return;
             }
             let (tx, rx) = oneshot::channel();
-            let dial_ms = state
-                .dial_started
-                .remove(&peer_id)
-                .map(|t| t.elapsed().as_millis() as u64);
-            state.dial_started_unproven.remove(&peer_id);
             state.pending.insert(
                 peer_id,
                 PendingPhase::AwaitingIdentify {
@@ -9184,6 +9191,84 @@ mod tests {
         assert!(ours.is_connected(&remote_id));
         assert!(state.bzz_peers.contains(&remote_id), "BZZ session kept");
         assert_eq!(status_rx.borrow().peers.connected, 1);
+    }
+
+    /// A tracked dial that resolves as a *duplicate* connection (the peer
+    /// is already in the pipeline) still clears its dial-start markers.
+    /// A stale `dial_started_unproven` would otherwise exempt a later,
+    /// unrelated dial failure to that peer on a proven link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_dialer_connection_clears_dial_start_markers() {
+        let cfg = FAST_LIVENESS;
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        remote
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let remote_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.select_next_some().await {
+                break address;
+            }
+        };
+        let remote_id = *remote.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                remote.select_next_some().await;
+            }
+        });
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut state = test_state();
+        let mut control = ours.behaviour().stream.new_control();
+        let hs = HandshakeParams {
+            local_peer_id: *ours.local_peer_id(),
+            signing_secret: [7u8; SECP256K1_SECRET_LEN],
+            overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+            network_id: 1,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let mut peerstore = PeerStore::disabled();
+        for round in 0..2 {
+            // No bzz peers yet: our connectivity counts as down, so the
+            // dial is marked unproven.
+            state.dialing.insert(remote_id);
+            state.note_dial_started(remote_id);
+            assert!(state.dial_started_unproven.contains(&remote_id));
+            ours.dial(
+                DialOpts::peer_id(remote_id)
+                    .addresses(vec![remote_addr.clone()])
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                    .build(),
+            )
+            .unwrap();
+            loop {
+                let ev = tokio::time::timeout(Duration::from_secs(10), ours.select_next_some())
+                    .await
+                    .expect("connection");
+                let established = matches!(ev, SwarmEvent::ConnectionEstablished { .. });
+                handle_swarm_event(
+                    &mut ours,
+                    &mut state,
+                    None,
+                    &mut control,
+                    &hs,
+                    &result_tx,
+                    &mut peerstore,
+                    ev,
+                );
+                if established {
+                    break;
+                }
+            }
+            // Round 0 enters the pipeline; round 1 is the duplicate early return.
+            assert!(state.pending.contains_key(&remote_id), "round {round}");
+            assert!(
+                !state.dial_started.contains_key(&remote_id),
+                "round {round}: dial_started left behind"
+            );
+            assert!(
+                !state.dial_started_unproven.contains(&remote_id),
+                "round {round}: dial_started_unproven left behind"
+            );
+        }
     }
 
     fn stamp_for(batch_id: [u8; 32]) -> [u8; ant_postage::STAMP_SIZE] {
