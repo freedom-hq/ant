@@ -51,6 +51,7 @@
 //! `website-index-document`, we treat that as the path. This matches what
 //! `bee/pkg/api/bzz.go` does when serving `bzz://<ref>/`.
 
+use crate::accounting::CreditWindow;
 use crate::feed::{feed_from_metadata, resolve_sequence_feed_full, FeedError, FeedType};
 use crate::joiner::{join_encrypted, ENCRYPTED_REF_SIZE};
 use crate::ChunkFetcher;
@@ -194,7 +195,17 @@ pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    let root_node = load_node_ref(fetcher, root_ref).await?;
+    resolve_feed_root_sniffing(fetcher, root_ref, None).await
+}
+
+/// [`resolve_feed_root`] whose root-node load hands `sniff_credit` to
+/// the header sniff (see [`lookup_path_with_sniff_credit`]).
+async fn resolve_feed_root_sniffing(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: &[u8],
+    sniff_credit: Option<&CreditWindow>,
+) -> Result<(Vec<u8>, bool), ManifestError> {
+    let root_node = load_node_ref_sniffing(fetcher, root_ref, sniff_credit).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
@@ -243,9 +254,45 @@ pub async fn lookup_path(
     root_ref: &[u8],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
+    lookup_path_sniffing(fetcher, root_ref, path, None).await
+}
+
+/// [`lookup_path`] whose raw-bytes sniff on `root_ref` may wait for
+/// peer credit, within `sniff_credit` (issue #122).
+///
+/// For a bare `/bzz/<ref>/` (#112), whose reference may name raw bytes:
+/// the root → leftmost-leaf fetches that tell a raw file from a manifest
+/// node (normally two for a few-MiB file, none for a single-chunk
+/// manifest) use [`ChunkFetcher::fetch_waiting_for_credit`], each with
+/// [`CreditWindow::budget`]. These are sequential, so together they wait
+/// no longer than what is left of the window, and a caller that shares
+/// one window across its retries and its other waiting fetches (the
+/// `/bzz` resolution loop) can't stack waits past it. Everything else
+/// stays non-waiting, as in [`lookup_path`]: the fallback join of the
+/// node when the sniff can't tell, feed probes, and every other node of
+/// the walk.
+pub async fn lookup_path_with_sniff_credit(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: &[u8],
+    path: &str,
+    sniff_credit: &CreditWindow,
+) -> Result<LookupResult, ManifestError> {
+    lookup_path_sniffing(fetcher, root_ref, path, Some(sniff_credit)).await
+}
+
+async fn lookup_path_sniffing(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: &[u8],
+    path: &str,
+    sniff_credit: Option<&CreditWindow>,
+) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
-    let (effective_root, is_feed) = resolve_feed_root(fetcher, root_ref).await?;
+    // Only the user's own reference is sniffed with credit: that is where
+    // a raw `/bytes` reference shows up. (`load_node_ref` below reloads
+    // the same node for a non-feed manifest from the request's cache.)
+    let (effective_root, is_feed) =
+        resolve_feed_root_sniffing(fetcher, root_ref, sniff_credit).await?;
     let root_node = load_node_ref(fetcher, &effective_root).await?;
     debug!(
         target: "ant_retrieval::mantaray",
@@ -719,6 +766,16 @@ pub(crate) async fn load_node_ref(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
 ) -> Result<Node, ManifestError> {
+    load_node_ref_sniffing(fetcher, node_ref, None).await
+}
+
+/// [`load_node_ref`] whose header sniff waits for peer credit within
+/// `sniff_credit`, if given (issue #122). The fallback join never waits.
+async fn load_node_ref_sniffing(
+    fetcher: &dyn ChunkFetcher,
+    node_ref: &[u8],
+    sniff_credit: Option<&CreditWindow>,
+) -> Result<Node, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
         let bytes = join_encrypted(fetcher, enc_ref, DEFAULT_MAX_FILE_BYTES).await?;
@@ -750,7 +807,7 @@ pub(crate) async fn load_node_ref(
     // its 64-byte header would make the answer depend on every chunk of
     // the file arriving inside the manifest lookup (#113).
     let sniffed = SniffedFetcher::new(fetcher);
-    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk).await {
+    if leftmost_leaf_is_not_a_manifest(&sniffed, &root_chunk, sniff_credit).await {
         debug!(
             target: "ant_retrieval::mantaray",
             root = %hex::encode(addr),
@@ -782,11 +839,13 @@ type FetchErr = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// It deliberately doesn't forward
 /// [`ChunkFetcher::fetch_waiting_for_credit`]: the trait default turns
-/// that into a plain `fetch`, so neither the sniff nor the fallback join
-/// of a manifest node ever waits for peer credit (issue #117). A node
-/// load is one step of a walk that runs inside the 30 s `/bzz`
-/// resolution budget; a starved node fails at once, as before #117, and
-/// the resolution loop retries the walk.
+/// that into a plain `fetch`, so the fallback join of a manifest node
+/// never waits for peer credit (issue #117). A node load is one step of
+/// a walk that runs inside the 30 s `/bzz` resolution budget; a starved
+/// node fails at once, as before #117, and the resolution loop retries
+/// the walk. The one waiting fetch is the sniff's own
+/// [`Self::sniff_fetch`], and only when its caller hands it a credit
+/// window (a bare `/bzz/<ref>/` root, issue #122).
 struct SniffedFetcher<'a> {
     inner: &'a dyn ChunkFetcher,
     state: std::sync::Mutex<SniffState>,
@@ -810,11 +869,25 @@ impl<'a> SniffedFetcher<'a> {
     fn replay(&self) {
         self.state.lock().expect("sniff state lock").replaying = true;
     }
-}
 
-#[async_trait::async_trait]
-impl ChunkFetcher for SniffedFetcher<'_> {
-    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+    /// A sniff fetch, recorded like [`ChunkFetcher::fetch`]. With a
+    /// `credit` window it waits for peer credit for at most what is left
+    /// of the window ([`CreditWindow::budget`]); without one, or once the
+    /// window has passed, it is a plain `fetch`.
+    async fn sniff_fetch(
+        &self,
+        addr: [u8; 32],
+        credit: Option<&CreditWindow>,
+    ) -> Result<Vec<u8>, FetchErr> {
+        let budget = credit.map_or(std::time::Duration::ZERO, CreditWindow::budget);
+        self.fetch_recorded(addr, budget).await
+    }
+
+    async fn fetch_recorded(
+        &self,
+        addr: [u8; 32],
+        credit_budget: std::time::Duration,
+    ) -> Result<Vec<u8>, FetchErr> {
         let replaying = {
             let mut state = self.state.lock().expect("sniff state lock");
             if state.replaying {
@@ -828,7 +901,13 @@ impl ChunkFetcher for SniffedFetcher<'_> {
             }
             state.replaying
         };
-        let result = self.inner.fetch(addr).await;
+        let result = if credit_budget.is_zero() {
+            self.inner.fetch(addr).await
+        } else {
+            self.inner
+                .fetch_waiting_for_credit(addr, credit_budget)
+                .await
+        };
         if !replaying {
             let mut state = self.state.lock().expect("sniff state lock");
             match &result {
@@ -840,6 +919,13 @@ impl ChunkFetcher for SniffedFetcher<'_> {
             }
         }
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl ChunkFetcher for SniffedFetcher<'_> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, FetchErr> {
+        self.fetch_recorded(addr, std::time::Duration::ZERO).await
     }
 
     async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
@@ -878,7 +964,15 @@ const HEADER_SNIFF_MAX_DEPTH: usize = 8;
 /// header counts as positively not a manifest (#115), so `/bzz/<ref>/`
 /// on a tiny raw `/bytes` upload serves the bytes instead of failing the
 /// lookup with `TooShort`.
-async fn leftmost_leaf_is_not_a_manifest(fetcher: &dyn ChunkFetcher, root_chunk: &[u8]) -> bool {
+///
+/// With a `credit` window each level's fetch may wait for peer credit
+/// within what is left of it (issue #122, see
+/// [`lookup_path_with_sniff_credit`]); without one they are plain.
+async fn leftmost_leaf_is_not_a_manifest(
+    fetcher: &SniffedFetcher<'_>,
+    root_chunk: &[u8],
+    credit: Option<&CreditWindow>,
+) -> bool {
     let mut chunk = root_chunk.to_vec();
     for _ in 0..HEADER_SNIFF_MAX_DEPTH {
         let Some((span, payload)) = chunk.split_first_chunk::<8>() else {
@@ -898,7 +992,7 @@ async fn leftmost_leaf_is_not_a_manifest(fetcher: &dyn ChunkFetcher, root_chunk:
         let Some(child) = payload.first_chunk::<32>().copied() else {
             return false;
         };
-        match fetcher.fetch(child).await {
+        match fetcher.sniff_fetch(child, credit).await {
             Ok(wire) if cac_valid(&child, &wire) => chunk = wire,
             _ => return false,
         }
@@ -1300,7 +1394,7 @@ mod tests {
     use super::*;
     use crate::ChunkFetcher;
     use async_trait::async_trait;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::error::Error;
 
     /// HashMap-backed fetcher mirroring `joiner::tests::MapFetcher`.
@@ -1989,6 +2083,153 @@ mod tests {
                 assert!(typed.is_none());
             }
         }
+    }
+
+    /// Fetcher over a starved peer pool that credit can refill: a plain
+    /// `fetch` of anything but `plain_ok` fails at once as a starved
+    /// `FetchExhausted` (every candidate overdraft-skipped), while
+    /// `fetch_waiting_for_credit` with a budget gets the chunk (credit
+    /// came free during the wait). Records every waiting fetch.
+    struct CreditGatedFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        plain_ok: HashSet<[u8; 32]>,
+        waits: std::sync::Mutex<Vec<([u8; 32], std::time::Duration)>>,
+    }
+
+    impl CreditGatedFetcher {
+        fn new(chunks: HashMap<[u8; 32], Vec<u8>>, plain_ok: &[[u8; 32]]) -> Self {
+            Self {
+                chunks,
+                plain_ok: plain_ok.iter().copied().collect(),
+                waits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn waits(&self) -> Vec<([u8; 32], std::time::Duration)> {
+            self.waits.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for CreditGatedFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            match self.chunks.get(&addr) {
+                Some(wire) if self.plain_ok.contains(&addr) => Ok(wire.clone()),
+                _ => Err(Box::new(crate::fetcher::FetchExhausted {
+                    message: "no BZZ peers available".into(),
+                    pool_starved: true,
+                })),
+            }
+        }
+
+        async fn fetch_waiting_for_credit(
+            &self,
+            addr: [u8; 32],
+            credit_budget: std::time::Duration,
+        ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.waits.lock().unwrap().push((addr, credit_budget));
+            if credit_budget.is_zero() {
+                return self.fetch(addr).await;
+            }
+            self.chunks
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| "missing chunk".into())
+        }
+
+        fn waits_for_credit(&self) -> bool {
+            true
+        }
+    }
+
+    /// Issue #122: on a starved pool, a bare `/bzz/<raw-ref>/`'s sniff
+    /// waits for credit on its root → leftmost-leaf fetches (two for a
+    /// 1.6 MB segment), so the raw file is recognised (`NotAManifest`,
+    /// streamed like `/bytes`) instead of failing the sniff and falling
+    /// into the full join. Each fetch gets the window's budget. The plain
+    /// `lookup_path` (requests with a path, every other caller) still
+    /// never waits.
+    // Paused clock: the plain lookup's fallback join retries its starved
+    // children with ~2 min of back-off.
+    #[tokio::test(start_paused = true)]
+    async fn starved_bare_root_sniff_waits_for_credit_and_spots_raw_bytes() {
+        let window = std::time::Duration::from_secs(30);
+        let data = raw_file(1_601_572);
+        for level in [0u8, 1] {
+            let split = crate::split_bytes_with_redundancy(&data, level);
+            let all = chunk_map(&split.chunks);
+            let path = leftmost_path(&all, split.root);
+            assert_eq!(path.len(), 3, "level {level}: root → intermediate → leaf");
+
+            // The root is already in the request cache (`run_stream_bzz`
+            // fetched it, waiting); everything else needs credit.
+            let fetcher = CreditGatedFetcher::new(all.clone(), &[split.root]);
+            let err = lookup_path_with_sniff_credit(
+                &fetcher,
+                &split.root,
+                "",
+                &CreditWindow::new(window),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, ManifestError::NotAManifest),
+                "level {level}: expected NotAManifest, got {err:?}",
+            );
+            let budget = crate::accounting::CREDIT_WAIT_BUDGET;
+            assert_eq!(
+                fetcher.waits(),
+                vec![(path[1], budget), (path[2], budget)],
+                "level {level}: one waiting fetch per tree level below the root",
+            );
+
+            let fetcher = CreditGatedFetcher::new(all, &[split.root]);
+            let err = lookup_path(&fetcher, &split.root, "").await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Fetch(_)),
+                "level {level}: a non-waiting sniff can't tell on a starved pool, \
+                 so the fallback join runs and fails: {err:?}",
+            );
+            assert!(
+                fetcher.waits().is_empty(),
+                "level {level}: lookup_path waited"
+            );
+        }
+    }
+
+    /// Issue #122: only the sniff waits. When the leftmost leaf carries a
+    /// manifest header (or the sniff can't tell), the fallback join of
+    /// the node stays non-waiting, as #117 decided: none of its fetches
+    /// reach `fetch_waiting_for_credit`, so it adds no credit wait on
+    /// top of the sniff's, however many chunks it fetches or retries.
+    // Paused clock: the join retries its starved chunks with back-off.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_join_after_a_waiting_sniff_never_waits() {
+        let root_wire = hex::decode(ROOT_HEX).unwrap();
+        let mut node = root_wire[8..].to_vec();
+        node.resize(64 * 1024, 0);
+        let split = crate::split_bytes(&node);
+        let all = chunk_map(&split.chunks);
+        let path = leftmost_path(&all, split.root);
+        assert_eq!(path.len(), 2, "root → leaf");
+        let fetcher = CreditGatedFetcher::new(all, &[split.root]);
+        let err = lookup_path_with_sniff_credit(
+            &fetcher,
+            &split.root,
+            "",
+            &CreditWindow::new(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Fetch(JoinError::FetchChunk { .. })),
+            "expected the non-waiting full join to run and fail, got {err:?}",
+        );
+        assert_eq!(
+            fetcher.waits(),
+            vec![(path[1], crate::accounting::CREDIT_WAIT_BUDGET)],
+            "the sniff's leaf fetch waits; the fallback join's fetches don't",
+        );
     }
 
     /// Fetcher that records every requested address.

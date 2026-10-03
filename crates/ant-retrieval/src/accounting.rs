@@ -199,14 +199,24 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// - **The data-root fetch of `/bytes` and `/bzz`**, plus the buffered
 ///   requests' data roots. This is the direct fetch only: dispersed-replica
 ///   probes never wait. A `/bytes` or `/bzz` root waits at most this long
-///   and never past the 30 s resolution budget. A `/bzz` attempt waits
-///   for at most two roots (a bare root and the data root behind its
-///   index document; the manifest walk between them never waits), so a
-///   starved first attempt ends by ~20 s and a second attempt still
-///   fits inside the budget.
+///   and never past the 30 s resolution budget.
+/// - **A bare `/bzz/<ref>/`'s raw-bytes sniff** (issue #122): the root →
+///   leftmost-leaf fetches that tell a raw file from a manifest node
+///   (`mantaray::lookup_path_with_sniff_credit`; two for a few-MiB
+///   segment, none for a single-chunk manifest root). Without them a
+///   starved sniff can't tell and falls back to joining the whole file
+///   before the first byte. A request with a path never runs this.
 ///
-/// Nothing else waits. That covers manifest walks (sniff, node loads,
-/// and their fallback join), feed probes, replica probes, recovery
+///   Every waiting fetch of a `/bzz` request (bare root, sniff, data
+///   root), in every attempt, takes its budget from one window, the 30 s
+///   resolution budget, and they run one after another. So a `/bzz`
+///   request waits at most 30 s for credit in total before its body,
+///   however many attempts and roots it goes through; once the window
+///   has passed, these fetches no longer wait at all.
+///
+/// Nothing else waits. That covers manifest walks (node loads, every
+/// sniff but a bare `/bzz` root's, and every sniff's fallback join),
+/// feed probes, replica probes, recovery
 /// sweeps, the encrypted joiner (in-order and buffered, so one wait per
 /// chunk would add up within one body stall), pin / stewardship /
 /// verify, traversal, ACT, and the SOC / chunk API. A joiner run on one

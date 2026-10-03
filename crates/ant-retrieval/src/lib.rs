@@ -88,8 +88,9 @@ pub use manifest_writer::{
     RawManifestEntry, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
-    list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,
-    MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
+    list_manifest, lookup_path, lookup_path_with_sniff_credit, resolve_feed_root, LookupResult,
+    ManifestEntry, ManifestError, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY,
+    MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_load::PushLoadTracker;
@@ -145,8 +146,9 @@ pub trait ChunkFetcher: Send + Sync {
     /// Opt-in, because a wait inside a fan-out or a retry loop multiplies:
     /// only callers that need the chunk, fetch it once per attempt, and
     /// bound their retries by a window ([`crate::accounting::CreditWindow`])
-    /// use it. Those are the joiners' data-chunk fetches and the `/bytes`
-    /// / `/bzz` data-root fetch; see
+    /// use it. Those are the joiners' data-chunk fetches, the `/bytes`
+    /// / `/bzz` data-root fetch and a bare `/bzz` root's raw-bytes sniff;
+    /// see
     /// [`crate::accounting::CREDIT_WAIT_BUDGET`] for the full list and
     /// bounds. Default is plain `fetch`, right for every fetcher that has
     /// no credit to wait for (and for wrappers that must not wait, like

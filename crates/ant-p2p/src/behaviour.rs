@@ -5074,7 +5074,9 @@ async fn run_stream_bzz(
     let resolution_started = Instant::now();
     // The bare-root and data-root fetches wait for peer credit, but never
     // past the resolution budget, so the attempts' waits can't stack
-    // (issue #117). The manifest walk in between never waits.
+    // (issue #117). So do a bare root's raw-bytes sniff fetches (issue
+    // #122), from the same window. The rest of the manifest walk, and the
+    // sniff's fallback join, never wait.
     let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
@@ -5107,8 +5109,11 @@ async fn run_stream_bzz(
         // Bare `/bzz/<ref>/` may name raw bytes (#112), so its root gets
         // the same dispersed-replica fallback `/bytes` gives it before
         // the manifest walk; the walk then reads the root from the
-        // request cache. A path implies a manifest, so it keeps the
-        // plain walk.
+        // request cache. Its root → leftmost-leaf sniff waits for credit
+        // too (#122), so a raw ref is recognised and streamed like
+        // `/bytes` instead of falling into the sniff's full, non-waiting
+        // fallback join on a starved pool. A path implies a manifest, so
+        // it keeps the plain walk.
         let looked_up = match (bare_root, <[u8; 32]>::try_from(reference.as_slice())) {
             (true, Ok(root)) => match ant_retrieval::fetch_root_with_replicas(
                 &fetcher,
@@ -5117,7 +5122,15 @@ async fn run_stream_bzz(
             )
             .await
             {
-                Ok(_) => lookup_path(&fetcher, &reference, &path).await,
+                Ok(_) => {
+                    ant_retrieval::lookup_path_with_sniff_credit(
+                        &fetcher,
+                        &reference,
+                        &path,
+                        &credit_window,
+                    )
+                    .await
+                }
                 Err(source) => Err(ManifestError::Fetch(ant_retrieval::JoinError::FetchChunk {
                     addr: hex::encode(root),
                     source,
