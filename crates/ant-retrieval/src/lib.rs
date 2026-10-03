@@ -265,6 +265,30 @@ pub enum RetrievalError {
     BadPayloadSize(usize),
 }
 
+impl RetrievalError {
+    /// Did the peer answer that the chunk is missing? Bee has two such
+    /// answers, both a `Delivery.Err` string (so the only place left to
+    /// read them is here, where the peer's reply is decoded):
+    ///
+    /// - `storage: not found`: the peer looked in its reserve
+    ///   (`storage.ErrNotFound`);
+    /// - `no peer found`: a forwarder had no peer closer to the chunk
+    ///   to forward to (`topology.ErrNotFound`). Bee's own `/bytes` and
+    ///   `/bzz` answer 404 for this one too (issue #123).
+    ///
+    /// Transport failures (timeouts, dropped streams, …) are not.
+    #[must_use]
+    pub fn is_chunk_not_found(&self) -> bool {
+        match self {
+            Self::Remote(msg) => {
+                let msg = msg.to_ascii_lowercase();
+                msg.contains("not found") || msg.contains("no peer found")
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub(crate) struct PbHeaders {
     #[prost(message, repeated, tag = "1")]

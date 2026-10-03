@@ -296,7 +296,11 @@ async fn head_request(
                     drain_until_done(&mut ack_rx).await;
                     return Ok((total_bytes, content_type, filename));
                 }
-                Ok(Some(ControlAck::Error { message })) => {
+                Ok(Some(
+                    ControlAck::Error { message }
+                    | ControlAck::NotFound { message }
+                    | ControlAck::NotReady { message },
+                )) => {
                     if is_no_peers(&message) {
                         if !sleep_until_or_deadline(NO_PEERS_RETRY_INTERVAL, deadline).await {
                             return Err(StreamError::Stream(format!(
@@ -379,7 +383,11 @@ async fn range_request(
                         slot.cache_hits = p.cache_hits;
                     }
                 }
-                Ok(Some(ControlAck::Error { message })) => {
+                Ok(Some(
+                    ControlAck::Error { message }
+                    | ControlAck::NotFound { message }
+                    | ControlAck::NotReady { message },
+                )) => {
                     // A no-peers error before `BzzStreamStart` is the
                     // cold-start case — back off and retry the whole
                     // range request. Once the stream has started we
@@ -486,7 +494,11 @@ async fn range_pull(
                         slot.cache_hits = p.cache_hits;
                     }
                 }
-                Ok(Some(ControlAck::Error { message })) => {
+                Ok(Some(
+                    ControlAck::Error { message }
+                    | ControlAck::NotFound { message }
+                    | ControlAck::NotReady { message },
+                )) => {
                     if !got_start && is_no_peers(&message) {
                         if !sleep_until_or_deadline(NO_PEERS_RETRY_INTERVAL, deadline).await {
                             return Err(StreamError::Stream(format!(
@@ -522,7 +534,13 @@ async fn range_pull(
 
 async fn drain_until_done(rx: &mut mpsc::Receiver<ControlAck>) {
     while let Ok(Some(ack)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-        if matches!(ack, ControlAck::StreamDone | ControlAck::Error { .. }) {
+        if matches!(
+            ack,
+            ControlAck::StreamDone
+                | ControlAck::Error { .. }
+                | ControlAck::NotFound { .. }
+                | ControlAck::NotReady { .. }
+        ) {
             return;
         }
     }

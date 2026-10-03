@@ -4958,8 +4958,16 @@ async fn run_stream_bytes(
     // once, as `/bzz` does. The empty-set branch below covers a pool
     // that empties after dispatch (its only peer just dropped): `/bytes`
     // waits that out and only then reports `no peers available`. A
-    // miss peers confirmed (`not found` from an unstarved fetch) is
-    // final, so a missing reference still 404s as quickly as before.
+    // miss more than a couple of peers confirmed (`is_final_miss`) is
+    // final and 404s at once. A miss only one or two peers answered (a
+    // cold node with a thin peer table) is *not* final: it is retried
+    // with fresh peer snapshots and only answers the 404 when the loop
+    // gives up — after `MAX_FETCH_ATTEMPTS` attempts or the
+    // `RESOLUTION_RETRY_BUDGET`, whichever comes first (the linear
+    // backoff alone is ~22 s over ten attempts). So on such a node a
+    // missing reference takes up to ~30 s to 404, not the sub-second
+    // answer it got before R1-M2 on PR #124; that is intended, since
+    // one or two cold peers' miss is not the network's answer.
     //
     // The direct root fetch waits for peer credit, but never past the
     // resolution budget (`credit_window`), so the attempts' waits can't
@@ -4988,12 +4996,16 @@ async fn run_stream_bytes(
             .is_none_or(|e| is_bytes_root_transient(e.as_ref()))
             && attempt < MAX_FETCH_ATTEMPTS
             && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET;
-        let message = failure.map_or_else(
+        let message = failure.as_ref().map_or_else(
             || "no peers available; wait for handshakes to complete".to_string(),
             |e| format!("fetch root chunk {}: {e}", hex::encode(reference)),
         );
         if !retry {
-            let _ = ack.send(ControlAck::Error { message }).await;
+            let terminal = match failure {
+                Some(e) => pre_stream_failure_ack(message, e.as_ref()),
+                None => ControlAck::Error { message },
+            };
+            let _ = ack.send(terminal).await;
             return;
         }
         let backoff = RETRY_BACKOFF_BASE * attempt as u32;
@@ -5154,6 +5166,7 @@ async fn run_stream_bzz(
             }
             Err(e)
                 if is_bzz_lookup_transient(&e, bare_root)
+                    && !is_final_miss(&e)
                     && attempt < MAX_FETCH_ATTEMPTS
                     && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET =>
             {
@@ -5170,9 +5183,10 @@ async fn run_stream_bzz(
             }
             Err(e) => {
                 let _ = ack
-                    .send(ControlAck::Error {
-                        message: format!("manifest lookup '{path}': {e}"),
-                    })
+                    .send(pre_stream_failure_ack(
+                        format!("manifest lookup '{path}': {e}"),
+                        &e,
+                    ))
                     .await;
                 return;
             }
@@ -5233,7 +5247,8 @@ async fn run_stream_bzz(
         {
             Ok(r) => r,
             Err(e)
-                if attempt < MAX_FETCH_ATTEMPTS
+                if is_bytes_root_transient(e.as_ref())
+                    && attempt < MAX_FETCH_ATTEMPTS
                     && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET =>
             {
                 last_error = Some(format!("fetch data root {}: {e}", hex::encode(data_ref)));
@@ -5248,11 +5263,8 @@ async fn run_stream_bzz(
                 continue;
             }
             Err(e) => {
-                let _ = ack
-                    .send(ControlAck::Error {
-                        message: format!("fetch data root {}: {e}", hex::encode(data_ref)),
-                    })
-                    .await;
+                let message = format!("fetch data root {}: {e}", hex::encode(data_ref));
+                let _ = ack.send(pre_stream_failure_ack(message, e.as_ref())).await;
                 return;
             }
         };
@@ -5661,13 +5673,54 @@ const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 64;
 /// re-flood the same overloaded forwarders the moment they shed us.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
-/// Should a failed `/bytes` root fetch be retried (`run_stream_bytes`)?
-/// Yes unless peers confirmed the chunk missing: an empty or
-/// overdraft-starved pool (`no BZZ peers available`, a starved `not
-/// found` tail), timeouts and dropped streams can all clear up within
-/// the resolution budget, a real miss can't (issue #117).
+/// Should a failed `/bytes` root fetch (`run_stream_bytes`, and `/bzz`'s
+/// data root) be retried? Yes unless the miss is final
+/// ([`is_final_miss`]): an empty or overdraft-starved pool (`no BZZ
+/// peers available`, a starved `not found` tail), timeouts, dropped
+/// streams and a cold node's one or two `not found` answers can all
+/// clear up within the resolution budget, a real miss can't (issues
+/// #117, #123). Errors from other fetchers fall back to the message
+/// ([`ant_retrieval::rs::shard_confirmed_missing`]).
 fn is_bytes_root_transient(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    !ant_retrieval::rs::shard_confirmed_missing(e)
+    match ant_retrieval::fetcher::FetchExhausted::find(e) {
+        Some(x) => !x.corroborated_missing(),
+        None => !ant_retrieval::rs::shard_confirmed_missing(e),
+    }
+}
+
+/// Did the fetcher behind `e` (found through any wrapping, e.g. a
+/// manifest walk's `ManifestError::Fetch`) end with more than a couple
+/// of peers confirming the chunk missing
+/// ([`ant_retrieval::fetcher::FetchExhausted::corroborated_missing`])?
+/// Such a miss is final: no retry within the resolution budget will
+/// change the network's answer. A merely confirmed miss — every ranked
+/// peer asked, but only one or two of them, as on a node that has just
+/// started — is retried with fresh peer snapshots, and only reported
+/// (as a 404, [`pre_stream_failure_ack`]) once the budget runs out
+/// (R1-M2 on PR #124).
+fn is_final_miss(e: &(dyn std::error::Error + 'static)) -> bool {
+    ant_retrieval::fetcher::FetchExhausted::find(e)
+        .is_some_and(ant_retrieval::fetcher::FetchExhausted::corroborated_missing)
+}
+
+/// Terminal ack for a `/bytes` or `/bzz` retrieval that failed before
+/// its stream started, typed off the fetcher's error behind `e` rather
+/// than its message (issue #123):
+///
+/// - peers confirmed the chunk missing → [`ControlAck::NotFound`], which
+///   the gateway answers with bee's 404. That includes a fetch whose
+///   last answer was `no peer found`, which used to fall through to a
+///   502 that Freedom retries for ~50 s;
+/// - the last answer was a miss but the peer pool was starved →
+///   [`ControlAck::NotReady`] (503): one cold peer's "not found" is not
+///   the network's answer (#114), so it must not read as a 404 either;
+/// - anything else → [`ControlAck::Error`], as before.
+fn pre_stream_failure_ack(message: String, e: &(dyn std::error::Error + 'static)) -> ControlAck {
+    match ant_retrieval::fetcher::FetchExhausted::find(e) {
+        Some(x) if x.confirmed_missing() => ControlAck::NotFound { message },
+        Some(x) if x.last_not_found => ControlAck::NotReady { message },
+        _ => ControlAck::Error { message },
+    }
 }
 
 /// One pipeline attempt's outcome on failure. `Transient` failures
@@ -9009,8 +9062,9 @@ mod tests {
     }
 
     /// `/bytes` retries its root fetch through a cold or flaky pool but
-    /// not through a confirmed miss, so a missing reference still 404s
-    /// promptly (issue #117).
+    /// not through a corroborated miss, so a missing reference that more
+    /// than a couple of peers confirmed 404s promptly (issue #117); a
+    /// thin miss is retried until the resolution budget runs out.
     #[test]
     fn bytes_root_retries_all_but_a_confirmed_miss() {
         let err = |m: &str| -> Box<dyn std::error::Error + Send + Sync> { m.into() };
@@ -9032,6 +9086,102 @@ mod tests {
         ] {
             assert!(!is_bytes_root_transient(err(miss).as_ref()), "{miss}");
         }
+    }
+
+    /// Issue #123: a `/bytes` or `/bzz` root that peers confirmed missing
+    /// ends in a typed `NotFound` (the gateway's 404) for *both* of bee's
+    /// miss tails, `storage: not found` and `no peer found` — the latter
+    /// used to end in a plain `Error`, i.e. a 502. The fetcher's error is
+    /// found bare (`/bytes`, `/bzz` data root) and wrapped in the manifest
+    /// walk's `ManifestError::Fetch` (`/bzz` root), and the miss is final
+    /// there too. A miss from a starved pool is never a 404 (#114).
+    #[test]
+    fn pre_stream_failure_ack_types_each_miss_tail() {
+        use ant_retrieval::fetcher::FetchExhausted;
+        use ant_retrieval::{JoinError, ManifestError};
+        let message = |tail: &str| {
+            format!("all peers failed for chunk ab after 34 attempts (last: remote: retrieve chunk: {tail})")
+        };
+        // `answers`: how many peers said "not found" (34 = every one asked).
+        let bare_n =
+            |tail: &str, starved, not_found, answers| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(
+                    FetchExhausted::new(message(tail), starved, not_found)
+                        .with_not_found_answers(answers),
+                )
+            };
+        let bare = |tail: &str, starved, not_found: bool| {
+            bare_n(tail, starved, not_found, if not_found { 34 } else { 0 })
+        };
+        let wrapped_n = |tail: &str, starved, not_found, answers| {
+            ManifestError::Fetch(JoinError::FetchChunk {
+                addr: "ab".into(),
+                source: bare_n(tail, starved, not_found, answers),
+            })
+        };
+        let wrapped = |tail: &str, starved, not_found: bool| {
+            wrapped_n(tail, starved, not_found, if not_found { 34 } else { 0 })
+        };
+        let kind = |ack: &ControlAck| match ack {
+            ControlAck::NotFound { .. } => "NotFound",
+            ControlAck::NotReady { .. } => "NotReady",
+            ControlAck::Error { .. } => "Error",
+            other => panic!("unexpected {other:?}"),
+        };
+        for tail in ["no peer found", "storage: not found"] {
+            let ack = pre_stream_failure_ack("m".into(), bare(tail, false, true).as_ref());
+            assert_eq!(kind(&ack), "NotFound", "bare {tail}");
+            let e = wrapped(tail, false, true);
+            assert_eq!(
+                kind(&pre_stream_failure_ack("m".into(), &e)),
+                "NotFound",
+                "{tail}"
+            );
+            // Final: neither `/bytes` nor the `/bzz` lookup retries it.
+            assert!(
+                !is_bytes_root_transient(bare(tail, false, true).as_ref()),
+                "{tail}"
+            );
+            assert!(is_final_miss(&e), "{tail}");
+
+            // R1-M2 on PR #124: a cold node's only peer answering the
+            // miss (every ranked peer asked, so not starved) is still the
+            // 404 to give once retries run out, but neither `/bytes` nor
+            // the `/bzz` lookup stops retrying on it at once.
+            let ack = pre_stream_failure_ack("m".into(), bare_n(tail, false, true, 1).as_ref());
+            assert_eq!(kind(&ack), "NotFound", "thin {tail}");
+            assert!(
+                is_bytes_root_transient(bare_n(tail, false, true, 1).as_ref()),
+                "thin {tail}"
+            );
+            let e = wrapped_n(tail, false, true, 2);
+            assert_eq!(kind(&pre_stream_failure_ack("m".into(), &e)), "NotFound");
+            assert!(!is_final_miss(&e), "thin {tail}");
+
+            // Starved: one cold peer's answer, retried and never a 404.
+            let ack = pre_stream_failure_ack("m".into(), bare(tail, true, true).as_ref());
+            assert_eq!(kind(&ack), "NotReady", "starved {tail}");
+            let e = wrapped(tail, true, true);
+            assert_eq!(kind(&pre_stream_failure_ack("m".into(), &e)), "NotReady");
+            assert!(
+                is_bytes_root_transient(bare(tail, true, true).as_ref()),
+                "{tail}"
+            );
+            assert!(!is_final_miss(&e), "{tail}");
+        }
+        // Not a miss: unchanged, a plain error (502) that is retried.
+        let e = bare("timeout", false, false);
+        assert_eq!(
+            kind(&pre_stream_failure_ack("m".into(), e.as_ref())),
+            "Error"
+        );
+        assert!(is_bytes_root_transient(e.as_ref()));
+        let e: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
+        assert_eq!(
+            kind(&pre_stream_failure_ack("m".into(), e.as_ref())),
+            "Error"
+        );
+        assert!(!is_final_miss(&ManifestError::NotAManifest));
     }
 
     /// Pin the contract that `is_manifest_transient` treats a feed

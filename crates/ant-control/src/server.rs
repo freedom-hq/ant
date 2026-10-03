@@ -590,12 +590,13 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::FeedResolved { .. } | ControlAck::FeedNotFound => Response::Error {
             message: "feed resolution is only supported by ant-gateway".to_string(),
         },
-        // `NotReady` exists for the gateway HTTP path so it can return
-        // `503 Service Unavailable`; collapsing to a generic error here
-        // keeps the Unix-socket surface unchanged.
-        ControlAck::NotReady { message } | ControlAck::Error { message } => {
-            Response::Error { message }
-        }
+        // `NotReady` and `NotFound` exist for the gateway HTTP path so it
+        // can return `503 Service Unavailable` / `404 Not Found`;
+        // collapsing to a generic error here keeps the Unix-socket
+        // surface unchanged.
+        ControlAck::NotReady { message }
+        | ControlAck::NotFound { message }
+        | ControlAck::Error { message } => Response::Error { message },
     }
 }
 
