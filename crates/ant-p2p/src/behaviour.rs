@@ -4959,9 +4959,15 @@ async fn run_stream_bytes(
     // that empties after dispatch (its only peer just dropped): `/bytes`
     // waits that out and only then reports `no peers available`. A
     // miss more than a couple of peers confirmed (`is_final_miss`) is
-    // final, so a missing reference still 404s as quickly as before; a
-    // cold node's one or two `not found` answers are retried and only
-    // answer the 404 once the budget runs out.
+    // final and 404s at once. A miss only one or two peers answered (a
+    // cold node with a thin peer table) is *not* final: it is retried
+    // with fresh peer snapshots and only answers the 404 when the loop
+    // gives up — after `MAX_FETCH_ATTEMPTS` attempts or the
+    // `RESOLUTION_RETRY_BUDGET`, whichever comes first (the linear
+    // backoff alone is ~22 s over ten attempts). So on such a node a
+    // missing reference takes up to ~30 s to 404, not the sub-second
+    // answer it got before R1-M2 on PR #124; that is intended, since
+    // one or two cold peers' miss is not the network's answer.
     //
     // The direct root fetch waits for peer credit, but never past the
     // resolution budget (`credit_window`), so the attempts' waits can't
@@ -9056,8 +9062,9 @@ mod tests {
     }
 
     /// `/bytes` retries its root fetch through a cold or flaky pool but
-    /// not through a confirmed miss, so a missing reference still 404s
-    /// promptly (issue #117).
+    /// not through a corroborated miss, so a missing reference that more
+    /// than a couple of peers confirmed 404s promptly (issue #117); a
+    /// thin miss is retried until the resolution budget runs out.
     #[test]
     fn bytes_root_retries_all_but_a_confirmed_miss() {
         let err = |m: &str| -> Box<dyn std::error::Error + Send + Sync> { m.into() };
