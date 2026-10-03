@@ -1282,9 +1282,15 @@ async fn attempt_download(
 // Live node status
 // ---------------------------------------------------------------------------
 
-/// Current number of BZZ peers we've completed the handshake with.
-/// The node loop updates this on every status tick; the FFI reads the
-/// latest snapshot from the shared watch channel without blocking.
+/// Number of connected peers whose connection answers pings (libp2p
+/// connections, including peers still in the BZZ handshake). A connection
+/// that stops answering (a socket reaped during an OS suspension, an
+/// expired NAT mapping) stops being counted within ~20 s of its last pong
+/// and is closed ~10 s later; after the process was frozen, a connection
+/// that doesn't answer within ~12 s of the node running again is
+/// uncounted (issue #83). The node loop updates this on every status
+/// tick; the FFI reads the latest snapshot from the shared watch channel
+/// without blocking.
 ///
 /// Returns `-1` on a null / poisoned handle (never happens in practice
 /// unless the Swift side calls this after `ant_shutdown`).
@@ -1309,13 +1315,15 @@ pub unsafe extern "C" fn ant_peer_count(handle: *const AntHandle) -> i32 {
 /// peers, **without** a full [`ant_shutdown`] / [`ant_init`]. Cheap and
 /// idempotent — safe to call on every foreground transition.
 ///
-/// After a long suspension the in-process node's libp2p connections are
-/// half-open (the kernel sockets were reaped but no FIN arrived, so the
-/// peer counter still looks healthy) and nothing re-dials, so the next
-/// `bzz://` retrieval hangs and the page renders blank. This re-opens live
-/// sockets to the bootnodes in parallel so retrieval has working routes
-/// again; the dead connections fall away as they're touched. It does not
-/// forcibly disconnect surviving peers — a healthy short-background resume
+/// After a long suspension the in-process node's libp2p connections can be
+/// half-open (the kernel sockets were reaped but no FIN arrived). The node
+/// notices that on its own (issue #83): connections that stop answering
+/// pings are closed ~20-30 s after it runs again, and a streak of
+/// retrievals failing on the link makes it do what this call does (at
+/// most once a minute). This call skips that wait: it re-opens live
+/// sockets to the bootnodes in parallel at once, so retrieval has working
+/// routes on foreground instead of after a failed retrieval. It does not
+/// itself disconnect surviving peers — a healthy short-background resume
 /// stays close to a no-op rather than paying a full re-handshake.
 ///
 /// This recovers the *swarm* only. If the in-process gateway's localhost

@@ -153,9 +153,10 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeDownload<'
 
 /// `at.vibing.ant.downloadsmoke.AntNode.nativePeerCount(handle: Long): Int`
 ///
-/// Mirror of [`crate::ant_peer_count`]. Reads the latest BZZ peer
-/// count from the shared `watch::Receiver` snapshot — non-blocking,
-/// safe to poll at any cadence. Returns `-1` on a null handle.
+/// Mirror of [`crate::ant_peer_count`]. Reads the latest count of
+/// connected peers that answer pings (issue #83) from the shared
+/// `watch::Receiver` snapshot — non-blocking, safe to poll at any
+/// cadence. Returns `-1` on a null handle.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativePeerCount<'caller>(
     mut unowned_env: EnvUnowned<'caller>,

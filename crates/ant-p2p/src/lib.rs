@@ -1,9 +1,11 @@
 //! libp2p host (TCP + DNS, Noise, Yamux, Identify, Ping) and Swarm `/swarm/handshake/14.0.0/handshake`.
 
 mod behaviour;
+mod bounded_close;
 mod dial;
 pub mod dnsaddr;
 mod handshake;
+mod liveness;
 pub mod lurker;
 pub mod lurker_registry;
 pub mod messaging;

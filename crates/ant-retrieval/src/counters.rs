@@ -20,7 +20,7 @@
 //! peak-tracking it wants without burning daemon CPU on a sliding
 //! window we'd then have to wire through the wire format.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Where a chunk delivery came from — fed into
 /// [`RetrievalCounters::record_chunk`] so the snapshot can split the
@@ -65,6 +65,11 @@ pub struct RetrievalCounters {
     /// that lands here lifts to memory and the *next* request for
     /// the same chunk will increment `mem_hits`.
     disk_hits: AtomicU64,
+    /// Retrieval attempts that failed on the link (timeout, stream
+    /// couldn't be opened) since the last chunk the network delivered.
+    /// The swarm loop reads it to notice a wedged peer set (issue #83);
+    /// see [`Self::record_link_failure`].
+    link_failure_streak: AtomicU32,
 }
 
 /// Plain-old-data snapshot of [`RetrievalCounters`]. Cheaper to
@@ -115,8 +120,29 @@ impl RetrievalCounters {
             ChunkSource::Disk => {
                 self.disk_hits.fetch_add(1, Ordering::Relaxed);
             }
-            ChunkSource::Network => {}
+            ChunkSource::Network => {
+                self.link_failure_streak.store(0, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Record one retrieval attempt that failed on the link to its peer
+    /// (`RetrievalError::Timeout` / `OpenStream`): the kind of failure a
+    /// dead socket produces, unlike a peer answering "not found". Any
+    /// chunk delivered from the network resets the streak.
+    pub fn record_link_failure(&self) {
+        self.link_failure_streak.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Link failures since the last chunk delivered from the network.
+    pub fn link_failure_streak(&self) -> u32 {
+        self.link_failure_streak.load(Ordering::Relaxed)
+    }
+
+    /// Start a new streak (the swarm loop calls this once it has acted on
+    /// one).
+    pub fn reset_link_failure_streak(&self) {
+        self.link_failure_streak.store(0, Ordering::Relaxed);
     }
 
     /// Read all counters in one shot. Called by the status publisher
@@ -148,5 +174,24 @@ mod tests {
         assert_eq!(s.mem_hits, 1);
         assert_eq!(s.disk_hits, 1);
         assert_eq!(s.cache_hits(), 2);
+    }
+
+    #[test]
+    fn link_failure_streak_resets_on_network_delivery_only() {
+        let c = RetrievalCounters::new();
+        c.record_link_failure();
+        c.record_link_failure();
+        c.record_chunk(4104, ChunkSource::Memory);
+        c.record_chunk(4104, ChunkSource::Disk);
+        assert_eq!(
+            c.link_failure_streak(),
+            2,
+            "cache hits say nothing about links"
+        );
+        c.record_chunk(4104, ChunkSource::Network);
+        assert_eq!(c.link_failure_streak(), 0);
+        c.record_link_failure();
+        c.reset_link_failure_streak();
+        assert_eq!(c.link_failure_streak(), 0);
     }
 }

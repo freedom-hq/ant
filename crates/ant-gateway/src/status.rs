@@ -56,6 +56,8 @@ pub async fn health(State(handle): State<GatewayHandle>) -> Response {
 /// (`{"status":"ready",…}` / `{"status":"unready",…}`, same shape as
 /// `/health`) — bee-js and our Swift `BeeReadiness` both index `status`,
 /// so a bodyless `200` reads as not-ready. We mirror `/health`'s body.
+/// Peers whose connection stopped answering pings (`stale`, issue #83)
+/// don't make the node ready.
 pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
     let snap = handle.status.borrow();
     let ready = snap.peers.connected > 0
@@ -63,7 +65,7 @@ pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
             .peers
             .connected_peers
             .iter()
-            .any(|p| p.bzz_overlay.is_some());
+            .any(|p| p.bzz_overlay.is_some() && !p.stale);
     let body = Json(HealthBody {
         status: if ready { "ready" } else { "unready" },
         version: handle.agent.as_str().to_string(),

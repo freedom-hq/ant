@@ -72,6 +72,27 @@ async fn readiness_503_when_no_peers() {
     assert_eq!(json["status"], "unready");
 }
 
+/// Issue #83: a handshaked peer whose connection stopped answering
+/// pings (`stale`) doesn't make the node ready — that was the probe gate
+/// hosts were lied to by while every retrieval hung.
+#[tokio::test]
+async fn readiness_503_when_the_only_peer_is_stale() {
+    let mut snap = snapshot_with_one_peer();
+    snap.peers.connected_peers[0].stale = true;
+    snap.peers.connected = 0;
+    let router = status_only_router(snap);
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/readiness")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[tokio::test]
 async fn node_returns_ultra_light_mode() {
     let router = status_only_router(snapshot_with_one_peer());

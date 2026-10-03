@@ -1805,6 +1805,11 @@ impl RoutingFetcher {
                             if blacklist {
                                 self.blacklist_peer(peer);
                             }
+                            if is_link_failure(&e) {
+                                if let Some(counters) = self.counters.as_ref() {
+                                    counters.record_link_failure();
+                                }
+                            }
                             if e.is_chunk_not_found() {
                                 not_found_answers += 1;
                             }
@@ -1955,6 +1960,19 @@ const fn is_peer_fatal(err: &RetrievalError) -> bool {
         | RetrievalError::InvalidChunk
         | RetrievalError::BadPayloadSize(_) => true,
     }
+}
+
+/// Whether `err` is what a dead link to the peer looks like: the request
+/// timed out or the stream couldn't be opened. `Remote` (bee answered),
+/// `Io` (bee closed the stream, its "not found") and framing errors all
+/// prove the connection works. The swarm loop self-heals after a streak
+/// of these with no chunk delivered in between (issue #83,
+/// `RetrievalCounters::record_link_failure`).
+const fn is_link_failure(err: &RetrievalError) -> bool {
+    matches!(
+        err,
+        RetrievalError::Timeout(_) | RetrievalError::OpenStream(_)
+    )
 }
 
 /// Detached drain of the losing in-flight fetches after a winner has
@@ -2465,6 +2483,34 @@ mod tests {
         let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
             .with_accounting(acc);
         (fetcher, p, held)
+    }
+
+    /// Issue #83: a retrieval that times out on its peer's link counts
+    /// toward the process-wide link-failure streak the swarm loop
+    /// self-heals on. The peer here never answers (its stream can't
+    /// even be opened), exactly what a half-open socket looks like.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_retrieval_counts_as_a_link_failure() {
+        let behaviour = libp2p_stream::Behaviour::default();
+        let counters = Arc::new(RetrievalCounters::new());
+        let fetcher = RoutingFetcher::with_static_peers(
+            behaviour.new_control(),
+            vec![(PeerId::random(), [0x80u8; 32])],
+        )
+        .with_counters(counters.clone());
+        let err = fetcher.fetch([0x55u8; 32]).await.expect_err("dead peer");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(counters.link_failure_streak(), 1);
+        assert!(is_link_failure(&RetrievalError::OpenStream(
+            "closed".into()
+        )));
+        assert!(!is_link_failure(&RetrievalError::Remote(
+            "storage: not found".into()
+        )));
+        assert!(!is_link_failure(&RetrievalError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "bee's not found"
+        ))));
     }
 
     /// Wire bytes of a plain two-leaf intermediate root (span 8 KiB)
