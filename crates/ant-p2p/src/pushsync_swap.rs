@@ -241,19 +241,15 @@ struct EmitCore {
     /// so the brief lock window doesn't span the swap stream's
     /// network roundtrip.
     pending_debt: Mutex<HashMap<PeerId, u64>>,
-    /// One lock per beneficiary, held from reading the last cumulative
-    /// to recording the new one, so two cheques to the same peer (a
-    /// pushsync and a retrieval one) can't both build on the same
-    /// previous cumulative. Bee holds its chequebook lock across the
-    /// same span (`chequebook.Issue`).
-    beneficiary_locks: Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>,
     /// Retrieval payments' funds and rates; `None` keeps downloads on
     /// the free tier.
     retrieval: Mutex<Option<RetrievalSwapPolicy>>,
-    /// Held from checking the funds left to recording a retrieval
-    /// cheque in the ledger, so two payments to different peers can't
-    /// both pass the check on the same funds.
-    issue_gate: Mutex<()>,
+    // Issuing is serialised by the ledger's `beneficiary_lock` (two
+    // cheques to one peer, a pushsync and a retrieval one, can't build on
+    // the same previous cumulative; bee's `chequebook.Issue` lock) and
+    // `funds_gate` (two payments can't pass the funds check on the same
+    // funds). Both live with the ledger's state, so they also cover an
+    // old service and a new one on the same chequebook (PR #126 R3-M1).
 }
 
 /// Live SWAP settlement service. One per process; shared with the
@@ -335,14 +331,6 @@ impl EmitCore {
         }
     }
 
-    fn beneficiary_lock(&self, beneficiary: [u8; 20]) -> Arc<tokio::sync::Mutex<()>> {
-        let mut g = match self.beneficiary_locks.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.entry(beneficiary).or_default().clone()
-    }
-
     async fn emit_for(&self, peer: PeerId, amount: u64) -> Result<U256, SwapError> {
         let beneficiary = self
             .cfg
@@ -351,7 +339,7 @@ impl EmitCore {
             .ok_or_else(|| SwapError::Rejected("no eoa for peer".into()))?;
         let amount_u256 = U256::from(amount);
         let mut control = self.control_clone();
-        let lock = self.beneficiary_lock(beneficiary);
+        let lock = self.outbound_ledger.beneficiary_lock(beneficiary);
         let _issuing = lock.lock().await;
         let new_cum = crate::swap::issue_and_emit(
             &mut control,
@@ -400,10 +388,7 @@ impl EmitCore {
         new_cumulative: U256,
         amount: U256,
     ) -> Result<(), SwapError> {
-        let _gate = match self.issue_gate.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _gate = self.outbound_ledger.funds_gate();
         let left = self.available(policy);
         if left < amount {
             return Err(SwapError::Rejected(format!(
@@ -461,7 +446,7 @@ impl EmitCore {
             .peer_eth
             .get(&peer)
             .ok_or_else(|| SwapError::Rejected("no eoa for peer".into()))?;
-        let lock = self.beneficiary_lock(beneficiary);
+        let lock = self.outbound_ledger.beneficiary_lock(beneficiary);
         let _issuing = lock.lock().await;
         let mut control = self.control_clone();
         let (mut stream, rates) = open_settlement(&mut control, peer).await?;
@@ -542,9 +527,7 @@ impl PushsyncSwap {
                 outbound_ledger,
                 control: Mutex::new(control),
                 pending_debt: Mutex::new(HashMap::new()),
-                beneficiary_locks: Mutex::new(HashMap::new()),
                 retrieval: Mutex::new(None),
-                issue_gate: Mutex::new(()),
             }),
             hot_hint: None,
         }
@@ -618,12 +601,15 @@ impl PushsyncSwap {
     }
 
     /// Whether this service pays retrieval debt now: a policy is
-    /// installed and the chequebook has funds left under it.
+    /// installed, the outbound ledger is readable (so what the
+    /// chequebook already owes is known; this retries a failed read)
+    /// and the chequebook has funds left under the policy.
     #[must_use]
     pub fn pays_retrieval(&self) -> bool {
-        self.core
-            .retrieval_policy()
-            .is_some_and(|p| !self.core.available(&p).is_zero())
+        self.core.retrieval_policy().is_some_and(|p| {
+            self.core.outbound_ledger.ensure_readable().is_ok()
+                && !self.core.available(&p).is_zero()
+        })
     }
 }
 
@@ -853,6 +839,63 @@ mod tests {
         drop(new);
         let old = service_for(dir.path(), [0xa1; 20]);
         assert_eq!(old.cumulative_for(&peer), U256::from(1_500u64));
+    }
+
+    /// Two services on one chequebook (settlement disabled and
+    /// re-enabled while the old one finishes) check and spend the same
+    /// funds under one gate (PR #126 R3-M1): racing retrieval cheques
+    /// from both never take the liability past the deposit.
+    #[test]
+    fn two_services_on_one_chequebook_never_overdraw_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Arc::new(service(dir.path()));
+        let new = Arc::new(service(dir.path()));
+        let p = policy(1_000);
+        let paid = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for i in 0..40u8 {
+                let svc = if i % 2 == 0 { old.clone() } else { new.clone() };
+                let paid = &paid;
+                s.spawn(move || {
+                    let b = [i; 20];
+                    if svc
+                        .core
+                        .issue_within_funds(&p, &b, U256::from(100u64), U256::from(100u64))
+                        .is_ok()
+                    {
+                        paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(paid.into_inner(), 10);
+        assert_eq!(old.outbound_ledger().total_issued(), U256::from(1_000u64));
+        assert_eq!(new.outbound_ledger().total_issued(), U256::from(1_000u64));
+    }
+
+    /// While the outbound ledger can't be read, the service doesn't
+    /// claim to pay retrieval (PR #126 R3-M2): the node reports the free
+    /// tier instead of installing a payer whose every cheque fails, and
+    /// switches back once the file reads again.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_ledger_does_not_pay_retrieval() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let set_mode = |m| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m));
+        set_mode(0o000).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as root: permissions don't fake a failed read.
+            set_mode(0o600).unwrap();
+            return;
+        }
+        let svc = service(dir.path());
+        svc.set_retrieval_policy(Some(policy(1_000)));
+        assert!(!svc.pays_retrieval());
+        set_mode(0o600).unwrap();
+        assert!(svc.pays_retrieval());
     }
 
     /// A peer can't name its own price: rates above the oracle's are

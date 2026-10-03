@@ -533,12 +533,36 @@ pub fn issue_cheque(
 /// million PLUR at most.
 ///
 /// Clones (and ledgers opened on the same file and chequebook while one
-/// is alive) share one state.
+/// is alive) share one state, and with it the locks that serialise
+/// issuing cheques ([`Self::beneficiary_lock`], [`Self::funds_gate`]).
+///
+/// A file that isn't JSON of either shape is moved aside to
+/// `<name>.corrupt-<unix secs>` and the chequebook starts from zero: its
+/// figures can't be recovered by reading it again, and refusing every
+/// cheque until someone repairs it by hand would stop uploads and paid
+/// downloads for good. Nothing is paid twice by restarting: a peer only
+/// credits a cheque above the cumulative it already holds, and refuses
+/// one the chequebook's balance can't cover.
 #[derive(Clone)]
 pub struct OutboundLedger {
     chequebook: [u8; 20],
-    state: Arc<Mutex<OutboundState>>,
+    shared: Arc<OutboundShared>,
     persist_path: Option<PathBuf>,
+}
+
+/// What every [`OutboundLedger`] open on one `(file, chequebook)` shares.
+#[derive(Default)]
+struct OutboundShared {
+    state: Mutex<OutboundState>,
+    /// One lock per beneficiary, held from reading its last cumulative
+    /// to recording the new one (bee's `chequebook.Issue` lock). Shared
+    /// so an old service still finishing a cheque and a new one on the
+    /// same chequebook can't both sign `C + a` and `C + b` on the same
+    /// `C` (PR #126 R3-M1).
+    issuing: Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>,
+    /// Held from checking the funds left to recording a cheque against
+    /// them, across every service on the chequebook.
+    funds: Mutex<()>,
 }
 
 /// One chequebook's cumulatives, shared by every [`OutboundLedger`]
@@ -574,7 +598,7 @@ static OUTBOUND_FILE_LOCK: Mutex<()> = Mutex::new(());
 /// cheque) shares the first one's state instead of keeping its own copy,
 /// so neither can write back a stale cumulative over the other's newer
 /// one. Guarded by [`OUTBOUND_FILE_LOCK`].
-type OutboundRegistry = Vec<((PathBuf, [u8; 20]), Weak<Mutex<OutboundState>>)>;
+type OutboundRegistry = Vec<((PathBuf, [u8; 20]), Weak<OutboundShared>)>;
 static OUTBOUND_LEDGERS: Mutex<OutboundRegistry> = Mutex::new(Vec::new());
 
 fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
@@ -583,8 +607,9 @@ fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
         .collect()
 }
 
-/// Read `path`. `Ok(None)` when it doesn't exist; a file that is neither
-/// shape is an error.
+/// Read `path`. `Ok(None)` when it doesn't exist. A file that is
+/// neither shape is moved aside (see [`OutboundLedger`]) and reads as
+/// missing; an I/O error, which may pass, is returned.
 fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -594,12 +619,42 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
     if let Ok(file) = serde_json::from_slice::<OutboundFile>(&bytes) {
         return Ok(Some(file));
     }
-    let legacy =
-        serde_json::from_slice::<HashMap<String, String>>(&bytes).map_err(std::io::Error::other)?;
+    let legacy = match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        Ok(legacy) => legacy,
+        Err(e) => {
+            quarantine_outbound_file(path, &e)?;
+            return Ok(None);
+        }
+    };
     // Marked with an empty key until a chequebook adopts it.
     Ok(Some(OutboundFile {
         chequebooks: HashMap::from([(String::new(), legacy)]),
     }))
+}
+
+/// Move an unparseable outbound ledger out of the way, keeping it for
+/// whoever wants to look at it. Fails (and the file stays, unread) only
+/// if it can't be moved.
+fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std::io::Result<()> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".corrupt-{secs}"));
+    let aside = path.with_file_name(name);
+    std::fs::rename(path, &aside).map_err(|e| {
+        std::io::Error::other(format!(
+            "unparseable ({parse_error}) and can't be moved aside: {e}"
+        ))
+    })?;
+    warn!(
+        target: "ant_p2p::swap",
+        file = %path.display(),
+        moved_to = %aside.display(),
+        "outbound ledger is unparseable ({parse_error}); moved it aside and \
+         starting its chequebooks' cheque totals from zero",
+    );
+    Ok(())
 }
 
 /// Read `path` (caller holds [`OUTBOUND_FILE_LOCK`]), adopting a file
@@ -651,8 +706,8 @@ impl OutboundLedger {
     /// issue or write until it can ([`Self::ensure_readable`]).
     pub fn open(persist_path: Option<PathBuf>, chequebook: [u8; 20]) -> Self {
         let key = hex::encode(chequebook);
-        let state = match &persist_path {
-            None => Arc::new(Mutex::new(OutboundState::default())),
+        let shared = match &persist_path {
+            None => Arc::new(OutboundShared::default()),
             Some(p) => {
                 let _file = lock_file();
                 let mut reg = OUTBOUND_LEDGERS
@@ -664,8 +719,8 @@ impl OutboundLedger {
                     .iter()
                     .find(|(k, _)| *k == id)
                     .and_then(|(_, w)| w.upgrade());
-                if let Some(state) = live {
-                    state
+                if let Some(shared) = live {
+                    shared
                 } else {
                     let mut st = OutboundState::default();
                     if let Err(e) = load_outbound_section(p, &key, &mut st) {
@@ -676,21 +731,49 @@ impl OutboundLedger {
                         );
                         st.unread = Some(e.to_string());
                     }
-                    let state = Arc::new(Mutex::new(st));
-                    reg.push((id, Arc::downgrade(&state)));
-                    state
+                    let shared = Arc::new(OutboundShared {
+                        state: Mutex::new(st),
+                        ..OutboundShared::default()
+                    });
+                    reg.push((id, Arc::downgrade(&shared)));
+                    shared
                 }
             }
         };
         Self {
             chequebook,
-            state,
+            shared,
             persist_path,
         }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, OutboundState> {
-        self.state.lock().expect("outbound ledger poisoned")
+        self.shared.state.lock().expect("outbound ledger poisoned")
+    }
+
+    /// Lock to hold from reading `beneficiary`'s last cumulative to
+    /// recording the next one, shared by every ledger on this chequebook
+    /// and file, so two cheques to one beneficiary can't build on the
+    /// same previous cumulative.
+    #[must_use]
+    pub fn beneficiary_lock(&self, beneficiary: [u8; 20]) -> Arc<tokio::sync::Mutex<()>> {
+        self.shared
+            .issuing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(beneficiary)
+            .or_default()
+            .clone()
+    }
+
+    /// Gate to hold from checking the chequebook's funds left
+    /// (deposit less [`Self::total_issued`]) to recording the cheque
+    /// that spends them, shared like [`Self::beneficiary_lock`].
+    pub fn funds_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.shared
+            .funds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Chequebook whose cheques this ledger tracks.
@@ -713,9 +796,24 @@ impl OutboundLedger {
         };
         let _file = lock_file();
         match load_outbound_section(path, &hex::encode(self.chequebook), &mut st) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                info!(
+                    target: "ant_p2p::swap",
+                    chequebook = %hex::encode(self.chequebook),
+                    "outbound ledger readable again; cheques resume",
+                );
+                Ok(())
+            }
             Err(e) => {
-                st.unread = Some(e.to_string());
+                let msg = e.to_string();
+                if st.unread.as_deref() != Some(msg.as_str()) {
+                    warn!(
+                        target: "ant_p2p::swap",
+                        chequebook = %hex::encode(self.chequebook),
+                        "outbound ledger still unreadable: {e}; no cheques until it can be read",
+                    );
+                }
+                st.unread = Some(msg);
                 Err(e)
             }
         }
@@ -1550,6 +1648,61 @@ mod tests {
         let reopened = OutboundLedger::open(Some(path), cb);
         assert_eq!(reopened.cumulative_for(&p), U256::from(250u64));
         assert_eq!(reopened.cumulative_for(&q), U256::from(10u64));
+    }
+
+    /// Ledgers on one chequebook share the locks that serialise issuing,
+    /// not just the figures (PR #126 R3-M1): an old service's cheque and
+    /// a new service's to the same beneficiary queue on one lock, and
+    /// both services' funds checks on one gate.
+    #[test]
+    fn outbound_ledgers_on_one_chequebook_share_their_issue_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let peer = [0x11u8; 20];
+        let old = OutboundLedger::open(Some(path.clone()), [0xc1; 20]);
+        let new = OutboundLedger::open(Some(path.clone()), [0xc1; 20]);
+        let other = OutboundLedger::open(Some(path), [0xc2; 20]);
+
+        let held = old.beneficiary_lock(peer);
+        let _issuing = held.try_lock().unwrap();
+        assert!(new.beneficiary_lock(peer).try_lock().is_err());
+        assert!(new.beneficiary_lock([0x22; 20]).try_lock().is_ok());
+        assert!(other.beneficiary_lock(peer).try_lock().is_ok());
+
+        let _gate = old.funds_gate();
+        assert!(new.shared.funds.try_lock().is_err());
+        assert!(other.shared.funds.try_lock().is_ok());
+    }
+
+    /// A ledger file that isn't JSON (PR #126 R3-M2) is moved aside, not
+    /// left blocking every cheque until it is repaired by hand: the
+    /// ledger opens readable, starts from zero and writes a fresh file,
+    /// and the broken bytes are kept next to it.
+    #[test]
+    fn an_unparseable_outbound_ledger_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let peer = [0x11u8; 20];
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let ledger = OutboundLedger::open(Some(path.clone()), [0xc1; 20]);
+        ledger.ensure_readable().unwrap();
+        assert_eq!(ledger.total_issued(), U256::zero());
+        ledger.record_issued(&peer, U256::from(70u64)).unwrap();
+
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("pushsync_outbound.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            b"{ not json"
+        );
+        drop(ledger);
+        let reopened = OutboundLedger::open(Some(path), [0xc1; 20]);
+        assert_eq!(reopened.cumulative_for(&peer), U256::from(70u64));
     }
 
     /// `EmitChequePb` round-trips through prost, so any future change
