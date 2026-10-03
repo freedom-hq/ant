@@ -191,8 +191,11 @@ pub struct RoutingFetcher {
     /// when the daemon's accounting hasn't been constructed
     /// (legacy `antctl get` paths).
     accounting: Option<Arc<Accounting>>,
-    /// No credit-waiting fetch or push through this fetcher waits past
-    /// this instant ([`RoutingFetcher::with_credit_deadline`]).
+    /// No credit-waiting fetch or push through this fetcher waits for
+    /// credit past this instant ([`RoutingFetcher::with_credit_deadline`]).
+    /// Only the credit wait is capped: a push already in flight runs to
+    /// its own pushsync timeout, and a fetch's network round trips are
+    /// not bounded by it.
     credit_deadline: Option<tokio::time::Instant>,
     /// Process-wide cumulative counters. Bumped on every chunk the
     /// fetcher hands back (network or cache); read by the status
@@ -785,10 +788,19 @@ impl RoutingFetcher {
     /// credit deadline ([`Self::with_credit_deadline`]), which the
     /// gateway's push paths set so their re-walks share one budget.
     fn push_credit_budget(&self) -> Duration {
-        self.credit_deadline.map_or(CREDIT_WAIT_BUDGET, |deadline| {
+        self.push_credit_left(CREDIT_WAIT_BUDGET)
+    }
+
+    /// `left` of a push walk's credit budget, cut to what is left before
+    /// the credit deadline right now. Re-read before every nap, not once
+    /// per walk: a walk can outlive the deadline with a push in flight
+    /// (one peer hanging to its pushsync timeout), and must not nap past
+    /// it afterwards.
+    fn push_credit_left(&self, left: Duration) -> Duration {
+        self.credit_deadline.map_or(left, |deadline| {
             deadline
                 .saturating_duration_since(tokio::time::Instant::now())
-                .min(CREDIT_WAIT_BUDGET)
+                .min(left)
         })
     }
 
@@ -1021,9 +1033,12 @@ impl RoutingFetcher {
                 // peers were skipped only for credit, wait for it like
                 // bee's `pushToClosest` ("sleeping to refresh overdraft
                 // balance") and try them again, at most `credit_budget`
-                // per walk; without a budget left, give up.
+                // per walk and never past the credit deadline (checked
+                // now, not only at walk start: a push that hung to its
+                // timeout may have outlived it); without a budget left,
+                // give up.
                 if let Some(at) = retry_at {
-                    let left = credit_budget.saturating_sub(credit_waited);
+                    let left = self.push_credit_left(credit_budget.saturating_sub(credit_waited));
                     if !left.is_zero() {
                         let nap = at
                             .saturating_duration_since(tokio::time::Instant::now())
@@ -1039,7 +1054,10 @@ impl RoutingFetcher {
                         credit_waited += nap;
                         // The budget is spent: end the round now, so the
                         // last one asks every peer again before giving up.
-                        if credit_waited >= credit_budget {
+                        if self
+                            .push_credit_left(credit_budget.saturating_sub(credit_waited))
+                            .is_zero()
+                        {
                             credit_retry_at = Some(tokio::time::Instant::now());
                         }
                         continue;
@@ -1213,11 +1231,10 @@ impl RoutingFetcher {
                 waited_ms = credit_waited.as_millis() as u64,
                 "pushsync: no candidate peer had credit within the credit budget; giving up the walk",
             );
-            return Err(PushSyncError::Remote(format!(
-                "no pushsync peer has credit: {} candidate peer(s) at their credit limit after waiting {:?}",
+            return Err(crate::pushsync::no_push_credit_error(
                 overdrawn.len(),
                 credit_waited,
-            )));
+            ));
         }
 
         // Candidate set / error budget exhausted. Bee never fails an
@@ -2739,6 +2756,34 @@ mod tests {
         let (took, err) = push_until_refused(&fetcher, addr).await;
         assert_eq!(took, Duration::ZERO, "past the deadline: {err}");
         assert!(err.starts_with("no pushsync peer has credit"), "{err}");
+    }
+
+    /// PR #138 R1-M1: the credit deadline is re-read before every nap,
+    /// not once at walk start. The closest peer has credit and hangs to
+    /// its pushsync timeout while the other one stays overdrawn; when
+    /// the hung push fails, the deadline has passed, so the walk gives
+    /// up at once instead of napping its leftover per-walk budget.
+    #[tokio::test(start_paused = true)]
+    async fn push_does_not_nap_past_the_credit_deadline() {
+        let addr = [0u8; 32];
+        let (near, far) = (PeerId::random(), PeerId::random());
+        let acc = Arc::new(Accounting::new());
+        let _held = hold_all_credit(&acc, far);
+        let (fetcher, _load, _behaviour) =
+            credit_gated_push_fetcher(vec![(near, [0x01u8; 32]), (far, [0x80u8; 32])], &acc);
+        let fetcher =
+            fetcher.with_credit_deadline(tokio::time::Instant::now() + CREDIT_WAIT_BUDGET);
+        let started = tokio::time::Instant::now();
+        let err = fetcher
+            .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+            .await
+            .expect_err("the near peer never answers, the far one never has credit");
+        assert!(crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT > CREDIT_WAIT_BUDGET);
+        assert_eq!(
+            started.elapsed(),
+            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
+            "{err}"
+        );
     }
 
     /// Pushes still in flight when `push_stamped_chunk` returns (a winner

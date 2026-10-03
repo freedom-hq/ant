@@ -4302,13 +4302,17 @@ async fn push_with_patience(
     strict_first: bool,
     rejections_are_lag_until: Option<Instant>,
 ) -> Result<(), ant_retrieval::pushsync::PushSyncError> {
-    let started = std::time::Instant::now();
+    // The patience budget runs on tokio's clock (as the fetcher's credit
+    // deadline does), so tests can drive it with a paused clock; the
+    // batch-propagation window below stays on `std::time::Instant`, the
+    // clock its registration stamp was taken on.
+    let started = tokio::time::Instant::now();
     let mut patience = Patience::new(gateway_push_patience(), started);
     let mut last_err = None;
     let mut walk = 0u32;
     loop {
         walk += 1;
-        let strict = strict_first && !patience.exhausted(Instant::now());
+        let strict = strict_first && !patience.exhausted(tokio::time::Instant::now());
         let res = fetcher
             .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, strict)
             .await;
@@ -4343,7 +4347,7 @@ async fn push_with_patience(
                     );
                     last_err = Some(e);
                     tokio::time::sleep(wait).await;
-                    patience.restart(Instant::now());
+                    patience.restart(tokio::time::Instant::now());
                     continue;
                 }
                 if matches!(
@@ -4352,7 +4356,7 @@ async fn push_with_patience(
                 ) {
                     return Err(e);
                 }
-                if patience.exhausted(Instant::now()) {
+                if patience.exhausted(tokio::time::Instant::now()) {
                     // Strict SOCs get one final bee-aligned
                     // shallow-accepting walk before we give up: stored
                     // shallow beats a 502 with nothing stored.
@@ -4398,20 +4402,20 @@ async fn push_with_patience(
 #[derive(Debug, Clone, Copy)]
 struct Patience {
     budget: Duration,
-    from: Instant,
+    from: tokio::time::Instant,
 }
 
 impl Patience {
-    fn new(budget: Duration, now: Instant) -> Self {
+    fn new(budget: Duration, now: tokio::time::Instant) -> Self {
         Self { budget, from: now }
     }
 
     /// Start the budget over, after a propagation wait.
-    fn restart(&mut self, now: Instant) {
+    fn restart(&mut self, now: tokio::time::Instant) {
         self.from = now;
     }
 
-    fn exhausted(&self, now: Instant) -> bool {
+    fn exhausted(&self, now: tokio::time::Instant) -> bool {
         now.saturating_duration_since(self.from) >= self.budget
     }
 }
@@ -11134,10 +11138,7 @@ mod tests {
     /// budget, so a pool that stays at its limit costs one
     /// `CREDIT_WAIT_BUDGET` of waiting, not one per re-walk, before the
     /// push is handed back (the upload job re-queues it).
-    ///
-    /// Runs on the real clock (~14 s): the patience budget is measured
-    /// with `std::time::Instant`, which a paused tokio clock doesn't move.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn push_credit_waits_share_one_budget_across_rewalks() {
         use ant_retrieval::accounting::{Accounting, CREDIT_WAIT_BUDGET, OVERDRAFT_LIMIT};
         let mut state = SwarmState::new(
@@ -11530,7 +11531,7 @@ mod tests {
     #[test]
     fn patience_restarts_after_a_propagation_wait_but_is_never_stretched() {
         let budget = Duration::from_secs(12);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
 
         // No propagation wait (e.g. only "exhausted pushsync peers"
