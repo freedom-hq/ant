@@ -58,6 +58,7 @@ pub mod fetcher;
 pub mod joiner;
 pub mod manifest_writer;
 pub mod mantaray;
+pub mod priority;
 pub mod progress;
 pub mod rs;
 pub mod rs_encode;

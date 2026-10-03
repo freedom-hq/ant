@@ -222,6 +222,25 @@ pub trait RetrievalPayment: Send + Sync {
     async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String>;
 }
 
+/// Credit a look-ahead fetch of the streaming joiner leaves unreserved
+/// on every peer, for the fetches at the head of the window (issue #46;
+/// [`crate::priority`]): one chunk at the highest price a peer charges
+/// (`peer_price` at proximity 0).
+///
+/// Without it, on a cold node the look-ahead fetches (up to 16 sibling
+/// subtrees of a download, each with its own fan-out) take every unit of
+/// credit a pseudosettle refresh frees, and the chunk the consumer is
+/// waiting for queues behind all of them. With it, a peer's last chunk
+/// of credit can only be taken by a head fetch (or by a fetch outside a
+/// streaming join, which is served as before), so a head fetch finds
+/// credit on any peer that has a chunk's worth left. It costs no
+/// throughput once the pool is starved: the refresh pays the debt down
+/// at the same rate whether or not this much of it is kept free, and the
+/// look-ahead takes the rest as before. The initial burst of a fresh
+/// peer (its 1.69M-unit limit, about five chunks) shrinks by one chunk
+/// for look-ahead fetches.
+pub const HEAD_CREDIT_RESERVE: u64 = 32 * 10_000;
+
 /// Per-chunk skip TTL for peers that fail [`Accounting::try_reserve`].
 ///
 /// Mirrors bee's `overDraftRefresh = time.Millisecond * 600` in
@@ -290,6 +309,15 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 /// is `false`) has no wait to bound, so its windows don't cut off a
 /// starved child's subtree retries either: it keeps all of them, as
 /// before #117.
+///
+/// **Head-of-window priority (issue #46) changes who gets freed credit
+/// first, not how long anyone waits.** A streaming joiner's data-chunk
+/// fetches are ranked against the consumer's read position
+/// ([`crate::priority`]): a look-ahead one leaves
+/// [`HEAD_CREDIT_RESERVE`] of every peer's limit to the head of the
+/// window, so it finds the pool starved a little sooner. It waits
+/// exactly as above, within the same per-attempt budget and the same
+/// window; no site waits that didn't, and no bound above changes.
 pub const CREDIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// A retry loop's credit window: the bound on how long the credit waits
@@ -567,6 +595,21 @@ impl Accounting {
     /// `pkg/retrieval/retrieval.go::case ErrOverdraft` arm.
     #[must_use]
     pub fn try_reserve(&self, peer: PeerId, price: u64) -> Option<DebitGuard> {
+        self.try_reserve_leaving(peer, price, 0)
+    }
+
+    /// [`Accounting::try_reserve`], but admit the dispatch only if it
+    /// leaves at least `headroom` of the peer's limit unreserved. A
+    /// look-ahead fetch of the streaming joiner passes
+    /// [`HEAD_CREDIT_RESERVE`], so the credit a peer gets back always
+    /// goes to the chunks the consumer is waiting for first (issue #46).
+    #[must_use]
+    pub fn try_reserve_leaving(
+        &self,
+        peer: PeerId,
+        price: u64,
+        headroom: u64,
+    ) -> Option<DebitGuard> {
         let payer = current_payer(&self.payment);
         let mut peers = self.peers.lock().ok()?;
         let now = Instant::now();
@@ -603,7 +646,7 @@ impl Accounting {
         // so (as in bee) it frees credit for later reservations, not this
         // one.
         let cheque = payer.as_ref().and_then(|_| entry.cheque_due(next, now));
-        let admitted = next <= limit;
+        let admitted = next.saturating_add(headroom) <= limit;
         if admitted {
             entry.reserved = entry.reserved.saturating_add(price);
             entry.last_used = now;

@@ -5823,6 +5823,9 @@ const RETRIEVAL_INFLIGHT_CAP: usize = 256;
 /// around a small neighbourhood, and the pseudosettle refresh budget
 /// per peer (`450k units/s × MIN_REFRESH_INTERVAL` = 900k units / 2 s)
 /// caps the steady-state per-peer fetch rate at ~12 chunks / 2 s.
+/// The chunks at the head of a streaming download's window skip this
+/// cap (issue #46, `ant_retrieval::priority`), so a large file's
+/// look-ahead can't queue the chunk its consumer is waiting for.
 const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 64;
 
 /// Multiplier base for inter-attempt backoff. Attempt N waits
