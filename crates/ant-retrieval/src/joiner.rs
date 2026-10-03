@@ -2624,12 +2624,17 @@ mod tests {
         }
     }
 
-    /// Two 128-leaf subtrees (2 × 512 KiB): the root, the two
-    /// intermediates and every leaf address in document order, and the
-    /// file bytes.
-    fn two_subtree_file(
-        fetcher: &mut MapFetcher,
-    ) -> (Vec<u8>, [[u8; 32]; 2], Vec<[u8; 32]>, Vec<u8>) {
+    /// A file built by [`two_subtree_file`].
+    struct TwoSubtreeFile {
+        root: Vec<u8>,
+        intermediates: [[u8; 32]; 2],
+        /// Every leaf address, in document order.
+        leaves: Vec<[u8; 32]>,
+        bytes: Vec<u8>,
+    }
+
+    /// Two 128-leaf subtrees (2 × 512 KiB), its chunks in `fetcher`.
+    fn two_subtree_file(fetcher: &mut MapFetcher) -> TwoSubtreeFile {
         let mut expected = Vec::with_capacity(256 * CHUNK_SIZE);
         let mut leaves = Vec::with_capacity(256);
         let mut intermediates = [[0u8; 32]; 2];
@@ -2653,7 +2658,12 @@ mod tests {
         let mut root = (expected.len() as u64).to_le_bytes().to_vec();
         root.extend_from_slice(&intermediates[0]);
         root.extend_from_slice(&intermediates[1]);
-        (root, intermediates, leaves, expected)
+        TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        }
     }
 
     /// Issue #46: the streaming joiner ranks every data-chunk fetch
@@ -2667,13 +2677,18 @@ mod tests {
     async fn streaming_join_ranks_fetches_by_the_read_position() {
         use crate::priority::{Priority, HEAD_WINDOW};
         let mut map = MapFetcher::new();
-        let (root, intermediates, leaves, expected) = two_subtree_file(&mut map);
+        let TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        } = two_subtree_file(&mut map);
         let open = std::sync::Arc::new(tokio::sync::Notify::new());
         let fetcher = std::sync::Arc::new(RankingFetcher {
             map,
-            ranks: Default::default(),
+            ranks: std::sync::Mutex::default(),
             gate: Some((intermediates[1], open.clone())),
-            gated_rank_before: Default::default(),
+            gated_rank_before: std::sync::Mutex::default(),
         });
         let (tx, mut rx) = mpsc::channel(1);
         let f = fetcher.clone();
@@ -2737,12 +2752,17 @@ mod tests {
     async fn range_join_ranks_from_the_range_start_and_buffered_join_is_unranked() {
         use crate::priority::{Priority, HEAD_WINDOW};
         let mut map = MapFetcher::new();
-        let (root, intermediates, leaves, expected) = two_subtree_file(&mut map);
+        let TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        } = two_subtree_file(&mut map);
         let fetcher = RankingFetcher {
             map,
-            ranks: Default::default(),
+            ranks: std::sync::Mutex::default(),
             gate: None,
-            gated_rank_before: Default::default(),
+            gated_rank_before: std::sync::Mutex::default(),
         };
         let start = 600 * 1024;
         let (tx, mut rx) = mpsc::channel(512);

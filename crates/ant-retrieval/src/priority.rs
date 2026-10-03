@@ -150,9 +150,12 @@ mod tests {
             // An offset without a read head, or a read head without an
             // offset, is unranked.
             assert_eq!(current(), Priority::Unranked);
-            at_offset(0, async { assert_eq!(current(), Priority::Head) }).await;
+            at_offset(0, async {
+                assert_eq!(current(), Priority::Head);
+            })
+            .await;
             at_offset(HEAD_WINDOW - 1, async {
-                assert_eq!(current(), Priority::Head)
+                assert_eq!(current(), Priority::Head);
             })
             .await;
             at_offset(HEAD_WINDOW, async {
@@ -164,7 +167,10 @@ mod tests {
             .await;
         })
         .await;
-        at_offset(0, async { assert_eq!(current(), Priority::Unranked) }).await;
+        at_offset(0, async {
+            assert_eq!(current(), Priority::Unranked);
+        })
+        .await;
         assert_eq!(head.position(), 4096);
     }
 }
