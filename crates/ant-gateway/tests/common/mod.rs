@@ -270,7 +270,7 @@ pub fn status_router_with_chain_hooks_and_cors(
         on_chequebook_refused,
         cors,
         None,
-        Ok(None),
+        Ok((None, None)),
     )
 }
 
@@ -289,7 +289,27 @@ pub fn status_router_with_chain_and_issued(
         None,
         CorsConfig::default(),
         None,
-        Ok(issued),
+        Ok((issued, None)),
+    )
+}
+
+/// [`status_router_with_chain_and_issued`] whose snapshot names the
+/// chequebook the issued total counts (`issued: None` with a chequebook
+/// is an unreadable outbound ledger).
+pub fn status_router_with_chain_and_issued_by(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    issued: Option<u128>,
+    chequebook: [u8; 20],
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Ok((issued, Some(chequebook))),
     )
 }
 
@@ -328,7 +348,7 @@ pub fn status_router_recording_registrations(
         None,
         CorsConfig::default(),
         Some(seen.clone()),
-        Ok(None),
+        Ok((None, None)),
     );
     (router, seen)
 }
@@ -340,7 +360,7 @@ fn chain_router(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
     registrations: Option<Registrations>,
-    issued: Result<Option<u128>, String>,
+    issued: Result<(Option<u128>, Option<[u8; 20]>), String>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -353,10 +373,13 @@ fn chain_router(
         while let Some(cmd) = cmd_rx.recv().await {
             if let ControlCommand::AccountingSnapshot { ack } = cmd {
                 let _ = ack.send(match &issued {
-                    Ok(issued) => ControlAck::Accounting(ant_control::AccountingSnapshotView {
-                        peers: Vec::new(),
-                        cheques_issued_plur: issued.map(|i| i.to_string()),
-                    }),
+                    Ok((issued, chequebook)) => {
+                        ControlAck::Accounting(ant_control::AccountingSnapshotView {
+                            peers: Vec::new(),
+                            cheques_issued_plur: issued.map(|i| i.to_string()),
+                            cheques_issued_chequebook: chequebook.map(hex::encode),
+                        })
+                    }
                     Err(message) => ControlAck::Error {
                         message: message.clone(),
                     },

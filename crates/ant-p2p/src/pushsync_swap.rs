@@ -437,6 +437,11 @@ impl EmitCore {
         let policy = self
             .retrieval_policy()
             .ok_or_else(|| SwapError::Rejected("retrieval payments are off".into()))?;
+        // A ledger whose file couldn't be read doesn't know what this
+        // chequebook already owes: no cheques until it does.
+        self.outbound_ledger
+            .ensure_readable()
+            .map_err(|e| SwapError::Rejected(format!("outbound ledger unreadable: {e}")))?;
         // Most this payment can cost; refuse before touching the network
         // when even that isn't covered.
         let most = SettlementRates {
@@ -521,10 +526,12 @@ fn check_rates(rates: &SettlementRates, policy: &RetrievalSwapPolicy) -> Result<
 }
 
 impl PushsyncSwap {
-    /// Build the service. Loads the outbound cumulative-payout
-    /// snapshot if `outbound_ledger_path` exists; missing or
-    /// unparseable snapshots start empty (bee accepts our cheques
-    /// from `cumulative = 0` upward, so a fresh start is harmless).
+    /// Build the service. Loads the chequebook's outbound
+    /// cumulative-payout section from `outbound_ledger_path`; a missing
+    /// file starts empty. A file that exists but can't be read leaves
+    /// the service refusing to issue cheques until a read succeeds,
+    /// rather than restarting the chequebook's cumulatives from zero
+    /// (see [`OutboundLedger`]).
     #[must_use]
     pub fn new(cfg: PushsyncSwapConfig, control: Control) -> Self {
         let outbound_ledger =

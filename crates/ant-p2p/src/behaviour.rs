@@ -935,6 +935,11 @@ struct SwarmState {
     /// legacy "push without settlement" behaviour for ultra-light
     /// reads + tests.
     pushsync_swap: Option<Arc<crate::PushsyncSwap>>,
+    /// Outbound ledger of the last service `DisablePushsyncSwap` turned
+    /// off. Its cheques are still outstanding, so while no service runs
+    /// the accounting snapshot keeps reporting them (for the chequebook
+    /// it names) instead of claiming nothing was issued.
+    retired_outbound: Option<crate::swap::OutboundLedger>,
     /// Inbound SWAP credit ledger (cheques peers paid us), shared with
     /// the swap sink task spawned by `sinks::spawn`. Retained here so
     /// [`ControlCommand::AccountingSnapshot`] can render the
@@ -1074,6 +1079,7 @@ impl SwarmState {
             external_addresses_order: Vec::new(),
             peer_eth,
             pushsync_swap: None,
+            retired_outbound: None,
             credit_ledger: None,
             retrieval_payments: true,
             retrieval_funds: None,
@@ -3600,7 +3606,10 @@ fn handle_control_command(
                 .as_ref()
                 .is_some_and(|s| s.chequebook() == chequebook);
             let message = if running {
-                state.pushsync_swap = None;
+                state.retired_outbound = state
+                    .pushsync_swap
+                    .take()
+                    .map(|s| s.outbound_ledger().clone());
                 sync_retrieval_payment(state);
                 warn!(
                     target: "ant_p2p::pushsync_swap",
@@ -4030,12 +4039,21 @@ fn build_accounting_snapshot(state: &SwarmState) -> AccountingSnapshotView {
     }
     // Stable order so repeated snapshots render identically.
     rows.sort_by(|a, b| a.peer.cmp(&b.peer));
+    let outbound = state
+        .pushsync_swap
+        .as_ref()
+        .map(|svc| svc.outbound_ledger())
+        .or(state.retired_outbound.as_ref());
     AccountingSnapshotView {
         peers: rows,
-        cheques_issued_plur: state
-            .pushsync_swap
-            .as_ref()
-            .map(|svc| svc.outbound_ledger().total_issued().to_string()),
+        cheques_issued_plur: outbound.and_then(|l| {
+            // An unreadable ledger doesn't know the total: report none
+            // rather than a short one.
+            l.ensure_readable()
+                .ok()
+                .map(|()| l.total_issued().to_string())
+        }),
+        cheques_issued_chequebook: outbound.map(|l| hex::encode(l.chequebook())),
     }
 }
 
@@ -9941,6 +9959,75 @@ mod tests {
         );
         assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
         assert!(state.pushsync_swap.is_none(), "settlement is off again");
+    }
+
+    /// Switching settlement off doesn't make its cheques vanish from the
+    /// accounting snapshot (PR #126 R2-M1): the total keeps coming, and
+    /// it names the chequebook it counts.
+    #[tokio::test]
+    async fn accounting_snapshot_names_the_chequebook_its_issued_total_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let cb = [0xcbu8; 20];
+        let mut send = |state: &mut SwarmState, cmd| {
+            handle_control_command(state, &mut peerstore, &control, None, 0, cmd);
+        };
+        assert!(build_accounting_snapshot(&state)
+            .cheques_issued_chequebook
+            .is_none());
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::EnablePushsyncSwap {
+                chequebook: cb,
+                swap_secret: [3u8; 32],
+                chain_id: 100,
+                outbound_ledger_path: dir.path().join("out.json").to_string_lossy().into(),
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        state
+            .pushsync_swap
+            .as_ref()
+            .unwrap()
+            .outbound_ledger()
+            .record_issued(&[0x11; 20], primitive_types::U256::from(700u64))
+            .unwrap();
+        let snap = build_accounting_snapshot(&state);
+        assert_eq!(snap.cheques_issued_plur.as_deref(), Some("700"));
+        let cb_hex = hex::encode(cb);
+        assert_eq!(
+            snap.cheques_issued_chequebook.as_deref(),
+            Some(cb_hex.as_str())
+        );
+
+        let (ack, rx) = oneshot::channel();
+        send(
+            &mut state,
+            ControlCommand::DisablePushsyncSwap {
+                chequebook: cb,
+                ack,
+            },
+        );
+        assert!(matches!(rx.await.unwrap(), ControlAck::Ok { .. }));
+        let snap = build_accounting_snapshot(&state);
+        assert_eq!(snap.cheques_issued_plur.as_deref(), Some("700"));
+        assert_eq!(
+            snap.cheques_issued_chequebook.as_deref(),
+            Some(cb_hex.as_str())
+        );
     }
 
     /// `PostageList` reports a registration age only for batches the node

@@ -18,7 +18,8 @@ use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router,
     status_router_recording_registrations, status_router_with_chain,
     status_router_with_chain_and_failing_snapshot, status_router_with_chain_and_hook,
-    status_router_with_chain_and_issued, status_router_with_chain_hooks_and_cors,
+    status_router_with_chain_and_issued, status_router_with_chain_and_issued_by,
+    status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -291,6 +292,46 @@ async fn chequebook_balance_survives_a_failed_node_snapshot() {
     );
     let (_, json) = get(router, "/chequebook/balance").await;
     assert!(json.get("availableBalanceError").is_none(), "{json}");
+}
+
+/// The node's issued total belongs to the chequebook its snapshot names
+/// (PR #126 R2-M1): it comes off this chequebook's balance only when
+/// that is this chequebook; another chequebook's total, or an
+/// unreadable ledger, leaves `availableBalance` at the balance, flagged.
+#[tokio::test]
+async fn chequebook_available_balance_counts_only_its_own_cheques() {
+    let cb = [0xCD; 20];
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "15000000");
+    assert!(json.get("availableBalanceError").is_none(), "{json}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        Some(30_000_000),
+        [0xEF; 20],
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["availableBalance"], "42000000");
+    let err = json["availableBalanceError"].as_str().expect("flagged");
+    assert!(err.contains("efefef"), "{err}");
+
+    let router = status_router_with_chain_and_issued_by(
+        snapshot_with_one_peer(),
+        chain_ctx(Some(cb)),
+        None,
+        cb,
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(json["availableBalance"], "42000000");
+    assert!(json["availableBalanceError"].is_string(), "{json}");
 }
 
 #[tokio::test]

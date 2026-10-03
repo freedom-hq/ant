@@ -502,10 +502,18 @@ pub struct AccountingSnapshotView {
     /// PLUR promised in every cheque this node has issued from its
     /// chequebook, for pushsync and retrieval alike (bee's
     /// `totalIssued`, the sum of the outbound ledger's cumulatives),
-    /// decimal. `None` when outbound settlement isn't running. Feeds
-    /// `/chequebook/balance`'s `availableBalance`.
+    /// decimal, for the chequebook in [`Self::cheques_issued_chequebook`].
+    /// `None` when outbound settlement has never run in this process, or
+    /// when the outbound ledger file can't be read (the total is
+    /// unknown). Feeds `/chequebook/balance`'s `availableBalance`.
     #[serde(default)]
     pub cheques_issued_plur: Option<String>,
+    /// Chequebook (lowercase hex, no `0x`) whose cheques
+    /// `cheques_issued_plur` counts: the running outbound settlement's,
+    /// or the last one switched off by `DisablePushsyncSwap`. `None`
+    /// when outbound settlement has never run in this process.
+    #[serde(default)]
+    pub cheques_issued_chequebook: Option<String>,
 }
 
 /// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying

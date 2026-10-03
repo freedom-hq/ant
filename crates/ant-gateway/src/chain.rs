@@ -556,13 +556,16 @@ struct ChequebookBalanceBody {
 /// `AvailableBalance`: that balance plus what beneficiaries already
 /// cashed (`totalPaidOut()`) minus every cheque the node has issued, so
 /// it drops as soon as uploads or downloads (issue #121) pay with
-/// cheques, not only once peers cash them. While outbound settlement
-/// isn't running the node has issued nothing it can count, and
-/// `availableBalance` is the balance. Zeros when no chequebook is
+/// cheques, not only once peers cash them. The node's total is for the
+/// chequebook its snapshot names (the running settlement's, or the last
+/// one switched off); it is only subtracted when that is this
+/// chequebook. While outbound settlement has never run the node has
+/// issued nothing it can count, and `availableBalance` is the balance. Zeros when no chequebook is
 /// configured (PLAN.md D2).
 ///
 /// Only the balance read is required: when the node's snapshot or the
-/// `totalPaidOut()` read fails, the response still carries
+/// `totalPaidOut()` read fails, the snapshot counts another chequebook,
+/// or the node's outbound ledger is unreadable, the response still carries
 /// `totalBalance`, with `availableBalance` set to it and
 /// `availableBalanceError` saying it isn't the real figure.
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
@@ -588,12 +591,25 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Err(r) => return r,
     };
     let available: Result<u128, String> = async {
-        let issued = crate::settlements::fetch_snapshot(&handle)
+        let snapshot = crate::settlements::fetch_snapshot(&handle)
             .await
-            .map_err(|_| "the node's issued-cheques total is unavailable".to_string())?
-            .cheques_issued_plur;
+            .map_err(|_| "the node's issued-cheques total is unavailable".to_string())?;
+        // The total belongs to one chequebook; it only comes off this
+        // one's balance if they are the same.
+        let issued = match snapshot.cheques_issued_chequebook.as_deref() {
+            // Outbound settlement never ran: nothing issued to count.
+            None if snapshot.cheques_issued_plur.is_none() => return Ok(bal),
+            Some(theirs) if !theirs.eq_ignore_ascii_case(&hex::encode(cb)) => {
+                return Err(format!(
+                    "the node's issued-cheques total is for chequebook 0x{theirs}, not 0x{}",
+                    hex::encode(cb),
+                ));
+            }
+            // `None` with a total: a node from before the field.
+            None | Some(_) => snapshot.cheques_issued_plur,
+        };
         let Some(issued) = issued else {
-            return Ok(bal);
+            return Err("the node's outbound cheque ledger is unreadable".to_string());
         };
         let paid_out = tokio::time::timeout(
             CHAIN_RPC_TIMEOUT,
