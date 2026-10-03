@@ -353,9 +353,11 @@ struct PeerBalance {
     /// (bee's `shadowReservedBalance`). Debt they will clear is not paid
     /// twice.
     shadow_reserved: u64,
-    /// A SWAP payment to this peer is in flight (bee's `paymentOngoing`):
-    /// at most one at a time.
-    payment_ongoing: bool,
+    /// The SWAP payment to this peer in flight, if any (bee's
+    /// `paymentOngoing`): at most one at a time. Held as the payment's
+    /// [`PaymentTicket`] so only that payment's outcome clears it, not a
+    /// payment started on a previous connection's entry.
+    payment_ongoing: Option<PaymentTicket>,
     /// When the last SWAP payment to this peer failed, for the
     /// [`FAILED_SETTLEMENT_INTERVAL`] back-off.
     last_payment_failure: Option<Instant>,
@@ -373,7 +375,7 @@ impl Default for PeerBalance {
             last_used: Instant::now(),
             time_settled: 0,
             shadow_reserved: 0,
-            payment_ongoing: false,
+            payment_ongoing: None,
             last_payment_failure: None,
             swap_settled: 0,
         }
@@ -397,14 +399,14 @@ impl PeerBalance {
     /// refreshed has, as in bee (zero refresh timestamp), everything
     /// still due to the refresh, so it's not paid.
     ///
-    /// On `Some(amount)` the payment is marked in flight and `amount` is
-    /// shadow-reserved; the caller must report the outcome with
-    /// [`Accounting::payment_done`].
-    fn cheque_due(&mut self, expected_debt: u64, now: Instant) -> Option<u64> {
+    /// On `Some` the payment is marked in flight under the returned
+    /// ticket and its amount is shadow-reserved; the caller must report
+    /// the outcome with [`Accounting::payment_done`].
+    fn cheque_due(&mut self, expected_debt: u64, now: Instant) -> Option<PaymentTicket> {
         if self.balance == 0
             || expected_debt.saturating_sub(self.shadow_reserved) < EARLY_PAYMENT_THRESHOLD
             || self.balance.saturating_sub(self.shadow_reserved) < LIGHT_REFRESH_RATE_PER_SEC
-            || self.payment_ongoing
+            || self.payment_ongoing.is_some()
         {
             return None;
         }
@@ -423,11 +425,26 @@ impl PeerBalance {
         if amount < MINIMUM_PAYMENT {
             return None;
         }
-        self.payment_ongoing = true;
+        let ticket = PaymentTicket {
+            id: NEXT_PAYMENT_ID.fetch_add(1, Ordering::Relaxed),
+            amount,
+        };
+        self.payment_ongoing = Some(ticket);
         self.shadow_reserved = self.shadow_reserved.saturating_add(amount);
-        Some(amount)
+        Some(ticket)
     }
 }
+
+/// One SWAP payment started by [`PeerBalance::cheque_due`]: a
+/// process-unique id and the amount, in accounting units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaymentTicket {
+    id: u64,
+    amount: u64,
+}
+
+/// Source of [`PaymentTicket::id`]s.
+static NEXT_PAYMENT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Shared accounting state.
 ///
@@ -588,8 +605,8 @@ impl Accounting {
             entry.last_used = now;
         }
         drop(peers);
-        if let (Some(payer), Some(amount)) = (payer, cheque) {
-            self.spawn_payment(payer, peer, amount);
+        if let (Some(payer), Some(ticket)) = (payer, cheque) {
+            self.spawn_payment(payer, peer, ticket);
         }
         if !admitted {
             return None;
@@ -606,39 +623,44 @@ impl Accounting {
         })
     }
 
-    fn spawn_payment(&self, payer: Arc<dyn RetrievalPayment>, peer: PeerId, amount: u64) {
+    fn spawn_payment(&self, payer: Arc<dyn RetrievalPayment>, peer: PeerId, ticket: PaymentTicket) {
         spawn_payment(
             payer,
             peer,
-            amount,
+            ticket,
             self.peers.clone(),
             self.credit_freed.clone(),
             self.credit_epoch.clone(),
         );
     }
 
-    /// Record the outcome of a SWAP payment of `amount` started by
+    /// Record the outcome of a SWAP payment started by
     /// [`PeerBalance::cheque_due`] (bee's `NotifyPaymentSent`): release
-    /// the shadow reservation, and on success lower the debt by `amount`
-    /// and wake a fetch waiting for credit; on failure start the
-    /// [`FAILED_SETTLEMENT_INTERVAL`] back-off.
+    /// the shadow reservation, and on success lower the debt by the
+    /// ticket's amount and wake a fetch waiting for credit; on failure
+    /// start the [`FAILED_SETTLEMENT_INTERVAL`] back-off.
     fn payment_done(
         balances: &SharedBalances,
         epoch: &AtomicU64,
         notify: &Notify,
         peer: PeerId,
-        amount: u64,
+        ticket: PaymentTicket,
         ok: bool,
     ) {
+        let amount = ticket.amount;
         let Ok(mut peers) = balances.lock() else {
             return;
         };
         // A peer forgotten (disconnected) meanwhile starts afresh, on
-        // bee's side too.
-        let Some(entry) = peers.get_mut(&peer) else {
+        // bee's side too: its entry now, if any, is a later connection's,
+        // and this payment is not the one in flight there.
+        let Some(entry) = peers
+            .get_mut(&peer)
+            .filter(|entry| entry.payment_ongoing == Some(ticket))
+        else {
             return;
         };
-        entry.payment_ongoing = false;
+        entry.payment_ongoing = None;
         entry.shadow_reserved = entry.shadow_reserved.saturating_sub(amount);
         if !ok {
             entry.last_payment_failure = Some(Instant::now());
@@ -829,11 +851,11 @@ impl DebitGuard {
             )
         };
         self.applied = true;
-        if let (Some(payer), Some(amount)) = (payer, cheque) {
+        if let (Some(payer), Some(ticket)) = (payer, cheque) {
             spawn_payment(
                 payer,
                 self.peer,
-                amount,
+                ticket,
                 self.balances.clone(),
                 self.credit_freed.clone(),
                 self.credit_epoch.clone(),
@@ -888,11 +910,12 @@ fn current_payer(slot: &PaymentSlot) -> Option<Arc<dyn RetrievalPayment>> {
 fn spawn_payment(
     payer: Arc<dyn RetrievalPayment>,
     peer: PeerId,
-    amount: u64,
+    ticket: PaymentTicket,
     balances: SharedBalances,
     credit_freed: Arc<Notify>,
     credit_epoch: Arc<AtomicU64>,
 ) {
+    let amount = ticket.amount;
     tokio::spawn(async move {
         let result = payer.pay(peer, amount).await;
         if let Err(e) = &result {
@@ -908,7 +931,7 @@ fn spawn_payment(
             &credit_epoch,
             &credit_freed,
             peer,
-            amount,
+            ticket,
             result.is_ok(),
         );
     });
@@ -1097,6 +1120,47 @@ mod tests {
         take(&acc, peer, 1, 300_000);
         settle_payments().await;
         assert_eq!(payer.calls().len(), 1, "backing off after the failure");
+    }
+
+    /// A payment that finishes after its peer disconnected and came back
+    /// (PR #126 R1-M2) leaves the new connection's entry alone: the debt,
+    /// and the payment in flight there, are that connection's.
+    #[tokio::test]
+    async fn a_payment_from_a_previous_connection_does_not_touch_the_new_one() {
+        let gate = Arc::new(Notify::new());
+        let payer = Arc::new(Payer {
+            gate: Some(gate.clone()),
+            ..Payer::default()
+        });
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        take(&acc, peer, 3, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls().len(), 1, "first connection's payment");
+
+        acc.forget(&peer);
+        acc.credit(peer, 0);
+        take(&acc, peer, 3, 300_000);
+        settle_payments().await;
+        assert_eq!(payer.calls().len(), 2, "second connection's payment");
+
+        // The first payment finishes (waiters wake oldest first).
+        gate.notify_one();
+        settle_payments().await;
+        assert_eq!(acc.debug_snapshot(&peer), Some((900_000, 0)));
+        take(&acc, peer, 1, 300_000);
+        settle_payments().await;
+        assert_eq!(
+            payer.calls().len(),
+            2,
+            "the second payment is still in flight: no third"
+        );
+
+        gate.notify_one();
+        settle_payments().await;
+        assert_eq!(acc.debug_snapshot(&peer), Some((600_000, 0)));
+        assert_eq!(acc.swap_settled(&peer), 600_000);
     }
 
     /// Without a payer (no funded chequebook, or the switch off) the

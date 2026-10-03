@@ -527,7 +527,8 @@ impl PushsyncSwap {
     /// from `cumulative = 0` upward, so a fresh start is harmless).
     #[must_use]
     pub fn new(cfg: PushsyncSwapConfig, control: Control) -> Self {
-        let outbound_ledger = OutboundLedger::open(Some(cfg.outbound_ledger_path.clone()));
+        let outbound_ledger =
+            OutboundLedger::open(Some(cfg.outbound_ledger_path.clone()), cfg.chequebook);
         Self {
             core: Arc::new(EmitCore {
                 cfg,
@@ -762,9 +763,13 @@ mod tests {
     }
 
     fn service(dir: &std::path::Path) -> PushsyncSwap {
+        service_for(dir, [0xcb; 20])
+    }
+
+    fn service_for(dir: &std::path::Path, chequebook: [u8; 20]) -> PushsyncSwap {
         PushsyncSwap::new(
             PushsyncSwapConfig::new(
-                [0xcb; 20],
+                chequebook,
                 random_secp256k1_secret(),
                 100,
                 dir.join("out.json"),
@@ -819,6 +824,28 @@ mod tests {
         );
         svc.set_retrieval_policy(None);
         assert!(!svc.pays_retrieval());
+    }
+
+    /// A new chequebook on the same data dir (PR #126 R1-F1) neither
+    /// builds its cheques on the old one's cumulatives nor counts the old
+    /// one's cheques against its own deposit.
+    #[test]
+    fn a_new_chequebook_does_not_inherit_the_old_ones_cheques() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = [0xbb; 20];
+        {
+            let old = service_for(dir.path(), [0xa1; 20]);
+            old.outbound_ledger()
+                .record_issued(&peer, U256::from(1_500u64))
+                .unwrap();
+        }
+        let new = service_for(dir.path(), [0xb2; 20]);
+        assert_eq!(new.cumulative_for(&peer), U256::zero());
+        new.set_retrieval_policy(Some(policy(1_000)));
+        assert!(new.pays_retrieval(), "the new deposit is untouched");
+        drop(new);
+        let old = service_for(dir.path(), [0xa1; 20]);
+        assert_eq!(old.cumulative_for(&peer), U256::from(1_500u64));
     }
 
     /// A peer can't name its own price: rates above the oracle's are

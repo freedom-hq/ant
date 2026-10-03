@@ -270,7 +270,7 @@ pub fn status_router_with_chain_hooks_and_cors(
         on_chequebook_refused,
         cors,
         None,
-        None,
+        Ok(None),
     )
 }
 
@@ -289,7 +289,24 @@ pub fn status_router_with_chain_and_issued(
         None,
         CorsConfig::default(),
         None,
-        issued,
+        Ok(issued),
+    )
+}
+
+/// [`status_router_with_chain`] whose node fails every
+/// `AccountingSnapshot`.
+pub fn status_router_with_chain_and_failing_snapshot(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+) -> Router {
+    chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        None,
+        Err("snapshot fixture fails".into()),
     )
 }
 
@@ -311,7 +328,7 @@ pub fn status_router_recording_registrations(
         None,
         CorsConfig::default(),
         Some(seen.clone()),
-        None,
+        Ok(None),
     );
     (router, seen)
 }
@@ -323,7 +340,7 @@ fn chain_router(
     on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
     cors: CorsConfig,
     registrations: Option<Registrations>,
-    issued: Option<u128>,
+    issued: Result<Option<u128>, String>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -335,12 +352,15 @@ fn chain_router(
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             if let ControlCommand::AccountingSnapshot { ack } = cmd {
-                let _ = ack.send(ControlAck::Accounting(
-                    ant_control::AccountingSnapshotView {
+                let _ = ack.send(match &issued {
+                    Ok(issued) => ControlAck::Accounting(ant_control::AccountingSnapshotView {
                         peers: Vec::new(),
                         cheques_issued_plur: issued.map(|i| i.to_string()),
+                    }),
+                    Err(message) => ControlAck::Error {
+                        message: message.clone(),
                     },
-                ));
+                });
                 continue;
             }
             if let ControlCommand::RegisterBatch {

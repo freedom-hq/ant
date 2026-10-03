@@ -17,8 +17,8 @@ use axum::http::{Method, Request, StatusCode};
 use common::{
     body_bytes, send, snapshot_with_one_peer, status_only_router,
     status_router_recording_registrations, status_router_with_chain,
-    status_router_with_chain_and_hook, status_router_with_chain_and_issued,
-    status_router_with_chain_hooks_and_cors,
+    status_router_with_chain_and_failing_snapshot, status_router_with_chain_and_hook,
+    status_router_with_chain_and_issued, status_router_with_chain_hooks_and_cors,
 };
 use serde_json::Value;
 
@@ -267,6 +267,30 @@ async fn chequebook_available_balance_deducts_issued_cheques() {
         status_router_with_chain_and_issued(snapshot_with_one_peer(), chain_ctx(Some(cb)), None);
     let (_, json) = get(router, "/chequebook/balance").await;
     assert_eq!(json["availableBalance"], "42000000");
+}
+
+/// The balance read alone answers `/chequebook/balance` (PR #126
+/// R1-M3): when the node's snapshot fails, `totalBalance` still comes
+/// back, with `availableBalance` at that upper bound and flagged.
+#[tokio::test]
+async fn chequebook_balance_survives_a_failed_node_snapshot() {
+    let router = status_router_with_chain_and_failing_snapshot(
+        snapshot_with_one_peer(),
+        chain_ctx(Some([0xCD; 20])),
+    );
+    let (status, json) = get(router, "/chequebook/balance").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["totalBalance"], "42000000");
+    assert_eq!(json["availableBalance"], "42000000");
+    assert!(json["availableBalanceError"].is_string(), "{json}");
+
+    let router = status_router_with_chain_and_issued(
+        snapshot_with_one_peer(),
+        chain_ctx(Some([0xCD; 20])),
+        Some(30_000_000),
+    );
+    let (_, json) = get(router, "/chequebook/balance").await;
+    assert!(json.get("availableBalanceError").is_none(), "{json}");
 }
 
 #[tokio::test]

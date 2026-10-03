@@ -539,6 +539,15 @@ struct ChequebookBalanceBody {
     total_balance: String,
     #[serde(rename = "availableBalance")]
     available_balance: String,
+    /// Set when `availableBalance` couldn't be worked out (the node's
+    /// issued-cheques total or the chequebook's `totalPaidOut()` didn't
+    /// come back): `availableBalance` is then `totalBalance`, an upper
+    /// bound, and this says why. Not a bee field.
+    #[serde(
+        rename = "availableBalanceError",
+        skip_serializing_if = "Option::is_none"
+    )]
+    available_balance_error: Option<String>,
 }
 
 /// `GET /chequebook/balance`. `totalBalance` is the chequebook
@@ -551,11 +560,17 @@ struct ChequebookBalanceBody {
 /// isn't running the node has issued nothing it can count, and
 /// `availableBalance` is the balance. Zeros when no chequebook is
 /// configured (PLAN.md D2).
+///
+/// Only the balance read is required: when the node's snapshot or the
+/// `totalPaidOut()` read fails, the response still carries
+/// `totalBalance`, with `availableBalance` set to it and
+/// `availableBalanceError` saying it isn't the real figure.
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
     let zero = || {
         Json(ChequebookBalanceBody {
             total_balance: "0".into(),
             available_balance: "0".into(),
+            available_balance_error: None,
         })
         .into_response()
     };
@@ -572,25 +587,37 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => v,
         Err(r) => return r,
     };
-    let issued = match crate::settlements::fetch_snapshot(&handle).await {
-        Ok(snapshot) => snapshot.cheques_issued_plur,
-        Err(r) => return r,
-    };
-    let available = match issued {
-        None => bal,
-        Some(issued) => {
-            let paid_out = match guarded(chain.reader.chequebook_total_paid_out(cb)).await {
-                Ok(v) => v,
-                Err(r) => return r,
-            };
-            // More issued than u128 holds is more than any chequebook.
-            let issued = issued.parse::<u128>().unwrap_or(u128::MAX);
-            bal.saturating_add(paid_out).saturating_sub(issued)
+    let available: Result<u128, String> = async {
+        let issued = crate::settlements::fetch_snapshot(&handle)
+            .await
+            .map_err(|_| "the node's issued-cheques total is unavailable".to_string())?
+            .cheques_issued_plur;
+        let Some(issued) = issued else {
+            return Ok(bal);
+        };
+        let paid_out = tokio::time::timeout(
+            CHAIN_RPC_TIMEOUT,
+            chain.reader.chequebook_total_paid_out(cb),
+        )
+        .await
+        .map_err(|_| "chequebook.totalPaidOut timed out".to_string())?
+        .map_err(|e| format!("chequebook.totalPaidOut: {e}"))?;
+        // More issued than u128 holds is more than any chequebook.
+        let issued = issued.parse::<u128>().unwrap_or(u128::MAX);
+        Ok(bal.saturating_add(paid_out).saturating_sub(issued))
+    }
+    .await;
+    let (available, available_balance_error) = match available {
+        Ok(v) => (v, None),
+        Err(e) => {
+            tracing::warn!(target: "ant_gateway", "chequebook availableBalance: {e}");
+            (bal, Some(e))
         }
     };
     Json(ChequebookBalanceBody {
         total_balance: bal.to_string(),
         available_balance: available.to_string(),
+        available_balance_error,
     })
     .into_response()
 }

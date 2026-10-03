@@ -2515,6 +2515,7 @@ impl SettlementOnBuy {
                 _ => {}
             }
         }
+        stop_retrieval_funds_watch(chequebook);
         self.refuse_in_gateway(chequebook);
     }
 
@@ -2666,11 +2667,28 @@ impl SettlementOnBuy {
 /// Reads go to `--gnosis-rpc-url`, else the public logs RPC (as the
 /// gateway's reads do). Without either, or with `--retrieval-payments
 /// false`, nothing runs and downloads stay on the free tier.
+///
+/// One watch per process: starting one for another chequebook stops the
+/// previous one (else a disabled chequebook's watch would keep
+/// overwriting the node's funds with its own, switching payments off
+/// until the new one's next read), and a repeat for the same chequebook
+/// keeps the running one.
 fn spawn_retrieval_funds_watch(
     opt: &Opt,
     chequebook: [u8; 20],
     commands: mpsc::Sender<ControlCommand>,
 ) {
+    let mut watch = RETRIEVAL_FUNDS_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((running, task)) = watch.as_ref() {
+        if *running == chequebook && !task.is_finished() {
+            return;
+        }
+    }
+    if let Some((_, task)) = watch.take() {
+        task.abort();
+    }
     if !opt.retrieval_payments {
         return;
     }
@@ -2681,11 +2699,33 @@ fn spawn_retrieval_funds_watch(
         );
         return;
     };
-    tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
+    let task = tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
         ant_chain::ChainClient::new(rpc),
         chequebook,
         move |funds| publish_retrieval_funds(commands.clone(), chequebook, funds),
     ));
+    *watch = Some((chequebook, task.abort_handle()));
+}
+
+/// The retrieval-funds watch [`spawn_retrieval_funds_watch`] runs, and
+/// its chequebook.
+static RETRIEVAL_FUNDS_WATCH: std::sync::Mutex<Option<([u8; 20], tokio::task::AbortHandle)>> =
+    std::sync::Mutex::new(None);
+
+/// Stop the retrieval-funds watch if it is `chequebook`'s: settlement
+/// no longer runs on it.
+fn stop_retrieval_funds_watch(chequebook: [u8; 20]) {
+    let mut watch = RETRIEVAL_FUNDS_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if watch
+        .as_ref()
+        .is_some_and(|(running, _)| *running == chequebook)
+    {
+        if let Some((_, task)) = watch.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Hand one [`ant_chain::chequebook_store::RetrievalFunds`] read to the

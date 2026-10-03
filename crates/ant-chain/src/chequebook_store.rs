@@ -530,13 +530,15 @@ pub async fn read_retrieval_funds(
 /// read them now and every [`RETRIEVAL_FUNDS_REFRESH`], handing each
 /// successful read to `publish`. A failed read publishes nothing, so the
 /// node keeps its last good value (a hiccup doesn't read as "empty").
-/// Returns when `publish` returns `false` (the node is gone, or runs
-/// settlement on another chequebook now).
+/// Returns when `publish` returns `false` (the node is gone).
 ///
 /// Both `antd` and `ant-ffi` run this for the chequebook settlement runs
 /// on, publishing into `ControlCommand::SetRetrievalFunds`, so retrieval
 /// payments (issue #121) spend at most what the chequebook holds, on
-/// either entry point.
+/// either entry point. Each keeps one watch per node and aborts it when
+/// settlement moves to another chequebook (or, in `antd`, is switched
+/// off): the node accepts funds for any chequebook, so a stale watch
+/// would otherwise keep overwriting the current one's.
 #[cfg(feature = "chain-rpc")]
 pub async fn watch_retrieval_funds<F, Fut>(
     client: crate::ChainClient,

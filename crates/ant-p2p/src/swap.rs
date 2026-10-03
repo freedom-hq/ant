@@ -513,39 +513,119 @@ pub fn issue_cheque(
 }
 
 /// Companion to [`CreditLedger`] for OUTBOUND cheques: tracks the
-/// last cumulative amount we issued to each peer's beneficiary so
-/// the next cheque is monotonically larger. Same persistence shape
-/// as the inbound ledger, separate file by convention.
+/// last cumulative amount one chequebook issued to each peer's
+/// beneficiary so the next cheque is monotonically larger.
+///
+/// Cumulatives belong to a `(chequebook, beneficiary)` pair: bee keeps
+/// its `lastReceived` per chequebook, and a chequebook's liability
+/// (what [`Self::total_issued`] reports) is only its own cheques. So the
+/// file holds one section per chequebook and a ledger opened for one
+/// chequebook reads and rewrites only its own section. Switching the
+/// data dir to another chequebook (`--chequebook`, a fresh deploy after
+/// a rejected one) starts that chequebook from zero, and switching back
+/// finds the first one's cumulatives where they were.
+///
+/// A file written before the sections existed (a bare `beneficiary →
+/// cumulative` map) is adopted by the first chequebook that opens it and
+/// rewritten under it at once, so a second chequebook can't adopt it
+/// too. Such files only ever held pushsync cheques, which were a few
+/// million PLUR at most.
 pub struct OutboundLedger {
+    chequebook: [u8; 20],
     inner: Mutex<HashMap<String, U256>>,
     persist_path: Option<PathBuf>,
 }
 
+/// On-disk shape of the outbound ledger: `chequebook hex → (beneficiary
+/// hex → cumulative as a decimal string)`.
+#[derive(Default, Serialize, Deserialize)]
+struct OutboundFile {
+    chequebooks: HashMap<String, HashMap<String, String>>,
+}
+
+/// Serialises read-modify-write of outbound ledger files across every
+/// ledger in the process: two services (an old chequebook's still
+/// finishing a cheque, the new one's) can share one file.
+static OUTBOUND_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
+    map.into_iter()
+        .filter_map(|(k, v)| U256::from_dec_str(&v).ok().map(|u| (k, u)))
+        .collect()
+}
+
+/// Read `path`. `Ok(None)` when it doesn't exist; a file that is neither
+/// shape is an error.
+fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if let Ok(file) = serde_json::from_slice::<OutboundFile>(&bytes) {
+        return Ok(Some(file));
+    }
+    let legacy =
+        serde_json::from_slice::<HashMap<String, String>>(&bytes).map_err(std::io::Error::other)?;
+    // Marked with an empty key until a chequebook adopts it.
+    Ok(Some(OutboundFile {
+        chequebooks: HashMap::from([(String::new(), legacy)]),
+    }))
+}
+
 impl OutboundLedger {
-    pub fn open(persist_path: Option<PathBuf>) -> Self {
+    /// Open `chequebook`'s cumulatives from `persist_path` (or start
+    /// empty without one). See the type docs for the file layout.
+    pub fn open(persist_path: Option<PathBuf>, chequebook: [u8; 20]) -> Self {
+        let key = hex::encode(chequebook);
         let inner = match &persist_path {
-            Some(p) if p.exists() => match std::fs::read(p) {
-                Ok(bytes) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-                    Ok(map) => map
-                        .into_iter()
-                        .filter_map(|(k, v)| U256::from_dec_str(&v).ok().map(|u| (k, u)))
-                        .collect(),
+            None => HashMap::new(),
+            Some(p) => {
+                let _file = OUTBOUND_FILE_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match read_outbound_file(p) {
+                    Ok(None) => HashMap::new(),
+                    Ok(Some(mut file)) => {
+                        if let Some(legacy) = file.chequebooks.remove("") {
+                            info!(
+                                target: "ant_p2p::swap",
+                                chequebook = %key,
+                                "adopting an outbound ledger written before per-chequebook sections",
+                            );
+                            let mine = file.chequebooks.entry(key.clone()).or_default();
+                            for (k, v) in legacy {
+                                mine.entry(k).or_insert(v);
+                            }
+                            if let Err(e) = write_outbound_file(p, &file) {
+                                warn!(target: "ant_p2p::swap", "outbound ledger migrate: {e}");
+                            }
+                        }
+                        file.chequebooks
+                            .remove(&key)
+                            .map(parse_cumulatives)
+                            .unwrap_or_default()
+                    }
                     Err(e) => {
                         warn!(
                             target: "ant_p2p::swap",
-                            "outbound ledger unparseable: {e}; starting empty",
+                            "outbound ledger unreadable: {e}; starting empty",
                         );
                         HashMap::new()
                     }
-                },
-                Err(_) => HashMap::new(),
-            },
-            _ => HashMap::new(),
+                }
+            }
         };
         Self {
+            chequebook,
             inner: Mutex::new(inner),
             persist_path,
         }
+    }
+
+    /// Chequebook whose cheques this ledger tracks.
+    pub fn chequebook(&self) -> [u8; 20] {
+        self.chequebook
     }
 
     /// Last cumulative we issued to `beneficiary` (zero if none).
@@ -574,7 +654,8 @@ impl OutboundLedger {
     }
 
     /// Set `beneficiary` → `new_cumulative` (typically called after
-    /// a successful [`emit_cheque`]). Persists atomically.
+    /// a successful [`emit_cheque`]). Persists atomically, rewriting
+    /// only this chequebook's section of the file.
     pub fn record_issued(
         &self,
         beneficiary: &[u8; 20],
@@ -584,23 +665,32 @@ impl OutboundLedger {
         let mut guard = self.inner.lock().expect("outbound ledger poisoned");
         guard.insert(key, new_cumulative);
         if let Some(path) = &self.persist_path {
-            persist_outbound(path, &guard)?;
+            let _file = OUTBOUND_FILE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Keep other chequebooks' sections; a file we can't read is
+            // replaced (the warning at open already said so).
+            let mut file = read_outbound_file(path).ok().flatten().unwrap_or_default();
+            file.chequebooks.remove("");
+            file.chequebooks.insert(
+                hex::encode(self.chequebook),
+                guard
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect(),
+            );
+            write_outbound_file(path, &file)?;
         }
         Ok(())
     }
 }
 
-fn persist_outbound(path: &Path, map: &HashMap<String, U256>) -> std::io::Result<()> {
+fn write_outbound_file(path: &Path, file: &OutboundFile) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("json.tmp");
-    // Serialise as map<hex, dec-string> so U256 round-trips as text.
-    let dec_map: HashMap<String, String> = map
-        .iter()
-        .map(|(k, v)| (k.clone(), v.to_string()))
-        .collect();
-    let bytes = serde_json::to_vec_pretty(&dec_map).map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
@@ -1240,12 +1330,43 @@ mod tests {
         let beneficiary = [0xbbu8; 20];
 
         {
-            let ob = OutboundLedger::open(Some(path.clone()));
+            let ob = OutboundLedger::open(Some(path.clone()), [0xc1; 20]);
             assert_eq!(ob.cumulative_for(&beneficiary), U256::zero());
             ob.record_issued(&beneficiary, U256::from(42u64)).unwrap();
         }
-        let ob2 = OutboundLedger::open(Some(path));
+        let ob2 = OutboundLedger::open(Some(path), [0xc1; 20]);
         assert_eq!(ob2.cumulative_for(&beneficiary), U256::from(42u64));
+    }
+
+    /// Cumulatives belong to the chequebook that issued them (PR #126
+    /// R1-F1): another chequebook on the same file starts from zero and
+    /// owes nothing, the first one's survive its writes, and a file from
+    /// before the sections is adopted by exactly one chequebook.
+    #[test]
+    fn outbound_ledger_is_scoped_to_its_chequebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (a, b) = ([0xa0u8; 20], [0xb0u8; 20]);
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            br#"{"1111111111111111111111111111111111111111":"1500"}"#,
+        )
+        .unwrap();
+
+        let ledger_a = OutboundLedger::open(Some(path.clone()), a);
+        assert_eq!(ledger_a.cumulative_for(&peer), U256::from(1_500u64));
+        let ledger_b = OutboundLedger::open(Some(path.clone()), b);
+        assert_eq!(ledger_b.cumulative_for(&peer), U256::zero());
+        assert_eq!(ledger_b.total_issued(), U256::zero());
+
+        ledger_b.record_issued(&peer, U256::from(200u64)).unwrap();
+        ledger_a.record_issued(&peer, U256::from(1_600u64)).unwrap();
+        let reopened_b = OutboundLedger::open(Some(path.clone()), b);
+        assert_eq!(reopened_b.cumulative_for(&peer), U256::from(200u64));
+        let reopened_a = OutboundLedger::open(Some(path), a);
+        assert_eq!(reopened_a.cumulative_for(&peer), U256::from(1_600u64));
+        assert_eq!(reopened_a.total_issued(), U256::from(1_600u64));
     }
 
     /// `EmitChequePb` round-trips through prost, so any future change
