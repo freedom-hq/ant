@@ -546,6 +546,8 @@ pub async fn join_to_sender_range(
         drop(relay_tx);
         r
     });
+    // Once `out` closes, the relay ends and drops `relay_rx`, so the
+    // joiner's next send fails with `OutputClosed`, as it did on `out`.
     let relay = async move {
         while let Some(buf) = relay_rx.recv().await {
             let len = buf.len() as u64;
@@ -554,8 +556,10 @@ pub async fn join_to_sender_range(
         }
         Ok::<(), JoinError>(())
     };
-    tokio::try_join!(join, relay)?;
-    Ok(())
+    // Not `try_join!`: a join error still lets the relay hand `out`
+    // every buffer the joiner sent before it.
+    let (joined, relayed) = tokio::join!(join, relay);
+    joined.and(relayed)
 }
 
 /// Decoded layout of one intermediate chunk, shared by every tree
