@@ -1305,12 +1305,20 @@ impl SwarmState {
         entry.until = Instant::now() + delay;
     }
 
-    /// Are we cut off ourselves? With no connected bzz peer at all, an
-    /// outbound dial failure says more about our own link (no network,
-    /// Wi-Fi ↔ cellular handover, the OS suspending sockets) than about
-    /// the remote peer, so it must not be charged to that peer.
+    /// Are we cut off ourselves? Then an outbound dial failure says more
+    /// about our own link (no network, Wi-Fi ↔ cellular handover, the OS
+    /// suspending sockets) than about the remote peer, so it must not be
+    /// charged to that peer.
+    ///
+    /// An empty peer set is the obvious case. A full one proves nothing
+    /// (issue #90): after a suspend or a handover `bzz_peers` stays
+    /// populated with zombie sockets until the liveness pass closes them
+    /// (~30 s), and every dial in that window fails. So the link also
+    /// counts as down while no connection has answered a ping lately, or
+    /// none has since a stall / `Resume` / self-heal
+    /// ([`Liveness::network_unproven`]).
     fn own_connectivity_down(&self) -> bool {
-        self.bzz_peers.is_empty()
+        self.bzz_peers.is_empty() || self.liveness.network_unproven(Instant::now())
     }
 
     /// Clear the hint dedup and re-queue every peerstore entry. With
@@ -1429,7 +1437,8 @@ impl SwarmState {
 
 /// Book-keeping for an `OutgoingConnectionError` on `peer`.
 ///
-/// While our own connectivity is down (no connected bzz peer, see
+/// While our own connectivity is down (no connected bzz peer, or none of
+/// our connections answering lately, see
 /// [`SwarmState::own_connectivity_down`]) the failure is not charged to the
 /// peer at all: neither the in-memory [`DialBackoff`] nor the peerstore's
 /// consecutive-failure count moves. Both would otherwise punish every peer
@@ -1437,8 +1446,9 @@ impl SwarmState {
 /// undialed for up to [`DIAL_BACKOFF_MAX`] once the link is back, and the
 /// peerstore (worse, and permanent) by evicting them after `MAX_FAIL_COUNT`
 /// failures, which empties exactly the list the post-outage re-warm dials
-/// from. The cost is that a genuinely dead peer tried during a cold start
-/// is only charged once some other peer has connected.
+/// from. The cost is that a genuinely dead peer isn't charged for the
+/// attempts that fail during a cold start, or after a `Resume` before any
+/// connection has answered again.
 fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p: PeerId) {
     // `dial_started` is set by the two paths that *we* drive
     // (bootstrap_dial, fill_pipeline_from_hints). Any other
@@ -7520,6 +7530,10 @@ fn force_resume(
     // explicit resume after an outage must redial known-good peers now,
     // not after backoffs earned while our own link was down expire.
     let warmed = state.rewarm_from_peerstore(peerstore, local_peer_id, true);
+    // Our link may have changed under the connections we still hold:
+    // don't charge the dials this fires to the peers until some
+    // connection answers again (issue #90).
+    state.liveness.suspect_network(Instant::now());
     // Unpark the automatic guards: reset the bootstrap backoff and rewind
     // both cadence clocks so the loop-top maintenance can re-fire
     // immediately if this resume doesn't fully recover the set on its own.
@@ -8719,6 +8733,7 @@ async fn forward_lurker_messages(
 mod tests {
     use super::*;
     use libp2p::identity::Keypair;
+    use libp2p::swarm::ConnectionId;
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
@@ -9711,6 +9726,17 @@ mod tests {
         store
     }
 
+    /// A connected bzz peer whose connection just answered a ping, as the
+    /// swarm loop records it (`ConnectionEstablished` + a pong). Returns
+    /// the connection so a test can pong on it again.
+    fn connect_answering(state: &mut SwarmState, peer: PeerId) -> ConnectionId {
+        let conn = ConnectionId::new_unchecked(state.bzz_peers.len() + 1000);
+        state.bzz_peers.insert(peer);
+        state.liveness.on_established(conn, peer, Instant::now());
+        state.liveness.on_pong(conn, Instant::now());
+        conn
+    }
+
     /// Drive a tracked dial to `peer` failing through the same handler the
     /// `OutgoingConnectionError` arm calls (backoff + peerstore).
     fn fail_tracked_dial(state: &mut SwarmState, peerstore: &mut PeerStore, peer: PeerId) {
@@ -9733,7 +9759,7 @@ mod tests {
 
         // Backoff earned while connected (so the handler does charge it).
         let mut state = backoff_test_state();
-        state.bzz_peers.insert(live);
+        let live_conn = connect_answering(&mut state, live);
         fail_tracked_dial(&mut state, &mut peerstore, known);
         fail_tracked_dial(&mut state, &mut peerstore, stranger);
         assert!(state.dial_backed_off(&known) && state.dial_backed_off(&stranger));
@@ -9761,6 +9787,9 @@ mod tests {
 
         // maybe_top_up_peers below the floor but with a surviving peer:
         // not a collapse, so backoffs stand and the hint is not dialed.
+        // (The surviving connection answers after the resume, so the
+        // failure is charged again.)
+        state.liveness.on_pong(live_conn, Instant::now());
         fail_tracked_dial(&mut state, &mut peerstore, known);
         assert!(state.dial_backed_off(&known));
         let mut last_top_up_at = Instant::now().checked_sub(PEER_TOP_UP_INTERVAL).unwrap();
@@ -9803,7 +9832,7 @@ mod tests {
         );
 
         // Connected again: failures are charged to the peer as before.
-        state.bzz_peers.insert(pid());
+        connect_answering(&mut state, pid());
         fail_tracked_dial(&mut state, &mut peerstore, peer);
         assert!(state.dial_backed_off(&peer));
         for _ in 0..10 {
@@ -9815,6 +9844,82 @@ mod tests {
         );
     }
 
+    /// Issue #90: after a suspend or a network handover `bzz_peers` stays
+    /// full of zombie sockets until the liveness pass closes them, and
+    /// every dial in that window fails because *our* link is gone. Those
+    /// failures must not back the peers off or evict them from the
+    /// peerstore — the list the post-outage re-warm dials from. Same for
+    /// the dials a `Resume` / self-heal fires before any connection has
+    /// answered again.
+    #[tokio::test]
+    async fn dial_failures_not_charged_on_zombie_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer, other) = (pid(), pid());
+        let mut peerstore = peerstore_with(dir.path(), &[peer, other]);
+        let mut state = backoff_test_state();
+        let local = pid();
+        let (tx, _rx) = mpsc::channel::<Multiaddr>(8);
+
+        // Zombies: connected, but nothing has answered for longer than
+        // the proof window (no pong since the link died).
+        let silent_since = Instant::now()
+            .checked_sub(LivenessConfig::DEFAULT.proof_window + Duration::from_secs(1))
+            .unwrap();
+        for n in 0..3 {
+            let zombie = pid();
+            state.bzz_peers.insert(zombie);
+            state
+                .liveness
+                .on_established(ConnectionId::new_unchecked(n), zombie, silent_since);
+        }
+        assert!(state.liveness.stale_peers(Instant::now()).is_empty());
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, peer);
+        }
+        assert!(!state.dial_backed_off(&peer), "not backed off");
+        assert!(
+            peerstore.contains(&peer),
+            "zombie-window failures must not evict a known-good peer"
+        );
+
+        // A connection that still answers proves the link: charged again.
+        let live = connect_answering(&mut state, pid());
+        fail_tracked_dial(&mut state, &mut peerstore, peer);
+        assert!(state.dial_backed_off(&peer));
+
+        // `Resume` (or a self-heal) after a handover: the redials it
+        // fires fail while the old connections haven't answered again.
+        let mut backoff = MAX_BACKOFF;
+        let (mut last_bootstrap_at, mut last_top_up_at) = (Instant::now(), Instant::now());
+        force_resume(
+            &[],
+            &mut state,
+            &peerstore,
+            &mut backoff,
+            &mut last_bootstrap_at,
+            &mut last_top_up_at,
+            local,
+            &tx,
+        );
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, other);
+        }
+        assert!(!state.dial_backed_off(&other));
+        assert!(
+            peerstore.contains(&other),
+            "dials before the first answer after a resume must not evict"
+        );
+
+        // The first answer after the resume: a dead peer is charged and,
+        // eventually, evicted as before.
+        state.liveness.on_pong(live, Instant::now());
+        for _ in 0..10 {
+            fail_tracked_dial(&mut state, &mut peerstore, other);
+        }
+        assert!(state.dial_backed_off(&other));
+        assert!(!peerstore.contains(&other), "a dead peer is still evicted");
+    }
+
     /// A backed-off hint popped by the fill loop must not be discarded
     /// while its peer stays in `seen_hints` (which would keep gossip from
     /// ever re-queueing it): it leaves the dedup, gossip re-queues it, and
@@ -9822,7 +9927,7 @@ mod tests {
     #[test]
     fn backed_off_hint_leaves_dedup_for_requeue() {
         let mut state = backoff_test_state();
-        state.bzz_peers.insert(pid());
+        connect_answering(&mut state, pid());
         let mut peerstore = PeerStore::disabled();
         let local = pid();
         let (dead, good) = (pid(), pid());

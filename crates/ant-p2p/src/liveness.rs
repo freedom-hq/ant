@@ -38,6 +38,15 @@
 //! monotonic clock (Linux/Android system suspend) leaves no visible gap, but
 //! then the pongs don't look old either: the regular rules apply in awake
 //! time and close the dead sockets within one `live_window + close_grace`.
+//!
+//! **Our own link (issue #90).** The same pongs tell whether *our* network
+//! works at all: [`Liveness::network_unproven`] is true while no connection
+//! has answered within [`LivenessConfig::proof_window`], or none has since
+//! the network was last suspected to have changed under us (a loop stall,
+//! or a `Resume` / self-heal, see [`Liveness::suspect_network`]). The swarm
+//! loop doesn't charge outbound dial failures to the remote peer then:
+//! with zombie sockets still in `bzz_peers` after a suspend or a handover,
+//! a non-empty peer set says nothing about whether the link works.
 
 use libp2p::swarm::ConnectionId;
 use libp2p::PeerId;
@@ -77,6 +86,12 @@ pub(crate) struct LivenessConfig {
     /// At most one self-heal per this window, so a genuinely unreachable
     /// chunk can't cause a redial storm.
     pub self_heal_cooldown: Duration,
+    /// Our own network counts as working while some connection answered a
+    /// ping (or was established) within this window. Two ping intervals:
+    /// with any live peer a pong arrives at least every `ping_interval`,
+    /// so a gap of two means none of them got through. Erring short only
+    /// stops charging dial failures to peers for a moment.
+    pub proof_window: Duration,
 }
 
 impl LivenessConfig {
@@ -89,6 +104,7 @@ impl LivenessConfig {
         stall_gap: Duration::from_secs(10),
         self_heal_streak: 8,
         self_heal_cooldown: Duration::from_mins(1),
+        proof_window: Duration::from_secs(10),
     };
 }
 
@@ -117,6 +133,13 @@ pub(crate) struct Liveness {
     resumed_at: Option<Instant>,
     last_tick: Instant,
     last_self_heal: Option<Instant>,
+    /// Last moment the network answered us: a pong on any connection, or
+    /// a connection established. See [`Self::network_unproven`].
+    last_proof: Option<Instant>,
+    /// Last moment our network was suspected to have changed under us
+    /// (loop stall, `Resume`, self-heal). A proof older than this doesn't
+    /// count.
+    suspect_since: Option<Instant>,
 }
 
 impl Liveness {
@@ -127,6 +150,8 @@ impl Liveness {
             resumed_at: None,
             last_tick: now,
             last_self_heal: None,
+            last_proof: None,
+            suspect_since: None,
         }
     }
 
@@ -140,6 +165,7 @@ impl Liveness {
                 closing: false,
             },
         );
+        self.last_proof = Some(now);
     }
 
     pub(crate) fn on_closed(&mut self, conn: ConnectionId) {
@@ -150,6 +176,27 @@ impl Liveness {
         if let Some(c) = self.conns.get_mut(&conn) {
             c.last_ok = now;
         }
+        self.last_proof = Some(now);
+    }
+
+    /// Our network may have changed under us (the host's `Resume` after a
+    /// suspend or a network change, or a self-heal on failing retrievals):
+    /// until a connection answers again, [`Self::network_unproven`] holds.
+    pub(crate) fn suspect_network(&mut self, now: Instant) {
+        self.suspect_since = Some(now);
+    }
+
+    /// Is there no recent evidence that our own network works? True when
+    /// no connection answered a ping or was established within
+    /// [`LivenessConfig::proof_window`], or none did since
+    /// [`Self::suspect_network`] / a loop stall. Connections whose peer
+    /// doesn't speak ping never prove anything here (bee always does).
+    pub(crate) fn network_unproven(&self, now: Instant) -> bool {
+        let Some(proof) = self.last_proof else {
+            return true;
+        };
+        now.saturating_duration_since(proof) > self.cfg.proof_window
+            || self.suspect_since.is_some_and(|s| proof < s)
     }
 
     /// The swarm was asked to close `conn`; see [`Conn::closing`].
@@ -174,6 +221,7 @@ impl Liveness {
         self.last_tick = now;
         if gap >= self.cfg.stall_gap {
             self.resumed_at = Some(now);
+            self.suspect_network(now);
             true
         } else {
             false
@@ -369,6 +417,43 @@ mod tests {
         assert_eq!(l.stale_connections(now), vec![]);
         l.on_closed(conn(1));
         assert!(l.conns.is_empty());
+    }
+
+    /// Issue #90: a populated peer set doesn't prove our link works. The
+    /// network is proven only by a recent pong or a new connection, and a
+    /// suspected change (stall, `Resume`) voids the proofs before it.
+    #[test]
+    fn network_is_proven_only_by_recent_answers() {
+        let t0 = Instant::now();
+        let mut l = Liveness::new(CFG, t0);
+        let a = PeerId::random();
+        assert!(l.network_unproven(t0), "nothing answered yet");
+        l.on_established(conn(1), a, t0);
+        assert!(!l.network_unproven(t0));
+        // Zombie socket: still connected, but no pong for a while.
+        let quiet = t0 + CFG.proof_window + Duration::from_millis(1);
+        assert!(l.network_unproven(quiet));
+        assert!(
+            l.stale_peers(quiet).is_empty(),
+            "noticed before the peer stops counting"
+        );
+        l.on_pong(conn(1), quiet);
+        assert!(!l.network_unproven(quiet));
+
+        // `Resume`: earlier answers no longer count, the next one does.
+        let resume = quiet + Duration::from_secs(1);
+        l.suspect_network(resume);
+        assert!(l.network_unproven(resume));
+        l.on_pong(conn(1), resume + Duration::from_millis(100));
+        assert!(!l.network_unproven(resume + Duration::from_millis(100)));
+
+        // A loop stall does the same.
+        let thawed = resume + Duration::from_secs(3);
+        assert!(l.tick(thawed));
+        assert!(l.network_unproven(thawed));
+        let b = PeerId::random();
+        l.on_established(conn(2), b, thawed + Duration::from_secs(1));
+        assert!(!l.network_unproven(thawed + Duration::from_secs(1)));
     }
 
     #[test]
