@@ -812,6 +812,18 @@ impl PeerInfo {
     pub fn live_connected_count(connected_peers: &[PeerConnectionInfo]) -> u32 {
         u32::try_from(connected_peers.iter().filter(|p| !p.stale).count()).unwrap_or(u32::MAX)
     }
+
+    /// The node has a peer it can serve retrievals through: a routing-table
+    /// peer that answers pings and isn't a bootnode on its way out
+    /// ([`RoutingInfo::serving`]). What `/readiness` reports (#78). Not
+    /// `connected`, which also counts libp2p connections still in the BZZ
+    /// handshake, and not the routing table's `size`: a cold node's first
+    /// handshaked peer is always a bootnode, which resets the connection
+    /// within milliseconds and never serves a chunk.
+    #[must_use]
+    pub fn can_retrieve(&self) -> bool {
+        self.routing.serving > 0
+    }
 }
 
 /// Snapshot of the forwarding-Kademlia routing table: how many BZZ peers
@@ -830,6 +842,17 @@ pub struct RoutingInfo {
     /// Per-bin connected peer counts. Always 32 elements when populated.
     #[serde(default)]
     pub bins: Vec<u32>,
+    /// Routing-table peers the node can serve retrievals through: every
+    /// entry except one whose connection stopped answering pings (stale,
+    /// #83) and a bootnode that joined less than a few seconds ago.
+    /// Mainnet bootnodes hand out their peer list and reset the
+    /// connection within milliseconds of the handshake (bee's bootnode
+    /// mode), and bee never sends a protocol request to a bootnode
+    /// anyway (`topology.Select.IncludeBootnodes`). A bootnode that stays
+    /// connected — a private network's only node — counts after the
+    /// grace. `/readiness` is `serving > 0`. Zero on older daemons.
+    #[serde(default)]
+    pub serving: u32,
     /// Total known peers (connected + hive-discovered-but-unconnected),
     /// deduped by overlay. Always `>= size`. Zero on older daemons that
     /// didn't track a known-peer book.
@@ -1091,6 +1114,29 @@ impl GatewayRequestKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `can_retrieve` (what `/readiness` reports, #78) follows the routing
+    /// table's serving peers only: open libp2p connections (a bootnode
+    /// mid-handshake, a handshaked row whose peer left the table) and a
+    /// routing table holding just a bootnode don't make a node ready.
+    #[test]
+    fn can_retrieve_follows_the_routing_table_not_connections() {
+        let mut peers = PeerInfo {
+            connected: 2,
+            connected_peers: vec![PeerConnectionInfo {
+                peer_id: "12D3KooWBootnode".into(),
+                bzz_overlay: Some(format!("0x{}", "ab".repeat(32))),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!peers.can_retrieve(), "connections alone are not readiness");
+        // A bootnode in the routing table: in it, but not serving.
+        peers.routing.size = 1;
+        assert!(!peers.can_retrieve(), "a bootnode alone is not readiness");
+        peers.routing.serving = 1;
+        assert!(peers.can_retrieve());
+    }
 
     /// Catch the "tagged newtype variant containing a sequence" trap
     /// before it reaches a live socket: serde's internally-tagged enum

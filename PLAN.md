@@ -2518,7 +2518,7 @@ Methods listed are the ones we serve; bee's other methods on the same path retur
 | Path | Methods | Tier | Notes |
 |---|---|---|---|
 | `/health` | GET | A | `{status:"ok", version, apiVersion}`. |
-| `/readiness` | GET | A | `200` once routing table has ≥1 BZZ-handshaked peer; else `503`. |
+| `/readiness` | GET | A | `200` once routing table has ≥1 BZZ-handshaked peer that isn't a fresh bootnode (#78); else `503`. |
 | `/node` | GET | A | `{beeMode}`: `"ultra-light"` until SWAP lights up, then `"light"`. |
 | `/addresses` | GET | A | `{ethereum, overlay, public_key, pss_public_key:null, underlay:[...]}`. |
 | `/peers` | GET | A | `{peers: [...]}` from `ant-p2p` snapshot. |
@@ -2617,7 +2617,7 @@ Single capability: a bee-shaped read-only HTTP surface on `127.0.0.1:1633`, suff
 | Endpoint | Source |
 |---|---|
 | `GET /health` | static — version from `env!("CARGO_PKG_VERSION")` |
-| `GET /readiness` | `ant-p2p` peer snapshot ≥ 1 BZZ-handshaked peer |
+| `GET /readiness` | `ant-p2p` routing snapshot: ≥ 1 serving BZZ peer — not stale, and a bootnode only after 5 s in the table (#78) |
 | `GET /node` | hardcoded `{beeMode:"ultra-light", chequebookEnabled:false, swapEnabled:false}` |
 | `GET /addresses` | existing identity in `antd::main` (overlay, ethereum, libp2p public key) |
 | `GET /peers` | `ant-p2p` peer snapshot |

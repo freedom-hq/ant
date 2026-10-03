@@ -783,6 +783,14 @@ struct SwarmState {
     failed: Vec<PeerFailure>,
     pending: HashMap<PeerId, PendingPhase>,
     bzz_peers: HashSet<PeerId>,
+    /// Peer ids we dialed as bootnodes ([`handle_bootnode_dial`]). They
+    /// count toward `RoutingInfo::serving` (`/readiness`) only after
+    /// [`BOOTNODE_SERVING_GRACE`] in the routing table — see
+    /// [`serving_peer_count`].
+    bootnode_peers: HashSet<PeerId>,
+    /// When each routing-table entry was admitted. Removed with the entry
+    /// on `ConnectionClosed`.
+    routing_admitted_at: HashMap<PeerId, Instant>,
     /// Total cold-start time (dial + identify + handshake, in ms) for each
     /// peer that has reached `Ready`. Surfaced as `ready_in_ms` on the
     /// pipeline rows so `antop` can show the column and rank slow
@@ -1061,6 +1069,8 @@ impl SwarmState {
             failed: Vec::new(),
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
+            bootnode_peers: HashSet::new(),
+            routing_admitted_at: HashMap::new(),
             ready_in_ms: HashMap::new(),
             routing: RoutingTable::new(base_overlay),
             known: KnownPeers::new(base_overlay),
@@ -1608,7 +1618,7 @@ fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mu
         .dial_backoff
         .retain(|_, b| now.saturating_duration_since(b.until) < DIAL_BACKOFF_MAX);
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(&state.routing, &state.known);
+    let routing = routing_snapshot(state, Instant::now());
     let retrieval = build_retrieval_info(state);
     tx.send_modify(|st| {
         st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
@@ -1665,30 +1675,61 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
 }
 
 /// Build a `RoutingInfo` that mirrors the live routing table for the
-/// control snapshot. Cheap (32 entries) so we recompute on every pipeline
-/// sync rather than try to track deltas.
-fn routing_snapshot(table: &RoutingTable, known: &KnownPeers) -> RoutingInfo {
+/// control snapshot. Cheap (32 entries plus one pass over the table) so
+/// we recompute on every pipeline sync rather than try to track deltas.
+fn routing_snapshot(state: &SwarmState, now: Instant) -> RoutingInfo {
+    let table = &state.routing;
+    let known = &state.known;
     let counts = table.bin_counts();
     let known_counts = known.bin_counts();
     RoutingInfo {
         base_overlay: format!("0x{}", hex::encode(table.base())),
         size: table.len() as u32,
         bins: counts.iter().map(|c| u32::from(*c)).collect(),
+        serving: serving_peer_count(state, now),
         known_size: known.len() as u32,
         known_bins: known_counts.to_vec(),
     }
 }
 
+/// How long a bootnode must stay in the routing table before it counts as
+/// a serving peer (`RoutingInfo::serving`, `/readiness`). Mainnet
+/// bootnodes run bee's bootnode mode: they hand out peers and reset the
+/// connection 3–600 ms after the handshake (#78), so they never get
+/// here. A bootnode that does stay — a private network's only node,
+/// which ant does route through — makes the node ready after this.
+const BOOTNODE_SERVING_GRACE: Duration = Duration::from_secs(5);
+
+/// Routing-table peers the node can serve retrievals through at `now`:
+/// every entry except one whose connections stopped answering pings
+/// ([`Liveness::stale_peers`], #83) and a bootnode admitted less than
+/// [`BOOTNODE_SERVING_GRACE`] ago. The pipeline sync (every
+/// [`PIPELINE_SYNC_INTERVAL`]) republishes it, so a peer going stale, or
+/// a bootnode that stays, is reflected within one tick.
+fn serving_peer_count(state: &SwarmState, now: Instant) -> u32 {
+    let stale = state.liveness.stale_peers(now);
+    state
+        .routing
+        .snapshot()
+        .iter()
+        .filter(|(peer, _)| !stale.contains(peer))
+        .filter(|(peer, _)| {
+            !state.bootnode_peers.contains(peer)
+                || state
+                    .routing_admitted_at
+                    .get(peer)
+                    .is_some_and(|at| now.saturating_duration_since(*at) >= BOOTNODE_SERVING_GRACE)
+        })
+        .count() as u32
+}
+
 /// Push a routing-only update to the status snapshot. Used right after
-/// `routing.admit` so `antop` reflects new peers without waiting for
-/// the next pipeline-sync tick.
-fn sync_routing_snapshot(
-    status: Option<&watch::Sender<StatusSnapshot>>,
-    table: &RoutingTable,
-    known: &KnownPeers,
-) {
+/// `routing.admit` and `routing.forget` so `antop` and the gateway's
+/// `/readiness` (`PeerInfo::can_retrieve`) reflect the table without
+/// waiting for the next pipeline-sync tick.
+fn sync_routing_snapshot(status: Option<&watch::Sender<StatusSnapshot>>, state: &SwarmState) {
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(table, known);
+    let routing = routing_snapshot(state, Instant::now());
     tx.send_modify(|st| st.peers.routing = routing);
 }
 
@@ -1877,6 +1918,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
     };
+    // Know the bootnodes before the first warm dial: a stored bootnode is
+    // dialed from the hint queue long before `/dnsaddr/` resolution (if
+    // it succeeds at all) tags it in `handle_bootnode_dial`.
+    seed_bootnode_tags(&mut state, &peerstore, &cfg.bootnodes);
     // Warm the dial pipeline from the on-disk snapshot before the bootnode
     // dial fires. The bootnode dial still runs as a fallback — if every
     // stored peer is dead, the bootnodes carry us back into the network.
@@ -2035,6 +2080,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 state.enqueue_hint(hint, local_peer_id);
             }
             Some(addr) = bootnode_dial_rx.recv() => {
+                if let Some(peer) = crate::dial::extract_peer_id(&addr) {
+                    // Already handshaked from a warm hint: flag the stored
+                    // entry now, the handshake that would flag it is past.
+                    peerstore.mark_bootnode(&peer);
+                }
                 handle_bootnode_dial(&mut swarm, &mut state, addr);
             }
             Some(target) = neighborhood_dial_rx.recv() => {
@@ -7836,6 +7886,7 @@ fn handle_swarm_event(
             // forwarder would keep picking a peer we have no live
             // connection to.
             state.routing.forget(&peer_id);
+            state.routing_admitted_at.remove(&peer_id);
             // Drop the accounting mirror for this peer too: bee's
             // `notifyPeerConnect` resets the `accountingPeer` on
             // reconnect, so our balance must reset alongside.
@@ -7854,6 +7905,10 @@ fn handle_swarm_event(
             // check). Idempotent on peers we never had a handshake for.
             state.peer_eth.forget(&peer_id);
             state.publish_peers();
+            // Keep the status snapshot's routing size in step with the
+            // table: `/readiness` reads it, and must go back to 503 as
+            // soon as the last peer drops, not at the next pipeline tick.
+            sync_routing_snapshot(status, state);
             if was_bzz {
                 info!(
                     target: "ant_p2p",
@@ -7940,7 +7995,9 @@ fn handle_ping_event(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, ev
 ///    what `ControlCommand::Resume` does ([`force_resume`]), at most once
 ///    per [`LivenessConfig::self_heal_cooldown`];
 /// 4. publish which connected peers are stale, so `peers.connected`
-///    (`ant_peer_count`, `/readiness`) counts only live ones.
+///    (`ant_peer_count`) counts only live ones. `/readiness` reads
+///    `RoutingInfo::serving`, which skips stale peers itself
+///    ([`serving_peer_count`]).
 #[allow(clippy::too_many_arguments)]
 fn maintain_liveness(
     swarm: &mut Swarm<AntBehaviour>,
@@ -8091,6 +8148,10 @@ fn handle_drive_outcome(
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.
             state.routing.admit(peer, info.remote_overlay);
+            state
+                .routing_admitted_at
+                .entry(peer)
+                .or_insert_with(Instant::now);
             // A connected peer is also a known peer (so population is
             // always >= connected). Idempotent if hive already noted it.
             state.known.note(info.remote_overlay);
@@ -8118,7 +8179,7 @@ fn handle_drive_outcome(
                 &info,
                 peer_agents.get(&peer).cloned(),
             );
-            sync_routing_snapshot(cfg.status.as_ref(), &state.routing, &state.known);
+            sync_routing_snapshot(cfg.status.as_ref(), state);
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive
@@ -8136,6 +8197,9 @@ fn handle_drive_outcome(
                 bzz_ts,
                 info.remote_chequebook,
             );
+            if state.bootnode_peers.contains(&peer) {
+                peerstore.mark_bootnode(&peer);
+            }
         }
         DriveOutcome::OpenFailed(e) => {
             debug!(target: "ant_p2p", %peer, "open handshake stream: {e}");
@@ -8571,6 +8635,20 @@ fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr
     });
 }
 
+/// Tag every peer known to be a bootnode before any dial goes out: the
+/// configured bootnode multiaddrs that carry a `/p2p/` id, and the stored
+/// peers a previous run dialed as bootnodes ([`PeerStore::bootnodes`]).
+/// `/dnsaddr/` entries are tagged later, as their leaves resolve
+/// ([`handle_bootnode_dial`]); without this a warm-started node dials a
+/// stored bootnode from the hint queue first and, if resolution is slow or
+/// fails, counts it as a serving peer for `/readiness` at once (#78).
+fn seed_bootnode_tags(state: &mut SwarmState, peerstore: &PeerStore, bootnodes: &[Multiaddr]) {
+    state
+        .bootnode_peers
+        .extend(bootnodes.iter().filter_map(crate::dial::extract_peer_id));
+    state.bootnode_peers.extend(peerstore.bootnodes());
+}
+
 /// Drain one bootnode multiaddr from the channel and dial it from the
 /// swarm-event-loop task. Mirrors the bookkeeping `bootstrap_dial` used
 /// to do inline: skips peers we're already connected to (or already
@@ -8581,6 +8659,7 @@ fn handle_bootnode_dial(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState,
     let Some(peer) = crate::dial::extract_peer_id(&addr) else {
         return;
     };
+    state.bootnode_peers.insert(peer);
     if swarm.is_connected(&peer) || state.dialing.contains(&peer) {
         return;
     }
@@ -9979,6 +10058,153 @@ mod tests {
             bin_balance_candidates(&base, &saturated, &known, |_| false).is_empty(),
             "balanced table must produce no dials",
         );
+    }
+
+    /// `/readiness` (#78) counts routing peers that can serve: a bootnode
+    /// counts only after `BOOTNODE_SERVING_GRACE` in the table (mainnet
+    /// bootnodes reset the connection milliseconds after the handshake),
+    /// any other routing peer at once, and never a forgotten peer. Stale
+    /// peers: `serving_peer_count_skips_stale_peers`.
+    #[test]
+    fn serving_peer_count_skips_fresh_bootnodes() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let t0 = Instant::now();
+        let boot = pid();
+        state.bootnode_peers.insert(boot);
+        state.routing.admit(boot, [1u8; 32]);
+        state.routing_admitted_at.insert(boot, t0);
+        assert_eq!(serving_peer_count(&state, t0), 0, "fresh bootnode");
+        let snap = routing_snapshot(&state, t0);
+        assert_eq!((snap.size, snap.serving), (1, 0));
+        assert_eq!(
+            serving_peer_count(
+                &state,
+                t0 + BOOTNODE_SERVING_GRACE.saturating_sub(Duration::from_millis(1))
+            ),
+            0,
+        );
+        assert_eq!(
+            serving_peer_count(&state, t0 + BOOTNODE_SERVING_GRACE),
+            1,
+            "a bootnode that stays (private network) counts after the grace",
+        );
+
+        let peer = pid();
+        state.routing.admit(peer, [2u8; 32]);
+        state.routing_admitted_at.insert(peer, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1, "gossiped peer at once");
+
+        state.routing.forget(&peer);
+        state.routing_admitted_at.remove(&peer);
+        assert_eq!(serving_peer_count(&state, t0), 0);
+    }
+
+    /// A routing peer whose connection stopped answering pings (#83)
+    /// doesn't count toward `RoutingInfo::serving` while it waits to be
+    /// closed as dead — the staleness half of `/readiness`. The gateway
+    /// only reads the published `serving` figure, so this is the one test
+    /// that catches `serving_peer_count` counting a stale peer.
+    #[test]
+    fn serving_peer_count_skips_stale_peers() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let t0 = Instant::now();
+        let quiet = pid();
+        state.routing.admit(quiet, [3u8; 32]);
+        state.routing_admitted_at.insert(quiet, t0);
+        state
+            .liveness
+            .on_established(libp2p::swarm::ConnectionId::new_unchecked(1), quiet, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1, "answering pings");
+        let silent = t0 + LivenessConfig::DEFAULT.live_window + Duration::from_secs(1);
+        assert!(state.liveness.stale_peers(silent).contains(&quiet));
+        assert_eq!(serving_peer_count(&state, silent), 0, "stale-only table");
+        let snap = routing_snapshot(&state, silent);
+        assert_eq!(
+            (snap.size, snap.serving),
+            (1, 0),
+            "in the table, not serving"
+        );
+
+        // A live peer alongside it still serves; the stale one stays out.
+        let live = pid();
+        state.routing.admit(live, [4u8; 32]);
+        state.routing_admitted_at.insert(live, silent);
+        assert_eq!(serving_peer_count(&state, silent), 1);
+    }
+
+    /// A warm start dials stored peers from the hint queue before the
+    /// `/dnsaddr/` bootnode list resolves (or when it never does). A
+    /// bootnode the previous run persisted must still be tagged, so it
+    /// doesn't make `/readiness` 200 on its own (#78): `seed_bootnode_tags`
+    /// reads the flag back from `peers.json` and the configured `/p2p/`
+    /// ids, with this run's resolution failing outright.
+    #[test]
+    fn warm_start_tags_stored_bootnodes_without_dnsaddr_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let boot = pid();
+        let gossiped = pid();
+        {
+            // Previous run: both handshaked, `boot` dialed as a bootnode.
+            let mut store = PeerStore::load(path.clone());
+            let addr: Multiaddr = "/ip4/192.0.2.1/tcp/1634".parse().unwrap();
+            store.record_success(boot, vec![addr.clone()], [1u8; 32], 0, None);
+            store.record_success(gossiped, vec![addr], [2u8; 32], 0, None);
+            store.mark_bootnode(&boot);
+            store.flush();
+        }
+        let peerstore = PeerStore::load(path);
+        let static_boot = pid();
+        let bootnodes: Vec<Multiaddr> = vec![
+            "/dnsaddr/nonexistent.invalid".parse().unwrap(),
+            format!("/ip4/192.0.2.2/tcp/1634/p2p/{static_boot}")
+                .parse()
+                .unwrap(),
+        ];
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        seed_bootnode_tags(&mut state, &peerstore, &bootnodes);
+        assert!(state.bootnode_peers.contains(&boot), "stored bootnode");
+        assert!(
+            state.bootnode_peers.contains(&static_boot),
+            "configured /p2p/ id"
+        );
+        assert!(!state.bootnode_peers.contains(&gossiped));
+
+        let t0 = Instant::now();
+        state.routing.admit(boot, [1u8; 32]);
+        state.routing_admitted_at.insert(boot, t0);
+        assert_eq!(
+            serving_peer_count(&state, t0),
+            0,
+            "a warm-dialed stored bootnode alone is not ready",
+        );
+        state.routing.admit(gossiped, [2u8; 32]);
+        state.routing_admitted_at.insert(gossiped, t0);
+        assert_eq!(serving_peer_count(&state, t0), 1);
     }
 
     /// Pin the contract that `publish_peers` actually republishes the

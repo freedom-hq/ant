@@ -34,7 +34,8 @@ async fn health_returns_ok_status_with_versions() {
     assert_eq!(json["apiVersion"], "7.2.0");
 }
 
-/// `/readiness` answers 200 once we have at least one BZZ-handshaked peer.
+/// `/readiness` answers 200 once a BZZ-handshaked peer that can serve is
+/// in the routing table.
 #[tokio::test]
 async fn readiness_200_when_peer_handshaked() {
     let router = status_only_router(snapshot_with_one_peer());
@@ -74,12 +75,20 @@ async fn readiness_503_when_no_peers() {
 
 /// Issue #83: a handshaked peer whose connection stopped answering
 /// pings (`stale`) doesn't make the node ready — that was the probe gate
-/// hosts were lied to by while every retrieval hung.
+/// hosts were lied to by while every retrieval hung. The gateway can't
+/// see staleness itself: it answers from the published
+/// `RoutingInfo::serving`, which the node loop's `serving_peer_count`
+/// computes without stale peers. That half is covered by
+/// `ant_p2p`'s `serving_peer_count_skips_stale_peers`; this test pins the
+/// gateway half: a stale-only snapshot, as the node loop publishes it,
+/// answers 503.
 #[tokio::test]
-async fn readiness_503_when_the_only_peer_is_stale() {
+async fn readiness_503_for_a_stale_only_snapshot() {
     let mut snap = snapshot_with_one_peer();
     snap.peers.connected_peers[0].stale = true;
     snap.peers.connected = 0;
+    // What `serving_peer_count` publishes for a stale-only table.
+    snap.peers.routing.serving = 0;
     let router = status_only_router(snap);
     let resp = send(
         router,
@@ -91,6 +100,39 @@ async fn readiness_503_when_the_only_peer_is_stale() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// `/readiness` stays 503 until a routing peer can serve (#78), however
+/// many libp2p connections are open. A cold node's first connection, and
+/// its first routing-table entry, is a bootnode that resets the connection
+/// right after the handshake; while that's all it has, every `/bzz`
+/// answers 502 "no peers available".
+#[tokio::test]
+async fn readiness_503_until_a_routing_peer_can_serve() {
+    // Connections, a handshaked row, even a routing-table entry — but it's
+    // a fresh bootnode, so nothing serves.
+    let mut bootnode_only = snapshot_with_one_peer();
+    bootnode_only.peers.connected = 3;
+    bootnode_only.peers.routing.serving = 0;
+    // Connections alone, with an empty routing table.
+    let mut connections_only = bootnode_only.clone();
+    connections_only.peers.routing.size = 0;
+    connections_only.peers.routing.bins = vec![0; 32];
+    for snap in [bootnode_only, connections_only] {
+        let router = status_only_router(snap);
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readiness")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["status"], "unready");
+    }
 }
 
 #[tokio::test]

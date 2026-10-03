@@ -51,21 +51,27 @@ pub async fn health(State(handle): State<GatewayHandle>) -> Response {
     .into_response()
 }
 
-/// `GET /readiness`. `200` once we have at least one BZZ-handshaked
-/// peer; `503` until then. Bee marshals a JSON status body in BOTH cases
+/// `GET /readiness`. `200` once the node can serve a retrieval — a
+/// BZZ-handshaked peer in its routing table that isn't stale, where a
+/// bootnode counts only after a 5 s grace in the table (so a private
+/// network whose only peer is its bootnode still turns ready;
+/// [`ant_control::PeerInfo::can_retrieve`], `RoutingInfo::serving`) —
+/// and `503` until then, or again if every such peer drops. Until #78 a bare libp2p connection
+/// counted, so a cold node reported ready ~50–250 ms after start on its
+/// first bootnode connection, which resets right after the handshake;
+/// when the bootnodes kept doing that, every `/bzz` answered 502 "no
+/// peers available" for up to a minute after `200`. Bee flips readiness
+/// once its components are constructed and never routes a request
+/// through a bootnode; a light ant node's only component that can't
+/// serve at once is its peer set, so readiness waits for it. Peers whose
+/// connection stopped answering pings (`stale`, issue #83) don't make the
+/// node ready either. Bee marshals a JSON status body in BOTH cases
 /// (`{"status":"ready",…}` / `{"status":"unready",…}`, same shape as
 /// `/health`) — bee-js and our Swift `BeeReadiness` both index `status`,
 /// so a bodyless `200` reads as not-ready. We mirror `/health`'s body.
-/// Peers whose connection stopped answering pings (`stale`, issue #83)
-/// don't make the node ready.
 pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
     let snap = handle.status.borrow();
-    let ready = snap.peers.connected > 0
-        || snap
-            .peers
-            .connected_peers
-            .iter()
-            .any(|p| p.bzz_overlay.is_some() && !p.stale);
+    let ready = snap.peers.can_retrieve();
     let body = Json(HealthBody {
         status: if ready { "ready" } else { "unready" },
         version: handle.agent.as_str().to_string(),
