@@ -7712,7 +7712,12 @@ fn handle_swarm_event(
                 // Another connection to this peer is still open (a dial
                 // race left a duplicate, or liveness closed a dead one
                 // next to a live one): the peer, its BZZ session and its
-                // routing entry stay.
+                // routing entry stay. The closed connection may have
+                // carried a SWAP cheque stream, though, so its payment
+                // must not count as delivered: a new session for the
+                // peer makes `PushsyncSwap`'s delivery check fail for
+                // any cheque in flight (the EOA stays).
+                state.peer_eth.renew_session(&peer_id);
                 debug!(
                     target: "ant_p2p",
                     %peer_id,

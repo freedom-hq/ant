@@ -136,6 +136,20 @@ impl PeerEthMap {
         }
     }
 
+    /// Start a new session for `peer`, keeping its EOA. Called from the
+    /// swarm's `ConnectionClosed` handler when one of the peer's
+    /// connections closes while another stays open: a cheque stream may
+    /// have run on the closed one (it can't be told which), so a payment
+    /// in flight must see that its connection may be gone, while the
+    /// peer itself stays handshaken. No-op for a peer with no entry.
+    pub fn renew_session(&self, peer: &PeerId) {
+        if let Ok(mut g) = self.inner.write() {
+            if let Some(entry) = g.get_mut(peer) {
+                entry.1 = NEXT_PEER_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Drop `peer`'s entry. Called from the swarm's `ConnectionClosed`
     /// handler so a reconnected peer doesn't carry over a stale EOA, and
     /// so a payment in flight sees that its connection is gone.
@@ -651,6 +665,24 @@ mod tests {
         eth.forget(&peer);
         eth.record(peer, [7; 20]);
         assert!(check.await.unwrap().is_err(), "reconnected: not delivered");
+
+        // ... or one of the peer's two connections closes (it may be the
+        // one the cheque went out on): the peer stays, keeping its EOA,
+        // but the cheque doesn't count (PR #133 R2-F1).
+        let (_, session) = eth.session(&peer).unwrap();
+        let check = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.core.connection_held(peer, session).await }
+        });
+        tokio::time::sleep(DELIVERY_GRACE / 2).await;
+        eth.renew_session(&peer);
+        assert!(
+            check.await.unwrap().is_err(),
+            "a duplicate closed: not delivered"
+        );
+        assert_eq!(eth.get(&peer), Some([7; 20]), "the peer keeps its EOA");
+        let (_, session) = eth.session(&peer).unwrap();
+        assert!(svc.core.connection_held(peer, session).await.is_ok());
 
         // Gone before the cheque: no session to pay against.
         eth.forget(&peer);
