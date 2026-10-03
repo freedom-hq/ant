@@ -2447,6 +2447,55 @@ mod tests {
         assert!(err.to_string().contains("no BZZ peers available"), "{err}");
     }
 
+    /// Issue #122: a bare `/bzz/<ref>/`'s sniff waits for credit on a
+    /// starved pool (real `RoutingFetcher`), but only inside its credit
+    /// window, and the fallback join after it adds no wait of its own.
+    /// The root is in the request cache (`run_stream_bzz` already fetched
+    /// it); its leftmost child is starved and never refills. Measured
+    /// against the same lookup with the window already spent (exactly
+    /// the pre-#122, non-waiting lookup), the sniff adds one capped wait
+    /// (10 s from a fresh 30 s window), what is left of a nearly spent
+    /// window (5 s), and nothing more: the fallback join's fetches and
+    /// retries stay non-waiting.
+    #[tokio::test(start_paused = true)]
+    async fn starved_bare_root_sniff_waits_only_inside_its_window() {
+        let child = [0x99u8; 32];
+        let root_wire = two_leaf_root(child);
+        let root =
+            ant_crypto::bmt_hash_with_span(root_wire[..8].try_into().unwrap(), &root_wire[8..])
+                .unwrap();
+        let window = Duration::from_secs(30);
+        let lookup = |left: Duration| {
+            let root_wire = root_wire.clone();
+            async move {
+                let (fetcher, _acc, _p, held) = starved_fetcher(child);
+                let cache = Arc::new(InMemoryChunkCache::new(8));
+                cache.put(root, root_wire);
+                let fetcher = fetcher.with_cache(cache);
+                let credit = crate::accounting::CreditWindow::new(window);
+                tokio::time::advance(window.saturating_sub(left)).await;
+                let started = tokio::time::Instant::now();
+                let r = crate::lookup_path_with_sniff_credit(&fetcher, &root, "", &credit).await;
+                drop(held);
+                assert!(r.is_err(), "pool never refills");
+                started.elapsed()
+            }
+        };
+        let non_waiting = lookup(Duration::ZERO).await;
+        for (left, sniff_wait) in [
+            (window, CREDIT_WAIT_BUDGET),
+            (Duration::from_secs(5), Duration::from_secs(5)),
+        ] {
+            let took = lookup(left).await;
+            let extra = took.saturating_sub(non_waiting);
+            assert!(
+                extra >= sniff_wait && extra < sniff_wait + OVERDRAFT_REFRESH,
+                "{left:?} left in the window: lookup took {took:?}, \
+                 {extra:?} more than the non-waiting {non_waiting:?}",
+            );
+        }
+    }
+
     /// Issue #117: the opted-in data path (the streaming joiner's child
     /// fetches) waits for credit instead of failing on a starved pool,
     /// and once the peer's credit comes free it is woken (not left to
