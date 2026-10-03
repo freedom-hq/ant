@@ -232,12 +232,16 @@ int ant_set_swap_enabled(const AntHandle *handle, bool enabled, char **out_err);
  * Confirming accepts that peers paid before the loss hold cheques the
  * node can't see: they may refuse new cheques, and disconnect the node,
  * until its restarted cumulatives pass what they hold. A running node
- * picks it up at its next chequebook-funds read (within a minute).
+ * picks it up at its next chequebook-funds read (within a minute). A
+ * marker that can't be parsed is replaced by one that confirms only this
+ * chequebook (every other one stays lost), so it never has to be deleted
+ * by hand. A chequebook deployed after the loss, and one whose ledger was
+ * open when the file was lost, aren't affected and need no confirmation.
  *
  * Returns 0 once confirmed, 1 when there was nothing to confirm (no loss
  * on record, or this chequebook already confirmed), -1 if `handle` is
- * NULL or `chequebook` is malformed, -2 if the marker can't be read or
- * written; on -1/-2 an allocated error string is written into *out_err
+ * NULL or `chequebook` is malformed, -2 if the marker can't be read (an
+ * I/O error, not a parse error) or written; on -1/-2 an allocated error string is written into *out_err
  * (free with ant_free_string).
  */
 int ant_confirm_cheque_liability(const AntHandle *handle, const char *chequebook, char **out_err);

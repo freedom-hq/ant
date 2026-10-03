@@ -2588,11 +2588,24 @@ async fn resolve_or_deploy_chequebook(
         .await
     };
     match deployed {
-        Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
-            address: cb,
-            deployed: true,
-            verified: true,
-        })),
+        Ok(cb) => {
+            // Brand new, so it has issued no cheques: a lost outbound
+            // ledger on record doesn't apply to it (PR #126 R1-M3).
+            if let Err(e) =
+                ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
+            {
+                tracing::warn!(
+                    target: "ant-ffi",
+                    "can't record the new chequebook in the lost-ledger marker: {e}; \
+                     it stays on the free tier for downloads until confirmed",
+                );
+            }
+            Ok(Resolution::Use(ResolvedChequebook {
+                address: cb,
+                deployed: true,
+                verified: true,
+            }))
+        }
         Err(ChequebookError::InsufficientGas { need, .. }) => {
             tracing::warn!(
                 target: "ant-ffi",

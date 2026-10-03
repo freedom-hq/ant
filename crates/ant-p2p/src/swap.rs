@@ -111,6 +111,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -566,7 +567,15 @@ pub fn issue_cheque(
 /// marker never clears by itself, only by an operator confirming the
 /// chequebook's outstanding liability ([`confirm_cheque_liability`]:
 /// `antd --confirm-cheque-liability`, `ant_confirm_cheque_liability`)
-/// (PR #126 R4-M1).
+/// (PR #126 R4-M1). That also works on a marker that can't be parsed:
+/// it is replaced by one that still counts every other chequebook as
+/// lost, so nobody has to delete it by hand. Two kinds of chequebook
+/// are exempt without an operator, since their figures are known
+/// (PR #126 R1-M3): one deployed after the loss
+/// ([`note_fresh_chequebook`]), which has never issued a cheque, and one
+/// whose ledger was open in this process when the file was lost — its
+/// cumulatives survived in memory, so it is exempt at once for this run
+/// and for good once it has written them to the new file.
 #[derive(Clone)]
 pub struct OutboundLedger {
     chequebook: [u8; 20],
@@ -587,6 +596,15 @@ struct OutboundShared {
     /// Held from checking the funds left to recording a cheque against
     /// them, across every service on the chequebook.
     funds: Mutex<()>,
+    /// The chequebook's figures were read from the file at least once,
+    /// so the in-memory cumulatives hold everything it ever issued from
+    /// this file (they only grow, and every cheque is recorded here).
+    loaded: AtomicBool,
+    /// The file was lost while this state was `loaded`: the figures in
+    /// memory are still complete, so the loss doesn't apply to this
+    /// chequebook. Cleared once they are rewritten to the new file and
+    /// the marker records the chequebook as known.
+    survived_loss: AtomicBool,
 }
 
 /// One chequebook's cumulatives, shared by every [`OutboundLedger`]
@@ -667,6 +685,24 @@ fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
         .collect()
 }
 
+/// Flag every live ledger on `path` whose figures were loaded as
+/// having survived its loss (see [`OutboundShared::survived_loss`]).
+/// Caller holds [`OUTBOUND_FILE_LOCK`] and not [`OUTBOUND_LEDGERS`].
+fn flag_survivors(path: &Path) {
+    let reg = OUTBOUND_LEDGERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for ((p, _), w) in reg.iter() {
+        if p == path {
+            if let Some(shared) = w.upgrade() {
+                if shared.loaded.load(Ordering::SeqCst) {
+                    shared.survived_loss.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
 /// Read `path`. `Ok(None)` when it doesn't exist. A file that is
 /// neither shape is moved aside (see [`OutboundLedger`]) and reads as
 /// missing; an I/O error, which may pass, is returned.
@@ -722,6 +758,7 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
             "unparseable ({parse_error}) and can't record that its figures are lost: {e}"
         ))
     })?;
+    flag_survivors(path);
     std::fs::rename(path, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't be moved aside: {e}"
@@ -749,24 +786,105 @@ fn lost_marker_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// The `<name>.lost` marker: where the lost figures were moved, and the
+/// The `<name>.lost` marker: where the lost figures were moved, the
 /// chequebooks whose outstanding liability an operator has confirmed
-/// since the last loss.
-#[derive(Default, Serialize, Deserialize)]
+/// since the last loss, and the ones whose figures are known without an
+/// operator (deployed after the loss, or rewritten from memory that
+/// outlived it).
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct LostMarker {
+    #[serde(default)]
     moved_aside: Vec<String>,
+    #[serde(default)]
     confirmed: Vec<String>,
+    #[serde(default)]
+    known: Vec<String>,
 }
 
-/// Read the marker. `Ok(None)` when there is none.
+impl LostMarker {
+    fn clears(&self, key: &str) -> bool {
+        self.confirmed
+            .iter()
+            .chain(&self.known)
+            .any(|c| c.eq_ignore_ascii_case(key))
+    }
+
+    /// The marker that replaces one we can't parse: a loss is on record,
+    /// but neither where it went nor who was confirmed is known.
+    fn replacing_unreadable(e: &std::io::Error) -> Self {
+        Self {
+            moved_aside: vec![format!("unknown: the previous marker was unreadable ({e})")],
+            ..Self::default()
+        }
+    }
+}
+
+/// Read the marker. `Ok(None)` when there is none; a marker that isn't
+/// valid JSON is an `InvalidData` error, any other error is I/O (and may
+/// pass).
 fn read_lost_marker(path: &Path) -> std::io::Result<Option<LostMarker>> {
     match std::fs::read(lost_marker_path(path)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
-            .map_err(std::io::Error::other),
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// What identifies one version of the marker file: `None` when there is
+/// none. A rewrite replaces the file (a new inode), and a hand edit
+/// changes its length or mtime.
+type MarkerStamp = Option<(u64, u64, Option<std::time::SystemTime>)>;
+
+fn marker_stamp(marker_path: &Path) -> std::io::Result<MarkerStamp> {
+    match std::fs::metadata(marker_path) {
+        Ok(m) => {
+            #[cfg(unix)]
+            let ino = std::os::unix::fs::MetadataExt::ino(&m);
+            #[cfg(not(unix))]
+            let ino = 0;
+            Ok(Some((ino, m.len(), m.modified().ok())))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The last marker read per marker path, with the stamp it was read at.
+type MarkerCache = HashMap<PathBuf, (MarkerStamp, Result<Option<LostMarker>, String>)>;
+static LOST_MARKERS: Mutex<Option<MarkerCache>> = Mutex::new(None);
+
+/// [`read_lost_marker`] for the hot readers ([`OutboundLedger::lost_figures`]
+/// runs on the swarm loop and before every retrieval cheque): no
+/// [`OUTBOUND_FILE_LOCK`], so it never waits behind a ledger rewrite's
+/// fsync (the marker is only ever replaced whole, by rename), and the
+/// file is parsed again only when it changed — usually all it costs is
+/// a `stat` of a file that doesn't exist (PR #126 R1-M1).
+fn cached_lost_marker(path: &Path) -> Result<Option<LostMarker>, String> {
+    let marker_path = lost_marker_path(path);
+    let stamp = marker_stamp(&marker_path).map_err(|e| e.to_string())?;
+    let mut cache = LOST_MARKERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((s, m)) = cache.get(&marker_path) {
+        if *s == stamp {
+            return m.clone();
+        }
+    }
+    let read = match stamp {
+        None => Ok(None),
+        Some(_) => match read_lost_marker(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::InvalidData => {
+                // An I/O error may pass: don't remember it.
+                return Err(e.to_string());
+            }
+            r => r.map_err(|e| e.to_string()),
+        },
+    };
+    cache.insert(marker_path, (stamp, read.clone()));
+    read
 }
 
 fn write_lost_marker(path: &Path, marker: &LostMarker) -> std::io::Result<()> {
@@ -781,17 +899,34 @@ fn write_lost_marker(path: &Path, marker: &LostMarker) -> std::io::Result<()> {
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, marker_path)
+    std::fs::rename(&tmp, &marker_path)?;
+    if let Some(cache) = LOST_MARKERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        cache.remove(&marker_path);
+    }
+    Ok(())
 }
 
 /// Record that `path`'s figures were lost (moved to `aside`): every
 /// chequebook on it is unknown again, including ones confirmed after an
-/// earlier loss. An unreadable earlier marker is replaced — the new one
-/// confirms nothing either, so that only ever widens the loss.
+/// earlier loss. An earlier marker that can't be parsed is replaced (the
+/// new one confirms nothing either, so that only ever widens the loss);
+/// one that can't be read for another reason fails the call, so a
+/// passing I/O error doesn't drop the record of earlier losses.
 fn mark_figures_lost(path: &Path, aside: &Path) -> std::io::Result<()> {
-    let mut marker = read_lost_marker(path).ok().flatten().unwrap_or_default();
+    let mut marker = match read_lost_marker(path) {
+        Ok(m) => m.unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            LostMarker::replacing_unreadable(&e)
+        }
+        Err(e) => return Err(e),
+    };
     marker.moved_aside.push(aside.display().to_string());
     marker.confirmed.clear();
+    marker.known.clear();
     write_lost_marker(path, &marker)
 }
 
@@ -800,9 +935,9 @@ fn mark_figures_lost(path: &Path, aside: &Path) -> std::io::Result<()> {
 /// loss: the answer gates money.
 fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
     let key = hex::encode(chequebook);
-    match read_lost_marker(path) {
+    match cached_lost_marker(path) {
         Ok(None) => None,
-        Ok(Some(m)) if m.confirmed.iter().any(|c| c.eq_ignore_ascii_case(&key)) => None,
+        Ok(Some(m)) if m.clears(&key) => None,
         Ok(Some(m)) => Some(format!(
             "the outbound cheque ledger was unparseable and moved aside ({}), so the \
              cheques chequebook 0x{key} issued before are unknown; downloads stay on \
@@ -811,7 +946,10 @@ fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
             m.moved_aside.join(", "),
         )),
         Err(e) => Some(format!(
-            "can't read the lost-ledger marker {}: {e}",
+            "can't read the lost-ledger marker {} ({e}), so chequebook 0x{key}'s cheque \
+             figures count as lost; downloads stay on the free tier until an operator \
+             confirms its outstanding liability (antd --confirm-cheque-liability 0x{key}, \
+             or ant_confirm_cheque_liability), which replaces an unparseable marker",
             lost_marker_path(path).display(),
         )),
     }
@@ -824,12 +962,26 @@ fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
 /// and that retrieval may pay from it again. Clears the chequebook's
 /// lost state ([`OutboundLedger::lost_figures`]) until the next loss.
 /// Returns `false` when there was nothing to confirm (no loss on record,
-/// or this chequebook already confirmed). A running node picks it up at
-/// its next retrieval-funds read.
+/// or this chequebook already confirmed). A marker that can't be parsed
+/// is replaced by one that confirms only this chequebook — every other
+/// chequebook stays lost — so it never needs deleting by hand; an I/O
+/// error is returned. A running node picks it up at its next
+/// retrieval-funds read.
 pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::Result<bool> {
     let _file = lock_file();
-    let Some(mut marker) = read_lost_marker(path)? else {
-        return Ok(false);
+    let mut marker = match read_lost_marker(path) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            warn!(
+                target: "ant_p2p::swap",
+                marker = %lost_marker_path(path).display(),
+                "lost-ledger marker is unparseable ({e}); replacing it, every \
+                 chequebook but the confirmed one stays lost",
+            );
+            LostMarker::replacing_unreadable(&e)
+        }
+        Err(e) => return Err(e),
     };
     let key = hex::encode(chequebook);
     if marker
@@ -848,6 +1000,31 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
          outbound ledger; downloads may pay from this chequebook again",
     );
     Ok(true)
+}
+
+/// Record that `chequebook` was just deployed, so it has issued no
+/// cheques and a loss of the ledger at `path` recorded before now
+/// doesn't apply to it (PR #126 R1-M3). Call right after a successful
+/// deploy, before any ledger on the chequebook issues. No-op without a
+/// loss on record. A marker that can't be read is left alone (the
+/// chequebook stays lost until an operator confirms it) and the error
+/// returned.
+pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Result<()> {
+    let _file = lock_file();
+    note_known(path, &hex::encode(chequebook))
+}
+
+/// Add `key` to the marker's known chequebooks. Caller holds
+/// [`OUTBOUND_FILE_LOCK`].
+fn note_known(path: &Path, key: &str) -> std::io::Result<()> {
+    let Some(mut marker) = read_lost_marker(path)? else {
+        return Ok(());
+    };
+    if marker.clears(key) {
+        return Ok(());
+    }
+    marker.known.push(key.to_string());
+    write_lost_marker(path, &marker)
 }
 
 /// Read `path` (caller holds [`OUTBOUND_FILE_LOCK`]), adopting a file
@@ -908,36 +1085,49 @@ impl OutboundLedger {
         let shared = match &persist_path {
             None => Arc::new(OutboundShared::default()),
             Some(p) => {
+                // The file lock is held throughout, so nothing else opens
+                // or registers a ledger between the lookup and the push;
+                // the registry itself is released while the file is read,
+                // since a move aside flags the live ledgers in it.
                 let _file = lock_file();
-                let mut reg = OUTBOUND_LEDGERS
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                reg.retain(|(_, w)| w.strong_count() > 0);
                 let id = (p.clone(), chequebook);
-                let live = reg
-                    .iter()
-                    .find(|(k, _)| *k == id)
-                    .and_then(|(_, w)| w.upgrade());
+                let live = {
+                    let mut reg = OUTBOUND_LEDGERS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    reg.retain(|(_, w)| w.strong_count() > 0);
+                    reg.iter()
+                        .find(|(k, _)| *k == id)
+                        .and_then(|(_, w)| w.upgrade())
+                };
                 if let Some(shared) = live {
                     shared
                 } else {
                     let mut st = OutboundState::default();
-                    if let Err(e) = load_outbound_section(p, &key, &mut st) {
-                        warn!(
-                            target: "ant_p2p::swap",
-                            chequebook = %key,
-                            "outbound ledger unreadable: {e}; no cheques until it can be read",
-                        );
-                        st.unread = Some(e.to_string());
-                    }
+                    let loaded = match load_outbound_section(p, &key, &mut st) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!(
+                                target: "ant_p2p::swap",
+                                chequebook = %key,
+                                "outbound ledger unreadable: {e}; no cheques until it can be read",
+                            );
+                            st.unread = Some(e.to_string());
+                            false
+                        }
+                    };
                     if let Some(why) = lost_figures_at(p, &chequebook) {
                         warn!(target: "ant_p2p::swap", "{why}");
                     }
                     let shared = Arc::new(OutboundShared {
                         state: Mutex::new(st),
+                        loaded: AtomicBool::new(loaded),
                         ..OutboundShared::default()
                     });
-                    reg.push((id, Arc::downgrade(&shared)));
+                    OUTBOUND_LEDGERS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((id, Arc::downgrade(&shared)));
                     shared
                 }
             }
@@ -999,6 +1189,7 @@ impl OutboundLedger {
         let _file = lock_file();
         match load_outbound_section(path, &hex::encode(self.chequebook), &mut st) {
             Ok(_) => {
+                self.shared.loaded.store(true, Ordering::SeqCst);
                 info!(
                     target: "ant_p2p::swap",
                     chequebook = %hex::encode(self.chequebook),
@@ -1025,12 +1216,18 @@ impl OutboundLedger {
     /// unparseable and moved aside, and no operator has confirmed the
     /// chequebook's outstanding liability since (see the type docs) —
     /// or `None` while they are known. Retrieval doesn't pay while this
-    /// is `Some`; pushsync still does. Read from disk on every call, so a
-    /// loss or a confirmation shows at once in every ledger on the file.
+    /// is `Some`; pushsync still does. Checked against the marker on
+    /// every call, so a loss or a confirmation shows at once in every
+    /// ledger on the file — but without the file lock, and parsing the
+    /// marker only when it changed, since this runs on the swarm loop
+    /// (PR #126 R1-M1). A ledger whose figures were in memory when the
+    /// file was lost isn't affected (see the type docs).
     #[must_use]
     pub fn lost_figures(&self) -> Option<String> {
         let path = self.persist_path.as_ref()?;
-        let _file = lock_file();
+        if self.shared.survived_loss.load(Ordering::SeqCst) {
+            return None;
+        }
         lost_figures_at(path, &self.chequebook)
     }
 
@@ -1089,13 +1286,27 @@ impl OutboundLedger {
                 }
             };
             file.chequebooks.insert(
-                chequebook,
+                chequebook.clone(),
                 st.cumulatives
                     .iter()
                     .map(|(k, v)| (k.clone(), v.to_string()))
                     .collect(),
             );
             write_outbound_file(path, &file)?;
+            self.shared.loaded.store(true, Ordering::SeqCst);
+            // Figures that outlived a loss in memory are on disk again:
+            // record them as known, so a restart doesn't count them lost.
+            if self.shared.survived_loss.load(Ordering::SeqCst) {
+                match note_known(path, &chequebook) {
+                    Ok(()) => self.shared.survived_loss.store(false, Ordering::SeqCst),
+                    Err(e) => warn!(
+                        target: "ant_p2p::swap",
+                        chequebook = %chequebook,
+                        "can't record in the lost-ledger marker that this chequebook's \
+                         figures were rewritten: {e}; retrying at its next cheque",
+                    ),
+                }
+            }
         }
         Ok(())
     }
@@ -1977,10 +2188,130 @@ mod tests {
             serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
         assert_eq!(marker.moved_aside.len(), 2, "both copies are named");
 
-        // A marker that can't be parsed counts as a loss.
+        // A marker that can't be parsed counts as a loss, for every
+        // chequebook (PR #126 R1-M2)...
         std::fs::write(lost_marker_path(&path), b"garbage").unwrap();
-        assert!(confirm_cheque_liability(&path, a).is_err());
+        let why = la.lost_figures().expect("unparseable marker is a loss");
+        assert!(why.contains("--confirm-cheque-liability"), "{why}");
+        // ...and confirming replaces it, clearing only that chequebook.
+        assert!(confirm_cheque_liability(&path, a).unwrap());
+        assert!(la.lost_figures().is_none());
+        let lb = OutboundLedger::open(Some(path.clone()), b);
+        assert!(lb.lost_figures().is_some(), "b stays lost");
+        let marker: LostMarker =
+            serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
+        assert!(
+            marker.moved_aside[0].contains("unreadable"),
+            "{:?}",
+            marker.moved_aside
+        );
+        // A loss on top of an unparseable marker still records itself.
+        drop((la, lb));
+        std::fs::write(lost_marker_path(&path), b"garbage").unwrap();
+        std::fs::write(&path, b"{ broken a third time").unwrap();
+        let la = OutboundLedger::open(Some(path.clone()), a);
         assert!(la.lost_figures().is_some());
+        let marker: LostMarker =
+            serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
+        assert_eq!(marker.moved_aside.len(), 2, "{:?}", marker.moved_aside);
+    }
+
+    /// A loss only applies to chequebooks whose figures it took (PR #126
+    /// R1-M3): one deployed afterwards has issued nothing, and one whose
+    /// ledger was open keeps its figures in memory — at once for this
+    /// run, and across a restart once it has rewritten them. A ledger
+    /// opened only after the loss is still lost.
+    #[test]
+    fn a_loss_spares_chequebooks_whose_figures_are_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (live, closed, fresh) = ([0xa1u8; 20], [0xa2u8; 20], [0xa3u8; 20]);
+        let peer = [0x11u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), live);
+        l.record_issued(&peer, U256::from(500u64)).unwrap();
+        let c = OutboundLedger::open(Some(path.clone()), closed);
+        c.record_issued(&peer, U256::from(70u64)).unwrap();
+        drop(c);
+
+        // The file is lost under the running ledger; another open reads it.
+        std::fs::write(&path, b"{ not json").unwrap();
+        let c = OutboundLedger::open(Some(path.clone()), closed);
+        assert!(
+            c.lost_figures().is_some(),
+            "closed chequebook's figures are gone"
+        );
+        assert!(
+            l.lost_figures().is_none(),
+            "live figures survived in memory"
+        );
+        assert_eq!(l.cumulative_for(&peer), U256::from(500u64));
+
+        // Not yet on disk: a restart before the next cheque counts it lost.
+        let marker: LostMarker =
+            serde_json::from_slice(&std::fs::read(lost_marker_path(&path)).unwrap()).unwrap();
+        assert!(marker.known.is_empty(), "{:?}", marker.known);
+        l.record_issued(&peer, U256::from(600u64)).unwrap();
+        drop(l);
+        let l = OutboundLedger::open(Some(path.clone()), live);
+        assert_eq!(l.cumulative_for(&peer), U256::from(600u64));
+        assert!(
+            l.lost_figures().is_none(),
+            "rewritten, so known across a restart"
+        );
+        assert!(c.lost_figures().is_some());
+
+        // A chequebook deployed after the loss.
+        note_fresh_chequebook(&path, fresh).unwrap();
+        assert!(OutboundLedger::open(Some(path.clone()), fresh)
+            .lost_figures()
+            .is_none());
+        // Nothing to note without a loss on record.
+        let other = dir.path().join("other.json");
+        note_fresh_chequebook(&other, fresh).unwrap();
+        assert!(!lost_marker_path(&other).exists());
+
+        // A later loss makes them all unknown again.
+        drop((l, c));
+        std::fs::write(&path, b"{ broken again").unwrap();
+        for cb in [live, closed, fresh] {
+            assert!(OutboundLedger::open(Some(path.clone()), cb)
+                .lost_figures()
+                .is_some());
+        }
+    }
+
+    /// The marker is re-read when it changes, including by hand, though
+    /// [`OutboundLedger::lost_figures`] caches it (PR #126 R1-M1).
+    #[test]
+    fn lost_figures_follows_marker_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xd1u8; 20];
+        std::fs::write(&path, b"{ not json").unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some());
+        assert!(l.lost_figures().is_some(), "cached read agrees");
+        std::fs::remove_file(lost_marker_path(&path)).unwrap();
+        assert!(l.lost_figures().is_none(), "a deleted marker is seen");
+        std::fs::write(lost_marker_path(&path), b"x").unwrap();
+        assert!(l.lost_figures().is_some(), "so is a new one");
+    }
+
+    /// `lost_figures` doesn't wait for the outbound file lock, which a
+    /// cheque's rewrite + fsync holds (PR #126 R1-M1).
+    #[test]
+    fn lost_figures_does_not_take_the_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let l = OutboundLedger::open(Some(path), [0xd2u8; 20]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = lock_file();
+        std::thread::spawn(move || {
+            let _ = tx.send(l.lost_figures());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        assert!(matches!(got, Ok(None)), "{got:?}");
     }
 
     /// Moving a broken ledger aside never replaces an earlier copy (PR

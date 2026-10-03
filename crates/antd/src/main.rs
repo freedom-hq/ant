@@ -334,9 +334,12 @@ struct Opt {
     /// oracle rate), and never spends more than the chequebook holds.
     /// Needs a funded chequebook and a Gnosis RPC to read its balance;
     /// without them it does nothing. `false` keeps downloads on the free
-    /// tier even with a funded chequebook. Upload (pushsync) cheques are
-    /// not governed by it yet: #127 makes them pay at bee's rate under
-    /// this same switch. Falls back to `ANT_SWAP_ENABLE` env.
+    /// tier even with a funded chequebook. The default differs from
+    /// bee's, which is `false` (`cmd/bee/cmd/cmd.go`): a bee config that
+    /// leaves the key out pays here, so set `swap-enable: false` to match
+    /// it. Upload (pushsync) cheques are not governed by it yet: #127
+    /// makes them pay at bee's rate under this same switch. Falls back
+    /// to `ANT_SWAP_ENABLE` env.
     #[arg(
         long = "swap-enable",
         env = "ANT_SWAP_ENABLE",
@@ -354,7 +357,11 @@ struct Opt {
     /// `chequeLedgerLost`). Confirming accepts that peers paid before the
     /// loss hold cheques the node can't see: they may refuse new cheques,
     /// and disconnect the node, until its restarted cumulatives pass what
-    /// they hold. Repeatable; applied at start, before the node runs.
+    /// they hold. An unparseable marker is replaced by one confirming only
+    /// this chequebook (every other one stays lost), so it never has to be
+    /// deleted by hand. A chequebook deployed after the loss, and one whose
+    /// ledger was open when the file was lost, need no confirmation.
+    /// Repeatable; applied at start, before the node runs.
     #[arg(long = "confirm-cheque-liability", value_name = "CHEQUEBOOK")]
     confirm_cheque_liability: Vec<String>,
 }
@@ -2120,6 +2127,15 @@ async fn resolve_chequebook(
     wallet.note_deploy_attempt(&deployed);
     match deployed {
         Ok(cb) => {
+            // Brand new, so it has issued no cheques: a lost outbound
+            // ledger on record doesn't apply to it (PR #126 R1-M3).
+            if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
+                tracing::warn!(
+                    target: "antd",
+                    "can't record the new chequebook in the lost-ledger marker: {e}; \
+                     it stays on the free tier for downloads until confirmed",
+                );
+            }
             // Freshly factory-deployed, so it's registered by construction
             // — skip the redundant `deployedContracts` round-trip.
             let pushsync = ant_p2p::PushsyncSwapConfig::new(
