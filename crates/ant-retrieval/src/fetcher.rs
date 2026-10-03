@@ -356,9 +356,9 @@ impl RoutingFetcher {
     }
 
     /// Attach the per-peer pushsync load tracker (perf-lab Experiment
-    /// 2). When set, `next_push_peer` skips peers at their
-    /// latency-aware concurrent-push cap — falling through to the
-    /// unfiltered ranking if EVERY candidate is saturated — and every
+    /// 2). When set, `push_candidates` ranks peers at their
+    /// latency-aware concurrent-push cap after every other candidate —
+    /// so they are picked only if EVERY candidate is saturated — and every
     /// dispatch reports begin/end + latency into the tracker.
     #[must_use]
     pub fn with_push_load(mut self, load: std::sync::Arc<crate::PushLoadTracker>) -> Self {
@@ -646,13 +646,15 @@ impl RoutingFetcher {
     /// already connected skip the wait entirely.
     const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(2500);
 
-    /// Rank the live peer set closest-first to `chunk_addr` and return the
-    /// next candidate not already used for this chunk. The per-process
-    /// push-skip cache (cross-chunk cool-down) is applied as a *soft*
-    /// filter: if honouring it would leave no candidate (every closest
-    /// peer is currently cooling down), we fall through to the unfiltered
-    /// ranking so a small / flappy network can still make progress.
-    fn next_push_peer(&self, chunk_addr: &[u8; 32], used: &[PeerId]) -> Option<(PeerId, Overlay)> {
+    /// Rank the live peer set closest-first to `chunk_addr`, leaving out
+    /// peers already used for this chunk, in the order a push tries them.
+    /// The per-process push-skip cache (cross-chunk cool-down) is applied
+    /// as a *soft* filter: peers cooling down come after every other
+    /// candidate rather than not at all, so a small / flappy network can
+    /// still make progress. The first entry is the next peer to push to;
+    /// the rest are where a push goes when that one has no credit
+    /// (issue #128), one ranked pass instead of one per refusal.
+    fn push_candidates(&self, chunk_addr: &[u8; 32], used: &[PeerId]) -> Vec<(PeerId, Overlay)> {
         let live = self.peers_rx.borrow();
         let mut ranked: Vec<(PeerId, Overlay)> = live
             .iter()
@@ -660,25 +662,6 @@ impl RoutingFetcher {
             .copied()
             .collect();
         drop(live);
-        // Per-peer in-flight cap (Experiment 2): drop saturated peers
-        // from the ranking so concurrent chunks fan out to lower-PO
-        // peers instead of stacking debt on the same closest storers.
-        // Soft: if EVERY candidate is at cap, fall through unfiltered —
-        // a small peer set must still make progress.
-        if let Some(load) = self.push_load.as_ref() {
-            let unsaturated: Vec<(PeerId, Overlay)> = ranked
-                .iter()
-                .copied()
-                .filter(|(p, _)| !load.at_cap(p))
-                .collect();
-            if unsaturated.is_empty() {
-                if !ranked.is_empty() {
-                    load.note_saturated_fallthrough();
-                }
-            } else {
-                ranked = unsaturated;
-            }
-        }
         ranked.sort_by(|(_, a), (_, b)| {
             for i in 0..32 {
                 let da = a[i] ^ chunk_addr[i];
@@ -689,12 +672,36 @@ impl RoutingFetcher {
             }
             Ordering::Equal
         });
-        if let Some(skip) = self.push_skip.as_ref() {
-            if let Some(hit) = ranked.iter().copied().find(|(p, _)| !skip.is_skipped(*p)) {
-                return Some(hit);
+        // The push-skip cache's soft filter: cooling peers after fresh
+        // ones, each group still closest-first.
+        let fresh_first = |group: Vec<(PeerId, Overlay)>| -> Vec<(PeerId, Overlay)> {
+            match self.push_skip.as_ref() {
+                None => group,
+                Some(skip) => {
+                    let (mut fresh, cooling): (Vec<_>, Vec<_>) =
+                        group.into_iter().partition(|(p, _)| !skip.is_skipped(*p));
+                    fresh.extend(cooling);
+                    fresh
+                }
             }
+        };
+        // Per-peer in-flight cap (Experiment 2): saturated peers go after
+        // every unsaturated one, so concurrent chunks fan out to lower-PO
+        // peers instead of stacking debt on the same closest storers.
+        // Soft: if EVERY candidate is at cap, they are all still
+        // candidates — a small peer set must still make progress.
+        if let Some(load) = self.push_load.as_ref() {
+            let (unsaturated, saturated): (Vec<_>, Vec<_>) =
+                ranked.into_iter().partition(|(p, _)| !load.at_cap(p));
+            if unsaturated.is_empty() && !saturated.is_empty() {
+                load.note_saturated_fallthrough();
+            }
+            ranked = fresh_first(unsaturated);
+            ranked.extend(fresh_first(saturated));
+        } else {
+            ranked = fresh_first(ranked);
         }
-        ranked.first().copied()
+        ranked
     }
 
     /// Best-effort request to the swarm loop to dial peers toward `target`'s
@@ -889,11 +896,15 @@ impl RoutingFetcher {
         // not we are still listening.
         let mut inflight = PushInFlight::new(self.pushsync_settlement.is_some());
 
-        // Peers refused credit for this chunk, each with the instant it may
-        // be asked again: bee's `skip.Add(chunk, peer, overDraftRefresh)`
-        // after `PrepareCredit` returns `ErrOverdraft` (issue #128). Unlike
-        // `used`, the skip expires, and it costs no error budget.
-        let mut overdrawn: Vec<(PeerId, tokio::time::Instant)> = Vec::new();
+        // Peers refused credit for this chunk in the current credit round:
+        // bee's `skip.Add(chunk, peer, overDraftRefresh)` after
+        // `PrepareCredit` returns `ErrOverdraft` (issue #128). Unlike
+        // `used`, the skip ends — at `credit_retry_at`, one
+        // `OVERDRAFT_REFRESH` after the round's first refusal, when every
+        // one of them may be asked again (bee's `PruneExpiresAfter` and
+        // retry) — and it costs no error budget.
+        let mut overdrawn: Vec<PeerId> = Vec::new();
+        let mut credit_retry_at: Option<tokio::time::Instant> = None;
         // Time spent waiting for credit with every candidate overdrawn and
         // nothing in flight; at most `credit_budget` per walk.
         let mut credit_waited = Duration::ZERO;
@@ -931,7 +942,7 @@ impl RoutingFetcher {
                 let stamp = stamp.clone();
                 let delay_ms: u64 = $delay_ms;
                 // Load-book the dispatch SYNCHRONOUSLY so the very next
-                // `next_push_peer` (for a concurrent chunk) already sees
+                // `push_candidates` (for a concurrent chunk) already sees
                 // this peer's in-flight count (Experiment 2). The guard
                 // moves into the attempt, so the slot is released however
                 // the attempt ends — finished, drained, or dropped
@@ -962,46 +973,48 @@ impl RoutingFetcher {
         }
 
         loop {
+            // A credit round has run out: every peer refused credit in it
+            // may be asked again.
+            if credit_retry_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                overdrawn.clear();
+                credit_retry_at = None;
+            }
             // Fill the requested dispatch slots with the next-closest
             // peers we haven't dialled yet for this chunk, each only once
             // it has credit (bee's `PrepareCredit` before every push,
             // issue #128): a peer this push would take past its
-            // disconnect limit is skipped for `OVERDRAFT_REFRESH` and the
+            // disconnect limit is skipped until the round ends and the
             // next-closest one is tried instead. Reserving also starts a
             // payment to the peer when one is due (the mirror's settle
             // step), in the background.
-            while want > 0 {
-                let now = tokio::time::Instant::now();
-                overdrawn.retain(|(_, until)| *until > now);
-                let excluded: Vec<PeerId> = used
-                    .iter()
-                    .copied()
-                    .chain(overdrawn.iter().map(|(p, _)| *p))
-                    .collect();
-                let Some((peer, overlay)) = self.next_push_peer(&chunk_addr, &excluded) else {
-                    break;
-                };
-                let price = peer_chunk_price(&overlay, &chunk_addr);
-                let Ok(credit) = self.prepare_push_credit(peer, price) else {
-                    trace!(
-                        target: "ant_retrieval::fetcher",
-                        %peer,
-                        price,
-                        "pushsync: peer is at its credit limit; trying the next-closest peer",
-                    );
-                    overdrawn.push((peer, now + OVERDRAFT_REFRESH));
-                    continue;
-                };
-                used.push(peer);
-                dispatch!(peer, overlay, price, credit, 0u64);
-                want -= 1;
+            if want > 0 {
+                let excluded: Vec<PeerId> = used.iter().chain(&overdrawn).copied().collect();
+                for (peer, overlay) in self.push_candidates(&chunk_addr, &excluded) {
+                    if want == 0 {
+                        break;
+                    }
+                    let price = peer_chunk_price(&overlay, &chunk_addr);
+                    let Ok(credit) = self.prepare_push_credit(peer, price) else {
+                        trace!(
+                            target: "ant_retrieval::fetcher",
+                            %peer,
+                            price,
+                            "pushsync: peer is at its credit limit; trying the next-closest peer",
+                        );
+                        overdrawn.push(peer);
+                        continue;
+                    };
+                    used.push(peer);
+                    dispatch!(peer, overlay, price, credit, 0u64);
+                    want -= 1;
+                }
+                if want > 0 && !overdrawn.is_empty() && credit_retry_at.is_none() {
+                    credit_retry_at = Some(tokio::time::Instant::now() + OVERDRAFT_REFRESH);
+                }
             }
-
-            // The earliest instant an overdrawn peer may be asked again,
-            // while a dispatch slot is open for it.
-            let credit_retry_at = (want > 0)
-                .then(|| overdrawn.iter().map(|(_, until)| *until).min())
-                .flatten();
+            // When to ask the overdrawn peers again, while a dispatch slot
+            // is open for one of them.
+            let retry_at = credit_retry_at.filter(|_| want > 0);
 
             if inflight.futs.is_empty() {
                 // Nothing pending and no admissible candidate left. When
@@ -1009,11 +1022,12 @@ impl RoutingFetcher {
                 // bee's `pushToClosest` ("sleeping to refresh overdraft
                 // balance") and try them again, at most `credit_budget`
                 // per walk; without a budget left, give up.
-                if let Some(at) = credit_retry_at {
+                if let Some(at) = retry_at {
                     let left = credit_budget.saturating_sub(credit_waited);
                     if !left.is_zero() {
-                        let now = tokio::time::Instant::now();
-                        let nap = at.saturating_duration_since(now).min(left);
+                        let nap = at
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(left);
                         debug!(
                             target: "ant_retrieval::fetcher",
                             addr = %hex::encode(chunk_addr),
@@ -1023,10 +1037,10 @@ impl RoutingFetcher {
                         );
                         tokio::time::sleep(nap).await;
                         credit_waited += nap;
-                        // A wait that reached its budget wipes the
-                        // skips: the last round asks every peer again.
+                        // The budget is spent: end the round now, so the
+                        // last one asks every peer again before giving up.
                         if credit_waited >= credit_budget {
-                            overdrawn.clear();
+                            credit_retry_at = Some(tokio::time::Instant::now());
                         }
                         continue;
                     }
@@ -1181,9 +1195,9 @@ impl RoutingFetcher {
                     // concurrent attempt set to one more closest peer.
                     want += 1;
                 }
-                // An overdrawn peer's skip ran out while a dispatch slot
-                // waits for one: ask the candidates again.
-                () = sleep_until_or_never(credit_retry_at) => {}
+                // The credit round ran out while a dispatch slot waits for
+                // a peer: ask the overdrawn ones again.
+                () = sleep_until_or_never(retry_at) => {}
             }
         }
 
