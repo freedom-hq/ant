@@ -31,10 +31,10 @@
 //! (`PushsyncSwap`, while `swap-enable` is on and the chequebook has
 //! funds) settles push debt exactly as it settles retrieval debt — the
 //! refresh first, then a cheque priced `units × exchange + deduction`
-//! once the debt reaches the early-payment threshold. Reserving the
-//! debit is what triggers that cheque (`Accounting::try_reserve`), even
-//! when the reservation itself is refused. See
-//! `behaviour::push_settlement`.
+//! once the debt reaches the early-payment threshold. Recording the
+//! debit is what triggers that cheque (`Accounting::debit`), and it is
+//! recorded even past the overdraft limit, since the push already
+//! happened. See `behaviour::push_settlement`.
 
 use ant_retrieval::accounting::Accounting;
 use ant_retrieval::PushsyncSettlement;
@@ -74,17 +74,38 @@ impl PushsyncSettlement for PushPseudosettle {
             // the real price.
             return;
         }
-        // Mirror the debit. `try_reserve` refusing means our mirror is
-        // already at the reserve ceiling for this peer — the hot hint
-        // has fired and the driver is refreshing; bee's view is ahead
-        // of ours in that state, so dropping the record (rather than
-        // blocking the push path) is the honest cheap option.
-        if let Some(guard) = self.0.try_reserve(peer, price) {
-            guard.apply();
-        }
+        // Mirror the debit, past the overdraft limit too: the chunk was
+        // pushed and bee has debited it, so dropping it would leave the
+        // mirror (the only record of upload debt the payer settles) short
+        // of bee's view, and cheques would underpay. `debit` fires the
+        // hot hint and starts a cheque when one is due (PR #126 R1-M2).
+        self.0.debit(peer, price);
     }
 
     fn forget(&self, peer: &PeerId) {
         self.0.forget(peer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ant_retrieval::accounting::OVERDRAFT_LIMIT;
+
+    /// Every receipted push lands in the mirror, past the overdraft limit
+    /// too: bee debited it, and the payer settles only what the mirror
+    /// holds (PR #126 R1-M2).
+    #[tokio::test]
+    async fn push_debits_past_the_overdraft_limit_are_kept() {
+        let acc = Arc::new(Accounting::new());
+        let settle = PushPseudosettle::new(acc.clone());
+        let peer = PeerId::random();
+        settle.note_pushsync(peer, 0).await;
+        assert_eq!(acc.debug_snapshot(&peer), None, "pre-flight: nothing");
+        let n = OVERDRAFT_LIMIT / 100_000 + 5;
+        for _ in 0..n {
+            settle.note_pushsync(peer, 100_000).await;
+        }
+        assert_eq!(acc.debug_snapshot(&peer), Some((n * 100_000, 0)));
     }
 }

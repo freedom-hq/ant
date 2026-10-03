@@ -1597,18 +1597,20 @@ type FundsWatch = (
     tokio::task::AbortHandle,
 );
 
-/// Keep the node's view of what `chequebook` can pay for downloads
-/// current (issue #121): run the shared
+/// Keep the node's view of what `chequebook` can pay for downloads and
+/// uploads current (issues #121, #127): run the shared
 /// `ant_chain::chequebook_store::watch_retrieval_funds` (as `antd`
 /// does), publishing each read into `ControlCommand::SetRetrievalFunds`,
 /// over `client` (so through the host chain transport when one is
-/// installed). Started by every successful [`setup_settlement`]; one
+/// installed). Started by every successful [`setup_settlement`] and
+/// every successful deposit top-up ([`refresh_retrieval_funds`]); one
 /// watch per node, replaced when its chequebook changes.
 ///
 /// `ant_init` reloads a persisted chequebook without an RPC, so until the
-/// first settlement setup after it (the gateway-start chain init, a
-/// storage call, `ant_deploy_chequebook`) the node knows no funds and
-/// downloads stay on the free tier.
+/// first settlement setup or top-up after it (the gateway-start chain
+/// init, a storage call, `ant_deploy_chequebook`,
+/// `ant_storage_settlement_topup*`) the node knows no funds and
+/// downloads and uploads stay on the free tier.
 #[cfg(feature = "chain")]
 fn watch_retrieval_funds(
     cmd_tx: &mpsc::Sender<ControlCommand>,
@@ -1635,24 +1637,60 @@ fn watch_retrieval_funds(
         chequebook,
         move |funds| {
             let commands = commands.clone();
-            async move {
-                let (ack, ack_rx) = oneshot::channel();
-                let sent = send(
-                    &commands,
-                    ControlCommand::SetRetrievalFunds {
-                        chequebook,
-                        deposited_plur: funds.deposited_plur,
-                        exchange_rate_plur: funds.exchange_rate_plur,
-                        deduction_plur: funds.deduction_plur,
-                        ack,
-                    },
-                )
-                .await;
-                sent.is_ok() && recv_oneshot(ack_rx).await.is_ok()
-            }
+            async move { publish_retrieval_funds(&commands, chequebook, funds).await }
         },
     ));
     watches.push((chequebook, cmd_tx.clone(), task.abort_handle()));
+}
+
+/// Hand one read of `chequebook`'s funds to the node
+/// (`ControlCommand::SetRetrievalFunds`). `false` once the node is gone.
+#[cfg(feature = "chain")]
+async fn publish_retrieval_funds(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    chequebook: [u8; 20],
+    funds: ant_chain::chequebook_store::RetrievalFunds,
+) -> bool {
+    let (ack, ack_rx) = oneshot::channel();
+    let sent = send(
+        cmd_tx,
+        ControlCommand::SetRetrievalFunds {
+            chequebook,
+            deposited_plur: funds.deposited_plur,
+            exchange_rate_plur: funds.exchange_rate_plur,
+            deduction_plur: funds.deduction_plur,
+            ack,
+        },
+    )
+    .await;
+    sent.is_ok() && recv_oneshot(ack_rx).await.is_ok()
+}
+
+/// After a deposit into `chequebook` (PR #126 R1-M3): tell the node its
+/// new funds now, rather than at the watch's next read up to
+/// [`ant_chain::chequebook_store::RETRIEVAL_FUNDS_REFRESH`] later (a
+/// payer removed for exhausted credit comes back at once), and make sure
+/// the funds watch runs. `ant_init` reloads a persisted chequebook
+/// without an RPC and starts no watch, so without this a host that only
+/// tops up would never get the node paying. A failed read publishes
+/// nothing (the node keeps what it knew); the watch retries it.
+#[cfg(feature = "chain")]
+async fn refresh_retrieval_funds(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    chequebook: [u8; 20],
+) {
+    match ant_chain::chequebook_store::read_retrieval_funds(client, &chequebook).await {
+        Ok(funds) => {
+            publish_retrieval_funds(cmd_tx, chequebook, funds).await;
+        }
+        Err(e) => tracing::debug!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            "funds not re-read after the deposit (the watch retries): {e}",
+        ),
+    }
+    watch_retrieval_funds(cmd_tx, client, chequebook);
 }
 
 /// One [`ant_gateway::WalletTxLock`] per node account, process-wide.
@@ -2170,7 +2208,10 @@ async fn settlement_topup_xdai_checked(
         funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR, amount).await
     };
     match funded {
-        Ok(status) => to_json(&SettlementDeposit::of(&status)),
+        Ok(status) => {
+            refresh_retrieval_funds(cmd_tx, client, cb).await;
+            to_json(&SettlementDeposit::of(&status))
+        }
         Err(
             e @ funding::FundingError::ChequebookRefused {
                 chequebook,
@@ -4543,6 +4584,22 @@ mod chain_tests {
         assert_eq!(node.lock().unwrap().disabled, [] as [[u8; 20]; 0]);
         assert!(!super::lock_disqualified().contains(&(eth, GOOD)));
         assert_eq!(slot.get(), Some(GOOD));
+        // PR #126 R1-M3: the top-up tells the node its funds at once (no
+        // settlement setup ran before it, as after a bare `ant_init`),
+        // and leaves the funds watch running.
+        assert_eq!(
+            node.lock().unwrap().funds.first().copied(),
+            Some((GOOD, super::DEPOSIT_TARGET_PLUR, 100_000)),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while node.lock().unwrap().funds.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            node.lock().unwrap().funds.len(),
+            2,
+            "the watch's first read"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

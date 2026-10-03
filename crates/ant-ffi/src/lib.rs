@@ -1459,11 +1459,13 @@ pub unsafe extern "C" fn ant_swap_status(
 }
 
 /// Confirm the outstanding liability of `chequebook` (`0x…` hex, NUL
-/// terminated) after its cheque figures were lost, and let downloads pay
-/// from it again. When the node's outbound cheque ledger
-/// (`pushsync_outbound.json`) is found unparseable it is moved aside and a
-/// `.lost` marker is left; while that marker names a loss, retrieval
-/// doesn't pay from any chequebook that used the file (logged at warn,
+/// terminated) after its cheque figures were lost, and let the node pay
+/// cheques from it again, for downloads and uploads alike. When the
+/// node's outbound cheque ledger (`pushsync_outbound.json`) is found
+/// unparseable it is moved aside and a `.lost` marker is left; while that
+/// marker names a loss, the node pays no cheques (downloads or uploads;
+/// both stay on the free pseudosettle tier) from any chequebook that
+/// used the file (logged at warn,
 /// and `/chequebook/balance` reports `chequeLedgerLost`). Only this call
 /// (or `antd --confirm-cheque-liability`) clears it, never time or a
 /// restart. Confirming accepts that peers paid before the loss hold
@@ -2413,7 +2415,11 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// spending, and again right before the transfer — a deposit there would
 /// back cheques peers drop — or those checks can't be read, or a
 /// chequebook deployed moments ago isn't visible to the RPC yet (retry
-/// later; nothing was spent). Returns the refreshed
+/// later; nothing was spent). On success the node re-reads the
+/// chequebook's funds over `gnosis_rpc` and pays cheques from them at
+/// once ([`ant_swap_status`] `paying`, when the switch is on), and keeps
+/// re-reading them every minute, even after an `ant_init` that reloaded
+/// the chequebook without an RPC. Returns the refreshed
 /// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
 /// and spends real funds** and **blocks** until they confirm, so the app
 /// gates it behind explicit confirmation. Requires the `chain` build

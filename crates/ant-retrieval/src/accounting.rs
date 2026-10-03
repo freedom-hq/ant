@@ -627,6 +627,54 @@ impl Accounting {
         })
     }
 
+    /// Record `price` of debt to `peer` that was already incurred, with
+    /// no overdraft check: bee debited it when it served the request, so
+    /// the mirror has to hold it whatever the limit says. Used for
+    /// pushsync, whose debit is only known once the receipt is in (the
+    /// push has happened by then, unlike a retrieval reservation, which
+    /// gates the request). Settles like bee's pushsync client, which
+    /// runs `PrepareCredit` and then `Apply`: [`Accounting::try_reserve`]'s
+    /// settle step without its admission check, then
+    /// [`DebitGuard::apply`] (the hot hint when the debt crosses
+    /// [`HOT_DEBT_THRESHOLD`], and a cheque if one is still due). So debt
+    /// past [`OVERDRAFT_LIMIT`] is paid too rather than dropped (PR #126
+    /// R1-M2).
+    pub fn debit(&self, peer: PeerId, price: u64) {
+        let payer = current_payer(&self.payment);
+        let cheque = {
+            let Ok(mut peers) = self.peers.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            let entry = peers.entry(peer).or_insert_with(|| PeerBalance {
+                last_used: now,
+                ..PeerBalance::default()
+            });
+            let next = entry
+                .balance
+                .saturating_add(entry.reserved)
+                .saturating_add(price);
+            let cheque = payer.as_ref().and_then(|_| entry.cheque_due(next, now));
+            entry.reserved = entry.reserved.saturating_add(price);
+            entry.last_used = now;
+            cheque
+        };
+        if let (Some(payer), Some(ticket)) = (payer, cheque) {
+            self.spawn_payment(payer, peer, ticket);
+        }
+        DebitGuard {
+            peer,
+            price,
+            applied: false,
+            balances: self.peers.clone(),
+            hot_hint: self.hot_hint.clone(),
+            credit_freed: self.credit_freed.clone(),
+            credit_epoch: self.credit_epoch.clone(),
+            payment: self.payment.clone(),
+        }
+        .apply();
+    }
+
     fn spawn_payment(&self, payer: Arc<dyn RetrievalPayment>, peer: PeerId, ticket: PaymentTicket) {
         spawn_payment(
             payer,
@@ -1080,6 +1128,51 @@ mod tests {
         drop(acc.try_reserve(third, 175_000));
         settle_payments().await;
         assert_eq!(payer.calls().len(), 1, "{:?}", payer.calls());
+    }
+
+    /// Debt incurred past the overdraft limit (a pushed chunk, debited by
+    /// bee once the receipt is in) is recorded, not dropped, so the next
+    /// cheque pays it too (PR #126 R1-M2). Here the push debt piles up
+    /// while the peer's one payment is in flight.
+    #[tokio::test]
+    async fn incurred_debt_past_the_limit_is_kept_and_paid() {
+        let gate = Arc::new(Notify::new());
+        let payer = Arc::new(Payer {
+            gate: Some(gate.clone()),
+            ..Payer::default()
+        });
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        for _ in 0..3 {
+            acc.debit(peer, 300_000);
+        }
+        settle_payments().await;
+        assert_eq!(payer.calls(), vec![(peer, 600_000)], "one in flight");
+
+        for _ in 0..10 {
+            acc.debit(peer, 300_000);
+        }
+        const { assert!(3_900_000 > OVERDRAFT_LIMIT) };
+        assert_eq!(acc.debug_snapshot(&peer), Some((3_900_000, 0)));
+        assert!(
+            acc.try_reserve(peer, 1).is_none(),
+            "past the limit: retrieval skips the peer"
+        );
+
+        gate.notify_one();
+        settle_payments().await;
+        assert_eq!(acc.debug_snapshot(&peer), Some((3_300_000, 0)));
+        acc.debit(peer, 300_000);
+        settle_payments().await;
+        assert_eq!(
+            payer.calls(),
+            vec![(peer, 600_000), (peer, 3_300_000)],
+            "the debt past the limit is paid by the next cheque"
+        );
+        gate.notify_one();
+        settle_payments().await;
+        assert_eq!(acc.debug_snapshot(&peer), Some((300_000, 0)));
     }
 
     /// A peer never refreshed has its whole debt still due to the refresh

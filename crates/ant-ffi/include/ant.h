@@ -238,10 +238,12 @@ char *ant_swap_status(const AntHandle *handle, char **out_err);
 
 /*
  * Confirm the outstanding liability of `chequebook` ("0x…" hex) after
- * its cheque figures were lost, and let downloads pay from it again.
+ * its cheque figures were lost, and let the node pay cheques from it
+ * again, for downloads and uploads alike.
  * When the node's outbound cheque ledger (pushsync_outbound.json) is
  * found unparseable it is moved aside and a ".lost" marker is left;
- * while that marker names a loss, retrieval doesn't pay from any
+ * while that marker names a loss, the node pays no cheques (downloads
+ * or uploads; both stay on the free pseudosettle tier) from any
  * chequebook that used the file (logged at warn, and /chequebook/balance
  * reports chequeLedgerLost). Only this call (or antd
  * --confirm-cheque-liability) clears it, never time or a restart.
@@ -517,7 +519,11 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * this call runs before spending (and again right before the transfer)
  * — it never funds that one — or when those checks can't be read, or a
  * chequebook deployed moments ago isn't visible to the RPC yet (retry;
- * nothing spent). Returns the
+ * nothing spent). On success the node re-reads the chequebook's funds
+ * over `gnosis_rpc` and pays cheques from them at once (ant_swap_status
+ * paying, when the switch is on), and keeps re-reading them every
+ * minute, even after an ant_init that reloaded the chequebook without an
+ * RPC. Returns the
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.

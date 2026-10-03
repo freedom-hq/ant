@@ -789,9 +789,9 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
         file = %path.display(),
         moved_to = %aside.display(),
         "outbound ledger is unparseable ({parse_error}); moved it aside. Its \
-         chequebooks' cheque totals are lost: uploads' cheques restart from \
-         zero, and downloads stay on the free tier for every chequebook that \
-         used this file until an operator confirms its outstanding \
+         chequebooks' cheque totals are lost: the node pays no cheques, for \
+         downloads or uploads (both stay on the free tier), from any chequebook \
+         that used this file until an operator confirms its outstanding \
          liability (antd --confirm-cheque-liability <chequebook>, or \
          ant_confirm_cheque_liability)",
     );
@@ -960,14 +960,14 @@ fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
         Ok(Some(m)) if m.clears(&key) => None,
         Ok(Some(m)) => Some(format!(
             "the outbound cheque ledger was unparseable and moved aside ({}), so the \
-             cheques chequebook 0x{key} issued before are unknown; downloads stay on \
-             the free tier until an operator confirms its outstanding liability \
+             cheques chequebook 0x{key} issued before are unknown; downloads and \
+             uploads stay on the free tier until an operator confirms its outstanding liability \
              (antd --confirm-cheque-liability 0x{key}, or ant_confirm_cheque_liability)",
             m.moved_aside.join(", "),
         )),
         Err(e) => Some(format!(
             "can't read the lost-ledger marker {} ({e}), so chequebook 0x{key}'s cheque \
-             figures count as lost; downloads stay on the free tier until an operator \
+             figures count as lost; downloads and uploads stay on the free tier until an operator \
              confirms its outstanding liability (antd --confirm-cheque-liability 0x{key}, \
              or ant_confirm_cheque_liability), which replaces an unparseable marker",
             lost_marker_path(path).display(),
@@ -1017,7 +1017,7 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
         target: "ant_p2p::swap",
         chequebook = %format!("0x{key}"),
         "operator confirmed the outstanding liability of cheques lost with the \
-         outbound ledger; downloads may pay from this chequebook again",
+         outbound ledger; downloads and uploads may pay from this chequebook again",
     );
     Ok(true)
 }

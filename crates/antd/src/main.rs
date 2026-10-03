@@ -352,8 +352,9 @@ struct Opt {
 
     /// Confirm the outstanding liability of a chequebook (`0x…`) whose
     /// cheque figures were lost with an unparseable outbound ledger, and
-    /// let downloads pay from it again. While the ledger's `.lost` marker
-    /// names a loss, retrieval doesn't pay from any chequebook that used
+    /// let the node pay cheques from it again, for downloads and uploads
+    /// alike. While the ledger's `.lost` marker names a loss, the node pays
+    /// no cheques (downloads or uploads) from any chequebook that used
     /// the file (the node logs it, and `/chequebook/balance` reports
     /// `chequeLedgerLost`). Confirming accepts that peers paid before the
     /// loss hold cheques the node can't see: they may refuse new cheques,
@@ -2726,13 +2727,13 @@ fn confirm_cheque_liabilities(data_dir: &Path, chequebooks: &[String]) -> Result
     Ok(())
 }
 
-/// Keep the node's view of what `chequebook` can pay for downloads
-/// current (issue #121): run the shared
+/// Keep the node's view of what `chequebook` can pay for downloads and
+/// uploads current (issues #121, #127): run the shared
 /// `ant_chain::chequebook_store::watch_retrieval_funds` (as `ant-ffi`
 /// does), publishing each read into `ControlCommand::SetRetrievalFunds`.
 /// Reads go to `--gnosis-rpc-url`, else the public logs RPC (as the
-/// gateway's reads do). Without either nothing runs and downloads stay on
-/// the free tier. It runs whatever `--swap-enable` says, so switching
+/// gateway's reads do). Without either nothing runs and downloads and
+/// uploads stay on the free tier. It runs whatever `--swap-enable` says, so switching
 /// SWAP on at runtime (`ControlCommand::SetSwapEnabled`) finds the funds
 /// already known; the node applies the switch.
 ///
@@ -2760,7 +2761,8 @@ fn spawn_retrieval_funds_watch(
     let Some(rpc) = configured_rpc_url(opt).or_else(|| resolve_logs_rpc(opt)) else {
         tracing::info!(
             target: "antd",
-            "no Gnosis RPC to read the chequebook balance from; downloads stay on the free tier",
+            "no Gnosis RPC to read the chequebook balance from; downloads and uploads stay on \
+             the free tier",
         );
         return;
     };

@@ -812,10 +812,11 @@ mod tests {
     }
 
     /// A ledger moved aside as unparseable lost what the chequebook owes
-    /// (PR #126 R4-M1): retrieval stays on the free tier — no payer, and
-    /// a payment that races in is refused before any stream opens — even
-    /// after a restart, until the operator confirms the liability.
-    /// Pushsync cheques keep their behaviour: the ledger still records.
+    /// (PR #126 R4-M1): downloads and uploads stay on the free tier — no
+    /// payer (the one payer serves both since #127), and a payment that
+    /// races in is refused before any stream opens — even after a
+    /// restart, until the operator confirms the liability. The ledger
+    /// itself still records.
     #[tokio::test]
     async fn a_lost_ledger_keeps_retrieval_off_until_confirmed() {
         let dir = tempfile::tempdir().unwrap();
