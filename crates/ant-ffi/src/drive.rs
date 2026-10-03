@@ -2036,20 +2036,30 @@ async fn settlement_deposit_for(
 /// refreshed [`settlement_deposit`] JSON. Submits real Gnosis
 /// transactions and spends real funds, so the app gates it behind an
 /// explicit confirmation.
+///
+/// With `amount`, deposits that many PLUR more instead, whatever the
+/// target (a host topping up browsing credit beyond the default
+/// deposit); the gateway's `POST /v0/settlement/deposit?amount=` runs
+/// the same shared step.
 #[cfg(feature = "chain")]
-pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+pub(crate) fn settlement_topup_xdai(
+    h: &AntHandle,
+    rpc: String,
+    amount: Option<u128>,
+) -> Result<String, DriveError> {
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
     let secret = h.signing_secret;
     let cmd_tx = h.cmd_tx.clone();
     h.runtime.block_on(async move {
-        settlement_topup_xdai_for(
+        settlement_topup_xdai_adding(
             &cmd_tx,
             &h.chain_client(rpc),
             &data_dir,
             owner,
             secret,
             &h.gateway_chequebook,
+            amount,
         )
         .await
     })
@@ -2074,7 +2084,7 @@ pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String
 /// On a refusal the in-process gateway's chequebook `slot` follows: a
 /// chequebook disqualified here is cleared from it, so `/wallet` and
 /// `POST /chequebook/deposit` stop using it without a gateway restart.
-#[cfg(feature = "chain")]
+#[cfg(all(feature = "chain", test))]
 async fn settlement_topup_xdai_for(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
@@ -2083,7 +2093,23 @@ async fn settlement_topup_xdai_for(
     secret: [u8; 32],
     slot: &ant_gateway::ChequebookSlot,
 ) -> Result<String, DriveError> {
-    let result = settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret).await;
+    settlement_topup_xdai_adding(cmd_tx, client, data_dir, owner, secret, slot, None).await
+}
+
+/// [`settlement_topup_xdai_for`] with an optional explicit amount (see
+/// [`settlement_topup_xdai`]).
+#[cfg(feature = "chain")]
+async fn settlement_topup_xdai_adding(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: [u8; 20],
+    secret: [u8; 32],
+    slot: &ant_gateway::ChequebookSlot,
+    amount: Option<u128>,
+) -> Result<String, DriveError> {
+    let result =
+        settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret, amount).await;
     if result.is_err() {
         // Clears the slot only if it holds a chequebook now in
         // `DISQUALIFIED`; any other failure leaves it alone.
@@ -2100,6 +2126,7 @@ async fn settlement_topup_xdai_checked(
     data_dir: &std::path::Path,
     owner: [u8; 20],
     secret: [u8; 32],
+    amount: Option<u128>,
 ) -> Result<String, DriveError> {
     let cb = persisted_chequebook(data_dir, &owner).ok_or_else(|| {
         DriveError::Op(
@@ -2140,7 +2167,7 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR).await
+        funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR, amount).await
     };
     match funded {
         Ok(status) => to_json(&SettlementDeposit::of(&status)),

@@ -704,6 +704,43 @@ pub struct StatusSnapshot {
     /// default is `true`.
     #[serde(default = "chain_ready_missing_default")]
     pub chain_ready: bool,
+    /// The node's SWAP settlement switch and whether it pays (issues
+    /// #121, #127). Published by the node loop whenever the switch, the
+    /// chequebook or its funds change. Old daemons leave this at the
+    /// `#[serde(default)]` value.
+    #[serde(default)]
+    pub settlement: SettlementInfo,
+}
+
+/// Node-wide SWAP settlement state: bee's `swap-enable` switch, read by
+/// the gateway's `GET /node` and `GET /v0/settlement/swap` and by
+/// ant-ffi's `ant_swap_status`, so hosts needn't probe for support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementInfo {
+    /// Bee's `swap-enable`: SWAP cheques may pay peers, for downloads and
+    /// uploads alike. Changed at runtime by `SetSwapEnabled`
+    /// (`PUT /v0/settlement/swap`, `ant_set_swap_enabled`, the control
+    /// socket).
+    pub swap_enabled: bool,
+    /// The chequebook outbound settlement runs on (`0x` + 40 hex), if
+    /// any.
+    #[serde(default)]
+    pub chequebook: Option<String>,
+    /// Cheques are being paid now: the switch is on and the chequebook
+    /// has funds the node has read from the chain and not yet spent, with
+    /// its cheque ledger known. `false` means the free pseudosettle tier.
+    #[serde(default)]
+    pub paying: bool,
+}
+
+impl Default for SettlementInfo {
+    fn default() -> Self {
+        Self {
+            swap_enabled: true,
+            chequebook: None,
+            paying: false,
+        }
+    }
 }
 
 /// Missing-field default for [`StatusSnapshot::chain_ready`]: a daemon

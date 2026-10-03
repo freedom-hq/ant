@@ -11,7 +11,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, on, patch, post, MethodFilter, MethodRouter};
+use axum::routing::{get, on, patch, post, put, MethodFilter, MethodRouter};
 use axum::Router;
 
 use tracing::Instrument;
@@ -116,6 +116,18 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route(
             "/v0/storage/extend",
             post(chain::storage_extend).route_layer(spend_guard.clone()),
+        )
+        // Ant extension: the node's `swap-enable` switch, read and set
+        // at runtime (Freedom runs `antd --no-control-socket`). The write
+        // refuses web pages like the spending routes above.
+        .route(
+            "/v0/settlement/swap",
+            get(status::swap_get).merge(put(status::swap_put).route_layer(
+                middleware::from_fn_with_state(
+                    handle.clone(),
+                    crate::cors::settlement_switch_guard,
+                ),
+            )),
         )
         .route(
             "/v0/settlement/deposit",

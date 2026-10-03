@@ -378,7 +378,10 @@ impl ChainWriter for AntChainWriter {
         Ok(self.deposit_view(Some(&status)))
     }
 
-    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+    async fn fund_deposit_with_xdai(
+        &self,
+        amount: Option<u128>,
+    ) -> Result<DepositView, FundingFailure> {
         if let Some(cb) = self.chequebook.refused() {
             return Err(FundingFailure::Rejected(format!(
                 "chequebook 0x{} failed its on-chain checks, so settlement is off for it; \
@@ -391,10 +394,14 @@ impl ChainWriter for AntChainWriter {
                 "this node has no chequebook yet; buying storage creates one".into(),
             )
         })?;
-        let status =
-            funding::fund_deposit_with_xdai(&self.payer(), &cb, self.deposit_target_or_default())
-                .await
-                .map_err(failure)?;
+        let status = funding::fund_deposit_with_xdai(
+            &self.payer(),
+            &cb,
+            self.deposit_target_or_default(),
+            amount,
+        )
+        .await
+        .map_err(failure)?;
         Ok(self.deposit_view(Some(&status)))
     }
 }
@@ -645,7 +652,7 @@ mod tests {
         )
         .expect("context built");
         let writer = ctx.writer.clone().expect("writer");
-        match writer.fund_deposit_with_xdai().await {
+        match writer.fund_deposit_with_xdai(None).await {
             Err(FundingFailure::Rejected(m)) => {
                 assert!(m.contains("failed its on-chain checks"), "{m}");
             }

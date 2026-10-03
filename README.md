@@ -75,10 +75,13 @@ the still-open items.
 - **SWAP wire protocol (`/swarm/swap/1.0.0/swap`).** Full inbound
   listener with EIP-712 cheque verification, monotonicity enforcement,
   sticky issuer-EOA pinning, and crash-safe credit ledger. Outbound
-  cheque issuance + emit helpers (`OutboundLedger` + `issue_and_emit`).
-  As a light node `antd` is a net debtor — it issues outbound cheques
-  for chunks it consumes; the inbound listener exists for symmetry +
-  forward compatibility (PLAN.md M3 Phase 7).
+  cheques for downloads and uploads alike, priced like bee's
+  (`units × exchange + deduction`, capped by the price oracle and the
+  chequebook's available balance) and switched by `swap-enable`
+  (`OutboundLedger` + `PushsyncSwap`). As a light node `antd` is a net
+  debtor — it issues outbound cheques for chunks it consumes; the
+  inbound listener exists for symmetry + forward compatibility
+  (PLAN.md M3 Phase 7).
 - **Operator tooling — postage on-chain.** `antctl postage` talks
   directly to Gnosis (no daemon required) and exposes:
   - `antctl postage create   --depth N --amount-per-chunk W` — submits `createBatch(...)`.

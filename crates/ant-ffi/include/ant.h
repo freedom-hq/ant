@@ -198,15 +198,14 @@ int ant_resume(const AntHandle *handle, char **out_err);
 
 /*
  * Bee's swap-enable: switch SWAP settlement on or off for the running
- * node. Today it governs retrieval payments (issue #121). On (the
- * default), downloads pay peers with SWAP cheques from the node's
+ * node, for downloads (issue #121) and uploads (issue #127) alike. On
+ * (the default), the node pays peers with SWAP cheques from its
  * chequebook once the debt to a peer reaches half its payment threshold,
- * after the free pseudosettle refresh, as bee does; that lifts downloads
- * past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB (bee's
- * oracle rate), never more than the chequebook holds. Off keeps
- * downloads on the free tier even with a funded chequebook. Upload
- * (pushsync) cheques are not governed by it yet: #127 makes them pay at
- * bee's rate under this same switch.
+ * after the free pseudosettle refresh, as bee does: one balance per
+ * peer, cheques worth units x exchange + deduction at bee's oracle rate
+ * (up to ~0.75 xBZZ per GB), never more than the chequebook holds. That
+ * lifts downloads past the free tier's ~5-6 Mbit/s. Off keeps downloads
+ * and uploads on the free tier even with a funded chequebook.
  *
  * Payments also need a chequebook with funds the node has read from the
  * chain: they start after the first settlement setup that has an RPC
@@ -219,6 +218,23 @@ int ant_resume(const AntHandle *handle, char **out_err);
  * string is written into *out_err (free with ant_free_string).
  */
 int ant_set_swap_enabled(const AntHandle *handle, bool enabled, char **out_err);
+
+/*
+ * The node's SWAP settlement state as a JSON object — what the gateway's
+ * GET /v0/settlement/swap and GET /node's "settlement" report, for a host
+ * that doesn't run the gateway:
+ *   {"supported":bool,"swap_switch":true,"swap_enabled":bool,
+ *    "paying":bool,"chequebook":"0x…"|null,"persisted":false}
+ * supported: this build pays peers with SWAP cheques once a funded
+ * chequebook backs settlement (the `chain` feature). swap_switch: the
+ * switch can be changed at runtime (ant_set_swap_enabled). swap_enabled:
+ * bee's swap-enable as the node runs it now, for downloads and uploads
+ * alike. paying: cheques are being paid right now (switch on, chequebook
+ * funds read from the chain and not spent), otherwise the free
+ * pseudosettle tier. persisted: always false, the switch resets at
+ * ant_init. Never blocks on the network. Free with ant_free_string.
+ */
+char *ant_swap_status(const AntHandle *handle, char **out_err);
 
 /*
  * Confirm the outstanding liability of `chequebook` ("0x…" hex) after
@@ -509,6 +525,23 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
 char *ant_storage_settlement_topup(const AntHandle *handle,
                                    const char *gnosis_rpc,
                                    char **out_err);
+
+/*
+ * Like ant_storage_settlement_topup, but deposits `amount_plur` more (a
+ * decimal PLUR string, 1 xBZZ = 10^16 PLUR) whatever the deposit's
+ * target: how a host tops up browsing credit beyond the node's default
+ * deposit. The same product flow and guards: the chain checks run before
+ * anything is spent, and the node swaps xDAI only for the xBZZ the wallet
+ * lacks. Errors on an amount that isn't a positive integer. Mirrors the
+ * gateway's POST /v0/settlement/deposit?amount=. Returns the refreshed
+ * ant_storage_settlement_deposit JSON. SUBMITS REAL TRANSACTIONS AND
+ * SPENDS REAL FUNDS, and BLOCKS until they confirm. Requires the `chain`
+ * cargo feature.
+ */
+char *ant_storage_settlement_topup_amount(const AntHandle *handle,
+                                          const char *gnosis_rpc,
+                                          const char *amount_plur,
+                                          char **out_err);
 
 /*
  * Deep read-back propagation check for an uploaded reference. Resolves

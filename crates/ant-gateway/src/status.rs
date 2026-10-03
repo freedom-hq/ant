@@ -87,6 +87,46 @@ struct NodeBody {
     chequebook_enabled: bool,
     #[serde(rename = "swapEnabled")]
     swap_enabled: bool,
+    /// Ant extension: SWAP settlement capability and state, so a host
+    /// can tell this node pays peers and has the runtime switch without
+    /// parsing `antd --help` (Freedom's wallet UI).
+    settlement: SettlementBody,
+}
+
+/// `GET /node`'s `settlement` object and the body of
+/// `GET`/`PUT /v0/settlement/swap`.
+#[derive(Debug, Serialize)]
+pub(crate) struct SettlementBody {
+    /// This node can pay peers with SWAP cheques once it has a funded
+    /// chequebook (light mode). `false` on an ultra-light node.
+    pub(crate) supported: bool,
+    /// The `swap-enable` switch can be read and set at runtime on
+    /// `/v0/settlement/swap`.
+    #[serde(rename = "swapSwitch")]
+    pub(crate) swap_switch: bool,
+    /// Bee's `swap-enable`, live: cheques may pay peers, for downloads
+    /// and uploads alike.
+    #[serde(rename = "swapEnabled")]
+    pub(crate) swap_enabled: bool,
+    /// Cheques are paid right now: the switch is on and the chequebook
+    /// has funds left as of the node's last chain read (every 60 s).
+    /// `false`: the free pseudosettle tier.
+    pub(crate) paying: bool,
+    /// The chequebook settlement runs on (`0x…`), or `null`.
+    pub(crate) chequebook: Option<String>,
+}
+
+impl SettlementBody {
+    pub(crate) fn of(handle: &GatewayHandle, light: bool) -> Self {
+        let s = handle.status.borrow().settlement.clone();
+        Self {
+            supported: light,
+            swap_switch: true,
+            swap_enabled: s.swap_enabled,
+            paying: light && s.paying,
+            chequebook: s.chequebook,
+        }
+    }
 }
 
 /// `GET /node`. Reports `light` once `antd` has uploads + SWAP
@@ -96,19 +136,111 @@ struct NodeBody {
 /// publish/feed/SOC-write surface work (PLAN.md J.4.1). While chain
 /// init is still resolving we answer a retryable `503` rather than a
 /// premature `ultra-light` that would wrongly disable Freedom's
-/// publish surface. `chequebookEnabled` / `swapEnabled` track
-/// `beeMode` because, in `antd`, light mode *is* the SWAP-settlement
-/// mode.
+/// publish surface. `chequebookEnabled` tracks `beeMode` because, in
+/// `antd`, light mode *is* the SWAP-settlement mode; `swapEnabled` is
+/// bee's `swap-enable` switch as the node runs it now (always `false`
+/// on an ultra-light node, as in bee). The Ant-only `settlement` object
+/// adds the capability (`supported`, `swapSwitch`) and whether cheques
+/// are paid right now; see `/v0/settlement/swap`.
 pub async fn node(State(handle): State<GatewayHandle>) -> Response {
     let Some(state) = handle.chain_state() else {
         return crate::error::chain_initializing();
     };
     let light = state.light_mode;
+    let settlement = SettlementBody::of(&handle, light);
     Json(NodeBody {
         bee_mode: if light { "light" } else { "ultra-light" },
         gateway_mode: false,
         chequebook_enabled: light,
-        swap_enabled: light,
+        swap_enabled: light && settlement.swap_enabled,
+        settlement,
+    })
+    .into_response()
+}
+
+/// `GET`/`PUT /v0/settlement/swap` body: the node's settlement state,
+/// and whether a change made here survives a restart.
+#[derive(Debug, Serialize)]
+struct SwapBody {
+    #[serde(flatten)]
+    settlement: SettlementBody,
+    /// Always `false`: the runtime switch isn't persisted. `antd` reads
+    /// `swap-enable` from its `--config` file or `--swap-enable` at the
+    /// next start (Freedom writes it into the `config.yaml` it
+    /// generates); ant-ffi hosts call `ant_set_swap_enabled` after every
+    /// `ant_init`.
+    persisted: bool,
+}
+
+/// `PUT /v0/settlement/swap` request: `{"swapEnabled": bool}`.
+#[derive(Debug, serde::Deserialize)]
+pub struct SwapRequest {
+    #[serde(rename = "swapEnabled")]
+    swap_enabled: bool,
+}
+
+/// How long `PUT /v0/settlement/swap` waits for the node loop.
+const SWAP_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `GET /v0/settlement/swap` (Ant extension): bee's `swap-enable` switch
+/// as the node runs it now, whether cheques are being paid, and the
+/// chequebook — the same object as `GET /node`'s `settlement`, plus
+/// `persisted`. `503` until chain init resolves.
+pub async fn swap_get(State(handle): State<GatewayHandle>) -> Response {
+    let Some(state) = handle.chain_state() else {
+        return crate::error::chain_initializing();
+    };
+    Json(SwapBody {
+        settlement: SettlementBody::of(&handle, state.light_mode),
+        persisted: false,
+    })
+    .into_response()
+}
+
+/// `PUT /v0/settlement/swap` with `{"swapEnabled": bool}` (Ant
+/// extension): switch SWAP settlement on or off for the running node,
+/// downloads and uploads alike — the same command as `antctl`'s,
+/// `antd --swap-enable` at runtime, and ant-ffi's
+/// `ant_set_swap_enabled`, so a host running `antd
+/// --no-control-socket` (Freedom) needn't restart the node to flip it.
+/// Answers the state afterwards. Not persisted (see [`SwapBody`]).
+///
+/// Turning it on lets the node spend its chequebook, so the route takes
+/// the same guard as the wallet-spending routes (#105): a request from a
+/// web page is refused unless its origin is listed exactly in
+/// `cors-allowed-origins` (`cors::settlement_switch_guard`).
+pub async fn swap_put(
+    State(handle): State<GatewayHandle>,
+    Json(req): Json<SwapRequest>,
+) -> Response {
+    let Some(state) = handle.chain_state() else {
+        return crate::error::chain_initializing();
+    };
+    let (ack, rx) = tokio::sync::oneshot::channel();
+    let cmd = ant_control::ControlCommand::SetSwapEnabled {
+        enabled: req.swap_enabled,
+        ack,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return crate::retrieval::node_unavailable();
+    }
+    match tokio::time::timeout(SWAP_SWITCH_TIMEOUT, rx).await {
+        Ok(Ok(ant_control::ControlAck::Ok { .. })) => {}
+        Ok(Ok(ant_control::ControlAck::Error { message })) => {
+            return crate::error::json_error(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+        Ok(Ok(_) | Err(_)) => return crate::retrieval::node_unavailable(),
+        Err(_) => {
+            return crate::error::json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the node didn't answer the swap switch in time",
+            )
+        }
+    }
+    // The node loop publishes the new state before it acks.
+    Json(SwapBody {
+        settlement: SettlementBody::of(&handle, state.light_mode),
+        persisted: false,
     })
     .into_response()
 }

@@ -69,9 +69,11 @@
 //!   restart can't accept a replayed older cheque.
 //! - [`run_inbound`]: listener task that drains accepted streams,
 //!   verifies cheques, and updates the ledger.
-//! - [`emit_cheque`]: outbound dialer that signs and ships a cheque.
-//! - [`issue_and_emit`]: one-shot helper that mints a fresh cheque
-//!   with `cumulative_payout = previous + amount` and emits it.
+//! - [`emit_cheque`]: outbound dialer that ships a signed cheque.
+//! - [`open_settlement`] / [`write_cheque`] / [`await_processed`]: the
+//!   steps of bee's `swapprotocol.EmitCheque` that the node's payer
+//!   (`crate::PushsyncSwap`) runs, pricing each cheque from the
+//!   recipient's rate headers.
 //!
 //! # What this module does **not** do (yet)
 //!
@@ -562,8 +564,9 @@ pub fn issue_cheque(
 /// So a move aside also leaves a marker, `<name>.lost`, and while it
 /// exists every chequebook on the file counts as having lost its
 /// figures ([`Self::lost_figures`]): its issued total is unknown,
-/// retrieval doesn't pay from it (`PushsyncSwap::pays_retrieval`) and
-/// `/chequebook/balance` says so. Pushsync cheques go on as before. The
+/// the node pays no cheques from it, for downloads or uploads
+/// (`PushsyncSwap::pays_retrieval`), and `/chequebook/balance` says so
+/// (until #127 upload cheques went on regardless). The
 /// marker never clears by itself, only by an operator confirming the
 /// chequebook's outstanding liability ([`confirm_cheque_liability`]:
 /// `antd --confirm-cheque-liability`, `ant_confirm_cheque_liability`)
@@ -1232,8 +1235,8 @@ impl OutboundLedger {
     /// Why this chequebook's figures are unknown — the ledger file was
     /// unparseable and moved aside, and no operator has confirmed the
     /// chequebook's outstanding liability since (see the type docs) —
-    /// or `None` while they are known. Retrieval doesn't pay while this
-    /// is `Some`; pushsync still does. Checked against the marker on
+    /// or `None` while they are known. No cheque, for downloads or
+    /// uploads, is paid while this is `Some`. Checked against the marker on
     /// every call, so a loss or a confirmation shows at once in every
     /// ledger on the file — but without the file lock, and parsing the
     /// marker only when it changed, since this runs on the swarm loop
@@ -1564,40 +1567,6 @@ pub async fn emit_cheque(
     Ok(())
 }
 
-/// One-shot helper: look up the last cumulative we issued to
-/// `beneficiary`, sign a fresh cheque for `previous + amount`, send
-/// it, and on success record the new cumulative in the outbound
-/// ledger. Returns the new cumulative amount on success.
-#[allow(clippy::too_many_arguments)]
-pub async fn issue_and_emit(
-    control: &mut Control,
-    peer: PeerId,
-    secret: &[u8; SECP256K1_SECRET_LEN],
-    chequebook: [u8; 20],
-    beneficiary: [u8; 20],
-    amount: U256,
-    chain_id: u64,
-    outbound: &OutboundLedger,
-) -> Result<U256, SwapError> {
-    outbound
-        .ensure_readable()
-        .map_err(|e| SwapError::Rejected(format!("outbound ledger unreadable: {e}")))?;
-    let prev = outbound.cumulative_for(&beneficiary);
-    let new_cum = prev
-        .checked_add(amount)
-        .ok_or_else(|| SwapError::Rejected("cumulative overflow".into()))?;
-    let signed = issue_cheque(secret, chequebook, beneficiary, new_cum, chain_id)?;
-    emit_cheque(control, peer, &signed).await?;
-    if let Err(e) = outbound.record_issued(&beneficiary, new_cum) {
-        warn!(
-            target: "ant_p2p::swap",
-            beneficiary = %hex::encode(beneficiary),
-            "outbound ledger persist failed after successful emit: {e}",
-        );
-    }
-    Ok(new_cum)
-}
-
 /// Bee's settlement response headers (`pkg/settlement/swap/headers`):
 /// the cheque recipient's `exchange` rate (PLUR per accounting unit, from
 /// the swap price oracle) and the one-off `deduction` (PLUR), both
@@ -1712,10 +1681,16 @@ pub async fn write_cheque(stream: &mut Stream, signed: &SignedCheque) -> Result<
 /// recipient past its disconnect limit, and bee blocklists the payer
 /// (`debitAction.Apply`).
 ///
-/// Bee ends the stream with `FullClose` on acceptance and `Reset` on a
-/// refusal, but rust-yamux reports a remote reset as end of stream too,
-/// so this can't tell the two apart; `Err` means only that the stream
-/// failed some other way.
+/// Bee ends the stream with `FullClose` only after `ReceiveCheque`
+/// succeeded and with `Reset` on any failure (`swapprotocol.handler`,
+/// bee 7515c4c). rust-yamux 0.13 can't tell them apart: a remote `RST`
+/// and a dropped connection (`drop_all_streams`) both move the stream to
+/// `Closed`, which reads as a clean end of stream (`Ok(0)`), exactly like
+/// a `FIN`. So `Ok` here means only that the stream ended, and `Err` that
+/// it failed some other way. The payer adds the signal it does have: the
+/// connection must still be up a moment later (`crate::PushsyncSwap`,
+/// `DELIVERY_GRACE`). A refusal that resets only the stream, with the
+/// connection kept, still reads as delivered.
 pub async fn await_processed(mut stream: Stream) -> Result<(), SwapError> {
     let mut rest = Vec::new();
     stream

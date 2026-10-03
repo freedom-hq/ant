@@ -225,13 +225,13 @@ pub struct RunConfig {
     /// cheque — but every received cheque is silently dropped.
     pub swap: Option<SwapConfig>,
     /// Optional outbound SWAP settlement configuration (Phase 7b).
-    /// When `Some`, every accepted pushsync receipt is reported into
-    /// a [`crate::PushsyncSwap`] which tracks per-peer cumulative
-    /// debt and emits an EIP-712 cheque to the peer's BZZ-handshake
-    /// EOA when the debt crosses [`crate::DEFAULT_CHEQUE_TRIGGER`].
-    /// Without this, sustained pushsync uploads stall after a few
-    /// hundred chunks per peer (bee's paymentTolerance) — see the
-    /// 2026-05-08 production failure write-up in `PLAN.md` § Phase 7b.
+    /// When `Some`, the node builds a [`crate::PushsyncSwap`] on the
+    /// chequebook: the cheque payer of the shared accounting mirror,
+    /// which settles retrieval and pushsync debt alike (bee's one
+    /// balance per peer) — the free pseudosettle refresh first, then a
+    /// cheque priced like bee's once the debt reaches the early-payment
+    /// threshold, while `swap-enable` is on and the chequebook has funds
+    /// (issues #121, #127).
     pub pushsync_swap: Option<crate::PushsyncSwapConfig>,
     /// Shared `peer_id -> ethereum_address` registry. The swarm
     /// loop populates this in the BZZ-handshake-success branch
@@ -949,9 +949,14 @@ struct SwarmState {
     /// in which case every received-side field is absent — honest:
     /// without a ledger we accept no cheques.
     credit_ledger: Option<Arc<crate::swap::CreditLedger>>,
-    /// `swap-enable` (issue #121): `false` keeps downloads on the free
-    /// tier whatever the chequebook holds.
+    /// `swap-enable` (issues #121, #127): `false` keeps downloads and
+    /// uploads on the free tier whatever the chequebook holds.
     swap_enabled: bool,
+    /// The node's status channel, so settlement changes made from a
+    /// control command reach `StatusSnapshot::settlement` (see
+    /// [`publish_settlement`]). `None` in tests and embeddings without
+    /// one.
+    status: Option<watch::Sender<StatusSnapshot>>,
     /// Latest `SetRetrievalFunds` and the chequebook it's for. Applied to
     /// the outbound SWAP service whenever it runs on that chequebook, so
     /// funds read before the service starts (antd's late chain init) are
@@ -1001,12 +1006,6 @@ struct SwarmState {
     /// whole sequence (measured: warm == cold at up to 4.3 s without
     /// this). In-memory only — a restart just pays one cold walk.
     feed_hints: FeedHints,
-    /// Clone of the shared pseudosettle hot-hint sender, retained so a
-    /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
-    /// a freshly-built [`crate::PushsyncSwap`] the same way startup
-    /// wiring does. `None` until `run` populates it (and in tests /
-    /// builds without the pseudosettle driver).
-    hot_hint: Option<mpsc::Sender<ant_retrieval::accounting::HotHint>>,
     /// Overlay-indexed dial book: every peer we've learned about via hive
     /// gossip (or the on-disk peerstore) that we are *not* currently
     /// connected to, retained with its dial multiaddrs + overlay. Unlike
@@ -1082,6 +1081,7 @@ impl SwarmState {
             retired_outbound: None,
             credit_ledger: None,
             swap_enabled: true,
+            status: None,
             retrieval_funds: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
@@ -1089,7 +1089,6 @@ impl SwarmState {
             runtime_registered: HashMap::new(),
             bought_batches: HashMap::new(),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            hot_hint: None,
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
         }
@@ -1766,6 +1765,8 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
     state.swap_enabled = cfg.swap_enabled;
+    state.status = cfg.status.clone();
+    publish_settlement(&state);
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
     // a public multiaddr for us. Without this bee's inbound handshake handler
@@ -1808,18 +1809,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
         crate::pseudosettle::HOT_HINT_CHANNEL_CAP,
     );
-    // Phase 7d: same `HotHint` channel feeds both retrieval-side
-    // accounting and pushsync-side debt accumulation. The driver
-    // doesn't care which subsystem produced the hint; it only acts
-    // on the (peer, hot=true) flag. Clone the sender so we can pass
-    // a copy into `PushsyncSwap` further down — the channel is
-    // reference-counted internally so cloning is cheap and only
-    // the last drop closes the receiver side.
-    let hot_hint_tx_for_pushsync = hot_hint_tx.clone();
-    // Retain a clone so a runtime `EnablePushsyncSwap` (FFI first-buy
-    // chequebook bootstrap) can wire the same driver into a swap
-    // service built after startup, matching the startup path below.
-    state.hot_hint = Some(hot_hint_tx.clone());
+    // The accounting mirror feeds the driver's hot hints for retrieval
+    // and pushsync debt alike (pushsync debits land in it through
+    // `PushPseudosettle`, see `push_settlement`).
     let accounting =
         Arc::new(ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx));
     tokio::spawn(crate::pseudosettle::run_driver(
@@ -1842,17 +1834,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // `OutboundLedger` snapshot lives at the configured path so
     // cumulative cheque amounts survive restarts.
     if let Some(swap_cfg) = cfg.pushsync_swap.clone() {
-        // Phase 7d: thread the shared hot-hint sender into the SWAP
-        // service so each `note_pushsync` queues a pseudosettle
-        // refresh on the same driver that retrieval-side debt uses.
-        let svc = Arc::new(
-            crate::PushsyncSwap::new(swap_cfg, control.clone())
-                .with_hot_hint(hot_hint_tx_for_pushsync),
-        );
+        let svc = Arc::new(crate::PushsyncSwap::new(swap_cfg, control.clone()));
         info!(
             target: "ant_p2p::pushsync_swap",
             chequebook = %hex::encode(svc.chequebook()),
-            "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
+            "outbound SWAP settlement enabled",
         );
         state.pushsync_swap = Some(svc);
         sync_retrieval_payment(&state);
@@ -2137,6 +2123,12 @@ async fn recv_late_chain(rx: Option<&mut mpsc::Receiver<LateChainInit>>) -> Opti
 /// retrieval pays from the same chequebook, ledger and service that
 /// pushsync uses, and only while it runs.
 fn sync_retrieval_payment(state: &SwarmState) {
+    sync_payer(state);
+    publish_settlement(state);
+}
+
+/// [`sync_retrieval_payment`]'s payer half.
+fn sync_payer(state: &SwarmState) {
     let Some(accounting) = state.accounting.as_ref() else {
         return;
     };
@@ -2174,6 +2166,35 @@ fn sync_retrieval_payment(state: &SwarmState) {
     accounting.set_payment(payer);
 }
 
+/// Publish the node's settlement state (the `swap-enable` switch, the
+/// chequebook, whether cheques are paid now) into
+/// `StatusSnapshot::settlement`, for `GET /node`, `GET
+/// /v0/settlement/swap` and `ant_swap_status`. Only sends on a change.
+fn publish_settlement(state: &SwarmState) {
+    let Some(status) = state.status.as_ref() else {
+        return;
+    };
+    let info = ant_control::SettlementInfo {
+        swap_enabled: state.swap_enabled,
+        chequebook: state
+            .pushsync_swap
+            .as_ref()
+            .map(|svc| format!("0x{}", hex::encode(svc.chequebook()))),
+        paying: state
+            .accounting
+            .as_ref()
+            .is_some_and(|a| a.pays_with_swap()),
+    };
+    status.send_if_modified(|snap| {
+        if snap.settlement == info {
+            false
+        } else {
+            snap.settlement = info;
+            true
+        }
+    });
+}
+
 /// Install the chain-derived inputs once `antd`'s startup Gnosis reads
 /// complete: fill the upload-runtime slot consulted by
 /// `handle_control_command` (`PushChunk`, postage commands) and build
@@ -2201,14 +2222,11 @@ fn apply_late_chain_init(
             // patch in the live handshake-EOA registry the same way
             // `run_node` does for the startup path.
             swap_cfg.peer_eth = state.peer_eth.clone();
-            let mut svc = crate::PushsyncSwap::new(swap_cfg, control.clone());
-            if let Some(tx) = state.hot_hint.clone() {
-                svc = svc.with_hot_hint(tx);
-            }
+            let svc = crate::PushsyncSwap::new(swap_cfg, control.clone());
             info!(
                 target: "ant_p2p::pushsync_swap",
                 chequebook = %hex::encode(svc.chequebook()),
-                "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
+                "outbound SWAP settlement enabled",
             );
             state.pushsync_swap = Some(Arc::new(svc));
             sync_retrieval_payment(state);
@@ -2772,7 +2790,11 @@ fn handle_control_command(
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
-            let pushsync_swap = state.pushsync_swap.clone();
+            let push_settlement = push_settlement(
+                state.accounting.clone(),
+                state.pushsync_swap.is_some(),
+                crate::push_pseudosettle::PushPseudosettle::enabled_by_env(),
+            );
             let push_skip = state.push_skip.clone();
             let neighborhood_dial = state.neighborhood_dial_tx.clone();
             tokio::spawn(async move {
@@ -2788,8 +2810,7 @@ fn handle_control_command(
                 if let Some(tx) = neighborhood_dial {
                     push_fetcher = push_fetcher.with_neighborhood_dialer(tx);
                 }
-                if let Some(svc) = pushsync_swap {
-                    let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+                if let Some(s) = push_settlement {
                     push_fetcher = push_fetcher.with_pushsync_settlement(s);
                 }
                 let reply = stewardship_reupload(
@@ -3561,16 +3582,13 @@ fn handle_control_command(
                 PathBuf::from(outbound_ledger_path),
                 state.peer_eth.clone(),
             );
-            let mut svc = crate::PushsyncSwap::new(cfg, control.clone());
-            if let Some(tx) = state.hot_hint.clone() {
-                svc = svc.with_hot_hint(tx);
-            }
+            let svc = crate::PushsyncSwap::new(cfg, control.clone());
             state.pushsync_swap = Some(Arc::new(svc));
             sync_retrieval_payment(state);
             info!(
                 target: "ant_p2p::pushsync_swap",
                 chequebook = %hex::encode(chequebook),
-                "outbound SWAP settlement enabled at runtime — pushsync will emit cheques",
+                "outbound SWAP settlement enabled at runtime",
             );
             let _ = ack.send(ControlAck::Ok {
                 message: format!(
@@ -3607,7 +3625,7 @@ fn handle_control_command(
             sync_retrieval_payment(state);
             let _ = ack.send(ControlAck::Ok {
                 message: format!(
-                    "swap settlement {} (retrieval payments)",
+                    "swap settlement {} (downloads and uploads)",
                     if enabled { "on" } else { "off" }
                 ),
             });
@@ -4633,22 +4651,39 @@ fn build_push_fetcher(
     if let Some(tx) = state.neighborhood_dial_tx.clone() {
         fetcher = fetcher.with_neighborhood_dialer(tx);
     }
-    if let Some(svc) = state.pushsync_swap.clone() {
-        let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
-        fetcher = fetcher.with_pushsync_settlement(s);
-    } else if let Some(acc) = state
-        .accounting
-        .clone()
-        .filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
-    {
-        // Experiment 1: cheque-less push settlement — mirror push
-        // debits into the shared Accounting so the pseudosettle
-        // driver time-settles upload peers (bee-light behaviour).
-        let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
-            Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
+    if let Some(s) = push_settlement(
+        state.accounting.clone(),
+        state.pushsync_swap.is_some(),
+        crate::push_pseudosettle::PushPseudosettle::enabled_by_env(),
+    ) {
         fetcher = fetcher.with_pushsync_settlement(s);
     }
     fetcher
+}
+
+/// How pushsync debt is settled: like bee, in the same per-peer balance
+/// as retrieval debt. Each accepted push is debited to the shared
+/// accounting mirror ([`crate::push_pseudosettle::PushPseudosettle`]),
+/// which settles it the way it settles downloads — the free pseudosettle
+/// refresh first, then, while the node has a payer installed (a funded
+/// chequebook with `swap-enable` on, see [`sync_retrieval_payment`]), a
+/// cheque priced `units × exchange + deduction` once the debt reaches the
+/// early-payment threshold, lowering the mirror only by the units bee
+/// credits for a delivered cheque (issue #127).
+///
+/// Without a chequebook the debit is still mirrored so the refresh covers
+/// uploads (perf-lab experiment 1), unless `ANT_PUSH_PSEUDOSETTLE=0`
+/// opts out (`pseudosettle_by_env`, the A/B control arm). With a
+/// chequebook it always is: the mirror is what pays.
+fn push_settlement(
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    has_chequebook: bool,
+    pseudosettle_by_env: bool,
+) -> Option<Arc<dyn ant_retrieval::PushsyncSettlement>> {
+    let acc = accounting.filter(|_| has_chequebook || pseudosettle_by_env)?;
+    Some(Arc::new(crate::push_pseudosettle::PushPseudosettle::new(
+        acc,
+    )))
 }
 
 /// Fire one self-probe push per due rejected batch (issue #52). Called
@@ -7650,20 +7685,13 @@ fn handle_swarm_event(
             if let Some(acc) = state.accounting.as_ref() {
                 acc.forget(&peer_id);
             }
-            // Same logic for the pushsync-side outbound debt mirror
-            // (Phase 7b): bee resets its view of our debt on
-            // reconnect, so any local pending PLUR for this peer is
-            // stale and would otherwise either over-pay (we re-emit
-            // a cheque the receiver has already cashed in their
-            // mind) or skip cheque emission until a much higher
-            // threshold than necessary.
-            if let Some(s) = state.pushsync_swap.as_ref() {
-                ant_retrieval::PushsyncSettlement::forget(s.as_ref(), &peer_id);
-            }
+            // (Pushsync debt lives in that same mirror since #127.)
             // Drop the EOA registry entry too — a reconnected peer
             // re-runs the BZZ handshake and re-records its beneficiary,
-            // so a stale entry can only mislead. Idempotent on peers
-            // we never had a handshake for.
+            // so a stale entry can only mislead — and with it the
+            // connection's session, which tells a SWAP payment in flight
+            // that its connection is gone (`PushsyncSwap`'s delivery
+            // check). Idempotent on peers we never had a handshake for.
             state.peer_eth.forget(&peer_id);
             state.publish_peers();
             if was_bzz {
@@ -9837,6 +9865,9 @@ mod tests {
         );
         let accounting = Arc::new(ant_retrieval::accounting::Accounting::new());
         state.accounting = Some(accounting.clone());
+        let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        state.status = Some(status_tx);
+        let settlement = || status_rx.borrow().settlement.clone();
         let mut peerstore = PeerStore::disabled();
         let control = test_control();
         let (cb, other) = ([0xcbu8; 20], [0x0cu8; 20]);
@@ -9876,6 +9907,16 @@ mod tests {
             },
         );
         assert!(accounting.pays_with_swap(), "earlier funds apply on enable");
+        // ... and the status hosts read says so (`GET /node`,
+        // `/v0/settlement/swap`, `ant_swap_status`).
+        assert_eq!(
+            settlement(),
+            ant_control::SettlementInfo {
+                swap_enabled: true,
+                chequebook: Some(format!("0x{}", hex::encode(cb))),
+                paying: true,
+            }
+        );
 
         let (ack, _rx) = oneshot::channel();
         send(
@@ -9886,6 +9927,8 @@ mod tests {
             },
         );
         assert!(!accounting.pays_with_swap(), "switch off: free tier");
+        assert!(!settlement().swap_enabled);
+        assert!(!settlement().paying);
         let (ack, _rx) = oneshot::channel();
         send(
             &mut state,
@@ -9909,6 +9952,83 @@ mod tests {
             },
         );
         assert!(!accounting.pays_with_swap(), "settlement off");
+    }
+
+    /// Uploads settle like bee (issue #127): with a chequebook, every
+    /// accepted push is debited to the one accounting mirror retrieval
+    /// uses — even with `ANT_PUSH_PSEUDOSETTLE=0`, which only opts a
+    /// chequebook-less node out — so the payer installed there pays push
+    /// debt with the same cheques, at the early-payment threshold, and
+    /// the debt drops only by what a delivered cheque covers. Before #127
+    /// the chequebook's pushsync service kept its own counter instead and
+    /// paid `debt` PLUR, which the mirror never saw.
+    #[tokio::test]
+    async fn uploads_settle_through_the_shared_payer() {
+        #[derive(Default)]
+        struct Payer {
+            calls: std::sync::Mutex<Vec<(PeerId, u64)>>,
+            refuse: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl ant_retrieval::accounting::RetrievalPayment for Payer {
+            async fn pay(&self, peer: PeerId, amount: u64) -> Result<(), String> {
+                self.calls.lock().unwrap().push((peer, amount));
+                if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("connection closed as the cheque stream ended".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let accounting = Arc::new(ant_retrieval::accounting::Accounting::new());
+        assert!(push_settlement(Some(accounting.clone()), false, false).is_none());
+        assert!(push_settlement(Some(accounting.clone()), false, true).is_some());
+        let push = push_settlement(Some(accounting.clone()), true, false)
+            .expect("a chequebook settles pushsync through the mirror");
+
+        let payer = Arc::new(Payer::default());
+        accounting.set_payment(Some(payer.clone()));
+        let settle = || tokio::time::sleep(Duration::from_millis(20));
+        let peer = PeerId::random();
+        accounting.credit(peer, 0); // a refresh was accepted just now
+        push.note_pushsync(peer, 0).await; // pre-flight: no debit
+        push.note_pushsync(peer, 300_000).await;
+        push.note_pushsync(peer, 300_000).await;
+        settle().await;
+        assert!(payer.calls.lock().unwrap().is_empty(), "600 k < 675 k");
+        assert_eq!(accounting.debug_snapshot(&peer), Some((600_000, 0)));
+        push.note_pushsync(peer, 300_000).await;
+        settle().await;
+        assert_eq!(*payer.calls.lock().unwrap(), vec![(peer, 600_000)]);
+        assert_eq!(accounting.debug_snapshot(&peer), Some((300_000, 0)));
+        assert_eq!(accounting.swap_settled(&peer), 600_000);
+
+        // An undelivered cheque (reset with the connection, timeout)
+        // lowers nothing.
+        payer
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let other = PeerId::random();
+        accounting.credit(other, 0);
+        for _ in 0..3 {
+            push.note_pushsync(other, 300_000).await;
+        }
+        settle().await;
+        assert_eq!(payer.calls.lock().unwrap().len(), 2);
+        assert_eq!(accounting.debug_snapshot(&other), Some((900_000, 0)));
+        assert_eq!(accounting.swap_settled(&other), 0);
+
+        // `swap-enable` off removes the payer: push debt waits for the
+        // refresh, as on a node without a chequebook.
+        accounting.set_payment(None);
+        let third = PeerId::random();
+        accounting.credit(third, 0);
+        for _ in 0..3 {
+            push.note_pushsync(third, 300_000).await;
+        }
+        settle().await;
+        assert_eq!(payer.calls.lock().unwrap().len(), 2);
+        assert_eq!(accounting.debug_snapshot(&third), Some((900_000, 0)));
     }
 
     #[tokio::test]

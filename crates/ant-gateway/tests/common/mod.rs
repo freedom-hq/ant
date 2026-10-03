@@ -161,6 +161,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
         control_socket: "/tmp/antd.sock".to_string(),
         retrieval: RetrievalInfo::default(),
         chain_ready: true,
+        settlement: ant_control::SettlementInfo::default(),
     }
 }
 
@@ -206,6 +207,47 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         cors: Arc::new(CorsConfig::default()),
         chain_state: GatewayChainState {
             light_mode: false,
+            chain: None,
+        }
+        .preset(),
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
+    };
+    build_router(handle)
+}
+
+/// A light node whose loop answers `SetSwapEnabled` as the production
+/// loop does: publish the switch into `StatusSnapshot::settlement`, then
+/// ack. For the `swap-enable` route and `/node` capability tests. Pages
+/// from `cors` origins are allowed through the switch's guard.
+pub fn swap_switch_router(snapshot: StatusSnapshot, cors: CorsConfig) -> Router {
+    let (status_tx, status_rx) = watch::channel(snapshot);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::SetSwapEnabled { enabled, ack } = cmd {
+                status_tx.send_modify(|s| {
+                    s.settlement.swap_enabled = enabled;
+                    s.settlement.paying = enabled && s.settlement.chequebook.is_some();
+                });
+                let _ = ack.send(ControlAck::Ok {
+                    message: "switched (fixture)".into(),
+                });
+            }
+        }
+    });
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/test".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(test_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(cors),
+        chain_state: GatewayChainState {
+            light_mode: true,
             chain: None,
         }
         .preset(),

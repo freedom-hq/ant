@@ -10,7 +10,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::{
-    body_bytes, empty_snapshot, send, snapshot_with_one_peer, status_only_router, test_identity,
+    body_bytes, empty_snapshot, send, snapshot_with_one_peer, status_only_router,
+    swap_switch_router, test_identity,
 };
 use serde_json::Value;
 
@@ -89,6 +90,140 @@ async fn node_returns_ultra_light_mode() {
     assert_eq!(json["gatewayMode"], false);
     assert_eq!(json["chequebookEnabled"], false);
     assert_eq!(json["swapEnabled"], false);
+    assert_eq!(json["settlement"]["supported"], false);
+    assert_eq!(json["settlement"]["paying"], false);
+}
+
+async fn call(
+    router: axum::Router,
+    method: Method,
+    uri: &str,
+    origin: Option<&str>,
+    body: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(o) = origin {
+        b = b.header("origin", o);
+    }
+    if body.is_some() {
+        b = b.header("content-type", "application/json");
+    }
+    let resp = send(
+        router,
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap(),
+    )
+    .await;
+    let status = resp.status();
+    let bytes = body_bytes(resp).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn paying_snapshot() -> ant_control::StatusSnapshot {
+    let mut snap = snapshot_with_one_peer();
+    snap.settlement = ant_control::SettlementInfo {
+        swap_enabled: true,
+        chequebook: Some("0x370e6965a8c169dbf3456edf852f5a7ffa2f1e81".into()),
+        paying: true,
+    };
+    snap
+}
+
+/// `/node` says whether this node settles with SWAP and can switch it at
+/// runtime, and the switch's live state (Freedom's capability signal),
+/// with bee's `swapEnabled` following the switch.
+#[tokio::test]
+async fn node_reports_the_settlement_switch() {
+    let router = swap_switch_router(paying_snapshot(), ant_gateway::CorsConfig::default());
+    let (status, json) = call(router.clone(), Method::GET, "/node", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["beeMode"], "light");
+    assert_eq!(json["swapEnabled"], true);
+    let s = &json["settlement"];
+    assert_eq!(s["supported"], true);
+    assert_eq!(s["swapSwitch"], true);
+    assert_eq!(s["swapEnabled"], true);
+    assert_eq!(s["paying"], true);
+    assert_eq!(
+        s["chequebook"],
+        "0x370e6965a8c169dbf3456edf852f5a7ffa2f1e81"
+    );
+
+    let (status, _) = call(
+        router.clone(),
+        Method::PUT,
+        "/v0/settlement/swap",
+        None,
+        Some(r#"{"swapEnabled":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, json) = call(router, Method::GET, "/node", None, None).await;
+    assert_eq!(json["swapEnabled"], false);
+    assert_eq!(json["settlement"]["swapEnabled"], false);
+    assert_eq!(json["settlement"]["paying"], false);
+}
+
+/// `GET`/`PUT /v0/settlement/swap` read and flip the running node's
+/// `swap-enable` through the node loop, answer the state afterwards and
+/// say it isn't persisted; a malformed body is refused, and so is a
+/// switch from a web page (#105) unless its origin is listed exactly —
+/// `null` (dweb pages) and `*` never count.
+#[tokio::test]
+async fn swap_switch_reads_and_sets_the_running_node() {
+    let cors = ant_gateway::CorsConfig::new(["https://wallet.example"]);
+    let router = swap_switch_router(paying_snapshot(), cors);
+    let (status, json) = call(
+        router.clone(),
+        Method::GET,
+        "/v0/settlement/swap",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["swapEnabled"], true);
+    assert_eq!(json["paying"], true);
+    assert_eq!(json["persisted"], false);
+
+    let put = |origin, body| {
+        let router = router.clone();
+        async move {
+            call(
+                router,
+                Method::PUT,
+                "/v0/settlement/swap",
+                origin,
+                Some(body),
+            )
+            .await
+        }
+    };
+    let (status, json) = put(None, r#"{"swapEnabled":false}"#).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["swapEnabled"], false);
+    assert_eq!(json["paying"], false);
+    for origin in ["null", "https://evil.example"] {
+        let (status, json) = put(Some(origin), r#"{"swapEnabled":true}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}: {json}");
+    }
+    let (_, json) = call(
+        router.clone(),
+        Method::GET,
+        "/v0/settlement/swap",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(json["swapEnabled"], false, "a refused page changed nothing");
+    let (status, json) = put(Some("https://wallet.example"), r#"{"swapEnabled":true}"#).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["swapEnabled"], true);
+    let (status, _) = put(None, r#"{"swapEnabled":"yes"}"#).await;
+    assert!(status.is_client_error(), "{status}");
 }
 
 /// `/addresses` echoes the static `GatewayIdentity`. Overlay/publicKey

@@ -258,13 +258,12 @@ struct Opt {
 
     /// 20-byte chequebook contract address (`0x` + 40 hex). When set
     /// alongside `--swap-key`, the daemon enables outbound SWAP
-    /// settlement (Phase 7b): every successful pushsync push accrues
-    /// debt against the receiver's beneficiary EOA, and an EIP-712
-    /// cheque is emitted automatically once the per-peer debt crosses
-    /// `LIGHT_PAYMENT_THRESHOLD / 2` (≈ 675 K PLUR). Required for
-    /// sustained uploads — without it pushsync stalls after a few
-    /// hundred chunks per peer (bee paymentTolerance). Falls back to
-    /// `CHEQUEBOOK_ADDRESS` env. The chequebook's on-chain
+    /// settlement: pushsync and retrieval debt share one balance per
+    /// peer, as in bee, and once it reaches half the peer's payment
+    /// threshold (after the free pseudosettle refresh) an EIP-712 cheque
+    /// worth `units × exchange + deduction` at bee's oracle rate pays it,
+    /// while `--swap-enable` is on and the chequebook has funds. Falls
+    /// back to `CHEQUEBOOK_ADDRESS` env. The chequebook's on-chain
     /// `issuer()` view must return the EOA derived from `--swap-key`.
     #[arg(long)]
     chequebook: Option<String>,
@@ -315,8 +314,9 @@ struct Opt {
     /// zero) deposit rather than a failed transfer. Default 0.001 xBZZ,
     /// shared with `ant-ffi`
     /// (`ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`).
-    /// Ignored for a manually supplied chequebook. Falls back to
-    /// `CHEQUEBOOK_DEPOSIT_PLUR` env.
+    /// Ignored for a manually supplied chequebook. A host adds more on
+    /// demand with `POST /v0/settlement/deposit?amount=<PLUR>`. Falls
+    /// back to `CHEQUEBOOK_DEPOSIT_PLUR` env.
     #[arg(
         long,
         env = "CHEQUEBOOK_DEPOSIT_PLUR",
@@ -326,20 +326,21 @@ struct Opt {
 
     /// SWAP settlement on or off for the node: bee's `swap-enable`
     /// (also read from the `--config` file's `swap-enable` key; the flag
-    /// wins). On (the default), downloads pay peers with SWAP cheques
-    /// from the chequebook once the debt to a peer reaches half its
-    /// payment threshold, after the free pseudosettle refresh, as bee
-    /// does (issue #121). That lifts downloads past the free tier's
-    /// ~5-6 Mbit/s ceiling, at about 0.75 xBZZ per fully paid GB (bee's
-    /// oracle rate), and never spends more than the chequebook holds.
-    /// Needs a funded chequebook and a Gnosis RPC to read its balance;
-    /// without them it does nothing. `false` keeps downloads on the free
-    /// tier even with a funded chequebook. The default differs from
-    /// bee's, which is `false` (`cmd/bee/cmd/cmd.go`): a bee config that
-    /// leaves the key out pays here, so set `swap-enable: false` to match
-    /// it. Upload (pushsync) cheques are not governed by it yet: #127
-    /// makes them pay at bee's rate under this same switch. Falls back
-    /// to `ANT_SWAP_ENABLE` env.
+    /// wins). On (the default), downloads (issue #121) and uploads
+    /// (issue #127) pay peers with SWAP cheques from the chequebook once
+    /// the debt to a peer reaches half its payment threshold, after the
+    /// free pseudosettle refresh, as bee does: one balance per peer,
+    /// cheques worth `units × exchange + deduction` at bee's oracle rate
+    /// (about 0.75 xBZZ per fully paid GB), never more than the
+    /// chequebook holds. That lifts downloads past the free tier's ~5-6
+    /// Mbit/s ceiling. Needs a funded chequebook and a Gnosis RPC to read
+    /// its balance; without them it does nothing. `false` keeps both on
+    /// the free tier even with a funded chequebook. The default differs
+    /// from bee's, which is `false` (`cmd/bee/cmd/cmd.go`): a bee config
+    /// that leaves the key out pays here, so set `swap-enable: false` to
+    /// match it. Also readable and settable at runtime over the API
+    /// (`GET`/`PUT /v0/settlement/swap`). Falls back to
+    /// `ANT_SWAP_ENABLE` env.
     #[arg(
         long = "swap-enable",
         env = "ANT_SWAP_ENABLE",
@@ -520,6 +521,7 @@ async fn main() -> Result<()> {
         // real value as soon as it starts, and flips it to `true` when
         // the `LateChainInit` lands.
         chain_ready: false,
+        settlement: ant_control::SettlementInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 

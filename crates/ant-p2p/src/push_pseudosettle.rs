@@ -24,9 +24,17 @@
 //!
 //! DEFAULT ON since the perf-lab verdict (collapse-to-zero became a
 //! stable plateau; see PERF-LAB.md exp 1). `ANT_PUSH_PSEUDOSETTLE=0`
-//! disables (the A/B control arm). The SWAP service still wins when a
-//! chequebook is configured (it settles harder debts and also
-//! hot-hints).
+//! disables it on a node without a chequebook (the A/B control arm).
+//!
+//! With a chequebook it is how uploads pay, too (issue #127): the
+//! mirror is bee's one balance per peer, so the payer installed in it
+//! (`PushsyncSwap`, while `swap-enable` is on and the chequebook has
+//! funds) settles push debt exactly as it settles retrieval debt — the
+//! refresh first, then a cheque priced `units × exchange + deduction`
+//! once the debt reaches the early-payment threshold. Reserving the
+//! debit is what triggers that cheque (`Accounting::try_reserve`), even
+//! when the reservation itself is refused. See
+//! `behaviour::push_settlement`.
 
 use ant_retrieval::accounting::Accounting;
 use ant_retrieval::PushsyncSettlement;

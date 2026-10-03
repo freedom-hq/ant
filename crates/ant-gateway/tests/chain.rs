@@ -727,8 +727,14 @@ impl ChainWriter for FundingWriter {
             funding: QUOTED_FUNDING,
         })
     }
-    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
-        self.record("fund_deposit_with_xdai".into());
+    async fn fund_deposit_with_xdai(
+        &self,
+        amount: Option<u128>,
+    ) -> Result<DepositView, FundingFailure> {
+        self.record(match amount {
+            None => "fund_deposit_with_xdai".into(),
+            Some(a) => format!("fund_deposit_with_xdai amount={a}"),
+        });
         if let Some(refusal) = self.refuse_deposit {
             return Err(FundingFailure::ChequebookRefused {
                 chequebook: [0xCB; 20],
@@ -942,6 +948,42 @@ async fn v0_settlement_deposit_reports_and_tops_up() {
     assert_eq!(json["needsTopUp"], false);
     assert_eq!(json["xdaiToSendWei"], "0");
     assert_eq!(writer.calls(), ["fund_deposit_with_xdai"]);
+}
+
+/// `?amount=` (Freedom's "add browsing credit") reaches the writer as
+/// an explicit deposit; a zero or non-numeric amount is refused before
+/// the writer is called, and the web-page guard still applies.
+#[tokio::test]
+async fn v0_settlement_deposit_takes_an_optional_amount() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let (status, _) = req(
+        router.clone(),
+        Method::POST,
+        "/v0/settlement/deposit?amount=50000000000000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for bad in ["0", "lots", "-1"] {
+        let (status, json) = req(
+            router.clone(),
+            Method::POST,
+            &format!("/v0/settlement/deposit?amount={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "amount={bad}: {json}");
+    }
+    let page = Request::builder()
+        .method(Method::POST)
+        .uri("/v0/settlement/deposit?amount=50000000000000")
+        .header("origin", "null")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(router, page).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        writer.calls(),
+        ["fund_deposit_with_xdai amount=50000000000000"]
+    );
 }
 
 /// One on-chain write at a time: while a buy runs, other writes (new

@@ -398,13 +398,11 @@ pub enum ControlCommand {
         ack: oneshot::Sender<ControlAck>,
     },
     /// Bee's node-wide SWAP settlement switch (`swap-enable`), changed at
-    /// runtime (a superset of bee, which reads it at start). It governs
-    /// retrieval payments (issue #121) today: `true` (the default) pays
-    /// peers for downloads with SWAP cheques past the early-payment
-    /// threshold once a funded chequebook backs settlement, as bee does;
-    /// `false` keeps downloads on the free pseudosettle tier even with
-    /// one. Upload (pushsync) cheques are not governed by it yet; #127
-    /// makes them pay at bee's rate under this same switch. Acks `Ok`.
+    /// runtime (a superset of bee, which reads it at start). `true` (the
+    /// default) pays peers with SWAP cheques for downloads (issue #121)
+    /// and uploads (issue #127) alike past the early-payment threshold
+    /// once a funded chequebook backs settlement, as bee does; `false`
+    /// keeps both on the free pseudosettle tier even with one. Acks `Ok`.
     SetSwapEnabled {
         enabled: bool,
         ack: oneshot::Sender<ControlAck>,

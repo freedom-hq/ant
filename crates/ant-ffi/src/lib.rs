@@ -778,6 +778,7 @@ fn init_inner(
         // The FFI path resolves chain state before starting the loop
         // (no late-chain channel), so it is ready by construction.
         chain_ready: true,
+        settlement: ant_control::SettlementInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -1359,15 +1360,14 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
 }
 
 /// Bee's `swap-enable`: switch SWAP settlement on or off for the running
-/// node. Today it governs retrieval payments (issue #121). On (the
-/// default), downloads pay peers with SWAP cheques from the node's
+/// node, for downloads (issue #121) and uploads (issue #127) alike. On
+/// (the default), the node pays peers with SWAP cheques from its
 /// chequebook once the debt to a peer reaches half its payment threshold,
-/// after the free pseudosettle refresh, as bee does; that lifts downloads
-/// past the free tier's ~5-6 Mbit/s, at up to ~0.75 xBZZ per GB (bee's
-/// oracle rate), never more than the chequebook holds. Off keeps
-/// downloads on the free tier even with a funded chequebook. Upload
-/// (pushsync) cheques are not governed by it yet: #127 makes them pay at
-/// bee's rate under this same switch.
+/// after the free pseudosettle refresh, as bee does: one balance per
+/// peer, cheques worth `units × exchange + deduction` at bee's oracle
+/// rate (up to ~0.75 xBZZ per GB), never more than the chequebook holds.
+/// That lifts downloads past the free tier's ~5-6 Mbit/s. Off keeps
+/// downloads and uploads on the free tier even with a funded chequebook.
 ///
 /// Payments also need a chequebook with funds the node has read from the
 /// chain: they start after the first settlement setup that has an RPC
@@ -1412,6 +1412,49 @@ pub unsafe extern "C" fn ant_set_swap_enabled(
                 -2
             }
         }
+    }
+}
+
+/// The node's SWAP settlement state as JSON — what the gateway's `GET
+/// /v0/settlement/swap` and `GET /node`'s `settlement` report, for a host
+/// that doesn't run the gateway:
+///
+/// `{"supported":bool,"swap_switch":true,"swap_enabled":bool,
+///   "paying":bool,"chequebook":"0x…"|null,"persisted":false}`
+///
+/// `supported`: this build pays peers with SWAP cheques once a funded
+/// chequebook backs settlement (the `chain` feature). `swap_switch`: the
+/// switch can be changed at runtime ([`ant_set_swap_enabled`]).
+/// `swap_enabled`: bee's `swap-enable` as the node runs it now, for
+/// downloads and uploads alike. `paying`: cheques are being paid right
+/// now (switch on, chequebook funds read from the chain and not spent),
+/// otherwise the free pseudosettle tier. `persisted`: always `false`, the
+/// switch resets at `ant_init`. Never blocks on the network.
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_swap_status(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_swap_status", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let s = h.status_rx.borrow().settlement.clone();
+            serde_json::to_string(&serde_json::json!({
+                "supported": cfg!(feature = "chain"),
+                "swap_switch": true,
+                "swap_enabled": s.swap_enabled,
+                "paying": s.paying,
+                "chequebook": s.chequebook,
+                "persisted": false,
+            }))
+            .map_err(|e| format!("serialize swap status: {e}"))
+        })
     }
 }
 
@@ -2395,11 +2438,69 @@ pub unsafe extern "C" fn ant_storage_settlement_topup(
                 if rpc.trim().is_empty() {
                     return Err("ant_storage_settlement_topup: gnosis_rpc required".to_string());
                 }
-                drive::settlement_topup_xdai(h, rpc).map_err(|e| e.to_string())
+                drive::settlement_topup_xdai(h, rpc, None).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
                 let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Like [`ant_storage_settlement_topup`], but deposits `amount_plur` more
+/// (a decimal PLUR string, 1 xBZZ = 10^16 PLUR) whatever the deposit's
+/// target: how a host tops up browsing credit beyond the node's default
+/// deposit (Freedom's wallet UI). The same product flow and guards: the
+/// chain checks run before anything is spent, and the node swaps xDAI
+/// only for the xBZZ the wallet lacks. Errors on an amount that isn't a
+/// positive integer. Mirrors the gateway's `POST
+/// /v0/settlement/deposit?amount=`. Returns the refreshed
+/// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
+/// and spends real funds** and **blocks** until they confirm. Requires
+/// the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_plur` must be valid
+/// NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    amount_plur: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_topup_amount", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_plur)?;
+            let amount = match amount.trim().parse::<u128>() {
+                Ok(a) if a > 0 => a,
+                _ => {
+                    return Err(format!(
+                        "ant_storage_settlement_topup_amount: amount_plur must be a positive \
+                         integer, got {amount:?}"
+                    ))
+                }
+            };
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err(
+                        "ant_storage_settlement_topup_amount: gnosis_rpc required".to_string()
+                    );
+                }
+                drive::settlement_topup_xdai(h, rpc, Some(amount)).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, amount);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -4579,6 +4680,69 @@ mod tests {
             #[cfg(feature = "chain")]
             gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         }
+    }
+
+    /// A host without the gateway reads the node's settlement state —
+    /// capability, the `swap-enable` switch, whether it pays — from
+    /// `ant_swap_status` (Freedom's wallet UI), live from the status the
+    /// node loop publishes; a deposit amount that isn't a positive integer
+    /// is refused before anything touches the chain.
+    #[test]
+    fn swap_status_and_deposit_amount_for_hosts() {
+        let dir = scratch_dir("swap-status");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let mut h = test_handle(runtime, &dir);
+        let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        h.status_rx = status_rx;
+        let handle = Box::into_raw(Box::new(h));
+        let read = || -> serde_json::Value {
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe { ant_swap_status(handle, &raw mut err) };
+            assert!(!raw.is_null());
+            let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+            unsafe { ant_free_string(raw) };
+            serde_json::from_str(&json).unwrap()
+        };
+        let v = read();
+        assert_eq!(v["swap_switch"], true);
+        assert_eq!(v["swap_enabled"], true, "bee's switch, on by default");
+        assert_eq!(v["paying"], false);
+        assert_eq!(v["persisted"], false);
+        assert_eq!(v["supported"], cfg!(feature = "chain"));
+        status_tx.send_modify(|s| {
+            s.settlement = ant_control::SettlementInfo {
+                swap_enabled: false,
+                chequebook: Some("0xcb".into()),
+                paying: false,
+            };
+        });
+        let v = read();
+        assert_eq!(v["swap_enabled"], false);
+        assert_eq!(v["chequebook"], "0xcb");
+
+        let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        for bad in ["0", "abc", "-5", ""] {
+            let amount = CString::new(bad).unwrap();
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe {
+                ant_storage_settlement_topup_amount(
+                    handle,
+                    rpc.as_ptr(),
+                    amount.as_ptr(),
+                    &raw mut err,
+                )
+            };
+            assert!(raw.is_null(), "{bad:?} accepted");
+            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+            unsafe { ant_free_string(err) };
+            assert!(msg.contains("positive integer"), "{bad:?}: {msg}");
+        }
+        unsafe { ant_shutdown(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

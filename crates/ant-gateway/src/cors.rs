@@ -317,6 +317,29 @@ pub async fn wallet_spend_guard(
     }
 }
 
+/// Guard for `PUT /v0/settlement/swap`, the runtime `swap-enable`
+/// switch: switching it on lets the node spend its chequebook on
+/// cheques, so a web page may not flip it — the same decision as
+/// [`wallet_spend_guard`] (#105): no `Origin` and no cross-site
+/// `Sec-Fetch-Site` (Freedom's main process, an ant-ffi host, `curl`),
+/// or an origin listed exactly in `cors-allowed-origins`; anything else,
+/// `null` and `*`-only matches included, is `403`.
+pub async fn settlement_switch_guard(
+    State(handle): State<GatewayHandle>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if browser_request_allowed(&handle.cors, req.headers()) {
+        next.run(req).await
+    } else {
+        crate::error::json_error(
+            StatusCode::FORBIDDEN,
+            "this route switches the node's chequebook payments and does not accept requests \
+             from web pages; list the page's origin explicitly in cors-allowed-origins to allow it",
+        )
+    }
+}
+
 /// The decision behind [`wallet_spend_guard`].
 fn browser_request_allowed(cfg: &CorsConfig, h: &axum::http::HeaderMap) -> bool {
     let origin = h.get(header::ORIGIN).map(|v| v.to_str().unwrap_or(""));

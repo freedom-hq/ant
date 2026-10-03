@@ -119,10 +119,10 @@ pub struct NodeConfig {
     /// `time_to_first_peer_s`). See [`ant_p2p::RunConfig::late_chain_rx`].
     pub late_chain: Option<mpsc::Receiver<LateChainInit>>,
     /// Bee's `swap-enable`: SWAP settlement on or off for the node. On
-    /// (`true`, the default), downloads pay peers with SWAP cheques once
-    /// a funded chequebook backs outbound settlement (issue #121), as bee
-    /// does; `false` keeps them on the free pseudosettle tier. Upload
-    /// cheques follow it once #127 lands. Switchable at runtime with
+    /// (`true`, the default), downloads (issue #121) and uploads (issue
+    /// #127) pay peers with SWAP cheques once a funded chequebook backs
+    /// outbound settlement, as bee does; `false` keeps both on the free
+    /// pseudosettle tier. Switchable at runtime with
     /// `ControlCommand::SetSwapEnabled`.
     pub swap_enabled: bool,
 }

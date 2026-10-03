@@ -164,9 +164,13 @@ pub trait ChainWriter: Send + Sync {
     async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
-    /// Top the chequebook's deposit up to its target, swapping xDAI for
-    /// the xBZZ it needs. Returns the status afterwards.
-    async fn fund_deposit_with_xdai(&self) -> Result<DepositView, FundingFailure> {
+    /// Top the chequebook's deposit up to its target, or with `amount`
+    /// grow it by that many PLUR, swapping xDAI for the xBZZ it needs.
+    /// Returns the status afterwards.
+    async fn fund_deposit_with_xdai(
+        &self,
+        _amount: Option<u128>,
+    ) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
 }
@@ -1452,22 +1456,38 @@ pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response
 /// its target, paid from the node wallet's xDAI. A no-op when it's
 /// already there. Returns the status afterwards.
 ///
+/// `?amount=<PLUR>` deposits that much more instead, whatever the
+/// target: a host topping up browsing credit beyond the node's default
+/// deposit (`--chequebook-deposit-plur`). Same guards and the same
+/// product flow (the xDAI→xBZZ swap covers only what the wallet lacks);
+/// a missing, non-numeric or zero amount is a `400`.
+///
 /// The deposit and balances are read under the [`WalletTxLock`], so a
 /// background top-up that just landed isn't paid twice. Nothing is
 /// spent on a chequebook the chain rejects (`ant_chain::funding`); such
 /// a refusal goes to [`GatewayHandle::on_chequebook_refused`] once the
 /// lock is released, and the embedder decides whether it stands (and
 /// switches settlement off) or is an RPC that hasn't seen its deploy.
-pub async fn settlement_fund_deposit(State(handle): State<GatewayHandle>) -> Response {
+pub async fn settlement_fund_deposit(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let (chain, w) = match writer(&handle) {
         Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let amount = match param::<u128>(&q, "amount") {
+        Ok(Some(0)) => {
+            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
+        }
+        Ok(a) => a,
         Err(r) => return r,
     };
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
     let tx = chain.tx_lock.lock().await;
-    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai()).await;
+    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai(amount)).await;
     drop(tx);
     match funded {
         Ok(Ok(d)) => deposit_response(chain.wallet_eth, &d),
