@@ -526,23 +526,39 @@ pub fn issue_cheque(
 /// a rejected one) starts that chequebook from zero, and switching back
 /// finds the first one's cumulatives where they were.
 ///
-/// A file written before the sections existed (a bare `beneficiary →
-/// cumulative` map) is adopted by the first chequebook that opens it and
-/// rewritten under it at once, so a second chequebook can't adopt it
-/// too. Such files only ever held pushsync cheques, which were a few
-/// million PLUR at most.
+/// On disk it stays the flat `string → decimal string` map releases
+/// before the sections wrote, with each entry keyed
+/// `<chequebook hex>:<beneficiary hex>`, so a downgraded release still
+/// parses the file: it loads the entries (finding none under its bare
+/// beneficiary keys, so its pushsync cheques restart from zero) and
+/// writes them all back with its own, instead of failing to parse and
+/// replacing every chequebook's figures (PR #126 R4-M3).
+///
+/// Bare `beneficiary → cumulative` entries — a file from before the
+/// sections, or ones a downgraded release added — are adopted by the
+/// first chequebook that opens the file (the larger figure wins against
+/// one it already has) and rewritten under it at once, so a second
+/// chequebook can't adopt them too. Only pushsync cheques were ever
+/// written that way, a few million PLUR at most.
 ///
 /// Clones (and ledgers opened on the same file and chequebook while one
 /// is alive) share one state, and with it the locks that serialise
 /// issuing cheques ([`Self::beneficiary_lock`], [`Self::funds_gate`]).
 ///
 /// A file that isn't JSON of either shape is moved aside to
-/// `<name>.corrupt-<unix secs>` and the chequebook starts from zero: its
-/// figures can't be recovered by reading it again, and refusing every
-/// cheque until someone repairs it by hand would stop uploads and paid
-/// downloads for good. Nothing is paid twice by restarting: a peer only
-/// credits a cheque above the cumulative it already holds, and refuses
-/// one the chequebook's balance can't cover.
+/// `<name>.corrupt-<unix secs>[-n]` and every chequebook in it starts
+/// from zero: its figures can't be recovered by reading it again, and
+/// refusing every cheque until someone repairs it by hand would stop
+/// uploads and paid downloads for good. Nothing is paid twice by
+/// restarting — a peer only credits a cheque above the cumulative it
+/// already holds — but that is also the cost: a peer this chequebook
+/// had paid up to `C` refuses each new cheque until the restarted
+/// cumulative passes `C`. The payer can't see those refusals (bee
+/// resets the stream, which rust-yamux reports as a clean end, see
+/// [`await_processed`]), so it lowers its debt mirror as if paid, runs
+/// up real debt with that peer, and is disconnected or blocklisted by
+/// it until the new cumulative passes `C` (PR #126 R4-M1). Peers it had
+/// never paid are unaffected, and so is pushsync to other peers.
 #[derive(Clone)]
 pub struct OutboundLedger {
     chequebook: [u8; 20],
@@ -579,11 +595,47 @@ struct OutboundState {
     unread: Option<String>,
 }
 
-/// On-disk shape of the outbound ledger: `chequebook hex → (beneficiary
-/// hex → cumulative as a decimal string)`.
+/// The outbound ledger file, read into sections: `chequebook hex →
+/// (beneficiary hex → cumulative as a decimal string)`, with bare
+/// (pre-section) entries under the empty key until a chequebook adopts
+/// them. On disk it is flat (see [`OutboundLedger`] and
+/// [`write_outbound_file`]); this nested shape was only written by
+/// unreleased builds of PR #126 and is still read.
 #[derive(Default, Serialize, Deserialize)]
 struct OutboundFile {
     chequebooks: HashMap<String, HashMap<String, String>>,
+}
+
+impl OutboundFile {
+    /// Split a flat on-disk map into sections.
+    fn from_flat(flat: HashMap<String, String>) -> Self {
+        let mut file = Self::default();
+        for (k, v) in flat {
+            let (chequebook, beneficiary) = k.split_once(':').unwrap_or(("", k.as_str()));
+            file.chequebooks
+                .entry(chequebook.to_string())
+                .or_default()
+                .insert(beneficiary.to_string(), v);
+        }
+        file
+    }
+
+    /// The flat on-disk map: bare entries keep their bare key.
+    fn to_flat(&self) -> HashMap<String, String> {
+        self.chequebooks
+            .iter()
+            .flat_map(|(chequebook, section)| {
+                section.iter().map(move |(beneficiary, v)| {
+                    let key = if chequebook.is_empty() {
+                        beneficiary.clone()
+                    } else {
+                        format!("{chequebook}:{beneficiary}")
+                    };
+                    (key, v.clone())
+                })
+            })
+            .collect()
+    }
 }
 
 /// Serialises read-modify-write of outbound ledger files across every
@@ -616,20 +668,16 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if let Ok(file) = serde_json::from_slice::<OutboundFile>(&bytes) {
-        return Ok(Some(file));
-    }
-    let legacy = match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-        Ok(legacy) => legacy,
+    match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        Ok(flat) => Ok(Some(OutboundFile::from_flat(flat))),
         Err(e) => {
+            if let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) {
+                return Ok(Some(nested));
+            }
             quarantine_outbound_file(path, &e)?;
-            return Ok(None);
+            Ok(None)
         }
-    };
-    // Marked with an empty key until a chequebook adopts it.
-    Ok(Some(OutboundFile {
-        chequebooks: HashMap::from([(String::new(), legacy)]),
-    }))
+    }
 }
 
 /// Move an unparseable outbound ledger out of the way, keeping it for
@@ -639,9 +687,25 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".corrupt-{secs}"));
-    let aside = path.with_file_name(name);
+    // `rename` replaces an existing file, so never reuse a name: a
+    // second move within the same second would lose the first copy
+    // (PR #126 R4-M2). Callers hold `OUTBOUND_FILE_LOCK`, so nothing in
+    // this process takes the name between the check and the move.
+    let aside = (0u32..1000)
+        .map(|n| {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".corrupt-{secs}"));
+            if n > 0 {
+                name.push(format!("-{n}"));
+            }
+            path.with_file_name(name)
+        })
+        .find(|p| matches!(p.try_exists(), Ok(false)))
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "unparseable ({parse_error}) and no free name to move it aside to"
+            ))
+        })?;
     std::fs::rename(path, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't be moved aside: {e}"
@@ -652,7 +716,8 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
         file = %path.display(),
         moved_to = %aside.display(),
         "outbound ledger is unparseable ({parse_error}); moved it aside and \
-         starting its chequebooks' cheque totals from zero",
+         starting its chequebooks' cheque totals from zero — peers paid \
+         before refuse new cheques until the new totals pass what they hold",
     );
     Ok(())
 }
@@ -674,8 +739,14 @@ fn load_outbound_section(
             "adopting an outbound ledger written before per-chequebook sections",
         );
         let mine = file.chequebooks.entry(key.to_string()).or_default();
-        for (k, v) in legacy {
-            mine.entry(k).or_insert(v);
+        for (k, v) in parse_cumulatives(legacy) {
+            let cur = mine
+                .get(&k)
+                .and_then(|c| U256::from_dec_str(c).ok())
+                .unwrap_or_default();
+            if v >= cur {
+                mine.insert(k, v.to_string());
+            }
         }
         if let Err(e) = write_outbound_file(path, &file) {
             warn!(target: "ant_p2p::swap", "outbound ledger migrate: {e}");
@@ -891,7 +962,7 @@ fn write_outbound_file(path: &Path, file: &OutboundFile) -> std::io::Result<()> 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec_pretty(&file.to_flat()).map_err(std::io::Error::other)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
@@ -1703,6 +1774,112 @@ mod tests {
         drop(ledger);
         let reopened = OutboundLedger::open(Some(path), [0xc1; 20]);
         assert_eq!(reopened.cumulative_for(&peer), U256::from(70u64));
+    }
+
+    /// Moving a broken ledger aside never replaces an earlier copy (PR
+    /// #126 R4-M2): a name already taken for this second gets a suffix.
+    #[test]
+    fn moving_a_ledger_aside_keeps_every_earlier_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Earlier copies under this second's and the next second's names.
+        for s in [secs, secs + 1] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("pushsync_outbound.json.corrupt-{s}")),
+                format!("earlier {s}"),
+            )
+            .unwrap();
+        }
+        for (cb, junk) in [([0xc1u8; 20], "{ first"), ([0xc2u8; 20], "{ second")] {
+            std::fs::write(&path, junk).unwrap();
+            OutboundLedger::open(Some(path.clone()), cb)
+                .ensure_readable()
+                .unwrap();
+        }
+        let mut kept: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != &path)
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                "earlier ".to_string() + &secs.to_string(),
+                "earlier ".to_string() + &(secs + 1).to_string(),
+                "{ first".into(),
+                "{ second".into(),
+            ]
+        );
+    }
+
+    /// A release from before the sections still parses the file and
+    /// keeps every chequebook's figures when it rewrites it (PR #126
+    /// R4-M3); whatever it adds is adopted again after the upgrade.
+    #[test]
+    fn a_downgraded_release_keeps_every_chequebooks_cumulatives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (a, b) = ([0xa0u8; 20], [0xb0u8; 20]);
+        let (p, q) = ([0x11u8; 20], [0x22u8; 20]);
+        {
+            let la = OutboundLedger::open(Some(path.clone()), a);
+            la.record_issued(&p, U256::from(1_500u64)).unwrap();
+            la.record_issued(&q, U256::from(40u64)).unwrap();
+            OutboundLedger::open(Some(path.clone()), b)
+                .record_issued(&p, U256::from(200u64))
+                .unwrap();
+        }
+
+        // The pre-PR release's open + record_issued, verbatim in effect:
+        // parse a flat string map, keep every decimal entry, insert its
+        // own bare-beneficiary cumulative and write the map back.
+        let mut old: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap())
+                .expect("a pre-section release must parse the file");
+        old.retain(|_, v| U256::from_dec_str(v).is_ok());
+        assert_eq!(old.len(), 3, "{old:?}");
+        old.insert(hex::encode(q), "90".into());
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let la = OutboundLedger::open(Some(path.clone()), a);
+        assert_eq!(la.cumulative_for(&p), U256::from(1_500u64));
+        // The downgraded release's larger figure for q wins.
+        assert_eq!(la.cumulative_for(&q), U256::from(90u64));
+        let lb = OutboundLedger::open(Some(path.clone()), b);
+        assert_eq!(lb.cumulative_for(&p), U256::from(200u64));
+        assert_eq!(lb.cumulative_for(&q), U256::zero());
+        drop((la, lb));
+        let flat: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(flat.keys().all(|k| k.contains(':')), "{flat:?}");
+    }
+
+    /// The nested layout unreleased builds of this PR wrote still reads.
+    #[test]
+    fn the_nested_ledger_layout_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"chequebooks":{{"{}":{{"{}":"77"}}}}}}"#,
+                hex::encode(cb),
+                hex::encode(peer)
+            ),
+        )
+        .unwrap();
+        let ledger = OutboundLedger::open(Some(path), cb);
+        ledger.ensure_readable().unwrap();
+        assert_eq!(ledger.cumulative_for(&peer), U256::from(77u64));
     }
 
     /// `EmitChequePb` round-trips through prost, so any future change
