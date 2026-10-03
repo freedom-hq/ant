@@ -275,8 +275,13 @@ pub struct PushsyncSwap {
 /// that dropped, as a plain end of stream (`Ok(0)`), so the stream alone
 /// can't tell an accepted cheque from a refused or lost one. What the
 /// payer *can* see is the connection: the swarm loop drops the peer's
-/// [`PeerEthMap`] session on `ConnectionClosed`. A session that is gone
-/// or replaced within this window counts the cheque as undelivered. The
+/// [`PeerEthMap`] session when its last connection closes, and renews it
+/// when any one of several connections closes (it can't tell which one
+/// carried the cheque stream). A session that is gone or replaced within
+/// this window counts the cheque as undelivered — so a dial-race
+/// duplicate closing in the window voids a cheque that went out on the
+/// surviving connection too (the mirror stays up; the next cheque pays
+/// those units again, and bee credits them). The
 /// window covers the swarm loop handling the close after the stream task
 /// woke; in the paid runs on PR #126 the two resets showed up in the same
 /// millisecond as the stream end.
@@ -339,16 +344,26 @@ impl EmitCore {
         Ok(())
     }
 
-    /// Whether the connection a cheque went out on was still up
-    /// [`DELIVERY_GRACE`] after its stream ended: `session` is the peer's
-    /// [`PeerEthMap`] session from before the cheque was sent.
+    /// Whether every connection to `peer` was still up
+    /// [`DELIVERY_GRACE`] after the cheque stream ended: `session` is the
+    /// peer's [`PeerEthMap`] session from before the cheque was sent.
+    /// Fails if the session is gone (the peer's last connection closed)
+    /// *or* renewed — and the swarm loop renews it when *any* of the
+    /// peer's connections closes, not only the one the cheque went out on
+    /// (it can't tell which carried the stream; PR #133 R2-F1). So a
+    /// dial-race duplicate or a liveness-closed dead connection closing
+    /// in the window counts a cheque delivered on the surviving
+    /// connection as undelivered: the debt mirror isn't lowered and the
+    /// next cheque pays those units again (no overpayment, since the
+    /// ledger's cumulative already holds the cheque).
     async fn connection_held(&self, peer: PeerId, session: u64) -> Result<(), SwapError> {
         tokio::time::sleep(DELIVERY_GRACE).await;
         match self.cfg.peer_eth.session(&peer) {
             Some((_, now)) if now == session => Ok(()),
             _ => Err(SwapError::Rejected(
-                "the connection closed as the cheque stream ended (a reset can't be told from \
-                 bee's FullClose), so the cheque is not counted as delivered"
+                "a connection to the peer closed as the cheque stream ended (the one it went \
+                 out on or a duplicate; a reset can't be told from bee's FullClose), so the \
+                 cheque is not counted as delivered"
                     .into(),
             )),
         }
@@ -362,11 +377,12 @@ impl EmitCore {
     /// it and waits until the recipient has finished with it. Returns the
     /// PLUR paid.
     ///
-    /// `Ok` only when the stream ended and the connection held for
-    /// [`DELIVERY_GRACE`] afterwards; the caller then lowers its debt
+    /// `Ok` only when the stream ended and all of the peer's connections
+    /// held for [`DELIVERY_GRACE`] afterwards; the caller then lowers its debt
     /// mirror by `units`, which is what bee credits for the cheque
     /// (`(paid − deduction) / exchange`). A cheque that was recorded but
-    /// then failed, timed out, or ended with its connection stays issued
+    /// then failed, timed out, or saw any of the peer's connections close
+    /// within the grace (see [`Self::connection_held`]) stays issued
     /// liability in the ledger (the next cheque to the beneficiary builds
     /// on it, so nothing is paid twice), but lowers no debt. Every cheque
     /// recorded is logged with its amount, whatever its outcome, so the

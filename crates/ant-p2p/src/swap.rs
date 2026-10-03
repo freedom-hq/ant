@@ -1687,9 +1687,9 @@ pub async fn write_cheque(stream: &mut Stream, signed: &SignedCheque) -> Result<
 /// and a dropped connection (`drop_all_streams`) both move the stream to
 /// `Closed`, which reads as a clean end of stream (`Ok(0)`), exactly like
 /// a `FIN`. So `Ok` here means only that the stream ended, and `Err` that
-/// it failed some other way. The payer adds the signal it does have: the
-/// connection must still be up a moment later (`crate::PushsyncSwap`,
-/// `DELIVERY_GRACE`). A refusal that resets only the stream, with the
+/// it failed some other way. The payer adds the signal it does have: no
+/// connection to the peer — the cheque's own or a duplicate — may close
+/// within a moment after (`crate::PushsyncSwap`, `DELIVERY_GRACE`). A refusal that resets only the stream, with the
 /// connection kept, still reads as delivered.
 pub async fn await_processed(mut stream: Stream) -> Result<(), SwapError> {
     let mut rest = Vec::new();
