@@ -510,6 +510,13 @@ struct SweepState {
     /// a transient error is only kept to answer the callers that were
     /// waiting on that sweep.
     outcome: Option<Result<Vec<Vec<u8>>, RecoveryError>>,
+    /// Whether the latest sweep ran at the head of a streaming join's
+    /// window ([`crate::priority`], issue #46). The sweep runs under the
+    /// rank of the caller that triggered it; a look-ahead-ranked sweep
+    /// leaves every peer a head reserve and queues for its request's
+    /// permits, so its transient shortfall is no answer for a head
+    /// caller, which sweeps again at its own rank instead.
+    head_ranked: bool,
 }
 
 impl SweepState {
@@ -614,7 +621,12 @@ impl RsDecoder {
         if let Some(outcome) = state.final_outcome() {
             return outcome.clone();
         }
-        if state.sweeps > seen {
+        // A sweep that finished while we waited answers us too, unless
+        // we are the head and it ran at a lower rank: then its transient
+        // shortfall may only be the head reserve it had to leave, and
+        // we sweep again at head rank (a final outcome returned above).
+        let head = crate::priority::current() == crate::priority::Priority::Head;
+        if state.sweeps > seen && (state.head_ranked || !head) {
             if let Some(outcome) = state.outcome.as_ref() {
                 return outcome.clone();
             }
@@ -622,6 +634,9 @@ impl RsDecoder {
         let outcome = self.recover_inner(fetcher, trigger).await;
         state.sweeps += 1;
         state.outcome = Some(outcome.clone());
+        // The rank only ever rises (the read head only moves on), so a
+        // sweep that started at the head ran at the head throughout.
+        state.head_ranked = head;
         outcome
     }
 
@@ -941,6 +956,79 @@ pub async fn fetch_root_with_replicas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every fetch is unreached (a starved pool): the direct fetch fails
+    /// after 10 ms, a sweep fetch after 50 ms. Records each sweep fetch's
+    /// rank.
+    struct UnreachedFetcher(std::sync::Mutex<Vec<crate::priority::Priority>>);
+
+    #[async_trait::async_trait]
+    impl ChunkFetcher for UnreachedFetcher {
+        async fn fetch(
+            &self,
+            _addr: [u8; 32],
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().push(crate::priority::current());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Err("no BZZ peers available".into())
+        }
+
+        async fn fetch_waiting_for_credit(
+            &self,
+            _addr: [u8; 32],
+            _credit_budget: std::time::Duration,
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Err("no BZZ peers available".into())
+        }
+    }
+
+    /// R1-M1 on PR #135: a head shard that misses while a look-ahead
+    /// sibling's sweep is running does not take that look-ahead-ranked
+    /// sweep's transient shortfall as its answer; it sweeps again at
+    /// head rank. A look-ahead caller still shares a finished sweep.
+    #[tokio::test(start_paused = true)]
+    async fn head_shard_resweeps_after_a_look_ahead_sweep() {
+        use crate::priority::{at_offset, with_read_head, Priority, ReadHead, HEAD_WINDOW};
+        let addrs: Vec<[u8; 32]> = (0u8..5).map(|i| [i; 32]).collect();
+        let total = addrs.len();
+        let dec = RsDecoder::new(addrs, 3);
+        let fetcher = UnreachedFetcher(std::sync::Mutex::new(Vec::new()));
+        let read_head = ReadHead::new(0);
+        let shard = |index: usize, offset: u64, delay_ms: u64| {
+            let (dec, fetcher, read_head) = (&dec, &fetcher, read_head.clone());
+            with_read_head(
+                read_head,
+                at_offset(offset, async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    dec.fetch_data_shard(fetcher, index, std::time::Duration::ZERO)
+                        .await
+                }),
+            )
+        };
+        // All three read the sweep count before any sweep; look-ahead
+        // shard 2's direct fetch misses first and starts the sweep, and
+        // head shard 0 and look-ahead shard 1 miss while it runs.
+        let (ahead, head, ahead2) = tokio::join!(
+            shard(2, 4 * HEAD_WINDOW, 0),
+            shard(0, 0, 5),
+            shard(1, 4 * HEAD_WINDOW, 6),
+        );
+        for r in [&ahead, &head, &ahead2] {
+            assert!(r.as_ref().is_err_and(|e| e.transient), "{r:?}");
+        }
+        let ranks = fetcher.0.lock().unwrap().clone();
+        assert_eq!(
+            ranks.len(),
+            2 * total,
+            "one look-ahead sweep, one head sweep; the second look-ahead caller shares a sweep: {ranks:?}",
+        );
+        assert_eq!(
+            ranks.iter().filter(|r| **r == Priority::Head).count(),
+            total,
+            "the head shard's own sweep runs at head rank: {ranks:?}",
+        );
+    }
 
     /// A shard counts as confirmed missing only when peers said so and
     /// the fetcher wasn't cut short by an overdraft-starved pool. Both of

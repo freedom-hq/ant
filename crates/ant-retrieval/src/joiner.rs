@@ -43,6 +43,7 @@
 //! still rejects a 64-byte root via [`JoinError::UnsupportedEncryption`].
 
 use crate::accounting::{CreditWindow, CREDIT_WAIT_BUDGET};
+use crate::priority::{self, ReadHead};
 use crate::ChunkFetcher;
 use ant_crypto::CHUNK_SIZE;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -498,6 +499,11 @@ impl ByteRange {
 /// Partial Content` headers — this function only produces the body
 /// bytes for the range. It does not emit chunks before `start` or
 /// after `end`.
+///
+/// The join tracks how far `out` has taken the body, and ranks every
+/// data-chunk fetch against it, so the fetcher gives the chunks the
+/// consumer needs next priority over look-ahead ([`crate::priority`],
+/// issue #46).
 pub async fn join_to_sender_range(
     fetcher: &dyn ChunkFetcher,
     root_chunk_data: &[u8],
@@ -515,17 +521,45 @@ pub async fn join_to_sender_range(
         });
     }
 
-    match range {
-        None => join_subtree_to_sender(fetcher, payload, span, 0, level, parity, &out).await,
-        Some(range) => {
-            let clamped = ByteRange {
-                start: range.start.min(span.saturating_sub(1)),
-                end_inclusive: range.end_inclusive.min(span.saturating_sub(1)),
-            };
-            join_subtree_range_to_sender(fetcher, payload, span, 0, level, parity, clamped, &out)
+    let range = range.map(|range| ByteRange {
+        start: range.start.min(span.saturating_sub(1)),
+        end_inclusive: range.end_inclusive.min(span.saturating_sub(1)),
+    });
+
+    // The consumer's read position, for head-of-window priority (issue
+    // #46, [`crate::priority`]): the joiner sends into `relay_tx`, and
+    // the relay moves the read head on once `out` has taken each buffer.
+    let head = ReadHead::new(range.map_or(0, |r| r.start));
+    let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(1);
+    let join = priority::with_read_head(head.clone(), async move {
+        let r = match range {
+            None => {
+                join_subtree_to_sender(fetcher, payload, span, 0, level, parity, &relay_tx).await
+            }
+            Some(range) => {
+                join_subtree_range_to_sender(
+                    fetcher, payload, span, 0, level, parity, range, &relay_tx,
+                )
                 .await
+            }
+        };
+        drop(relay_tx);
+        r
+    });
+    // Once `out` closes, the relay ends and drops `relay_rx`, so the
+    // joiner's next send fails with `OutputClosed`, as it did on `out`.
+    let relay = async move {
+        while let Some(buf) = relay_rx.recv().await {
+            let len = buf.len() as u64;
+            out.send(buf).await.map_err(|_| JoinError::OutputClosed)?;
+            head.advance(len);
         }
-    }
+        Ok::<(), JoinError>(())
+    };
+    // Not `try_join!`: a join error still lets the relay hand `out`
+    // every buffer the joiner sent before it.
+    let (joined, relayed) = tokio::join!(join, relay);
+    joined.and(relayed)
 }
 
 /// Decoded layout of one intermediate chunk, shared by every tree
@@ -853,6 +887,14 @@ fn join_subtree_to_sender<'a>(
         // at the leaf level — the process-wide retrieval semaphore
         // remains the final cap, but this keeps the joiner's own
         // bookkeeping in check too.
+        //
+        // A sibling that has fetched its chunks frees its slot whether
+        // or not the merger has reached it, so while the leftmost one is
+        // slow the others pull in the rest of the window. Each data-chunk
+        // fetch therefore carries its file offset
+        // (`join_child_to_sender`), and the fetcher serves the ones
+        // within `priority::HEAD_WINDOW` of the consumer's read position
+        // first (issue #46).
         type ProducerFut<'b> =
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'b>>;
         let fanout = FETCH_FANOUT.min(refs).max(1);
@@ -919,7 +961,11 @@ async fn join_child_to_sender(
     child_offset: u64,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
-    let child_chunk = fetch_child_with_retries(fetcher, decoder, index, addr).await?;
+    let child_chunk = priority::at_offset(
+        child_offset,
+        fetch_child_with_retries(fetcher, decoder, index, addr),
+    )
+    .await?;
     let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
     let (child_level, _, child_parity) = crate::rs::chunk_meta(&child_chunk).unwrap_or((0, 0, 0));
     join_subtree_to_sender(
@@ -1127,7 +1173,11 @@ async fn join_child_range_to_sender(
     range: ByteRange,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
-    let child_chunk = fetch_child_with_retries(fetcher, decoder, index, addr).await?;
+    let child_chunk = priority::at_offset(
+        child_offset,
+        fetch_child_with_retries(fetcher, decoder, index, addr),
+    )
+    .await?;
     let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
     let (child_level, _, child_parity) = crate::rs::chunk_meta(&child_chunk).unwrap_or((0, 0, 0));
     join_subtree_range_to_sender(
@@ -2549,6 +2599,216 @@ mod tests {
         join.await.unwrap().unwrap();
         let want = &expected[start as usize..=end as usize];
         assert_eq!(body, want);
+    }
+
+    /// Records the [`crate::priority`] rank each fetch runs with. The
+    /// fetch of `gate` (if set) records its rank, waits for the test to
+    /// open the gate, and records it again.
+    struct RankingFetcher {
+        map: MapFetcher,
+        ranks: std::sync::Mutex<HashMap<[u8; 32], crate::priority::Priority>>,
+        gate: Option<([u8; 32], std::sync::Arc<tokio::sync::Notify>)>,
+        gated_rank_before: std::sync::Mutex<Option<crate::priority::Priority>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChunkFetcher for RankingFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if let Some((gate, open)) = self.gate.as_ref() {
+                if *gate == addr {
+                    *self.gated_rank_before.lock().unwrap() = Some(crate::priority::current());
+                    open.notified().await;
+                }
+            }
+            self.ranks
+                .lock()
+                .unwrap()
+                .insert(addr, crate::priority::current());
+            self.map.fetch(addr).await
+        }
+    }
+
+    /// A file built by [`two_subtree_file`].
+    struct TwoSubtreeFile {
+        root: Vec<u8>,
+        intermediates: [[u8; 32]; 2],
+        /// Every leaf address, in document order.
+        leaves: Vec<[u8; 32]>,
+        bytes: Vec<u8>,
+    }
+
+    /// Two 128-leaf subtrees (2 × 512 KiB), its chunks in `fetcher`.
+    fn two_subtree_file(fetcher: &mut MapFetcher) -> TwoSubtreeFile {
+        let mut expected = Vec::with_capacity(256 * CHUNK_SIZE);
+        let mut leaves = Vec::with_capacity(256);
+        let mut intermediates = [[0u8; 32]; 2];
+        for (group, intermediate) in intermediates.iter_mut().enumerate() {
+            let mut payload = Vec::with_capacity(128 * 32);
+            for leaf in 0..128usize {
+                let mut data = vec![(group * 128 + leaf) as u8; CHUNK_SIZE];
+                data[..2].copy_from_slice(&((group * 128 + leaf) as u16).to_le_bytes());
+                let (addr, wire) = cac_new(&data).unwrap();
+                fetcher.insert(addr, wire);
+                payload.extend_from_slice(&addr);
+                leaves.push(addr);
+                expected.extend_from_slice(&data);
+            }
+            let span = 128 * CHUNK_SIZE as u64;
+            let mut wire = span.to_le_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            *intermediate = chunk_addr(&payload, span);
+            fetcher.insert(*intermediate, wire);
+        }
+        let mut root = (expected.len() as u64).to_le_bytes().to_vec();
+        root.extend_from_slice(&intermediates[0]);
+        root.extend_from_slice(&intermediates[1]);
+        TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        }
+    }
+
+    /// Issue #46: the streaming joiner ranks every data-chunk fetch
+    /// against how far its consumer has read, so the fetcher can serve
+    /// the head of the window first. While the consumer has read
+    /// nothing, only the chunks within `HEAD_WINDOW` of byte 0 are the
+    /// head; once it has read the first subtree, the second subtree's
+    /// chunks at the new read position are, including a fetch that
+    /// started as look-ahead and was still running.
+    #[tokio::test]
+    async fn streaming_join_ranks_fetches_by_the_read_position() {
+        use crate::priority::{Priority, HEAD_WINDOW};
+        let mut map = MapFetcher::new();
+        let TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        } = two_subtree_file(&mut map);
+        let open = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fetcher = std::sync::Arc::new(RankingFetcher {
+            map,
+            ranks: std::sync::Mutex::default(),
+            gate: Some((intermediates[1], open.clone())),
+            gated_rank_before: std::sync::Mutex::default(),
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let f = fetcher.clone();
+        let join = tokio::spawn(async move {
+            join_to_sender(
+                &*f,
+                &root,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                tx,
+            )
+            .await
+        });
+
+        let half = 128 * CHUNK_SIZE;
+        let mut got = Vec::new();
+        while got.len() < half {
+            got.extend_from_slice(&rx.recv().await.expect("first subtree"));
+        }
+        assert_eq!(
+            *fetcher.gated_rank_before.lock().unwrap(),
+            Some(Priority::LookAhead),
+            "the second subtree starts as look-ahead",
+        );
+        {
+            let ranks = fetcher.ranks.lock().unwrap();
+            assert_eq!(ranks[&intermediates[0]], Priority::Head);
+            for (i, leaf) in leaves[..128].iter().enumerate() {
+                let want = if ((i * CHUNK_SIZE) as u64) < HEAD_WINDOW {
+                    Priority::Head
+                } else {
+                    Priority::LookAhead
+                };
+                assert_eq!(ranks[leaf], want, "first subtree, leaf {i}");
+            }
+        }
+        open.notify_one();
+        got.extend_from_slice(&drain(&mut rx).await);
+        join.await.unwrap().unwrap();
+        assert_eq!(got, expected);
+        let ranks = fetcher.ranks.lock().unwrap();
+        assert_eq!(
+            ranks[&intermediates[1]],
+            Priority::Head,
+            "a running fetch the consumer caught up with is the head",
+        );
+        for (i, leaf) in leaves[128..].iter().enumerate() {
+            let want = if ((i * CHUNK_SIZE) as u64) < HEAD_WINDOW {
+                Priority::Head
+            } else {
+                Priority::LookAhead
+            };
+            assert_eq!(ranks[leaf], want, "second subtree, leaf {i}");
+        }
+    }
+
+    /// Issue #46: a range request's read position starts at the range,
+    /// and the buffered joiner has no consumer to rank against (its
+    /// fetches stay unranked, served as before).
+    #[tokio::test]
+    async fn range_join_ranks_from_the_range_start_and_buffered_join_is_unranked() {
+        use crate::priority::{Priority, HEAD_WINDOW};
+        let mut map = MapFetcher::new();
+        let TwoSubtreeFile {
+            root,
+            intermediates,
+            leaves,
+            bytes: expected,
+        } = two_subtree_file(&mut map);
+        let fetcher = RankingFetcher {
+            map,
+            ranks: std::sync::Mutex::default(),
+            gate: None,
+            gated_rank_before: std::sync::Mutex::default(),
+        };
+        let start = 600 * 1024;
+        let (tx, mut rx) = mpsc::channel(512);
+        join_to_sender_range(
+            &fetcher,
+            &root,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+            Some(ByteRange {
+                start,
+                end_inclusive: expected.len() as u64 - 1,
+            }),
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(drain(&mut rx).await, expected[start as usize..]);
+        {
+            let mut ranks = fetcher.ranks.lock().unwrap();
+            assert!(!ranks.contains_key(&intermediates[0]), "outside the range");
+            assert_eq!(ranks[&intermediates[1]], Priority::Head);
+            // The range walk fetches one child after another, each once
+            // the one before it went out, and this consumer never falls
+            // behind: every leaf is the head when it is fetched. Ranked
+            // from byte 0, the first one (at 600 KiB) would be look-ahead.
+            for (i, leaf) in leaves.iter().enumerate() {
+                let offset = (i * CHUNK_SIZE) as u64;
+                if offset + CHUNK_SIZE as u64 <= start {
+                    assert!(!ranks.contains_key(leaf), "leaf {i} is outside the range");
+                    continue;
+                }
+                assert_eq!(ranks[leaf], Priority::Head, "leaf {i}");
+            }
+            assert!(start >= HEAD_WINDOW);
+            ranks.clear();
+        }
+
+        let out = join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        assert_eq!(out, expected);
+        let ranks = fetcher.ranks.lock().unwrap();
+        assert_eq!(ranks.len(), 2 + 256);
+        assert!(ranks.values().all(|r| *r == Priority::Unranked));
     }
 
     /// Tail range of the very last leaf: this is the MP4 `moov`-at-end

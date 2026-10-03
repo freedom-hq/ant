@@ -21,6 +21,7 @@
 use crate::accounting::{Accounting, DebitGuard, OVERDRAFT_REFRESH};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
+use crate::priority::{self, Priority};
 use crate::progress::ProgressTracker;
 use crate::push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 use crate::pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
@@ -163,7 +164,9 @@ pub struct RoutingFetcher {
     /// acquire this semaphore before they enter the process-wide queue,
     /// which prevents one large joiner from filling the global FIFO with
     /// hundreds of descendant chunk fetches while another HTTP request is
-    /// still trying to fetch its root or first ordered subtree.
+    /// still trying to fetch its root or first ordered subtree. A fetch
+    /// at the head of a streaming join's window skips it
+    /// ([`acquire_request_permit`], issue #46).
     request_inflight_limit: Option<Arc<Semaphore>>,
     /// Notification channel into the pseudosettle driver. When set, every
     /// successful chunk fetch sends the source peer's id; the driver
@@ -484,6 +487,14 @@ impl RoutingFetcher {
     /// process-wide cap: `ant-p2p` creates one fetcher per `GetBytes` /
     /// `GetBzz` command, so this keeps concurrent browser downloads fair
     /// while still allowing the daemon as a whole to use the network.
+    ///
+    /// Fetches at the head of a streaming join's window bypass this cap
+    /// (issue #46, see [`crate::priority`]): a streaming request can go
+    /// over `limit` by its head-window fetches (the chunks within
+    /// [`crate::priority::HEAD_WINDOW`] of the read head), their hedges
+    /// and a recovery sweep one of them triggers. Those still take a
+    /// process-wide permit ([`Self::with_inflight_limit`]). Every other
+    /// fetch, including all of a non-streaming join, stays within it.
     #[must_use]
     pub fn with_request_inflight_limit(mut self, limit: usize) -> Self {
         self.request_inflight_limit = Some(Arc::new(Semaphore::new(limit.max(1))));
@@ -1467,11 +1478,7 @@ impl RoutingFetcher {
             let tracker = self.progress.clone();
             async move {
                 let _request_permit = match request_sem {
-                    Some(s) => Some(
-                        s.acquire_owned()
-                            .await
-                            .expect("request retrieval semaphore closed"),
-                    ),
+                    Some(s) => acquire_request_permit(s).await,
                     None => None,
                 };
                 let _permit = match sem {
@@ -1513,6 +1520,14 @@ impl RoutingFetcher {
              overdraft_skip: &mut std::collections::HashMap<PeerId, std::time::Instant>|
              -> Option<(PeerId, Option<DebitGuard>)> {
                 let now = std::time::Instant::now();
+                // A look-ahead chunk of a streaming join leaves every
+                // peer's last chunk of credit to the head of the window
+                // (issue #46). Ranked afresh on every pick: a fetch the
+                // consumer has caught up with is the head from now on.
+                let headroom = match priority::current() {
+                    Priority::LookAhead => crate::accounting::HEAD_CREDIT_RESERVE,
+                    Priority::Head | Priority::Unranked => 0,
+                };
                 // Sweep expired overdraft entries so the candidate set
                 // reopens once `lightRefreshRate` has had time to clear
                 // the peer's debt on bee's side.
@@ -1528,7 +1543,7 @@ impl RoutingFetcher {
                     match self.accounting.as_ref() {
                         Some(acc) => {
                             let price = Accounting::peer_price(&peer_overlay, &addr);
-                            if let Some(guard) = acc.try_reserve(peer, price) {
+                            if let Some(guard) = acc.try_reserve_leaving(peer, price, headroom) {
                                 return Some((peer, Some(guard)));
                             }
                             trace!(
@@ -1868,6 +1883,45 @@ impl RoutingFetcher {
             pool_starved,
             not_found_answers,
         )))
+    }
+}
+
+/// Take a permit from the request's own in-flight cap
+/// (`request_inflight_limit`), unless the fetch is at the head of a
+/// streaming join's window ([`crate::priority`], issue #46).
+///
+/// A head fetch skips this queue: on a large file the joiner's nested
+/// fan-out keeps far more fetches going than the cap admits, and the
+/// queue is first come, first served, so the chunk the consumer waits
+/// for would otherwise queue behind look-ahead fetches started before
+/// it. Head fetches are few (the chunks within
+/// [`priority::HEAD_WINDOW`] of the read head, their hedges, and a
+/// recovery sweep one of them triggers), so the request goes over its
+/// cap by that much at most; the process-wide cap still applies to
+/// them. A look-ahead fetch queues as before, keeping its place in the
+/// queue for as long as it waits, and leaves it the moment the consumer
+/// catches up with it ([`priority::until_head`]: woken by the read
+/// head's advance, not by polling). An unranked fetch (outside a
+/// streaming join) queues as before.
+async fn acquire_request_permit(sem: Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let acquire = async {
+        sem.acquire_owned()
+            .await
+            .expect("request retrieval semaphore closed")
+    };
+    match priority::current() {
+        Priority::Head => None,
+        Priority::Unranked => Some(acquire.await),
+        Priority::LookAhead => {
+            // One `Acquire` future for the whole wait: dropping and
+            // re-creating it would send the fetch to the back of the
+            // FIFO queue each time.
+            tokio::select! {
+                biased;
+                permit = acquire => Some(permit),
+                () = priority::until_head() => None,
+            }
+        }
     }
 }
 
@@ -2857,6 +2911,168 @@ mod tests {
             "the joiner's fetch must have reserved credit and dispatched: reserved {reserved}",
         );
         h.abort();
+    }
+
+    /// Issue #46: a peer's last chunk of credit goes to the head of a
+    /// streaming join's window, not to a look-ahead fetch that asked for
+    /// it first. The peer has 400k units left: one chunk, but not one
+    /// chunk plus [`HEAD_CREDIT_RESERVE`](crate::accounting::HEAD_CREDIT_RESERVE).
+    /// The look-ahead fetch is polled first, as the joiner's fan-out
+    /// polls a sibling that started earlier; it must leave the credit
+    /// and wait, and the head fetch must reserve it and be dispatched.
+    /// The two chunks are priced differently, so the reservation shows
+    /// which one got it.
+    #[tokio::test(start_paused = true)]
+    async fn look_ahead_fetch_leaves_the_last_credit_to_the_head() {
+        use crate::priority::{at_offset, with_read_head, ReadHead, HEAD_WINDOW};
+        let acc = Arc::new(Accounting::new());
+        let p = PeerId::random();
+        let o = [0x80u8; 32];
+        // Proximity 0 to `o`: the highest price, 320k.
+        let ahead_addr = [0x11u8; 32];
+        // Proximity 1: 310k.
+        let head_addr = [0xC1u8; 32];
+        assert_eq!(Accounting::peer_price(&o, &ahead_addr), 320_000);
+        assert_eq!(Accounting::peer_price(&o, &head_addr), 310_000);
+        let held = crate::accounting::OVERDRAFT_LIMIT - 400_000;
+        let _held = acc.try_reserve(p, held).expect("admits");
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
+            .with_accounting(acc.clone());
+
+        let ahead_done = Arc::new(std::sync::Mutex::new(None));
+        let done = ahead_done.clone();
+        let h = tokio::spawn(with_read_head(ReadHead::new(0), async move {
+            let started = tokio::time::Instant::now();
+            let ahead = at_offset(4 * HEAD_WINDOW, async {
+                let r = fetcher
+                    .fetch_waiting_for_credit(ahead_addr, CREDIT_WAIT_BUDGET)
+                    .await;
+                let starved = r
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<FetchExhausted>())
+                    .is_some_and(|e| e.pool_starved);
+                *done.lock().unwrap() = Some((started.elapsed(), starved));
+            });
+            // The dummy transport never answers: the head fetch hangs
+            // in its dispatch, holding its reservation.
+            let head = at_offset(0, async {
+                let _ = fetcher
+                    .fetch_waiting_for_credit(head_addr, CREDIT_WAIT_BUDGET)
+                    .await;
+            });
+            futures::join!(ahead, head);
+        }));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            acc.debug_snapshot(&p).unwrap().1,
+            held + 310_000,
+            "the head fetch, not the look-ahead one, must hold the last credit",
+        );
+        tokio::time::sleep(CREDIT_WAIT_BUDGET).await;
+        let (waited, starved) = ahead_done.lock().unwrap().expect("look-ahead fetch done");
+        assert!(
+            starved && waited >= CREDIT_WAIT_BUDGET,
+            "the look-ahead fetch must wait for credit beyond the head's reserve: starved {starved} after {waited:?}",
+        );
+        h.abort();
+    }
+
+    /// Issue #46: a fetch at the head of a streaming join's window skips
+    /// its request's in-flight queue; a look-ahead or unranked one waits
+    /// its turn, and a look-ahead one skips it too once the consumer has
+    /// caught up with it. "Dispatched" = past the permits, where the
+    /// progress tracker counts a fetch in flight.
+    #[tokio::test]
+    async fn head_fetch_skips_the_request_queue() {
+        use crate::priority::{at_offset, with_read_head, ReadHead, HEAD_WINDOW};
+        let p = PeerId::random();
+        let behaviour = libp2p_stream::Behaviour::default();
+        let tracker = Arc::new(ProgressTracker::new(false));
+        let fetcher = Arc::new(
+            RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, [0u8; 32])])
+                .with_request_inflight_limit(1)
+                .with_progress(tracker.clone()),
+        );
+        // Hold the request's only permit.
+        let _hold = fetcher
+            .request_inflight_limit
+            .clone()
+            .unwrap()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let read_head = ReadHead::new(0);
+        let spawn_at = |offset: Option<u64>| {
+            let fetcher = fetcher.clone();
+            let read_head = read_head.clone();
+            tokio::spawn(async move {
+                let fetch = async { fetcher.fetch([0x42u8; 32]).await.map(|_| ()) };
+                match offset {
+                    Some(offset) => with_read_head(read_head, at_offset(offset, fetch)).await,
+                    None => fetch.await,
+                }
+            })
+        };
+        let in_flight = || tracker.snapshot().in_flight;
+        let unranked = spawn_at(None);
+        let ahead = spawn_at(Some(2 * HEAD_WINDOW));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            in_flight(),
+            0,
+            "unranked and look-ahead fetches wait for the permit"
+        );
+
+        let head = spawn_at(Some(0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            in_flight(),
+            1,
+            "the head fetch must not wait for the request's permit"
+        );
+
+        // The consumer catches up: the waiting look-ahead fetch is now
+        // the head and goes ahead at once.
+        read_head.advance(2 * HEAD_WINDOW);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            in_flight(),
+            2,
+            "a look-ahead fetch the consumer caught up with skips the queue",
+        );
+        for h in [unranked, ahead, head] {
+            h.abort();
+        }
+    }
+
+    /// R1-M2 on PR #135: a look-ahead fetch waiting for its request's
+    /// permit keeps its place in the FIFO queue, so an unranked fetch
+    /// that queued after it does not overtake it, however long it waited.
+    #[tokio::test(start_paused = true)]
+    async fn look_ahead_keeps_its_place_in_the_request_queue() {
+        use crate::priority::{at_offset, with_read_head, ReadHead, HEAD_WINDOW};
+        let sem = Arc::new(Semaphore::new(1));
+        let hold = sem.clone().acquire_owned().await.unwrap();
+        let ahead = tokio::spawn(with_read_head(
+            ReadHead::new(0),
+            at_offset(2 * HEAD_WINDOW, acquire_request_permit(sem.clone())),
+        ));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let unranked = tokio::spawn(acquire_request_permit(sem.clone()));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(hold);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            ahead.is_finished(),
+            "the look-ahead fetch queued first and must get the permit first",
+        );
+        assert!(!unranked.is_finished());
+        drop(ahead.await.unwrap().expect("a permit, not a head bypass"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(unranked.is_finished());
     }
 
     /// R1-M2 on PR #119: a credit wake-up the oldest waiter can't use
