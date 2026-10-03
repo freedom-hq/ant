@@ -1788,10 +1788,14 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     }
 
     // Pseudosettle driver: keeps our per-peer debt below bee's
-    // light-mode `disconnectLimit` by periodically opening
+    // light-mode `disconnectLimit` by opening
     // `/swarm/pseudosettle/1.0.0/pseudosettle` and asking bee to clear
-    // the time-based allowance worth. The fetcher feeds this driver
-    // via `payment_notify` (see [`RoutingFetcher::with_payment_notify`]).
+    // the time-based allowance worth. Refreshes are scheduled off the
+    // accounting mirror below (`Accounting::refresh_due`, bee's settle
+    // trigger): a peer is refreshed only once its mirrored debt is due.
+    // The fetcher's `payment_notify` (see
+    // [`RoutingFetcher::with_payment_notify`]) and the hot hints only
+    // register peers with the driver; neither schedules a refresh.
     // The driver also subscribes to `peers_watch` so it skips
     // refreshes for peers we no longer have a direct connection to —
     // critical for gateway loads where the routing set churns through
@@ -1800,10 +1804,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // The shared `Accounting` mirror is the same one we hand to every
     // `RoutingFetcher` we build below; it gives the fetcher's hot path
     // admission control (refuse to dispatch to peers near
-    // `lightDisconnectLimit`) and the driver a way to credit peers
-    // back as bee accepts our refresh attempts. The driver also
-    // listens for `HotHint`s on a separate channel so a debt crossing
-    // can leapfrog the periodic walk.
+    // `lightDisconnectLimit`) and the driver both its refresh trigger
+    // and a way to credit peers back as bee accepts our refresh
+    // attempts.
     let (payment_notify_for_state, payment_notify_rx) =
         mpsc::channel::<PeerId>(crate::pseudosettle::NOTIFY_CHANNEL_CAP);
     let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
@@ -6331,22 +6334,23 @@ async fn probe_leaf_sources(
                 }
                 None => None,
             };
-            let hit = matches!(
-                tokio::time::timeout(
-                    probe_timeout,
-                    ant_retrieval::retrieve_chunk(&mut control, peer, addr),
-                )
-                .await,
-                Ok(Ok(_))
-            );
-            if hit {
+            let fetch = async move {
+                ant_retrieval::retrieve_chunk(&mut control, peer, addr)
+                    .await
+                    .is_ok()
+            };
+            // On a delivery, in time or late, bee has applied the debit:
+            // record it in the mirror, which is what schedules the
+            // pseudosettle refresh that clears it.
+            let on_delivered = move || {
                 if let Some(g) = guard {
                     g.apply();
                 }
                 if let Some(tx) = payment_notify.as_ref() {
                     let _ = tx.try_send(peer);
                 }
-            }
+            };
+            let hit = probe_draining_late_delivery(fetch, probe_timeout, on_delivered).await;
             // We reached the peer (reservation succeeded), so this is a
             // definitive answer regardless of hit/miss.
             (hit, true)
@@ -6356,6 +6360,46 @@ async fn probe_leaf_sources(
     LeafProbe {
         hits: results.iter().filter(|(hit, _)| *hit).count() as u32,
         answered: results.iter().filter(|(_, answered)| *answered).count() as u32,
+    }
+}
+
+/// Run one billable probe fetch with a `timeout` on the *answer* but not
+/// on the request: if `fetch` hasn't resolved by then the probe counts as
+/// a miss, but the request keeps running in the background (bounded by
+/// `retrieve_chunk`'s own `RETRIEVE_TIMEOUT`) and `on_delivered` still
+/// runs if bee delivers late. Dropping the request at the timeout would
+/// lose a debit bee may already have applied (`creditAction.Apply` runs
+/// when it writes the delivery), and since pseudosettle refreshes are
+/// scheduled only off the accounting mirror (`Accounting::refresh_due`),
+/// debt the mirror never sees is cleared only incidentally. This is the
+/// fetcher's loser drain (`spawn_drain_losers`) for the probe path.
+///
+/// Returns whether `fetch` delivered within `timeout`. `on_delivered`
+/// runs at most once, on an in-time or late delivery, never on a failure.
+async fn probe_draining_late_delivery<F, D>(
+    fetch: F,
+    timeout: std::time::Duration,
+    on_delivered: D,
+) -> bool
+where
+    F: std::future::Future<Output = bool> + Send + 'static,
+    D: FnOnce() + Send + 'static,
+{
+    let mut fetch = Box::pin(fetch);
+    match tokio::time::timeout(timeout, &mut fetch).await {
+        Ok(true) => {
+            on_delivered();
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            tokio::spawn(async move {
+                if fetch.await {
+                    on_delivered();
+                }
+            });
+            false
+        }
     }
 }
 
@@ -8414,6 +8458,69 @@ mod tests {
             rejections: 1,
             sample: "batchstore get: not found".into(),
         }
+    }
+
+    /// PR #134 R1-M2: a probe that times out must not lose the debit of a
+    /// delivery bee makes after the timeout — the mirror is what schedules
+    /// the pseudosettle refresh, so unmirrored debt would go uncleared.
+    #[tokio::test(start_paused = true)]
+    async fn probe_records_late_delivery_debit_in_mirror() {
+        use ant_retrieval::accounting::Accounting;
+        use std::time::Duration;
+        let acc = Arc::new(Accounting::new());
+        let peer = pid();
+        let guard = acc.try_reserve(peer, 1_000).expect("reserve");
+        let fetch = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            true
+        };
+        let hit =
+            probe_draining_late_delivery(fetch, Duration::from_secs(10), move || guard.apply())
+                .await;
+        assert!(!hit, "a late delivery is still a probe miss");
+        // Still in flight: reserved, not yet applied.
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, 1_000)));
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(
+            acc.debug_snapshot(&peer),
+            Some((1_000, 0)),
+            "late delivery's debit must land in the mirror",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_releases_reservation_when_late_fetch_fails() {
+        use ant_retrieval::accounting::Accounting;
+        use std::time::Duration;
+        let acc = Arc::new(Accounting::new());
+        let peer = pid();
+        let guard = acc.try_reserve(peer, 1_000).expect("reserve");
+        let fetch = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            false
+        };
+        let hit =
+            probe_draining_late_delivery(fetch, Duration::from_secs(10), move || guard.apply())
+                .await;
+        assert!(!hit);
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, 0)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_applies_in_time_delivery_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let hit =
+            probe_draining_late_delivery(async { true }, Duration::from_secs(10), move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        assert!(hit);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Issue #52 regression: a peer-rejected batch must carry a probe

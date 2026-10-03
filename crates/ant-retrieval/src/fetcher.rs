@@ -166,12 +166,14 @@ pub struct RoutingFetcher {
     /// still trying to fetch its root or first ordered subtree.
     request_inflight_limit: Option<Arc<Semaphore>>,
     /// Notification channel into the pseudosettle driver. When set, every
-    /// successful chunk fetch sends the source peer's id; the driver
-    /// uses that to schedule periodic
-    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes and keep our
-    /// per-peer debt below bee's light-mode `disconnectLimit`. Omitted in
-    /// unit tests (no real bee on the other end means there's no debt to
-    /// settle).
+    /// successful chunk fetch sends the source peer's id, which registers
+    /// the peer with the driver. It does not schedule a refresh: with the
+    /// accounting mirror attached (as in the daemon), the driver refreshes
+    /// a peer only once the mirror's debt to it reaches bee's settle
+    /// trigger (`Accounting::refresh_due`), so the debit recorded through
+    /// `accounting` is what keeps our per-peer debt below bee's light-mode
+    /// `disconnectLimit`. Omitted in unit tests (no real bee on the other
+    /// end means there's no debt to settle).
     payment_notify: Option<mpsc::Sender<PeerId>>,
     /// Optional client-side accounting mirror. When set, every
     /// chunk fetch dispatch goes through
@@ -492,13 +494,17 @@ impl RoutingFetcher {
 
     /// Wire this fetcher to the daemon's pseudosettle driver. On every
     /// successful chunk fetch, the source peer's id is sent on
-    /// `notify_tx`; the driver uses that as a heartbeat to schedule
-    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes. Without this,
-    /// debt accumulates on every peer that serves us until bee's
-    /// `disconnectLimit` kicks in (~7-30 chunks per peer in light mode)
-    /// — see the 0.3.0 streaming-regression appendix in `PLAN.md` for the
-    /// full analysis. The channel is bounded; if it backs up the fetcher
-    /// drops the notification rather than blocking the hot path.
+    /// `notify_tx`, registering the peer with the driver. With the
+    /// accounting mirror attached ([`Self::with_accounting`]) that is all
+    /// it does: the driver refreshes
+    /// (`/swarm/pseudosettle/1.0.0/pseudosettle`) a peer only once the
+    /// mirror's debt to it reaches bee's settle trigger, so the mirror,
+    /// not this channel, keeps debt below bee's `disconnectLimit` (~7-30
+    /// chunks per peer in light mode — see the 0.3.0 streaming-regression
+    /// appendix in `PLAN.md`). Without a mirror a notified peer is
+    /// refreshed on the driver's interval. The channel is bounded; if it
+    /// backs up the fetcher drops the notification rather than blocking
+    /// the hot path.
     #[must_use]
     pub fn with_payment_notify(mut self, notify_tx: mpsc::Sender<PeerId>) -> Self {
         self.payment_notify = Some(notify_tx);
@@ -1773,13 +1779,14 @@ impl RoutingFetcher {
                             if let Some(counters) = self.counters.as_ref() {
                                 counters.record_chunk(wire.len() as u64, crate::ChunkSource::Network);
                             }
-                            // Heartbeat into the pseudosettle driver. We
-                            // use `try_send` to keep the hot path
-                            // strictly non-blocking: if the driver
-                            // hasn't drained the bounded channel yet,
-                            // missing one notification just delays the
-                            // next refresh by at most one driver tick
-                            // (~1 s) and is harmless.
+                            // Register the peer with the pseudosettle
+                            // driver. `try_send` keeps the hot path
+                            // strictly non-blocking; a dropped
+                            // notification is harmless with the mirror
+                            // attached, since the driver schedules
+                            // refreshes off the mirror's debt (the
+                            // debit applied above), not off this
+                            // channel.
                             if let Some(notify) = self.payment_notify.as_ref() {
                                 let _ = notify.try_send(peer);
                             }
@@ -1969,11 +1976,14 @@ const fn is_peer_fatal(err: &RetrievalError) -> bool {
 ///   - **Cache write-through.** The loser already paid for the bytes;
 ///     caching them is free and a sibling fetch (or a future request
 ///     for the same chunk) skips the network entirely.
-///   - **Pseudosettle notify.** The chunk price was applied as a real
-///     debit on bee's accounting, so the pseudosettle driver needs to
-///     know we owe this peer. Without this notify, debt would still
-///     accumulate and we'd just trade ghost-overdraw blocklists for
-///     `lightDisconnectLimit` blocklists.
+///   - **Debit apply + pseudosettle notify.** The chunk price was applied
+///     as a real debit on bee's accounting, so it must land in our
+///     mirror too: the pseudosettle driver refreshes a peer only once
+///     the mirror's debt to it is due (`Accounting::refresh_due`), so a
+///     debit we skipped here would accumulate on bee's side unseen and
+///     we'd just trade ghost-overdraw blocklists for
+///     `lightDisconnectLimit` blocklists. The notify only registers the
+///     peer with the driver.
 ///   - **`record_chunk`** if recording is enabled.
 ///
 /// Errors from losing fetches are silently discarded — the winner has

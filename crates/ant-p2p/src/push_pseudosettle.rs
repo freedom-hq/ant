@@ -18,9 +18,9 @@
 //! Bee's own light nodes settle upload debt **time-based** via
 //! `/swarm/pseudosettle` — no cheques, no chain, no BZZ. Ant already
 //! runs the full pseudosettle driver for retrieval; this adapter just
-//! records push debits in the same `Accounting` mirror, which
-//! automatically fires the driver's `HotHint` when a peer's mirrored
-//! debt crosses `HOT_DEBT_THRESHOLD`.
+//! records push debits in the same `Accounting` mirror, from which the
+//! driver reads, every tick, which peers a refresh is due to
+//! (`Accounting::refresh_due`).
 //!
 //! DEFAULT ON since the perf-lab verdict (collapse-to-zero became a
 //! stable plateau; see PERF-LAB.md exp 1). `ANT_PUSH_PSEUDOSETTLE=0`

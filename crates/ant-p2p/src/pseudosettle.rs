@@ -150,16 +150,22 @@ const MAX_REFRESH_WINDOW_SECS: u64 = 60;
 /// peer first) rather than queueing behind the cap.
 const MAX_INFLIGHT_REFRESHES: usize = 32;
 
-/// Bound on the "I just fetched from X" channel into the driver. Drops
-/// on backpressure (the driver is a small fixed work queue; missing a
-/// notification only delays the next refresh by one tick).
+/// Bound on the "I just fetched from X" channel into the driver. A
+/// notification only registers the peer with the driver; with the
+/// accounting mirror attached (as in the daemon) it does not make a
+/// refresh due — only the mirror's debt does
+/// ([`Accounting::refresh_due`], read every tick). Without a mirror a
+/// notified peer is refreshed on the interval. Drops on backpressure:
+/// with a mirror a dropped notification changes nothing (an indebted
+/// peer is picked up from `refresh_due` anyway); without one it delays
+/// that peer's refreshes until its next notification.
 pub const NOTIFY_CHANNEL_CAP: usize = 1024;
 
 /// Bound on the hot-hint channel into the driver. Hot hints are rare
 /// (only fire on debt-threshold crossings), so a smaller cap is fine.
-/// Drops on backpressure: the driver still picks up the peer on its
-/// next periodic walk via the regular notify path, hot hints just
-/// shave off the latency.
+/// Like a notification, a hint only registers the peer; whether a
+/// refresh is due is read from the mirror on the next tick, so a hint
+/// dropped on backpressure costs nothing.
 pub const HOT_HINT_CHANNEL_CAP: usize = 256;
 
 /// Bee's `pseudosettle.proto::Payment { bytes Amount = 1 }`.
@@ -570,6 +576,17 @@ fn pick_refreshes(
 /// - **Back off after a failure** ([`FAILED_REFRESH_BACKOFF`], doubling),
 ///   so a connection bee no longer serves isn't hit every second.
 ///
+/// `notify_rx` and `hot_rx` only register peers; with the mirror
+/// attached they never schedule a refresh by themselves. That makes the
+/// mirror's accuracy load-bearing: bee clamps each refresh to its own
+/// view of our debt, so a refresh clears debt the mirror missed too, but
+/// only once the *mirrored* debt to that peer reaches the trigger. Debt
+/// bee applied and the mirror never recorded (a request dropped after
+/// bee wrote the delivery) is cleared only when that happens. Every
+/// billable request must therefore record its debit even when it is
+/// abandoned — see the fetcher's loser drain and the leaf probe's
+/// late-delivery drain in `behaviour.rs`.
+///
 /// `peers_rx` carries the routing-table snapshot — the peers we've
 /// completed the BZZ handshake with and can actually open substreams
 /// to. The driver consults it every tick and skips refreshes for
@@ -590,10 +607,11 @@ pub async fn run_driver(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut metrics = DriverMetrics::default();
-    // Log a summary roughly once per minute. At ~1 refresh / peer / 2 s
-    // and ~150 active peers during a busy fetch, this is ~4500 events
-    // per summary — granular enough to spot a regression, sparse enough
-    // to keep the log file readable.
+    // Log a summary roughly once per minute. A peer is refreshed at most
+    // once a second, and only while the mirror says we owe it (see the
+    // rules above), so a busy fetch from ~150 indebted peers is at most a
+    // few thousand events per summary — granular enough to spot a
+    // regression, sparse enough to keep the log file readable.
     let summary_every = Duration::from_mins(1);
     let mut last_summary = Instant::now();
     let mut last_metrics = DriverMetrics::default();
