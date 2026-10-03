@@ -874,11 +874,12 @@ impl RoutingFetcher {
                 let delay_ms: u64 = $delay_ms;
                 // Load-book the dispatch SYNCHRONOUSLY so the very next
                 // `next_push_peer` (for a concurrent chunk) already sees
-                // this peer's in-flight count (Experiment 2).
-                let push_load = self.push_load.clone();
-                if let Some(load) = push_load.as_ref() {
-                    load.begin(peer);
-                }
+                // this peer's in-flight count (Experiment 2). The guard
+                // moves into the attempt, so the slot is released however
+                // the attempt ends — finished, drained, or dropped
+                // unfinished (no settlement hook to drain into) — instead
+                // of leaking whenever the future is discarded (R4-M1).
+                let load_guard = self.push_load.as_ref().map(|l| l.book(peer));
                 inflight.futs.push(Box::pin(async move {
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -894,8 +895,8 @@ impl RoutingFetcher {
                         DEFAULT_PUSHSYNC_TIMEOUT,
                     )
                     .await;
-                    if let Some(load) = push_load.as_ref() {
-                        load.end(&peer, started.elapsed());
+                    if let Some(g) = load_guard {
+                        g.finish(started.elapsed());
                     }
                     (peer, overlay, price, r)
                 }));
@@ -2133,6 +2134,14 @@ type PushAttemptFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Push
 /// refreshes a peer once its *mirrored* debt is due, so a dropped receipt
 /// is debt bee holds and nothing ever clears. Each attempt is bounded by
 /// `DEFAULT_PUSHSYNC_TIMEOUT`, so the drain is too.
+///
+/// Cost of the drain: a losing hedge's stream now stays open until its
+/// receipt (or the up-to-45s timeout) instead of closing the moment the
+/// walk returns, so a push's streams can outlive the upload's concurrency
+/// window, and those attempts keep their [`crate::PushLoadGuard`] slot
+/// (counting toward the peer's push cap) until they end. Without a
+/// settlement hook nothing is drained: the attempts are dropped, which
+/// closes their streams and — via the guard — frees their load slots.
 struct PushInFlight {
     futs: FuturesUnordered<PushAttemptFuture>,
     settlement: Option<Arc<dyn PushsyncSettlement>>,
@@ -2154,7 +2163,8 @@ impl Drop for PushInFlight {
         }
         let futs = std::mem::take(&mut self.futs);
         // Without a settlement hook there is nothing to record; dropping
-        // the attempts just closes their streams, as before.
+        // the attempts closes their streams, and each attempt's
+        // `PushLoadGuard` frees its push-load slot on drop (R4-M1).
         let Some(settlement) = self.settlement.clone() else {
             return;
         };
@@ -2378,6 +2388,41 @@ mod tests {
         let mut got = rec.0.lock().unwrap().clone();
         got.sort_by_key(|(_, p)| *p);
         assert_eq!(got, vec![(deep, 110_000), (shallow, 220_000)]);
+    }
+
+    /// With no settlement hook (`ANT_PUSH_PSEUDOSETTLE=0`) unfinished
+    /// attempts are dropped, not drained — and must still free the
+    /// push-load slot they booked at dispatch, or every discarded hedge
+    /// ratchets its peer toward `at_cap` for good (PR #134 R4-M1). With a
+    /// hook, the drained attempt holds its slot until it really ends.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_push_attempts_release_push_load() {
+        let load = Arc::new(crate::PushLoadTracker::new(1));
+        let peer = PeerId::random();
+        let attempt = |load: &Arc<crate::PushLoadTracker>| -> PushAttemptFuture {
+            let guard = load.book(peer);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                guard.finish(Duration::from_secs(5));
+                (peer, [0u8; 32], 1, Ok(()))
+            })
+        };
+        {
+            let inflight = PushInFlight::new(None);
+            inflight.futs.push(attempt(&load));
+            assert!(load.at_cap(&peer));
+        }
+        assert!(!load.at_cap(&peer), "dropped attempt leaked its slot");
+
+        let rec = Arc::new(RecordingSettlement::default());
+        {
+            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            inflight.futs.push(attempt(&load));
+        }
+        assert!(load.at_cap(&peer), "drained attempt is still in flight");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!load.at_cap(&peer));
+        assert_eq!(rec.0.lock().unwrap().len(), 1);
     }
     use crate::accounting::CREDIT_WAIT_BUDGET;
     use std::time::Duration;

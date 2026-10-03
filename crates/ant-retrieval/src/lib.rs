@@ -93,7 +93,7 @@ pub use mantaray::{
     MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
-pub use push_load::PushLoadTracker;
+pub use push_load::{PushLoadGuard, PushLoadTracker};
 pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use rs::{fetch_root_with_replicas, replica_addresses, REPLICAS_OWNER, REPLICA_COUNTS};
