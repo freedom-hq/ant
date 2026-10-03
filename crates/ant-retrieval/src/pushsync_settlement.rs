@@ -18,17 +18,28 @@
 //!
 //! # What this trait does
 //!
-//! Decouples the pushsync hot path from the SWAP / cheque issuance code.
-//! The fetcher knows nothing about chequebooks, EIP-712, libp2p swap
-//! streams, or chain ids; it just calls
-//! [`PushsyncSettlement::note_pushsync`] right after every pushsync
-//! receipt it reads — deep or shallow, from the winner or from a hedge
-//! drained after the walk returned — since the storer debits us for
-//! each receipt it writes (`price` in accounting units, bee's
-//! `pricer.PeerPrice`). The implementation in
-//! `ant-p2p::push_pseudosettle` debits it to the shared
-//! [`Accounting`](crate::accounting::Accounting) mirror — bee's one
-//! balance per peer for every protocol — which settles it like
+//! Decouples the pushsync hot path from the accounting / SWAP code. The
+//! fetcher knows nothing about chequebooks, EIP-712, libp2p swap streams,
+//! or chain ids. Like bee's pushsync client (`pushToClosest`, which runs
+//! `accounting.PrepareCredit` before every push and skips the peer on
+//! `ErrOverdraft`), it asks [`PushsyncSettlement::prepare_credit`] for
+//! credit with a peer *before* it pushes to it (issue #128):
+//!
+//! - `None` means the push would take our debt to that peer past its
+//!   disconnect limit, so the fetcher skips the peer for this chunk for
+//!   [`OVERDRAFT_REFRESH`](crate::accounting::OVERDRAFT_REFRESH) and
+//!   pushes to the next-closest one instead. Pushing anyway is what got
+//!   busy peers to disconnect or blocklist us (bee's `debitAction.Apply`).
+//! - `Some(credit)` reserves the price. Once a receipt is read — deep or
+//!   shallow, from the winner or from a hedge drained after the walk
+//!   returned, since the storer debits us for each receipt it writes —
+//!   the fetcher calls [`PushCredit::apply`] (bee's `Action.Apply`); a
+//!   push that ends without one drops it, which releases the reservation
+//!   (bee's `Action.Cleanup`).
+//!
+//! The implementation in `ant-p2p::push_pseudosettle` reserves in the
+//! shared [`Accounting`](crate::accounting::Accounting) mirror — bee's
+//! one balance per peer for every protocol — which settles it like
 //! retrieval debt: the free pseudosettle refresh first, then, with a
 //! payer installed (a funded chequebook with `swap-enable` on), a cheque
 //! priced `units × exchange + deduction` once the debt reaches the
@@ -49,7 +60,6 @@
 //! the legacy "push without settlement" behaviour for tests and for the
 //! ultra-light read-only build.
 
-use async_trait::async_trait;
 use libp2p::PeerId;
 
 /// Bee's `pkg/pricer/pricer.go::PeerPrice`:
@@ -70,34 +80,56 @@ pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
     crate::accounting::Accounting::peer_price(peer_overlay, chunk_addr)
 }
 
+/// A reservation of credit for one push, from
+/// [`PushsyncSettlement::prepare_credit`]: bee's `accounting.Action`.
+/// [`PushCredit::apply`] records the debit once the peer has written a
+/// receipt; dropping it unapplied releases the reservation.
+pub struct PushCredit(Box<dyn PushCreditAction>);
+
+impl PushCredit {
+    /// Wrap an implementation's reservation.
+    #[must_use]
+    pub fn new(action: impl PushCreditAction + 'static) -> Self {
+        Self(Box::new(action))
+    }
+
+    /// The peer wrote a receipt (deep or shallow): record the debit.
+    pub fn apply(self) {
+        self.0.apply();
+    }
+}
+
+/// What a [`PushCredit`] does on [`PushCredit::apply`]. Dropping the
+/// action unapplied must release whatever it reserved.
+pub trait PushCreditAction: Send {
+    /// Record the reserved debit.
+    fn apply(self: Box<Self>);
+}
+
+impl PushCreditAction for crate::accounting::DebitGuard {
+    fn apply(self: Box<Self>) {
+        (*self).apply();
+    }
+}
+
 /// Settlement hook for pushsync.
 ///
-/// Implemented by `ant-p2p::pushsync_swap::PushsyncSwap`. The fetcher
-/// holds an `Arc<dyn PushsyncSettlement>` and calls `note_pushsync`
-/// after every pushsync receipt (deep or shallow); if the implementation decides
-/// it's time to emit a cheque, it does so synchronously *inside*
-/// `note_pushsync` so the next `push_stamped_chunk` call observes the
-/// peer paid up.
+/// Implemented by `ant-p2p::push_pseudosettle::PushPseudosettle`. The
+/// fetcher holds an `Arc<dyn PushsyncSettlement>`, calls
+/// [`Self::prepare_credit`] before every push and applies the credit for
+/// every receipt it reads (deep or shallow). A payment, when one is due,
+/// runs in the background (the mirror's settle step), never on the push
+/// path.
 ///
-/// The trait is deliberately small (one method) to keep the fetcher
-/// crate ignorant of SWAP semantics. Returning `()` (no `Result`) is a
-/// matter of policy: the fetcher must not refuse a successful pushsync
-/// just because the settlement leg failed — we want best-effort
-/// emission, not "block uploads if cheques can't be sent". Errors are
-/// logged inside the implementation.
-// `#[async_trait]` marks each boxed-future method `#[must_use]`, and
-// clippy 1.99's `double_must_use` flags that expansion, not our code.
-#[allow(clippy::double_must_use)]
-#[async_trait]
+/// Settlement itself is best-effort: a failed payment doesn't fail the
+/// upload. Only the credit check gates a push, as in bee.
 pub trait PushsyncSettlement: Send + Sync {
-    /// Called once per pushsync receipt read, deep or shallow, plus a
-    /// `price == 0` pre-flight before each dispatch. `price` is the chunk
-    /// price in PLUR (typically [`peer_chunk_price`] of `peer_overlay`
-    /// vs `chunk_addr`). Implementations that want richer state can
-    /// recover the chunk address and overlay from prior calls; for
-    /// minimal-API reasons the fetcher only forwards what's strictly
-    /// needed for the threshold check.
-    async fn note_pushsync(&self, peer: PeerId, price: u64);
+    /// Bee's `PrepareCredit` for one push of `price` (the chunk price in
+    /// PLUR, [`peer_chunk_price`] of the peer's overlay vs the chunk
+    /// address) to `peer`. `None`: the push would cross the peer's
+    /// disconnect limit, so don't push to it now. `Some`: the price is
+    /// reserved until the returned credit is applied or dropped.
+    fn prepare_credit(&self, peer: PeerId, price: u64) -> Option<PushCredit>;
 
     /// Drop all settlement state for `peer`, called from the swarm's
     /// `ConnectionClosed` handler. Bee's accounting resets per peer

@@ -31,14 +31,20 @@
 //! (`PushsyncSwap`, while `swap-enable` is on and the chequebook has
 //! funds) settles push debt exactly as it settles retrieval debt — the
 //! refresh first, then a cheque priced `units × exchange + deduction`
-//! once the debt reaches the early-payment threshold. Recording the
-//! debit is what triggers that cheque (`Accounting::debit`), and it is
-//! recorded even past the overdraft limit, since the push already
-//! happened. See `behaviour::push_settlement`.
+//! once the debt reaches the early-payment threshold. See
+//! `behaviour::push_settlement`.
+//!
+//! Like bee's pushsync client, every push first reserves its price in
+//! the mirror (`PrepareCredit`, [`Accounting::try_reserve`]); a peer the
+//! push would take past its disconnect limit is refused, and the fetcher
+//! pushes to the next-closest peer instead (issue #128). Reserving runs
+//! the mirror's settle step, so a cheque that is due starts before the
+//! push, not after. A receipt applies the reservation, past the limit
+//! too if the debt grew meanwhile, since the push has happened (PR #126
+//! R1-M2); a push that ends without one releases it.
 
 use ant_retrieval::accounting::Accounting;
-use ant_retrieval::PushsyncSettlement;
-use async_trait::async_trait;
+use ant_retrieval::{PushCredit, PushsyncSettlement};
 use libp2p::PeerId;
 use std::sync::Arc;
 
@@ -65,21 +71,9 @@ impl PushPseudosettle {
     }
 }
 
-#[async_trait]
 impl PushsyncSettlement for PushPseudosettle {
-    async fn note_pushsync(&self, peer: PeerId, price: u64) {
-        if price == 0 {
-            // Pre-flight call from `push_stamped_chunk` (price unknown
-            // yet). Nothing to record; the post-receipt call carries
-            // the real price.
-            return;
-        }
-        // Mirror the debit, past the overdraft limit too: the chunk was
-        // pushed and bee has debited it, so dropping it would leave the
-        // mirror (the only record of upload debt the payer settles) short
-        // of bee's view, and cheques would underpay. `debit` fires the
-        // hot hint and starts a cheque when one is due (PR #126 R1-M2).
-        self.0.debit(peer, price);
+    fn prepare_credit(&self, peer: PeerId, price: u64) -> Option<PushCredit> {
+        self.0.try_reserve(peer, price).map(PushCredit::new)
     }
 
     fn forget(&self, peer: &PeerId) {
@@ -92,20 +86,41 @@ mod tests {
     use super::*;
     use ant_retrieval::accounting::OVERDRAFT_LIMIT;
 
-    /// Every receipted push lands in the mirror, past the overdraft limit
-    /// too: bee debited it, and the payer settles only what the mirror
-    /// holds (PR #126 R1-M2).
-    #[tokio::test]
-    async fn push_debits_past_the_overdraft_limit_are_kept() {
+    /// Bee's `PrepareCredit` for pushes: a push is admitted only while
+    /// the mirror's expected debt (applied and reserved) stays inside the
+    /// peer's disconnect limit; an applied receipt is debited, a dropped
+    /// credit releases its reservation (issue #128).
+    #[test]
+    fn pushes_reserve_credit_and_are_refused_past_the_limit() {
         let acc = Arc::new(Accounting::new());
         let settle = PushPseudosettle::new(acc.clone());
         let peer = PeerId::random();
-        settle.note_pushsync(peer, 0).await;
-        assert_eq!(acc.debug_snapshot(&peer), None, "pre-flight: nothing");
-        let n = OVERDRAFT_LIMIT / 100_000 + 5;
-        for _ in 0..n {
-            settle.note_pushsync(peer, 100_000).await;
+        let price = 100_000;
+        let fit = OVERDRAFT_LIMIT / price;
+        let mut held: Vec<PushCredit> = (0..fit)
+            .map(|_| {
+                settle
+                    .prepare_credit(peer, price)
+                    .expect("inside the limit")
+            })
+            .collect();
+        assert_eq!(acc.debug_snapshot(&peer), Some((0, fit * price)));
+        assert!(
+            settle.prepare_credit(peer, price).is_none(),
+            "one more in-flight push would cross the disconnect limit",
+        );
+        // A receipt moves its reservation into the balance; a failed push
+        // releases its reservation.
+        held.pop().expect("held").apply();
+        drop(held.pop());
+        assert_eq!(acc.debug_snapshot(&peer), Some((price, (fit - 2) * price)));
+        assert!(settle.prepare_credit(peer, price).is_some(), "credit freed");
+        // A different peer is unaffected.
+        assert!(settle.prepare_credit(PeerId::random(), price).is_some());
+        // Every receipt is recorded (PR #126 R1-M2): the push happened.
+        for credit in held {
+            credit.apply();
         }
-        assert_eq!(acc.debug_snapshot(&peer), Some((n * 100_000, 0)));
+        assert_eq!(acc.debug_snapshot(&peer), Some(((fit - 1) * price, 0)));
     }
 }
