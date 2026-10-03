@@ -7880,7 +7880,9 @@ fn handle_ping_event(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, ev
 ///    what `ControlCommand::Resume` does ([`force_resume`]), at most once
 ///    per [`LivenessConfig::self_heal_cooldown`];
 /// 4. publish which connected peers are stale, so `peers.connected`
-///    (`ant_peer_count`, `/readiness`) counts only live ones.
+///    (`ant_peer_count`) counts only live ones. `/readiness` reads
+///    `RoutingInfo::serving`, which skips stale peers itself
+///    ([`serving_peer_count`]).
 #[allow(clippy::too_many_arguments)]
 fn maintain_liveness(
     swarm: &mut Swarm<AntBehaviour>,
