@@ -538,10 +538,11 @@ pub async fn read_retrieval_funds(
 /// Both `antd` and `ant-ffi` run this for the chequebook settlement runs
 /// on, publishing into `ControlCommand::SetRetrievalFunds`, so SWAP
 /// payments for downloads (issue #121) and uploads (issue #127) spend at
-/// most what the chequebook holds, on either entry point. Each keeps one watch per node and aborts it when
-/// settlement moves to another chequebook (or, in `antd`, is switched
-/// off): the node accepts funds for any chequebook, so a stale watch
-/// would otherwise keep overwriting the current one's.
+/// most what the chequebook holds, on either entry point. Each keeps one
+/// watch per node and aborts it when settlement moves to another
+/// chequebook (or, in `antd`, is switched off): the node accepts funds
+/// for any chequebook, so a stale watch would otherwise keep overwriting
+/// the current one's.
 #[cfg(feature = "chain-rpc")]
 pub async fn watch_retrieval_funds<F, Fut>(
     client: crate::ChainClient,
