@@ -506,7 +506,10 @@ async fn probe_once(
             // A timeout is folded into "transient" — an upper bound for
             // the bracket / not-present for the look-ahead — rather than a
             // definitive "absent", so we never assert the feed ended on a
-            // slow probe; the next resolution re-checks.
+            // slow probe; the next resolution re-checks. Dropping the
+            // fetch at the deadline doesn't drop its in-flight requests:
+            // `RoutingFetcher` hands them to its loser drain, so a late
+            // delivery still records its debit in the accounting mirror.
             Some(d) => match tokio::time::timeout(d, fetcher.fetch(addr)).await {
                 Ok(result) => result,
                 Err(_elapsed) => {

@@ -32,6 +32,7 @@ use libp2p_stream::Control;
 use std::cmp::Ordering;
 use std::error::Error as StdError;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -1453,7 +1454,22 @@ impl RoutingFetcher {
         // Peers that answered "not found" / "no peer found" (see
         // `pool_starved`).
         let mut not_found_answers = 0usize;
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        // Dispatched requests. If this fetch is dropped mid-flight (an
+        // outer `timeout` — a feed probe deadline, `verify_chunks_present`'s
+        // per-chunk cap — or a gateway client going away), the guard hands
+        // whatever is still in flight to the loser drain instead of
+        // dropping it: bee may already have applied the debit for a
+        // delivery it is writing, and the mirror must record it (see
+        // `InFlight`).
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut in_flight = InFlight::new(
+            addr,
+            abandoned.clone(),
+            self.cache.clone(),
+            self.disk_cache.clone(),
+            self.record_dir.clone(),
+            self.payment_notify.clone(),
+        );
         let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
         // Per-chunk overdraft skip: a peer landed here when
         // `Accounting::try_reserve` refused to admit the dispatch.
@@ -1471,6 +1487,7 @@ impl RoutingFetcher {
             let sem = self.inflight_limit.clone();
             let request_sem = self.request_inflight_limit.clone();
             let tracker = self.progress.clone();
+            let abandoned = abandoned.clone();
             async move {
                 let _request_permit = match request_sem {
                     Some(s) => Some(
@@ -1484,6 +1501,14 @@ impl RoutingFetcher {
                     Some(s) => Some(s.acquire_owned().await.expect("retrieval semaphore closed")),
                     None => None,
                 };
+                // Still queued at a semaphore when the fetch was won or
+                // dropped: nothing reached bee yet, so don't send it now.
+                // The reservation releases with the guard. (Only the
+                // drain ever sees this error; it discards it.)
+                if abandoned.load(AtomicOrdering::Acquire) {
+                    let e = RetrievalError::OpenStream("abandoned before dispatch".into());
+                    return (peer, Err(e), guard);
+                }
                 // Count "in flight" only after both semaphore permits
                 // are held — fetches still queued at the semaphore are
                 // not yet consuming network bandwidth.
@@ -1734,14 +1759,7 @@ impl RoutingFetcher {
                             // notifies pseudosettle for every success,
                             // so hot peers stay debt-cleared even when
                             // they lose the race.
-                            spawn_drain_losers(
-                                in_flight,
-                                addr,
-                                self.cache.clone(),
-                                self.disk_cache.clone(),
-                                self.record_dir.clone(),
-                                self.payment_notify.clone(),
-                            );
+                            in_flight.drain_in_background();
                             let mut wire = Vec::with_capacity(8 + chunk.payload().len());
                             wire.extend_from_slice(&chunk.span_bytes());
                             wire.extend_from_slice(chunk.payload());
@@ -2082,6 +2100,119 @@ fn spawn_drain_losers<S>(
             }
         }
     });
+}
+
+/// The in-flight set of one [`RoutingFetcher::fetch_within`] call, which
+/// is never simply dropped while requests are still running.
+///
+/// Bee applies a retrieval debit when it writes the delivery
+/// (`creditAction.Apply`), so a request dropped after that point leaves
+/// debt at bee the accounting mirror never records — and pseudosettle
+/// refreshes only off the mirror (`Accounting::refresh_due`), so that debt
+/// would only clear incidentally. A fetch can end with requests still in
+/// flight in two ways:
+///
+/// - it is won: the losers are handed off explicitly
+///   ([`InFlight::drain_in_background`]);
+/// - its future is dropped by the caller (an outer `tokio::time::timeout`
+///   such as the feed look-ahead deadline or `verify_chunks_present`'s
+///   per-chunk cap, or a gateway request whose client disconnected): the
+///   [`Drop`] impl does the same hand-off.
+///
+/// Either way [`spawn_drain_losers`] reads each remaining request to
+/// completion (bounded by `retrieve_chunk`'s own `RETRIEVE_TIMEOUT`) and
+/// applies its debit on a delivery. Requests still queued at a retrieval
+/// semaphore have sent nothing; the shared `abandoned` flag stops them
+/// from being sent at all.
+struct InFlight<F: std::future::Future<Output = DrainItem> + Send + 'static> {
+    futures: Option<FuturesUnordered<F>>,
+    addr: [u8; 32],
+    abandoned: Arc<AtomicBool>,
+    cache: Option<Arc<InMemoryChunkCache>>,
+    disk_cache: Option<Arc<DiskChunkCache>>,
+    record_dir: Option<PathBuf>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+}
+
+/// What one dispatched retrieval resolves to.
+type DrainItem = (
+    PeerId,
+    Result<RetrievedChunk, RetrievalError>,
+    Option<DebitGuard>,
+);
+
+impl<F: std::future::Future<Output = DrainItem> + Send + 'static> InFlight<F> {
+    fn new(
+        addr: [u8; 32],
+        abandoned: Arc<AtomicBool>,
+        cache: Option<Arc<InMemoryChunkCache>>,
+        disk_cache: Option<Arc<DiskChunkCache>>,
+        record_dir: Option<PathBuf>,
+        payment_notify: Option<mpsc::Sender<PeerId>>,
+    ) -> Self {
+        Self {
+            futures: Some(FuturesUnordered::new()),
+            addr,
+            abandoned,
+            cache,
+            disk_cache,
+            record_dir,
+            payment_notify,
+        }
+    }
+
+    fn set(&mut self) -> &mut FuturesUnordered<F> {
+        self.futures
+            .as_mut()
+            .expect("in-flight set already drained")
+    }
+
+    fn push(&mut self, fut: F) {
+        self.set().push(fut);
+    }
+
+    fn len(&self) -> usize {
+        self.futures.as_ref().map_or(0, FuturesUnordered::len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    async fn next(&mut self) -> Option<DrainItem> {
+        self.set().next().await
+    }
+
+    /// Hand every request still in flight to a detached drain task. No-op
+    /// if none are (or the set was already handed off).
+    fn drain_in_background(&mut self) {
+        let Some(futures) = self.futures.take() else {
+            return;
+        };
+        if futures.is_empty() {
+            return;
+        }
+        self.abandoned.store(true, AtomicOrdering::Release);
+        // A drop outside any runtime (process teardown) has nowhere to
+        // spawn to; the requests die with the runtime anyway.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        spawn_drain_losers(
+            futures,
+            self.addr,
+            self.cache.clone(),
+            self.disk_cache.clone(),
+            self.record_dir.clone(),
+            self.payment_notify.clone(),
+        );
+    }
+}
+
+impl<F: std::future::Future<Output = DrainItem> + Send + 'static> Drop for InFlight<F> {
+    fn drop(&mut self) {
+        self.drain_in_background();
+    }
 }
 
 /// Best-effort dump of a CAC-validated chunk's wire bytes to
@@ -2445,6 +2576,75 @@ mod tests {
         // satisfy `retrieve_chunk`.
         drop(hold);
         h.abort();
+    }
+
+    /// R2-M1 on PR #134: an [`InFlight`] set dropped with a request still
+    /// running (the caller's future was cancelled by an outer timeout)
+    /// hands it to the loser drain, so a late delivery still applies its
+    /// debit to the mirror instead of releasing the reservation unpaid.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_in_flight_set_still_applies_a_late_debit() {
+        let acc = Arc::new(Accounting::new());
+        let p = PeerId::random();
+        let addr = [0x5au8; 32];
+        let guard = acc.try_reserve(p, 1_000).expect("fresh peer admits");
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut set = InFlight::new(addr, abandoned.clone(), None, None, None, None);
+        set.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let chunk = RetrievedChunk {
+                address: addr,
+                data: vec![0u8; 8],
+            };
+            (p, Ok(chunk), Some(guard))
+        }));
+        assert_eq!(acc.debug_snapshot(&p), Some((0, 1_000)));
+        drop(set);
+        assert!(abandoned.load(AtomicOrdering::Acquire));
+        // Still reserved while the drain waits for the delivery…
+        assert_eq!(acc.debug_snapshot(&p), Some((0, 1_000)));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        // …and applied once it lands.
+        assert_eq!(acc.debug_snapshot(&p), Some((1_000, 0)));
+    }
+
+    /// R2-M1 on PR #134, through the real `fetch`: cancelling it with an
+    /// outer timeout (the feed look-ahead deadline, verify's per-chunk
+    /// cap) no longer drops the dispatched request and its reservation.
+    /// The request here is parked at the retrieval semaphore; once a slot
+    /// frees, the drain sees the fetch was abandoned and releases the
+    /// reservation without sending anything.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_fetch_keeps_its_request_for_the_drain() {
+        let acc = Arc::new(Accounting::new());
+        let p = PeerId::random();
+        let o = [0x80u8; 32];
+        let addr = [0x3cu8; 32];
+        let sem = Arc::new(Semaphore::new(1));
+        let hold = sem.clone().acquire_owned().await.unwrap();
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), vec![(p, o)])
+            .with_accounting(acc.clone())
+            .with_inflight_limit(sem.clone());
+        let r = tokio::time::timeout(Duration::from_millis(500), fetcher.fetch(addr)).await;
+        assert!(
+            r.is_err(),
+            "the fetch must still be parked at the semaphore"
+        );
+        let price = Accounting::peer_price(&o, &addr);
+        assert_eq!(
+            acc.debug_snapshot(&p),
+            Some((0, price)),
+            "the cancelled fetch's request must survive in the drain",
+        );
+        drop(hold);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            acc.debug_snapshot(&p),
+            Some((0, 0)),
+            "an abandoned request that never reached bee releases its reservation",
+        );
+        assert_eq!(sem.available_permits(), 1);
     }
 
     /// A fetcher with accounting over one peer whose credit is used up:

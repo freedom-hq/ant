@@ -584,8 +584,12 @@ fn pick_refreshes(
 /// bee applied and the mirror never recorded (a request dropped after
 /// bee wrote the delivery) is cleared only when that happens. Every
 /// billable request must therefore record its debit even when it is
-/// abandoned — see the fetcher's loser drain and the leaf probe's
-/// late-delivery drain in `behaviour.rs`.
+/// abandoned. There are two billable request sites, and both do: the
+/// `RoutingFetcher` hands losing hedges *and* requests still in flight
+/// when its caller drops the fetch (an outer timeout, a client gone) to
+/// its loser drain (`InFlight` in `ant-retrieval`'s `fetcher.rs`), and
+/// the verify leaf probe waits out a timed-out request
+/// (`probe_draining_late_delivery` in `behaviour.rs`).
 ///
 /// `peers_rx` carries the routing-table snapshot — the peers we've
 /// completed the BZZ handshake with and can actually open substreams
