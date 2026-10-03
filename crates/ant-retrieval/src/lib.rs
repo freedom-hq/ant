@@ -88,7 +88,7 @@ pub use manifest_writer::{
     RawManifestEntry, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
-    list_manifest, lookup_path, lookup_path_with_sniff_credit, resolve_feed_root, LookupResult,
+    list_manifest, lookup_path, lookup_path_with_credit, resolve_feed_root, LookupResult,
     ManifestEntry, ManifestError, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY,
     MANTARAY_INDEX_DOC_KEY,
 };
@@ -147,8 +147,8 @@ pub trait ChunkFetcher: Send + Sync {
     /// only callers that need the chunk, fetch it once per attempt, and
     /// bound their retries by a window ([`crate::accounting::CreditWindow`])
     /// use it. Those are the joiners' data-chunk fetches, the `/bytes`
-    /// / `/bzz` data-root fetch and a bare `/bzz` root's raw-bytes sniff;
-    /// see
+    /// / `/bzz` data-root fetch, and the `/bzz` manifest walk's node
+    /// loads and raw-bytes sniff; see
     /// [`crate::accounting::CREDIT_WAIT_BUDGET`] for the full list and
     /// bounds. Default is plain `fetch`, right for every fetcher that has
     /// no credit to wait for (and for wrappers that must not wait, like
@@ -189,8 +189,11 @@ pub trait ChunkFetcher: Send + Sync {
 /// `fetch` and `put_recovered`, and leaves
 /// [`ChunkFetcher::fetch_waiting_for_credit`] at the trait default
 /// (plain `fetch`). Wrap a fetcher in it before handing it to a joiner on
-/// a path that must stay non-waiting (manifest walks, traversal, ACT;
-/// see [`accounting::CREDIT_WAIT_BUDGET`]).
+/// a path that must stay non-waiting: the encrypted joiner (including an
+/// encrypted manifest node's join, even inside the `/bzz` walk, whose
+/// plain node loads do wait), traversal, ACT; see
+/// [`accounting::CREDIT_WAIT_BUDGET`]. Manifest walks outside `/bzz`
+/// don't need it — they use the non-waiting [`mantaray::lookup_path`].
 pub struct NoCreditWait<'a>(pub &'a dyn ChunkFetcher);
 
 #[async_trait]

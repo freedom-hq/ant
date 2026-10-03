@@ -266,23 +266,30 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 ///   requests' data roots. This is the direct fetch only: dispersed-replica
 ///   probes never wait. A `/bytes` or `/bzz` root waits at most this long
 ///   and never past the 30 s resolution budget.
-/// - **A bare `/bzz/<ref>/`'s raw-bytes sniff** (issue #122): the root →
-///   leftmost-leaf fetches that tell a raw file from a manifest node
-///   (`mantaray::lookup_path_with_sniff_credit`; two for a few-MiB
-///   segment, none for a single-chunk manifest root). Without them a
+/// - **The `/bzz` manifest walk** (`mantaray::lookup_path_with_credit`):
+///   each node load's root-chunk fetch (issue #130; one per trie level:
+///   the root, a feed's target root, each fork's child on the way down,
+///   also in the directory-redirect check and the index / error-document
+///   retries), and below it the header sniff's root → leftmost-leaf
+///   fetches (issue #122; two for a few-MiB raw segment behind a bare
+///   `/bzz/<ref>/`, none for a single-chunk node). Without them a
+///   starved walk fails and the resolution loop backs off and retries
+///   it while concurrent body fetches take every freed credit, and a
 ///   starved sniff can't tell and falls back to joining the whole file
-///   before the first byte. A request with a path never runs this.
+///   before the first byte. The walk loads one node at a time, so its
+///   waits run one after another.
 ///
-///   Every waiting fetch of a `/bzz` request (bare root, sniff, data
-///   root), in every attempt, takes its budget from one window, the 30 s
-///   resolution budget, and they run one after another. So a `/bzz`
+///   Every waiting fetch of a `/bzz` request (bare root, walk and sniff,
+///   data root), in every attempt, takes its budget from one window, the
+///   30 s resolution budget, and they run one after another. So a `/bzz`
 ///   request waits at most 30 s for credit in total before its body,
-///   however many attempts and roots it goes through; once the window
-///   has passed, these fetches no longer wait at all.
+///   however many attempts, roots and trie levels it goes through; once
+///   the window has passed, these fetches no longer wait at all.
 ///
-/// Nothing else waits. That covers manifest walks (node loads, every
-/// sniff but a bare `/bzz` root's, and every sniff's fallback join),
-/// feed probes, replica probes, recovery
+/// Nothing else waits. That covers every manifest walk outside the
+/// streaming `/bzz` loop (buffered `GetBzz`, manifest listings), the
+/// fallback join of a multi-chunk manifest node, encrypted manifest
+/// nodes, feed probes, replica probes, recovery
 /// sweeps, the encrypted joiner (in-order and buffered, so one wait per
 /// chunk would add up within one body stall), pin / stewardship /
 /// verify, traversal, ACT, and the SOC / chunk API. A joiner run on one
