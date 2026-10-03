@@ -2113,15 +2113,15 @@ async fn recv_late_chain(rx: Option<&mut mpsc::Receiver<LateChainInit>>) -> Opti
     }
 }
 
-/// Bring retrieval payments (issue #121) in line with the node's state:
-/// the outbound SWAP service gets the retrieval policy for its chequebook
+/// Bring SWAP payments (issues #121, #127) in line with the node's state:
+/// the outbound SWAP service gets the payment policy for its chequebook
 /// (the latest `SetRetrievalFunds` for it, unless the switch is off), and
-/// retrieval accounting pays through that service only while it has
-/// funds under that policy. Otherwise accounting has no payer and debt is
-/// settled by the pseudosettle refresh alone, exactly as without a
-/// chequebook. Called after every change to any of those inputs, so
-/// retrieval pays from the same chequebook, ledger and service that
-/// pushsync uses, and only while it runs.
+/// the accounting mirror — retrieval and pushsync debt alike — pays
+/// through that service only while it has funds under that policy.
+/// Otherwise accounting has no payer and debt is settled by the
+/// pseudosettle refresh alone, exactly as without a chequebook. Called
+/// after every change to any of those inputs; also publishes the result
+/// ([`publish_settlement`]).
 fn sync_retrieval_payment(state: &SwarmState) {
     sync_payer(state);
     publish_settlement(state);
@@ -2146,11 +2146,11 @@ fn sync_payer(state: &SwarmState) {
         info!(
             target: "ant_p2p::pushsync_swap",
             paying,
-            "retrieval settlement: {}",
+            "SWAP settlement: {}",
             if paying {
-                "downloads pay peers with SWAP cheques past the early-payment threshold"
+                "downloads and uploads pay peers with SWAP cheques past the early-payment threshold"
             } else {
-                "downloads use the free pseudosettle tier"
+                "downloads and uploads use the free pseudosettle tier"
             },
         );
         if !paying {
