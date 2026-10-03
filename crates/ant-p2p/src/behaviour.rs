@@ -6,14 +6,15 @@ use crate::handshake::{
     handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
     PROTOCOL_HANDSHAKE_V15,
 };
+use crate::liveness::{Liveness, LivenessConfig};
 use crate::peerstore::PeerStore;
 use crate::routing::{KnownPeers, Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
     AccountingSnapshotView, CacheInfo, ControlAck, ControlCommand, DiskCacheInfo,
     ExternalAddressInfo, GatewayActivity, GetProgress, HandshakeReport, LastChequeView,
-    PeerAccountingView, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo,
-    RoutingInfo, StatusSnapshot, StreamRange,
+    PeerAccountingView, PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry,
+    RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange,
 };
 use ant_crypto::HandshakeWireVersion;
 use ant_crypto::{
@@ -310,6 +311,9 @@ pub struct AntBehaviour {
     upnp: libp2p::upnp::tokio::Behaviour,
 }
 
+/// How often the swarm loop runs its connection liveness pass
+/// ([`maintain_liveness`]). The loop wakes at least every 250 ms.
+const LIVENESS_PASS_INTERVAL: Duration = Duration::from_millis(500);
 const MIN_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// Bee's inbound handshake handler waits for the peerstore to be populated
@@ -1023,6 +1027,9 @@ struct SwarmState {
     /// knows about (from `known_dialable`) toward that address. `None`
     /// until `run` wires the channel (and in tests).
     neighborhood_dial_tx: Option<mpsc::Sender<[u8; 32]>>,
+    /// Per-connection ping liveness (issue #83): which connections still
+    /// answer, which to close as dead, and what `peers.connected` counts.
+    liveness: Liveness,
 }
 
 impl SwarmState {
@@ -1091,6 +1098,7 @@ impl SwarmState {
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
+            liveness: Liveness::new(LivenessConfig::DEFAULT, Instant::now()),
         }
     }
 
@@ -1704,7 +1712,7 @@ fn local_overlay_from_secret(
 /// `target_peers` and the dialer stops pulling from the hint queue.
 pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let local_peer_id = cfg.libp2p_keypair.public().to_peer_id();
-    let mut swarm = build_swarm(cfg.libp2p_keypair.clone())?;
+    let mut swarm = build_swarm(cfg.libp2p_keypair.clone(), &LivenessConfig::DEFAULT)?;
     let mut commands = cfg.commands.take();
     let listen: Multiaddr = LISTEN.parse().unwrap();
     swarm
@@ -1957,6 +1965,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut last_pipeline_sync = Instant::now()
         .checked_sub(PIPELINE_SYNC_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut last_liveness_pass = Instant::now();
 
     loop {
         fill_pipeline_from_hints(&mut swarm, &mut state);
@@ -1976,6 +1985,21 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             &bootnode_dial_tx,
         );
         maybe_balance_bins(&mut swarm, &mut state, &mut last_bin_balance_at);
+        if last_liveness_pass.elapsed() >= LIVENESS_PASS_INTERVAL {
+            maintain_liveness(
+                &mut swarm,
+                &mut state,
+                cfg.status.as_ref(),
+                &cfg.bootnodes,
+                &peerstore,
+                &mut backoff,
+                &mut last_bootstrap_at,
+                &mut last_top_up_at,
+                local_peer_id,
+                &bootnode_dial_tx,
+            );
+            last_liveness_pass = Instant::now();
+        }
         if last_pipeline_sync.elapsed() >= PIPELINE_SYNC_INTERVAL {
             sync_peer_pipeline(cfg.status.as_ref(), &mut state);
             last_pipeline_sync = Instant::now();
@@ -7356,7 +7380,8 @@ fn maybe_top_up_peers(
 }
 
 /// Force a post-suspension recovery, driven by an explicit
-/// [`ControlCommand::Resume`]. Re-warms the dial queue from the on-disk
+/// [`ControlCommand::Resume`] or by the liveness pass's self-heal on a
+/// streak of retrieval link failures ([`maintain_liveness`]). Re-warms the dial queue from the on-disk
 /// peerstore and fires a fresh bootstrap dial **unconditionally** — unlike
 /// [`maybe_top_up_peers`] / [`maybe_rebootstrap`], which only fire once the
 /// peer *count* has visibly collapsed.
@@ -7367,8 +7392,8 @@ fn maybe_top_up_peers(
 /// automatic guard fires — the node sits on a swarm of zombies and the next
 /// retrieval hangs. Bypassing the gate re-opens live sockets to the
 /// bootnodes (and, through their hive gossip, the wider set) in parallel,
-/// so retrieval has working routes again while the dead connections fall
-/// away as the host touches them.
+/// so retrieval has working routes again; the liveness pass closes the
+/// dead connections once they miss their pongs.
 ///
 /// Returns the number of warm peer hints re-queued. Surviving connections
 /// are left untouched: re-warming only enqueues hints (`enqueue_hint` skips
@@ -7593,8 +7618,14 @@ fn handle_swarm_event(
             record_external_address(state, swarm, status, address, ExternalAddrSource::Observed);
         }
         SwarmEvent::ConnectionEstablished {
-            peer_id, endpoint, ..
+            peer_id,
+            connection_id,
+            endpoint,
+            ..
         } => {
+            state
+                .liveness
+                .on_established(connection_id, peer_id, Instant::now());
             state.dialing.remove(&peer_id);
             state.dial_hint_addr.remove(&peer_id);
             state.failed.retain(|f| f.peer != peer_id);
@@ -7666,7 +7697,27 @@ fn handle_swarm_event(
                 trace!(target: "ant_p2p", %peer_id, "identify sent; unblocking handshake");
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id,
+            num_established,
+            cause,
+            ..
+        } => {
+            state.liveness.on_closed(connection_id);
+            if num_established > 0 {
+                // Another connection to this peer is still open (a dial
+                // race left a duplicate, or liveness closed a dead one
+                // next to a live one): the peer, its BZZ session and its
+                // routing entry stay.
+                debug!(
+                    target: "ant_p2p",
+                    %peer_id,
+                    num_established,
+                    "one of the peer's connections closed; peer stays connected",
+                );
+                return;
+            }
             state.closing.remove(&peer_id);
             state.dial_hint_addr.remove(&peer_id);
             let was_pending = state.pending.remove(&peer_id).is_some();
@@ -7733,8 +7784,144 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(AntBehaviourEvent::Upnp(ev)) => {
             handle_upnp_event(state, swarm, status, ev);
         }
+        SwarmEvent::Behaviour(AntBehaviourEvent::Ping(ev)) => {
+            handle_ping_event(swarm, state, ev);
+        }
         _ => {}
     }
+}
+
+/// Feed one ping result into [`SwarmState::liveness`] (issue #83). A
+/// pong refreshes the connection. A reported failure closes it: the
+/// ping handler stays quiet about a single failed ping and reports only
+/// the second in a row, so this is a connection that stopped answering
+/// rather than one slow pong. A peer that doesn't speak ping is left
+/// alone.
+fn handle_ping_event(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, ev: ping::Event) {
+    match ev.result {
+        Ok(rtt) => {
+            trace!(target: "ant_p2p", peer = %ev.peer, ?rtt, "pong");
+            state.liveness.on_pong(ev.connection, Instant::now());
+        }
+        Err(ping::Failure::Unsupported) => {
+            debug!(target: "ant_p2p", peer = %ev.peer, "peer doesn't support ping; not judging its liveness");
+            state.liveness.on_ping_unsupported(ev.connection);
+        }
+        Err(e) => {
+            info!(
+                target: "ant_p2p",
+                peer = %ev.peer,
+                "closing dead connection: two pings in a row failed ({e})",
+            );
+            swarm.close_connection(ev.connection);
+        }
+    }
+}
+
+/// Connection liveness pass (issue #83), run from the loop top at most
+/// every [`LIVENESS_PASS_INTERVAL`]:
+///
+/// 1. notice a frozen process (see [`Liveness::tick`]);
+/// 2. close connections that stopped answering pings, so their peers
+///    leave routing and the top-up guards redial;
+/// 3. self-heal on a streak of retrieval link failures: close every
+///    connection that hasn't answered within the liveness window and do
+///    what `ControlCommand::Resume` does ([`force_resume`]), at most once
+///    per [`LivenessConfig::self_heal_cooldown`];
+/// 4. publish which connected peers are stale, so `peers.connected`
+///    (`ant_peer_count`, `/readiness`) counts only live ones.
+#[allow(clippy::too_many_arguments)]
+fn maintain_liveness(
+    swarm: &mut Swarm<AntBehaviour>,
+    state: &mut SwarmState,
+    status: Option<&watch::Sender<StatusSnapshot>>,
+    bootnodes: &[Multiaddr],
+    peerstore: &PeerStore,
+    backoff: &mut Duration,
+    last_bootstrap_at: &mut Instant,
+    last_top_up_at: &mut Instant,
+    local_peer_id: PeerId,
+    bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
+) {
+    let now = Instant::now();
+    if state.liveness.tick(now) {
+        info!(
+            target: "ant_p2p",
+            "swarm loop resumed after a stall; re-verifying every connection by ping",
+        );
+    }
+    close_dead_connections(swarm, state, now);
+    let streak = state.retrieval_counters.link_failure_streak();
+    if state.liveness.take_self_heal(streak, now) {
+        state.retrieval_counters.reset_link_failure_streak();
+        let stale = state.liveness.stale_connections(now);
+        for (conn, _) in &stale {
+            swarm.close_connection(*conn);
+        }
+        info!(
+            target: "ant_p2p",
+            streak,
+            closed = stale.len(),
+            "retrievals failing on the link; closed unanswering connections, redialing",
+        );
+        force_resume(
+            bootnodes,
+            state,
+            peerstore,
+            backoff,
+            last_bootstrap_at,
+            last_top_up_at,
+            local_peer_id,
+            bootnode_dial_tx,
+        );
+    }
+    publish_liveness(status, &state.liveness, now);
+}
+
+/// Close every connection [`Liveness::dead_connections`] names.
+fn close_dead_connections(swarm: &mut Swarm<AntBehaviour>, state: &SwarmState, now: Instant) {
+    for (conn, peer) in state.liveness.dead_connections(now) {
+        if swarm.close_connection(conn) {
+            info!(
+                target: "ant_p2p",
+                %peer,
+                "closing dead connection: no pong within the liveness window",
+            );
+        }
+    }
+}
+
+/// Mark the stale rows of `connected_peers` and recount
+/// `peers.connected` from the rest. Publishes only on a change.
+fn publish_liveness(
+    status: Option<&watch::Sender<StatusSnapshot>>,
+    liveness: &Liveness,
+    now: Instant,
+) {
+    let Some(s) = status else {
+        return;
+    };
+    let stale: HashSet<String> = liveness
+        .stale_peers(now)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    s.send_if_modified(|st| {
+        let mut changed = false;
+        for p in &mut st.peers.connected_peers {
+            let is_stale = stale.contains(&p.peer_id);
+            if p.stale != is_stale {
+                p.stale = is_stale;
+                changed = true;
+            }
+        }
+        let connected = PeerInfo::live_connected_count(&st.peers.connected_peers);
+        if st.peers.connected != connected {
+            st.peers.connected = connected;
+            changed = true;
+        }
+        changed
+    });
 }
 
 /// Finalize the per-peer pipeline result. `Ok` promotes the peer to
@@ -8005,6 +8192,7 @@ fn observe_event(
                                 bzz_overlay: None,
                                 full_node: None,
                                 last_bzz_at_unix: None,
+                                stale: false,
                             },
                         );
                     } else if num_established.get() == 1 {
@@ -8019,7 +8207,7 @@ fn observe_event(
                             peer.connected_at_unix = connected_at_unix;
                         }
                     }
-                    st.peers.connected = st.peers.connected_peers.len() as u32;
+                    st.peers.connected = PeerInfo::live_connected_count(&st.peers.connected_peers);
                 });
                 tracing::trace!(target: "ant_p2p", %pid, "status: connection opened");
             }
@@ -8038,7 +8226,7 @@ fn observe_event(
                     if *num_established == 0 {
                         st.peers.connected_peers.retain(|p| p.peer_id != pid);
                     }
-                    st.peers.connected = st.peers.connected_peers.len() as u32;
+                    st.peers.connected = PeerInfo::live_connected_count(&st.peers.connected_peers);
                 });
             }
         }
@@ -8324,7 +8512,10 @@ fn resolver_config() -> dns::ResolverConfig {
     }
 }
 
-fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
+fn build_swarm(
+    keypair: Keypair,
+    liveness: &LivenessConfig,
+) -> Result<Swarm<AntBehaviour>, RunError> {
     // `push_listen_addr_updates` triggers an identify-push whenever our
     // listener set changes. That matters for bee: if a later listener arrives
     // (e.g. port reopens after network change) bee learns it mid-connection
@@ -8337,7 +8528,11 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
     let behaviour = AntBehaviour {
         stream: libp2p_stream::Behaviour::default(),
         identify: identify::Behaviour::new(id_cfg),
-        ping: ping::Behaviour::new(ping::Config::new()),
+        ping: ping::Behaviour::new(
+            ping::Config::new()
+                .with_interval(liveness.ping_interval)
+                .with_timeout(liveness.ping_timeout),
+        ),
         upnp: libp2p::upnp::tokio::Behaviour::default(),
     };
 
@@ -8400,6 +8595,357 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// Liveness timings shrunk so a real-socket test runs in seconds.
+    const FAST_LIVENESS: LivenessConfig = LivenessConfig {
+        ping_interval: Duration::from_millis(100),
+        ping_timeout: Duration::from_millis(300),
+        live_window: Duration::from_millis(600),
+        resume_verify: Duration::from_millis(600),
+        close_grace: Duration::from_millis(600),
+        stall_gap: Duration::from_secs(10),
+        ..LivenessConfig::DEFAULT
+    };
+
+    fn test_state() -> SwarmState {
+        SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        )
+    }
+
+    /// Relay one TCP connection to `target` (a `/ip4/../tcp/..` multiaddr).
+    /// Returns the relay's multiaddr and its freeze switch: once set, the
+    /// relay stops forwarding in both directions but holds both sockets.
+    async fn freezable_tcp_relay(
+        target: &Multiaddr,
+    ) -> (Multiaddr, Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let port = target
+            .iter()
+            .find_map(|p| match p {
+                libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let frozen = Arc::new(AtomicBool::new(false));
+        let f = frozen.clone();
+        tokio::spawn(async move {
+            let (down, _) = listener.accept().await.unwrap();
+            let up = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (dr, dw) = down.into_split();
+            let (ur, uw) = up.into_split();
+            let pump = |mut r: tokio::net::tcp::OwnedReadHalf,
+                        mut w: tokio::net::tcp::OwnedWriteHalf,
+                        f: Arc<AtomicBool>| async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    if f.load(Ordering::SeqCst) {
+                        // Hold both halves forever.
+                        std::future::pending::<()>().await;
+                    }
+                    match tokio::time::timeout(Duration::from_millis(20), r.read(&mut buf)).await {
+                        Err(_) => {}
+                        Ok(Ok(0) | Err(_)) => return,
+                        Ok(Ok(n)) => {
+                            if f.load(Ordering::SeqCst) {
+                                std::future::pending::<()>().await;
+                            }
+                            if w.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            let a = tokio::spawn(pump(dr, uw, f.clone()));
+            let b = tokio::spawn(pump(ur, dw, f));
+            let _ = tokio::join!(a, b);
+        });
+        (addr, frozen)
+    }
+
+    /// Issue #83, end to end over real TCP: a peer that stops answering
+    /// (its process frozen, its socket still open — the half-open state
+    /// a reaped mobile socket leaves) stops being counted in
+    /// `peers.connected` and then has its connection closed by the swarm
+    /// loop's liveness pass. While it answered, the same pass left the
+    /// connection alone. On `main` nothing closed it: the test runs into
+    /// its timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_peer_is_uncounted_then_disconnected() {
+        let cfg = FAST_LIVENESS;
+        // Remote: a plain node of ours on loopback, frozen on demand.
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        remote
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let remote_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.select_next_some().await {
+                break address;
+            }
+        };
+        tokio::spawn(async move {
+            loop {
+                remote.select_next_some().await;
+            }
+        });
+        // Between us and the remote: a TCP relay that, once frozen, stops
+        // forwarding but keeps both sockets open. Nothing reaches either
+        // side any more and nobody sees a FIN or RST: a half-open link.
+        let (proxy_addr, freeze) = freezable_tcp_relay(&remote_addr).await;
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut state = test_state();
+        state.liveness = Liveness::new(cfg, Instant::now());
+        let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let mut control = ours.behaviour().stream.new_control();
+        let hs = HandshakeParams {
+            local_peer_id: *ours.local_peer_id(),
+            signing_secret: [7u8; SECP256K1_SECRET_LEN],
+            overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+            network_id: 1,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let mut peerstore = PeerStore::disabled();
+        let (dial_tx, _dial_rx) = mpsc::channel::<Multiaddr>(8);
+        let mut agents = HashMap::new();
+        let (mut backoff, mut last_boot, mut last_top_up) =
+            (MIN_BACKOFF, Instant::now(), Instant::now());
+        ours.dial(proxy_addr).unwrap();
+
+        let started = Instant::now();
+        let mut established_at = None;
+        let mut frozen_at = None;
+        let mut uncounted_at = None;
+        let mut pass = tokio::time::interval(Duration::from_millis(50));
+        let closed_at = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "frozen peer never disconnected (frozen {:?} ago)",
+                frozen_at.map(|t: Instant| t.elapsed()),
+            );
+            tokio::select! {
+                ev = ours.select_next_some() => {
+                    let established = matches!(ev, SwarmEvent::ConnectionEstablished { .. });
+                    let closed = matches!(ev, SwarmEvent::ConnectionClosed { .. });
+                    observe_event(Some(&status_tx), &mut agents, &ev);
+                    handle_swarm_event(
+                        &mut ours, &mut state, Some(&status_tx), &mut control, &hs,
+                        &result_tx, &mut peerstore, ev,
+                    );
+                    if established {
+                        established_at = Some(Instant::now());
+                    }
+                    if closed {
+                        break Instant::now();
+                    }
+                }
+                _ = pass.tick() => {
+                    maintain_liveness(
+                        &mut ours, &mut state, Some(&status_tx), &[], &PeerStore::disabled(),
+                        &mut backoff, &mut last_boot, &mut last_top_up, hs.local_peer_id,
+                        &dial_tx,
+                    );
+                    let (listed, counted) = {
+                        let s = status_rx.borrow();
+                        (s.peers.connected_peers.len(), s.peers.connected)
+                    };
+                    if frozen_at.is_none() {
+                        if let Some(t) = established_at {
+                            assert_eq!((listed, counted), (1, 1), "a live peer is counted");
+                            // Answering for 3 whole windows: kept open.
+                            if t.elapsed() > 3 * (cfg.live_window + cfg.close_grace) {
+                                freeze.store(true, std::sync::atomic::Ordering::SeqCst);
+                                frozen_at = Some(Instant::now());
+                            }
+                        }
+                    } else if listed == 1 && counted == 0 && uncounted_at.is_none() {
+                        uncounted_at = Some(Instant::now());
+                    }
+                }
+            }
+        };
+        let frozen_at = frozen_at.expect("closed while the peer still answered pings");
+        let uncounted_at = uncounted_at.expect("the silent peer was still counted until it closed");
+        assert!(uncounted_at < closed_at);
+        // Uncounted within one window of its last pong, closed within
+        // `close_grace` after that (+ slack for the 50 ms pass cadence).
+        let slack = Duration::from_millis(400);
+        assert!(
+            uncounted_at - frozen_at <= cfg.live_window + slack,
+            "{:?}",
+            uncounted_at - frozen_at
+        );
+        assert!(
+            closed_at - frozen_at <= cfg.live_window + cfg.close_grace + slack,
+            "{:?}",
+            closed_at - frozen_at,
+        );
+        let s = status_rx.borrow();
+        assert!(s.peers.connected_peers.is_empty());
+        assert_eq!(s.peers.connected, 0);
+    }
+
+    /// Issue #83: a streak of retrieval link failures makes the liveness
+    /// pass do what `ControlCommand::Resume` does (re-warm + redial, here
+    /// visible as the cleared hint dedup), once per cooldown window.
+    #[tokio::test]
+    async fn link_failure_streak_triggers_one_self_heal_per_window() {
+        let mut swarm = build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT).unwrap();
+        let mut state = test_state();
+        let (dial_tx, _dial_rx) = mpsc::channel::<Multiaddr>(8);
+        let (mut backoff, mut last_boot, mut last_top_up) =
+            (MAX_BACKOFF, Instant::now(), Instant::now());
+        let mut pass = |state: &mut SwarmState, backoff: &mut Duration| {
+            maintain_liveness(
+                &mut swarm,
+                state,
+                None,
+                &[],
+                &PeerStore::disabled(),
+                backoff,
+                &mut last_boot,
+                &mut last_top_up,
+                pid(),
+                &dial_tx,
+            );
+        };
+        // Below the threshold: nothing.
+        for _ in 1..LivenessConfig::DEFAULT.self_heal_streak {
+            state.retrieval_counters.record_link_failure();
+        }
+        state.seen_hints.insert(pid());
+        pass(&mut state, &mut backoff);
+        assert_eq!(state.seen_hints.len(), 1);
+        assert_eq!(backoff, MAX_BACKOFF);
+        // At the threshold: self-heal, streak restarted.
+        state.retrieval_counters.record_link_failure();
+        pass(&mut state, &mut backoff);
+        assert!(
+            state.seen_hints.is_empty(),
+            "self-heal re-warmed the dial queue"
+        );
+        assert_eq!(
+            backoff, MIN_BACKOFF,
+            "self-heal unparked the bootstrap guard"
+        );
+        assert_eq!(state.retrieval_counters.link_failure_streak(), 0);
+        // A second streak inside the cooldown: no redial storm.
+        for _ in 0..LivenessConfig::DEFAULT.self_heal_streak {
+            state.retrieval_counters.record_link_failure();
+        }
+        state.seen_hints.insert(pid());
+        backoff = MAX_BACKOFF;
+        pass(&mut state, &mut backoff);
+        assert_eq!(state.seen_hints.len(), 1);
+        assert_eq!(backoff, MAX_BACKOFF);
+    }
+
+    /// A peer with a duplicate connection keeps its BZZ session, routing
+    /// entry and status row when one of the two closes (liveness may close
+    /// a dead duplicate next to a live one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_one_of_two_connections_keeps_the_peer() {
+        let cfg = FAST_LIVENESS;
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        remote
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let remote_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.select_next_some().await {
+                break address;
+            }
+        };
+        let remote_id = *remote.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                remote.select_next_some().await;
+            }
+        });
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut state = test_state();
+        let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let mut control = ours.behaviour().stream.new_control();
+        let hs = HandshakeParams {
+            local_peer_id: *ours.local_peer_id(),
+            signing_secret: [7u8; SECP256K1_SECRET_LEN],
+            overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+            network_id: 1,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let mut peerstore = PeerStore::disabled();
+        let mut agents = HashMap::new();
+        for _ in 0..2 {
+            ours.dial(
+                DialOpts::peer_id(remote_id)
+                    .addresses(vec![remote_addr.clone()])
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                    .build(),
+            )
+            .unwrap();
+        }
+        let mut conns = Vec::new();
+        while conns.len() < 2 {
+            let ev = tokio::time::timeout(Duration::from_secs(10), ours.select_next_some())
+                .await
+                .expect("two connections");
+            if let SwarmEvent::ConnectionEstablished { connection_id, .. } = &ev {
+                conns.push(*connection_id);
+            }
+            observe_event(Some(&status_tx), &mut agents, &ev);
+            handle_swarm_event(
+                &mut ours,
+                &mut state,
+                Some(&status_tx),
+                &mut control,
+                &hs,
+                &result_tx,
+                &mut peerstore,
+                ev,
+            );
+        }
+        // Pretend the BZZ handshake finished on this peer.
+        state.bzz_peers.insert(remote_id);
+        assert!(ours.close_connection(conns[0]));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(10), ours.select_next_some())
+                .await
+                .expect("close event");
+            let closed = matches!(ev, SwarmEvent::ConnectionClosed { .. });
+            observe_event(Some(&status_tx), &mut agents, &ev);
+            handle_swarm_event(
+                &mut ours,
+                &mut state,
+                Some(&status_tx),
+                &mut control,
+                &hs,
+                &result_tx,
+                &mut peerstore,
+                ev,
+            );
+            if closed {
+                break;
+            }
+        }
+        assert!(ours.is_connected(&remote_id));
+        assert!(state.bzz_peers.contains(&remote_id), "BZZ session kept");
+        assert_eq!(status_rx.borrow().peers.connected, 1);
     }
 
     fn stamp_for(batch_id: [u8; 32]) -> [u8; ant_postage::STAMP_SIZE] {

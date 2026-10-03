@@ -49,12 +49,14 @@ pub enum ControlCommand {
     ///
     /// This is the lever an embedded host (the iOS in-process node) pulls
     /// on a background→foreground transition: after a long OS suspension
-    /// the libp2p connections are half-open (the kernel sockets were
-    /// reaped but no FIN was seen, so `bzz_peers` looks healthy) and
-    /// nothing re-dials — the next retrieval hangs and the page renders
-    /// blank. A fresh bootstrap dial opens new sockets in parallel so
-    /// retrieval has live routes again; the dead connections fail
-    /// individual requests and get reaped as the host touches them.
+    /// the libp2p connections can be half-open (the kernel sockets were
+    /// reaped but no FIN was seen, so `bzz_peers` looks healthy). The
+    /// swarm loop's liveness pass (issue #83) closes connections that
+    /// stop answering pings ~20-30 s after the loop runs again, and runs
+    /// this same recovery itself on a streak of retrieval link failures
+    /// (at most once a minute); this command skips that wait. A fresh
+    /// bootstrap dial opens new sockets in parallel so retrieval has
+    /// live routes again.
     ///
     /// Cheap and idempotent — safe to call on every foreground. The ack is
     /// a [`ControlAck::Ok`] whose message reports how many warm hints were

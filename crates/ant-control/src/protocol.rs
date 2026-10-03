@@ -780,6 +780,9 @@ pub struct ExternalAddressInfo {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerInfo {
+    /// Connected peers that answer pings: `connected_peers` minus the
+    /// rows marked [`PeerConnectionInfo::stale`]. This is what
+    /// `ant_peer_count` reports.
     pub connected: u32,
     #[serde(default)]
     pub node_limit: u32,
@@ -800,6 +803,15 @@ pub struct PeerInfo {
     /// Empty `bins` on older daemons.
     #[serde(default)]
     pub routing: RoutingInfo,
+}
+
+impl PeerInfo {
+    /// The [`Self::connected`] figure for `connected_peers`: rows not
+    /// marked stale.
+    #[must_use]
+    pub fn live_connected_count(connected_peers: &[PeerConnectionInfo]) -> u32 {
+        u32::try_from(connected_peers.iter().filter(|p| !p.stale).count()).unwrap_or(u32::MAX)
+    }
 }
 
 /// Snapshot of the forwarding-Kademlia routing table: how many BZZ peers
@@ -875,6 +887,11 @@ pub struct PeerConnectionInfo {
     pub full_node: Option<bool>,
     #[serde(default)]
     pub last_bzz_at_unix: Option<u64>,
+    /// The connection hasn't answered a ping within the liveness window
+    /// (issue #83): most likely a dead socket the node is about to close.
+    /// Not counted in [`PeerInfo::connected`]. `false` on older daemons.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

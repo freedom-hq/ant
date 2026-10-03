@@ -169,9 +169,14 @@ unsigned char *ant_download(AntHandle *handle,
                             char **out_err);
 
 /*
- * Number of BZZ peers currently connected (post-handshake). Cheap —
- * reads the last-published status snapshot without blocking. Returns
- * -1 if `handle` is NULL.
+ * Number of connected peers whose connection answers pings (libp2p
+ * connections, including peers still in the BZZ handshake). A connection
+ * that stops answering (a socket reaped during an OS suspension, an
+ * expired NAT mapping) stops being counted within ~20 s of its last pong
+ * and is closed ~10 s later; after the process was frozen, a connection
+ * that doesn't answer within ~12 s of the node running again is
+ * uncounted. Cheap — reads the last-published status snapshot without
+ * blocking. Returns -1 if `handle` is NULL.
  */
 int ant_peer_count(const AntHandle *handle);
 
@@ -181,13 +186,16 @@ int ant_peer_count(const AntHandle *handle);
  * peers, WITHOUT a full ant_shutdown / ant_init. Cheap and idempotent —
  * safe to call on every foreground transition.
  *
- * After a long suspension the in-process node's libp2p connections are
- * half-open (sockets reaped, but the peer counter still looks healthy) and
- * nothing re-dials, so the next bzz:// retrieval hangs and the page renders
- * blank. This re-opens live sockets to the bootnodes in parallel so
- * retrieval has working routes again. It recovers the swarm only — if the
- * gateway's localhost listener was also torn down, rebind it separately
- * with ant_stop_gateway + ant_start_gateway.
+ * After a long suspension the in-process node's libp2p connections can be
+ * half-open (sockets reaped, no FIN seen). The node notices that on its
+ * own: connections that stop answering pings are closed ~20-30 s after
+ * it runs again, and a streak of retrievals failing on the link makes it
+ * do what this call does (at most once a minute). This call skips that
+ * wait: it re-opens live sockets to the bootnodes in parallel at once, so
+ * retrieval has working routes on foreground instead of after a failed
+ * retrieval. It recovers the swarm only — if the gateway's localhost
+ * listener was also torn down, rebind it separately with
+ * ant_stop_gateway + ant_start_gateway.
  *
  * Returns 0 on success, -1 if `handle` is NULL, and -2 if the node loop
  * didn't ack (already shut down) — in which case an allocated error string

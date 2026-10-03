@@ -139,6 +139,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
                 ),
                 full_node: Some(true),
                 last_bzz_at_unix: Some(1_700_000_002),
+                stale: false,
             }],
             peer_pipeline: Vec::new(),
             last_handshake: None,

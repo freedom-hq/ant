@@ -4,6 +4,7 @@ mod behaviour;
 mod dial;
 pub mod dnsaddr;
 mod handshake;
+mod liveness;
 pub mod lurker;
 pub mod lurker_registry;
 pub mod messaging;
