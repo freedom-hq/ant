@@ -554,8 +554,11 @@ const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
     "chequebook.json",
     "swap_credits.json",
     "pushsync_outbound.json",
-    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it.
+    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it,
+    // and so does its cheque journal, live and mid-compaction (#140).
     "pushsync_outbound.json.lost",
+    "pushsync_outbound.json.journal",
+    "pushsync_outbound.json.journal.old",
 ];
 
 /// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
@@ -4181,6 +4184,8 @@ mod tests {
         std::fs::write(dir.join("chequebook.json"), b"{}").expect("write chequebook");
         std::fs::write(dir.join("swap_credits.json"), b"{}").expect("write credits");
         std::fs::write(dir.join("pushsync_outbound.json"), b"{}").expect("write outbound");
+        std::fs::write(dir.join("pushsync_outbound.json.journal"), b"{}\n")
+            .expect("write outbound journal");
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -4521,6 +4526,8 @@ mod tests {
                 "{name} must not be visible to the new account",
             );
         }
+        // The outbound ledger's cheque journal goes with it (#140).
+        assert!(!dir.join("pushsync_outbound.json.journal").exists());
         // Parked, not destroyed: A can still be restored.
         let parked = dir
             .join(ACCOUNT_PARK_DIR)
