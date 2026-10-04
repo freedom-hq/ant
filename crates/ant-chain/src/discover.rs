@@ -140,10 +140,11 @@ pub struct TransferScan {
     /// `Some(x)` means "every block up to `x` was read by some confirming
     /// pass", not that a confirming pass ever ran to the head. `None` only
     /// until a confirming pass has read its first window. The blocks above
-    /// it were only read by routine continued scans, whose "none" rests on every earlier answer, so
-    /// before a "none" may lead to a deploy, [`find_owned_chequebook`]
-    /// reads those blocks again — and only those, so a wallet whose deploy
-    /// keeps failing pays the full history once, not on every check.
+    /// it were only read by routine continued scans, whose "none" rests
+    /// on every earlier answer, so before a "none" may lead to a deploy,
+    /// [`find_owned_chequebook`] reads those blocks again — and only
+    /// those, so a wallet whose deploy keeps failing pays the full
+    /// history once, not on every check.
     pub confirmed_through: Option<u64>,
 }
 
