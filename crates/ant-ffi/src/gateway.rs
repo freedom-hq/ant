@@ -420,6 +420,12 @@ pub unsafe extern "C" fn ant_start_gateway(
             on_chequebook_refused,
         };
 
+        // `/health.walletScan` reads `pending` from the first request on:
+        // the chain state is preset, so `chainReady` is already true.
+        #[cfg(feature = "chain")]
+        if chain_client.is_some() {
+            handle.chain_init.note_pending();
+        }
         let task = handle.runtime.spawn(async move {
             if let Err(e) = Gateway::serve(gw, addr).await {
                 tracing::error!(target: "ant-ffi", "in-process gateway ended: {e}");
@@ -527,8 +533,9 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
     let secret = handle.signing_secret;
     let eth = handle.eth;
     let slot = handle.gateway_chequebook.clone();
+    init.note_pending();
     handle.runtime.spawn(async move {
-        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, |adopted| {
+        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, true, |adopted| {
             crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
         })
         .await;

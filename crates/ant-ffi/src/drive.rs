@@ -143,6 +143,10 @@ pub(crate) struct ChainInit {
     /// don't both scan and double-register the same batch: the second
     /// waits and then sees the flag.
     batches_rediscovered: tokio::sync::Mutex<bool>,
+    /// A background retry of a failed rediscovery is running
+    /// ([`Self::retry_rediscovery`]): at most one per handle, however
+    /// often the host re-calls `ant_start_gateway`.
+    rediscovery_retrying: std::sync::atomic::AtomicBool,
     /// Set once settlement has been switched on for an adopted
     /// chequebook, so a later run (every idempotent `ant_start_gateway`
     /// re-call spawns one) doesn't re-resolve it over RPC.
@@ -202,6 +206,7 @@ impl ChainInit {
             upload,
             unverified: std::sync::Mutex::new(unverified),
             batches_rediscovered: tokio::sync::Mutex::new(false),
+            rediscovery_retrying: std::sync::atomic::AtomicBool::new(false),
             settlement_on: std::sync::atomic::AtomicBool::new(false),
             pass: tokio::sync::Mutex::new(()),
             not_found_since: std::sync::Mutex::new(HashMap::new()),
@@ -240,36 +245,86 @@ impl ChainInit {
         swap_secret: [u8; 32],
     ) -> Option<[u8; 20]> {
         let mut adopted = None;
-        self.run_reporting(chain, cmd_tx, data_dir, swap_secret, |cb| adopted = cb)
-            .await;
+        self.run_reporting(chain, cmd_tx, data_dir, swap_secret, false, |cb| {
+            adopted = cb;
+        })
+        .await;
         adopted
     }
 
     /// [`Self::run`], calling `report` with step 3's outcome (the
     /// chequebook settlement was switched on for, or `None`) right when
     /// it's known, so the gateway's chequebook slot doesn't wait out a
-    /// batch recheck.
+    /// batch recheck. With `retry`, a failed step 2 is retried in the
+    /// background with backoff ([`Self::retry_rediscovery`]) alongside
+    /// step 1's recheck, as `antd` does, so `/health.walletScan` moves on
+    /// from `retrying` without waiting for the host's next start call.
     pub(crate) async fn run_reporting(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
         data_dir: &std::path::Path,
         swap_secret: [u8; 32],
+        retry: bool,
         report: impl FnOnce(Option<[u8; 20]>),
     ) {
         let recheck_at = self
             .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
             .await;
-        self.rediscover_owned(chain, cmd_tx, data_dir).await;
+        let rediscovered = self.rediscover_owned(chain, cmd_tx, data_dir).await;
         report(
             self.adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
                 .await,
         );
-        if let Some(recheck_at) = recheck_at {
-            tokio::time::sleep_until(recheck_at).await;
-            self.verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
-                .await;
+        let recheck = async {
+            if let Some(recheck_at) = recheck_at {
+                tokio::time::sleep_until(recheck_at).await;
+                self.verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
+                    .await;
+            }
+        };
+        let retry_rediscovery = async {
+            if retry && !rediscovered {
+                self.retry_rediscovery(chain, cmd_tx, data_dir).await;
+            }
+        };
+        tokio::join!(recheck, retry_rediscovery);
+    }
+
+    /// Report a rediscovery that will run (`/health.walletScan` =
+    /// `pending`) unless one already finished for this handle. Called
+    /// before the gateway serves, so a host never reads the chain as
+    /// ready with no rediscovery reported. A run in flight holds the
+    /// flag's lock and reports for itself.
+    pub(crate) fn note_pending(&self) {
+        if let Ok(done) = self.batches_rediscovered.try_lock() {
+            if !*done {
+                ant_chain::discover::wallet_scan_pending(&self.upload.batch_owner);
+            }
         }
+    }
+
+    /// Retry a failed [`Self::rediscover_owned`] with the shared backoff
+    /// until it succeeds. A scan that failed kept its progress, so each
+    /// retry only reads what's left. One loop per handle.
+    async fn retry_rediscovery(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+    ) {
+        use std::sync::atomic::Ordering;
+        if self.rediscovery_retrying.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for attempt in 0u32.. {
+            let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
+            tokio::time::sleep(delay).await;
+            if self.rediscover_owned(chain, cmd_tx, data_dir).await {
+                break;
+            }
+        }
+        self.rediscovery_retrying.store(false, Ordering::Release);
     }
 
     /// Step 3 of [`Self::run`]: adopt the chequebook without spending,
@@ -328,25 +383,29 @@ impl ChainInit {
     /// transfer scan as `antd` and `ant_storage_discover`, so only the
     /// first start reads the full history (#118); `ant_storage_discover_full`
     /// is the way to read it all again. A new issuer starts at
-    /// index 0, as in `antd` without a bee `stamperstore`.
+    /// index 0, as in `antd` without a bee `stamperstore`. Returns whether
+    /// the rediscovery is complete for this handle, and reports it to
+    /// `/health.walletScan`.
     async fn rediscover_owned(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
         data_dir: &std::path::Path,
-    ) {
+    ) -> bool {
+        let owner = self.upload.batch_owner;
         let mut rediscovered = self.batches_rediscovered.lock().await;
         if *rediscovered {
-            return;
+            return true;
         }
-        let found = match owned_batches(chain, &self.upload.batch_owner, data_dir, false).await {
+        let found = match owned_batches(chain, &owner, data_dir, false).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!(
                     target: "ant-ffi",
-                    "postage batch rediscovery scan failed: {e}; retrying on the next gateway start",
+                    "postage batch rediscovery scan failed: {e}; retrying",
                 );
-                return;
+                ant_chain::discover::wallet_scan_failed(&owner, &e.to_string());
+                return false;
             }
         };
         let mut all_registered = true;
@@ -384,7 +443,7 @@ impl ChainInit {
                     tracing::warn!(
                         target: "ant-ffi",
                         batch = %format!("0x{}", hex::encode(b.batch_id)),
-                        "could not register rediscovered batch: {e}; retrying on the next gateway start",
+                        "could not register rediscovered batch: {e}; retrying",
                     );
                 }
             }
@@ -393,6 +452,15 @@ impl ChainInit {
         // registration failed is picked up by the next run's scan (the
         // ones registered now are skipped as known).
         *rediscovered = all_registered;
+        if all_registered {
+            ant_chain::discover::wallet_scan_done(&owner);
+        } else {
+            ant_chain::discover::wallet_scan_failed(
+                &owner,
+                "could not register a rediscovered batch",
+            );
+        }
+        all_registered
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
@@ -4284,6 +4352,70 @@ mod chain_tests {
         init.rediscover_owned(&client(&script), &cmd_tx, &dir).await;
         assert_eq!(node.lock().unwrap().registered, vec![lost], "retried");
         assert!(*init.batches_rediscovered.lock().await);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed rediscovery reads as `retrying` in `/health.walletScan`
+    /// and is retried in the background with the shared backoff until it
+    /// succeeds, without waiting for the host's next `ant_start_gateway`.
+    /// Its own wallet: the status registry is process-wide.
+    #[tokio::test(start_paused = true)]
+    async fn failed_rediscovery_is_retried_in_the_background() {
+        use ant_chain::discover::{wallet_scan_status, WalletScanState};
+        const EOA: [u8; 20] = [0x77; 20];
+        let dir = scratch("chain-init-backoff");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let lost = [0xa4u8; 32];
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(std::sync::Arc::clone(&upload));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut script = ChainScript::new(EOA);
+        script.transfers.push((postage_addr, [0x05; 32]));
+        script.created.push((lost, [0x05; 32]));
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+        node.lock().unwrap().fail_registers = 1;
+
+        init.note_pending();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Pending
+        );
+        assert!(!init.rediscover_owned(&client(&script), &cmd_tx, &dir).await);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Retrying
+        );
+
+        let started = tokio::time::Instant::now();
+        init.retry_rediscovery(&client(&script), &cmd_tx, &dir)
+            .await;
+        assert!(started.elapsed() >= std::time::Duration::from_secs(15));
+        assert_eq!(node.lock().unwrap().registered, vec![lost], "retried");
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        assert!(!init
+            .rediscovery_retrying
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // A later gateway start finds it done and doesn't announce another.
+        init.note_pending();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
