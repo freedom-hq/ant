@@ -270,7 +270,14 @@ fn persist_transfer_scan(data_dir: &std::path::Path, scan: &TransferScan) {
 /// continuing `previous` (same wallet) from where it stopped instead of
 /// starting over. Its transfers in the rescan tail are dropped and read
 /// again. With `save_to`, the progress is saved there every
-/// [`SCAN_SAVE_EVERY`] while the scan runs.
+/// [`SCAN_SAVE_EVERY`] while the scan runs, and when it fails. With
+/// `confirms` — a pass that reads from the deploy block, or re-reads the
+/// blocks above the confirmed mark — every block it reads is confirmed:
+/// the saved progress carries [`TransferScan::confirmed_through`] up to
+/// where it got, so a confirming pass cut short and resumed (a first scan
+/// interrupted by the app going to the background) only leaves the blocks
+/// the resumed part read unconfirmed, not the whole history.
+#[allow(clippy::too_many_arguments)]
 async fn scan_transfers(
     client: &ChainClient,
     chain_id: u64,
@@ -279,6 +286,7 @@ async fn scan_transfers(
     from_block: u64,
     previous: Option<TransferScan>,
     save_to: Option<&std::path::Path>,
+    confirms: bool,
 ) -> Result<TransferScan, RpcError> {
     let head = client.eth_block_number().await?;
     let mut scan = match previous.filter(|p| {
@@ -323,6 +331,9 @@ async fn scan_transfers(
                 // Never backwards: a scan within the tail of the
                 // previous one leaves its mark where it was.
                 scan.scanned_through = scan.scanned_through.max(end.min(settled));
+                if confirms {
+                    scan.confirmed_through = Some(scan.scanned_through);
+                }
                 if let Some(dir) = save_to {
                     if saved_at.elapsed() >= SCAN_SAVE_EVERY {
                         persist_transfer_scan(dir, &scan);
@@ -408,7 +419,10 @@ async fn update_transfer_scan(
     let _scanning = SCANS.lock().await;
     let chain_id = client.eth_chain_id().await?;
     let saved = load_transfer_scan(data_dir, chain_id, node_eoa);
-    let replacing = saved.is_some() && mode != ScanMode::Continue;
+    // Only a full rescan replaces the saved scan wholesale; a confirming
+    // re-read only rewinds it to its confirmed mark, which its progress
+    // then carries forward (see below).
+    let replacing = saved.is_some() && mode == ScanMode::Full;
     let previous = match mode {
         ScanMode::Continue => saved,
         ScanMode::Full => None,
@@ -428,10 +442,14 @@ async fn update_transfer_scan(
         .as_ref()
         .map_or(GNOSIS_XBZZ_DEPLOY_BLOCK, |p| p.scanned_through + 1);
     let started = std::time::Instant::now();
-    // Progress saves are for resuming a scan cut short. A rescan that
+    // Progress saves are for resuming a scan cut short. A full rescan that
     // replaces a saved scan doesn't save its progress over it: a rescan
     // failing part-way would otherwise swap a complete scan for a partial
-    // one. It is saved once it completes.
+    // one. It is saved once it completes. A confirming re-read does save
+    // its progress, with the confirmed mark moved up to it: cut short, the
+    // next check re-reads only the blocks it didn't get to, rather than
+    // starting again from the old mark (or from the deploy block, for a
+    // scan that had none) every time.
     let mut scan = scan_transfers(
         client,
         chain_id,
@@ -440,6 +458,7 @@ async fn update_transfer_scan(
         GNOSIS_XBZZ_DEPLOY_BLOCK,
         previous,
         (!replacing).then_some(data_dir),
+        confirms,
     )
     .await?;
     if confirms {
@@ -1028,8 +1047,10 @@ mod tests {
         node_eoa: &[u8; 20],
         from_block: u64,
     ) -> Result<Vec<DiscoveredBatch>, RpcError> {
-        let scan =
-            scan_transfers(client, 100, xbzz_token, node_eoa, from_block, None, None).await?;
+        let scan = scan_transfers(
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+        )
+        .await?;
         owned_batches_in(client, postage_contract, &scan).await
     }
 
@@ -1042,8 +1063,10 @@ mod tests {
         node_eoa: &[u8; 20],
         from_block: u64,
     ) -> Result<Option<[u8; 20]>, RpcError> {
-        let scan =
-            scan_transfers(client, 100, xbzz_token, node_eoa, from_block, None, None).await?;
+        let scan = scan_transfers(
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+        )
+        .await?;
         owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
     }
 
@@ -1705,6 +1728,107 @@ mod tests {
         assert_eq!(chain.ranges.lock().unwrap()[0].0, read[1].1 + 1, "resumed");
         assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
         assert_eq!(scan.transfers.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A first scan cut short and resumed is still confirmed up to where
+    /// its first part got: the chequebook check before a deploy re-reads
+    /// only the blocks the resumed part read, not the whole history.
+    #[tokio::test]
+    async fn a_resumed_first_scan_keeps_its_confirmed_mark() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            fail_after: Mutex::new(Some(2)),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-resume-mark");
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("the third window fails");
+        let cut = chain.ranges.lock().unwrap()[1].1;
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(saved.confirmed_through, Some(cut), "progress is confirmed");
+
+        *chain.fail_after.lock().unwrap() = None;
+        let resumed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.confirmed_through,
+            Some(cut),
+            "the resumed part isn't"
+        );
+
+        chain.ranges.lock().unwrap().clear();
+        assert_eq!(find_cb(&client, &dir, true).await, None);
+        let ranges = chain.ranges.lock().unwrap().clone();
+        assert!(
+            ranges.iter().all(|r| r.0 > cut),
+            "only the blocks since the mark: {ranges:?}"
+        );
+        let scan = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A confirming check that reads the whole history (a scan with no
+    /// confirmed mark) and is cut short saves its progress with the mark
+    /// moved up to it: the next check continues from there instead of
+    /// starting again from the deploy block.
+    #[tokio::test]
+    async fn a_failed_confirming_check_resumes_where_it_stopped() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(17_000_000, [9; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-confirm-resume");
+        let mut scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        // Saved before the mark existed, and missing the deposit.
+        scan.confirmed_through = None;
+        scan.transfers.clear();
+        persist_transfer_scan(&dir, &scan);
+
+        chain.ranges.lock().unwrap().clear();
+        // The routine refresh's tail read, then two windows of the
+        // confirming read from the deploy block, then a failure.
+        *chain.fail_after.lock().unwrap() = Some(3);
+        find_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            &dir,
+            true,
+        )
+        .await
+        .expect_err("the confirming read fails part-way");
+        let read = chain.ranges.lock().unwrap().clone();
+        let cut = read.last().unwrap().1;
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(read[1].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).expect("progress saved");
+        assert_eq!(saved.confirmed_through, Some(cut));
+        assert_eq!(saved.scanned_through, cut);
+        assert_eq!(saved.transfers.len(), 1, "the deposit it found is kept");
+
+        chain.ranges.lock().unwrap().clear();
+        *chain.fail_after.lock().unwrap() = None;
+        assert_eq!(find_cb(&client, &dir, true).await, Some(CB));
+        let ranges = chain.ranges.lock().unwrap().clone();
+        assert!(ranges.iter().all(|r| r.0 > cut), "resumed: {ranges:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
