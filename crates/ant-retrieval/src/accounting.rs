@@ -304,8 +304,25 @@ pub const OVERDRAFT_REFRESH: Duration = Duration::from_millis(600);
 ///   request waits at most 30 s for credit in total before its body,
 ///   however many attempts, roots and trie levels it goes through; once
 ///   the window has passed, these fetches no longer wait at all.
+/// - **Pushes** (`RoutingFetcher::push_stamped_chunk`, issue #128). Each
+///   push first reserves credit with its peer, as bee's pushsync client
+///   runs `PrepareCredit` (a peer at its limit is skipped for
+///   [`OVERDRAFT_REFRESH`] and the next-closest one is tried). Only when
+///   every candidate is at its limit and nothing is in flight does the
+///   walk sleep until a skipped peer may be asked again (≤
+///   [`OVERDRAFT_REFRESH`]) and retry, for at most this budget in total
+///   per walk, then give up. The node's push commands (`PushChunk`:
+///   every upload-job chunk and the gateway's `/bytes`, `/bzz`, `/chunks`
+///   uploads; `PushSoc`) cut that to a deadline this long after the push
+///   starts (`RoutingFetcher::with_credit_deadline`), shared by all of
+///   the gateway patience loop's re-walks, so one push command waits at
+///   most this long for credit in total; the upload job then re-queues
+///   the chunk. The other push walks (stewardship re-upload, the batch
+///   self-probe) wait at most this long per chunk walk. A push waiting
+///   for credit only sleeps: it never takes a credit wake-up
+///   ([`Accounting::wait_for_credit`]) from a waiting fetch.
 ///
-/// Nothing else waits. That covers every manifest walk outside the
+/// Of the retrieval paths, nothing else waits. That covers every manifest walk outside the
 /// streaming `/bzz` loop (buffered `GetBzz`, manifest listings), the
 /// fallback join of a multi-chunk manifest node, encrypted manifest
 /// nodes, feed probes, replica probes, recovery
@@ -701,16 +718,17 @@ impl Accounting {
 
     /// Record `price` of debt to `peer` that was already incurred, with
     /// no overdraft check: bee debited it when it served the request, so
-    /// the mirror has to hold it whatever the limit says. Used for
-    /// pushsync, whose debit is only known once the receipt is in (the
-    /// push has happened by then, unlike a retrieval reservation, which
-    /// gates the request). Settles like bee's pushsync client, which
-    /// runs `PrepareCredit` and then `Apply`: [`Accounting::try_reserve`]'s
-    /// settle step without its admission check, then
-    /// [`DebitGuard::apply`] (the hot hint when the debt crosses
-    /// [`HOT_DEBT_THRESHOLD`], and a cheque if one is still due). So debt
-    /// past [`OVERDRAFT_LIMIT`] is paid too rather than dropped (PR #126
-    /// R1-M2).
+    /// the mirror has to hold it whatever the limit says:
+    /// [`Accounting::try_reserve`]'s settle step without its admission
+    /// check, then [`DebitGuard::apply`] (the hot hint when the debt
+    /// crosses [`HOT_DEBT_THRESHOLD`], and a cheque if one is still
+    /// due), so debt past [`OVERDRAFT_LIMIT`] is paid too rather than
+    /// dropped (PR #126 R1-M2).
+    ///
+    /// Pushsync no longer records its debt here: like bee's pushsync
+    /// client, which runs `PrepareCredit` before every push, each push
+    /// now reserves with [`Accounting::try_reserve`] first and applies the
+    /// reservation once the receipt is in (issue #128).
     pub fn debit(&self, peer: PeerId, price: u64) {
         let payer = current_payer(&self.payment);
         let cheque = {

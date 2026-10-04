@@ -600,10 +600,18 @@ impl RetrievalPayment for PushsyncSwap {
 #[derive(Default)]
 pub struct NoopPushsyncSettlement;
 
-#[async_trait::async_trait]
 impl PushsyncSettlement for NoopPushsyncSettlement {
-    async fn note_pushsync(&self, _peer: PeerId, _price: u64) {}
+    fn prepare_credit(&self, _peer: PeerId, _price: u64) -> Option<ant_retrieval::PushCredit> {
+        Some(ant_retrieval::PushCredit::new(NoCredit))
+    }
     fn forget(&self, _peer: &PeerId) {}
+}
+
+/// [`NoopPushsyncSettlement`]'s credit: reserves and records nothing.
+struct NoCredit;
+
+impl ant_retrieval::PushCreditAction for NoCredit {
+    fn apply(self: Box<Self>) {}
 }
 
 #[cfg(test)]

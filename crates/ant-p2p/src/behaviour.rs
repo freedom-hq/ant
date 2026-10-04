@@ -4346,13 +4346,17 @@ async fn push_with_patience(
     strict_first: bool,
     rejections_are_lag_until: Option<Instant>,
 ) -> Result<(), ant_retrieval::pushsync::PushSyncError> {
-    let started = std::time::Instant::now();
+    // The patience budget runs on tokio's clock (as the fetcher's credit
+    // deadline does), so tests can drive it with a paused clock; the
+    // batch-propagation window below stays on `std::time::Instant`, the
+    // clock its registration stamp was taken on.
+    let started = tokio::time::Instant::now();
     let mut patience = Patience::new(gateway_push_patience(), started);
     let mut last_err = None;
     let mut walk = 0u32;
     loop {
         walk += 1;
-        let strict = strict_first && !patience.exhausted(Instant::now());
+        let strict = strict_first && !patience.exhausted(tokio::time::Instant::now());
         let res = fetcher
             .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, strict)
             .await;
@@ -4387,7 +4391,7 @@ async fn push_with_patience(
                     );
                     last_err = Some(e);
                     tokio::time::sleep(wait).await;
-                    patience.restart(Instant::now());
+                    patience.restart(tokio::time::Instant::now());
                     continue;
                 }
                 if matches!(
@@ -4396,7 +4400,7 @@ async fn push_with_patience(
                 ) {
                     return Err(e);
                 }
-                if patience.exhausted(Instant::now()) {
+                if patience.exhausted(tokio::time::Instant::now()) {
                     // Strict SOCs get one final bee-aligned
                     // shallow-accepting walk before we give up: stored
                     // shallow beats a 502 with nothing stored.
@@ -4442,20 +4446,20 @@ async fn push_with_patience(
 #[derive(Debug, Clone, Copy)]
 struct Patience {
     budget: Duration,
-    from: Instant,
+    from: tokio::time::Instant,
 }
 
 impl Patience {
-    fn new(budget: Duration, now: Instant) -> Self {
+    fn new(budget: Duration, now: tokio::time::Instant) -> Self {
         Self { budget, from: now }
     }
 
     /// Start the budget over, after a propagation wait.
-    fn restart(&mut self, now: Instant) {
+    fn restart(&mut self, now: tokio::time::Instant) {
         self.from = now;
     }
 
-    fn exhausted(&self, now: Instant) -> bool {
+    fn exhausted(&self, now: tokio::time::Instant) -> bool {
         now.saturating_duration_since(self.from) >= self.budget
     }
 }
@@ -4908,8 +4912,14 @@ fn push_with_stamp(
         });
         return;
     }
-    let fetcher =
-        build_push_fetcher(state, control.clone(), network_id).with_require_deep(require_deep);
+    // One credit-wait budget for the whole push, shared by all of
+    // `push_with_patience`'s re-walks (issue #128): each walk waits only
+    // for what is left of it, so the waits can't add up per walk.
+    let fetcher = build_push_fetcher(state, control.clone(), network_id)
+        .with_require_deep(require_deep)
+        .with_credit_deadline(
+            tokio::time::Instant::now() + ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
+        );
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     tokio::spawn(async move {
@@ -4985,7 +4995,10 @@ fn push_soc_with_stamp(
         });
         return;
     }
-    let fetcher = build_push_fetcher(state, control.clone(), network_id);
+    // One credit-wait budget for all re-walks, as in `push_with_stamp`.
+    let fetcher = build_push_fetcher(state, control.clone(), network_id).with_credit_deadline(
+        tokio::time::Instant::now() + ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
+    );
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     tokio::spawn(async move {
@@ -11323,7 +11336,7 @@ mod tests {
     }
 
     /// Uploads settle like bee (issue #127): with a chequebook, every
-    /// accepted push is debited to the one accounting mirror retrieval
+    /// accepted push reserves its credit (issue #128) and is debited to the one accounting mirror retrieval
     /// uses — even with `ANT_PUSH_PSEUDOSETTLE=0`, which only opts a
     /// chequebook-less node out — so the payer installed there pays push
     /// debt with the same cheques, at the early-payment threshold, and
@@ -11357,15 +11370,21 @@ mod tests {
         let payer = Arc::new(Payer::default());
         accounting.set_payment(Some(payer.clone()));
         let settle = || tokio::time::sleep(Duration::from_millis(20));
+        // One push with a receipt: credit reserved first (issue #128),
+        // then applied.
+        let push_receipt = |peer: PeerId| {
+            push.prepare_credit(peer, 300_000)
+                .expect("inside the peer's credit limit")
+                .apply();
+        };
         let peer = PeerId::random();
         accounting.credit(peer, 0); // a refresh was accepted just now
-        push.note_pushsync(peer, 0).await; // pre-flight: no debit
-        push.note_pushsync(peer, 300_000).await;
-        push.note_pushsync(peer, 300_000).await;
+        push_receipt(peer);
+        push_receipt(peer);
         settle().await;
         assert!(payer.calls.lock().unwrap().is_empty(), "600 k < 675 k");
         assert_eq!(accounting.debug_snapshot(&peer), Some((600_000, 0)));
-        push.note_pushsync(peer, 300_000).await;
+        push_receipt(peer);
         settle().await;
         assert_eq!(*payer.calls.lock().unwrap(), vec![(peer, 600_000)]);
         assert_eq!(accounting.debug_snapshot(&peer), Some((300_000, 0)));
@@ -11379,7 +11398,7 @@ mod tests {
         let other = PeerId::random();
         accounting.credit(other, 0);
         for _ in 0..3 {
-            push.note_pushsync(other, 300_000).await;
+            push_receipt(other);
         }
         settle().await;
         assert_eq!(payer.calls.lock().unwrap().len(), 2);
@@ -11392,11 +11411,69 @@ mod tests {
         let third = PeerId::random();
         accounting.credit(third, 0);
         for _ in 0..3 {
-            push.note_pushsync(third, 300_000).await;
+            push_receipt(third);
         }
         settle().await;
         assert_eq!(payer.calls.lock().unwrap().len(), 2);
         assert_eq!(accounting.debug_snapshot(&third), Some((900_000, 0)));
+    }
+
+    /// Issue #128: a push through the gateway / upload-job path
+    /// (`push_with_stamp`) never pushes to a peer at its credit limit,
+    /// and all of `push_with_patience`'s re-walks share one credit-wait
+    /// budget, so a pool that stays at its limit costs one
+    /// `CREDIT_WAIT_BUDGET` of waiting, not one per re-walk, before the
+    /// push is handed back (the upload job re-queues it).
+    #[tokio::test(start_paused = true)]
+    async fn push_credit_waits_share_one_budget_across_rewalks() {
+        use ant_retrieval::accounting::{Accounting, CREDIT_WAIT_BUDGET, OVERDRAFT_LIMIT};
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let accounting = Arc::new(Accounting::new());
+        state.accounting = Some(accounting.clone());
+        let peer = PeerId::random();
+        state.peers_watch.send_replace(vec![(peer, [0x80u8; 32])]);
+        let _held = accounting
+            .try_reserve(peer, OVERDRAFT_LIMIT)
+            .expect("a fresh peer has its whole limit");
+        let behaviour = libp2p_stream::Behaviour::default();
+        let (ack, rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        push_with_stamp(
+            &state,
+            &behaviour.new_control(),
+            1,
+            [0u8; 32],
+            vec![0u8; 16],
+            [0u8; ant_postage::STAMP_SIZE],
+            false,
+            ack,
+        );
+        let reply = rx.await.expect("acked");
+        let took = started.elapsed();
+        let ControlAck::Error { message } = reply else {
+            panic!("expected an error, got {reply:?}");
+        };
+        assert!(message.contains("no pushsync peer has credit"), "{message}");
+        assert_eq!(
+            accounting.debug_snapshot(&peer),
+            Some((0, OVERDRAFT_LIMIT)),
+            "nothing was pushed to the peer",
+        );
+        // One budget of waiting, then re-walks that don't wait until the
+        // patience runs out (≤ 1.75 s between walks).
+        assert!(
+            took >= CREDIT_WAIT_BUDGET
+                && took <= gateway_push_patience().max(CREDIT_WAIT_BUDGET) + Duration::from_secs(2),
+            "push took {took:?}",
+        );
     }
 
     #[tokio::test]
@@ -11740,7 +11817,7 @@ mod tests {
     #[test]
     fn patience_restarts_after_a_propagation_wait_but_is_never_stretched() {
         let budget = Duration::from_secs(12);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
 
         // No propagation wait (e.g. only "exhausted pushsync peers"

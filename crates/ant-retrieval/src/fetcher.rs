@@ -18,13 +18,13 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
-use crate::accounting::{Accounting, DebitGuard, OVERDRAFT_REFRESH};
+use crate::accounting::{Accounting, DebitGuard, CREDIT_WAIT_BUDGET, OVERDRAFT_REFRESH};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
 use crate::priority::{self, Priority};
 use crate::progress::ProgressTracker;
 use crate::push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
-use crate::pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
+use crate::pushsync_settlement::{peer_chunk_price, PushCredit, PushsyncSettlement};
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -191,8 +191,11 @@ pub struct RoutingFetcher {
     /// when the daemon's accounting hasn't been constructed
     /// (legacy `antctl get` paths).
     accounting: Option<Arc<Accounting>>,
-    /// No credit-waiting fetch through this fetcher waits past this
-    /// instant ([`RoutingFetcher::with_credit_deadline`]).
+    /// No credit-waiting fetch or push through this fetcher waits for
+    /// credit past this instant ([`RoutingFetcher::with_credit_deadline`]).
+    /// Only the credit wait is capped: a push already in flight runs to
+    /// its own pushsync timeout, and a fetch's network round trips are
+    /// not bounded by it.
     credit_deadline: Option<tokio::time::Instant>,
     /// Process-wide cumulative counters. Bumped on every chunk the
     /// fetcher hands back (network or cache); read by the status
@@ -201,17 +204,18 @@ pub struct RoutingFetcher {
     /// delta. `None` in unit tests (no daemon); the daemon clones
     /// one shared `Arc` into every fetcher.
     counters: Option<Arc<RetrievalCounters>>,
-    /// Optional pushsync-side settlement hook. When `Some`, every
-    /// pushsync receipt — deep or shallow, and one that arrives after
-    /// the walk moved on (a losing hedge, a dropped push) — is reported via
-    /// [`PushsyncSettlement::note_pushsync`] so the implementation
-    /// can decide whether the per-peer outbound debt has crossed a
-    /// SWAP-cheque trigger. The fetcher itself stays ignorant of
-    /// SWAP / chequebook concerns; the implementation lives in
-    /// `ant-p2p::pushsync_swap`. `None` keeps the legacy
-    /// "push without settlement" behaviour for unit tests and the
-    /// ultra-light read-only build (where the daemon never opens a
-    /// pushsync stream anyway).
+    /// Optional pushsync-side settlement hook. When `Some`, every push
+    /// first asks it for credit with the peer
+    /// ([`PushsyncSettlement::prepare_credit`], bee's `PrepareCredit`):
+    /// a peer at its credit limit is skipped (issue #128), and every
+    /// pushsync receipt — deep or shallow, and one that arrives after the
+    /// walk moved on (a losing hedge, a dropped push) — applies the
+    /// push's credit, debiting the peer. The fetcher itself stays
+    /// ignorant of SWAP / chequebook concerns; the implementation lives
+    /// in `ant-p2p::push_pseudosettle`. `None` pushes without credit
+    /// checks or debits: unit tests, the ultra-light read-only build
+    /// (where the daemon never opens a pushsync stream anyway) and a
+    /// chequebook-less node with `ANT_PUSH_PSEUDOSETTLE=0`.
     pushsync_settlement: Option<Arc<dyn PushsyncSettlement>>,
     /// Optional shared push-side peer skip cache. When set,
     /// `push_stamped_chunk` filters its ranked candidate list
@@ -355,9 +359,9 @@ impl RoutingFetcher {
     }
 
     /// Attach the per-peer pushsync load tracker (perf-lab Experiment
-    /// 2). When set, `next_push_peer` skips peers at their
-    /// latency-aware concurrent-push cap — falling through to the
-    /// unfiltered ranking if EVERY candidate is saturated — and every
+    /// 2). When set, `push_candidates` ranks peers at their
+    /// latency-aware concurrent-push cap after every other candidate —
+    /// so they are picked only if EVERY candidate is saturated — and every
     /// dispatch reports begin/end + latency into the tracker.
     #[must_use]
     pub fn with_push_load(mut self, load: std::sync::Arc<crate::PushLoadTracker>) -> Self {
@@ -365,13 +369,14 @@ impl RoutingFetcher {
         self
     }
 
-    /// Attach a pushsync-side settlement hook. After every pushsync
-    /// receipt, deep or shallow, accepted or not (the storer debits us
-    /// for each one it writes), we call `settlement.note_pushsync(peer, price)`
-    /// so the hook can decide whether to emit a SWAP cheque before the
-    /// next push lands. The hook is best-effort: a settlement failure
-    /// does not fail the upload, just causes the next pushsync against
-    /// the same peer to potentially be RST'd by bee. See
+    /// Attach a pushsync-side settlement hook. Before every push we ask
+    /// it for credit with the peer (`settlement.prepare_credit(peer,
+    /// price)`, bee's `PrepareCredit`) and push only to a peer that has
+    /// it (issue #128); after every pushsync receipt, deep or shallow,
+    /// accepted or not (the storer debits us for each one it writes), we
+    /// apply that credit. Payment is best-effort: a failed one does not
+    /// fail the upload, it leaves the debt to the refresh, and the credit
+    /// check keeps the next pushes inside the peer's limit meanwhile. See
     /// [`PushsyncSettlement`] for the rationale.
     #[must_use]
     pub fn with_pushsync_settlement(mut self, settlement: Arc<dyn PushsyncSettlement>) -> Self {
@@ -406,7 +411,9 @@ impl RoutingFetcher {
     /// it, a starved fetch fails at once as plain `fetch` does. For a
     /// request that retries a whole buffered join, so its attempts can't
     /// stack one credit wait each (see
-    /// [`crate::accounting::CREDIT_WAIT_BUDGET`]).
+    /// [`crate::accounting::CREDIT_WAIT_BUDGET`]). It caps a push walk's
+    /// credit wait the same way, for the gateway's push re-walks (issue
+    /// #128).
     #[must_use]
     pub fn with_credit_deadline(mut self, deadline: tokio::time::Instant) -> Self {
         self.credit_deadline = Some(deadline);
@@ -642,13 +649,15 @@ impl RoutingFetcher {
     /// already connected skip the wait entirely.
     const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(2500);
 
-    /// Rank the live peer set closest-first to `chunk_addr` and return the
-    /// next candidate not already used for this chunk. The per-process
-    /// push-skip cache (cross-chunk cool-down) is applied as a *soft*
-    /// filter: if honouring it would leave no candidate (every closest
-    /// peer is currently cooling down), we fall through to the unfiltered
-    /// ranking so a small / flappy network can still make progress.
-    fn next_push_peer(&self, chunk_addr: &[u8; 32], used: &[PeerId]) -> Option<(PeerId, Overlay)> {
+    /// Rank the live peer set closest-first to `chunk_addr`, leaving out
+    /// peers already used for this chunk, in the order a push tries them.
+    /// The per-process push-skip cache (cross-chunk cool-down) is applied
+    /// as a *soft* filter: peers cooling down come after every other
+    /// candidate rather than not at all, so a small / flappy network can
+    /// still make progress. The first entry is the next peer to push to;
+    /// the rest are where a push goes when that one has no credit
+    /// (issue #128), one ranked pass instead of one per refusal.
+    fn push_candidates(&self, chunk_addr: &[u8; 32], used: &[PeerId]) -> Vec<(PeerId, Overlay)> {
         let live = self.peers_rx.borrow();
         let mut ranked: Vec<(PeerId, Overlay)> = live
             .iter()
@@ -656,25 +665,6 @@ impl RoutingFetcher {
             .copied()
             .collect();
         drop(live);
-        // Per-peer in-flight cap (Experiment 2): drop saturated peers
-        // from the ranking so concurrent chunks fan out to lower-PO
-        // peers instead of stacking debt on the same closest storers.
-        // Soft: if EVERY candidate is at cap, fall through unfiltered —
-        // a small peer set must still make progress.
-        if let Some(load) = self.push_load.as_ref() {
-            let unsaturated: Vec<(PeerId, Overlay)> = ranked
-                .iter()
-                .copied()
-                .filter(|(p, _)| !load.at_cap(p))
-                .collect();
-            if unsaturated.is_empty() {
-                if !ranked.is_empty() {
-                    load.note_saturated_fallthrough();
-                }
-            } else {
-                ranked = unsaturated;
-            }
-        }
         ranked.sort_by(|(_, a), (_, b)| {
             for i in 0..32 {
                 let da = a[i] ^ chunk_addr[i];
@@ -685,12 +675,36 @@ impl RoutingFetcher {
             }
             Ordering::Equal
         });
-        if let Some(skip) = self.push_skip.as_ref() {
-            if let Some(hit) = ranked.iter().copied().find(|(p, _)| !skip.is_skipped(*p)) {
-                return Some(hit);
+        // The push-skip cache's soft filter: cooling peers after fresh
+        // ones, each group still closest-first.
+        let fresh_first = |group: Vec<(PeerId, Overlay)>| -> Vec<(PeerId, Overlay)> {
+            match self.push_skip.as_ref() {
+                None => group,
+                Some(skip) => {
+                    let (mut fresh, cooling): (Vec<_>, Vec<_>) =
+                        group.into_iter().partition(|(p, _)| !skip.is_skipped(*p));
+                    fresh.extend(cooling);
+                    fresh
+                }
             }
+        };
+        // Per-peer in-flight cap (Experiment 2): saturated peers go after
+        // every unsaturated one, so concurrent chunks fan out to lower-PO
+        // peers instead of stacking debt on the same closest storers.
+        // Soft: if EVERY candidate is at cap, they are all still
+        // candidates — a small peer set must still make progress.
+        if let Some(load) = self.push_load.as_ref() {
+            let (unsaturated, saturated): (Vec<_>, Vec<_>) =
+                ranked.into_iter().partition(|(p, _)| !load.at_cap(p));
+            if unsaturated.is_empty() && !saturated.is_empty() {
+                load.note_saturated_fallthrough();
+            }
+            ranked = fresh_first(unsaturated);
+            ranked.extend(fresh_first(saturated));
+        } else {
+            ranked = fresh_first(ranked);
         }
-        ranked.first().copied()
+        ranked
     }
 
     /// Best-effort request to the swarm loop to dial peers toward `target`'s
@@ -757,6 +771,39 @@ impl RoutingFetcher {
         }
     }
 
+    /// Bee's `PrepareCredit` for one push of `price` to `peer` (issue
+    /// #128). `Ok(None)` without a settlement hook (nothing is metered),
+    /// `Ok(Some(credit))` once the price is reserved, `Err(())` when the
+    /// push would take our debt to the peer past its disconnect limit.
+    fn prepare_push_credit(&self, peer: PeerId, price: u64) -> Result<Option<PushCredit>, ()> {
+        match self.pushsync_settlement.as_ref() {
+            None => Ok(None),
+            Some(s) => s.prepare_credit(peer, price).map(Some).ok_or(()),
+        }
+    }
+
+    /// How long one push walk may wait for credit, in total, while every
+    /// candidate peer is at its credit limit and nothing is in flight:
+    /// [`CREDIT_WAIT_BUDGET`], cut to what is left before the fetcher's
+    /// credit deadline ([`Self::with_credit_deadline`]), which the
+    /// gateway's push paths set so their re-walks share one budget.
+    fn push_credit_budget(&self) -> Duration {
+        self.push_credit_left(CREDIT_WAIT_BUDGET)
+    }
+
+    /// `left` of a push walk's credit budget, cut to what is left before
+    /// the credit deadline right now. Re-read before every nap, not once
+    /// per walk: a walk can outlive the deadline with a push in flight
+    /// (one peer hanging to its pushsync timeout), and must not nap past
+    /// it afterwards.
+    fn push_credit_left(&self, left: Duration) -> Duration {
+        self.credit_deadline.map_or(left, |deadline| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(left)
+        })
+    }
+
     /// Push one stamped chunk into the network, porting bee 2.8.0's
     /// origin upload path (`pkg/pushsync::pushToClosest(origin=true)`
     /// followed by `pkg/pusher`'s shallow-receipt handling).
@@ -787,6 +834,14 @@ impl RoutingFetcher {
     /// * **Hard failures** (stream open / io / remote rejection) consume a
     ///   bounded budget ([`MAX_PUSH_ERRORS`], bee `maxPushErrors`); a
     ///   single mid-exchange `Io` gets one same-peer retry first.
+    /// * **Credit before every push** (issue #128, bee's `PrepareCredit`),
+    ///   with a settlement hook installed: a peer the push would take past
+    ///   its disconnect limit is skipped for [`OVERDRAFT_REFRESH`] and the
+    ///   next-closest peer is tried, without spending the error budget.
+    ///   With every candidate at its limit and nothing in flight, the walk
+    ///   waits for credit, at most [`CREDIT_WAIT_BUDGET`] (cut to the
+    ///   fetcher's credit deadline), then gives up with
+    ///   `no pushsync peer has credit`.
     ///
     /// Does **not** mutate the retrieval blacklist; push uses its own
     /// skip list because a peer that rejects a stamped write may still
@@ -851,7 +906,21 @@ impl RoutingFetcher {
         // that records the debit of every receipt that still arrives:
         // the storer debits us once it has written a receipt, whether or
         // not we are still listening.
-        let mut inflight = PushInFlight::new(self.pushsync_settlement.clone());
+        let mut inflight = PushInFlight::new(self.pushsync_settlement.is_some());
+
+        // Peers refused credit for this chunk in the current credit round:
+        // bee's `skip.Add(chunk, peer, overDraftRefresh)` after
+        // `PrepareCredit` returns `ErrOverdraft` (issue #128). Unlike
+        // `used`, the skip ends — at `credit_retry_at`, one
+        // `OVERDRAFT_REFRESH` after the round's first refusal, when every
+        // one of them may be asked again (bee's `PruneExpiresAfter` and
+        // retry) — and it costs no error budget.
+        let mut overdrawn: Vec<PeerId> = Vec::new();
+        let mut credit_retry_at: Option<tokio::time::Instant> = None;
+        // Time spent waiting for credit with every candidate overdrawn and
+        // nothing in flight; at most `credit_budget` per walk.
+        let mut credit_waited = Duration::ZERO;
+        let credit_budget = self.push_credit_budget();
 
         // `want` is bee's `retryC`: how many fresh attempts to dispatch to
         // the next-closest peers. Seed with one; the preemptive ticker and
@@ -875,16 +944,17 @@ impl RoutingFetcher {
         // delay (used for the same-peer transient retry). Pushes the
         // future onto `inflight`.
         macro_rules! dispatch {
-            ($peer:expr, $overlay:expr, $price:expr, $delay_ms:expr) => {{
+            ($peer:expr, $overlay:expr, $price:expr, $credit:expr, $delay_ms:expr) => {{
                 let peer = $peer;
                 let overlay = $overlay;
                 let price = $price;
+                let credit: Option<PushCredit> = $credit;
                 let mut control = self.control.clone();
                 let wire = wire.clone();
                 let stamp = stamp.clone();
                 let delay_ms: u64 = $delay_ms;
                 // Load-book the dispatch SYNCHRONOUSLY so the very next
-                // `next_push_peer` (for a concurrent chunk) already sees
+                // `push_candidates` (for a concurrent chunk) already sees
                 // this peer's in-flight count (Experiment 2). The guard
                 // moves into the attempt, so the slot is released however
                 // the attempt ends — finished, drained, or dropped
@@ -909,44 +979,107 @@ impl RoutingFetcher {
                     if let Some(g) = load_guard {
                         g.finish(started.elapsed());
                     }
-                    (peer, overlay, price, r)
+                    (peer, overlay, price, credit, r)
                 }));
             }};
         }
 
         loop {
-            // Fill the requested dispatch slots with the next-closest
-            // peers we haven't dialled yet for this chunk. Pre-settle each
-            // peer first (bee accepts the cheque, credits us, then accepts
-            // the chunk on the same connection — without this the next
-            // pushsync after a settlement threshold crossing would be
-            // RST'd by bee).
-            while want > 0 {
-                let Some((peer, overlay)) = self.next_push_peer(&chunk_addr, &used) else {
-                    break;
-                };
-                used.push(peer);
-                if let Some(s) = self.pushsync_settlement.as_ref() {
-                    s.note_pushsync(peer, 0).await;
-                }
-                let price = peer_chunk_price(&overlay, &chunk_addr);
-                dispatch!(peer, overlay, price, 0u64);
-                want -= 1;
+            // A credit round has run out: every peer refused credit in it
+            // may be asked again.
+            if credit_retry_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                overdrawn.clear();
+                credit_retry_at = None;
             }
+            // Fill the requested dispatch slots with the next-closest
+            // peers we haven't dialled yet for this chunk, each only once
+            // it has credit (bee's `PrepareCredit` before every push,
+            // issue #128): a peer this push would take past its
+            // disconnect limit is skipped until the round ends and the
+            // next-closest one is tried instead. Reserving also starts a
+            // payment to the peer when one is due (the mirror's settle
+            // step), in the background.
+            if want > 0 {
+                let excluded: Vec<PeerId> = used.iter().chain(&overdrawn).copied().collect();
+                for (peer, overlay) in self.push_candidates(&chunk_addr, &excluded) {
+                    if want == 0 {
+                        break;
+                    }
+                    let price = peer_chunk_price(&overlay, &chunk_addr);
+                    let Ok(credit) = self.prepare_push_credit(peer, price) else {
+                        trace!(
+                            target: "ant_retrieval::fetcher",
+                            %peer,
+                            price,
+                            "pushsync: peer is at its credit limit; trying the next-closest peer",
+                        );
+                        overdrawn.push(peer);
+                        continue;
+                    };
+                    used.push(peer);
+                    dispatch!(peer, overlay, price, credit, 0u64);
+                    want -= 1;
+                }
+            }
+            // Start the round's clock at its first refusal, whether or not
+            // the pass still filled its slots: the skip lasts one
+            // `OVERDRAFT_REFRESH` (bee's `skip.Add(.., overDraftRefresh)`),
+            // so a later hedge or re-dispatch may ask the refused peer
+            // again instead of passing over it for the rest of the walk
+            // (PR #138 R2-F1).
+            if !overdrawn.is_empty() && credit_retry_at.is_none() {
+                credit_retry_at = Some(tokio::time::Instant::now() + OVERDRAFT_REFRESH);
+            }
+            // When to ask the overdrawn peers again, while a dispatch slot
+            // is open for one of them.
+            let retry_at = credit_retry_at.filter(|_| want > 0);
 
             if inflight.futs.is_empty() {
-                // Nothing pending and no candidates left to dial.
+                // Nothing pending and no admissible candidate left. When
+                // peers were skipped only for credit, wait for it like
+                // bee's `pushToClosest` ("sleeping to refresh overdraft
+                // balance") and try them again, at most `credit_budget`
+                // per walk and never past the credit deadline (checked
+                // now, not only at walk start: a push that hung to its
+                // timeout may have outlived it); without a budget left,
+                // give up.
+                if let Some(at) = retry_at {
+                    let left = self.push_credit_left(credit_budget.saturating_sub(credit_waited));
+                    if !left.is_zero() {
+                        let nap = at
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(left);
+                        debug!(
+                            target: "ant_retrieval::fetcher",
+                            addr = %hex::encode(chunk_addr),
+                            overdrawn = overdrawn.len(),
+                            waited_ms = credit_waited.as_millis() as u64,
+                            "pushsync: every candidate peer is at its credit limit; waiting for credit",
+                        );
+                        tokio::time::sleep(nap).await;
+                        credit_waited += nap;
+                        // The budget is spent: end the round now, so the
+                        // last one asks every peer again before giving up.
+                        if self
+                            .push_credit_left(credit_budget.saturating_sub(credit_waited))
+                            .is_zero()
+                        {
+                            credit_retry_at = Some(tokio::time::Instant::now());
+                        }
+                        continue;
+                    }
+                }
                 break;
             }
 
             tokio::select! {
                 // Prefer draining results over firing more hedges.
                 biased;
-                Some((peer, overlay, price, res)) = inflight.futs.next() => {
+                Some((peer, overlay, price, credit, res)) = inflight.futs.next() => {
                     match res {
                         Ok(()) => {
-                            if let Some(s) = self.pushsync_settlement.as_ref() {
-                                s.note_pushsync(peer, price).await;
+                            if let Some(credit) = credit {
+                                credit.apply();
                             }
                             // A peer that just accepted a chunk is healthy
                             // right now: clear any cool-down so the next
@@ -968,8 +1101,8 @@ impl RoutingFetcher {
                             // receipt, shallow or deep, so every one is
                             // real debt the mirror must record — not just
                             // the one we finally accept (PR #134 R3-M1).
-                            if let Some(s) = self.pushsync_settlement.as_ref() {
-                                s.note_pushsync(peer, price).await;
+                            if let Some(credit) = credit {
+                                credit.apply();
                             }
                             shallow_attempts += 1;
                             shallow_seen = true;
@@ -1018,15 +1151,25 @@ impl RoutingFetcher {
                         Err(e) if is_transient_pushsync_error(&e) && !retried.contains(&peer) => {
                             // One same-peer retry on a fresh stream for a
                             // mid-exchange Io error (the connection was
-                            // alive moments ago).
+                            // alive moments ago). It is a new push, so it
+                            // needs credit of its own: the failed one's
+                            // reservation was released with it.
                             retried.push(peer);
-                            warn!(
-                                target: "ant_retrieval::fetcher",
-                                %peer,
-                                err=%e,
-                                "pushsync attempt failed; retrying same peer once on a fresh stream",
-                            );
-                            dispatch!(peer, overlay, price, 150u64);
+                            drop(credit);
+                            if let Ok(credit) = self.prepare_push_credit(peer, price) {
+                                warn!(
+                                    target: "ant_retrieval::fetcher",
+                                    %peer,
+                                    err=%e,
+                                    "pushsync attempt failed; retrying same peer once on a fresh stream",
+                                );
+                                dispatch!(peer, overlay, price, credit, 150u64);
+                            } else {
+                                // No credit for the retry: hedge onto the
+                                // next-closest peer instead.
+                                last_err = Some(e);
+                                want += 1;
+                            }
                         }
                         Err(e) => {
                             if is_stamp_rejection(&e) {
@@ -1076,7 +1219,28 @@ impl RoutingFetcher {
                     // concurrent attempt set to one more closest peer.
                     want += 1;
                 }
+                // The credit round ran out while a dispatch slot waits for
+                // a peer: ask the overdrawn ones again.
+                () = sleep_until_or_never(retry_at) => {}
             }
+        }
+
+        // Every candidate was at its credit limit for the whole credit
+        // budget and none was pushed to: say so, rather than as a generic
+        // exhaustion. The upload job re-queues the chunk; the gateway's
+        // patience loop re-walks it.
+        if used.is_empty() && !overdrawn.is_empty() {
+            debug!(
+                target: "ant_retrieval::fetcher",
+                addr = %hex::encode(chunk_addr),
+                overdrawn = overdrawn.len(),
+                waited_ms = credit_waited.as_millis() as u64,
+                "pushsync: no candidate peer had credit within the credit budget; giving up the walk",
+            );
+            return Err(crate::pushsync::no_push_credit_error(
+                overdrawn.len(),
+                credit_waited,
+            ));
         }
 
         // Candidate set / error budget exhausted. Bee never fails an
@@ -1132,6 +1296,15 @@ impl RoutingFetcher {
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
         )))
+    }
+}
+
+/// Sleep until `at`, or forever when there is nothing to wait for (a
+/// `select!` arm that never fires).
+async fn sleep_until_or_never(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2186,11 +2359,15 @@ fn spawn_drain_losers<S>(
     });
 }
 
-/// One pushsync attempt's outcome: `(peer, overlay, chunk_price, result)`.
+/// One pushsync attempt's outcome: `(peer, overlay, chunk_price, credit,
+/// result)`. `credit` is the reservation the attempt was admitted with
+/// ([`PushsyncSettlement::prepare_credit`]); `None` without a settlement
+/// hook.
 type PushAttempt = (
     PeerId,
     Overlay,
     u64,
+    Option<PushCredit>,
     Result<(), crate::pushsync::PushSyncError>,
 );
 
@@ -2201,7 +2378,8 @@ type PushAttemptFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Push
 /// with hedges still running, or the caller dropped the push), whatever is
 /// still in flight goes to a detached drain that records the debit of
 /// every receipt that still arrives — deep or shallow — in the pushsync
-/// settlement mirror. A storer applies the debit once it has written its
+/// settlement mirror (it applies the attempt's credit; an attempt that
+/// ends without a receipt releases it). A storer applies the debit once it has written its
 /// receipt, whether or not we read it, and the pseudosettle driver only
 /// refreshes a peer once its *mirrored* debt is due, so a dropped receipt
 /// is debt bee holds and nothing ever clears. Each attempt is bounded by
@@ -2211,19 +2389,22 @@ type PushAttemptFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Push
 /// receipt (or the up-to-45s timeout) instead of closing the moment the
 /// walk returns, so a push's streams can outlive the upload's concurrency
 /// window, and those attempts keep their [`crate::PushLoadGuard`] slot
-/// (counting toward the peer's push cap) until they end. Without a
+/// (counting toward the peer's push cap) and their credit reservation
+/// (counting toward the peer's disconnect limit, as bee's pushsync holds
+/// its `Action` until the push returns) until they end. Without a
 /// settlement hook nothing is drained: the attempts are dropped, which
 /// closes their streams and — via the guard — frees their load slots.
 struct PushInFlight {
     futs: FuturesUnordered<PushAttemptFuture>,
-    settlement: Option<Arc<dyn PushsyncSettlement>>,
+    /// A settlement hook is installed, so receipts are debited.
+    records_debits: bool,
 }
 
 impl PushInFlight {
-    fn new(settlement: Option<Arc<dyn PushsyncSettlement>>) -> Self {
+    fn new(records_debits: bool) -> Self {
         Self {
             futs: FuturesUnordered::new(),
-            settlement,
+            records_debits,
         }
     }
 }
@@ -2237,9 +2418,9 @@ impl Drop for PushInFlight {
         // Without a settlement hook there is nothing to record; dropping
         // the attempts closes their streams, and each attempt's
         // `PushLoadGuard` frees its push-load slot on drop (R4-M1).
-        let Some(settlement) = self.settlement.clone() else {
+        if !self.records_debits {
             return;
-        };
+        }
         // A drop outside any runtime (process teardown) has nowhere to
         // spawn to; the requests die with the runtime anyway.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -2247,12 +2428,14 @@ impl Drop for PushInFlight {
         }
         tokio::spawn(async move {
             let mut futs = futs;
-            while let Some((peer, _overlay, price, res)) = futs.next().await {
+            while let Some((_peer, _overlay, _price, credit, res)) = futs.next().await {
                 if matches!(
                     res,
                     Ok(()) | Err(crate::pushsync::PushSyncError::ShallowReceipt { .. })
                 ) {
-                    settlement.note_pushsync(peer, price).await;
+                    if let Some(credit) = credit {
+                        credit.apply();
+                    }
                 }
             }
         });
@@ -2406,16 +2589,241 @@ fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
 mod tests {
     use super::*;
 
-    /// Records every `note_pushsync` call.
+    /// Grants every credit and records each one applied.
     #[derive(Default)]
-    struct RecordingSettlement(Mutex<Vec<(PeerId, u64)>>);
+    struct RecordingSettlement(Arc<Mutex<Vec<(PeerId, u64)>>>);
 
-    #[async_trait]
+    struct RecordedCredit {
+        applied: Arc<Mutex<Vec<(PeerId, u64)>>>,
+        peer: PeerId,
+        price: u64,
+    }
+
+    impl crate::PushCreditAction for RecordedCredit {
+        fn apply(self: Box<Self>) {
+            self.applied.lock().unwrap().push((self.peer, self.price));
+        }
+    }
+
     impl PushsyncSettlement for RecordingSettlement {
-        async fn note_pushsync(&self, peer: PeerId, price: u64) {
-            self.0.lock().unwrap().push((peer, price));
+        fn prepare_credit(&self, peer: PeerId, price: u64) -> Option<PushCredit> {
+            Some(PushCredit::new(RecordedCredit {
+                applied: self.0.clone(),
+                peer,
+                price,
+            }))
         }
         fn forget(&self, _peer: &PeerId) {}
+    }
+
+    /// Bee's `PrepareCredit` over an accounting mirror, as
+    /// `ant-p2p::push_pseudosettle` does it.
+    struct MirrorSettlement(Arc<Accounting>);
+
+    impl PushsyncSettlement for MirrorSettlement {
+        fn prepare_credit(&self, peer: PeerId, price: u64) -> Option<PushCredit> {
+            self.0.try_reserve(peer, price).map(PushCredit::new)
+        }
+        fn forget(&self, peer: &PeerId) {
+            self.0.forget(peer);
+        }
+    }
+
+    /// A push fetcher over `peers` whose pushes get credit from `acc`
+    /// and are booked in a one-slot push-load tracker, so a peer is
+    /// `at_cap` exactly while a push to it is in flight. Pushes never
+    /// get an answer (the stream behaviour is never polled), so they stay
+    /// in flight until the pushsync timeout.
+    fn credit_gated_push_fetcher(
+        peers: Vec<(PeerId, Overlay)>,
+        acc: &Arc<Accounting>,
+    ) -> (
+        RoutingFetcher,
+        Arc<crate::PushLoadTracker>,
+        libp2p_stream::Behaviour,
+    ) {
+        let behaviour = libp2p_stream::Behaviour::default();
+        let load = Arc::new(crate::PushLoadTracker::new(1));
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), peers)
+            .with_network_id(1)
+            .with_push_load(load.clone())
+            .with_pushsync_settlement(Arc::new(MirrorSettlement(acc.clone())));
+        (fetcher, load, behaviour)
+    }
+
+    /// Take every unit of `peer`'s credit (its whole disconnect limit).
+    fn hold_all_credit(acc: &Accounting, peer: PeerId) -> DebitGuard {
+        acc.try_reserve(peer, crate::accounting::OVERDRAFT_LIMIT)
+            .expect("a fresh peer has its whole limit")
+    }
+
+    /// Issue #128, bee's `PrepareCredit` before every push: the closest
+    /// peer is at its credit limit, so the push goes to the next-closest
+    /// peer, with that peer's price reserved, instead of taking the
+    /// closest one past its disconnect limit.
+    #[tokio::test(start_paused = true)]
+    async fn push_skips_a_peer_at_its_credit_limit() {
+        let addr = [0u8; 32];
+        let (near, far) = (PeerId::random(), PeerId::random());
+        let (near_o, far_o) = ([0x01u8; 32], [0x80u8; 32]);
+        let acc = Arc::new(Accounting::new());
+        let held = hold_all_credit(&acc, near);
+        let (fetcher, load, _behaviour) =
+            credit_gated_push_fetcher(vec![(near, near_o), (far, far_o)], &acc);
+        let push = tokio::spawn(async move {
+            fetcher
+                .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !load.at_cap(&near),
+            "pushed to the closest peer although it is at its credit limit",
+        );
+        assert!(load.at_cap(&far), "the next-closest peer gets the push");
+        assert_eq!(
+            acc.debug_snapshot(&far),
+            Some((0, peer_chunk_price(&far_o, &addr))),
+            "the push holds the far peer's price",
+        );
+        assert_eq!(
+            acc.debug_snapshot(&near),
+            Some((0, crate::accounting::OVERDRAFT_LIMIT)),
+        );
+        push.abort();
+        drop(held);
+    }
+
+    /// Issue #128: with every candidate at its credit limit, the push
+    /// waits for credit, like bee's `pushToClosest` ("sleeping to refresh
+    /// overdraft balance"), and pushes as soon as the peer has credit
+    /// again, within one `OVERDRAFT_REFRESH`.
+    #[tokio::test(start_paused = true)]
+    async fn push_waits_for_credit_then_pushes() {
+        let addr = [0u8; 32];
+        let (p, o) = (PeerId::random(), [0x80u8; 32]);
+        let acc = Arc::new(Accounting::new());
+        let held = hold_all_credit(&acc, p);
+        let (fetcher, load, _behaviour) = credit_gated_push_fetcher(vec![(p, o)], &acc);
+        let push = tokio::spawn(async move {
+            fetcher
+                .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+                .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!push.is_finished(), "the push waits for credit");
+        assert!(!load.at_cap(&p), "pushed past the peer's credit limit");
+        drop(held); // a refresh or a payment freed the peer's credit
+        tokio::time::sleep(OVERDRAFT_REFRESH + Duration::from_millis(10)).await;
+        assert!(load.at_cap(&p), "pushed once the peer had credit");
+        assert_eq!(
+            acc.debug_snapshot(&p),
+            Some((0, peer_chunk_price(&o, &addr)))
+        );
+        push.abort();
+    }
+
+    /// Push `addr` on `fetcher` until it gives up; how long it took and
+    /// why.
+    async fn push_until_refused(fetcher: &RoutingFetcher, addr: [u8; 32]) -> (Duration, String) {
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(
+            CREDIT_WAIT_BUDGET * 3,
+            fetcher.push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE]),
+        )
+        .await
+        .expect("the credit wait must be bounded")
+        .expect_err("the peer never has credit");
+        (started.elapsed(), err.to_string())
+    }
+
+    /// Issue #128: the credit wait is bounded per walk by
+    /// `CREDIT_WAIT_BUDGET`, cut to the fetcher's credit deadline, which
+    /// the gateway's push paths share across their re-walks; past it a
+    /// walk gives up at once. The walk never pushes past the limit, and
+    /// says why it gave up.
+    #[tokio::test(start_paused = true)]
+    async fn push_credit_wait_is_bounded() {
+        let addr = [0u8; 32];
+        let (p, o) = (PeerId::random(), [0x80u8; 32]);
+        let acc = Arc::new(Accounting::new());
+        let _held = hold_all_credit(&acc, p);
+        let (fetcher, load, _behaviour) = credit_gated_push_fetcher(vec![(p, o)], &acc);
+        let (took, err) = push_until_refused(&fetcher, addr).await;
+        assert_eq!(took, CREDIT_WAIT_BUDGET, "{err}");
+        assert!(err.starts_with("no pushsync peer has credit"), "{err}");
+        assert!(!load.at_cap(&p));
+
+        let (fetcher, _load, _behaviour) = credit_gated_push_fetcher(vec![(p, o)], &acc);
+        let fetcher =
+            fetcher.with_credit_deadline(tokio::time::Instant::now() + Duration::from_secs(3));
+        let (took, err) = push_until_refused(&fetcher, addr).await;
+        assert_eq!(took, Duration::from_secs(3), "{err}");
+        let (took, err) = push_until_refused(&fetcher, addr).await;
+        assert_eq!(took, Duration::ZERO, "past the deadline: {err}");
+        assert!(err.starts_with("no pushsync peer has credit"), "{err}");
+    }
+
+    /// PR #138 R1-M1: the credit deadline is re-read before every nap,
+    /// not once at walk start. The closest peer has credit and hangs to
+    /// its pushsync timeout while the other one stays overdrawn; when
+    /// the hung push fails, the deadline has passed, so the walk gives
+    /// up at once instead of napping its leftover per-walk budget.
+    #[tokio::test(start_paused = true)]
+    async fn push_does_not_nap_past_the_credit_deadline() {
+        let addr = [0u8; 32];
+        let (near, far) = (PeerId::random(), PeerId::random());
+        let acc = Arc::new(Accounting::new());
+        let _held = hold_all_credit(&acc, far);
+        let (fetcher, _load, _behaviour) =
+            credit_gated_push_fetcher(vec![(near, [0x01u8; 32]), (far, [0x80u8; 32])], &acc);
+        let fetcher =
+            fetcher.with_credit_deadline(tokio::time::Instant::now() + CREDIT_WAIT_BUDGET);
+        let started = tokio::time::Instant::now();
+        let err = fetcher
+            .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+            .await
+            .expect_err("the near peer never answers, the far one never has credit");
+        assert!(crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT > CREDIT_WAIT_BUDGET);
+        assert_eq!(
+            started.elapsed(),
+            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
+            "{err}"
+        );
+    }
+
+    /// PR #138 R2-F1: a peer refused credit in a pass that still filled
+    /// its slot is skipped for one `OVERDRAFT_REFRESH`, not for the rest
+    /// of the walk. The closest peer is overdrawn at the first dispatch
+    /// and has credit again soon after; the 5 s preemptive hedge goes to
+    /// it, not to the farthest peer.
+    #[tokio::test(start_paused = true)]
+    async fn push_hedge_asks_a_peer_again_once_its_credit_round_ends() {
+        let addr = [0u8; 32];
+        let (near, mid, far) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let acc = Arc::new(Accounting::new());
+        let held = hold_all_credit(&acc, near);
+        let (fetcher, load, _behaviour) = credit_gated_push_fetcher(
+            vec![
+                (near, [0x01u8; 32]),
+                (mid, [0x40u8; 32]),
+                (far, [0x80u8; 32]),
+            ],
+            &acc,
+        );
+        let push = tokio::spawn(async move {
+            fetcher
+                .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(load.at_cap(&mid), "the first push skips the overdrawn peer");
+        assert!(!load.at_cap(&near));
+        drop(held); // the closest peer has credit again
+        tokio::time::sleep(RoutingFetcher::PREEMPTIVE_INTERVAL).await;
+        assert!(load.at_cap(&near), "the hedge asks the closest peer again");
+        assert!(!load.at_cap(&far), "the hedge passed over the closest peer");
+        push.abort();
     }
 
     /// Pushes still in flight when `push_stamped_chunk` returns (a winner
@@ -2429,7 +2837,7 @@ mod tests {
         let rec = Arc::new(RecordingSettlement::default());
         let (deep, shallow, failed) = (PeerId::random(), PeerId::random(), PeerId::random());
         {
-            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            let inflight = PushInFlight::new(true);
             for (peer, price, delay, res) in [
                 (deep, 110_000u64, 3u64, Ok(())),
                 (
@@ -2448,9 +2856,10 @@ mod tests {
                     Err(PushSyncError::Remote("nope".into())),
                 ),
             ] {
+                let credit = rec.prepare_credit(peer, price);
                 inflight.futs.push(Box::pin(async move {
                     tokio::time::sleep(Duration::from_secs(delay)).await;
-                    (peer, [0u8; 32], price, res)
+                    (peer, [0u8; 32], price, credit, res)
                 }));
             }
             // Dropped with all three still pending.
@@ -2471,24 +2880,25 @@ mod tests {
     async fn dropped_push_attempts_release_push_load() {
         let load = Arc::new(crate::PushLoadTracker::new(1));
         let peer = PeerId::random();
+        let rec = Arc::new(RecordingSettlement::default());
         let attempt = |load: &Arc<crate::PushLoadTracker>| -> PushAttemptFuture {
             let guard = load.book(peer);
+            let credit = rec.prepare_credit(peer, 1);
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 guard.finish(Duration::from_secs(5));
-                (peer, [0u8; 32], 1, Ok(()))
+                (peer, [0u8; 32], 1, credit, Ok(()))
             })
         };
         {
-            let inflight = PushInFlight::new(None);
+            let inflight = PushInFlight::new(false);
             inflight.futs.push(attempt(&load));
             assert!(load.at_cap(&peer));
         }
         assert!(!load.at_cap(&peer), "dropped attempt leaked its slot");
 
-        let rec = Arc::new(RecordingSettlement::default());
         {
-            let inflight = PushInFlight::new(Some(rec.clone() as Arc<dyn PushsyncSettlement>));
+            let inflight = PushInFlight::new(true);
             inflight.futs.push(attempt(&load));
         }
         assert!(load.at_cap(&peer), "drained attempt is still in flight");

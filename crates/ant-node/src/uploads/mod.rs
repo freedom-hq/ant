@@ -5542,6 +5542,23 @@ mod tests {
         );
     }
 
+    /// Issue #128 / PR #138 R1-M2: a walk that gives up because every
+    /// candidate peer stayed at its credit limit is a momentary state of
+    /// the neighbourhood (credit comes back with refreshes and payments),
+    /// so the upload job must re-queue the chunk, not fail. The message is
+    /// built by the real constructor and wrapped as the daemon acks it
+    /// (`pushsync: {e}`), so a rewording that trips a fatal marker
+    /// ("saturated", "not usable", …) fails here instead of in the field.
+    #[test]
+    fn no_push_credit_error_is_transient_for_uploads() {
+        let e = ant_retrieval::pushsync::no_push_credit_error(3, Duration::from_secs(10));
+        let msg = format!("pushsync: {e}");
+        assert!(
+            !is_fatal_push_error(&msg),
+            "an all-overdrawn neighbourhood must re-queue the chunk, not fail the job: {msg}",
+        );
+    }
+
     /// Pin the escalation schedule: quick early re-checks (a fresh
     /// upload usually settles within minutes), backing off to the cap.
     #[test]

@@ -39,6 +39,19 @@ const RECEIPT_MAX: usize = 4 * 1024;
 /// and we never see the late ack.
 const PUSHSYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// The error a push walk gives up with when every candidate peer stayed
+/// at its credit limit for the whole credit budget (issue #128). One
+/// constructor, so the upload job's string classifiers
+/// (`ant-node::uploads::is_fatal_push_error` / `is_no_peer_error`, which
+/// see it as `pushsync: <this>`) can be pinned against the real text: it
+/// must stay transient: the chunk is re-queued, not the job failed.
+#[must_use]
+pub fn no_push_credit_error(overdrawn: usize, waited: Duration) -> PushSyncError {
+    PushSyncError::Remote(format!(
+        "no pushsync peer has credit: {overdrawn} candidate peer(s) at their credit limit after waiting {waited:?}",
+    ))
+}
+
 #[derive(Debug, Error)]
 pub enum PushSyncError {
     #[error("io: {0}")]
