@@ -326,7 +326,8 @@ impl ChainInit {
     /// on-chain that isn't registered yet (a reinstall or restore from
     /// key leaves them on-chain but not on disk). Uses the same saved
     /// transfer scan as `antd` and `ant_storage_discover`, so only the
-    /// first start reads the full history (#118). A new issuer starts at
+    /// first start reads the full history (#118); `ant_storage_discover_full`
+    /// is the way to read it all again. A new issuer starts at
     /// index 0, as in `antd` without a bee `stamperstore`.
     async fn rediscover_owned(
         &self,
@@ -338,7 +339,7 @@ impl ChainInit {
         if *rediscovered {
             return;
         }
-        let found = match owned_batches(chain, &self.upload.batch_owner, data_dir).await {
+        let found = match owned_batches(chain, &self.upload.batch_owner, data_dir, false).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!(
@@ -951,35 +952,56 @@ pub(crate) fn storage_connect_batch(
 }
 
 /// The funded postage batches `owner` holds on Gnosis, from the saved
-/// transfer scan in `data_dir` (brought up to the chain head first).
+/// transfer scan in `data_dir` (brought up to the chain head first), or
+/// with `full_rescan` from a scan of the whole history that replaces it.
 #[cfg(feature = "chain")]
 async fn owned_batches(
     chain: &ant_chain::ChainClient,
     owner: &[u8; 20],
     data_dir: &std::path::Path,
+    full_rescan: bool,
 ) -> Result<Vec<ant_chain::discover::DiscoveredBatch>, ant_chain::RpcError> {
-    let scan = ant_chain::discover::refresh_transfer_scan(
-        chain,
-        ant_chain::GNOSIS_BZZ_TOKEN,
-        owner,
-        data_dir,
-    )
-    .await?;
+    let scan = if full_rescan {
+        ant_chain::discover::rescan_transfer_history(
+            chain,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+        )
+        .await?
+    } else {
+        ant_chain::discover::refresh_transfer_scan(
+            chain,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+        )
+        .await?
+    };
     ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan).await
 }
 
 /// Auto-discover every funded postage batch this account owns on Gnosis
-/// (the saved transfer scan, then the blocks since) and register each one.
-/// Returns `{"registered":[...],"status":<plan>}`.
+/// and register each one. Returns `{"registered":[...],"status":<plan>}`.
+///
+/// Continues the saved transfer scan (only the blocks since, #118), or
+/// with `full_rescan` (`ant_storage_discover_full`) reads the account's
+/// whole transfer history again and replaces it: the way back from a
+/// saved scan an RPC once answered incompletely, which nothing automatic
+/// revisits. Hosts call the plain form at every start, so it stays cheap.
 #[cfg(feature = "chain")]
-pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+pub(crate) fn storage_discover(
+    h: &AntHandle,
+    rpc: String,
+    full_rescan: bool,
+) -> Result<String, DriveError> {
     let cmd_tx = h.cmd_tx.clone();
     let eth = h.eth;
     let secret = h.signing_secret;
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let found = owned_batches(&chain, &eth, &data_dir)
+        let found = owned_batches(&chain, &eth, &data_dir, full_rescan)
             .await
             .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
         let mut registered = Vec::new();
@@ -2370,26 +2392,20 @@ async fn resolve_or_deploy_chequebook(
 
     // 2. Rediscover a chequebook this node EOA already owns on-chain
     //    (reinstall with a restored key). Adopt + persist it.
-    let owned = match ant_chain::discover::refresh_transfer_scan(
+    //    Reads the saved transfer scan; a "none" that would lead to the
+    //    deploy below is first confirmed with a full rescan, so a saved
+    //    scan that missed a deposit can't strand it behind a second
+    //    chequebook.
+    let owned = ant_chain::discover::find_owned_chequebook(
         client,
+        &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+        ant_chain::GNOSIS_POSTAGE_STAMP,
         ant_chain::GNOSIS_BZZ_TOKEN,
         &node_eth,
         data_dir,
+        may_deploy,
     )
-    .await
-    {
-        Ok(scan) => {
-            ant_chain::discover::owned_chequebook_in(
-                client,
-                &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
-                ant_chain::GNOSIS_POSTAGE_STAMP,
-                ant_chain::GNOSIS_BZZ_TOKEN,
-                &scan,
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    .await;
     match owned {
         Ok(Some(cb)) => {
             if let Err(e) = chequebook_store::persist_chequebook(
@@ -2997,6 +3013,7 @@ mod chain_tests {
                 )
             };
             let result = match method.as_str() {
+                "eth_chainId" => json!("0x64"),
                 "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
                 "eth_getLogs" => json!([{
                     "address": ant_chain::GNOSIS_BZZ_TOKEN,
@@ -3528,6 +3545,7 @@ mod chain_tests {
             self.seen.lock().unwrap().push(method.clone());
             let id = req["id"].clone();
             let result = match method.as_str() {
+                "eth_chainId" => json!("0x64"),
                 "eth_blockNumber" => json!(format!("0x{:x}", HIT_BLOCK + 500)),
                 // A backend that hasn't seen the tx (yet).
                 "eth_getTransactionReceipt" => serde_json::Value::Null,

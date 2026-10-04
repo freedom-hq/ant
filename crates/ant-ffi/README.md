@@ -170,7 +170,7 @@ target/aarch64-apple-ios/release/libant_ffi.a       # device
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `chain` | off | `ant_storage_connect_batch`, `ant_storage_discover`, `ant_storage_quote`, `ant_storage_buy`, `ant_storage_buy_xdai` — anything that reads or writes Gnosis. Pulls reqwest + rustls into the slice, so download-only apps should leave it off. Without it those functions return an error. |
+| `chain` | off | `ant_storage_connect_batch`, `ant_storage_discover`, `ant_storage_discover_full`, `ant_storage_quote`, `ant_storage_buy`, `ant_storage_buy_xdai` — anything that reads or writes Gnosis. Pulls reqwest + rustls into the slice, so download-only apps should leave it off. Without it those functions return an error. |
 | `jni` | off | Android-only JNI exports. Never needed on iOS. |
 
 ## 2. Wire up the Xcode project
@@ -294,7 +294,7 @@ commented contract. Summary:
 | Streaming (ranged reads, e.g. video) | `ant_stream_open`, `ant_stream_read`, `ant_stream_pull`, `ant_stream_progress`, `ant_stream_close` |
 | Uploads | `ant_upload_start`, `ant_upload_list`, `ant_upload_status`, `ant_upload_pause` / `_resume` / `_cancel` |
 | Storage plans (postage) | `ant_storage_status`, `ant_storage_settlement_status`, `ant_storage_verify_propagation` |
-| Storage plans, on-chain (`chain` feature) | `ant_storage_connect_batch`, `ant_storage_discover`, `ant_storage_quote`, `ant_storage_buy`, `ant_storage_buy_xdai` |
+| Storage plans, on-chain (`chain` feature) | `ant_storage_connect_batch`, `ant_storage_discover`, `ant_storage_discover_full`, `ant_storage_quote`, `ant_storage_buy`, `ant_storage_buy_xdai` |
 
 References accept `64-hex`, `bytes://<hex>`, or `bzz://<hex>[/path]`.
 The structured calls return JSON documents (shapes documented per

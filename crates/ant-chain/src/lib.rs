@@ -301,6 +301,25 @@ impl ChainClient {
         u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(format!("eth_blockNumber: {e}")))
     }
 
+    /// The RPC's chain id (`eth_chainId`). Keys state saved from a
+    /// chain scan, so a scan made against one chain is never resumed
+    /// against another.
+    pub async fn eth_chain_id(&self) -> Result<u64, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_chainId",
+            "params": [],
+        });
+        let v = self.rpc(&body).await?;
+        if let Some(msg) = rpc_error_message(&v) {
+            return Err(RpcError::Rpc(msg));
+        }
+        let s = rpc_result_str(&v)?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(format!("eth_chainId: {e}")))
+    }
+
     /// `PostageStamp.lastPrice()` — current price per chunk per block
     /// (PLUR), the value bee-js's stamp-cost math reads from
     /// `/chainstate.currentPrice`.
