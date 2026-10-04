@@ -221,6 +221,20 @@ pub const MINIMUM_PAYMENT: u64 = LIGHT_REFRESH_RATE_PER_SEC / 5;
 /// (any cheque worth at least one unit is accepted, `ErrChequeValueTooLow`).
 /// With no refresh due the floor never bites: `PeerBalance::cheque_due`
 /// already pays only a settled debt of at least this much.
+///
+/// "The refresh clears it" assumes the refresh is landing. When
+/// refreshes stall (rejected, timing out), `refreshDue` keeps growing by
+/// one refresh second per second since the last *accepted* refresh, and
+/// a cheque needs `balance ≥ (whole seconds + 1) × refresh rate`. So the
+/// floor stops cheques about a second sooner than bee's would: from 3 s
+/// after the last accepted refresh only a debt of at least 1.8 M (past
+/// [`OVERDRAFT_LIMIT`], reachable only by already-incurred push debt)
+/// is paid, and from 4 s nothing within bee's light ceiling
+/// (`disconnectLimit + refreshRate` = 2.1375 M) is, until a refresh
+/// lands. Bee's [`MINIMUM_PAYMENT`] floor stops one second later (a
+/// 250 k cheque 3.2 s after the refresh on a 1.6 M debt; nothing from
+/// 5 s), so the gap is bounded to that second, and retrieval itself
+/// never admits past [`OVERDRAFT_LIMIT`] either way.
 pub const MINIMUM_CHEQUE: u64 = LIGHT_REFRESH_RATE_PER_SEC;
 
 /// After a failed SWAP payment to a peer, no new one to that peer for
@@ -502,8 +516,10 @@ impl PeerBalance {
     /// cover (`balance − refreshDue − shadowReserved`, where `refreshDue`
     /// is a light refresh rate per whole second since the last accepted
     /// refresh) and must be at least [`MINIMUM_CHEQUE`] (issue #131: below
-    /// that, the refresh due within a second pays it for free, and a
-    /// cheque would cost the peer as much as a large one). A peer never
+    /// that, the refresh due within a second pays it for free if it
+    /// lands, and a cheque would cost the peer as much as a large one;
+    /// while refreshes stall, this stops cheques about a second sooner
+    /// than bee's floor, see [`MINIMUM_CHEQUE`]). A peer never
     /// refreshed has, as in bee (zero refresh timestamp), everything
     /// still due to the refresh, so it's not paid.
     ///
@@ -1310,6 +1326,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// While refreshes stall, the floor stops cheques a second sooner than
+    /// bee's [`MINIMUM_PAYMENT`] would (PR #139 R1-M1): 3.2 s after the
+    /// last accepted refresh a 1.6 M debt leaves 250 k past the refresh's
+    /// share, not sent; at 2.2 s the same debt still pays 700 k; from 4 s
+    /// not even bee's light ceiling (2.1375 M) is worth a cheque.
+    #[tokio::test]
+    async fn a_stalled_refresh_stops_cheques_a_second_before_bee() {
+        let cheque = |backdate_ms: u64, debt: u64| async move {
+            let payer = Arc::new(Payer::default());
+            let acc = paying(&payer);
+            let peer = PeerId::random();
+            acc.credit(peer, 0);
+            acc.backdate_refresh(&peer, Duration::from_millis(backdate_ms));
+            acc.debit(peer, debt);
+            settle_payments().await;
+            payer
+                .calls()
+                .into_iter()
+                .map(|(_, a)| a)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cheque(2_200, 1_600_000).await, vec![700_000]);
+        assert_eq!(cheque(3_200, 1_600_000).await, Vec::<u64>::new());
+        assert_eq!(cheque(3_200, 1_800_000).await, vec![450_000]);
+        let ceiling = LIGHT_DISCONNECT_LIMIT + LIGHT_REFRESH_RATE_PER_SEC;
+        assert_eq!(cheque(4_200, ceiling).await, Vec::<u64>::new());
+        // Bee's floor would still pay the first and last of those.
+        const { assert!(1_600_000 - 3 * LIGHT_REFRESH_RATE_PER_SEC >= MINIMUM_PAYMENT) };
+        assert!(
+            ceiling - 4 * LIGHT_REFRESH_RATE_PER_SEC >= MINIMUM_PAYMENT,
+            "{ceiling}"
+        );
     }
 
     /// Debt incurred past the overdraft limit (a pushed chunk, debited by
