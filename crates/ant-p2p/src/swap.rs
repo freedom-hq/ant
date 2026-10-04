@@ -768,9 +768,13 @@ struct JournalIo {
     retired: bool,
     /// Bytes in the current journal up to its last durable group commit.
     len: u64,
-    /// The last commit mark used in the current journal (see
-    /// [`journal_intact_len`]). Taken before each write, so a write that
-    /// fails still uses up its number.
+    /// The last durable commit mark in the current journal (see
+    /// [`journal_intact_len`]). Advanced only once a group commit is
+    /// synced: a write that fails is cut off before the retry
+    /// ([`Self::resume`]), so the retry takes the failed write's number
+    /// and its mark follows the last durable one with no gap — a crash
+    /// tearing the retry then reads as a torn tail, not damage
+    /// (PR #141 R5-M1).
     marks: u64,
     /// A write failed and its handle was dropped: where the journal ends
     /// as far as anything acknowledged goes. The next open cuts it back
@@ -785,7 +789,8 @@ struct Resume {
     /// The journal it is about, so it is never applied to another file
     /// that took the path.
     file: std::fs::Metadata,
-    /// [`JournalIo::marks`] at the failure.
+    /// [`JournalIo::marks`] at the failure: the last durable mark, the
+    /// failed write's own not counted.
     marks: u64,
 }
 
@@ -873,16 +878,19 @@ impl JournalIo {
         let f = self.file.as_mut().expect("opened above");
         // The commit mark closes the group commit: see
         // [`journal_intact_len`].
-        self.marks += 1;
+        // `marks` advances only once this commit is durable: see
+        // [`Self::marks`].
+        let mark = self.marks + 1;
         let mut group = Vec::with_capacity(buf.len() + 24);
         group.extend_from_slice(buf);
-        group.extend_from_slice(format!("#{}\n", self.marks).as_bytes());
+        group.extend_from_slice(format!("#{mark}\n").as_bytes());
         let written = f
             .write_all(&group)
             .and_then(|()| f.sync_data())
             .and_then(|()| sync_failure_hook());
         if written.is_ok() {
             self.len += group.len() as u64;
+            self.marks = mark;
         } else {
             // Without the handle's metadata the next open can't be sure
             // it reopened this file, and falls back to
@@ -4286,6 +4294,11 @@ mod tests {
         assert!(after.starts_with(&c1));
         let retry = after[c1.len()..].to_vec();
         assert!(!retry.starts_with(&failed), "the failed write was cut off");
+        assert!(failed.ends_with(b"#2\n"));
+        assert!(
+            retry.ends_with(b"#2\n"),
+            "the retry takes the cut-off write's number: no gap (PR #141 R5-M1)"
+        );
         let b2 = hex::encode(beneficiary(2));
         assert_eq!(
             String::from_utf8_lossy(&after).matches(b2.as_str()).count(),
@@ -4300,17 +4313,61 @@ mod tests {
         assert!(l.lost_figures().is_none());
         crash(&path, [l]);
 
-        // The layout an uncut retry would have left, with the failed
-        // write zeroed by a crash: never a silent drop.
+        // The layout an uncut retry would have left (the fallback when
+        // the failed handle's metadata was unreadable: the failed write's
+        // mark stays in the file and the retry numbers past it), with the
+        // failed write zeroed by a crash: never a silent drop.
         let mut disk = c1.clone();
         disk.extend(std::iter::repeat_n(0u8, failed.len()));
-        disk.extend_from_slice(&retry);
+        disk.extend_from_slice(&retry[..retry.len() - 3]);
+        disk.extend_from_slice(b"#3\n");
         std::fs::remove_file(&path).ok();
         std::fs::write(&jp, &disk).unwrap();
         assert_eq!(journal_intact_len(&disk), disk.len(), "damage, not torn");
         let l = OutboundLedger::open(Some(path.clone()), cb);
         assert!(l.lost_figures().is_some(), "acked cheques may be lost");
         assert!(lost_marker_path(&path).exists());
+        crash(&path, [l]);
+    }
+
+    /// A crash that tears the retry of a failed commit — its lines
+    /// zeroed, its trailing mark surviving — reads as a torn tail, the
+    /// same as the same tear without a failure before it: the retry was
+    /// never acknowledged, so nothing is lost and no marker gates the
+    /// chequebook. The cut-off write's number isn't burned, so the
+    /// retry's mark follows the last durable one (PR #141 R5-M1).
+    #[test]
+    fn a_torn_retry_after_a_failed_commit_is_torn_not_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc8u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        let c1 = std::fs::read(&jp).unwrap();
+        FAIL_NEXT_SYNC.with(|f| f.set(true));
+        assert!(l.record_issued(&beneficiary(2), U256::from(20u64)).is_err());
+        l.record_issued(&beneficiary(3), U256::from(5u64)).unwrap();
+        crash(&path, [l]);
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&c1));
+        assert!(
+            after.ends_with(b"#2\n"),
+            "{}",
+            String::from_utf8_lossy(&after)
+        );
+
+        // The crash zero-fills the retry's lines, its mark survives.
+        let mut torn = after.clone();
+        let len = torn.len();
+        torn[c1.len()..len - 3].fill(0);
+        assert_eq!(journal_intact_len(&torn), c1.len(), "torn, not damage");
+        std::fs::remove_file(&path).ok();
+        std::fs::write(&jp, &torn).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.total_issued(), U256::from(10u64));
+        assert!(l.lost_figures().is_none(), "nothing acknowledged was lost");
+        assert!(!lost_marker_path(&path).exists());
         crash(&path, [l]);
     }
 
