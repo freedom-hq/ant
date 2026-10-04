@@ -2737,6 +2737,10 @@ pub unsafe extern "C" fn ant_storage_connect_batch(
 /// `{"registered":[...ids],"status":<plan>}`. Requires the `chain`
 /// build feature.
 ///
+/// Continues the scan saved in the data dir, so after the first call
+/// only the blocks since are read (#118). [`ant_storage_discover_full`]
+/// reads the whole history again.
+///
 /// # Safety
 ///
 /// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
@@ -2753,7 +2757,46 @@ pub unsafe extern "C" fn ant_storage_discover(
             let rpc = cstr_to_string(gnosis_rpc)?;
             #[cfg(feature = "chain")]
             {
-                drive::storage_discover(h, rpc).map_err(|e| e.to_string())
+                drive::storage_discover(h, rpc, false).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// [`ant_storage_discover`], but reading the account's whole xBZZ
+/// transfer history again instead of continuing the saved scan, and
+/// replacing it. For a user's explicit "search again" when a plan they
+/// own is missing: an RPC that once answered part of the history
+/// incompletely (a backend far behind the head) leaves a hole the saved
+/// scan never revisits. As slow as the first scan behind a range-capped
+/// RPC (minutes), so don't call it at every start. Same return value.
+/// Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_discover_full(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_discover_full", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_discover(h, rpc, true).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {

@@ -6,19 +6,21 @@
 //! data dir carried over from bee — same key, no sidecar registry —
 //! comes back up with its existing on-chain state intact:
 //!
-//! 1. [`discover_owned_batches`] — the postage batches this EOA owns
+//! 1. [`owned_batches_in`] — the postage batches this EOA owns
 //!    and that are still funded, so they can be re-registered as usable
 //!    stamp issuers.
-//! 2. [`discover_owned_chequebook`] — the SWAP chequebook this EOA
+//! 2. [`owned_chequebook_in`] — the SWAP chequebook this EOA
 //!    deployed, so the node adopts it instead of deploying a fresh one
 //!    (stranding the old balance).
 //!
-//! Both reuse a single cheap scan: the ERC-20 `Transfer` event on the
-//! xBZZ token, filtered by the indexed `from` topic = node EOA. That
-//! filter returns only the node's own outgoing transfers (a tiny set),
-//! and every funded chequebook / bought batch was paid for by an
-//! ERC-20 transfer *from* the node EOA, so the target addresses are all
-//! in the `to` field of that set.
+//! Both read a single cheap scan, [`refresh_transfer_scan`]: the ERC-20
+//! `Transfer` event on the xBZZ token, filtered by the indexed `from`
+//! topic = node EOA. That filter returns only the node's own outgoing
+//! transfers (a tiny set), and every funded chequebook / bought batch
+//! was paid for by an ERC-20 transfer *from* the node EOA, so the target
+//! addresses are all in the `to` field of that set. The scan is saved in
+//! the data dir and continued on the next start, so only the first start
+//! reads the history from the xBZZ deploy block.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -75,6 +77,450 @@ pub struct DiscoveredBatch {
     pub remaining_balance: u128,
 }
 
+/// Blocks below the chain head that a scan doesn't yet count as scanned.
+/// Transfers in this tail are used, but the next scan reads the tail
+/// again, so neither of these leaves a permanent hole in the saved scan:
+///
+/// - a reorg (Gnosis finalises within ~64 blocks);
+/// - a load-balanced RPC whose `eth_blockNumber` and `eth_getLogs` land
+///   on different backends, the second one behind: it answers `[]` for
+///   blocks it hasn't seen yet rather than an error, so an empty window
+///   near the head can't be told from a real "no transfers".
+///
+/// 1 024 blocks is about 85 minutes on Gnosis — a backend further behind
+/// than that is broken, not lagging — and still one `eth_getLogs` window
+/// on the 10k/50k-capped public RPCs. A miss below it is what
+/// [`rescan_transfer_history`] is for.
+const RESCAN_TAIL: u64 = 1_024;
+
+/// Version of the persisted [`TransferScan`] file. Version 1 wasn't keyed
+/// by chain; its files are ignored (a full scan, once).
+const TRANSFER_SCAN_VERSION: u32 = 2;
+
+/// How often a running scan saves its progress, so a first scan cut
+/// short (the app quit, the RPC failed) resumes where it stopped.
+const SCAN_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One xBZZ `Transfer` out of the node wallet: what batch and chequebook
+/// rediscovery read from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeTransfer {
+    /// The recipient: the `PostageStamp` contract for a batch buy or
+    /// top-up, a chequebook for a deposit.
+    pub to: [u8; 20],
+    pub block: u64,
+    pub tx_hash: [u8; 32],
+}
+
+/// The node wallet's xBZZ `Transfer(from = node)` history, scanned up to
+/// a block. Batch and chequebook rediscovery both read it
+/// ([`owned_batches_in`], [`owned_chequebook_in`]) instead of each
+/// scanning the chain from the xBZZ deploy block, and
+/// [`refresh_transfer_scan`] keeps it on disk so a later start only reads
+/// the blocks since. A wallet with history behind a range-capped RPC
+/// otherwise paid tens of minutes per start for two identical
+/// full-history scans (issue #118).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferScan {
+    /// The chain scanned (`eth_chainId`); a scan is only ever continued
+    /// against the same chain.
+    pub chain_id: u64,
+    pub node_eoa: [u8; 20],
+    /// Every block from the scan start up to and including this one has
+    /// been scanned. Transfers above it are in the reorg tail: used, but
+    /// read again next time.
+    pub scanned_through: u64,
+    pub transfers: Vec<NodeTransfer>,
+    /// Every block up to this one was read by a *confirming* pass: one
+    /// scan from the xBZZ deploy block (a first scan, or
+    /// [`rescan_transfer_history`]), then [`find_owned_chequebook`]'s
+    /// re-reads of the blocks since. The mark advances window by window
+    /// as such a pass reads, and is saved with the scan's progress —
+    /// including when the pass fails or is cut short part-way — so
+    /// `Some(x)` means "every block up to `x` was read by some confirming
+    /// pass", not that a confirming pass ever ran to the head. `None` only
+    /// until a confirming pass has read its first window. The blocks above
+    /// it were only read by routine continued scans, whose "none" rests
+    /// on every earlier answer, so before a "none" may lead to a deploy,
+    /// [`find_owned_chequebook`] reads those blocks again — and only
+    /// those, so a wallet whose deploy keeps failing pays the full
+    /// history once, not on every check.
+    pub confirmed_through: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransferScanFile {
+    version: u32,
+    chain_id: u64,
+    node_eoa: String,
+    scanned_through: u64,
+    transfers: Vec<TransferRecord>,
+    /// [`TransferScan::confirmed_through`]. Absent in files written before
+    /// it existed: the next confirming check then reads the full history.
+    #[serde(default)]
+    confirmed_through: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransferRecord {
+    to: String,
+    block: u64,
+    tx_hash: String,
+}
+
+fn transfer_scan_path(
+    data_dir: &std::path::Path,
+    chain_id: u64,
+    node_eoa: &[u8; 20],
+) -> std::path::PathBuf {
+    data_dir.join(format!(
+        "transfer-scan-{chain_id}-0x{}.json",
+        hex::encode(node_eoa)
+    ))
+}
+
+/// The scan persisted for `node_eoa` on `chain_id` in `data_dir`, or
+/// `None` when there is none, it's unreadable, or it belongs to another
+/// wallet or chain: the caller then scans from the start.
+fn load_transfer_scan(
+    data_dir: &std::path::Path,
+    chain_id: u64,
+    node_eoa: &[u8; 20],
+) -> Option<TransferScan> {
+    let path = transfer_scan_path(data_dir, chain_id, node_eoa);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(target: "ant_chain", path = %path.display(), "unreadable transfer scan, rescanning: {e}");
+            return None;
+        }
+    };
+    let parsed = serde_json::from_slice::<TransferScanFile>(&bytes)
+        .ok()
+        .filter(|f| f.version == TRANSFER_SCAN_VERSION)
+        .and_then(|f| {
+            let eoa = parse_addr(&f.node_eoa)?;
+            let transfers = f
+                .transfers
+                .iter()
+                .map(|t| {
+                    let mut tx_hash = [0u8; 32];
+                    hex::decode_to_slice(t.tx_hash.trim_start_matches("0x"), &mut tx_hash).ok()?;
+                    Some(NodeTransfer {
+                        to: parse_addr(&t.to)?,
+                        block: t.block,
+                        tx_hash,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(TransferScan {
+                chain_id: f.chain_id,
+                node_eoa: eoa,
+                scanned_through: f.scanned_through,
+                transfers,
+                confirmed_through: f.confirmed_through.filter(|&c| c <= f.scanned_through),
+            })
+        });
+    match parsed {
+        Some(scan) if scan.node_eoa == *node_eoa && scan.chain_id == chain_id => Some(scan),
+        Some(_) => None,
+        None => {
+            tracing::warn!(target: "ant_chain", path = %path.display(), "malformed transfer scan, rescanning");
+            None
+        }
+    }
+}
+
+/// Write `scan` atomically (temp file, then rename). A failure only means
+/// the next start scans again, so it's logged rather than returned.
+fn persist_transfer_scan(data_dir: &std::path::Path, scan: &TransferScan) {
+    let file = TransferScanFile {
+        version: TRANSFER_SCAN_VERSION,
+        chain_id: scan.chain_id,
+        node_eoa: format!("0x{}", hex::encode(scan.node_eoa)),
+        scanned_through: scan.scanned_through,
+        confirmed_through: scan.confirmed_through,
+        transfers: scan
+            .transfers
+            .iter()
+            .map(|t| TransferRecord {
+                to: format!("0x{}", hex::encode(t.to)),
+                block: t.block,
+                tx_hash: format!("0x{}", hex::encode(t.tx_hash)),
+            })
+            .collect(),
+    };
+    // A temp file per write: a stamp buy's chequebook check and the
+    // startup batch rediscovery can save at the same time, and must not
+    // rename each other's half-written file into place.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = transfer_scan_path(data_dir, scan.chain_id, &scan.node_eoa);
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = serde_json::to_vec_pretty(&file)
+        .map_err(std::io::Error::other)
+        .and_then(|json| std::fs::write(&tmp, json))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(target: "ant_chain", path = %path.display(), "could not save the transfer scan; the next start rescans: {e}");
+    }
+}
+
+/// Scan the node wallet's xBZZ transfers from `from_block` to the head,
+/// continuing `previous` (same wallet) from where it stopped instead of
+/// starting over. Its transfers in the rescan tail are dropped and read
+/// again. With `save_to`, the progress is saved there every
+/// [`SCAN_SAVE_EVERY`] while the scan runs, and when it fails. With
+/// `confirms` — a pass that reads from the deploy block, or re-reads the
+/// blocks above the confirmed mark — every block it reads is confirmed:
+/// the saved progress carries [`TransferScan::confirmed_through`] up to
+/// where it got, so a confirming pass cut short and resumed (a first scan
+/// interrupted by the app going to the background) only leaves the blocks
+/// the resumed part read unconfirmed, not the whole history.
+#[allow(clippy::too_many_arguments)]
+async fn scan_transfers(
+    client: &ChainClient,
+    chain_id: u64,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    from_block: u64,
+    previous: Option<TransferScan>,
+    save_to: Option<&std::path::Path>,
+    confirms: bool,
+) -> Result<TransferScan, RpcError> {
+    let head = client.eth_block_number().await?;
+    let mut scan = match previous.filter(|p| {
+        p.node_eoa == *node_eoa
+            && p.chain_id == chain_id
+            && p.scanned_through.saturating_add(1) >= from_block
+    }) {
+        Some(mut p) => {
+            let through = p.scanned_through;
+            p.transfers.retain(|t| t.block <= through);
+            p
+        }
+        None => TransferScan {
+            chain_id,
+            node_eoa: *node_eoa,
+            scanned_through: from_block.saturating_sub(1),
+            transfers: Vec::new(),
+            confirmed_through: None,
+        },
+    };
+    let start = scan.scanned_through.saturating_add(1);
+    // Blocks up to here count as scanned once read; the tail above is
+    // read again next time.
+    let settled = head.saturating_sub(RESCAN_TAIL);
+    if start <= head {
+        let topics = json!([
+            format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
+            topic_for_address(node_eoa),
+        ]);
+        let mut saved_at = std::time::Instant::now();
+        let scanned = client
+            .scan_logs_with(xbzz_token, &topics, start, head, |end, logs| {
+                for log in logs {
+                    if log.topics.len() >= 3 {
+                        scan.transfers.push(NodeTransfer {
+                            to: address_from_topic(&log.topics[2]),
+                            block: log.block_number,
+                            tx_hash: log.tx_hash,
+                        });
+                    }
+                }
+                // Never backwards: a scan within the tail of the
+                // previous one leaves its mark where it was.
+                scan.scanned_through = scan.scanned_through.max(end.min(settled));
+                if confirms {
+                    scan.confirmed_through = Some(scan.scanned_through);
+                }
+                if let Some(dir) = save_to {
+                    if saved_at.elapsed() >= SCAN_SAVE_EVERY {
+                        persist_transfer_scan(dir, &scan);
+                        saved_at = std::time::Instant::now();
+                    }
+                }
+            })
+            .await;
+        if let (Err(_), Some(dir)) = (&scanned, save_to) {
+            persist_transfer_scan(dir, &scan);
+        }
+        scanned?;
+    }
+    Ok(scan)
+}
+
+/// Bring the node wallet's transfer scan in `data_dir` up to the chain
+/// head, save it, and return it. The first call scans from the xBZZ
+/// deploy block; later ones only read the blocks since the last call (and
+/// the rescan tail), so rediscovery takes seconds after the first start.
+/// A failed scan returns the error; the progress it made is saved, so the
+/// next call resumes from there. The saved scan is keyed by wallet and by
+/// the RPC's `eth_chainId`.
+///
+/// Shared by `antd` and `ant-ffi`, for both batch and chequebook
+/// rediscovery: read the result with [`owned_batches_in`] and
+/// [`owned_chequebook_in`].
+pub async fn refresh_transfer_scan(
+    client: &ChainClient,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+) -> Result<TransferScan, RpcError> {
+    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Continue).await
+}
+
+/// [`refresh_transfer_scan`], but reading the whole history from the xBZZ
+/// deploy block again instead of continuing the saved scan, and replacing
+/// it. Each saved scan only advances past blocks some RPC answered for,
+/// and an RPC can answer an incomplete `[]` (a backend far behind the
+/// head, a lossy log index); this is the way back from such a miss. As
+/// slow as the first start's scan behind a range-capped RPC, so it is for
+/// an explicit "search the chain" (`ant_storage_discover_full`, antd's
+/// `--rescan-chain-history`), not for every start.
+///
+/// The saved scan is only replaced once the rescan completes: a rescan
+/// that fails part-way leaves the previous scan as it was (its progress
+/// isn't saved over it), so the next start continues that one rather than
+/// resuming a long scan from a partial cursor.
+pub async fn rescan_transfer_history(
+    client: &ChainClient,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+) -> Result<TransferScan, RpcError> {
+    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Full).await
+}
+
+/// How [`update_transfer_scan`] treats the saved scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// Continue it from where it stopped.
+    Continue,
+    /// Read the blocks above its [`TransferScan::confirmed_through`]
+    /// again, or the whole history if it has none.
+    Confirm,
+    /// Read the whole history again.
+    Full,
+}
+
+async fn update_transfer_scan(
+    client: &ChainClient,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+    mode: ScanMode,
+) -> Result<TransferScan, RpcError> {
+    // One scan at a time in this process: a stamp buy's chequebook check
+    // that lands during the startup batch rediscovery waits for it, then
+    // reads only the blocks since, instead of scanning the history again
+    // alongside it.
+    static SCANS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _scanning = SCANS.lock().await;
+    let chain_id = client.eth_chain_id().await?;
+    let saved = load_transfer_scan(data_dir, chain_id, node_eoa);
+    // Only a full rescan replaces the saved scan wholesale; a confirming
+    // re-read only rewinds it to its confirmed mark, which its progress
+    // then carries forward (see below).
+    let replacing = saved.is_some() && mode == ScanMode::Full;
+    let previous = match mode {
+        ScanMode::Continue => saved,
+        ScanMode::Full => None,
+        // Drop what the routine scans read above the confirmed mark; the
+        // scan below reads those blocks again.
+        ScanMode::Confirm => saved.and_then(|mut p| {
+            let c = p.confirmed_through?;
+            p.scanned_through = c;
+            Some(p)
+        }),
+    };
+    // A scan read in one pass from the deploy block confirms what it read;
+    // a continued one keeps the mark it had, and a confirming re-read of
+    // the blocks since the mark moves it up to what it read.
+    let confirms = previous.is_none() || mode == ScanMode::Confirm;
+    let from = previous
+        .as_ref()
+        .map_or(GNOSIS_XBZZ_DEPLOY_BLOCK, |p| p.scanned_through + 1);
+    let started = std::time::Instant::now();
+    // Progress saves are for resuming a scan cut short. A full rescan that
+    // replaces a saved scan doesn't save its progress over it: a rescan
+    // failing part-way would otherwise swap a complete scan for a partial
+    // one. It is saved once it completes. A confirming re-read does save
+    // its progress, with the confirmed mark moved up to it: cut short, the
+    // next check re-reads only the blocks it didn't get to, rather than
+    // starting again from the old mark (or from the deploy block, for a
+    // scan that had none) every time.
+    let mut scan = scan_transfers(
+        client,
+        chain_id,
+        xbzz_token,
+        node_eoa,
+        GNOSIS_XBZZ_DEPLOY_BLOCK,
+        previous,
+        (!replacing).then_some(data_dir),
+        confirms,
+    )
+    .await?;
+    if confirms {
+        scan.confirmed_through = Some(scan.scanned_through);
+    }
+    persist_transfer_scan(data_dir, &scan);
+    tracing::info!(
+        target: "ant_chain",
+        chain_id,
+        from_block = from,
+        scanned_through = scan.scanned_through,
+        transfers = scan.transfers.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "node wallet transfer scan up to date",
+    );
+    Ok(scan)
+}
+
+/// The SWAP chequebook the node wallet deployed, read off the saved
+/// transfer scan ([`refresh_transfer_scan`] + [`owned_chequebook_in`]).
+///
+/// With `confirm_none` — the caller deploys a chequebook on `Ok(None)` —
+/// a "none" that rests on routine continued scans is confirmed first: the
+/// blocks above the scan's [`TransferScan::confirmed_through`] are read
+/// again, or the whole history from the xBZZ deploy block if no pass has
+/// confirmed it yet. A continued scan's answer rests on every earlier
+/// scan's: one window an RPC answered incompletely would otherwise hide
+/// the chequebook for good, and the deploy would strand its deposit. The
+/// confirmed mark is saved with the scan, so the full history is read
+/// once per wallet (on its first scan, or on the first confirming check
+/// of a scan saved before the mark existed); a later check — another
+/// buy after a deploy that soft-failed, a restart — re-reads only the
+/// blocks since the last confirmation.
+pub async fn find_owned_chequebook(
+    client: &ChainClient,
+    factory: &[u8; 20],
+    postage_contract: &str,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+    confirm_none: bool,
+) -> Result<Option<[u8; 20]>, RpcError> {
+    let scan = refresh_transfer_scan(client, xbzz_token, node_eoa, data_dir).await?;
+    let found = owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await?;
+    if found.is_some() || !confirm_none || scan.confirmed_through == Some(scan.scanned_through) {
+        return Ok(found);
+    }
+    tracing::info!(
+        target: "ant_chain",
+        confirmed_through = ?scan.confirmed_through,
+        "no chequebook in the saved transfer scan; reading the unconfirmed blocks again before deploying one",
+    );
+    let scan =
+        update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Confirm).await?;
+    owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
+}
+
 impl ChainClient {
     /// `eth_getLogs` for a single contract address over an inclusive
     /// block range, with the given topic filter (already JSON-encoded
@@ -121,13 +567,34 @@ impl ChainClient {
         to_block: u64,
     ) -> Result<Vec<LogEntry>, RpcError> {
         let mut out = Vec::new();
+        self.scan_logs_with(address, topics, from_block, to_block, |_, mut logs| {
+            out.append(&mut logs);
+        })
+        .await?;
+        Ok(out)
+    }
+
+    /// [`Self::scan_logs`], handing each window's logs to `window` along
+    /// with the window's last block, in block order, so a caller can keep
+    /// its progress.
+    async fn scan_logs_with(
+        &self,
+        address: &str,
+        topics: &serde_json::Value,
+        from_block: u64,
+        to_block: u64,
+        mut window: impl FnMut(u64, Vec<LogEntry>),
+    ) -> Result<(), RpcError> {
         let mut start = from_block;
-        let mut chunk = INITIAL_SCAN_CHUNK.min(to_block.saturating_sub(from_block).max(1));
+        // The whole range fits one window: `to - from + 1` blocks, not
+        // `to - from`, or the last block costs a request of its own.
+        let mut chunk =
+            INITIAL_SCAN_CHUNK.min(to_block.saturating_sub(from_block).saturating_add(1).max(1));
         while start <= to_block {
             let end = start.saturating_add(chunk.saturating_sub(1)).min(to_block);
             match self.eth_get_logs(address, topics, start, end).await {
-                Ok(mut logs) => {
-                    out.append(&mut logs);
+                Ok(logs) => {
+                    window(end, logs);
                     start = end.saturating_add(1);
                     chunk = chunk.saturating_mul(2).min(INITIAL_SCAN_CHUNK);
                 }
@@ -137,7 +604,7 @@ impl ChainClient {
                 Err(e) => return Err(e),
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// `PostageStamp.remainingBalance(bytes32)` — per-chunk balance left
@@ -155,15 +622,14 @@ impl ChainClient {
     }
 }
 
-/// Discover every postage batch owned by `node_eoa` that is still
-/// funded. Reuses the xBZZ `Transfer(from = node_eoa)` scan: batch
-/// buys / top-ups pull BZZ via `transferFrom`, emitting a `Transfer`
-/// whose `to` is the `PostageStamp` contract.
+/// The postage batches `scan`'s wallet owns that are still funded.
+/// Batch buys and top-ups pull BZZ via `transferFrom`, emitting a
+/// `Transfer` whose `to` is the `PostageStamp` contract.
 ///
-/// For each block that scan hits, a **single-block `eth_getLogs`** for
-/// `BatchCreated` on the `PostageStamp` contract recovers the batch ids,
-/// matched back to the `Transfer` by `transactionHash` (issue #77). This
-/// deliberately does *not* use `eth_getTransactionReceipt`: verified
+/// For each block such a transfer is in, a **single-block `eth_getLogs`**
+/// for `BatchCreated` on the `PostageStamp` contract recovers the batch
+/// ids, matched back to the `Transfer` by `transactionHash` (issue #77).
+/// This deliberately does *not* use `eth_getTransactionReceipt`: verified
 /// backends (Myotis) serve receipts near head only, so a receipt hop
 /// returns `null` for any older batch and silently loses it — while the
 /// log index they *do* carry covers exactly this query. It is also
@@ -171,34 +637,23 @@ impl ChainClient {
 /// per hit transaction). `BatchCreated.owner` is not an indexed topic,
 /// so an owner-filtered query cannot replace the `Transfer` scan itself;
 /// the per-batch owner check below still does that job.
-pub async fn discover_owned_batches(
+pub async fn owned_batches_in(
     client: &ChainClient,
     postage_contract: &str,
-    xbzz_token: &str,
-    node_eoa: &[u8; 20],
-    from_block: u64,
+    scan: &TransferScan,
 ) -> Result<Vec<DiscoveredBatch>, RpcError> {
     let postage_addr = parse_addr(postage_contract).ok_or_else(|| {
         RpcError::Decode(format!("bad postage contract address {postage_contract}"))
     })?;
-    let to_block = client.eth_block_number().await?;
-    let topics = json!([
-        format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
-        topic_for_address(node_eoa),
-    ]);
-    let logs = client
-        .scan_logs(xbzz_token, &topics, from_block, to_block)
-        .await?;
+    let node_eoa = &scan.node_eoa;
 
     // Transactions whose Transfer landed in the PostageStamp contract,
     // grouped by the block they were mined in — one `eth_getLogs` per
     // block covers every hit transaction in it.
     let mut hits: BTreeMap<u64, BTreeSet<[u8; 32]>> = BTreeMap::new();
-    for log in &logs {
-        if log.topics.len() >= 3 && address_from_topic(&log.topics[2]) == postage_addr {
-            hits.entry(log.block_number)
-                .or_default()
-                .insert(log.tx_hash);
+    for t in &scan.transfers {
+        if t.to == postage_addr {
+            hits.entry(t.block).or_default().insert(t.tx_hash);
         }
     }
 
@@ -320,48 +775,36 @@ pub async fn verify_persisted_batch(
     }
 }
 
-/// Discover the SWAP chequebook deployed by `node_eoa`. Reuses the same
-/// `Transfer(from = node_eoa)` scan: every funded chequebook was
-/// deposited into by the node EOA, so it is among the `to` addresses.
-/// Each candidate is verified with `factory.deployedContracts(to)` and
-/// `to.issuer() == node_eoa`. On more than one match the most-recently
-/// funded chequebook wins.
+/// The SWAP chequebook `scan`'s wallet deployed. Every funded chequebook
+/// was deposited into by the node EOA, so it is among the transfers'
+/// recipients. Each candidate is verified with
+/// `factory.deployedContracts(to)` and `to.issuer() == node_eoa`. On more
+/// than one match the most-recently funded chequebook wins.
 ///
 /// `Ok(None)` is authoritative — "every candidate was read, none is
 /// ours". A failed read is an `Err`, never an `Ok(None)`: callers treat
 /// the empty answer as licence to deploy a new chequebook.
-pub async fn discover_owned_chequebook(
+pub async fn owned_chequebook_in(
     client: &ChainClient,
     factory: &[u8; 20],
     postage_contract: &str,
     xbzz_token: &str,
-    node_eoa: &[u8; 20],
-    from_block: u64,
+    scan: &TransferScan,
 ) -> Result<Option<[u8; 20]>, RpcError> {
     let postage_addr = parse_addr(postage_contract);
     let xbzz_addr = parse_addr(xbzz_token);
-    let to_block = client.eth_block_number().await?;
-    let topics = json!([
-        format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
-        topic_for_address(node_eoa),
-    ]);
-    let logs = client
-        .scan_logs(xbzz_token, &topics, from_block, to_block)
-        .await?;
+    let node_eoa = &scan.node_eoa;
 
     // Distinct `to` addresses, keyed by the highest block we saw them
     // funded at (so we can prefer the most-recent on a tie).
     let mut candidates: BTreeMap<[u8; 20], u64> = BTreeMap::new();
-    for log in &logs {
-        if log.topics.len() < 3 {
-            continue;
-        }
-        let to = address_from_topic(&log.topics[2]);
+    for t in &scan.transfers {
+        let to = t.to;
         if &to == node_eoa || Some(to) == postage_addr || Some(to) == xbzz_addr || to == [0u8; 20] {
             continue;
         }
         let entry = candidates.entry(to).or_insert(0);
-        *entry = (*entry).max(log.block_number);
+        *entry = (*entry).max(t.block);
     }
 
     // Most-recent first.
@@ -600,6 +1043,37 @@ mod tests {
     const OTHER_TX: [u8; 32] = [0x99; 32];
     const OUR_BATCH: [u8; 32] = [0xbb; 32];
     const OTHER_BATCH: [u8; 32] = [0xcc; 32];
+
+    /// A one-off full scan, then [`owned_batches_in`].
+    async fn discover_owned_batches(
+        client: &ChainClient,
+        postage_contract: &str,
+        xbzz_token: &str,
+        node_eoa: &[u8; 20],
+        from_block: u64,
+    ) -> Result<Vec<DiscoveredBatch>, RpcError> {
+        let scan = scan_transfers(
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+        )
+        .await?;
+        owned_batches_in(client, postage_contract, &scan).await
+    }
+
+    /// A one-off full scan, then [`owned_chequebook_in`].
+    async fn discover_owned_chequebook(
+        client: &ChainClient,
+        factory: &[u8; 20],
+        postage_contract: &str,
+        xbzz_token: &str,
+        node_eoa: &[u8; 20],
+        from_block: u64,
+    ) -> Result<Option<[u8; 20]>, RpcError> {
+        let scan = scan_transfers(
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+        )
+        .await?;
+        owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
+    }
 
     /// Scripted chain backend, plugged in through the host-transport
     /// seam so the query plan is observable: every method ant issues is
@@ -1029,5 +1503,630 @@ mod tests {
             .await
             .expect_err("a failed issuer read must not read as not-ours");
         assert!(err.to_string().contains("backend unavailable"), "got {err}");
+    }
+    /// A chain whose head can move, answering the xBZZ `Transfer` scan
+    /// with only the transfers inside each requested range, and
+    /// recording the ranges asked for.
+    #[derive(Default)]
+    struct GrowingChain {
+        head: std::sync::atomic::AtomicU64,
+        transfers: Mutex<Vec<NodeTransfer>>,
+        ranges: Mutex<Vec<(u64, u64)>>,
+        /// Refuse wider `eth_getLogs` ranges, as a capped public RPC does.
+        cap: Option<u64>,
+        /// Fail every `eth_getLogs` once this many have succeeded.
+        fail_after: Mutex<Option<usize>>,
+        /// What `eth_chainId` answers; `0` is Gnosis.
+        chain_id: std::sync::atomic::AtomicU64,
+        /// How far behind `head` the backend serving `eth_getLogs` is: it
+        /// answers `[]` for the blocks it hasn't seen, no error.
+        logs_lag: std::sync::atomic::AtomicU64,
+    }
+
+    impl ChainTransport for GrowingChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let hex_u64 =
+                |v: &serde_json::Value| u64::from_str_radix(&v.as_str().unwrap()[2..], 16).unwrap();
+            let result = match req["method"].as_str().unwrap() {
+                "eth_chainId" => json!(format!(
+                    "0x{:x}",
+                    match self.chain_id.load(std::sync::atomic::Ordering::SeqCst) {
+                        0 => GNOSIS,
+                        id => id,
+                    }
+                )),
+                "eth_blockNumber" => json!(format!(
+                    "0x{:x}",
+                    self.head.load(std::sync::atomic::Ordering::SeqCst)
+                )),
+                // `CB` is a factory-deployed chequebook issued by the node.
+                "eth_call" => {
+                    let data = req["params"][0]["data"].as_str().unwrap();
+                    if data.starts_with(&deployed_contracts_selector()) {
+                        json!(word_hex(&[1]))
+                    } else if data.starts_with(&issuer_selector()) {
+                        json!(word_hex(&NODE_EOA))
+                    } else {
+                        panic!("unscripted eth_call data {data}")
+                    }
+                }
+                "eth_getLogs" => {
+                    let (from, to) = (
+                        hex_u64(&req["params"][0]["fromBlock"]),
+                        hex_u64(&req["params"][0]["toBlock"]),
+                    );
+                    let refuse = |message: &str| {
+                        Some(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req["id"],
+                                "error": {"code": -32603, "message": message},
+                            })
+                            .to_string(),
+                        )
+                    };
+                    if self.cap.is_some_and(|cap| to - from + 1 > cap) {
+                        return refuse("block range too large");
+                    }
+                    if *self.fail_after.lock().unwrap() == Some(0) {
+                        return refuse("backend unavailable");
+                    }
+                    if let Some(n) = self.fail_after.lock().unwrap().as_mut() {
+                        *n -= 1;
+                    }
+                    self.ranges.lock().unwrap().push((from, to));
+                    let seen_up_to = self.head.load(std::sync::atomic::Ordering::SeqCst)
+                        - self.logs_lag.load(std::sync::atomic::Ordering::SeqCst);
+                    let logs: Vec<_> = self
+                        .transfers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|t| (from..=to).contains(&t.block) && t.block <= seen_up_to)
+                        .map(|t| {
+                            log_json(
+                                crate::GNOSIS_BZZ_TOKEN,
+                                &[
+                                    format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
+                                    word_hex(&NODE_EOA),
+                                    word_hex(&t.to),
+                                ],
+                                &t.tx_hash,
+                                t.block,
+                            )
+                        })
+                        .collect();
+                    json!(logs)
+                }
+                other => panic!("unscripted method {other}"),
+            };
+            Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
+        }
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ant-chain-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const CB: [u8; 20] = [0xcb; 20];
+    const HEAD: u64 = 48_000_000;
+    const GNOSIS: u64 = 100;
+
+    /// A deposit into chequebook [`CB`].
+    fn to_cb(block: u64, tx_hash: [u8; 32]) -> NodeTransfer {
+        NodeTransfer {
+            to: CB,
+            block,
+            tx_hash,
+        }
+    }
+
+    /// The second start doesn't rescan history: it reads only the blocks
+    /// since the first scan (plus the reorg tail), and keeps what the
+    /// first one found (issue #118).
+    #[tokio::test]
+    async fn a_later_scan_reads_only_the_new_blocks() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(45_000_000, [1; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-cursor");
+
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(first.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(first.transfers.len(), 1);
+        assert_eq!(chain.ranges.lock().unwrap()[0].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+
+        // A thousand blocks later, with one new transfer.
+        chain.ranges.lock().unwrap().clear();
+        chain
+            .head
+            .store(HEAD + 1_000, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD + 500, [2; 32]));
+        let second = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            *chain.ranges.lock().unwrap(),
+            vec![(HEAD - RESCAN_TAIL + 1, HEAD + 1_000)],
+            "only the new blocks and the reorg tail are read"
+        );
+        assert_eq!(second.transfers.len(), 2);
+        assert_eq!(second.scanned_through, HEAD + 1_000 - RESCAN_TAIL);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A transfer seen in the reorg tail isn't remembered as final: if a
+    /// reorg drops it, the next scan doesn't report it.
+    #[tokio::test]
+    async fn a_transfer_reorged_out_of_the_tail_is_forgotten() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD - 10, [3; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-reorg");
+
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(first.transfers.len(), 1, "used while in the tail");
+
+        chain.transfers.lock().unwrap().clear(); // reorged away
+        let second = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert!(second.transfers.is_empty(), "{:?}", second.transfers);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A first scan that fails part-way keeps what it read: the next
+    /// start resumes after the last window that succeeded instead of
+    /// reading the history from the deploy block again.
+    #[tokio::test]
+    async fn a_failed_scan_resumes_where_it_stopped() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            fail_after: Mutex::new(Some(2)),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(17_000_000, [4; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-resume");
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("the third window fails");
+        let read = chain.ranges.lock().unwrap().clone();
+        assert_eq!(read.len(), 2);
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).expect("progress saved");
+        assert_eq!(saved.scanned_through, read[1].1);
+        assert_eq!(saved.transfers.len(), 1);
+
+        chain.ranges.lock().unwrap().clear();
+        *chain.fail_after.lock().unwrap() = None;
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(chain.ranges.lock().unwrap()[0].0, read[1].1 + 1, "resumed");
+        assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(scan.transfers.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A first scan cut short and resumed is still confirmed up to where
+    /// its first part got: the chequebook check before a deploy re-reads
+    /// only the blocks the resumed part read, not the whole history.
+    #[tokio::test]
+    async fn a_resumed_first_scan_keeps_its_confirmed_mark() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            fail_after: Mutex::new(Some(2)),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-resume-mark");
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("the third window fails");
+        let cut = chain.ranges.lock().unwrap()[1].1;
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(saved.confirmed_through, Some(cut), "progress is confirmed");
+
+        *chain.fail_after.lock().unwrap() = None;
+        let resumed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.confirmed_through,
+            Some(cut),
+            "the resumed part isn't"
+        );
+
+        chain.ranges.lock().unwrap().clear();
+        assert_eq!(find_cb(&client, &dir, true).await, None);
+        let ranges = chain.ranges.lock().unwrap().clone();
+        assert!(
+            ranges.iter().all(|r| r.0 > cut),
+            "only the blocks since the mark: {ranges:?}"
+        );
+        let scan = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A confirming check that reads the whole history (a scan with no
+    /// confirmed mark) and is cut short saves its progress with the mark
+    /// moved up to it: the next check continues from there instead of
+    /// starting again from the deploy block.
+    #[tokio::test]
+    async fn a_failed_confirming_check_resumes_where_it_stopped() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(17_000_000, [9; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-confirm-resume");
+        let mut scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        // Saved before the mark existed, and missing the deposit.
+        scan.confirmed_through = None;
+        scan.transfers.clear();
+        persist_transfer_scan(&dir, &scan);
+
+        chain.ranges.lock().unwrap().clear();
+        // The routine refresh's tail read, then two windows of the
+        // confirming read from the deploy block, then a failure.
+        *chain.fail_after.lock().unwrap() = Some(3);
+        find_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            &dir,
+            true,
+        )
+        .await
+        .expect_err("the confirming read fails part-way");
+        let read = chain.ranges.lock().unwrap().clone();
+        let cut = read.last().unwrap().1;
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(read[1].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).expect("progress saved");
+        assert_eq!(saved.confirmed_through, Some(cut));
+        assert_eq!(saved.scanned_through, cut);
+        assert_eq!(saved.transfers.len(), 1, "the deposit it found is kept");
+
+        chain.ranges.lock().unwrap().clear();
+        *chain.fail_after.lock().unwrap() = None;
+        assert_eq!(find_cb(&client, &dir, true).await, Some(CB));
+        let ranges = chain.ranges.lock().unwrap().clone();
+        assert!(ranges.iter().all(|r| r.0 > cut), "resumed: {ranges:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable saved scan means a full scan, not an error.
+    #[tokio::test]
+    async fn a_corrupt_saved_scan_starts_over() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-corrupt");
+        std::fs::write(transfer_scan_path(&dir, GNOSIS, &NODE_EOA), b"{ truncated").unwrap();
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(chain.ranges.lock().unwrap()[0].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+        assert!(
+            load_transfer_scan(&dir, GNOSIS, &NODE_EOA).is_some(),
+            "rewritten"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An `eth_getLogs` backend behind the `eth_blockNumber` one answers
+    /// `[]` for the blocks it hasn't seen. Those blocks stay in the rescan
+    /// tail, so the next scan finds the transfer instead of skipping it
+    /// for good.
+    #[tokio::test]
+    async fn a_lagging_logs_backend_does_not_skip_a_transfer() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .logs_lag
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD - 90, [5; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-lag");
+
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert!(first.transfers.is_empty(), "the lagging backend hid it");
+        assert!(first.scanned_through < HEAD - 90, "not counted as scanned");
+
+        chain.logs_lag.store(0, std::sync::atomic::Ordering::SeqCst);
+        let second = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(second.transfers, vec![to_cb(HEAD - 90, [5; 32])]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan saved against one chain isn't continued against another:
+    /// its cursor says nothing about the other chain's blocks.
+    #[tokio::test]
+    async fn a_scan_is_not_continued_on_another_chain() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-chain");
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        chain.ranges.lock().unwrap().clear();
+        chain
+            .chain_id
+            .store(10_200, std::sync::atomic::Ordering::SeqCst);
+        let other = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(other.chain_id, 10_200);
+        assert_eq!(other.confirmed_through, Some(other.scanned_through));
+        assert_eq!(chain.ranges.lock().unwrap()[0].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+        assert!(
+            load_transfer_scan(&dir, GNOSIS, &NODE_EOA).is_some(),
+            "kept"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chequebook check helper the tests below share.
+    async fn find_cb(
+        client: &ChainClient,
+        dir: &std::path::Path,
+        confirm_none: bool,
+    ) -> Option<[u8; 20]> {
+        find_owned_chequebook(
+            client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            dir,
+            confirm_none,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A saved scan that missed a deposit (an RPC answered one window
+    /// incompletely, below the rescan tail) and that no full pass has
+    /// confirmed (saved before the confirmed mark existed): the "none"
+    /// check before a chequebook deploy reads the whole history again and
+    /// finds it — a continued scan's "none" isn't trusted to deploy on.
+    #[tokio::test]
+    async fn a_missed_deposit_is_found_before_deploying() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-missed");
+        let mut scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        scan.confirmed_through = None;
+        persist_transfer_scan(&dir, &scan);
+        // The deposit was there all along; the saved scan missed it.
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(40_000_000, [6; 32]));
+
+        // Not about to deploy: the saved scan is read as it is.
+        chain.ranges.lock().unwrap().clear();
+        assert_eq!(find_cb(&client, &dir, false).await, None);
+        assert_eq!(chain.ranges.lock().unwrap()[0].0, HEAD - RESCAN_TAIL + 1);
+
+        // About to deploy: "none" is confirmed from the deploy block.
+        chain.ranges.lock().unwrap().clear();
+        assert_eq!(find_cb(&client, &dir, true).await, Some(CB));
+        assert_eq!(
+            chain.ranges.lock().unwrap().last().unwrap().0,
+            GNOSIS_XBZZ_DEPLOY_BLOCK
+        );
+        // The rescan replaced the saved scan, so a plain refresh sees it.
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(scan.transfers.len(), 1);
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A deposit a routine continued scan missed, above the confirmed
+    /// mark, is found by the confirming check, which reads only the
+    /// blocks since that mark — not the whole history again.
+    #[tokio::test]
+    async fn a_deposit_missed_since_the_confirmed_mark_is_found() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-missed-since");
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        let mark = first.scanned_through;
+        assert_eq!(first.confirmed_through, Some(mark));
+
+        // A later routine scan's backend lags far behind and answers `[]`
+        // for a deposit below the next scan's rescan tail.
+        chain
+            .head
+            .store(HEAD + 10_000, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .logs_lag
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD + 2_000, [7; 32]));
+        let missed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(missed.transfers, vec![]);
+        assert!(missed.scanned_through > HEAD + 2_000, "past the deposit");
+        assert_eq!(missed.confirmed_through, Some(mark), "mark kept");
+
+        chain.logs_lag.store(0, std::sync::atomic::Ordering::SeqCst);
+        chain.ranges.lock().unwrap().clear();
+        assert_eq!(find_cb(&client, &dir, true).await, Some(CB));
+        let ranges = chain.ranges.lock().unwrap().clone();
+        assert!(
+            ranges.iter().all(|r| r.0 > GNOSIS_XBZZ_DEPLOY_BLOCK),
+            "no full-history read: {ranges:?}"
+        );
+        assert_eq!(ranges.last().unwrap().0, mark + 1, "re-read from the mark");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A wallet with no chequebook whose deploy keeps failing (the caller
+    /// checks again on every buy, connect, discover and restart): only the
+    /// first confirming check reads the whole history; later ones read
+    /// only the blocks since, even across a restart (the mark is saved).
+    #[tokio::test]
+    async fn repeated_none_checks_read_the_history_once() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-none-repeat");
+        let full_reads = || {
+            chain
+                .ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == GNOSIS_XBZZ_DEPLOY_BLOCK)
+                .count()
+        };
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(full_reads(), 1, "the startup scan");
+        for step in 1..=3u64 {
+            chain
+                .head
+                .store(HEAD + step * 2_000, std::sync::atomic::Ordering::SeqCst);
+            chain.ranges.lock().unwrap().clear();
+            assert_eq!(find_cb(&client, &dir, true).await, None);
+            let ranges = chain.ranges.lock().unwrap().clone();
+            assert_eq!(
+                full_reads(),
+                0,
+                "check {step} re-read the history: {ranges:?}"
+            );
+            assert!(ranges.len() <= 2, "check {step}: {ranges:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A full rescan that fails part-way leaves the complete saved scan in
+    /// place, so the next start continues it instead of resuming a long
+    /// scan from the rescan's partial cursor.
+    #[tokio::test]
+    async fn a_failed_rescan_keeps_the_saved_scan() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10_000_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(17_000_000, [8; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-rescan-fail");
+        let complete = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+
+        *chain.fail_after.lock().unwrap() = Some(2);
+        rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("the third window fails");
+        assert_eq!(
+            load_transfer_scan(&dir, GNOSIS, &NODE_EOA),
+            Some(complete.clone()),
+            "the complete scan is kept"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chequebook check on a scan that was itself read from the deploy
+    /// block doesn't scan the history a second time.
+    #[tokio::test]
+    async fn a_first_scan_is_not_rescanned_to_confirm_none() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-first-none");
+        let found = find_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            &dir,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, None);
+        assert_eq!(chain.ranges.lock().unwrap().len(), 1, "one scan");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

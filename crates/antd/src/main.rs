@@ -306,6 +306,19 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     no_auto_chequebook: bool,
 
+    /// Read the node wallet's whole xBZZ transfer history again at
+    /// startup instead of continuing the scan saved in
+    /// `<data-dir>/transfer-scan-<chain>-0x<eoa>.json`, and replace it.
+    /// Each start normally reads only the blocks since the last one; if
+    /// an RPC once answered a window incompletely (a backend far behind
+    /// the head), a postage batch bought in it isn't rediscovered until
+    /// this flag is passed. As slow as a first start behind a
+    /// range-capped log RPC. (Before deploying a chequebook, `antd`
+    /// confirms "none" on its own by reading again every block no full
+    /// pass has confirmed yet.)
+    #[arg(long, default_value_t = false)]
+    rescan_chain_history: bool,
+
     /// Target xBZZ deposit behind the node's chequebook, in PLUR
     /// (1 BZZ = 1e16 PLUR). A freshly deployed chequebook is funded
     /// with it, and an antd-managed one is topped back up to it at
@@ -807,6 +820,24 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };
 
+    // With a write RPC, rediscovering batches and a chequebook from the
+    // wallet's transfer history runs in the background after chain init
+    // (see below), so it doesn't hold up `chainReady`: for a wallet with
+    // history behind a range-capped log RPC it took many minutes (#118).
+    // Without one, the upload runtime only exists if there are batches to
+    // stamp with, so rediscovery has to happen first, as before.
+    //
+    // The trade-off: `chainReady` no longer means "every batch the wallet
+    // owns is registered". Until the background rediscovery logs
+    // "background batch rediscovery finished", `GET /stamps` lists only
+    // the batches already on disk — on the first start of a wallet with
+    // long history behind a capped RPC, that can be 15–25 minutes, and a
+    // client that buys whenever it sees no usable stamp may buy a batch
+    // it already owns. A data dir that kept its `postage/` store (every
+    // restart of the same node) reloads its batches before `chainReady`
+    // and isn't affected; ant-ffi's `ChainInit` has always run this way.
+    let rediscover_later = resolve_logs_rpc(&opt).filter(|_| configured_rpc_url(&opt).is_some());
+
     let upload = build_upload_runtime(
         opt.gnosis_rpc_url.clone(),
         resolve_logs_rpc(&opt),
@@ -816,9 +847,14 @@ async fn main() -> Result<()> {
         signing_secret,
         eth,
         data_dir.clone(),
+        rediscover_later.is_some(),
+        opt.rescan_chain_history,
     )
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
+    // The node loop takes `upload`; the background rediscovery adds to the
+    // same issuer registry.
+    let upload_for_rediscovery = upload.clone();
 
     // The node is "light" (publish-capable) once it can stamp + pushsync
     // uploads — i.e. whenever an upload runtime exists. With a chain RPC
@@ -844,6 +880,7 @@ async fn main() -> Result<()> {
         signing_secret,
         eth,
         light_mode,
+        rediscover_later.is_none(),
         &settlement_on_buy.wallet,
     )
     .await?;
@@ -857,6 +894,12 @@ async fn main() -> Result<()> {
         tracing::info!(
             target: "antd",
             "outbound SWAP settlement configured — pushsync will emit cheques",
+        );
+    } else if rediscover_later.is_some() && startup_refused.is_none() {
+        tracing::info!(
+            target: "antd",
+            "outbound SWAP settlement not set up yet — rediscovering (or auto-deploying) the \
+             chequebook in the background",
         );
     } else {
         tracing::warn!(
@@ -939,6 +982,57 @@ async fn main() -> Result<()> {
         light_mode,
         chain: chain_ctx,
     });
+
+    // Now the background part of chain init (#118): batches the wallet
+    // owns on chain but not on disk, then — if settlement is still off —
+    // the chequebook resolution's rediscovery and auto-deploy steps, as a
+    // stamp buy would run them. Both read the saved transfer scan, so only
+    // the first start scans the full history.
+    if let Some(logs_rpc) = rediscover_later {
+        let settlement_on_buy = Arc::clone(&settlement_on_buy);
+        let postage_contract = opt.postage_contract.clone();
+        let data_dir = data_dir.clone();
+        let settle = matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
+        let full_rescan = opt.rescan_chain_history;
+        tokio::spawn(async move {
+            if let Some(rt) = upload_for_rediscovery {
+                let client = ant_chain::ChainClient::new(logs_rpc);
+                let found = rediscover_batches(
+                    &client,
+                    &postage_contract,
+                    &rt.batch_owner,
+                    &data_dir,
+                    full_rescan,
+                    &|id| {
+                        rt.issuers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(id)
+                    },
+                )
+                .await;
+                let added = found.len();
+                let mut issuers = rt
+                    .issuers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (id, issuer) in found {
+                    issuers.entry(id).or_insert(issuer);
+                }
+                tracing::info!(
+                    target: "antd",
+                    rediscovered = added,
+                    batches = issuers.len(),
+                    "background batch rediscovery finished; /stamps lists every batch found",
+                );
+            }
+            // Through the coalescer, like a stamp buy: a buy that
+            // already queued a run covers this one.
+            if settle && settlement_on_buy.pending.request() {
+                settlement_on_buy.run().await;
+            }
+        });
+    }
 
     if opt.no_control_socket && opt.no_http_api {
         drop(cmd_tx);
@@ -1464,6 +1558,8 @@ async fn build_upload_runtime(
     signing_secret: [u8; SECP256K1_SECRET_LEN],
     node_eth: [u8; 20],
     data_dir: PathBuf,
+    rediscover_later: bool,
+    full_rescan: bool,
 ) -> Result<Option<Arc<UploadRuntime>>> {
     let postage_dir = data_dir.join("postage");
 
@@ -1667,50 +1763,22 @@ async fn build_upload_runtime(
     //    issuers, carrying over bee's bucket counters when a
     //    `stamperstore` is present. Independent of storage incentives
     //    (a light node tracks its own batches). Best-effort: a flaky or
-    //    range-capped RPC must never stop the daemon from starting.
-    if let Some(logs_rpc) = logs_rpc {
-        let client = ant_chain::ChainClient::new(logs_rpc);
-        match ant_chain::discover::discover_owned_batches(
-            &client,
-            &postage_contract,
-            ant_chain::GNOSIS_BZZ_TOKEN,
-            &batch_owner,
-            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
-        )
-        .await
-        {
-            Ok(found) => {
-                let stamperstore = data_dir.join("stamperstore");
-                for b in found {
-                    if issuers.contains_key(&b.batch_id) {
-                        continue; // already reloaded / pre-registered
-                    }
-                    let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
-                    match open_recovered_issuer(&stamperstore, &store_path, &b) {
-                        Ok(iss) => {
-                            tracing::info!(
-                                target: "antd",
-                                batch = %format!("0x{}", hex::encode(b.batch_id)),
-                                depth = b.depth,
-                                bucket_depth = b.bucket_depth,
-                                immutable = b.immutable,
-                                remaining_balance = b.remaining_balance,
-                                "rediscovered owned postage batch from chain",
-                            );
-                            issuers.insert(b.batch_id, iss);
-                        }
-                        Err(e) => tracing::warn!(
-                            target: "antd",
-                            batch = %format!("0x{}", hex::encode(b.batch_id)),
-                            "could not open rediscovered batch: {e}",
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "antd",
-                "postage batch rediscovery scan failed: {e}; continuing without it",
-            ),
+    //    range-capped RPC must never stop the daemon from starting. With
+    //    a write RPC the caller runs this after chain init instead
+    //    (`rediscover_later`).
+    if !rediscover_later {
+        if let Some(logs_rpc) = logs_rpc {
+            let client = ant_chain::ChainClient::new(logs_rpc);
+            let found = rediscover_batches(
+                &client,
+                &postage_contract,
+                &batch_owner,
+                &data_dir,
+                full_rescan,
+                &|id| issuers.contains_key(id),
+            )
+            .await;
+            issuers.extend(found);
         }
     }
 
@@ -1737,6 +1805,82 @@ async fn build_upload_runtime(
         batch_owner,
         postage_dir,
     })))
+}
+
+/// Batches `owner` holds on chain that `known` doesn't have yet, opened
+/// as issuers (carrying over bee's counters when a `stamperstore` is
+/// present). Reads the saved transfer scan, so only the first start scans
+/// the full history (#118); with `full_rescan` (`--rescan-chain-history`)
+/// it reads the whole history again and replaces the saved scan.
+/// Best-effort: a failed scan is logged and finds nothing.
+async fn rediscover_batches(
+    client: &ant_chain::ChainClient,
+    postage_contract: &str,
+    owner: &[u8; 20],
+    data_dir: &Path,
+    full_rescan: bool,
+    known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
+) -> Vec<([u8; 32], ant_postage::StampIssuer)> {
+    let scan = if full_rescan {
+        ant_chain::discover::rescan_transfer_history(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+        )
+        .await
+    } else {
+        ant_chain::discover::refresh_transfer_scan(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+        )
+        .await
+    };
+    let found = match scan {
+        Ok(scan) => ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await,
+        Err(e) => Err(e),
+    };
+    let found = match found {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(
+                target: "antd",
+                "postage batch rediscovery scan failed: {e}; continuing without it",
+            );
+            return Vec::new();
+        }
+    };
+    let stamperstore = data_dir.join("stamperstore");
+    let postage_dir = data_dir.join("postage");
+    let mut out = Vec::new();
+    for b in found {
+        if known(&b.batch_id) {
+            continue; // already reloaded / pre-registered
+        }
+        let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
+        match open_recovered_issuer(&stamperstore, &store_path, &b) {
+            Ok(iss) => {
+                tracing::info!(
+                    target: "antd",
+                    batch = %format!("0x{}", hex::encode(b.batch_id)),
+                    depth = b.depth,
+                    bucket_depth = b.bucket_depth,
+                    immutable = b.immutable,
+                    remaining_balance = b.remaining_balance,
+                    "rediscovered owned postage batch from chain",
+                );
+                out.push((b.batch_id, iss));
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                "could not open rediscovered batch: {e}",
+            ),
+        }
+    }
+    out
 }
 
 /// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on
@@ -1859,6 +2003,7 @@ async fn resolve_chequebook(
     signing_secret: [u8; SECP256K1_SECRET_LEN],
     node_eth: [u8; 20],
     light_mode: bool,
+    scan: bool,
     wallet: &WalletCoord,
 ) -> Result<ResolvedChequebook> {
     let rpc_url = configured_rpc_url(opt);
@@ -1978,34 +2123,54 @@ async fn resolve_chequebook(
         });
     }
 
+    // Steps 3 and 4 can wait: at startup with a write RPC they run in the
+    // background after chain init (`SettlementOnBuy::run`), so the
+    // transfer-history scan doesn't hold up `chainReady` (#118).
+    if !scan {
+        return Ok(ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        });
+    }
+
     // 3. Rediscover a chequebook this node already deployed (bee-parity
     //    recovery). On a data dir carried over from bee, or one whose
     //    `chequebook.json` was lost, the node EOA's chequebook is
     //    rediscoverable on-chain from the node key. Adopt it (persist
     //    the association so future starts skip the scan) rather than
     //    deploying a fresh one and stranding the old balance.
-    //    A scan that already answered "none" in this process isn't
-    //    repeated: only our own deploy can change that answer, and each
-    //    scan reads the whole log history since the xBZZ deploy block.
-    //    A deploy that succeeded is persisted (step 2 finds it); one that
-    //    failed may still have landed with no record, so it re-arms the
-    //    scan (`WalletCoord::note_deploy_attempt`).
+    //    The lookup reads the saved transfer scan (only the blocks since
+    //    the last one, #118). When step 4 will deploy on a "none", that
+    //    answer is first confirmed (`find_owned_chequebook`'s
+    //    `confirm_none`): the blocks no full pass from the xBZZ deploy
+    //    block has confirmed are read again — the whole history only if
+    //    no pass has (the confirmed mark is saved with the scan), so a
+    //    saved scan that missed a deposit must not lead to a second
+    //    chequebook. A lookup that already answered "none" in this
+    //    process isn't repeated: only our own deploy can change that
+    //    answer. A deploy that succeeded is persisted (step 2
+    //    finds it); one that failed may still have landed with no record,
+    //    so it re-arms the lookup (`WalletCoord::note_deploy_attempt`).
     let scan_rpc = resolve_logs_rpc(opt).filter(|_| {
         !wallet
             .no_owned_chequebook
             .load(std::sync::atomic::Ordering::Relaxed)
     });
     if let Some(logs_rpc) = scan_rpc {
-        match ant_chain::discover::discover_owned_chequebook(
-            &ant_chain::ChainClient::new(logs_rpc),
+        let client = ant_chain::ChainClient::new(logs_rpc);
+        // Step 4's gates: whether a "none" here leads to a deploy.
+        let will_deploy = !opt.no_auto_chequebook && rpc_url.is_some() && light_mode;
+        let owned = ant_chain::discover::find_owned_chequebook(
+            &client,
             &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
             &opt.postage_contract,
             ant_chain::GNOSIS_BZZ_TOKEN,
             &node_eth,
-            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+            data_dir,
+            will_deploy,
         )
-        .await
-        {
+        .await;
+        match owned {
             Ok(Some(cb)) => {
                 tracing::info!(
                     target: "antd",
@@ -2633,6 +2798,7 @@ impl SettlementOnBuy {
             self.signing_secret,
             self.eth,
             true,
+            true,
             &self.wallet,
         )
         .await
@@ -2641,7 +2807,7 @@ impl SettlementOnBuy {
             Err(e) => {
                 tracing::warn!(
                     target: "antd",
-                    "could not set up outbound SWAP settlement after a stamp buy: {e:#}",
+                    "could not set up outbound SWAP settlement at runtime: {e:#}",
                 );
                 return None;
             }
@@ -2685,7 +2851,7 @@ impl SettlementOnBuy {
                 tracing::info!(
                     target: "antd",
                     chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
-                    "outbound SWAP settlement enabled after a stamp buy — pushsync will emit cheques",
+                    "outbound SWAP settlement enabled at runtime — pushsync will emit cheques",
                 );
                 spawn_retrieval_funds_watch(&self.opt, cfg.chequebook, self.commands.clone());
                 Some(Settlement::of(&self.opt, Some(&cfg)))
@@ -3129,6 +3295,43 @@ mod tests {
             wallet: WalletCoord::default(),
         });
         (this, rx)
+    }
+
+    /// At startup with a write RPC, the chequebook resolution leaves the
+    /// rediscovery scan and the auto-deploy to the background run, so
+    /// `chainReady` doesn't wait on them (#118): with no chequebook on
+    /// disk it answers "none yet" without touching the chain. Both RPCs
+    /// are unroutable, so any scan or deploy would fail this test rather
+    /// than hang it.
+    #[tokio::test]
+    async fn startup_resolution_leaves_the_scan_to_the_background() {
+        let dir = std::env::temp_dir().join(format!("antd-no-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opt = Opt::parse_from(["antd"]);
+        opt.gnosis_rpc_url = Some("http://127.0.0.1:1".into());
+        opt.gnosis_logs_rpc_url = "http://127.0.0.1:1".into();
+        let wallet = WalletCoord::default();
+
+        let resolved = resolve_chequebook(
+            &opt,
+            &dir,
+            [0x42; SECP256K1_SECRET_LEN],
+            [0xe0; 20],
+            true,
+            false,
+            &wallet,
+        )
+        .await
+        .unwrap();
+        assert!(resolved.address.is_none() && resolved.pushsync.is_none());
+        assert!(
+            !wallet
+                .no_owned_chequebook
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "no scan ran, so nothing may be recorded as \"no chequebook\""
+        );
+        assert!(!dir.join("chequebook.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `POST /v0/settlement/deposit` found the chain refusing the managed
