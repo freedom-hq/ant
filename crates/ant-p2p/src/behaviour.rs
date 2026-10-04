@@ -3233,25 +3233,30 @@ fn handle_control_command(
             };
             let tracker_for_run = tracker;
             tokio::spawn(async move {
-                let reply = run_get_bytes(
-                    control,
-                    peers_rx,
-                    cache,
-                    disk_cache,
-                    record_dir,
-                    inflight_limit,
-                    payment_notify,
-                    accounting,
-                    counters,
-                    tracker_for_run,
-                    reference,
-                    max_bytes,
+                let reply = unless_client_gone(
+                    &ack,
+                    run_get_bytes(
+                        control,
+                        peers_rx,
+                        cache,
+                        disk_cache,
+                        record_dir,
+                        inflight_limit,
+                        payment_notify,
+                        accounting,
+                        counters,
+                        tracker_for_run,
+                        reference,
+                        max_bytes,
+                    ),
                 )
                 .await;
                 if let Some(handle) = emitter {
                     handle.abort();
                 }
-                let _ = ack.send(reply).await;
+                if let Some(reply) = reply {
+                    let _ = ack.send(reply).await;
+                }
             });
         }
         ControlCommand::GetBytesEncrypted {
@@ -3286,23 +3291,28 @@ fn handle_control_command(
             let counters = state.retrieval_counters.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             tokio::spawn(async move {
-                let reply = run_get_bytes_encrypted(
-                    control,
-                    peers_rx,
-                    cache,
-                    disk_cache,
-                    record_dir,
-                    inflight_limit,
-                    payment_notify,
-                    accounting,
-                    counters,
-                    tracker,
-                    reference,
-                    key,
-                    max_bytes,
+                let reply = unless_client_gone(
+                    &ack,
+                    run_get_bytes_encrypted(
+                        control,
+                        peers_rx,
+                        cache,
+                        disk_cache,
+                        record_dir,
+                        inflight_limit,
+                        payment_notify,
+                        accounting,
+                        counters,
+                        tracker,
+                        reference,
+                        key,
+                        max_bytes,
+                    ),
                 )
                 .await;
-                let _ = ack.send(reply).await;
+                if let Some(reply) = reply {
+                    let _ = ack.send(reply).await;
+                }
             });
         }
         ControlCommand::StreamBytes {
@@ -3344,23 +3354,27 @@ fn handle_control_command(
             let started = Instant::now();
             let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
             let tracker_for_run = tracker;
+            let client = ack.clone();
             tokio::spawn(async move {
-                run_stream_bytes(
-                    control,
-                    peers_rx,
-                    cache,
-                    disk_cache,
-                    record_dir,
-                    inflight_limit,
-                    payment_notify,
-                    accounting,
-                    counters,
-                    tracker_for_run,
-                    reference,
-                    max_bytes,
-                    range,
-                    head_only,
-                    ack,
+                unless_client_gone(
+                    &client,
+                    run_stream_bytes(
+                        control,
+                        peers_rx,
+                        cache,
+                        disk_cache,
+                        record_dir,
+                        inflight_limit,
+                        payment_notify,
+                        accounting,
+                        counters,
+                        tracker_for_run,
+                        reference,
+                        max_bytes,
+                        range,
+                        head_only,
+                        ack,
+                    ),
                 )
                 .await;
                 emitter.abort();
@@ -3401,25 +3415,29 @@ fn handle_control_command(
             let started = Instant::now();
             let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
             let tracker_for_run = tracker;
+            let client = ack.clone();
             tokio::spawn(async move {
-                run_stream_bzz(
-                    control,
-                    peers_rx,
-                    cache,
-                    disk_cache,
-                    record_dir,
-                    inflight_limit,
-                    payment_notify,
-                    accounting,
-                    counters,
-                    tracker_for_run,
-                    reference,
-                    path,
-                    allow_degraded_redundancy,
-                    max_bytes,
-                    range,
-                    head_only,
-                    ack,
+                unless_client_gone(
+                    &client,
+                    run_stream_bzz(
+                        control,
+                        peers_rx,
+                        cache,
+                        disk_cache,
+                        record_dir,
+                        inflight_limit,
+                        payment_notify,
+                        accounting,
+                        counters,
+                        tracker_for_run,
+                        reference,
+                        path,
+                        allow_degraded_redundancy,
+                        max_bytes,
+                        range,
+                        head_only,
+                        ack,
+                    ),
                 )
                 .await;
                 emitter.abort();
@@ -3466,27 +3484,32 @@ fn handle_control_command(
             };
             let tracker_for_run = tracker;
             tokio::spawn(async move {
-                let reply = run_get_bzz(
-                    control,
-                    peers_rx,
-                    cache,
-                    disk_cache,
-                    record_dir,
-                    inflight_limit,
-                    payment_notify,
-                    accounting,
-                    counters,
-                    tracker_for_run,
-                    reference,
-                    path,
-                    allow_degraded_redundancy,
-                    max_bytes,
+                let reply = unless_client_gone(
+                    &ack,
+                    run_get_bzz(
+                        control,
+                        peers_rx,
+                        cache,
+                        disk_cache,
+                        record_dir,
+                        inflight_limit,
+                        payment_notify,
+                        accounting,
+                        counters,
+                        tracker_for_run,
+                        reference,
+                        path,
+                        allow_degraded_redundancy,
+                        max_bytes,
+                    ),
                 )
                 .await;
                 if let Some(handle) = emitter {
                     handle.abort();
                 }
-                let _ = ack.send(reply).await;
+                if let Some(reply) = reply {
+                    let _ = ack.send(reply).await;
+                }
             });
         }
         ControlCommand::ListBzz {
@@ -5836,6 +5859,34 @@ async fn stream_root_chunk_inner(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Run a retrieval task for a control client until it finishes or the
+/// client goes away, whichever comes first; `None` means the client left.
+///
+/// The gateway reads a request's acks from the receiving end of `ack` and
+/// drops it when the HTTP client disconnects, e.g. a video player that
+/// seeks away from a segment it was loading. The task only learned that
+/// on its next `ack.send`, which for a stream is its next in-order chunk:
+/// a head chunk waiting for credit or a retry could put that seconds away,
+/// and until then the look-ahead kept fetching, and debiting, chunks nobody
+/// would read, in competition with the requests that replaced it. Racing
+/// the task against `ack.closed()` drops it at the disconnect. Everything
+/// it owns is cancel-safe (the joiner's fetches, credit waits and permit
+/// waits); retrievals already on the wire still drain on their own, so the
+/// debit for chunks peers are already sending is applied as before.
+async fn unless_client_gone<T>(
+    ack: &mpsc::Sender<ControlAck>,
+    task: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        out = task => Some(out),
+        () = ack.closed() => {
+            debug!(target: "ant_p2p", "control client went away; dropping its retrieval");
+            None
         }
     }
 }
@@ -11942,5 +11993,43 @@ mod tests {
         let reference = [0xab; 32];
         assert!(raw_bytes_lookup(&reference, "index.html").is_none());
         assert!(raw_bytes_lookup(&reference, "/a/b").is_none());
+    }
+
+    /// A retrieval whose control client went away (the gateway dropped
+    /// the ack receiver because the HTTP client disconnected) is dropped
+    /// at once, with everything it owns, instead of running on until it
+    /// next tries to send an ack.
+    #[tokio::test]
+    async fn retrieval_is_dropped_when_its_client_goes_away() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let (ack, rx) = mpsc::channel::<ControlAck>(1);
+        let task = tokio::spawn(async move {
+            unless_client_gone(&ack, async move {
+                let _flag = flag;
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+        drop(rx);
+        let out = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the retrieval is dropped when its client goes away")
+            .unwrap();
+        assert!(out.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn retrieval_that_finishes_hands_back_its_reply() {
+        let (ack, _rx) = mpsc::channel::<ControlAck>(1);
+        assert_eq!(unless_client_gone(&ack, async { 7 }).await, Some(7));
     }
 }
