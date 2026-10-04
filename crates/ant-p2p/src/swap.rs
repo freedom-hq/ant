@@ -113,7 +113,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -537,6 +537,36 @@ pub fn issue_cheque(
 /// writes them all back with its own, instead of failing to parse and
 /// replacing every chequebook's figures (PR #126 R4-M3).
 ///
+/// The in-memory cumulatives are the source of truth while the process
+/// runs; the file is read only when a chequebook's ledger opens (or
+/// retries a failed read). A cheque doesn't rewrite it (issue #140: that
+/// cost one read, re-serialisation and fsync of the whole ledger per
+/// cheque, under one lock, and paid throughput fell as the ledger grew).
+/// Each cheque appends one line, `{"<chequebook>:<beneficiary>":"<cum>"}`,
+/// to a journal next to it, `<name>.journal`, and the cheque goes out only
+/// once that line is fsynced ([`Self::stage_issued`], [`PendingWrite`]).
+/// Cheques issued together share one write and fsync (group commit), and
+/// the work per cheque doesn't depend on how many peers the ledger holds.
+/// Reading takes the larger figure of the file and every journal line
+/// (cumulatives only grow), so a line repeated or replayed is harmless.
+///
+/// The journal is folded back into the file (compaction) once it holds
+/// as many lines as the file has entries (at least
+/// [`COMPACT_MIN_LINES`]), when the first ledger on the file opens, and
+/// when the last one closes. Compaction renames the journal to
+/// `<name>.journal.old` (new cheques start a fresh journal), writes the
+/// merged file (temp file, fsync, rename) and only then deletes the old
+/// journal; a crash at any step leaves every figure in the file or a
+/// journal, and the next open finishes the job. It reads the file like an
+/// open does, so it never writes over a file it couldn't read, and it
+/// keeps the sections of every chequebook in it.
+///
+/// A downgraded release reads only the file, so it misses the cheques
+/// still in a journal: after a clean stop there are none (the last ledger
+/// closing compacts), after a crash, start this release once first (the
+/// open compacts). The journal must travel with the file (ant-ffi's
+/// account parking moves both).
+///
 /// Bare `beneficiary → cumulative` entries — a file from before the
 /// sections, or ones a downgraded release added — are adopted by the
 /// first chequebook that opens the file (the larger figure wins against
@@ -610,6 +640,11 @@ struct OutboundShared {
     /// chequebook. Cleared once they are rewritten to the new file and
     /// the marker records the chequebook as known.
     survived_loss: AtomicBool,
+    /// Bumped every time [`Self::survived_loss`] is set, so clearing it
+    /// after a rewrite can tell whether another loss came in between.
+    loss_gen: AtomicU64,
+    /// Where cheques are journaled; `None` for a ledger without a file.
+    store: Option<Arc<JournalStore>>,
 }
 
 /// One chequebook's cumulatives, shared by every [`OutboundLedger`]
@@ -617,6 +652,9 @@ struct OutboundShared {
 #[derive(Default)]
 struct OutboundState {
     cumulatives: HashMap<String, U256>,
+    /// Sum of `cumulatives`, kept up to date so the funds check on the
+    /// pay path is O(1).
+    total: U256,
     /// The file couldn't be read (an I/O error, not "missing"), so the
     /// chequebook's recorded cumulatives are unknown. Nothing is written
     /// and no cheque is issued until a read succeeds
@@ -624,6 +662,852 @@ struct OutboundState {
     /// let the next write erase the file's figures and the next cheque
     /// repeat a cumulative the peer already holds.
     unread: Option<String>,
+}
+
+impl OutboundState {
+    /// Raise `beneficiary`'s cumulative to `v` (cumulatives only grow)
+    /// and return the figure it holds now.
+    fn raise(&mut self, beneficiary: String, v: U256) -> U256 {
+        let cur = self.cumulatives.entry(beneficiary).or_default();
+        if v > *cur {
+            self.total = self.total.saturating_add(v - *cur);
+            *cur = v;
+        }
+        *cur
+    }
+}
+
+/// Fewest journal lines that trigger a compaction; above it, the journal
+/// may grow to as many lines as the file has entries, so the cost of
+/// compacting stays proportional to the cheques that paid for it.
+pub const COMPACT_MIN_LINES: u64 = 4096;
+
+/// After a compaction fails (the file can't be read, say), wait this
+/// long before the next try, instead of retrying at every cheque.
+const COMPACT_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `<name><suffix>` next to `path`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// The journal cheques are appended to: `<name>.journal`.
+fn journal_path(path: &Path) -> PathBuf {
+    sibling(path, ".journal")
+}
+
+/// A journal being compacted: `<name>.journal.old`.
+fn journal_old_path(path: &Path) -> PathBuf {
+    sibling(path, ".journal.old")
+}
+
+/// fsync `path`'s directory, so a file created or renamed in it is still
+/// there after a crash.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// The journal of one ledger file, shared by every chequebook's ledger
+/// on it in this process (see [`OutboundLedger`]). Lock order: the file
+/// lock ([`OUTBOUND_FILE_LOCK`]) before `io`, `io` before `queue`; a
+/// ledger's state lock may be held while staging (`queue`), never while
+/// writing (`io`).
+struct JournalStore {
+    /// The ledger file the journal belongs to.
+    path: PathBuf,
+    /// Lines staged and not yet written.
+    queue: Mutex<JournalQueue>,
+    /// The open journal. Held across one append + fsync: whoever holds it
+    /// writes every line staged so far (group commit).
+    io: Mutex<JournalIo>,
+    /// Lines up to this sequence number are on disk.
+    durable: AtomicU64,
+    /// Entries in the file as last read or written; the compaction
+    /// threshold.
+    snapshot_entries: AtomicU64,
+    /// A compaction is running in the background.
+    compacting: AtomicBool,
+    /// When the last compaction failed.
+    compact_failed: Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Default)]
+struct JournalQueue {
+    buf: Vec<u8>,
+    lines: u64,
+    /// Sequence number of the last line staged.
+    staged: u64,
+}
+
+#[derive(Default)]
+struct JournalIo {
+    file: Option<std::fs::File>,
+    /// Lines in the current journal.
+    lines: u64,
+    /// The ledger's files were (or are about to be) moved away from its
+    /// path by someone else — an account switch parking the data dir
+    /// ([`hold_ledger_files`], PR #141 R1-M1/R2-F1): this store no longer
+    /// owns the path. Its handle is closed and it never writes, reopens,
+    /// compacts or folds anything again: the path belongs to whoever is
+    /// there now, and the moved files may come back to it later (a switch
+    /// back), where a handle kept open would be a second writer next to
+    /// the store that reopens them. A cheque staged on it fails instead
+    /// of going out.
+    retired: bool,
+    /// Bytes in the current journal up to its last durable group commit.
+    len: u64,
+    /// The last durable commit mark in the current journal (see
+    /// [`journal_intact_len`]). Advanced only once a group commit is
+    /// synced: a write that fails is cut off before the retry
+    /// ([`Self::resume`]), so the retry takes the failed write's number
+    /// and its mark follows the last durable one with no gap — a crash
+    /// tearing the retry then reads as a torn tail, not damage
+    /// (PR #141 R5-M1).
+    marks: u64,
+    /// A write failed and its handle was dropped: where the journal ends
+    /// as far as anything acknowledged goes. The next open cuts it back
+    /// to there (PR #141 R4-F1).
+    resume: Option<Resume>,
+}
+
+/// See [`JournalIo::resume`].
+struct Resume {
+    /// The journal's length at its last durable group commit.
+    len: u64,
+    /// The journal it is about, so it is never applied to another file
+    /// that took the path.
+    file: std::fs::Metadata,
+    /// [`JournalIo::marks`] at the failure: the last durable mark, the
+    /// failed write's own not counted.
+    marks: u64,
+}
+
+impl JournalIo {
+    /// See [`Self::retired`].
+    fn retire(&mut self) {
+        self.retired = true;
+        self.close();
+    }
+
+    /// Drop the handle on a journal that was moved away (compacted,
+    /// quarantined, retired): the next open starts on whatever is at the
+    /// path then.
+    fn close(&mut self) {
+        self.file = None;
+        self.lines = 0;
+        self.len = 0;
+        self.marks = 0;
+        self.resume = None;
+    }
+
+    /// Append `buf` (whole lines) to the journal as one group commit and
+    /// fsync it. On error the handle is dropped, and reopening it cuts the
+    /// journal back to its last durable commit: the failed write's bytes
+    /// may read back fine now (from the page cache) and be zeros after a
+    /// crash, and a retry appended after them would put an acknowledged
+    /// commit behind a zeroed range that [`journal_intact_len`] could read
+    /// as the torn tail of one write (PR #141 R4-F1). It also means a
+    /// retry never glues a line onto a torn one.
+    fn append(&mut self, path: &Path, buf: &[u8]) -> std::io::Result<()> {
+        use std::io::{Read, Seek, Write};
+        if self.file.is_none() {
+            if self.retired {
+                return Err(retired_error());
+            }
+            let jp = journal_path(path);
+            if let Some(parent) = jp.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            let existed = jp.try_exists()?;
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&jp)?;
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes)?;
+            let resume = self.resume.as_ref().filter(|r| {
+                usize::try_from(r.len).is_ok_and(|n| n <= bytes.len())
+                    && f.metadata().is_ok_and(|m| same_file(&m, &r.file))
+            });
+            let (good, marks) = if let Some(r) = resume {
+                (usize::try_from(r.len).expect("checked above"), r.marks)
+            } else {
+                let good = journal_intact_len(&bytes);
+                if bytes[good..].contains(&0) {
+                    keep_torn_copy(&jp, &bytes)?;
+                }
+                let marks = bytes[..good]
+                    .rsplit(|b| *b == b'\n')
+                    .find_map(commit_mark)
+                    .unwrap_or(0);
+                (good, marks)
+            };
+            if good != bytes.len() {
+                f.set_len(good as u64)?;
+            }
+            f.seek(std::io::SeekFrom::Start(good as u64))?;
+            if !existed {
+                sync_parent_dir(&jp)?;
+            }
+            // Once per opened handle, not per cheque. Cheque lines only,
+            // not the commit marks.
+            let lines = bytes[..good]
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty() && commit_mark(l).is_none())
+                .count();
+            self.lines = lines as u64;
+            self.len = good as u64;
+            self.marks = marks;
+            self.resume = None;
+            self.file = Some(f);
+        }
+        let f = self.file.as_mut().expect("opened above");
+        // The commit mark closes the group commit: see
+        // [`journal_intact_len`].
+        // `marks` advances only once this commit is durable: see
+        // [`Self::marks`].
+        let mark = self.marks + 1;
+        let mut group = Vec::with_capacity(buf.len() + 24);
+        group.extend_from_slice(buf);
+        group.extend_from_slice(format!("#{mark}\n").as_bytes());
+        let written = f
+            .write_all(&group)
+            .and_then(|()| f.sync_data())
+            .and_then(|()| sync_failure_hook());
+        if written.is_ok() {
+            self.len += group.len() as u64;
+            self.marks = mark;
+        } else {
+            // Without the handle's metadata the next open can't be sure
+            // it reopened this file, and falls back to
+            // `journal_intact_len`: the failed write's mark is then still
+            // in the file, so the retry's comes after a gap, and a crash
+            // zeroing the failed write reads as damage (a loss), never as
+            // a torn tail.
+            self.resume = f.metadata().ok().map(|file| Resume {
+                len: self.len,
+                file,
+                marks: self.marks,
+            });
+            self.file = None;
+        }
+        written
+    }
+}
+
+/// The error a retired journal store ([`JournalIo::retired`]) fails with.
+fn retired_error() -> std::io::Error {
+    std::io::Error::other(
+        "the outbound ledger's files were moved away from its path (account \
+         switched); this ledger no longer writes them",
+    )
+}
+
+/// How much of a journal's bytes is intact: the complete lines before
+/// the first one a crash may have torn. A last line without its newline
+/// was cut off mid-write; so was a line holding a NUL byte, which no
+/// journal line ever does — a filesystem that zero-fills the extents of
+/// a write not yet synced (XFS, ext4 without `data=ordered`) leaves
+/// those after a crash, possibly with a later part of the same write
+/// intact after them (PR #141 R2-M3).
+///
+/// That can only be the last group commit: every append is fsynced
+/// before the next starts, a failed one is cut off before the retry
+/// ([`JournalIo::append`], PR #141 R4-F1), and each one ends in a commit
+/// mark, `#<n>`, numbered from 1 in each journal. So a NUL is a torn
+/// write only when the marks around it say so: no mark after it, or
+/// exactly one — the file's last line — numbered one past the last mark
+/// before it. Everything from the NUL's line on then belongs to that
+/// one write, which was never acknowledged (no cheque went out on it)
+/// and is dropped whole. Any other mark after a NUL means synced,
+/// acknowledged lines were zeroed — a later commit followed, or a mark
+/// is missing because the zeroed range swallowed the end of an earlier
+/// commit (PR #141 R4-M1) — and cheques went out on them: that is
+/// damage, not a torn write, so every complete line is kept for
+/// [`load_journal`] to find the damaged one and quarantine the journal
+/// as a loss (PR #141 R3-F1). Damage that runs to the end of the file,
+/// taking every later mark with it, can't be told from a torn write and
+/// still reads as torn; the dropped bytes are kept in a copy then
+/// ([`keep_torn_copy`]).
+fn journal_intact_len(bytes: &[u8]) -> usize {
+    let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let Some(nul) = bytes[..complete].iter().position(|b| *b == 0) else {
+        return complete;
+    };
+    let line_start = bytes[..nul]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    let before = bytes[..line_start]
+        .rsplit(|b| *b == b'\n')
+        .find_map(commit_mark)
+        .unwrap_or(0);
+    // The lines after the NUL's own line (it ends before `complete`).
+    let after_start = nul
+        + bytes[nul..complete]
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("`complete` ends in a newline")
+        + 1;
+    let after = &bytes[after_start..complete];
+    let marks: Vec<u64> = after
+        .split(|b| *b == b'\n')
+        .filter_map(commit_mark)
+        .collect();
+    let last_line = after
+        .strip_suffix(b"\n")
+        .and_then(|a| a.rsplit(|b| *b == b'\n').next());
+    let torn = match marks[..] {
+        [] => true,
+        [only] => only == before + 1 && last_line.and_then(commit_mark) == Some(only),
+        _ => false,
+    };
+    if torn {
+        line_start
+    } else {
+        complete
+    }
+}
+
+/// The number of a commit mark line (`#<n>`, see [`journal_intact_len`]).
+fn commit_mark(line: &[u8]) -> Option<u64> {
+    let digits = line.strip_prefix(b"#")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Copy `bytes`, the journal `part` holding a zeroed range about to be
+/// dropped as a torn write, to `<part>.torn-<unix secs>[-n]` first: if it
+/// was damage instead (see [`journal_intact_len`]), what is left of the
+/// lines stays for whoever wants to look (PR #141 R4-M1). Not a loss and
+/// no marker — nothing on record says those lines were acknowledged.
+/// Fails, and nothing is dropped, if the copy can't be written.
+fn keep_torn_copy(part: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let copy = free_aside_name(part, "torn")
+        .ok_or_else(|| std::io::Error::other("no free name for a copy of a torn journal"))?;
+    std::fs::write(&copy, bytes)?;
+    std::fs::File::open(&copy)?.sync_all()?;
+    sync_parent_dir(&copy)?;
+    warn!(
+        target: "ant_p2p::swap",
+        file = %part.display(),
+        copy = %copy.display(),
+        "outbound ledger: the cheque journal ends in a zero-filled range a crash \
+         left in its last, unacknowledged write; dropping it (a copy is kept)",
+    );
+    Ok(())
+}
+
+/// A name `<part>.<tag>-<unix secs>[-n]` next to `part` that no file has.
+/// `rename` replaces an existing file, so a name is never reused: a
+/// second move within the same second would lose the first copy (PR #126
+/// R4-M2). Callers hold `OUTBOUND_FILE_LOCK`, so nothing in this process
+/// takes the name between the check and its use.
+fn free_aside_name(part: &Path, tag: &str) -> Option<PathBuf> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (0u32..1000)
+        .map(|n| {
+            let mut name = part.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".{tag}-{secs}"));
+            if n > 0 {
+                name.push(format!("-{n}"));
+            }
+            part.with_file_name(name)
+        })
+        .find(|p| matches!(p.try_exists(), Ok(false)))
+}
+
+/// `a` and `b` are the same file (inode); always true where that can't
+/// be told.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        true
+    }
+}
+
+/// Live journals by ledger file. Guarded by [`OUTBOUND_FILE_LOCK`].
+static JOURNALS: Mutex<Vec<(PathBuf, Weak<JournalStore>)>> = Mutex::new(Vec::new());
+
+/// The live journal on `path`, if any.
+fn live_journal(path: &Path) -> Option<Arc<JournalStore>> {
+    JOURNALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(p, _)| p == path)
+        .and_then(|(_, w)| w.upgrade())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make compactions on this thread stop with an error
+    /// right after step `n` (1: journal renamed, 2: file rewritten).
+    static COMPACT_STOP_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn compact_step(n: u8) -> std::io::Result<()> {
+    if COMPACT_STOP_AFTER.with(std::cell::Cell::get) == n {
+        return Err(std::io::Error::other(format!(
+            "test: compaction stopped after step {n}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next journal fsync on this thread reports an error
+    /// after the bytes were written, like an `EIO` from `fsync`.
+    static FAIL_NEXT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn sync_failure_hook() -> std::io::Result<()> {
+    if FAIL_NEXT_SYNC.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other("test: fsync failed"));
+    }
+    Ok(())
+}
+
+/// Test hook (see `FAIL_NEXT_SYNC`); never fails outside tests.
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)]
+#[inline]
+fn sync_failure_hook() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Test hook (see `COMPACT_STOP_AFTER`); never fails outside tests.
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)]
+#[inline]
+fn compact_step(_n: u8) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl JournalStore {
+    /// The journal on `path`, shared with live ledgers on it. A new one
+    /// (first ledger on the file in this process) folds journals a
+    /// previous run left behind into the file. Caller holds
+    /// [`OUTBOUND_FILE_LOCK`].
+    fn for_path(path: &Path) -> Arc<Self> {
+        if let Some(live) = live_journal(path) {
+            if !live.retire_if_moved() {
+                return live;
+            }
+            warn!(
+                target: "ant_p2p::swap",
+                file = %path.display(),
+                "outbound ledger: the cheque journal still open from an earlier ledger \
+                 was moved away (account switched); starting a new one on this path",
+            );
+            // Possibly its last owner: closing it folds, under the lock
+            // this thread holds (PR #141 R2-M2).
+            release_after_unlock(live);
+        }
+        let store = Arc::new(Self {
+            path: path.to_path_buf(),
+            queue: Mutex::default(),
+            io: Mutex::default(),
+            durable: AtomicU64::new(0),
+            snapshot_entries: AtomicU64::new(0),
+            compacting: AtomicBool::new(false),
+            compact_failed: Mutex::new(None),
+        });
+        {
+            let mut reg = JOURNALS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.retain(|(p, w)| p != path && w.strong_count() > 0);
+            reg.push((path.to_path_buf(), Arc::downgrade(&store)));
+        }
+        if let Err(e) = store.compact_locked() {
+            warn!(
+                target: "ant_p2p::swap",
+                file = %path.display(),
+                "outbound ledger: can't fold the cheque journal into the file: {e}; \
+                 it is kept and read along with the file",
+            );
+        }
+        store
+    }
+
+    /// Whether this store's open journal is no longer the file at its
+    /// path — moved away outside this process's ledger code, which only
+    /// ever moves the journal with the handle closed (an account switch
+    /// parks the data dir while a blocking cheque write outlived the
+    /// node's shutdown, and nothing held the files for the move with
+    /// [`hold_ledger_files`]). Retires the store if so (closing its
+    /// handle, see [`JournalIo::retired`]), and a new store takes the
+    /// path.
+    /// Caller holds [`OUTBOUND_FILE_LOCK`].
+    fn retire_if_moved(&self) -> bool {
+        let mut io = self
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if io.retired {
+            return true;
+        }
+        let Some(f) = &io.file else {
+            return false;
+        };
+        let moved = match (f.metadata(), std::fs::metadata(journal_path(&self.path))) {
+            (Ok(open), Ok(at_path)) => !same_file(&open, &at_path),
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => true,
+            // Can't tell: keep using it, as before.
+            _ => false,
+        };
+        if moved {
+            io.retire();
+        }
+        moved
+    }
+
+    /// See [`JournalIo::retired`].
+    fn is_retired(&self) -> bool {
+        self.io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+    }
+
+    /// Stage `entries` (`<chequebook>:<beneficiary>` → cumulative) as
+    /// journal lines. Returns the sequence number to wait for.
+    fn stage<'a>(&self, entries: impl IntoIterator<Item = (&'a str, &'a str, U256)>) -> u64 {
+        let mut q = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (chequebook, beneficiary, v) in entries {
+            q.buf.extend_from_slice(
+                format!("{{\"{chequebook}:{beneficiary}\":\"{v}\"}}\n").as_bytes(),
+            );
+            q.lines += 1;
+            q.staged += 1;
+        }
+        q.staged
+    }
+
+    fn is_durable(&self, seq: u64) -> bool {
+        self.durable.load(Ordering::SeqCst) >= seq
+    }
+
+    /// Block until every line up to `seq` is on disk, writing it (and
+    /// everything else staged) unless a concurrent caller already did.
+    fn commit(self: &Arc<Self>, seq: u64) -> std::io::Result<()> {
+        if self.is_durable(seq) {
+            return Ok(());
+        }
+        let mut io = self
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_durable(seq) {
+            return Ok(());
+        }
+        let (buf, lines, upto) = {
+            let mut q = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lines = std::mem::take(&mut q.lines);
+            (std::mem::take(&mut q.buf), lines, q.staged)
+        };
+        if let Err(e) = io.append(&self.path, &buf) {
+            // Put the lines back in front of anything staged since, for
+            // the next commit to retry.
+            let mut q = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut back = buf;
+            back.extend_from_slice(&q.buf);
+            q.buf = back;
+            q.lines += lines;
+            return Err(e);
+        }
+        self.durable.store(upto, Ordering::SeqCst);
+        io.lines += lines;
+        let due = io.lines >= COMPACT_MIN_LINES.max(self.snapshot_entries.load(Ordering::SeqCst));
+        drop(io);
+        if due {
+            self.compact_in_background();
+        }
+        Ok(())
+    }
+
+    /// Compact on a thread of its own, so no cheque waits for it.
+    fn compact_in_background(self: &Arc<Self>) {
+        let recently_failed = self
+            .compact_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|t| t.elapsed() < COMPACT_RETRY);
+        if recently_failed || self.compacting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let store = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("ledger-compact".into())
+            .spawn(move || {
+                let r = {
+                    let _file = lock_file();
+                    store.compact_locked()
+                };
+                if let Err(e) = r {
+                    warn!(
+                        target: "ant_p2p::swap",
+                        file = %store.path.display(),
+                        "outbound ledger: compaction failed: {e}; the cheque journal is \
+                         kept and retried later",
+                    );
+                    *store
+                        .compact_failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(std::time::Instant::now());
+                }
+                store.compacting.store(false, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            self.compacting.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Fold the journal into the file (see [`OutboundLedger`]). Caller
+    /// holds [`OUTBOUND_FILE_LOCK`]. A `.journal.old` left by an earlier,
+    /// interrupted compaction is folded first, then the current journal.
+    fn compact_locked(&self) -> std::io::Result<()> {
+        if self.is_retired() {
+            return Ok(());
+        }
+        loop {
+            let old = journal_old_path(&self.path);
+            let leftover = old.try_exists()?;
+            if !leftover {
+                let jp = journal_path(&self.path);
+                let mut io = self
+                    .io
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !jp.try_exists()? {
+                    return Ok(());
+                }
+                std::fs::rename(&jp, &old)?;
+                io.close();
+            }
+            compact_step(1)?;
+            // Read like an open does: an unreadable file fails the
+            // compaction (and the journal stays), an unparseable one is
+            // moved aside.
+            let mut file = read_outbound_file(&self.path)?.unwrap_or_default();
+            for line in load_journal(&self.path, &old)? {
+                file.merge_flat(line);
+            }
+            write_outbound_file(&self.path, &file)?;
+            sync_parent_dir(&self.path)?;
+            compact_step(2)?;
+            self.snapshot_entries
+                .store(file.entries() as u64, Ordering::SeqCst);
+            match std::fs::remove_file(&old) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            if !leftover {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Drop for JournalStore {
+    /// The last ledger on the file closed: write out anything still
+    /// staged and fold the journal into the file, so a downgraded release
+    /// finds every cheque there. Nothing for a retired store (its path
+    /// is someone else's now). Code holding the file lock never drops
+    /// its last reference (it hands it to [`release_after_unlock`]); if
+    /// that slips, this is skipped (the journal stays, and the next open
+    /// folds it) rather than deadlocking on the lock or folding in the
+    /// middle of a read or a move.
+    fn drop(&mut self) {
+        if self
+            .io
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+        {
+            return;
+        }
+        if HOLDS_FILE_LOCK.with(std::cell::Cell::get) {
+            debug_assert!(false, "last JournalStore dropped under the file lock");
+            return;
+        }
+        let _file = lock_file();
+        let io = self
+            .io
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let q = self
+            .queue
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !q.buf.is_empty() {
+            if let Err(e) = io.append(&self.path, &q.buf) {
+                warn!(
+                    target: "ant_p2p::swap",
+                    file = %self.path.display(),
+                    "outbound ledger: can't journal {} cheque line(s) at close: {e}",
+                    q.lines,
+                );
+            }
+        }
+        if let Err(e) = self.compact_locked() {
+            warn!(
+                target: "ant_p2p::swap",
+                file = %self.path.display(),
+                "outbound ledger: can't fold the cheque journal into the file at close: {e}; \
+                 it is kept and read along with the file",
+            );
+        }
+    }
+}
+
+/// Read the journal `part` of the ledger at `path`: one flat map per
+/// line. A torn tail ([`journal_intact_len`]: a last line without its
+/// newline, or a NUL-filled range a crash left) was cut off mid-write and
+/// never confirmed (no cheque went out on it), so it is skipped; any other line
+/// that doesn't parse means the journal is damaged, and it is moved aside
+/// like an unparseable file (its figures count as lost), reading as empty.
+/// `Ok(vec![])` when it doesn't exist; an I/O error is returned.
+fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String, String>>> {
+    let bytes = match std::fs::read(part) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let complete = journal_intact_len(&bytes);
+    if bytes[complete..].contains(&0) {
+        keep_torn_copy(part, &bytes)?;
+    }
+    let mut lines = Vec::new();
+    for (n, line) in bytes[..complete].split(|b| *b == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) || commit_mark(line).is_some() {
+            continue;
+        }
+        match serde_json::from_slice::<HashMap<String, String>>(line) {
+            Ok(m) => lines.push(m),
+            Err(e) => {
+                quarantine_outbound_file(path, part, &format!("line {}: {e}", n + 1))?;
+                return Ok(Vec::new());
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// A cheque recorded in memory whose journal line may not be on disk
+/// yet. Send the cheque only after [`Self::durable`] (or [`Self::wait`])
+/// returned `Ok`: then a crash can't forget it.
+#[must_use = "a cheque may only be sent once its record is durable"]
+pub struct PendingWrite {
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    store: Arc<JournalStore>,
+    seq: u64,
+    /// The ledger's figures survived a loss and this write rewrote all of
+    /// them: once durable, record the chequebook as known in the marker.
+    /// Holds the ledger's state alive meanwhile, so a ledger reopened on
+    /// the chequebook shares it instead of reading the file without this
+    /// line.
+    shared: Arc<OutboundShared>,
+    note_known: Option<(String, u64)>,
+}
+
+impl std::fmt::Debug for PendingWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingWrite")
+            .field("seq", &self.pending.as_ref().map(|p| p.seq))
+            .finish()
+    }
+}
+
+impl PendingWrite {
+    /// Block until the record is on disk.
+    pub fn wait(self) -> std::io::Result<()> {
+        let Some(p) = self.pending else {
+            return Ok(());
+        };
+        p.store.commit(p.seq)?;
+        if let Some((chequebook, generation)) = p.note_known {
+            let _file = lock_file();
+            // The files moved away (account switch) since: the marker at
+            // the path is another account's.
+            if p.store.is_retired() {
+                return Ok(());
+            }
+            // Not if another loss came in since this rewrite was staged:
+            // the rewrite may have been moved aside with the journal, so
+            // the chequebook is still lost on disk (and stays flagged, to
+            // be rewritten again at its next cheque). Losses are recorded
+            // under the file lock held here, so none can slip in between
+            // this check and the marker update.
+            if p.shared.loss_gen.load(Ordering::SeqCst) != generation {
+                return Ok(());
+            }
+            match note_known(&p.store.path, &chequebook) {
+                Ok(()) => p.shared.survived_loss.store(false, Ordering::SeqCst),
+                Err(e) => warn!(
+                    target: "ant_p2p::swap",
+                    chequebook = %chequebook,
+                    "can't record in the lost-ledger marker that this chequebook's \
+                     figures were rewritten: {e}; retrying at its next cheque",
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::wait`] on the blocking pool, unless it is already on disk
+    /// (a concurrent cheque's fsync covered it).
+    pub async fn durable(self) -> std::io::Result<()> {
+        match &self.pending {
+            None => return Ok(()),
+            Some(p) if p.note_known.is_none() && p.store.is_durable(p.seq) => return Ok(()),
+            Some(_) => {}
+        }
+        tokio::task::spawn_blocking(move || self.wait())
+            .await
+            .map_err(std::io::Error::other)?
+    }
 }
 
 /// The outbound ledger file, read into sections: `chequebook hex →
@@ -651,6 +1535,27 @@ impl OutboundFile {
         file
     }
 
+    /// Raise this file's figures to a flat map's (a journal line):
+    /// cumulatives only grow.
+    fn merge_flat(&mut self, flat: HashMap<String, String>) {
+        for (chequebook, entries) in Self::from_flat(flat).chequebooks {
+            let section = self.chequebooks.entry(chequebook).or_default();
+            for (beneficiary, v) in parse_cumulatives(entries) {
+                let cur = section
+                    .get(&beneficiary)
+                    .and_then(|c| U256::from_dec_str(c).ok());
+                if cur.is_none_or(|c| v > c) {
+                    section.insert(beneficiary, v.to_string());
+                }
+            }
+        }
+    }
+
+    /// Entries in the flat on-disk map.
+    fn entries(&self) -> usize {
+        self.chequebooks.values().map(HashMap::len).sum()
+    }
+
     /// The flat on-disk map: bare entries keep their bare key.
     fn to_flat(&self) -> HashMap<String, String> {
         self.chequebooks
@@ -672,7 +1577,8 @@ impl OutboundFile {
 /// Serialises read-modify-write of outbound ledger files across every
 /// ledger in the process (two services — an old chequebook's still
 /// finishing a cheque, the new one's — can share one file), and guards
-/// [`OUTBOUND_LEDGERS`]. Taken after a ledger's state lock, never before.
+/// [`OUTBOUND_LEDGERS`] and [`JOURNALS`]. Taken before a ledger's state
+/// lock, never after; recording a cheque doesn't take it at all.
 static OUTBOUND_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Live ledger states by `(file, chequebook)`. A second ledger opened on
@@ -699,25 +1605,29 @@ fn parse_cumulatives(map: HashMap<String, String>) -> HashMap<String, U256> {
 /// flag the result with [`flag_survivors`] once it is recorded. Caller
 /// holds [`OUTBOUND_FILE_LOCK`] and not [`OUTBOUND_LEDGERS`].
 fn known_survivors(path: &Path) -> Vec<Arc<OutboundShared>> {
-    let reg = OUTBOUND_LEDGERS
+    let live: Vec<_> = OUTBOUND_LEDGERS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.iter()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
         .filter(|((p, _), _)| p == path)
-        .filter_map(|((_, chequebook), w)| {
-            let shared = w.upgrade()?;
-            let known = shared.loaded.load(Ordering::SeqCst)
-                && (shared.survived_loss.load(Ordering::SeqCst)
-                    || lost_figures_at(path, chequebook).is_none());
-            known.then_some(shared)
-        })
-        .collect()
+        .filter_map(|((_, chequebook), w)| Some((*chequebook, w.upgrade()?)))
+        .collect();
+    let (known, other): (Vec<_>, Vec<_>) = live.into_iter().partition(|(chequebook, shared)| {
+        shared.loaded.load(Ordering::SeqCst)
+            && (shared.survived_loss.load(Ordering::SeqCst)
+                || lost_figures_at(path, chequebook).is_none())
+    });
+    // The caller holds the file lock; any of these may be the last
+    // reference (PR #141 R2-M2).
+    release_after_unlock(other);
+    known.into_iter().map(|(_, shared)| shared).collect()
 }
 
 /// Mark `survivors` (from [`known_survivors`]) as having survived the
 /// loss just recorded.
 fn flag_survivors(survivors: &[Arc<OutboundShared>]) {
     for shared in survivors {
+        shared.loss_gen.fetch_add(1, Ordering::SeqCst);
         shared.survived_loss.store(true, Ordering::SeqCst);
     }
 }
@@ -737,38 +1647,26 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
             if let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) {
                 return Ok(Some(nested));
             }
-            quarantine_outbound_file(path, &e)?;
+            quarantine_outbound_file(path, path, &e)?;
             Ok(None)
         }
     }
 }
 
-/// Move an unparseable outbound ledger out of the way, keeping it for
-/// whoever wants to look at it. Fails (and the file stays, unread) only
-/// if it can't be moved.
-fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std::io::Result<()> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    // `rename` replaces an existing file, so never reuse a name: a
-    // second move within the same second would lose the first copy
-    // (PR #126 R4-M2). Callers hold `OUTBOUND_FILE_LOCK`, so nothing in
-    // this process takes the name between the check and the move.
-    let aside = (0u32..1000)
-        .map(|n| {
-            let mut name = path.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".corrupt-{secs}"));
-            if n > 0 {
-                name.push(format!("-{n}"));
-            }
-            path.with_file_name(name)
-        })
-        .find(|p| matches!(p.try_exists(), Ok(false)))
-        .ok_or_else(|| {
-            std::io::Error::other(format!(
-                "unparseable ({parse_error}) and no free name to move it aside to"
-            ))
-        })?;
+/// Move `part` — the outbound ledger at `path` or one of its journals —
+/// out of the way as unparseable, keeping it for whoever wants to look at
+/// it, and record that the figures of every chequebook on the file are
+/// lost. Fails (and the file stays, unread) only if it can't be moved.
+fn quarantine_outbound_file(
+    path: &Path,
+    part: &Path,
+    parse_error: &dyn std::fmt::Display,
+) -> std::io::Result<()> {
+    let aside = free_aside_name(part, "corrupt").ok_or_else(|| {
+        std::io::Error::other(format!(
+            "unparseable ({parse_error}) and no free name to move it aside to"
+        ))
+    })?;
     // The marker goes first: a move without it would let retrieval
     // pay from figures we just lost. If it can't be written the file
     // stays where it is, unread, and the move is retried later.
@@ -779,14 +1677,29 @@ fn quarantine_outbound_file(path: &Path, parse_error: &serde_json::Error) -> std
         ))
     })?;
     flag_survivors(&survivors);
-    std::fs::rename(path, &aside).map_err(|e| {
+    release_after_unlock(survivors);
+    // The live journal is moved with its handle closed, so no cheque is
+    // appended to the copy set aside.
+    let live = (part == journal_path(path))
+        .then(|| live_journal(path))
+        .flatten();
+    let mut io = live.as_ref().map(|j| {
+        j.io.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    std::fs::rename(part, &aside).map_err(|e| {
         std::io::Error::other(format!(
             "unparseable ({parse_error}) and can't be moved aside: {e}"
         ))
     })?;
+    if let Some(io) = io.as_mut() {
+        io.close();
+    }
+    drop(io);
+    release_after_unlock(live);
     warn!(
         target: "ant_p2p::swap",
-        file = %path.display(),
+        file = %part.display(),
         moved_to = %aside.display(),
         "outbound ledger is unparseable ({parse_error}); moved it aside. Its \
          chequebooks' cheque totals are lost: the node pays no cheques, for \
@@ -1047,16 +1960,18 @@ fn note_known(path: &Path, key: &str) -> std::io::Result<()> {
     write_lost_marker(path, &marker)
 }
 
-/// Read `path` (caller holds [`OUTBOUND_FILE_LOCK`]), adopting a file
-/// from before the sections for `key`'s chequebook, and raise `state`'s
-/// cumulatives to the file's (cumulatives only grow). Returns the file
-/// for a caller about to rewrite it. On error `state` is untouched.
+/// Read `path` and its journals (caller holds [`OUTBOUND_FILE_LOCK`]),
+/// adopting a file from before the sections for `key`'s chequebook, and
+/// raise `state`'s cumulatives to what they hold (cumulatives only grow).
+/// Returns how many entries the file holds. On error `state` is
+/// untouched.
 fn load_outbound_section(
     path: &Path,
     key: &str,
     state: &mut OutboundState,
-) -> std::io::Result<OutboundFile> {
+) -> std::io::Result<usize> {
     let mut file = read_outbound_file(path)?.unwrap_or_default();
+    let entries = file.entries();
     if let Some(legacy) = file.chequebooks.remove("") {
         info!(
             target: "ant_p2p::swap",
@@ -1077,29 +1992,145 @@ fn load_outbound_section(
             warn!(target: "ant_p2p::swap", "outbound ledger migrate: {e}");
         }
     }
-    if let Some(section) = file.chequebooks.get(key) {
-        for (k, v) in parse_cumulatives(section.clone()) {
-            let cur = state.cumulatives.entry(k).or_insert(v);
-            if v > *cur {
-                *cur = v;
-            }
+    // Both journals are read before anything is taken, so a failed
+    // read leaves `state` as it was.
+    let mut journaled = load_journal(path, &journal_old_path(path))?;
+    journaled.extend(load_journal(path, &journal_path(path))?);
+    for line in journaled {
+        file.merge_flat(line);
+    }
+    if let Some(section) = file.chequebooks.remove(key) {
+        for (k, v) in parse_cumulatives(section) {
+            state.raise(k, v);
         }
     }
     state.unread = None;
-    Ok(file)
+    Ok(entries)
 }
 
-fn lock_file() -> std::sync::MutexGuard<'static, ()> {
-    OUTBOUND_FILE_LOCK
+thread_local! {
+    /// This thread holds [`OUTBOUND_FILE_LOCK`].
+    static HOLDS_FILE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// References to drop once this thread releases the file lock (see
+    /// [`release_after_unlock`]).
+    static RELEASE_AFTER_UNLOCK: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drop `v` once this thread releases [`OUTBOUND_FILE_LOCK`] instead of
+/// now. For references code holding the lock took only for a moment
+/// (upgraded from a registry's `Weak`): if it turns out to be the last
+/// one, the journal it closes is written out and folded at close
+/// ([`JournalStore`]'s `Drop`), which takes the lock itself — under the
+/// lock it couldn't, and would leave staged lines unwritten and the
+/// journal unfolded (PR #141 R2-M2). Kept alive meanwhile, the store
+/// also stays in the registry, so a ledger opened in between shares it
+/// rather than opening a second handle on the journal.
+fn release_after_unlock<T: 'static>(v: T) {
+    if HOLDS_FILE_LOCK.with(std::cell::Cell::get) {
+        RELEASE_AFTER_UNLOCK.with(|r| r.borrow_mut().push(Box::new(v)));
+    }
+}
+
+/// [`OUTBOUND_FILE_LOCK`], held.
+struct FileLock(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        HOLDS_FILE_LOCK.with(|h| h.set(false));
+        drop(self.0.take());
+        // Each may take the lock again (and queue more, released by that
+        // lock's own drop).
+        let released = RELEASE_AFTER_UNLOCK.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        drop(released);
+    }
+}
+
+fn lock_file() -> FileLock {
+    let guard = OUTBOUND_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDS_FILE_LOCK.with(|h| h.set(true));
+    FileLock(Some(guard))
+}
+
+/// The outbound ledger files at `path` (the ledger, its journals and
+/// its lost marker), held still for a caller about to move them away —
+/// an account switch parking the data dir (`ant-ffi`'s
+/// `bind_account_state`) — until dropped. See [`hold_ledger_files`].
+#[must_use = "the files are only held while this is alive"]
+pub struct LedgerFilesHeld {
+    _file: FileLock,
+}
+
+/// Take the files of the outbound ledger at `path` away from this
+/// process's ledgers before moving them (PR #141 R2-F1). Holds
+/// [`OUTBOUND_FILE_LOCK`] until the returned guard drops, so a
+/// compaction or a close-time fold still running (on a thread of its
+/// own, which can outlive the node's shutdown) finishes before the
+/// files move and none starts while they do; and retires every journal
+/// store on the path ([`JournalIo::retired`]), so one that runs after
+/// writes nothing at all — not over the next account's files adopted
+/// at the same path. Ledgers still open on the path fail their cheques
+/// from now on, and a ledger opened on it later starts afresh from
+/// whatever files are there then.
+pub fn hold_ledger_files(path: &Path) -> LedgerFilesHeld {
+    let file = lock_file();
+    let stores: Vec<Arc<JournalStore>> = {
+        let mut reg = JOURNALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stores = Vec::new();
+        reg.retain(|(p, w)| {
+            if p != path {
+                return w.strong_count() > 0;
+            }
+            stores.extend(w.upgrade());
+            false
+        });
+        stores
+    };
+    for store in &stores {
+        store
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire();
+    }
+    let ledgers: Vec<Arc<OutboundShared>> = {
+        let mut reg = OUTBOUND_LEDGERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ledgers = Vec::new();
+        reg.retain(|((p, _), w)| {
+            if p != path {
+                return w.strong_count() > 0;
+            }
+            ledgers.extend(w.upgrade());
+            false
+        });
+        ledgers
+    };
+    // The marker moves too: don't answer from the old one's cache.
+    if let Some(cache) = LOST_MARKERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        cache.remove(&lost_marker_path(path));
+    }
+    release_after_unlock((stores, ledgers));
+    LedgerFilesHeld { _file: file }
 }
 
 impl OutboundLedger {
     /// Open `chequebook`'s cumulatives from `persist_path` (or start
     /// empty without one). See the type docs for the file layout. A
     /// file that exists but can't be read leaves the ledger refusing to
-    /// issue or write until it can ([`Self::ensure_readable`]).
+    /// issue until it can ([`Self::ensure_readable`]).
     pub fn open(persist_path: Option<PathBuf>, chequebook: [u8; 20]) -> Self {
         let key = hex::encode(chequebook);
         let shared = match &persist_path {
@@ -1120,12 +2151,37 @@ impl OutboundLedger {
                         .find(|(k, _)| *k == id)
                         .and_then(|(_, w)| w.upgrade())
                 };
+                // A live state whose journal was retired (its files moved
+                // away under it, an account switch) can't write any more:
+                // reusing it would leave this ledger unable to pay for the
+                // rest of the process (PR #141 R2-M1). Start afresh from
+                // the files at the path instead; the old one stays with
+                // whoever still holds it, and drops out of the registry.
+                let live = match live {
+                    Some(shared) if shared.store.as_ref().is_some_and(|s| s.retire_if_moved()) => {
+                        OUTBOUND_LEDGERS
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retain(|(k, w)| {
+                                *k != id || !std::ptr::eq(w.as_ptr(), Arc::as_ptr(&shared))
+                            });
+                        release_after_unlock(shared);
+                        None
+                    }
+                    live => live,
+                };
                 if let Some(shared) = live {
                     shared
                 } else {
+                    let store = JournalStore::for_path(p);
                     let mut st = OutboundState::default();
                     let loaded = match load_outbound_section(p, &key, &mut st) {
-                        Ok(_) => true,
+                        Ok(entries) => {
+                            store
+                                .snapshot_entries
+                                .fetch_max(entries as u64, Ordering::SeqCst);
+                            true
+                        }
                         Err(e) => {
                             warn!(
                                 target: "ant_p2p::swap",
@@ -1142,6 +2198,7 @@ impl OutboundLedger {
                     let shared = Arc::new(OutboundShared {
                         state: Mutex::new(st),
                         loaded: AtomicBool::new(loaded),
+                        store: Some(store),
                         ..OutboundShared::default()
                     });
                     OUTBOUND_LEDGERS
@@ -1198,23 +2255,37 @@ impl OutboundLedger {
     /// file was read (or is missing). If the read at open failed, try it
     /// again now. Call before signing a cheque — while it errs,
     /// [`Self::cumulative_for`] and [`Self::total_issued`] may be short.
+    /// The state lock isn't held while the file is read.
     pub fn ensure_readable(&self) -> std::io::Result<()> {
-        let mut st = self.lock_state();
-        if st.unread.is_none() {
+        if self.lock_state().unread.is_none() {
             return Ok(());
         }
         let Some(path) = &self.persist_path else {
             return Ok(());
         };
         let _file = lock_file();
-        match load_outbound_section(path, &hex::encode(self.chequebook), &mut st) {
+        // Its files moved away (account switch): what is at the path now
+        // is someone else's, and must not be read, migrated or moved
+        // aside on this ledger's behalf.
+        if self.shared.store.as_ref().is_some_and(|s| s.is_retired()) {
+            return Err(retired_error());
+        }
+        let mut read = OutboundState::default();
+        let loaded = load_outbound_section(path, &hex::encode(self.chequebook), &mut read);
+        let mut st = self.lock_state();
+        match loaded {
             Ok(_) => {
-                self.shared.loaded.store(true, Ordering::SeqCst);
-                info!(
-                    target: "ant_p2p::swap",
-                    chequebook = %hex::encode(self.chequebook),
-                    "outbound ledger readable again; cheques resume",
-                );
+                for (k, v) in read.cumulatives {
+                    st.raise(k, v);
+                }
+                if st.unread.take().is_some() {
+                    self.shared.loaded.store(true, Ordering::SeqCst);
+                    info!(
+                        target: "ant_p2p::swap",
+                        chequebook = %hex::encode(self.chequebook),
+                        "outbound ledger readable again; cheques resume",
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1259,12 +2330,10 @@ impl OutboundLedger {
 
     /// Sum of every beneficiary's cumulative: all PLUR this chequebook
     /// has promised in cheques from this node (bee's `totalIssued`).
+    /// O(1): the sum is kept as cheques are recorded.
     #[must_use]
     pub fn total_issued(&self) -> U256 {
-        self.lock_state()
-            .cumulatives
-            .values()
-            .fold(U256::zero(), |acc, v| acc.saturating_add(*v))
+        self.lock_state().total
     }
 
     /// Like [`Self::cumulative_for`] but distinguishes "no cheque ever
@@ -1278,57 +2347,63 @@ impl OutboundLedger {
         self.lock_state().cumulatives.get(&key).copied()
     }
 
-    /// Set `beneficiary` → `new_cumulative` (typically called after
-    /// a successful [`emit_cheque`]). Persists atomically, rewriting
-    /// only this chequebook's section of the file. The in-memory record
-    /// always takes it; when the file can't be read nothing is written
-    /// (writing would replace figures we couldn't see) and the read
-    /// error is returned.
+    /// Record `beneficiary` → `new_cumulative` as issued: in memory at
+    /// once (so [`Self::total_issued`] counts it from now on), and staged
+    /// for the journal. Nothing is written yet and no lock is held on
+    /// return; the cheque may be sent only once the returned
+    /// [`PendingWrite`] is durable. Cheques staged together are written
+    /// and fsynced together.
+    ///
+    /// The journal line is written even while the file can't be read: it
+    /// only ever raises a figure, so it can't erase one this ledger
+    /// couldn't see. A ledger whose figures outlived a loss of the file
+    /// ([`Self::lost_figures`]) journals all of them with this cheque, so
+    /// a restart finds them again, and marks them known once they are on
+    /// disk.
+    pub fn stage_issued(&self, beneficiary: &[u8; 20], new_cumulative: U256) -> PendingWrite {
+        let key = hex::encode(beneficiary);
+        let mut st = self.lock_state();
+        let now = st.raise(key.clone(), new_cumulative);
+        let Some(store) = &self.shared.store else {
+            return PendingWrite { pending: None };
+        };
+        let chequebook = hex::encode(self.chequebook);
+        // Read before the rewrite is staged: a loss flagged after this
+        // point isn't covered by it.
+        let generation = self.shared.loss_gen.load(Ordering::SeqCst);
+        let (seq, note_known) = if self.shared.survived_loss.load(Ordering::SeqCst) {
+            let seq = store.stage(
+                st.cumulatives
+                    .iter()
+                    .map(|(b, v)| (chequebook.as_str(), b.as_str(), *v)),
+            );
+            (seq, Some((chequebook, generation)))
+        } else {
+            (
+                store.stage([(chequebook.as_str(), key.as_str(), now)]),
+                None,
+            )
+        };
+        drop(st);
+        PendingWrite {
+            pending: Some(Pending {
+                store: Arc::clone(store),
+                seq,
+                shared: Arc::clone(&self.shared),
+                note_known,
+            }),
+        }
+    }
+
+    /// [`Self::stage_issued`], then block until it is on disk. On error
+    /// the in-memory record still holds the cheque (and the line stays
+    /// staged, for the next write to retry).
     pub fn record_issued(
         &self,
         beneficiary: &[u8; 20],
         new_cumulative: U256,
     ) -> std::io::Result<()> {
-        let key = hex::encode(beneficiary);
-        let mut st = self.lock_state();
-        let cur = st.cumulatives.entry(key).or_insert(new_cumulative);
-        if new_cumulative > *cur {
-            *cur = new_cumulative;
-        }
-        if let Some(path) = &self.persist_path {
-            let _file = lock_file();
-            let chequebook = hex::encode(self.chequebook);
-            let mut file = match load_outbound_section(path, &chequebook, &mut st) {
-                Ok(f) => f,
-                Err(e) => {
-                    st.unread = Some(e.to_string());
-                    return Err(e);
-                }
-            };
-            file.chequebooks.insert(
-                chequebook.clone(),
-                st.cumulatives
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect(),
-            );
-            write_outbound_file(path, &file)?;
-            self.shared.loaded.store(true, Ordering::SeqCst);
-            // Figures that outlived a loss in memory are on disk again:
-            // record them as known, so a restart doesn't count them lost.
-            if self.shared.survived_loss.load(Ordering::SeqCst) {
-                match note_known(path, &chequebook) {
-                    Ok(()) => self.shared.survived_loss.store(false, Ordering::SeqCst),
-                    Err(e) => warn!(
-                        target: "ant_p2p::swap",
-                        chequebook = %chequebook,
-                        "can't record in the lost-ledger marker that this chequebook's \
-                         figures were rewritten: {e}; retrying at its next cheque",
-                    ),
-                }
-            }
-        }
-        Ok(())
+        self.stage_issued(beneficiary, new_cumulative).wait()
     }
 }
 
@@ -1992,10 +3067,10 @@ mod tests {
     }
 
     /// A file that exists but can't be read is not an empty ledger (PR
-    /// #126 R2-F1): the ledger opened on it refuses to issue, and no
-    /// ledger writes over it — another chequebook's sections and this
-    /// one's own figures survive. Once readable, it picks up where the
-    /// file left off.
+    /// #126 R2-F1): the ledger opened on it refuses to issue, and nothing
+    /// writes over it — another chequebook's cheques go to the journal
+    /// (issue #140), and a compaction, which would rewrite the file,
+    /// fails instead. Once readable, every figure is where it was.
     #[cfg(unix)]
     #[test]
     fn outbound_ledger_never_overwrites_a_file_it_could_not_read() {
@@ -2021,8 +3096,17 @@ mod tests {
         // A's ledger opened on the unreadable file can't issue.
         let ledger_a = OutboundLedger::open(Some(path.clone()), a);
         assert!(ledger_a.ensure_readable().is_err());
-        // B's write fails instead of replacing the file with B alone.
-        assert!(ledger_b.record_issued(&peer, U256::from(300u64)).is_err());
+        // B's cheque is journaled; the file isn't touched.
+        ledger_b.record_issued(&peer, U256::from(300u64)).unwrap();
+        let store = ledger_b.shared.store.clone().unwrap();
+        assert!(
+            {
+                let _file = lock_file();
+                store.compact_locked()
+            }
+            .is_err(),
+            "a compaction can't rewrite a file it can't read"
+        );
         set_mode(0o600).unwrap();
 
         let on_disk = read_outbound_file(&path).unwrap().unwrap();
@@ -2030,15 +3114,18 @@ mod tests {
             on_disk.chequebooks[&hex::encode(a)][&hex::encode(peer)],
             "1500"
         );
-        assert_eq!(
-            on_disk.chequebooks[&hex::encode(b)][&hex::encode(peer)],
-            "200"
-        );
-        // Readable again: A sees its cumulatives, B's next write lands.
+        assert!(!on_disk.chequebooks.contains_key(&hex::encode(b)));
+        // Readable again: A sees its cumulatives, B's next cheque lands.
         ledger_a.ensure_readable().unwrap();
         assert_eq!(ledger_a.cumulative_for(&peer), U256::from(1_500u64));
         ledger_b.record_issued(&peer, U256::from(400u64)).unwrap();
-        drop((ledger_a, ledger_b));
+        drop((ledger_a, ledger_b, store));
+        let on_disk = read_outbound_file(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.chequebooks[&hex::encode(b)][&hex::encode(peer)],
+            "400",
+            "the last ledger closing folds the journal into the file"
+        );
         let reopened_a = OutboundLedger::open(Some(path.clone()), a);
         assert_eq!(reopened_a.total_issued(), U256::from(1_500u64));
         let reopened_b = OutboundLedger::open(Some(path), b);
@@ -2434,6 +3521,1007 @@ mod tests {
         let flat: HashMap<String, String> =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(flat.keys().all(|k| k.contains(':')), "{flat:?}");
+    }
+
+    /// What a process crash leaves of `ledgers` on `path`: whatever is on
+    /// disk. Nothing is closed (no compaction at close), and the
+    /// process-wide state on the file is forgotten, so the next open reads
+    /// the disk like a restarted process would.
+    fn crash(path: &Path, ledgers: impl IntoIterator<Item = OutboundLedger>) {
+        for l in ledgers {
+            // A crash runs no destructors.
+            #[allow(clippy::mem_forget)]
+            std::mem::forget(l);
+        }
+        OUTBOUND_LEDGERS
+            .lock()
+            .unwrap()
+            .retain(|((p, _), _)| p != path);
+        JOURNALS.lock().unwrap().retain(|(p, _)| p != path);
+    }
+
+    fn flat_ledger(chequebook: [u8; 20], entries: u32) -> Vec<u8> {
+        let map: HashMap<String, String> = (0..entries)
+            .map(|i| {
+                let mut b = [0u8; 20];
+                b[..4].copy_from_slice(&i.to_be_bytes());
+                (
+                    format!("{}:{}", hex::encode(chequebook), hex::encode(b)),
+                    (1_000_000_000u64 + u64::from(i)).to_string(),
+                )
+            })
+            .collect();
+        serde_json::to_vec_pretty(&map).unwrap()
+    }
+
+    fn beneficiary(i: u32) -> [u8; 20] {
+        let mut b = [0u8; 20];
+        b[..4].copy_from_slice(&i.to_be_bytes());
+        b
+    }
+
+    /// A cheque costs one journal line, whatever the ledger's size (issue
+    /// #140): the file isn't read or rewritten, and the line is on disk
+    /// when `record_issued` returns.
+    #[test]
+    fn a_cheque_appends_one_line_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let snapshot = flat_ledger(cb, 2_000);
+        std::fs::write(&path, &snapshot).unwrap();
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(
+            ledger.cumulative_for(&beneficiary(7)),
+            U256::from(1_000_000_007u64)
+        );
+        for i in 0..3u32 {
+            ledger
+                .record_issued(&beneficiary(i), U256::from(2_000_000_000u64 + u64::from(i)))
+                .unwrap();
+        }
+        ledger
+            .record_issued(&beneficiary(5_000), U256::from(9u64))
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot, "file untouched");
+        let journal = std::fs::read_to_string(journal_path(&path)).unwrap();
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|l| commit_mark(l.as_bytes()).is_none())
+                .count(),
+            4,
+            "{journal}"
+        );
+        assert!(journal.ends_with(&format!(
+            "{{\"{}:{}\":\"9\"}}\n#4\n",
+            hex::encode(cb),
+            hex::encode(beneficiary(5_000))
+        )));
+        let expected = (0..2_000u64)
+            .map(|i| 1_000_000_000 + i)
+            .chain([1_000_000_000, 1_000_000_000, 1_000_000_000])
+            .sum::<u64>()
+            + 9;
+        assert_eq!(ledger.total_issued(), U256::from(expected));
+    }
+
+    /// Child half of [`a_cheque_on_disk_survives_a_crash`]: issue cheques
+    /// from several threads, print each one once it may be sent, and
+    /// abort mid-stream.
+    #[test]
+    #[ignore = "run by a_cheque_on_disk_survives_a_crash in a child process"]
+    fn crash_child_issues_then_aborts() {
+        use std::io::Write as _;
+        let Ok(path) = std::env::var("ANT_LEDGER_CRASH_PATH") else {
+            return;
+        };
+        let ledger = OutboundLedger::open(Some(PathBuf::from(path)), [0xc1; 20]);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for t in 0..8u32 {
+            let ledger = ledger.clone();
+            let acked = acked.clone();
+            std::thread::spawn(move || {
+                for i in 1..=10_000u64 {
+                    let b = beneficiary(t * 1_000 + u32::try_from(i % 50).unwrap());
+                    let cum = U256::from(i * 1_000 + u64::from(t));
+                    ledger.stage_issued(&b, cum).wait().unwrap();
+                    let mut out = std::io::stdout().lock();
+                    writeln!(out, "ACK {} {cum}", hex::encode(b)).unwrap();
+                    out.flush().unwrap();
+                    acked.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        while acked.load(Ordering::SeqCst) < 400 {
+            std::thread::yield_now();
+        }
+        std::process::abort();
+    }
+
+    /// Crash safety: a cheque cleared to go out (its record durable) is
+    /// on disk after the process dies — a real `abort()` in a child
+    /// process, with 8 threads issuing concurrently and lines in flight.
+    #[test]
+    fn a_cheque_on_disk_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        std::fs::write(&path, flat_ledger([0xc1; 20], 500)).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "swap::tests::crash_child_issues_then_aborts",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ANT_LEDGER_CRASH_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the child must have aborted");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut acked: HashMap<String, U256> = HashMap::new();
+        for line in stdout.lines().filter_map(|l| l.strip_prefix("ACK ")) {
+            let (b, cum) = line.split_once(' ').unwrap();
+            let cum = U256::from_dec_str(cum).unwrap();
+            let e = acked.entry(b.to_string()).or_default();
+            *e = (*e).max(cum);
+        }
+        assert!(acked.len() >= 50, "{} acked", acked.len());
+        let ledger = OutboundLedger::open(Some(path), [0xc1; 20]);
+        ledger.ensure_readable().unwrap();
+        for (b, cum) in &acked {
+            let b: [u8; 20] = hex::decode(b).unwrap().try_into().unwrap();
+            assert!(ledger.cumulative_for(&b) >= *cum, "lost a sent cheque");
+        }
+        assert_eq!(
+            ledger.cumulative_for(&beneficiary(499)),
+            U256::from(1_000_000_499u64),
+            "the file's figures are still there"
+        );
+    }
+
+    /// Concurrent issuers on two ledgers of one chequebook and a second
+    /// chequebook on the same file lose nothing — not to each other, not
+    /// to a compaction running meanwhile, not to a crash right after.
+    #[test]
+    fn concurrent_issuers_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (a, b) = ([0xa0u8; 20], [0xb0u8; 20]);
+        std::fs::write(&path, flat_ledger(a, 300)).unwrap();
+        let a1 = OutboundLedger::open(Some(path.clone()), a);
+        let a2 = OutboundLedger::open(Some(path.clone()), a);
+        let lb = OutboundLedger::open(Some(path.clone()), b);
+        let store = a1.shared.store.clone().unwrap();
+        std::thread::scope(|s| {
+            for t in 0..12u32 {
+                let l = [&a1, &a2, &lb][t as usize % 3].clone();
+                s.spawn(move || {
+                    for i in 1..=40u64 {
+                        // Each thread has its own beneficiaries, so the
+                        // last figure it wrote is the one to find.
+                        let ben = beneficiary(10_000 + t * 10 + u32::try_from(i % 10).unwrap());
+                        l.record_issued(&ben, U256::from(i)).unwrap();
+                    }
+                });
+            }
+            s.spawn(|| {
+                for _ in 0..5 {
+                    let _file = lock_file();
+                    store.compact_locked().unwrap();
+                }
+            });
+        });
+        let issued_a: u64 =
+            (0..300u64).map(|i| 1_000_000_000 + i).sum::<u64>() + 8 * (31..=40u64).sum::<u64>();
+        assert_eq!(a1.total_issued(), U256::from(issued_a));
+        assert_eq!(lb.total_issued(), U256::from(4 * (31..=40u64).sum::<u64>()));
+        drop(store);
+        crash(&path, [a1, a2, lb]);
+        let a1 = OutboundLedger::open(Some(path.clone()), a);
+        let lb = OutboundLedger::open(Some(path), b);
+        assert_eq!(a1.total_issued(), U256::from(issued_a));
+        assert_eq!(lb.total_issued(), U256::from(4 * (31..=40u64).sum::<u64>()));
+        for t in 0..12u32 {
+            let l = if t % 3 == 2 { &lb } else { &a1 };
+            for i in 31..=40u64 {
+                let ben = beneficiary(10_000 + t * 10 + u32::try_from(i % 10).unwrap());
+                assert_eq!(l.cumulative_for(&ben), U256::from(i));
+            }
+        }
+    }
+
+    /// A compaction cut short at any step — the journal renamed aside,
+    /// the file rewritten but the old journal not yet deleted, a temp file
+    /// left over — loses nothing across a crash, and the next open
+    /// finishes it.
+    #[test]
+    fn an_interrupted_compaction_loses_nothing() {
+        for step in [1u8, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pushsync_outbound.json");
+            let cb = [0xc1u8; 20];
+            std::fs::write(&path, flat_ledger(cb, 100)).unwrap();
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            l.record_issued(&beneficiary(1), U256::from(5_000_000_000u64))
+                .unwrap();
+            l.record_issued(&beneficiary(200), U256::from(7u64))
+                .unwrap();
+            let store = l.shared.store.clone().unwrap();
+            COMPACT_STOP_AFTER.with(|c| c.set(step));
+            let stopped = {
+                let _file = lock_file();
+                store.compact_locked()
+            };
+            COMPACT_STOP_AFTER.with(|c| c.set(0));
+            assert!(stopped.is_err(), "step {step}");
+            assert!(journal_old_path(&path).exists(), "step {step}");
+            // Cheques go on into a fresh journal meanwhile.
+            l.record_issued(&beneficiary(2), U256::from(6_000_000_000u64))
+                .unwrap();
+            l.record_issued(&beneficiary(200), U256::from(8u64))
+                .unwrap();
+            // A temp file from a rewrite cut off before its rename.
+            std::fs::write(path.with_extension("json.tmp"), b"{ half").unwrap();
+            drop(store);
+            crash(&path, [l]);
+
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            l.ensure_readable().unwrap();
+            assert!(l.lost_figures().is_none(), "step {step}");
+            assert_eq!(
+                l.cumulative_for(&beneficiary(1)),
+                U256::from(5_000_000_000u64)
+            );
+            assert_eq!(
+                l.cumulative_for(&beneficiary(2)),
+                U256::from(6_000_000_000u64)
+            );
+            assert_eq!(l.cumulative_for(&beneficiary(200)), U256::from(8u64));
+            assert_eq!(
+                l.cumulative_for(&beneficiary(99)),
+                U256::from(1_000_000_099u64)
+            );
+            // The open folded both journals into the file.
+            assert!(!journal_old_path(&path).exists(), "step {step}");
+            assert!(!journal_path(&path).exists(), "step {step}");
+            let on_disk = read_outbound_file(&path).unwrap().unwrap();
+            assert_eq!(on_disk.chequebooks[&hex::encode(cb)].len(), 101);
+            assert_eq!(
+                on_disk.chequebooks[&hex::encode(cb)][&hex::encode(beneficiary(200))],
+                "8"
+            );
+        }
+    }
+
+    /// A journal line cut off by a crash mid-write was never confirmed,
+    /// so it is skipped, and the next append starts on a clean line. A
+    /// damaged line anywhere else is a damaged journal: moved aside, and
+    /// the figures count as lost, like an unparseable file (PR #126).
+    #[test]
+    fn a_torn_journal_line_is_skipped_and_a_damaged_one_is_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        crash(&path, [l]);
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, br#"{"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1:00"#)
+            .unwrap();
+        drop(j);
+        // The open folds the journal; the torn line is dropped.
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(10u64));
+        assert!(l.lost_figures().is_none());
+        drop(l);
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(20u64)).unwrap();
+        crash(&path, [l]);
+        // A torn tail, then an append: the append cuts the tail off.
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, br#"{"c1c1"#).unwrap();
+        drop(j);
+        let store = Arc::new(JournalStore {
+            path: path.clone(),
+            queue: Mutex::default(),
+            io: Mutex::default(),
+            durable: AtomicU64::new(0),
+            snapshot_entries: AtomicU64::new(0),
+            compacting: AtomicBool::new(false),
+            compact_failed: Mutex::new(None),
+        });
+        let seq = store.stage([(
+            hex::encode(cb).as_str(),
+            hex::encode(beneficiary(2)).as_str(),
+            U256::from(3u64),
+        )]);
+        store.commit(seq).unwrap();
+        #[allow(clippy::mem_forget)] // crashed: no compaction at close
+        std::mem::forget(store);
+        let lines = std::fs::read_to_string(journal_path(&path)).unwrap();
+        assert_eq!(
+            lines
+                .lines()
+                .filter(|l| commit_mark(l.as_bytes()).is_none())
+                .count(),
+            2,
+            "{lines}"
+        );
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(20u64));
+        assert_eq!(l.cumulative_for(&beneficiary(2)), U256::from(3u64));
+        drop(l);
+
+        // A damaged line in the middle.
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(30u64)).unwrap();
+        crash(&path, [l]);
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, b"garbage\n{}\n").unwrap();
+        drop(j);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "a damaged journal is a loss");
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".journal.old.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(std::fs::read_to_string(dir.path().join(&aside[0]))
+            .unwrap()
+            .contains("garbage"));
+        // The file's figures from before the journal are still there.
+        assert_eq!(l.cumulative_for(&beneficiary(2)), U256::from(3u64));
+    }
+
+    /// A cheque whose line can't be written isn't durable — the caller
+    /// must not send it — but stays issued in memory, and its line stays
+    /// staged: the next write that succeeds puts it on disk too.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_journal_write_is_retried_with_the_next_cheque() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("data");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        let set_mode = |m| std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(m));
+        set_mode(0o500).unwrap();
+        if std::fs::write(sub.join("probe"), b"").is_ok() {
+            // Running as root: permissions don't fake a failed write.
+            set_mode(0o700).unwrap();
+            return;
+        }
+        assert!(l.record_issued(&beneficiary(1), U256::from(40u64)).is_err());
+        assert_eq!(l.total_issued(), U256::from(40u64), "issued in memory");
+        set_mode(0o700).unwrap();
+        l.record_issued(&beneficiary(2), U256::from(2u64)).unwrap();
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(40u64));
+        assert_eq!(l.total_issued(), U256::from(42u64));
+    }
+
+    /// A ledger whose figures outlived a loss of the file journals all
+    /// of them with its next cheque, not just that cheque's, so a crash
+    /// right after finds every one (PR #126 R1-M3 with the journal).
+    #[test]
+    fn a_survivor_journals_all_its_figures_after_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xa1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(500u64))
+            .unwrap();
+        l.record_issued(&beneficiary(2), U256::from(70u64)).unwrap();
+        let store = l.shared.store.clone().unwrap();
+        {
+            let _file = lock_file();
+            store.compact_locked().unwrap();
+        }
+        drop(store);
+        std::fs::write(&path, b"{ not json").unwrap();
+        drop(OutboundLedger::open(Some(path.clone()), [0xa2; 20]));
+        assert!(l.lost_figures().is_none(), "survived in memory");
+        l.record_issued(&beneficiary(3), U256::from(9u64)).unwrap();
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert!(l.lost_figures().is_none(), "known across the crash");
+        assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(500u64));
+        assert_eq!(l.cumulative_for(&beneficiary(2)), U256::from(70u64));
+        assert_eq!(l.total_issued(), U256::from(579u64));
+    }
+
+    /// A survivor's rewrite that is on disk but loses its journal to a
+    /// second loss before the waiter takes the file lock must not mark
+    /// the chequebook known: the rewrite went aside with the journal
+    /// (PR #141 R1-F1). It stays flagged and its next cheque rewrites
+    /// all of its figures again.
+    #[test]
+    fn a_loss_between_commit_and_wait_keeps_the_survivor_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xa1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(500u64))
+            .unwrap();
+        l.record_issued(&beneficiary(2), U256::from(70u64)).unwrap();
+        let store = l.shared.store.clone().unwrap();
+        {
+            let _file = lock_file();
+            store.compact_locked().unwrap();
+        }
+        // Loss 1: the file is damaged; `l` survives it in memory.
+        std::fs::write(&path, b"{ not json").unwrap();
+        drop(OutboundLedger::open(Some(path.clone()), [0xa2; 20]));
+        assert!(l.lost_figures().is_none(), "survived in memory");
+
+        // The next cheque stages the full rewrite and it reaches disk...
+        let w = l.stage_issued(&beneficiary(3), U256::from(9u64));
+        let seq = w.pending.as_ref().unwrap().seq;
+        store.commit(seq).unwrap();
+        // ...then, before the waiter takes the file lock, loss 2: a
+        // damaged journal line moves the journal (rewrite and all) aside.
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, b"garbage\n").unwrap();
+        drop(j);
+        drop(OutboundLedger::open(Some(path.clone()), [0xa3; 20]));
+        w.wait().unwrap();
+        assert!(
+            lost_figures_at(&path, &cb).is_some(),
+            "the rewrite was moved aside: the chequebook is still lost on disk"
+        );
+        assert!(l.shared.survived_loss.load(Ordering::SeqCst));
+
+        // Its next cheque rewrites everything again and marks it known.
+        l.record_issued(&beneficiary(4), U256::from(1u64)).unwrap();
+        drop(store);
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert!(l.lost_figures().is_none(), "known once rewritten again");
+        assert_eq!(l.total_issued(), U256::from(580u64));
+    }
+
+    /// A ledger still alive when its data dir is parked (an account
+    /// switch while a blocking cheque write outlived the shutdown) writes
+    /// nothing more, neither to the parked journal nor at the path; the
+    /// next ledger on the path gets a journal of its own instead of
+    /// appending to the parked one (PR #141 R1-M1), and a ledger reopened
+    /// on the old chequebook once its files are back pays again (R2-M1).
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_moved_away_is_not_reused_by_the_next_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let parked = dir.path().join("parked");
+        std::fs::create_dir(&parked).unwrap();
+        let (a, b) = ([0xa1u8; 20], [0xb1u8; 20]);
+        let old = OutboundLedger::open(Some(path.clone()), a);
+        old.record_issued(&beneficiary(1), U256::from(11u64))
+            .unwrap();
+        // The account switch parks the ledger's files.
+        std::fs::rename(journal_path(&path), parked.join("j")).unwrap();
+
+        let new = OutboundLedger::open(Some(path.clone()), b);
+        assert!(!Arc::ptr_eq(
+            old.shared.store.as_ref().unwrap(),
+            new.shared.store.as_ref().unwrap()
+        ));
+        new.record_issued(&beneficiary(2), U256::from(22u64))
+            .unwrap();
+        old.record_issued(&beneficiary(3), U256::from(33u64))
+            .expect_err("a retired ledger writes nothing");
+        let parked_lines = std::fs::read_to_string(parked.join("j")).unwrap();
+        assert!(parked_lines.contains(&hex::encode(a)), "{parked_lines}");
+        assert!(!parked_lines.contains(&hex::encode(b)), "{parked_lines}");
+        assert!(!parked_lines.contains(&hex::encode(beneficiary(3))));
+        let live = std::fs::read_to_string(journal_path(&path)).unwrap();
+        assert!(!live.contains(&hex::encode(a)), "{live}");
+
+        // Switch back: B's files go, A's come back, while `old` (leaked)
+        // still holds A's retired state.
+        drop(new);
+        let parked_b = dir.path().join("parked-b");
+        std::fs::create_dir(&parked_b).unwrap();
+        std::fs::rename(&path, parked_b.join("f")).unwrap();
+        std::fs::rename(parked.join("j"), journal_path(&path)).unwrap();
+        let again = OutboundLedger::open(Some(path.clone()), a);
+        assert!(!Arc::ptr_eq(&again.shared, &old.shared), "fresh state");
+        assert_eq!(again.cumulative_for(&beneficiary(1)), U256::from(11u64));
+        again
+            .record_issued(&beneficiary(4), U256::from(44u64))
+            .expect("A pays again");
+        old.record_issued(&beneficiary(5), U256::from(55u64))
+            .expect_err("still retired");
+        // The old ledger closes after all that: nothing of its is folded
+        // anywhere.
+        drop(old);
+        crash(&path, [again]);
+        let again = OutboundLedger::open(Some(path), a);
+        assert_eq!(again.cumulative_for(&beneficiary(4)), U256::from(44u64));
+        assert_eq!(again.total_issued(), U256::from(55u64));
+    }
+
+    /// An account switch holds the ledger files while it moves them
+    /// (PR #141 R2-F1): a compaction of the previous account's ledger
+    /// that was already waiting for the file lock, and the close-time
+    /// fold when the last of its ledgers drops after the switch, write
+    /// nothing over the next account's files adopted at the same path.
+    #[test]
+    fn a_compaction_outliving_an_account_switch_leaves_the_next_accounts_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let parked = dir.path().join("parked");
+        std::fs::create_dir(&parked).unwrap();
+        let (a, b) = ([0xa2u8; 20], [0xb2u8; 20]);
+        let old = OutboundLedger::open(Some(path.clone()), a);
+        old.record_issued(&beneficiary(1), U256::from(11u64))
+            .unwrap();
+        old.record_issued(&beneficiary(2), U256::from(12u64))
+            .unwrap();
+        let store = old.shared.store.clone().unwrap();
+        // A compaction that ran before the switch left the journal handle
+        // closed (the one at the path is reopened by name on demand).
+        {
+            let _file = lock_file();
+            store.compact_locked().unwrap();
+        }
+        old.record_issued(&beneficiary(1), U256::from(13u64))
+            .unwrap();
+
+        let held = hold_ledger_files(&path);
+        // A's compaction starts on its own thread and waits for the lock.
+        let compaction = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _file = lock_file();
+                store.compact_locked()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Park A's files, adopt B's.
+        std::fs::rename(&path, parked.join("f")).unwrap();
+        std::fs::rename(journal_path(&path), parked.join("j")).unwrap();
+        let b_file = format!(
+            r#"{{"{}:{}":"777"}}"#,
+            hex::encode(b),
+            hex::encode(beneficiary(9))
+        );
+        std::fs::write(&path, &b_file).unwrap();
+        drop(held);
+        compaction.join().unwrap().unwrap();
+        // A cheque the old ledger was still finishing goes nowhere.
+        old.record_issued(&beneficiary(2), U256::from(14u64))
+            .expect_err("the old account's ledger writes nothing after the switch");
+        drop(store);
+        drop(old);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), b_file);
+        assert!(!journal_path(&path).exists());
+        assert!(!journal_old_path(&path).exists());
+        assert!(std::fs::read_to_string(parked.join("j"))
+            .unwrap()
+            .contains(&hex::encode(a)));
+        let ledger_b = OutboundLedger::open(Some(path.clone()), b);
+        assert_eq!(ledger_b.cumulative_for(&beneficiary(9)), U256::from(777u64));
+        assert!(ledger_b.lost_figures().is_none());
+        crash(&path, [ledger_b]);
+    }
+
+    /// A journal store whose last reference goes on a thread holding the
+    /// file lock still writes its staged lines and folds the journal at
+    /// close, once the lock is released (PR #141 R2-M2).
+    #[test]
+    fn the_last_ledger_closing_under_the_file_lock_still_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc3u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(5u64)).unwrap();
+        // Staged, never committed.
+        drop(l.stage_issued(&beneficiary(2), U256::from(6u64)));
+        {
+            let _file = lock_file();
+            // A temporary upgrade, as `for_path` and the quarantine take.
+            let live = live_journal(&path).unwrap();
+            drop(l);
+            release_after_unlock(live);
+            assert!(journal_path(&path).exists(), "not under the lock");
+        }
+        assert!(!journal_path(&path).exists(), "folded at close");
+        let on_disk = read_outbound_file(&path).unwrap().unwrap().to_flat();
+        let key = |i| format!("{}:{}", hex::encode(cb), hex::encode(beneficiary(i)));
+        assert_eq!(on_disk.get(&key(1)).map(String::as_str), Some("5"));
+        assert_eq!(on_disk.get(&key(2)).map(String::as_str), Some("6"));
+    }
+
+    /// A NUL-filled range a crash left in the journal's last, never
+    /// synced group commit is a torn write, not damage: dropped without
+    /// a loss, and cut off by the next append (PR #141 R2-M3).
+    #[test]
+    fn a_zero_filled_journal_tail_is_torn_not_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc4u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        crash(&path, [l]);
+        // The unsynced group commit: lines zeroed, one survived after them.
+        let mut tail = vec![0u8; 300];
+        tail.push(b'\n');
+        tail.extend_from_slice(
+            format!(
+                "{{\"{}:{}\":\"99\"}}\n",
+                hex::encode(cb),
+                hex::encode(beneficiary(2))
+            )
+            .as_bytes(),
+        );
+        tail.extend_from_slice(&[0u8; 40]);
+        tail.push(b'\n');
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, &tail).unwrap();
+        drop(j);
+        assert_eq!(
+            journal_intact_len(&std::fs::read(journal_path(&path)).unwrap()),
+            std::fs::read(journal_path(&path)).unwrap().len() - tail.len()
+        );
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(10u64));
+        assert_eq!(l.cumulative_for(&beneficiary(2)), U256::zero());
+        assert!(l.lost_figures().is_none(), "no loss");
+        assert!(!lost_marker_path(&path).exists());
+        // An append after one cuts the tail off first.
+        crash(&path, [l]);
+        let mut j = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, &tail).unwrap();
+        drop(j);
+        let mut io = JournalIo::default();
+        io.append(
+            &path,
+            format!(
+                "{{\"{}:{}\":\"3\"}}\n",
+                hex::encode(cb),
+                hex::encode(beneficiary(3))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(io);
+        let bytes = std::fs::read(journal_path(&path)).unwrap();
+        assert!(!bytes.contains(&0), "the zeroed tail was cut off");
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(3)), U256::from(3u64));
+        assert!(l.lost_figures().is_none());
+        crash(&path, [l]);
+    }
+
+    /// A NUL-filled range in lines a later group commit came after was
+    /// synced and acknowledged — cheques went out on it — so it is
+    /// damage, not a torn write: the journal is moved aside and the
+    /// figures count as lost, never silently dropped (PR #141 R3-F1).
+    #[test]
+    fn a_zeroed_range_before_a_later_commit_is_a_loss_not_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc5u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        for (i, v) in [10u64, 20, 30].into_iter().enumerate() {
+            let i = u32::try_from(i).unwrap();
+            l.record_issued(&beneficiary(i), U256::from(v)).unwrap();
+        }
+        crash(&path, [l]);
+        let jp = journal_path(&path);
+        let mut bytes = std::fs::read(&jp).unwrap();
+        // Zero part of the first, synced line.
+        bytes[2..12].fill(0);
+        std::fs::write(&jp, &bytes).unwrap();
+        assert_eq!(journal_intact_len(&bytes), bytes.len());
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "acked cheques were lost");
+        assert!(lost_marker_path(&path).exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".journal.old.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            bytes,
+            "the damaged journal is kept whole"
+        );
+        // An append doesn't cut synced lines off either.
+        let mut io = JournalIo::default();
+        std::fs::write(&jp, &bytes).unwrap();
+        io.append(&path, b"{}\n").unwrap();
+        drop(io);
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&bytes), "nothing cut");
+        crash(&path, [l]);
+    }
+
+    /// A group commit whose fsync failed is cut off before the retry is
+    /// appended: its bytes read back fine now but may be zeros after a
+    /// crash, and an acknowledged retry behind such a range must never
+    /// read as a torn tail (PR #141 R4-F1). Even laid out that way, the
+    /// retry's commit mark comes after a gap, so the range reads as
+    /// damage — a loss, with the journal kept — not as torn.
+    #[test]
+    fn a_failed_commit_is_cut_off_before_its_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc6u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        let c1 = std::fs::read(&jp).unwrap();
+        FAIL_NEXT_SYNC.with(|f| f.set(true));
+        assert!(l.record_issued(&beneficiary(2), U256::from(20u64)).is_err());
+        let failed = std::fs::read(&jp).unwrap()[c1.len()..].to_vec();
+        assert!(
+            !failed.is_empty(),
+            "the failed write's bytes are in the file"
+        );
+        l.record_issued(&beneficiary(3), U256::from(5u64)).unwrap();
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&c1));
+        let retry = after[c1.len()..].to_vec();
+        assert!(!retry.starts_with(&failed), "the failed write was cut off");
+        assert!(failed.ends_with(b"#2\n"));
+        assert!(
+            retry.ends_with(b"#2\n"),
+            "the retry takes the cut-off write's number: no gap (PR #141 R5-M1)"
+        );
+        let b2 = hex::encode(beneficiary(2));
+        assert_eq!(
+            String::from_utf8_lossy(&after).matches(b2.as_str()).count(),
+            1,
+            "the retried line is in the file once"
+        );
+        crash(&path, [l]);
+
+        // As journaled: everything is there.
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.total_issued(), U256::from(35u64));
+        assert!(l.lost_figures().is_none());
+        crash(&path, [l]);
+
+        // The layout an uncut retry would have left (the fallback when
+        // the failed handle's metadata was unreadable: the failed write's
+        // mark stays in the file and the retry numbers past it), with the
+        // failed write zeroed by a crash: never a silent drop.
+        let mut disk = c1.clone();
+        disk.extend(std::iter::repeat_n(0u8, failed.len()));
+        disk.extend_from_slice(&retry[..retry.len() - 3]);
+        disk.extend_from_slice(b"#3\n");
+        std::fs::remove_file(&path).ok();
+        std::fs::write(&jp, &disk).unwrap();
+        assert_eq!(journal_intact_len(&disk), disk.len(), "damage, not torn");
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "acked cheques may be lost");
+        assert!(lost_marker_path(&path).exists());
+        crash(&path, [l]);
+    }
+
+    /// A crash that tears the retry of a failed commit — its lines
+    /// zeroed, its trailing mark surviving — reads as a torn tail, the
+    /// same as the same tear without a failure before it: the retry was
+    /// never acknowledged, so nothing is lost and no marker gates the
+    /// chequebook. The cut-off write's number isn't burned, so the
+    /// retry's mark follows the last durable one (PR #141 R5-M1).
+    #[test]
+    fn a_torn_retry_after_a_failed_commit_is_torn_not_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc8u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        let c1 = std::fs::read(&jp).unwrap();
+        FAIL_NEXT_SYNC.with(|f| f.set(true));
+        assert!(l.record_issued(&beneficiary(2), U256::from(20u64)).is_err());
+        l.record_issued(&beneficiary(3), U256::from(5u64)).unwrap();
+        crash(&path, [l]);
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&c1));
+        assert!(
+            after.ends_with(b"#2\n"),
+            "{}",
+            String::from_utf8_lossy(&after)
+        );
+
+        // The crash zero-fills the retry's lines, its mark survives.
+        let mut torn = after.clone();
+        let len = torn.len();
+        torn[c1.len()..len - 3].fill(0);
+        assert_eq!(journal_intact_len(&torn), c1.len(), "torn, not damage");
+        std::fs::remove_file(&path).ok();
+        std::fs::write(&jp, &torn).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.total_issued(), U256::from(10u64));
+        assert!(l.lost_figures().is_none(), "nothing acknowledged was lost");
+        assert!(!lost_marker_path(&path).exists());
+        crash(&path, [l]);
+    }
+
+    /// A zeroed range that starts in the second-to-last group commit and
+    /// swallows its commit mark is damage, not the last commit's torn
+    /// tail: the last commit's mark comes after a gap (PR #141 R4-M1).
+    /// One running to the end of the file, marks and all, can't be told
+    /// from a torn write and is dropped — but a copy is kept first.
+    #[test]
+    fn a_zeroed_range_across_two_commits_is_a_loss_and_a_dropped_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc7u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        let mut ends = Vec::new();
+        for i in 1..=3u32 {
+            l.record_issued(&beneficiary(i), U256::from(u64::from(i)))
+                .unwrap();
+            ends.push(std::fs::read(&jp).unwrap().len());
+        }
+        crash(&path, [l]);
+        let bytes = std::fs::read(&jp).unwrap();
+        assert!(bytes.ends_with(b"#3\n"));
+
+        // From the middle of commit 2 through its mark into commit 3.
+        let mut damaged = bytes.clone();
+        damaged[ends[0] + 5..ends[1] + 5].fill(0);
+        assert_eq!(journal_intact_len(&damaged), damaged.len());
+        std::fs::write(&jp, &damaged).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "commit 2 was acknowledged");
+        crash(&path, [l]);
+
+        // From the middle of commit 2 to the end of the file: dropped as
+        // torn, but kept in a copy.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("pushsync_outbound.json");
+        let jp2 = journal_path(&path2);
+        let mut tail = bytes.clone();
+        let len = tail.len();
+        tail[ends[0] + 5..len - 1].fill(0);
+        assert_eq!(journal_intact_len(&tail), ends[0]);
+        std::fs::write(&jp2, &tail).unwrap();
+        let l = OutboundLedger::open(Some(path2.clone()), cb);
+        assert!(l.lost_figures().is_none());
+        assert_eq!(l.total_issued(), U256::from(1u64));
+        let copies: Vec<_> = std::fs::read_dir(dir2.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".journal.old.torn-"))
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), tail);
+        crash(&path2, [l]);
+
+        // The same through an append: kept before it is cut off.
+        std::fs::remove_file(&path2).ok();
+        std::fs::write(&jp2, &tail).unwrap();
+        let mut io = JournalIo::default();
+        io.append(&path2, b"{}\n").unwrap();
+        assert_eq!(&std::fs::read(&jp2).unwrap()[..ends[0]], &bytes[..ends[0]]);
+        let copies = std::fs::read_dir(dir2.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".journal.torn-")
+            })
+            .count();
+        assert_eq!(copies, 1);
+    }
+
+    /// Once the journal holds as many lines as the threshold, it is folded
+    /// into the file in the background, without a cheque waiting for it.
+    #[test]
+    fn a_long_journal_is_compacted_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        let n = u32::try_from(COMPACT_MIN_LINES).unwrap();
+        let mut last = None;
+        for i in 0..n {
+            last = Some(l.stage_issued(&beneficiary(i), U256::from(u64::from(i) + 1)));
+        }
+        last.unwrap().wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while journal_path(&path).exists() || journal_old_path(&path).exists() {
+            assert!(std::time::Instant::now() < deadline, "never compacted");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let on_disk = read_outbound_file(&path).unwrap().unwrap();
+        assert_eq!(on_disk.entries(), n as usize);
+        l.record_issued(&beneficiary(0), U256::from(99u64)).unwrap();
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert_eq!(l.cumulative_for(&beneficiary(0)), U256::from(99u64));
+        assert_eq!(
+            l.cumulative_for(&beneficiary(n - 1)),
+            U256::from(u64::from(n))
+        );
+    }
+
+    /// Micro-benchmark for issue #140: what recording one cheque costs as
+    /// the ledger grows (500 / 4k / 50k entries), one issuer at a time and
+    /// 16 at once. `cargo test -p ant-p2p --release --lib
+    /// record_cost_vs_ledger_size -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn record_cost_vs_ledger_size() {
+        let cb = [0xc1u8; 20];
+        println!("entries | serial us/cheque (p50, mean) | 16 issuers cheques/s");
+        for entries in [500u32, 4_000, 50_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pushsync_outbound.json");
+            std::fs::write(&path, flat_ledger(cb, entries)).unwrap();
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            let mut took = Vec::new();
+            for i in 0..300u32 {
+                let t = std::time::Instant::now();
+                l.record_issued(
+                    &beneficiary(i % entries),
+                    U256::from(2_000_000_000u64 + u64::from(i)),
+                )
+                .unwrap();
+                took.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            let mean = took.iter().sum::<f64>() / took.len() as f64;
+            took.sort_by(f64::total_cmp);
+            let t = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for th in 0..16u32 {
+                    let l = l.clone();
+                    s.spawn(move || {
+                        for i in 0..100u32 {
+                            l.record_issued(
+                                &beneficiary((th * 100 + i) % entries),
+                                U256::from(3_000_000_000u64 + u64::from(i)),
+                            )
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            let rate = 1_600.0 / t.elapsed().as_secs_f64();
+            println!(
+                "{entries:>7} | {:>8.0} {:>8.0} | {rate:>8.0}",
+                took[took.len() / 2],
+                mean
+            );
+        }
     }
 
     /// The nested layout unreleased builds of this PR wrote still reads.

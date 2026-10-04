@@ -554,8 +554,11 @@ const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
     "chequebook.json",
     "swap_credits.json",
     "pushsync_outbound.json",
-    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it.
+    // The ledger's lost-figures marker (PR #126 R4-M1) travels with it,
+    // and so does its cheque journal, live and mid-compaction (#140).
     "pushsync_outbound.json.lost",
+    "pushsync_outbound.json.journal",
+    "pushsync_outbound.json.journal.old",
 ];
 
 /// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
@@ -602,7 +605,21 @@ struct AccountMarker {
 fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
     let current = format!("0x{}", hex::encode(eth));
     let marker = data_dir.join(ACCOUNT_MARKER_FILE);
-    match read_account_marker(&marker)? {
+    let previous = read_account_marker(&marker)?;
+    let parked = account_park_dir(data_dir, &current);
+    // Files are about to move: take the outbound cheque ledger's away
+    // from any ledger still open on them in this process first. The
+    // previous node's shutdown is bounded, so a cheque write, a
+    // background compaction or a close-time fold of the previous
+    // account's ledger can still be running, and each writes the
+    // ledger's files by name — after the move, over this account's
+    // (PR #141 R2-F1). Held until every move below is done.
+    let switching = previous
+        .as_deref()
+        .is_some_and(|p| !p.eq_ignore_ascii_case(&current));
+    let _ledger_files = (switching || parked.is_dir())
+        .then(|| ant_p2p::swap::hold_ledger_files(&data_dir.join("pushsync_outbound.json")));
+    match previous {
         // Same account as last launch: the canonical paths are its own.
         Some(previous) if previous.eq_ignore_ascii_case(&current) => {}
         // Someone else's (or unattributable) state sitting where this
@@ -626,7 +643,6 @@ fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
 
     // Swap this account's own parked state (if any) back in. Runs on
     // every start so an interrupted adopt is completed on the next one.
-    let parked = account_park_dir(data_dir, &current);
     if parked.is_dir() {
         move_account_entries(&parked, data_dir)?;
         // Empty now; a leftover (something else was put in there) is
@@ -4181,6 +4197,8 @@ mod tests {
         std::fs::write(dir.join("chequebook.json"), b"{}").expect("write chequebook");
         std::fs::write(dir.join("swap_credits.json"), b"{}").expect("write credits");
         std::fs::write(dir.join("pushsync_outbound.json"), b"{}").expect("write outbound");
+        std::fs::write(dir.join("pushsync_outbound.json.journal"), b"{}\n")
+            .expect("write outbound journal");
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -4521,6 +4539,8 @@ mod tests {
                 "{name} must not be visible to the new account",
             );
         }
+        // The outbound ledger's cheque journal goes with it (#140).
+        assert!(!dir.join("pushsync_outbound.json.journal").exists());
         // Parked, not destroyed: A can still be restored.
         let parked = dir
             .join(ACCOUNT_PARK_DIR)
@@ -4540,6 +4560,38 @@ mod tests {
             .join("chequebook.json")
             .exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An account switch takes the outbound cheque ledger's files away
+    /// from a ledger of the previous account still open in this process
+    /// (its node's shutdown is bounded): it writes nothing more, so
+    /// neither it nor its background compaction or close-time fold can
+    /// land on the next account's files at the same path (PR #141 R2-F1).
+    #[test]
+    fn an_account_switch_retires_the_previous_accounts_open_ledger() {
+        use ant_p2p::swap::OutboundLedger;
+        let dir = scratch_dir("account-switch-ledger");
+        let (a, b) = ([0xa5u8; 20], [0xb5u8; 20]);
+        let ledger = dir.join("pushsync_outbound.json");
+        bind_account_state(&dir, &a).expect("bind A");
+        let old = OutboundLedger::open(Some(ledger.clone()), [0xca; 20]);
+        old.record_issued(&[0x11; 20], 5u64.into()).expect("A pays");
+
+        bind_account_state(&dir, &b).expect("bind B");
+        old.record_issued(&[0x11; 20], 6u64.into())
+            .expect_err("the previous account's ledger is retired");
+        drop(old);
+        for name in ACCOUNT_SCOPED_ENTRIES {
+            assert!(!dir.join(name).exists(), "{name} written after the switch");
+        }
+        // A's figures went with A, and come back with it.
+        bind_account_state(&dir, &a).expect("bind A again");
+        let back = OutboundLedger::open(Some(ledger), [0xca; 20]);
+        assert_eq!(back.cumulative_for(&[0x11; 20]), 5u64.into());
+        back.record_issued(&[0x11; 20], 7u64.into())
+            .expect("A pays again");
+        drop(back);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

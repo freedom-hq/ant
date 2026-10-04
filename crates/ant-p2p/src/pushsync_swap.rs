@@ -43,8 +43,8 @@
 //! node's `swap-enable` switch is on and the chequebook has funds.
 
 use crate::swap::{
-    await_processed, issue_cheque, open_settlement, write_cheque, OutboundLedger, SettlementRates,
-    SwapError,
+    await_processed, issue_cheque, open_settlement, write_cheque, OutboundLedger, PendingWrite,
+    SettlementRates, SwapError,
 };
 use ant_crypto::SECP256K1_SECRET_LEN;
 use ant_retrieval::accounting::RetrievalPayment;
@@ -312,14 +312,16 @@ impl EmitCore {
 
     /// Record `beneficiary`'s cheque at `new_cumulative` (worth `amount`)
     /// as issued if the funds left cover it, or refuse. Check and record
-    /// are one step, so concurrent payments can't overdraw.
+    /// are one step, so concurrent payments can't overdraw. The record is
+    /// in memory on return; the cheque may go out once the returned write
+    /// is durable. No file I/O happens under the funds gate (issue #140).
     fn issue_within_funds(
         &self,
         policy: &RetrievalSwapPolicy,
         beneficiary: &[u8; 20],
         new_cumulative: U256,
         amount: U256,
-    ) -> Result<(), SwapError> {
+    ) -> Result<PendingWrite, SwapError> {
         let _gate = self.outbound_ledger.funds_gate();
         let left = self.available(policy);
         if left < amount {
@@ -327,21 +329,9 @@ impl EmitCore {
                 "chequebook credit exhausted: cheque of {amount} PLUR, {left} left",
             )));
         }
-        if let Err(e) = self
+        Ok(self
             .outbound_ledger
-            .record_issued(beneficiary, new_cumulative)
-        {
-            // The in-memory record holds it, so this process doesn't
-            // overdraw; a restart would forget the cheque, and the next
-            // one to this peer would not increase (refused by the peer,
-            // not overpaid).
-            tracing::warn!(
-                target: "ant_p2p::pushsync_swap",
-                beneficiary = %hex::encode(beneficiary),
-                "outbound ledger persist failed for a cheque: {e}",
-            );
-        }
-        Ok(())
+            .stage_issued(beneficiary, new_cumulative))
     }
 
     /// Whether every connection to `peer` was still up
@@ -464,9 +454,17 @@ impl EmitCore {
         // halfway, the recipient may still hold the cheque. The ledger's
         // total is the chequebook's liability, and it never outgrows the
         // deposit; the next cheque to this beneficiary builds on it, so
-        // nothing is paid twice either.
-        self.issue_within_funds(&policy, &beneficiary, new_cum, amount)?;
+        // nothing is paid twice either. Nothing is sent before the record
+        // is on disk, so a crash can't forget a cheque a peer holds; if
+        // it can't be written the cheque isn't sent (it stays issued in
+        // memory, and the next cheque to the peer covers it).
+        let pending = self.issue_within_funds(&policy, &beneficiary, new_cum, amount)?;
         let delivered = tokio::time::timeout_at(deadline, async {
+            pending.durable().await.map_err(|e| {
+                SwapError::Rejected(format!(
+                    "not sent: the outbound ledger can't record the cheque on disk: {e}"
+                ))
+            })?;
             write_cheque(&mut stream, &signed).await?;
             await_processed(stream).await?;
             self.connection_held(peer, session).await
@@ -769,6 +767,8 @@ mod tests {
         let p = policy(1_000);
         svc.core
             .issue_within_funds(&p, &b, U256::from(600u64), U256::from(600u64))
+            .unwrap()
+            .wait()
             .unwrap();
         let refused = svc
             .core
@@ -778,6 +778,8 @@ mod tests {
         assert_eq!(svc.outbound_ledger().cumulative_for(&a), U256::from(300u64));
         svc.core
             .issue_within_funds(&p, &a, U256::from(400u64), U256::from(100u64))
+            .unwrap()
+            .wait()
             .unwrap();
         assert_eq!(svc.outbound_ledger().total_issued(), U256::from(1_000u64));
         assert!(
@@ -827,11 +829,11 @@ mod tests {
                 let paid = &paid;
                 s.spawn(move || {
                     let b = [i; 20];
-                    if svc
-                        .core
-                        .issue_within_funds(&p, &b, U256::from(100u64), U256::from(100u64))
-                        .is_ok()
+                    if let Ok(w) =
+                        svc.core
+                            .issue_within_funds(&p, &b, U256::from(100u64), U256::from(100u64))
                     {
+                        w.wait().unwrap();
                         paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 });
