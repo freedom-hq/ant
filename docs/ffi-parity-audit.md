@@ -123,6 +123,21 @@ The matrix below describes `75d7328`. The catch-up branch, stacked on #97, chang
   - antd's background task loops until batch rediscovery succeeds. Its settlement run happens once, after the first attempt.
   - ant-ffi's `ChainInit` runs at most one retry loop per handle, next to step 1's recheck. Before this, a failed scan in ant-ffi waited for the host's next `ant_start_gateway`. The host can still trigger an attempt sooner that way.
 
+**Done in the unverified-first-scan follow-up (`feat/unverified-first-scan`, freedom-browser#484):**
+
+- **Why:** under Freedom's verified-only routing, the only keyless providers that serve a wallet's whole xBZZ history in one `eth_getLogs` all run on the same backend (Tenderly). The independent ones stop at 10k blocks, so a first scan verified by two providers is ~3,200 windows, about an hour. Freedom's bridge gains a second independent full-history source (Blockscout's index), which makes the verified scan one request. This change is the fallback for when that source is down or disagrees.
+- **`ChainClient::with_unverified_logs`** gives the transfer scan an explicitly unverified source: in antd via `--gnosis-unverified-logs-rpc-url`, in ant-ffi via `ant_set_unverified_logs_rpc`, which every `AntHandle::chain_client` then carries. A span the verified logs RPC can't serve in `MAX_VERIFIED_WINDOWS` (64) windows is read from it once, after a few instant range refusals, instead of window by window.
+  - Each batch and chequebook found is still checked through the verified route.
+  - The blocks read that way aren't confirmed (`TransferScan::provisional_since`).
+  - `/health.walletScan` ends in a new state, `confirming`, instead of `done`.
+- **`discover::confirm_transfer_scan`** re-reads the unconfirmed blocks through the verified route in at most a few windows, never as a crawl. Both entry points retry it in the background with `confirm_retry_delay` (1 min, doubling, at most 30 min), and once it's confirmed they register any batch the unverified read missed and move `walletScan` to `done`:
+  - antd's background task, which then re-runs the chequebook resolution if settlement is still off;
+  - ant-ffi's `ChainInit::confirm_unverified`, at most one loop per handle, which then adopts a chequebook if settlement isn't on yet and reports it to the gateway's slot. It never deploys at gateway start, as before.
+- **`find_owned_chequebook`'s "none, so deploy"** never rests on unverified blocks.
+  - Within `CONFIRM_CRAWL_AFTER_SECS` (6 h), its confirming re-read gives up instead of crawling, and the node stays without settlement rather than deploying.
+  - After that, it reads the span window by window through the verified route, so a second source that stays down doesn't leave the node without settlement for good.
+- **Only antd re-runs settlement once the 6 hours are up** (a 6 h settlement re-run in `confirm_unverified_scan`): only antd auto-deploys. In ant-ffi the crawl happens on the next call that may deploy (a storage buy, `ant_deploy_chequebook`).
+
 **Deferred:**
 
 - F6 (fd limit: measure on a device first).
@@ -221,6 +236,7 @@ An embedded host can set only:
 | `--disk-cache-path`, `--disk-cache-max-gb`, `--no-disk-cache` | `antd:189-205` | fixed path, 512 MiB (`ffi:101`) | hard-coded |
 | `--gnosis-rpc-url` / `GNOSIS_RPC_URL` / `blockchain-rpc-endpoint` | `antd:211`, `792`, `1338`, `1709` | `gnosis_rpc` on `ant_start_gateway` and each `ant_storage_*` call; no init-time RPC | FFI param (per call) |
 | `--gnosis-logs-rpc-url` / `GNOSIS_LOGS_RPC_URL` (default public RPC; empty string disables recovery) | `antd:223-228`, `2104-2111` | — (log scans reuse the per-call `gnosis_rpc`; no gateway read fallback, `ffi-gw:210`) | not settable. Relevant to F2: a range-capped `gnosis_rpc` makes the discovery scan slow |
+| `--gnosis-unverified-logs-rpc-url` / `GNOSIS_UNVERIFIED_LOGS_RPC_URL` (unset by default) | `antd` (`scan_client`) | `ant_set_unverified_logs_rpc` (`ffi`; every `AntHandle::chain_client` carries it) | **ported** (see §1.1, unverified first scan) |
 | `--postage-contract` | `antd:232` | `GNOSIS_POSTAGE_STAMP` (same address) | hard-coded |
 | `--postage-batch` / `STORAGE_STAMP_BATCH_ID` | `antd:238`, `578-593`, `1461-1517` | `ant_storage_connect_batch`, `ant_upload_start(batch_id)` | FFI (runtime) |
 | `--postage-owner-key` / `STORAGE_STAMP_PRIVATE_KEY` | `antd:247` | — | n/a |

@@ -147,6 +147,12 @@ pub(crate) struct ChainInit {
     /// ([`Self::retry_rediscovery`]): at most one per handle, however
     /// often the host re-calls `ant_start_gateway`.
     rediscovery_retrying: std::sync::atomic::AtomicBool,
+    /// The rediscovery read part of the history only from the unverified
+    /// source ([`crate::ant_set_unverified_logs_rpc`]), and that isn't
+    /// confirmed yet ([`Self::confirm_unverified`]).
+    unconfirmed: std::sync::atomic::AtomicBool,
+    /// A background confirmation is running: at most one per handle.
+    confirming: std::sync::atomic::AtomicBool,
     /// Set once settlement has been switched on for an adopted
     /// chequebook, so a later run (every idempotent `ant_start_gateway`
     /// re-call spawns one) doesn't re-resolve it over RPC.
@@ -207,6 +213,8 @@ impl ChainInit {
             unverified: std::sync::Mutex::new(unverified),
             batches_rediscovered: tokio::sync::Mutex::new(false),
             rediscovery_retrying: std::sync::atomic::AtomicBool::new(false),
+            unconfirmed: std::sync::atomic::AtomicBool::new(false),
+            confirming: std::sync::atomic::AtomicBool::new(false),
             settlement_on: std::sync::atomic::AtomicBool::new(false),
             pass: tokio::sync::Mutex::new(()),
             not_found_since: std::sync::Mutex::new(HashMap::new()),
@@ -258,7 +266,11 @@ impl ChainInit {
     /// batch recheck. With `retry`, a failed step 2 is retried in the
     /// background with backoff ([`Self::retry_rediscovery`]) alongside
     /// step 1's recheck, as `antd` does, so `/health.walletScan` moves on
-    /// from `retrying` without waiting for the host's next start call.
+    /// from `retrying` without waiting for the host's next start call;
+    /// and a rediscovery that read part of the history only from the
+    /// unverified source is confirmed afterwards
+    /// ([`Self::confirm_unverified`]), calling `report` again with the
+    /// chequebook that adopts, if any.
     pub(crate) async fn run_reporting(
         &self,
         chain: &ant_chain::ChainClient,
@@ -266,7 +278,7 @@ impl ChainInit {
         data_dir: &std::path::Path,
         swap_secret: [u8; 32],
         retry: bool,
-        report: impl FnOnce(Option<[u8; 20]>),
+        mut report: impl FnMut(Option<[u8; 20]>),
     ) {
         let recheck_at = self
             .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
@@ -283,12 +295,23 @@ impl ChainInit {
                     .await;
             }
         };
-        let retry_rediscovery = async {
-            if retry && !rediscovered {
+        let follow_up = async {
+            if !retry {
+                return;
+            }
+            if !rediscovered {
                 self.retry_rediscovery(chain, cmd_tx, data_dir).await;
             }
+            if self.unconfirmed.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(chequebook) = self
+                    .confirm_unverified(chain, cmd_tx, data_dir, swap_secret)
+                    .await
+                {
+                    report(Some(chequebook));
+                }
+            }
         };
-        tokio::join!(recheck, retry_rediscovery);
+        tokio::join!(recheck, follow_up);
     }
 
     /// Report a rediscovery that will run (`/health.walletScan` =
@@ -398,7 +421,11 @@ impl ChainInit {
             return true;
         }
         let found = match owned_batches(chain, &owner, data_dir, false).await {
-            Ok(found) => found,
+            Ok((found, unconfirmed)) => {
+                self.unconfirmed
+                    .store(unconfirmed, std::sync::atomic::Ordering::Release);
+                found
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "ant-ffi",
@@ -408,6 +435,29 @@ impl ChainInit {
                 return false;
             }
         };
+        let all_registered = self.register_found(cmd_tx, found).await;
+        // Only a clean pass ends the rediscovery: a batch whose
+        // registration failed is picked up by the next run's scan (the
+        // ones registered now are skipped as known).
+        *rediscovered = all_registered;
+        if all_registered {
+            ant_chain::discover::wallet_scan_done(&owner);
+        } else {
+            ant_chain::discover::wallet_scan_failed(
+                &owner,
+                "could not register a rediscovered batch",
+            );
+        }
+        all_registered
+    }
+
+    /// Register the batches in `found` this handle doesn't hold yet.
+    /// Returns whether every one of them registered.
+    async fn register_found(
+        &self,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        found: Vec<ant_chain::discover::DiscoveredBatch>,
+    ) -> bool {
         let mut all_registered = true;
         for b in found {
             let known = self
@@ -448,19 +498,90 @@ impl ChainInit {
                 }
             }
         }
-        // Only a clean pass ends the rediscovery: a batch whose
-        // registration failed is picked up by the next run's scan (the
-        // ones registered now are skipped as known).
-        *rediscovered = all_registered;
-        if all_registered {
-            ant_chain::discover::wallet_scan_done(&owner);
-        } else {
-            ant_chain::discover::wallet_scan_failed(
-                &owner,
-                "could not register a rediscovered batch",
-            );
-        }
         all_registered
+    }
+
+    /// Confirm a rediscovery that read part of the history only from the
+    /// unverified source: [`ant_chain::discover::confirm_transfer_scan`]
+    /// through the verified transport, one request at a time with the
+    /// shared backoff, never a crawl — as `antd` does. Once it's
+    /// confirmed, register any batch the unverified read missed, move
+    /// `/health.walletScan` to `done`, and adopt the chequebook if
+    /// settlement isn't on yet (nothing is deployed here, as in
+    /// [`Self::run`]). Returns the chequebook adopted, if any. One loop
+    /// per handle.
+    async fn confirm_unverified(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+        swap_secret: [u8; 32],
+    ) -> Option<[u8; 20]> {
+        use std::sync::atomic::Ordering;
+        if self.confirming.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let owner = self.upload.batch_owner;
+        let mut adopted = None;
+        for attempt in 0u32.. {
+            tokio::time::sleep(ant_chain::discover::confirm_retry_delay(attempt)).await;
+            let scan = match ant_chain::discover::confirm_transfer_scan(
+                chain,
+                ant_chain::GNOSIS_BZZ_TOKEN,
+                &owner,
+                data_dir,
+            )
+            .await
+            {
+                Ok(Some(scan)) => scan,
+                Ok(None) => {
+                    tracing::info!(
+                        target: "ant-ffi",
+                        "the transport can't confirm the wallet history read from the unverified \
+                         source yet; trying again",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "confirming the wallet history failed: {e}; trying again",
+                    );
+                    continue;
+                }
+            };
+            let found = match ant_chain::discover::owned_batches_in(
+                chain,
+                ant_chain::GNOSIS_POSTAGE_STAMP,
+                &scan,
+            )
+            .await
+            {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "reading the confirmed wallet history failed: {e}; trying again",
+                    );
+                    continue;
+                }
+            };
+            if !self.register_found(cmd_tx, found).await {
+                continue;
+            }
+            self.unconfirmed.store(false, Ordering::Release);
+            ant_chain::discover::wallet_scan_done(&owner);
+            tracing::info!(
+                target: "ant-ffi",
+                "the wallet history read from the unverified source is confirmed",
+            );
+            adopted = self
+                .adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
+                .await;
+            break;
+        }
+        self.confirming.store(false, Ordering::Release);
+        adopted
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
@@ -1043,14 +1164,16 @@ pub(crate) fn storage_connect_batch(
 
 /// The funded postage batches `owner` holds on Gnosis, from the saved
 /// transfer scan in `data_dir` (brought up to the chain head first), or
-/// with `full_rescan` from a scan of the whole history that replaces it.
+/// with `full_rescan` from a scan of the whole history that replaces it;
+/// and whether that scan still holds blocks read only from the unverified
+/// source ([`crate::ant_set_unverified_logs_rpc`]).
 #[cfg(feature = "chain")]
 async fn owned_batches(
     chain: &ant_chain::ChainClient,
     owner: &[u8; 20],
     data_dir: &std::path::Path,
     full_rescan: bool,
-) -> Result<Vec<ant_chain::discover::DiscoveredBatch>, ant_chain::RpcError> {
+) -> Result<(Vec<ant_chain::discover::DiscoveredBatch>, bool), ant_chain::RpcError> {
     let scan = if full_rescan {
         ant_chain::discover::rescan_transfer_history(
             chain,
@@ -1068,7 +1191,10 @@ async fn owned_batches(
         )
         .await?
     };
-    ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan).await
+    let found =
+        ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan)
+            .await?;
+    Ok((found, scan.provisional_since.is_some()))
 }
 
 /// Auto-discover every funded postage batch this account owns on Gnosis
@@ -1091,7 +1217,7 @@ pub(crate) fn storage_discover(
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let found = owned_batches(&chain, &eth, &data_dir, full_rescan)
+        let (found, _) = owned_batches(&chain, &eth, &data_dir, full_rescan)
             .await
             .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
         let mut registered = Vec::new();
@@ -3701,6 +3827,10 @@ mod chain_tests {
         /// "no" (the chain changing its answer between two checks).
         registered_reads: Option<usize>,
         factory_reads: Mutex<usize>,
+        /// Refuse xBZZ `eth_getLogs` ranges wider than this, as a
+        /// verified route that serves a few thousand blocks at a time
+        /// does; `0` serves any range.
+        cap: std::sync::atomic::AtomicU64,
         seen: Mutex<Vec<String>>,
     }
 
@@ -3715,6 +3845,7 @@ mod chain_tests {
                 checks_fail: false,
                 registered_reads: None,
                 factory_reads: Mutex::new(0),
+                cap: std::sync::atomic::AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -3805,6 +3936,20 @@ mod chain_tests {
                 "eth_getLogs" => {
                     let filter = &req["params"][0];
                     let address = filter["address"].as_str().unwrap().to_ascii_lowercase();
+                    let block = |key: &str| {
+                        u64::from_str_radix(&filter[key].as_str().unwrap()[2..], 16).unwrap()
+                    };
+                    let cap = self.cap.load(std::sync::atomic::Ordering::SeqCst);
+                    if cap > 0 && block("toBlock") - block("fromBlock") + 1 > cap {
+                        return Some(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32005, "message": "query exceeds max block range"},
+                            })
+                            .to_string(),
+                        );
+                    }
                     if address == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() {
                         json!(self
                             .transfers
@@ -4412,6 +4557,78 @@ mod chain_tests {
 
         // A later gateway start finds it done and doesn't announce another.
         init.note_pending();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A first rediscovery the transport can only serve window by window
+    /// reads the history once from the unverified source
+    /// (`ant_set_unverified_logs_rpc`), registers what it finds and reads
+    /// `confirming`; the background confirmation registers the batch the
+    /// unverified source left out once the transport serves the span, and
+    /// ends `done`. Its own wallet: the status registry is process-wide.
+    #[tokio::test(start_paused = true)]
+    async fn an_unverified_first_scan_is_confirmed_in_the_background() {
+        use ant_chain::discover::{wallet_scan_status, WalletScanState};
+        const EOA: [u8; 20] = [0x78; 20];
+        let dir = scratch("chain-init-unverified");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let (seen, missed) = ([0xa5u8; 32], [0xa6u8; 32]);
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(std::sync::Arc::clone(&upload));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut verified = ChainScript::new(EOA);
+        verified.transfers.push((postage_addr, [0x07; 32]));
+        verified.transfers.push((postage_addr, [0x08; 32]));
+        verified.created.push((seen, [0x07; 32]));
+        verified.created.push((missed, [0x08; 32]));
+        verified
+            .cap
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        let mut unverified = ChainScript::new(EOA);
+        unverified.transfers.push((postage_addr, [0x07; 32]));
+        let (verified, unverified) = (
+            std::sync::Arc::new(verified),
+            std::sync::Arc::new(unverified),
+        );
+        let chain = client(&verified).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, node) = fake_node();
+
+        init.note_pending();
+        assert!(init.rediscover_owned(&chain, &cmd_tx, &dir).await);
+        assert_eq!(node.lock().unwrap().registered, vec![seen]);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming
+        );
+
+        // The transport's second source is back: it serves the span.
+        verified.cap.store(0, std::sync::atomic::Ordering::SeqCst);
+        let adopted = init
+            .confirm_unverified(&chain, &cmd_tx, &dir, NODE_KEY)
+            .await;
+        assert_eq!(adopted, None, "no chequebook to adopt, and none deployed");
+        // The fake node doesn't fill the issuer map, so the batch already
+        // registered is sent again here; a real node fills it, and
+        // `register_found` skips the batch as known.
+        let registered = node.lock().unwrap().registered.clone();
+        assert_eq!(registered.last(), Some(&missed), "{registered:?}");
+        assert_eq!(registered.iter().filter(|b| **b == missed).count(), 1);
+        assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(
             wallet_scan_status(&EOA).unwrap().state,
             WalletScanState::Done

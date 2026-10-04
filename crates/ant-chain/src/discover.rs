@@ -97,6 +97,22 @@ const RESCAN_TAIL: u64 = 1_024;
 /// by chain; its files are ignored (a full scan, once).
 const TRANSFER_SCAN_VERSION: u32 = 2;
 
+/// With an unverified source to fall back on
+/// ([`ChainClient::with_unverified_logs`]), the verified route reads a span
+/// in at most about this many windows. A wider one — a first scan behind
+/// a 10k-block cap is ~3,200 windows, about an hour of quorum rounds — is
+/// read from the unverified source instead and confirmed later in one
+/// request ([`confirm_transfer_scan`]). 64 windows of 10k blocks cover
+/// about five weeks offline.
+const MAX_VERIFIED_WINDOWS: u64 = 64;
+
+/// How long blocks read only from the unverified source wait for a
+/// one-request confirmation before [`find_owned_chequebook`]'s "none" may
+/// be confirmed window by window instead: a deploy decision must not wait
+/// forever on a second source that stays down. An embedder that confirms
+/// in the background gives its settlement another go once this has passed.
+pub const CONFIRM_CRAWL_AFTER_SECS: u64 = 6 * 60 * 60;
+
 /// How often a running scan saves its progress, so a first scan cut
 /// short (the app quit, the RPC failed) resumes where it stopped.
 const SCAN_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
@@ -146,6 +162,13 @@ pub struct TransferScan {
     /// those, so a wallet whose deploy keeps failing pays the full
     /// history once, not on every check.
     pub confirmed_through: Option<u64>,
+    /// When some blocks above [`Self::confirmed_through`] were first read
+    /// only from the unverified source (unix seconds), until a verified
+    /// read confirms them. The transfers found there are used — each batch
+    /// and chequebook is still checked through the verified route — but
+    /// a "none" they back never leads to a deploy, and
+    /// `/health.walletScan` reads `confirming` meanwhile.
+    pub provisional_since: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -159,6 +182,9 @@ struct TransferScanFile {
     /// it existed: the next confirming check then reads the full history.
     #[serde(default)]
     confirmed_through: Option<u64>,
+    /// [`TransferScan::provisional_since`].
+    #[serde(default)]
+    provisional_since: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -220,6 +246,7 @@ fn load_transfer_scan(
                 scanned_through: f.scanned_through,
                 transfers,
                 confirmed_through: f.confirmed_through.filter(|&c| c <= f.scanned_through),
+                provisional_since: f.provisional_since,
             })
         });
     match parsed {
@@ -241,6 +268,7 @@ fn persist_transfer_scan(data_dir: &std::path::Path, scan: &TransferScan) {
         node_eoa: format!("0x{}", hex::encode(scan.node_eoa)),
         scanned_through: scan.scanned_through,
         confirmed_through: scan.confirmed_through,
+        provisional_since: scan.provisional_since,
         transfers: scan
             .transfers
             .iter()
@@ -289,6 +317,11 @@ pub struct WalletScanStatus {
     /// Why the last attempt failed. Only in [`WalletScanState::Retrying`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Some blocks were read only from the unverified source and aren't
+    /// confirmed yet: the rediscovery ends in
+    /// [`WalletScanState::Confirming`] rather than `Done`.
+    #[serde(skip)]
+    pub provisional: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -303,6 +336,21 @@ pub enum WalletScanState {
     /// The scan is up to date and the batches it found are registered.
     /// Later scans (a stamp buy's chequebook check) don't leave it.
     Done,
+    /// As `Done`, but part of the history was read only from an
+    /// unverified source: what it found is registered (each batch checked
+    /// through the verified route), and the embedder confirms in the
+    /// background that nothing is missing ([`confirm_transfer_scan`]),
+    /// then moves to `Done`. A host shows the normal state here; it may
+    /// note that the check is still running.
+    Confirming,
+}
+
+impl WalletScanState {
+    /// The rediscovery finished (confirmed or not): later scans don't
+    /// move it back to scanning or retrying.
+    fn finished(self) -> bool {
+        matches!(self, Self::Done | Self::Confirming)
+    }
 }
 
 /// The rediscovery status per wallet, for this process.
@@ -337,15 +385,22 @@ pub fn wallet_scan_pending(node_eoa: &[u8; 20]) {
                 scanned_through: None,
                 head: None,
                 error: None,
+                provisional: false,
             },
         );
     }
 }
 
 /// The rediscovery for `node_eoa` finished: its batches are registered.
+/// `Done`, or `Confirming` while part of the history was read only from
+/// the unverified source.
 pub fn wallet_scan_done(node_eoa: &[u8; 20]) {
     update_wallet_scan(node_eoa, |s| {
-        s.state = WalletScanState::Done;
+        s.state = if s.provisional {
+            WalletScanState::Confirming
+        } else {
+            WalletScanState::Done
+        };
         s.error = None;
     });
 }
@@ -354,7 +409,7 @@ pub fn wallet_scan_done(node_eoa: &[u8; 20]) {
 /// [`rediscovery_retry_delay`].
 pub fn wallet_scan_failed(node_eoa: &[u8; 20], error: &str) {
     update_wallet_scan(node_eoa, |s| {
-        if s.state != WalletScanState::Done {
+        if !s.state.finished() {
             s.state = WalletScanState::Retrying;
             s.error = Some(without_urls(error));
         }
@@ -405,17 +460,64 @@ pub fn rediscovery_retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(FIRST.saturating_mul(1u64 << attempt.min(10)).min(MAX))
 }
 
+/// What [`scan_transfers`] does with a span the verified route can't
+/// serve in [`MAX_VERIFIED_WINDOWS`] windows.
+#[derive(Clone, Copy)]
+enum Fallback<'a> {
+    /// Read it window by window, however many windows it takes.
+    Crawl,
+    /// Read it once from this unverified source; the blocks stay
+    /// unconfirmed ([`TransferScan::provisional_since`]).
+    Unverified(&'a ChainClient),
+    /// Stop with [`ScanStop::TooWide`]: the span can't be confirmed yet.
+    GiveUp,
+}
+
+/// Why [`scan_transfers`] stopped short.
+#[derive(Debug)]
+enum ScanStop {
+    Rpc(RpcError),
+    /// The verified route can't serve the span in a few windows, and the
+    /// pass may neither crawl nor read it unverified.
+    TooWide,
+}
+
+impl From<RpcError> for ScanStop {
+    fn from(e: RpcError) -> Self {
+        Self::Rpc(e)
+    }
+}
+
+impl ScanStop {
+    fn into_rpc(self) -> RpcError {
+        match self {
+            Self::Rpc(e) => e,
+            Self::TooWide => RpcError::Rpc(
+                "the verified log source can't confirm the wallet's history yet".into(),
+            ),
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Scan the node wallet's xBZZ transfers from `from_block` to the head,
 /// continuing `previous` (same wallet) from where it stopped instead of
 /// starting over. Its transfers in the rescan tail are dropped and read
 /// again. With `save_to`, the progress is saved there every
 /// [`SCAN_SAVE_EVERY`] while the scan runs, and when it fails. With
 /// `confirms` — a pass that reads from the deploy block, or re-reads the
-/// blocks above the confirmed mark — every block it reads is confirmed:
-/// the saved progress carries [`TransferScan::confirmed_through`] up to
-/// where it got, so a confirming pass cut short and resumed (a first scan
-/// interrupted by the app going to the background) only leaves the blocks
-/// the resumed part read unconfirmed, not the whole history.
+/// blocks above the confirmed mark — every block it reads through the
+/// verified route is confirmed: the saved progress carries
+/// [`TransferScan::confirmed_through`] up to where it got, so a confirming
+/// pass cut short and resumed (a first scan interrupted by the app going
+/// to the background) only leaves the blocks the resumed part read
+/// unconfirmed, not the whole history. Blocks read from the `fallback`'s
+/// unverified source are never confirmed.
 #[allow(clippy::too_many_arguments)]
 async fn scan_transfers(
     client: &ChainClient,
@@ -426,7 +528,8 @@ async fn scan_transfers(
     previous: Option<TransferScan>,
     save_to: Option<&std::path::Path>,
     confirms: bool,
-) -> Result<TransferScan, RpcError> {
+    fallback: Fallback<'_>,
+) -> Result<TransferScan, ScanStop> {
     let head = client.eth_block_number().await?;
     let mut scan = match previous.filter(|p| {
         p.node_eoa == *node_eoa
@@ -444,6 +547,7 @@ async fn scan_transfers(
             scanned_through: from_block.saturating_sub(1),
             transfers: Vec::new(),
             confirmed_through: None,
+            provisional_since: None,
         },
     };
     let start = scan.scanned_through.saturating_add(1);
@@ -451,56 +555,93 @@ async fn scan_transfers(
     // read again next time.
     let settled = head.saturating_sub(RESCAN_TAIL);
     update_wallet_scan(node_eoa, |s| {
-        if s.state != WalletScanState::Done {
+        if !s.state.finished() {
             *s = WalletScanStatus {
                 state: WalletScanState::Scanning,
                 from: Some(start),
                 scanned_through: None,
                 head: Some(head),
                 error: None,
+                provisional: s.provisional,
             };
         }
     });
-    if start <= head {
-        let topics = json!([
-            format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
-            topic_for_address(node_eoa),
-        ]);
-        let mut saved_at = std::time::Instant::now();
-        let scanned = client
-            .scan_logs_with(xbzz_token, &topics, start, head, |end, logs| {
-                for log in logs {
-                    if log.topics.len() >= 3 {
-                        scan.transfers.push(NodeTransfer {
-                            to: address_from_topic(&log.topics[2]),
-                            block: log.block_number,
-                            tx_hash: log.tx_hash,
-                        });
-                    }
-                }
-                // Never backwards: a scan within the tail of the
-                // previous one leaves its mark where it was.
-                scan.scanned_through = scan.scanned_through.max(end.min(settled));
-                if confirms {
-                    scan.confirmed_through = Some(scan.scanned_through);
-                }
-                update_wallet_scan(node_eoa, |s| {
-                    if s.state == WalletScanState::Scanning {
-                        s.scanned_through = Some(scan.scanned_through);
-                    }
+    if start > head {
+        return Ok(scan);
+    }
+    let topics = json!([
+        format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
+        topic_for_address(node_eoa),
+    ]);
+    let mut saved_at = std::time::Instant::now();
+    let mut take = |scan: &mut TransferScan, end: u64, logs: Vec<LogEntry>, verified: bool| {
+        for log in logs {
+            if log.topics.len() >= 3 {
+                scan.transfers.push(NodeTransfer {
+                    to: address_from_topic(&log.topics[2]),
+                    block: log.block_number,
+                    tx_hash: log.tx_hash,
                 });
-                if let Some(dir) = save_to {
-                    if saved_at.elapsed() >= SCAN_SAVE_EVERY {
-                        persist_transfer_scan(dir, &scan);
-                        saved_at = std::time::Instant::now();
-                    }
-                }
-            })
-            .await;
-        if let (Err(_), Some(dir)) = (&scanned, save_to) {
+            }
+        }
+        // Never backwards: a scan within the tail of the previous one
+        // leaves its mark where it was.
+        scan.scanned_through = scan.scanned_through.max(end.min(settled));
+        if confirms && verified && scan.provisional_since.is_none() {
+            scan.confirmed_through = Some(scan.scanned_through);
+        }
+        update_wallet_scan(node_eoa, |s| {
+            if s.state == WalletScanState::Scanning {
+                s.scanned_through = Some(scan.scanned_through);
+            }
+        });
+        if let Some(dir) = save_to {
+            if saved_at.elapsed() >= SCAN_SAVE_EVERY {
+                persist_transfer_scan(dir, scan);
+                saved_at = std::time::Instant::now();
+            }
+        }
+    };
+    let min_window = match fallback {
+        Fallback::Crawl => 1,
+        Fallback::Unverified(_) | Fallback::GiveUp => {
+            (head - start + 1).div_ceil(MAX_VERIFIED_WINDOWS).max(1)
+        }
+    };
+    let verified = client
+        .scan_logs_with(xbzz_token, &topics, start, head, min_window, |end, logs| {
+            take(&mut scan, end, logs, true);
+        })
+        .await;
+    let read = match verified {
+        Ok(None) => Ok(()),
+        Ok(Some(rest)) => match fallback {
+            Fallback::Unverified(unverified) => {
+                tracing::info!(
+                    target: "ant_chain",
+                    from_block = rest,
+                    to_block = head,
+                    "the verified log source can't serve this span in a few windows; reading it \
+                     from the unverified source, to be confirmed later",
+                );
+                scan.provisional_since.get_or_insert_with(unix_now);
+                update_wallet_scan(node_eoa, |s| s.provisional = true);
+                unverified
+                    .scan_logs_with(xbzz_token, &topics, rest, head, 1, |end, logs| {
+                        take(&mut scan, end, logs, false);
+                    })
+                    .await
+                    .map(|_| ())
+            }
+            Fallback::GiveUp | Fallback::Crawl => return Err(ScanStop::TooWide),
+        },
+        Err(e) => Err(e),
+    };
+    if let Err(e) = read {
+        if let Some(dir) = save_to {
             persist_transfer_scan(dir, &scan);
         }
-        scanned?;
+        return Err(e.into());
     }
     Ok(scan)
 }
@@ -522,7 +663,9 @@ pub async fn refresh_transfer_scan(
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
 ) -> Result<TransferScan, RpcError> {
-    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Continue).await
+    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Continue)
+        .await
+        .map_err(ScanStop::into_rpc)
 }
 
 /// [`refresh_transfer_scan`], but reading the whole history from the xBZZ
@@ -544,7 +687,60 @@ pub async fn rescan_transfer_history(
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
 ) -> Result<TransferScan, RpcError> {
-    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Full).await
+    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Full)
+        .await
+        .map_err(ScanStop::into_rpc)
+}
+
+/// Whether a pass with `fallback` saves its progress: one that may give
+/// up doesn't (see [`update_transfer_scan`]).
+fn fallback_saves(fallback: Fallback<'_>) -> bool {
+    !matches!(fallback, Fallback::GiveUp)
+}
+
+/// Confirm the blocks the transfer scan read only from the unverified
+/// source ([`ChainClient::with_unverified_logs`]): read the blocks above
+/// its confirmed mark again through the verified route, in at most a few
+/// windows — one request once the verified route has a second
+/// full-history source. `Ok(Some(scan))` once they're confirmed: read its
+/// batches and chequebook again, since the unverified read may have
+/// missed some, then call [`wallet_scan_done`]. `Ok(None)` while the verified route still can't serve the
+/// span: the saved scan stays as it was; try again after
+/// [`confirm_retry_delay`]. It never reads the span window by window —
+/// that is the hour-long crawl the unverified read avoided — except
+/// through [`find_owned_chequebook`] for a deploy decision that has waited
+/// long enough.
+///
+/// Only an embedder with an unverified source has anything to confirm
+/// (today `antd`'s `--gnosis-unverified-logs-rpc-url`).
+pub async fn confirm_transfer_scan(
+    client: &ChainClient,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+) -> Result<Option<TransferScan>, RpcError> {
+    match update_transfer_scan(
+        client,
+        xbzz_token,
+        node_eoa,
+        data_dir,
+        ScanMode::Confirm { crawl: false },
+    )
+    .await
+    {
+        Ok(scan) => Ok(Some(scan)),
+        Err(ScanStop::TooWide) => Ok(None),
+        Err(ScanStop::Rpc(e)) => Err(e),
+    }
+}
+
+/// How long to wait before trying [`confirm_transfer_scan`] again: 1
+/// minute, doubling, at most 30 minutes. Each try is one request.
+#[must_use]
+pub fn confirm_retry_delay(attempt: u32) -> std::time::Duration {
+    const FIRST: u64 = 60;
+    const MAX: u64 = 30 * 60;
+    std::time::Duration::from_secs(FIRST.saturating_mul(1u64 << attempt.min(10)).min(MAX))
 }
 
 /// How [`update_transfer_scan`] treats the saved scan.
@@ -553,8 +749,11 @@ enum ScanMode {
     /// Continue it from where it stopped.
     Continue,
     /// Read the blocks above its [`TransferScan::confirmed_through`]
-    /// again, or the whole history if it has none.
-    Confirm,
+    /// again, or the whole history if it has none, through the verified
+    /// route only. With an unverified source configured, a span the
+    /// verified route can't serve in a few windows stops the pass
+    /// ([`ScanStop::TooWide`]) unless `crawl`.
+    Confirm { crawl: bool },
     /// Read the whole history again.
     Full,
 }
@@ -565,7 +764,7 @@ async fn update_transfer_scan(
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
     mode: ScanMode,
-) -> Result<TransferScan, RpcError> {
+) -> Result<TransferScan, ScanStop> {
     // One scan at a time in this process: a stamp buy's chequebook check
     // that lands during the startup batch rediscovery waits for it, then
     // reads only the blocks since, instead of scanning the history again
@@ -582,17 +781,24 @@ async fn update_transfer_scan(
         ScanMode::Continue => saved,
         ScanMode::Full => None,
         // Drop what the routine scans read above the confirmed mark; the
-        // scan below reads those blocks again.
-        ScanMode::Confirm => saved.and_then(|mut p| {
+        // scan below reads those blocks again — including any read only
+        // from the unverified source, which this pass reads verified.
+        ScanMode::Confirm { .. } => saved.and_then(|mut p| {
             let c = p.confirmed_through?;
             p.scanned_through = c;
+            p.provisional_since = None;
             Some(p)
         }),
     };
     // A scan read in one pass from the deploy block confirms what it read;
     // a continued one keeps the mark it had, and a confirming re-read of
     // the blocks since the mark moves it up to what it read.
-    let confirms = previous.is_none() || mode == ScanMode::Confirm;
+    let confirms = previous.is_none() || matches!(mode, ScanMode::Confirm { .. });
+    let fallback = match (client.unverified_logs(), mode) {
+        (None, _) | (Some(_), ScanMode::Confirm { crawl: true }) => Fallback::Crawl,
+        (Some(_), ScanMode::Confirm { crawl: false }) => Fallback::GiveUp,
+        (Some(unverified), ScanMode::Continue | ScanMode::Full) => Fallback::Unverified(unverified),
+    };
     let from = previous
         .as_ref()
         .map_or(GNOSIS_XBZZ_DEPLOY_BLOCK, |p| p.scanned_through + 1);
@@ -604,31 +810,47 @@ async fn update_transfer_scan(
     // its progress, with the confirmed mark moved up to it: cut short, the
     // next check re-reads only the blocks it didn't get to, rather than
     // starting again from the old mark (or from the deploy block, for a
-    // scan that had none) every time.
-    let mut scan = scan_transfers(
+    // scan that had none) every time. A confirming pass that may give up
+    // saves nothing: given up, the saved scan (and the unverified reads it
+    // still holds) stays as it was.
+    let save_progress = !replacing && fallback_saves(fallback);
+    let scanned = scan_transfers(
         client,
         chain_id,
         xbzz_token,
         node_eoa,
         GNOSIS_XBZZ_DEPLOY_BLOCK,
         previous,
-        (!replacing).then_some(data_dir),
+        save_progress.then_some(data_dir),
         confirms,
+        fallback,
     )
-    .await
-    .inspect_err(|e| {
-        // A tracked rediscovery retries; until it does, it's retrying,
-        // not scanning.
-        update_wallet_scan(node_eoa, |s| {
-            if s.state == WalletScanState::Scanning {
-                s.state = WalletScanState::Retrying;
-                s.error = Some(without_urls(&e.to_string()));
-            }
-        });
-    })?;
-    if confirms {
+    .await;
+    let mut scan = match scanned {
+        Ok(scan) => scan,
+        Err(ScanStop::TooWide) => return Err(ScanStop::TooWide),
+        Err(ScanStop::Rpc(e)) => {
+            // A tracked rediscovery retries; until it does, it's
+            // retrying, not scanning.
+            update_wallet_scan(node_eoa, |s| {
+                if s.state == WalletScanState::Scanning {
+                    s.state = WalletScanState::Retrying;
+                    s.error = Some(without_urls(&e.to_string()));
+                }
+            });
+            return Err(ScanStop::Rpc(e));
+        }
+    };
+    if confirms && scan.provisional_since.is_none() {
         scan.confirmed_through = Some(scan.scanned_through);
     }
+    // Whether the rediscovery ends in `confirming` follows the saved scan,
+    // not just this pass: after a restart, a scan whose unverified blocks
+    // aren't confirmed yet still ends there. Once it's confirmed, the
+    // embedder moves `confirming` to `done` when it has registered what
+    // the confirmation found ([`wallet_scan_done`]).
+    let provisional = scan.provisional_since.is_some();
+    update_wallet_scan(node_eoa, |s| s.provisional = provisional);
     persist_transfer_scan(data_dir, &scan);
     tracing::info!(
         target: "ant_chain",
@@ -676,8 +898,36 @@ pub async fn find_owned_chequebook(
         confirmed_through = ?scan.confirmed_through,
         "no chequebook in the saved transfer scan; reading the unconfirmed blocks again before deploying one",
     );
-    let scan =
-        update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Confirm).await?;
+    // Blocks read only from the unverified source are confirmed in one
+    // request when the verified route can; a deploy decision that has
+    // waited CONFIRM_CRAWL_AFTER_SECS for that reads them window by window
+    // instead, rather than leaving the node without settlement for good.
+    let crawl = scan
+        .provisional_since
+        .is_some_and(|since| unix_now().saturating_sub(since) >= CONFIRM_CRAWL_AFTER_SECS);
+    let scan = match update_transfer_scan(
+        client,
+        xbzz_token,
+        node_eoa,
+        data_dir,
+        ScanMode::Confirm { crawl },
+    )
+    .await
+    {
+        Ok(scan) => scan,
+        Err(ScanStop::TooWide) => {
+            // Start the clock for a confirm-mode give-up with no
+            // unverified read behind it (a "none" resting on routine
+            // scans the verified route can't re-read in a few windows).
+            if scan.provisional_since.is_none() {
+                let mut waiting = scan;
+                waiting.provisional_since = Some(unix_now());
+                persist_transfer_scan(data_dir, &waiting);
+            }
+            return Err(ScanStop::TooWide.into_rpc());
+        }
+        Err(ScanStop::Rpc(e)) => return Err(e),
+    };
     owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
 }
 
@@ -727,7 +977,7 @@ impl ChainClient {
         to_block: u64,
     ) -> Result<Vec<LogEntry>, RpcError> {
         let mut out = Vec::new();
-        self.scan_logs_with(address, topics, from_block, to_block, |_, mut logs| {
+        self.scan_logs_with(address, topics, from_block, to_block, 1, |_, mut logs| {
             out.append(&mut logs);
         })
         .await?;
@@ -736,15 +986,18 @@ impl ChainClient {
 
     /// [`Self::scan_logs`], handing each window's logs to `window` along
     /// with the window's last block, in block order, so a caller can keep
-    /// its progress.
+    /// its progress. A range limit that would shrink the window below
+    /// `min_window` blocks stops the scan: `Ok(Some(block))` is the first
+    /// block not read. `Ok(None)` read it all.
     async fn scan_logs_with(
         &self,
         address: &str,
         topics: &serde_json::Value,
         from_block: u64,
         to_block: u64,
+        min_window: u64,
         mut window: impl FnMut(u64, Vec<LogEntry>),
-    ) -> Result<(), RpcError> {
+    ) -> Result<Option<u64>, RpcError> {
         let mut start = from_block;
         // The whole range fits one window: `to - from + 1` blocks, not
         // `to - from`, or the last block costs a request of its own.
@@ -759,12 +1012,15 @@ impl ChainClient {
                     chunk = chunk.saturating_mul(2).min(INITIAL_SCAN_CHUNK);
                 }
                 Err(RpcError::Rpc(msg)) if chunk > 1 && is_range_limit_error(&msg) => {
+                    if chunk / 2 < min_window {
+                        return Ok(Some(start));
+                    }
                     chunk = (chunk / 2).max(1);
                 }
                 Err(e) => return Err(e),
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// `PostageStamp.remainingBalance(bytes32)` — per-chunk balance left
@@ -1213,9 +1469,18 @@ mod tests {
         from_block: u64,
     ) -> Result<Vec<DiscoveredBatch>, RpcError> {
         let scan = scan_transfers(
-            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+            client,
+            100,
+            xbzz_token,
+            node_eoa,
+            from_block,
+            None,
+            None,
+            false,
+            Fallback::Crawl,
         )
-        .await?;
+        .await
+        .map_err(ScanStop::into_rpc)?;
         owned_batches_in(client, postage_contract, &scan).await
     }
 
@@ -1229,9 +1494,18 @@ mod tests {
         from_block: u64,
     ) -> Result<Option<[u8; 20]>, RpcError> {
         let scan = scan_transfers(
-            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+            client,
+            100,
+            xbzz_token,
+            node_eoa,
+            from_block,
+            None,
+            None,
+            false,
+            Fallback::Crawl,
         )
-        .await?;
+        .await
+        .map_err(ScanStop::into_rpc)?;
         owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
     }
 
@@ -1681,6 +1955,8 @@ mod tests {
         /// How far behind `head` the backend serving `eth_getLogs` is: it
         /// answers `[]` for the blocks it hasn't seen, no error.
         logs_lag: std::sync::atomic::AtomicU64,
+        /// `eth_getLogs` requests refused for their range.
+        refused: std::sync::atomic::AtomicUsize,
     }
 
     impl ChainTransport for GrowingChain {
@@ -1727,6 +2003,8 @@ mod tests {
                         )
                     };
                     if self.cap.is_some_and(|cap| to - from + 1 > cap) {
+                        self.refused
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         return refuse("block range too large");
                     }
                     if *self.fail_after.lock().unwrap() == Some(0) {
@@ -2040,6 +2318,7 @@ mod tests {
                 scanned_through: Some(HEAD + 1_000 - RESCAN_TAIL),
                 head: Some(HEAD + 1_000),
                 error: None,
+                provisional: false,
             }
         );
 
@@ -2112,6 +2391,7 @@ mod tests {
             scanned_through: None,
             head: Some(48_560_000),
             error: Some("no RPC quorum".into()),
+            provisional: false,
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -2153,6 +2433,195 @@ mod tests {
             .collect();
         assert_eq!(secs, [15, 30, 60, 120, 240, 300, 300]);
         assert_eq!(rediscovery_retry_delay(u32::MAX).as_secs(), 300);
+    }
+
+    /// A verified route that serves `cap` blocks per query, with an
+    /// unverified source that serves any range, both at `HEAD`, each with
+    /// its own transfer list (the unverified one may leave some out).
+    fn verified_with_unverified(
+        cap: Option<u64>,
+        verified: &[NodeTransfer],
+        unverified: &[NodeTransfer],
+    ) -> (
+        ChainClient,
+        std::sync::Arc<GrowingChain>,
+        std::sync::Arc<GrowingChain>,
+    ) {
+        let chain = |cap, transfers: &[NodeTransfer]| {
+            let c = std::sync::Arc::new(GrowingChain {
+                cap,
+                ..GrowingChain::default()
+            });
+            c.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+            c.transfers.lock().unwrap().extend_from_slice(transfers);
+            c
+        };
+        let (v, u) = (chain(cap, verified), chain(None, unverified));
+        let mut client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(v.clone()));
+        client.unverified_logs = Some(std::sync::Arc::new(
+            ChainClient::new("http://127.0.0.1:2").with_transport(Some(u.clone())),
+        ));
+        (client, v, u)
+    }
+
+    /// A first scan the verified route could only serve in ~3,200 windows
+    /// is read in one request from the unverified source instead, after a
+    /// few instant refusals, and stays unconfirmed: `walletScan` ends in
+    /// `confirming`, not `done`.
+    #[tokio::test]
+    async fn a_wide_first_scan_reads_unverified_and_stays_unconfirmed() {
+        const EOA: [u8; 20] = [0x54; 20];
+        let found = [to_cb(45_000_000, [1; 32])];
+        let (client, v, u) = verified_with_unverified(Some(10_000), &found, &found);
+        let dir = scratch_dir("scan-unverified");
+
+        wallet_scan_pending(&EOA);
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(scan.transfers.len(), 1);
+        assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
+        assert!(scan.provisional_since.is_some());
+        assert_eq!(scan.confirmed_through, None, "nothing was read verified");
+        assert!(v.ranges.lock().unwrap().is_empty(), "no verified crawl");
+        assert!(v.refused.load(std::sync::atomic::Ordering::SeqCst) <= 8);
+        assert_eq!(
+            *u.ranges.lock().unwrap(),
+            vec![(GNOSIS_XBZZ_DEPLOY_BLOCK, HEAD)],
+            "one unverified request"
+        );
+        wallet_scan_done(&EOA);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After a restart, a saved scan that still holds unconfirmed blocks
+    /// ends the rediscovery in `confirming`, even though this start's
+    /// pass read only the tail, through the verified route.
+    #[tokio::test]
+    async fn an_unconfirmed_saved_scan_still_reads_confirming_after_a_restart() {
+        const EOA: [u8; 20] = [0x56; 20];
+        let (client, _, _) = verified_with_unverified(Some(10_000), &[], &[]);
+        let dir = scratch_dir("scan-unverified-restart");
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+
+        // A new process: nothing tracked until the embedder announces it.
+        wallet_scan_pending(&EOA);
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        wallet_scan_done(&EOA);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Confirmation is one verified request, never a crawl: while the
+    /// verified route still can't serve the span the saved scan stays as
+    /// it was; once it can, the scan is confirmed — including a transfer
+    /// the unverified source left out — and `walletScan` reads `done`.
+    #[tokio::test]
+    async fn confirmation_waits_for_the_verified_route_then_finds_what_was_missing() {
+        const EOA: [u8; 20] = [0x55; 20];
+        let all = [to_cb(45_000_000, [1; 32]), to_cb(46_000_000, [2; 32])];
+        let (client, v, _) = verified_with_unverified(Some(10_000), &all, &all[..1]);
+        let dir = scratch_dir("scan-confirm-later");
+        wallet_scan_pending(&EOA);
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        wallet_scan_done(&EOA);
+
+        let refused = v.refused.load(std::sync::atomic::Ordering::SeqCst);
+        let unconfirmed = confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(unconfirmed, None);
+        assert!(v.ranges.lock().unwrap().is_empty(), "no verified crawl");
+        assert!(v.refused.load(std::sync::atomic::Ordering::SeqCst) - refused <= 8);
+        let saved = load_transfer_scan(&dir, GNOSIS, &EOA).unwrap();
+        assert!(saved.provisional_since.is_some(), "kept as it was");
+        assert_eq!(saved.transfers.len(), 1);
+
+        // The verified route now serves the whole span (its second source
+        // is back).
+        let (client, _, _) = verified_with_unverified(None, &all, &all[..1]);
+        let confirmed = confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap()
+            .expect("confirmed");
+        assert_eq!(confirmed.transfers.len(), 2, "the missed transfer is found");
+        assert_eq!(confirmed.provisional_since, None);
+        assert_eq!(confirmed.confirmed_through, Some(confirmed.scanned_through));
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming,
+            "done only once the embedder has registered what it found"
+        );
+        wallet_scan_done(&EOA);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A "no chequebook" that rests on an unverified read never leads to
+    /// a deploy before it's confirmed. Confirmation stays one request
+    /// for six hours; after that, the deploy decision reads the span
+    /// window by window through the verified route.
+    #[tokio::test]
+    async fn an_unconfirmed_none_waits_six_hours_before_the_deploy_crawl() {
+        let (client, v, _) = verified_with_unverified(Some(200_000), &[], &[]);
+        let dir = scratch_dir("scan-confirm-crawl");
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+
+        let err = find_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            &dir,
+            true,
+        )
+        .await
+        .expect_err("an unconfirmed none must not read as \"deploy\"");
+        assert!(err.to_string().contains("can't confirm"), "{err}");
+        let crawled = |v: &GrowingChain| {
+            v.ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.1 - r.0 > RESCAN_TAIL * 2)
+                .count()
+        };
+        assert_eq!(crawled(&v), 0, "no crawl within six hours");
+
+        let mut saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        saved.provisional_since = Some(unix_now() - CONFIRM_CRAWL_AFTER_SECS - 60);
+        persist_transfer_scan(&dir, &saved);
+        assert_eq!(find_cb(&client, &dir, true).await, None, "a confirmed none");
+        assert!(crawled(&v) > 100, "crawled window by window");
+        let scan = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(scan.provisional_since, None);
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn confirmation_backs_off_to_thirty_minutes() {
+        let secs: Vec<u64> = (0..7).map(|a| confirm_retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800]);
     }
 
     /// An unreadable saved scan means a full scan, not an error.

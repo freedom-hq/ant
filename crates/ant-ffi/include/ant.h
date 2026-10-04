@@ -228,6 +228,34 @@ int ant_resume(const AntHandle *handle, char **out_err);
 int ant_set_swap_enabled(const AntHandle *handle, bool enabled, char **out_err);
 
 /*
+ * Give the wallet's transfer scan an explicitly unverified source: one
+ * provider that serves the whole xBZZ history in a single eth_getLogs
+ * (e.g. https://rpc.gnosischain.com), for a host whose transport
+ * (ant_set_chain_transport) is a verified route that can only serve a
+ * few thousand blocks at a time. A span the transport can't serve in a
+ * few requests (a first scan, a long time offline) is read from it once
+ * instead of window by window, which is about an hour of verified
+ * windows for a wallet's whole history. What it finds is still checked
+ * through the transport, batch by batch and chequebook by chequebook;
+ * GET /health's walletScan reads "confirming", and the gateway's chain
+ * init confirms the span in the background through the transport, one
+ * request at a time (1 minute, doubling, at most 30 minutes). A "no
+ * chequebook" it backs never leads to a deploy until it's confirmed.
+ * antd's --gnosis-unverified-logs-rpc-url is the same.
+ *
+ * `url` NULL or empty clears it. Call it after ant_init and before
+ * ant_start_gateway: it reaches the chain reads started after it. It is
+ * not persisted; set it after every ant_init.
+ *
+ * Returns 0 on success, -1 if `handle` is NULL, -2 if `url` isn't valid
+ * UTF-8 (an allocated error string is written into *out_err; free with
+ * ant_free_string), and -3 when built without the `chain` feature.
+ */
+int ant_set_unverified_logs_rpc(const AntHandle *handle,
+                                const char *url,
+                                char **out_err);
+
+/*
  * The node's SWAP settlement state as a JSON object — what the gateway's
  * GET /v0/settlement/swap and GET /node's "settlement" report, for a host
  * that doesn't run the gateway:

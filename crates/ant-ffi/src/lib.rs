@@ -227,6 +227,10 @@ pub struct AntHandle {
     /// after an idempotent `ant_start_gateway` retry.
     #[cfg(feature = "chain")]
     gateway_chequebook: ant_gateway::ChequebookSlot,
+    /// [`ant_set_unverified_logs_rpc`]: the unverified source every chain
+    /// client built after it hands the wallet's transfer scan.
+    #[cfg(feature = "chain")]
+    unverified_logs: std::sync::Mutex<Option<String>>,
 }
 
 /// Chain wiring shared by the storage / settlement calls and the
@@ -253,7 +257,14 @@ impl AntHandle {
     /// crate builds must come from here, so a host that plugs in a
     /// verified source is not bypassed by one forgotten call site.
     pub(crate) fn chain_client(&self, rpc: impl Into<String>) -> ant_chain::ChainClient {
-        ant_chain::ChainClient::new(rpc).with_transport(self.host_chain_transport())
+        let unverified = self
+            .unverified_logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        ant_chain::ChainClient::new(rpc)
+            .with_transport(self.host_chain_transport())
+            .with_unverified_logs(unverified)
     }
 }
 
@@ -989,6 +1000,8 @@ fn init_inner(
         #[cfg(feature = "chain")]
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
+        unverified_logs: std::sync::Mutex::new(None),
+        #[cfg(feature = "chain")]
         chain_init,
         #[cfg(feature = "chain")]
         gateway_chequebook: ant_gateway::ChequebookSlot::default(),
@@ -1435,6 +1448,80 @@ pub unsafe extern "C" fn ant_set_swap_enabled(
                 write_out_err(out_err, "panic in ant_set_swap_enabled");
                 -2
             }
+        }
+    }
+}
+
+/// Give the wallet's transfer scan an explicitly unverified source: one
+/// provider that serves the whole xBZZ history in a single `eth_getLogs`
+/// (e.g. `https://rpc.gnosischain.com`), for a host whose transport
+/// ([`ant_set_chain_transport`]) is a verified route that can only serve
+/// a few thousand blocks at a time. A span the transport can't serve in a
+/// few requests — a first scan, a long time offline — is read from it
+/// once instead of window by window (about an hour of verified windows
+/// for a wallet's whole history). What it finds is still checked through
+/// the transport, batch by batch and chequebook by chequebook;
+/// `/health.walletScan` reads `confirming`, and the gateway's chain init
+/// confirms the span in the background through the transport, one
+/// request at a time (1 minute, doubling, at most 30 minutes). A "no
+/// chequebook" it backs never leads to a deploy until it's confirmed.
+/// `antd`'s `--gnosis-unverified-logs-rpc-url` is the same.
+///
+/// `url` NULL or empty clears it. Call it after [`ant_init`] and before
+/// [`ant_start_gateway`]: it reaches the chain reads started after it. It
+/// is not persisted; set it after every `ant_init`.
+///
+/// Returns `0` on success, `-1` on a null handle, `-2` if `url` isn't
+/// valid UTF-8 (an allocated error string goes into `*out_err`; free it
+/// with [`ant_free_string`]), and `-3` when built without the `chain`
+/// feature.
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `url` must be null or a NUL-terminated string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_unverified_logs_rpc(
+    handle: *const AntHandle,
+    url: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_set_unverified_logs_rpc: null handle");
+            return -1;
+        };
+        #[cfg(not(feature = "chain"))]
+        {
+            let _ = (handle, url);
+            write_out_err(
+                out_err,
+                "ant_set_unverified_logs_rpc: built without the `chain` feature",
+            );
+            -3
+        }
+        #[cfg(feature = "chain")]
+        {
+            let url = match cstr_to_opt_string(url) {
+                Ok(url) => url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
+                Err(e) => {
+                    write_out_err(out_err, &format!("ant_set_unverified_logs_rpc: {e}"));
+                    return -2;
+                }
+            };
+            tracing::info!(
+                target: "ant-ffi",
+                set = url.is_some(),
+                "unverified logs source for the wallet's transfer scan",
+            );
+            *handle
+                .unverified_logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = url;
+            0
         }
     }
 }
@@ -4779,6 +4866,8 @@ mod tests {
             publisher: Mutex::new(None),
             #[cfg(feature = "chain")]
             chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
+            #[cfg(feature = "chain")]
+            unverified_logs: std::sync::Mutex::new(None),
             #[cfg(feature = "chain")]
             chain_init: Arc::new(drive::ChainInit::new(Arc::new(UploadRuntime {
                 issuers: Mutex::new(std::collections::HashMap::new()),

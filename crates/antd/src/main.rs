@@ -225,6 +225,19 @@ struct Opt {
         default_value = "https://rpc.gnosischain.com"
     )]
     gnosis_logs_rpc_url: String,
+    /// An explicitly unverified source for the wallet's transfer scan
+    /// (rediscovering batches and the chequebook): one provider that
+    /// serves the whole history in a single `eth_getLogs`, for when
+    /// `--gnosis-logs-rpc-url` is a verified route that can only serve a
+    /// few thousand blocks at a time (Freedom's chain bridge serves both).
+    /// A span the logs RPC can't serve in a few requests is read from it
+    /// once instead of window by window; each batch and chequebook found
+    /// is still checked through the logs RPC, and `/health.walletScan`
+    /// reads `confirming` until the logs RPC confirms the span in the
+    /// background. Falls back to the `GNOSIS_UNVERIFIED_LOGS_RPC_URL` env.
+    /// Unset (the default), such a span is read window by window.
+    #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL")]
+    gnosis_unverified_logs_rpc_url: Option<String>,
 
     /// `PostageStamp` contract address (mainnet default keeps matching
     /// upstream bee). Override only when running against a fork.
@@ -840,7 +853,7 @@ async fn main() -> Result<()> {
 
     let upload = build_upload_runtime(
         opt.gnosis_rpc_url.clone(),
-        resolve_logs_rpc(&opt),
+        resolve_logs_rpc(&opt).map(|url| scan_client(url, unverified_logs_rpc(&opt))),
         opt.postage_contract.clone(),
         opt.postage_batch.clone(),
         opt.postage_owner_key.clone(),
@@ -994,51 +1007,30 @@ async fn main() -> Result<()> {
     // stamp buy would run them. Both read the saved transfer scan, so only
     // the first start scans the full history. A failed batch rediscovery
     // is retried with backoff (its scan keeps its progress) until it
-    // succeeds; `/health.walletScan` reports each state.
+    // succeeds; `/health.walletScan` reports each state. A history read
+    // only from `--gnosis-unverified-logs-rpc-url` is confirmed afterwards
+    // (see `confirm_unverified_scan`).
     if let Some(logs_rpc) = rediscover_later {
         let settlement_on_buy = Arc::clone(&settlement_on_buy);
         let postage_contract = opt.postage_contract.clone();
         let data_dir = data_dir.clone();
-        let mut settle = matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
+        let settle_wanted =
+            matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
         let full_rescan = opt.rescan_chain_history;
+        let client = scan_client(logs_rpc, unverified_logs_rpc(&opt));
         tokio::spawn(async move {
-            let client = ant_chain::ChainClient::new(logs_rpc);
+            let mut settle = settle_wanted;
+            let mut provisional = None;
             for attempt in 0u32.. {
                 let rediscovered = match &upload_for_rediscovery {
-                    Some(rt) => rediscover_batches(
-                        &client,
-                        &postage_contract,
-                        &rt.batch_owner,
-                        &data_dir,
-                        full_rescan,
-                        &|id| {
-                            rt.issuers
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .contains_key(id)
-                        },
-                    )
-                    .await
-                    .map(|found| {
-                        let added = found.len();
-                        let mut issuers = rt
-                            .issuers
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        for (id, issuer) in found {
-                            issuers.entry(id).or_insert(issuer);
-                        }
-                        tracing::info!(
-                            target: "antd",
-                            rediscovered = added,
-                            batches = issuers.len(),
-                            "background batch rediscovery finished; /stamps lists every batch found",
-                        );
-                    }),
-                    None => Ok(()),
+                    Some(rt) => {
+                        rediscover_into(rt, &client, &postage_contract, &data_dir, full_rescan)
+                            .await
+                    }
+                    None => Ok(None),
                 };
                 match &rediscovered {
-                    Ok(()) => ant_chain::discover::wallet_scan_done(&eth),
+                    Ok(_) => ant_chain::discover::wallet_scan_done(&eth),
                     Err(e) => ant_chain::discover::wallet_scan_failed(&eth, &e.to_string()),
                 }
                 // Settlement once, after the first attempt, through the
@@ -1049,14 +1041,33 @@ async fn main() -> Result<()> {
                 if std::mem::take(&mut settle) && settlement_on_buy.pending.request() {
                     settlement_on_buy.run().await;
                 }
-                let Err(e) = rediscovered else { break };
-                let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
-                tracing::warn!(
-                    target: "antd",
-                    "postage batch rediscovery scan failed: {e}; retrying in {}s",
-                    delay.as_secs(),
-                );
-                tokio::time::sleep(delay).await;
+                match rediscovered {
+                    Ok(since) => {
+                        provisional = since;
+                        break;
+                    }
+                    Err(e) => {
+                        let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
+                        tracing::warn!(
+                            target: "antd",
+                            "postage batch rediscovery scan failed: {e}; retrying in {}s",
+                            delay.as_secs(),
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+            if let (Some(since), Some(rt)) = (provisional, &upload_for_rediscovery) {
+                confirm_unverified_scan(
+                    rt,
+                    &client,
+                    &postage_contract,
+                    &data_dir,
+                    &eth,
+                    since,
+                    settle_wanted.then_some(&*settlement_on_buy),
+                )
+                .await;
             }
         });
     }
@@ -1578,7 +1589,7 @@ fn load_or_create_identity(
 #[allow(clippy::too_many_arguments)]
 async fn build_upload_runtime(
     cli_rpc: Option<String>,
-    logs_rpc: Option<String>,
+    logs: Option<ant_chain::ChainClient>,
     postage_contract: String,
     cli_batch: Option<String>,
     cli_key: Option<String>,
@@ -1794,8 +1805,7 @@ async fn build_upload_runtime(
     //    a write RPC the caller runs this after chain init instead
     //    (`rediscover_later`).
     if !rediscover_later {
-        if let Some(logs_rpc) = logs_rpc {
-            let client = ant_chain::ChainClient::new(logs_rpc);
+        if let Some(client) = logs {
             match rediscover_batches(
                 &client,
                 &postage_contract,
@@ -1806,7 +1816,7 @@ async fn build_upload_runtime(
             )
             .await
             {
-                Ok(found) => issuers.extend(found),
+                Ok((found, _)) => issuers.extend(found),
                 Err(e) => tracing::warn!(
                     target: "antd",
                     "postage batch rediscovery scan failed: {e}; continuing without it",
@@ -1846,7 +1856,8 @@ async fn build_upload_runtime(
 /// the full history (#118); with `full_rescan` (`--rescan-chain-history`)
 /// it reads the whole history again and replaces the saved scan. A batch
 /// that can't be opened is logged and skipped; a failed chain read is the
-/// error.
+/// error. Also returns when the scan still holds blocks read only from the
+/// unverified source ([`ant_chain::discover::TransferScan::provisional_since`]).
 async fn rediscover_batches(
     client: &ant_chain::ChainClient,
     postage_contract: &str,
@@ -1854,7 +1865,7 @@ async fn rediscover_batches(
     data_dir: &Path,
     full_rescan: bool,
     known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
-) -> Result<Vec<([u8; 32], ant_postage::StampIssuer)>, ant_chain::RpcError> {
+) -> Result<(Vec<([u8; 32], ant_postage::StampIssuer)>, Option<u64>), ant_chain::RpcError> {
     let scan = if full_rescan {
         ant_chain::discover::rescan_transfer_history(
             client,
@@ -1901,7 +1912,125 @@ async fn rediscover_batches(
             ),
         }
     }
-    Ok(out)
+    Ok((out, scan.provisional_since))
+}
+
+/// One background batch rediscovery: register the batches the saved
+/// transfer scan shows that `rt` doesn't hold yet. Returns when the scan
+/// still holds blocks read only from the unverified source.
+async fn rediscover_into(
+    rt: &UploadRuntime,
+    client: &ant_chain::ChainClient,
+    postage_contract: &str,
+    data_dir: &Path,
+    full_rescan: bool,
+) -> Result<Option<u64>, ant_chain::RpcError> {
+    let known = |id: &[u8; 32]| {
+        rt.issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    };
+    let (found, provisional) = rediscover_batches(
+        client,
+        postage_contract,
+        &rt.batch_owner,
+        data_dir,
+        full_rescan,
+        &known,
+    )
+    .await?;
+    let added = found.len();
+    let mut issuers = rt
+        .issuers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (id, issuer) in found {
+        issuers.entry(id).or_insert(issuer);
+    }
+    tracing::info!(
+        target: "antd",
+        rediscovered = added,
+        batches = issuers.len(),
+        unconfirmed = provisional.is_some(),
+        "background batch rediscovery finished; /stamps lists every batch found",
+    );
+    Ok(provisional)
+}
+
+/// Confirm a transfer scan that read part of the history only from the
+/// unverified source (`--gnosis-unverified-logs-rpc-url`, unconfirmed since
+/// `since`, unix seconds): one verified request at a time, with the shared
+/// backoff, never a crawl. Once it's confirmed, register any batch the
+/// unverified read missed and move `/health.walletScan` to `done`. With
+/// `settlement` (startup left it off), give the chequebook resolution
+/// another go once its "none" is confirmed — or once the deploy decision
+/// has waited long enough to read the span window by window
+/// (`CONFIRM_CRAWL_AFTER_SECS`, inside `find_owned_chequebook`).
+async fn confirm_unverified_scan(
+    rt: &UploadRuntime,
+    client: &ant_chain::ChainClient,
+    postage_contract: &str,
+    data_dir: &Path,
+    node_eth: &[u8; 20],
+    since: u64,
+    settlement: Option<&SettlementOnBuy>,
+) {
+    let mut settled_after_wait = false;
+    for attempt in 0u32.. {
+        let delay = ant_chain::discover::confirm_retry_delay(attempt);
+        tokio::time::sleep(delay).await;
+        match ant_chain::discover::confirm_transfer_scan(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            &rt.batch_owner,
+            data_dir,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                match rediscover_into(rt, client, postage_contract, data_dir, false).await {
+                    Ok(_) => {
+                        ant_chain::discover::wallet_scan_done(node_eth);
+                        tracing::info!(
+                            target: "antd",
+                            "the wallet history read from the unverified source is confirmed",
+                        );
+                        if let Some(settlement) = settlement {
+                            settlement.settle_if_off().await;
+                        }
+                        return;
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "antd",
+                        "registering the confirmed wallet history failed: {e}; retrying",
+                    ),
+                }
+            }
+            Ok(None) => {
+                let waited = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+                    .saturating_sub(since);
+                if waited >= ant_chain::discover::CONFIRM_CRAWL_AFTER_SECS && !settled_after_wait {
+                    settled_after_wait = true;
+                    if let Some(settlement) = settlement {
+                        settlement.settle_if_off().await;
+                    }
+                }
+                tracing::info!(
+                    target: "antd",
+                    "the logs RPC can't confirm the wallet history read from the unverified source \
+                     yet; trying again in {}s",
+                    ant_chain::discover::confirm_retry_delay(attempt + 1).as_secs(),
+                );
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                "confirming the wallet history failed: {e}; trying again",
+            ),
+        }
+    }
 }
 
 /// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on
@@ -2178,7 +2307,7 @@ async fn resolve_chequebook(
             .load(std::sync::atomic::Ordering::Relaxed)
     });
     if let Some(logs_rpc) = scan_rpc {
-        let client = ant_chain::ChainClient::new(logs_rpc);
+        let client = scan_client(logs_rpc, unverified_logs_rpc(opt));
         // Step 4's gates: whether a "none" here leads to a deploy.
         let will_deploy = !opt.no_auto_chequebook && rpc_url.is_some() && light_mode;
         let owned = ant_chain::discover::find_owned_chequebook(
@@ -2705,6 +2834,16 @@ impl SettlementOnBuy {
         })
     }
 
+    /// Re-run the chequebook resolution if settlement is still off, as a
+    /// stamp buy would (coalesced with one): the background confirmation
+    /// of the wallet history may have changed what its "none" may lead to.
+    async fn settle_if_off(&self) {
+        let off = matches!(*self.state.lock().await, Settlement::Off);
+        if off && self.pending.request() {
+            self.run().await;
+        }
+    }
+
     async fn run(&self) {
         let mut state = self.state.lock().await;
         // From here on a new buy needs a new run: this one may already
@@ -3169,6 +3308,21 @@ fn resolve_logs_rpc(opt: &Opt) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// `--gnosis-unverified-logs-rpc-url`, when set and not blank.
+fn unverified_logs_rpc(opt: &Opt) -> Option<String> {
+    opt.gnosis_unverified_logs_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The client the wallet's transfer scan reads through: the logs RPC,
+/// with the unverified source to fall back on for a wide span.
+fn scan_client(logs_rpc: String, unverified: Option<String>) -> ant_chain::ChainClient {
+    ant_chain::ChainClient::new(logs_rpc).with_unverified_logs(unverified)
 }
 
 fn strip_0x(s: &str) -> &str {
