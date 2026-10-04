@@ -227,14 +227,20 @@ pub const MINIMUM_PAYMENT: u64 = LIGHT_REFRESH_RATE_PER_SEC / 5;
 /// one refresh second per second since the last *accepted* refresh, and
 /// a cheque needs `balance ≥ (whole seconds + 1) × refresh rate`. So the
 /// floor stops cheques about a second sooner than bee's would: from 3 s
-/// after the last accepted refresh only a debt of at least 1.8 M (past
-/// [`OVERDRAFT_LIMIT`], reachable only by already-incurred push debt)
-/// is paid, and from 4 s nothing within bee's light ceiling
+/// after the last accepted refresh only a debt of at least 1.8 M is
+/// paid, and from 4 s nothing within bee's light ceiling
 /// (`disconnectLimit + refreshRate` = 2.1375 M) is, until a refresh
-/// lands. Bee's [`MINIMUM_PAYMENT`] floor stops one second later (a
-/// 250 k cheque 3.2 s after the refresh on a 1.6 M debt; nothing from
-/// 5 s), so the gap is bounded to that second, and retrieval itself
-/// never admits past [`OVERDRAFT_LIMIT`] either way.
+/// lands. A 1.8 M debt is past [`OVERDRAFT_LIMIT`] but still reachable
+/// by ordinary admitted traffic: once the last refresh is a second old,
+/// [`Accounting::try_reserve`] (used by retrieval and, since issue #128,
+/// by every push) adds the one-second allowance and admits up to that
+/// same 2.1375 M ceiling, so between 3 s and 4 s plain downloads and
+/// uploads still produce cheques (a 450 k one at 1.8 M applied). From
+/// 4 s the admission ceiling itself is out of the floor's reach: only
+/// already-incurred debt recorded past it with [`Accounting::debit`]
+/// could still be paid. Bee's [`MINIMUM_PAYMENT`] floor stops one second
+/// later (a 250 k cheque 3.2 s after the refresh on a 1.6 M debt;
+/// nothing from 5 s), so the gap is bounded to that second.
 pub const MINIMUM_CHEQUE: u64 = LIGHT_REFRESH_RATE_PER_SEC;
 
 /// After a failed SWAP payment to a peer, no new one to that peer for
@@ -1360,6 +1366,59 @@ mod tests {
             ceiling - 4 * LIGHT_REFRESH_RATE_PER_SEC >= MINIMUM_PAYMENT,
             "{ceiling}"
         );
+    }
+
+    /// The same stall seen through plain admission (PR #139 R2-M1): once
+    /// the refresh is a second old, [`Accounting::try_reserve`] admits up
+    /// to `OVERDRAFT_LIMIT + refreshRate` (2.1375 M), so 3.2 s after the
+    /// refresh ordinary reservations reach a 1.8 M debt and pay a 450 k
+    /// cheque; 4.2 s after it, reserving all the way to the admission
+    /// ceiling pays nothing.
+    #[tokio::test]
+    async fn a_stalled_refresh_through_admission() {
+        let run = |backdate_ms: u64| async move {
+            let payer = Arc::new(Payer::default());
+            let acc = paying(&payer);
+            let peer = PeerId::random();
+            acc.credit(peer, 0);
+            acc.backdate_refresh(&peer, Duration::from_millis(backdate_ms));
+            let mut admitted = 0u64;
+            while let Some(g) = acc.try_reserve(peer, 300_000) {
+                g.apply();
+                admitted += 300_000;
+            }
+            settle_payments().await;
+            let calls = payer
+                .calls()
+                .into_iter()
+                .map(|(_, a)| a)
+                .collect::<Vec<_>>();
+            (admitted, calls)
+        };
+        const CEILING: u64 = OVERDRAFT_LIMIT + LIGHT_REFRESH_RATE_PER_SEC;
+        let (admitted, calls) = run(3_200).await;
+        assert!(
+            admitted > OVERDRAFT_LIMIT && admitted <= CEILING,
+            "{admitted}"
+        );
+        assert_eq!(
+            calls,
+            vec![450_000],
+            "a cheque from admitted traffic at 3.2 s"
+        );
+        let (admitted, calls) = run(4_200).await;
+        assert!(
+            admitted > OVERDRAFT_LIMIT && admitted <= CEILING,
+            "{admitted}"
+        );
+        assert_eq!(
+            calls,
+            Vec::<u64>::new(),
+            "nothing admitted is paid at 4.2 s"
+        );
+        // The largest debt admission can reach leaves less than a minimum
+        // cheque past the refresh's share at 4 s.
+        const { assert!(CEILING - 4 * LIGHT_REFRESH_RATE_PER_SEC < MINIMUM_CHEQUE) };
     }
 
     /// Debt incurred past the overdraft limit (a pushed chunk, debited by
