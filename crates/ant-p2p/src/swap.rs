@@ -806,14 +806,22 @@ impl JournalIo {
             if !existed {
                 sync_parent_dir(&jp)?;
             }
-            // Once per opened handle, not per cheque.
-            #[allow(clippy::naive_bytecount)]
-            let lines = bytes[..good].iter().filter(|b| **b == b'\n').count();
+            // Once per opened handle, not per cheque. Cheque lines only,
+            // not the blank lines between group commits.
+            let lines = bytes[..good]
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count();
             self.lines = lines as u64;
             self.file = Some(f);
         }
         let f = self.file.as_mut().expect("opened above");
-        let written = f.write_all(buf).and_then(|()| f.sync_data());
+        // The blank line closes the group commit: see
+        // [`journal_intact_len`].
+        let mut group = Vec::with_capacity(buf.len() + 1);
+        group.extend_from_slice(buf);
+        group.push(b'\n');
+        let written = f.write_all(&group).and_then(|()| f.sync_data());
         if written.is_err() {
             self.file = None;
         }
@@ -834,20 +842,37 @@ fn retired_error() -> std::io::Error {
 /// was cut off mid-write; so was a line holding a NUL byte, which no
 /// journal line ever does — a filesystem that zero-fills the extents of
 /// a write not yet synced (XFS, ext4 without `data=ordered`) leaves
-/// those after a crash. Either can only be in the last group commit:
-/// every append is fsynced before the next starts, so everything past
-/// the first torn line belongs to that one write, which was never
-/// acknowledged (no cheque went out on it) and is dropped whole (PR #141
-/// R2-M3).
+/// those after a crash, possibly with a later part of the same write
+/// intact after them (PR #141 R2-M3).
+///
+/// That can only be the last group commit: every append is fsynced
+/// before the next starts, and each one ends in a blank line
+/// ([`JournalIo::append`]). So a NUL is a torn write only when no group
+/// commit ends after it except, at most, the very last one — everything
+/// past it then belongs to that one write, which was never acknowledged
+/// (no cheque went out on it) and is dropped whole. A NUL with a later
+/// group commit after it sits in lines that were synced and
+/// acknowledged, and cheques went out on them: that is damage, not a
+/// torn write, so every complete line is kept for [`load_journal`] to
+/// find the damaged one and quarantine the journal as a loss (PR #141
+/// R3-F1). Damage confined to the last group commit can't be told from
+/// a torn one and still reads as torn.
 fn journal_intact_len(bytes: &[u8]) -> usize {
     let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    match bytes[..complete].iter().position(|b| *b == 0) {
-        Some(nul) => bytes[..nul]
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |i| i + 1),
-        None => complete,
+    let Some(nul) = bytes[..complete].iter().position(|b| *b == 0) else {
+        return complete;
+    };
+    let later_commit = bytes[nul..complete]
+        .windows(2)
+        .enumerate()
+        .any(|(i, w)| w == b"\n\n" && nul + i + 2 < complete);
+    if later_commit {
+        return complete;
     }
+    bytes[..nul]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1)
 }
 
 /// `a` and `b` are the same file (inode); always true where that can't
@@ -3393,9 +3418,13 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), snapshot, "file untouched");
         let journal = std::fs::read_to_string(journal_path(&path)).unwrap();
-        assert_eq!(journal.lines().count(), 4, "{journal}");
+        assert_eq!(
+            journal.lines().filter(|l| !l.is_empty()).count(),
+            4,
+            "{journal}"
+        );
         assert!(journal.ends_with(&format!(
-            "{{\"{}:{}\":\"9\"}}\n",
+            "{{\"{}:{}\":\"9\"}}\n\n",
             hex::encode(cb),
             hex::encode(beneficiary(5_000))
         )));
@@ -3649,7 +3678,11 @@ mod tests {
         #[allow(clippy::mem_forget)] // crashed: no compaction at close
         std::mem::forget(store);
         let lines = std::fs::read_to_string(journal_path(&path)).unwrap();
-        assert_eq!(lines.lines().count(), 2, "{lines}");
+        assert_eq!(
+            lines.lines().filter(|l| !l.is_empty()).count(),
+            2,
+            "{lines}"
+        );
         let l = OutboundLedger::open(Some(path.clone()), cb);
         assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(20u64));
         assert_eq!(l.cumulative_for(&beneficiary(2)), U256::from(3u64));
@@ -4012,6 +4045,52 @@ mod tests {
         let l = OutboundLedger::open(Some(path.clone()), cb);
         assert_eq!(l.cumulative_for(&beneficiary(3)), U256::from(3u64));
         assert!(l.lost_figures().is_none());
+        crash(&path, [l]);
+    }
+
+    /// A NUL-filled range in lines a later group commit came after was
+    /// synced and acknowledged — cheques went out on it — so it is
+    /// damage, not a torn write: the journal is moved aside and the
+    /// figures count as lost, never silently dropped (PR #141 R3-F1).
+    #[test]
+    fn a_zeroed_range_before_a_later_commit_is_a_loss_not_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc5u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        for (i, v) in [10u64, 20, 30].into_iter().enumerate() {
+            let i = u32::try_from(i).unwrap();
+            l.record_issued(&beneficiary(i), U256::from(v)).unwrap();
+        }
+        crash(&path, [l]);
+        let jp = journal_path(&path);
+        let mut bytes = std::fs::read(&jp).unwrap();
+        // Zero part of the first, synced line.
+        bytes[2..12].fill(0);
+        std::fs::write(&jp, &bytes).unwrap();
+        assert_eq!(journal_intact_len(&bytes), bytes.len());
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "acked cheques were lost");
+        assert!(lost_marker_path(&path).exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".journal.old.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            bytes,
+            "the damaged journal is kept whole"
+        );
+        // An append doesn't cut synced lines off either.
+        let mut io = JournalIo::default();
+        std::fs::write(&jp, &bytes).unwrap();
+        io.append(&path, b"{}\n").unwrap();
+        drop(io);
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&bytes), "nothing cut");
         crash(&path, [l]);
     }
 
