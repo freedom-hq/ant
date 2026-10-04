@@ -315,7 +315,8 @@ struct Opt {
     /// the head), a postage batch bought in it isn't rediscovered until
     /// this flag is passed. As slow as a first start behind a
     /// range-capped log RPC. (Before deploying a chequebook, `antd`
-    /// always confirms "none" with a full rescan on its own.)
+    /// confirms "none" on its own by reading again every block no full
+    /// pass has confirmed yet.)
     #[arg(long, default_value_t = false)]
     rescan_chain_history: bool,
 
@@ -2083,13 +2084,14 @@ async fn resolve_chequebook(
     //    deploying a fresh one and stranding the old balance.
     //    The lookup reads the saved transfer scan (only the blocks since
     //    the last one, #118). When step 4 will deploy on a "none", that
-    //    answer is first confirmed with a full rescan from the xBZZ
-    //    deploy block (`find_owned_chequebook`'s `confirm_none`): a saved
-    //    scan that missed a deposit must not lead to a second chequebook.
-    //    A lookup that already answered "none" in this process isn't
-    //    repeated: only our own deploy can change that answer, and the
-    //    confirming rescan is as slow as a first start's behind a
-    //    range-capped RPC. A deploy that succeeded is persisted (step 2
+    //    answer is first confirmed (`find_owned_chequebook`'s
+    //    `confirm_none`): the blocks no full pass from the xBZZ deploy
+    //    block has confirmed are read again — the whole history only if
+    //    no pass has (the confirmed mark is saved with the scan), so a
+    //    saved scan that missed a deposit must not lead to a second
+    //    chequebook. A lookup that already answered "none" in this
+    //    process isn't repeated: only our own deploy can change that
+    //    answer. A deploy that succeeded is persisted (step 2
     //    finds it); one that failed may still have landed with no record,
     //    so it re-arms the lookup (`WalletCoord::note_deploy_attempt`).
     let scan_rpc = resolve_logs_rpc(opt).filter(|_| {

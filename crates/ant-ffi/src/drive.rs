@@ -2393,9 +2393,10 @@ async fn resolve_or_deploy_chequebook(
     // 2. Rediscover a chequebook this node EOA already owns on-chain
     //    (reinstall with a restored key). Adopt + persist it.
     //    Reads the saved transfer scan; a "none" that would lead to the
-    //    deploy below is first confirmed with a full rescan, so a saved
-    //    scan that missed a deposit can't strand it behind a second
-    //    chequebook.
+    //    deploy below is first confirmed by reading again the blocks no
+    //    full pass has confirmed (the whole history only once per wallet;
+    //    the mark is saved with the scan), so a saved scan that missed a
+    //    deposit can't strand it behind a second chequebook.
     let owned = ant_chain::discover::find_owned_chequebook(
         client,
         &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
