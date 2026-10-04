@@ -766,19 +766,55 @@ struct JournalIo {
     /// the store that reopens them. A cheque staged on it fails instead
     /// of going out.
     retired: bool,
+    /// Bytes in the current journal up to its last durable group commit.
+    len: u64,
+    /// The last commit mark used in the current journal (see
+    /// [`journal_intact_len`]). Taken before each write, so a write that
+    /// fails still uses up its number.
+    marks: u64,
+    /// A write failed and its handle was dropped: where the journal ends
+    /// as far as anything acknowledged goes. The next open cuts it back
+    /// to there (PR #141 R4-F1).
+    resume: Option<Resume>,
+}
+
+/// See [`JournalIo::resume`].
+struct Resume {
+    /// The journal's length at its last durable group commit.
+    len: u64,
+    /// The journal it is about, so it is never applied to another file
+    /// that took the path.
+    file: std::fs::Metadata,
+    /// [`JournalIo::marks`] at the failure.
+    marks: u64,
 }
 
 impl JournalIo {
     /// See [`Self::retired`].
     fn retire(&mut self) {
         self.retired = true;
-        self.file = None;
-        self.lines = 0;
+        self.close();
     }
 
-    /// Append `buf` (whole lines) to the journal and fsync it. On error
-    /// the handle is dropped; reopening it cuts any half-written line
-    /// off, so a retry never glues a line onto a torn one.
+    /// Drop the handle on a journal that was moved away (compacted,
+    /// quarantined, retired): the next open starts on whatever is at the
+    /// path then.
+    fn close(&mut self) {
+        self.file = None;
+        self.lines = 0;
+        self.len = 0;
+        self.marks = 0;
+        self.resume = None;
+    }
+
+    /// Append `buf` (whole lines) to the journal as one group commit and
+    /// fsync it. On error the handle is dropped, and reopening it cuts the
+    /// journal back to its last durable commit: the failed write's bytes
+    /// may read back fine now (from the page cache) and be zeros after a
+    /// crash, and a retry appended after them would put an acknowledged
+    /// commit behind a zeroed range that [`journal_intact_len`] could read
+    /// as the torn tail of one write (PR #141 R4-F1). It also means a
+    /// retry never glues a line onto a torn one.
     fn append(&mut self, path: &Path, buf: &[u8]) -> std::io::Result<()> {
         use std::io::{Read, Seek, Write};
         if self.file.is_none() {
@@ -798,7 +834,23 @@ impl JournalIo {
                 .open(&jp)?;
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes)?;
-            let good = journal_intact_len(&bytes);
+            let resume = self.resume.as_ref().filter(|r| {
+                usize::try_from(r.len).is_ok_and(|n| n <= bytes.len())
+                    && f.metadata().is_ok_and(|m| same_file(&m, &r.file))
+            });
+            let (good, marks) = if let Some(r) = resume {
+                (usize::try_from(r.len).expect("checked above"), r.marks)
+            } else {
+                let good = journal_intact_len(&bytes);
+                if bytes[good..].contains(&0) {
+                    keep_torn_copy(&jp, &bytes)?;
+                }
+                let marks = bytes[..good]
+                    .rsplit(|b| *b == b'\n')
+                    .find_map(commit_mark)
+                    .unwrap_or(0);
+                (good, marks)
+            };
             if good != bytes.len() {
                 f.set_len(good as u64)?;
             }
@@ -807,22 +859,42 @@ impl JournalIo {
                 sync_parent_dir(&jp)?;
             }
             // Once per opened handle, not per cheque. Cheque lines only,
-            // not the blank lines between group commits.
+            // not the commit marks.
             let lines = bytes[..good]
                 .split(|b| *b == b'\n')
-                .filter(|l| !l.is_empty())
+                .filter(|l| !l.is_empty() && commit_mark(l).is_none())
                 .count();
             self.lines = lines as u64;
+            self.len = good as u64;
+            self.marks = marks;
+            self.resume = None;
             self.file = Some(f);
         }
         let f = self.file.as_mut().expect("opened above");
-        // The blank line closes the group commit: see
+        // The commit mark closes the group commit: see
         // [`journal_intact_len`].
-        let mut group = Vec::with_capacity(buf.len() + 1);
+        self.marks += 1;
+        let mut group = Vec::with_capacity(buf.len() + 24);
         group.extend_from_slice(buf);
-        group.push(b'\n');
-        let written = f.write_all(&group).and_then(|()| f.sync_data());
-        if written.is_err() {
+        group.extend_from_slice(format!("#{}\n", self.marks).as_bytes());
+        let written = f
+            .write_all(&group)
+            .and_then(|()| f.sync_data())
+            .and_then(|()| sync_failure_hook());
+        if written.is_ok() {
+            self.len += group.len() as u64;
+        } else {
+            // Without the handle's metadata the next open can't be sure
+            // it reopened this file, and falls back to
+            // `journal_intact_len`: the failed write's mark is then still
+            // in the file, so the retry's comes after a gap, and a crash
+            // zeroing the failed write reads as damage (a loss), never as
+            // a torn tail.
+            self.resume = f.metadata().ok().map(|file| Resume {
+                len: self.len,
+                file,
+                marks: self.marks,
+            });
             self.file = None;
         }
         written
@@ -846,33 +918,113 @@ fn retired_error() -> std::io::Error {
 /// intact after them (PR #141 R2-M3).
 ///
 /// That can only be the last group commit: every append is fsynced
-/// before the next starts, and each one ends in a blank line
-/// ([`JournalIo::append`]). So a NUL is a torn write only when no group
-/// commit ends after it except, at most, the very last one — everything
-/// past it then belongs to that one write, which was never acknowledged
-/// (no cheque went out on it) and is dropped whole. A NUL with a later
-/// group commit after it sits in lines that were synced and
-/// acknowledged, and cheques went out on them: that is damage, not a
-/// torn write, so every complete line is kept for [`load_journal`] to
-/// find the damaged one and quarantine the journal as a loss (PR #141
-/// R3-F1). Damage confined to the last group commit can't be told from
-/// a torn one and still reads as torn.
+/// before the next starts, a failed one is cut off before the retry
+/// ([`JournalIo::append`], PR #141 R4-F1), and each one ends in a commit
+/// mark, `#<n>`, numbered from 1 in each journal. So a NUL is a torn
+/// write only when the marks around it say so: no mark after it, or
+/// exactly one — the file's last line — numbered one past the last mark
+/// before it. Everything from the NUL's line on then belongs to that
+/// one write, which was never acknowledged (no cheque went out on it)
+/// and is dropped whole. Any other mark after a NUL means synced,
+/// acknowledged lines were zeroed — a later commit followed, or a mark
+/// is missing because the zeroed range swallowed the end of an earlier
+/// commit (PR #141 R4-M1) — and cheques went out on them: that is
+/// damage, not a torn write, so every complete line is kept for
+/// [`load_journal`] to find the damaged one and quarantine the journal
+/// as a loss (PR #141 R3-F1). Damage that runs to the end of the file,
+/// taking every later mark with it, can't be told from a torn write and
+/// still reads as torn; the dropped bytes are kept in a copy then
+/// ([`keep_torn_copy`]).
 fn journal_intact_len(bytes: &[u8]) -> usize {
     let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
     let Some(nul) = bytes[..complete].iter().position(|b| *b == 0) else {
         return complete;
     };
-    let later_commit = bytes[nul..complete]
-        .windows(2)
-        .enumerate()
-        .any(|(i, w)| w == b"\n\n" && nul + i + 2 < complete);
-    if later_commit {
-        return complete;
-    }
-    bytes[..nul]
+    let line_start = bytes[..nul]
         .iter()
         .rposition(|b| *b == b'\n')
-        .map_or(0, |i| i + 1)
+        .map_or(0, |i| i + 1);
+    let before = bytes[..line_start]
+        .rsplit(|b| *b == b'\n')
+        .find_map(commit_mark)
+        .unwrap_or(0);
+    // The lines after the NUL's own line (it ends before `complete`).
+    let after_start = nul
+        + bytes[nul..complete]
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("`complete` ends in a newline")
+        + 1;
+    let after = &bytes[after_start..complete];
+    let marks: Vec<u64> = after
+        .split(|b| *b == b'\n')
+        .filter_map(commit_mark)
+        .collect();
+    let last_line = after
+        .strip_suffix(b"\n")
+        .and_then(|a| a.rsplit(|b| *b == b'\n').next());
+    let torn = match marks[..] {
+        [] => true,
+        [only] => only == before + 1 && last_line.and_then(commit_mark) == Some(only),
+        _ => false,
+    };
+    if torn {
+        line_start
+    } else {
+        complete
+    }
+}
+
+/// The number of a commit mark line (`#<n>`, see [`journal_intact_len`]).
+fn commit_mark(line: &[u8]) -> Option<u64> {
+    let digits = line.strip_prefix(b"#")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Copy `bytes`, the journal `part` holding a zeroed range about to be
+/// dropped as a torn write, to `<part>.torn-<unix secs>[-n]` first: if it
+/// was damage instead (see [`journal_intact_len`]), what is left of the
+/// lines stays for whoever wants to look (PR #141 R4-M1). Not a loss and
+/// no marker — nothing on record says those lines were acknowledged.
+/// Fails, and nothing is dropped, if the copy can't be written.
+fn keep_torn_copy(part: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let copy = free_aside_name(part, "torn")
+        .ok_or_else(|| std::io::Error::other("no free name for a copy of a torn journal"))?;
+    std::fs::write(&copy, bytes)?;
+    std::fs::File::open(&copy)?.sync_all()?;
+    sync_parent_dir(&copy)?;
+    warn!(
+        target: "ant_p2p::swap",
+        file = %part.display(),
+        copy = %copy.display(),
+        "outbound ledger: the cheque journal ends in a zero-filled range a crash \
+         left in its last, unacknowledged write; dropping it (a copy is kept)",
+    );
+    Ok(())
+}
+
+/// A name `<part>.<tag>-<unix secs>[-n]` next to `part` that no file has.
+/// `rename` replaces an existing file, so a name is never reused: a
+/// second move within the same second would lose the first copy (PR #126
+/// R4-M2). Callers hold `OUTBOUND_FILE_LOCK`, so nothing in this process
+/// takes the name between the check and its use.
+fn free_aside_name(part: &Path, tag: &str) -> Option<PathBuf> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (0u32..1000)
+        .map(|n| {
+            let mut name = part.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".{tag}-{secs}"));
+            if n > 0 {
+                name.push(format!("-{n}"));
+            }
+            part.with_file_name(name)
+        })
+        .find(|p| matches!(p.try_exists(), Ok(false)))
 }
 
 /// `a` and `b` are the same file (inode); always true where that can't
@@ -917,6 +1069,29 @@ fn compact_step(n: u8) -> std::io::Result<()> {
             "test: compaction stopped after step {n}"
         )));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next journal fsync on this thread reports an error
+    /// after the bytes were written, like an `EIO` from `fsync`.
+    static FAIL_NEXT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn sync_failure_hook() -> std::io::Result<()> {
+    if FAIL_NEXT_SYNC.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other("test: fsync failed"));
+    }
+    Ok(())
+}
+
+/// Test hook (see `FAIL_NEXT_SYNC`); never fails outside tests.
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)]
+#[inline]
+fn sync_failure_hook() -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1138,8 +1313,7 @@ impl JournalStore {
                     return Ok(());
                 }
                 std::fs::rename(&jp, &old)?;
-                io.file = None;
-                io.lines = 0;
+                io.close();
             }
             compact_step(1)?;
             // Read like an open does: an unreadable file fails the
@@ -1231,9 +1405,12 @@ fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String,
         Err(e) => return Err(e),
     };
     let complete = journal_intact_len(&bytes);
+    if bytes[complete..].contains(&0) {
+        keep_torn_copy(part, &bytes)?;
+    }
     let mut lines = Vec::new();
     for (n, line) in bytes[..complete].split(|b| *b == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
+        if line.iter().all(u8::is_ascii_whitespace) || commit_mark(line).is_some() {
             continue;
         }
         match serde_json::from_slice::<HashMap<String, String>>(line) {
@@ -1477,28 +1654,11 @@ fn quarantine_outbound_file(
     part: &Path,
     parse_error: &dyn std::fmt::Display,
 ) -> std::io::Result<()> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    // `rename` replaces an existing file, so never reuse a name: a
-    // second move within the same second would lose the first copy
-    // (PR #126 R4-M2). Callers hold `OUTBOUND_FILE_LOCK`, so nothing in
-    // this process takes the name between the check and the move.
-    let aside = (0u32..1000)
-        .map(|n| {
-            let mut name = part.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".corrupt-{secs}"));
-            if n > 0 {
-                name.push(format!("-{n}"));
-            }
-            part.with_file_name(name)
-        })
-        .find(|p| matches!(p.try_exists(), Ok(false)))
-        .ok_or_else(|| {
-            std::io::Error::other(format!(
-                "unparseable ({parse_error}) and no free name to move it aside to"
-            ))
-        })?;
+    let aside = free_aside_name(part, "corrupt").ok_or_else(|| {
+        std::io::Error::other(format!(
+            "unparseable ({parse_error}) and no free name to move it aside to"
+        ))
+    })?;
     // The marker goes first: a move without it would let retrieval
     // pay from figures we just lost. If it can't be written the file
     // stays where it is, unread, and the move is retried later.
@@ -1525,8 +1685,7 @@ fn quarantine_outbound_file(
         ))
     })?;
     if let Some(io) = io.as_mut() {
-        io.file = None;
-        io.lines = 0;
+        io.close();
     }
     drop(io);
     release_after_unlock(live);
@@ -3419,12 +3578,15 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), snapshot, "file untouched");
         let journal = std::fs::read_to_string(journal_path(&path)).unwrap();
         assert_eq!(
-            journal.lines().filter(|l| !l.is_empty()).count(),
+            journal
+                .lines()
+                .filter(|l| commit_mark(l.as_bytes()).is_none())
+                .count(),
             4,
             "{journal}"
         );
         assert!(journal.ends_with(&format!(
-            "{{\"{}:{}\":\"9\"}}\n\n",
+            "{{\"{}:{}\":\"9\"}}\n#4\n",
             hex::encode(cb),
             hex::encode(beneficiary(5_000))
         )));
@@ -3679,7 +3841,10 @@ mod tests {
         std::mem::forget(store);
         let lines = std::fs::read_to_string(journal_path(&path)).unwrap();
         assert_eq!(
-            lines.lines().filter(|l| !l.is_empty()).count(),
+            lines
+                .lines()
+                .filter(|l| commit_mark(l.as_bytes()).is_none())
+                .count(),
             2,
             "{lines}"
         );
@@ -4092,6 +4257,133 @@ mod tests {
         let after = std::fs::read(&jp).unwrap();
         assert!(after.starts_with(&bytes), "nothing cut");
         crash(&path, [l]);
+    }
+
+    /// A group commit whose fsync failed is cut off before the retry is
+    /// appended: its bytes read back fine now but may be zeros after a
+    /// crash, and an acknowledged retry behind such a range must never
+    /// read as a torn tail (PR #141 R4-F1). Even laid out that way, the
+    /// retry's commit mark comes after a gap, so the range reads as
+    /// damage — a loss, with the journal kept — not as torn.
+    #[test]
+    fn a_failed_commit_is_cut_off_before_its_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc6u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        let c1 = std::fs::read(&jp).unwrap();
+        FAIL_NEXT_SYNC.with(|f| f.set(true));
+        assert!(l.record_issued(&beneficiary(2), U256::from(20u64)).is_err());
+        let failed = std::fs::read(&jp).unwrap()[c1.len()..].to_vec();
+        assert!(
+            !failed.is_empty(),
+            "the failed write's bytes are in the file"
+        );
+        l.record_issued(&beneficiary(3), U256::from(5u64)).unwrap();
+        let after = std::fs::read(&jp).unwrap();
+        assert!(after.starts_with(&c1));
+        let retry = after[c1.len()..].to_vec();
+        assert!(!retry.starts_with(&failed), "the failed write was cut off");
+        let b2 = hex::encode(beneficiary(2));
+        assert_eq!(
+            String::from_utf8_lossy(&after).matches(b2.as_str()).count(),
+            1,
+            "the retried line is in the file once"
+        );
+        crash(&path, [l]);
+
+        // As journaled: everything is there.
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.total_issued(), U256::from(35u64));
+        assert!(l.lost_figures().is_none());
+        crash(&path, [l]);
+
+        // The layout an uncut retry would have left, with the failed
+        // write zeroed by a crash: never a silent drop.
+        let mut disk = c1.clone();
+        disk.extend(std::iter::repeat_n(0u8, failed.len()));
+        disk.extend_from_slice(&retry);
+        std::fs::remove_file(&path).ok();
+        std::fs::write(&jp, &disk).unwrap();
+        assert_eq!(journal_intact_len(&disk), disk.len(), "damage, not torn");
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "acked cheques may be lost");
+        assert!(lost_marker_path(&path).exists());
+        crash(&path, [l]);
+    }
+
+    /// A zeroed range that starts in the second-to-last group commit and
+    /// swallows its commit mark is damage, not the last commit's torn
+    /// tail: the last commit's mark comes after a gap (PR #141 R4-M1).
+    /// One running to the end of the file, marks and all, can't be told
+    /// from a torn write and is dropped — but a copy is kept first.
+    #[test]
+    fn a_zeroed_range_across_two_commits_is_a_loss_and_a_dropped_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc7u8; 20];
+        let jp = journal_path(&path);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        let mut ends = Vec::new();
+        for i in 1..=3u32 {
+            l.record_issued(&beneficiary(i), U256::from(u64::from(i)))
+                .unwrap();
+            ends.push(std::fs::read(&jp).unwrap().len());
+        }
+        crash(&path, [l]);
+        let bytes = std::fs::read(&jp).unwrap();
+        assert!(bytes.ends_with(b"#3\n"));
+
+        // From the middle of commit 2 through its mark into commit 3.
+        let mut damaged = bytes.clone();
+        damaged[ends[0] + 5..ends[1] + 5].fill(0);
+        assert_eq!(journal_intact_len(&damaged), damaged.len());
+        std::fs::write(&jp, &damaged).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(l.lost_figures().is_some(), "commit 2 was acknowledged");
+        crash(&path, [l]);
+
+        // From the middle of commit 2 to the end of the file: dropped as
+        // torn, but kept in a copy.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("pushsync_outbound.json");
+        let jp2 = journal_path(&path2);
+        let mut tail = bytes.clone();
+        let len = tail.len();
+        tail[ends[0] + 5..len - 1].fill(0);
+        assert_eq!(journal_intact_len(&tail), ends[0]);
+        std::fs::write(&jp2, &tail).unwrap();
+        let l = OutboundLedger::open(Some(path2.clone()), cb);
+        assert!(l.lost_figures().is_none());
+        assert_eq!(l.total_issued(), U256::from(1u64));
+        let copies: Vec<_> = std::fs::read_dir(dir2.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".journal.old.torn-"))
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), tail);
+        crash(&path2, [l]);
+
+        // The same through an append: kept before it is cut off.
+        std::fs::remove_file(&path2).ok();
+        std::fs::write(&jp2, &tail).unwrap();
+        let mut io = JournalIo::default();
+        io.append(&path2, b"{}\n").unwrap();
+        assert_eq!(&std::fs::read(&jp2).unwrap()[..ends[0]], &bytes[..ends[0]]);
+        let copies = std::fs::read_dir(dir2.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".journal.torn-")
+            })
+            .count();
+        assert_eq!(copies, 1);
     }
 
     /// Once the journal holds as many lines as the threshold, it is folded
