@@ -1020,9 +1020,15 @@ impl RoutingFetcher {
                     dispatch!(peer, overlay, price, credit, 0u64);
                     want -= 1;
                 }
-                if want > 0 && !overdrawn.is_empty() && credit_retry_at.is_none() {
-                    credit_retry_at = Some(tokio::time::Instant::now() + OVERDRAFT_REFRESH);
-                }
+            }
+            // Start the round's clock at its first refusal, whether or not
+            // the pass still filled its slots: the skip lasts one
+            // `OVERDRAFT_REFRESH` (bee's `skip.Add(.., overDraftRefresh)`),
+            // so a later hedge or re-dispatch may ask the refused peer
+            // again instead of passing over it for the rest of the walk
+            // (PR #138 R2-F1).
+            if !overdrawn.is_empty() && credit_retry_at.is_none() {
+                credit_retry_at = Some(tokio::time::Instant::now() + OVERDRAFT_REFRESH);
             }
             // When to ask the overdrawn peers again, while a dispatch slot
             // is open for one of them.
@@ -2784,6 +2790,40 @@ mod tests {
             crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
             "{err}"
         );
+    }
+
+    /// PR #138 R2-F1: a peer refused credit in a pass that still filled
+    /// its slot is skipped for one `OVERDRAFT_REFRESH`, not for the rest
+    /// of the walk. The closest peer is overdrawn at the first dispatch
+    /// and has credit again soon after; the 5 s preemptive hedge goes to
+    /// it, not to the farthest peer.
+    #[tokio::test(start_paused = true)]
+    async fn push_hedge_asks_a_peer_again_once_its_credit_round_ends() {
+        let addr = [0u8; 32];
+        let (near, mid, far) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let acc = Arc::new(Accounting::new());
+        let held = hold_all_credit(&acc, near);
+        let (fetcher, load, _behaviour) = credit_gated_push_fetcher(
+            vec![
+                (near, [0x01u8; 32]),
+                (mid, [0x40u8; 32]),
+                (far, [0x80u8; 32]),
+            ],
+            &acc,
+        );
+        let push = tokio::spawn(async move {
+            fetcher
+                .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(load.at_cap(&mid), "the first push skips the overdrawn peer");
+        assert!(!load.at_cap(&near));
+        drop(held); // the closest peer has credit again
+        tokio::time::sleep(RoutingFetcher::PREEMPTIVE_INTERVAL).await;
+        assert!(load.at_cap(&near), "the hedge asks the closest peer again");
+        assert!(!load.at_cap(&far), "the hedge passed over the closest peer");
+        push.abort();
     }
 
     /// Pushes still in flight when `push_stamped_chunk` returns (a winner
