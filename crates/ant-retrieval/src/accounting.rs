@@ -91,7 +91,8 @@
 //! [`EARLY_PAYMENT_THRESHOLD`] (half the peer's payment threshold), the
 //! debt the refresh isn't expected to cover is paid with a cheque
 //! (`PeerBalance::cheque_due`), one payment per peer at a time, at least
-//! [`MINIMUM_PAYMENT`], with [`FAILED_SETTLEMENT_INTERVAL`] of back-off
+//! [`MINIMUM_CHEQUE`] (one second of refresh, stricter than bee's
+//! [`MINIMUM_PAYMENT`]; issue #131), with [`FAILED_SETTLEMENT_INTERVAL`] of back-off
 //! after a failure. A paid debt frees credit like a refresh does. Without
 //! a payer nothing here runs, and the mirror behaves as before.
 //!
@@ -191,10 +192,36 @@ pub const LIGHT_PAYMENT_THRESHOLD: u64 = 1_350_000;
 /// concurrent requests occur").
 pub const EARLY_PAYMENT_THRESHOLD: u64 = LIGHT_PAYMENT_THRESHOLD / 2;
 
-/// Smallest SWAP payment worth a cheque: bee's `minimumPayment =
-/// refreshRate / minimumPaymentDivisor` (5), with a light node's refresh
-/// rate.
+/// Bee's smallest SWAP payment: `minimumPayment = refreshRate /
+/// minimumPaymentDivisor` (5), with a light node's refresh rate. Ant's
+/// payer uses the larger [`MINIMUM_CHEQUE`].
 pub const MINIMUM_PAYMENT: u64 = LIGHT_REFRESH_RATE_PER_SEC / 5;
+
+/// Smallest SWAP payment Ant sends as a cheque: one second of light
+/// refresh (issue #131).
+///
+/// The cheque is bee's `balance − refreshDue − shadowReserved`, and
+/// `refreshDue` jumps by a whole [`LIGHT_REFRESH_RATE_PER_SEC`] the moment
+/// the last refresh is a second old. Paid on bee's [`MINIMUM_PAYMENT`]
+/// floor, that turned a debt just past the trigger into a cheque of less
+/// than one chunk (90 k – 225 k units), sent while the refresh that clears
+/// the same debt for free was due: on a paid mainnet burst, 38 % of the
+/// cheques carried 14 % of the debt. Each cheque costs the receiving bee
+/// the same — `chequeStore.ReceiveCheque` takes one node-wide lock and
+/// makes three chain calls (`Issuer`, `Balance`, `PaidOut`) per cheque,
+/// whatever its size — so a sliver of debt is the most expensive way to
+/// pay it.
+///
+/// So a payment under one second of refresh waits: the refresh clears
+/// it, or the debt grows into a cheque at least this large. This is the
+/// rule bee applies to its own refresh ("minimum amount to trigger
+/// settlement for is 1 * refresh rate to avoid ineffective use of
+/// refreshments", `Accounting.settle`), applied to the cheque too. It is
+/// stricter than bee's payer and changes nothing a bee receiver checks
+/// (any cheque worth at least one unit is accepted, `ErrChequeValueTooLow`).
+/// With no refresh due the floor never bites: `PeerBalance::cheque_due`
+/// already pays only a settled debt of at least this much.
+pub const MINIMUM_CHEQUE: u64 = LIGHT_REFRESH_RATE_PER_SEC;
 
 /// After a failed SWAP payment to a peer, no new one to that peer for
 /// this long: bee's `failedSettlementInterval` (10 s). The pseudosettle
@@ -474,7 +501,9 @@ impl PeerBalance {
     /// amount is the debt the pseudosettle refresh is not expected to
     /// cover (`balance − refreshDue − shadowReserved`, where `refreshDue`
     /// is a light refresh rate per whole second since the last accepted
-    /// refresh) and must be at least [`MINIMUM_PAYMENT`]. A peer never
+    /// refresh) and must be at least [`MINIMUM_CHEQUE`] (issue #131: below
+    /// that, the refresh due within a second pays it for free, and a
+    /// cheque would cost the peer as much as a large one). A peer never
     /// refreshed has, as in bee (zero refresh timestamp), everything
     /// still due to the refresh, so it's not paid.
     ///
@@ -501,7 +530,7 @@ impl PeerBalance {
             .balance
             .saturating_sub(refresh_due)
             .saturating_sub(self.shadow_reserved);
-        if amount < MINIMUM_PAYMENT {
+        if amount < MINIMUM_CHEQUE {
             return None;
         }
         let ticket = PaymentTicket {
@@ -1201,8 +1230,9 @@ mod tests {
 
     /// The cheque covers only what the refresh is not expected to: a
     /// light refresh rate per whole second since the last accepted
-    /// refresh comes off it, and less than bee's `minimumPayment` is not
-    /// worth a cheque.
+    /// refresh comes off it, and less than [`MINIMUM_CHEQUE`] (one second
+    /// of refresh) is not worth a cheque: it waits for the refresh or for
+    /// more debt (issue #131).
     #[tokio::test]
     async fn cheque_leaves_the_refresh_its_share() {
         let payer = Arc::new(Payer::default());
@@ -1210,11 +1240,11 @@ mod tests {
         let peer = PeerId::random();
         acc.credit(peer, 0);
         acc.backdate_refresh(&peer, Duration::from_millis(1_500));
-        take(&acc, peer, 3, 300_000);
+        take(&acc, peer, 4, 300_000);
         settle_payments().await;
         assert_eq!(
             payer.calls(),
-            vec![(peer, 600_000 - LIGHT_REFRESH_RATE_PER_SEC)]
+            vec![(peer, 900_000 - LIGHT_REFRESH_RATE_PER_SEC)]
         );
         assert_eq!(acc.debug_snapshot(&peer), Some((750_000, 0)));
 
@@ -1223,7 +1253,7 @@ mod tests {
         acc.credit(other, 0);
         acc.backdate_refresh(&other, Duration::from_millis(2_100));
         take(&acc, other, 3, 300_000);
-        // 1 s: 450 k due, 50 k left, under the 90 k minimum payment.
+        // 1 s: 450 k due, 50 k left, under the minimum cheque.
         let third = PeerId::random();
         acc.credit(third, 0);
         acc.backdate_refresh(&third, Duration::from_millis(1_100));
@@ -1231,6 +1261,55 @@ mod tests {
         drop(acc.try_reserve(third, 175_000));
         settle_payments().await;
         assert_eq!(payer.calls().len(), 1, "{:?}", payer.calls());
+    }
+
+    /// Issue #131: with a refresh due, bee's sizing (`balance −
+    /// refreshDue`) leaves a debt just past the trigger a sliver. That
+    /// sliver is not sent as a cheque (on `main` it was: 150 k units, half
+    /// a chunk, at the third chunk); the debt waits until the cheque is
+    /// worth one second of refresh, and then pays all of it at once.
+    #[tokio::test]
+    async fn a_sliver_past_the_refresh_waits_for_a_larger_cheque() {
+        let payer = Arc::new(Payer::default());
+        let acc = paying(&payer);
+        let peer = PeerId::random();
+        acc.credit(peer, 0);
+        acc.backdate_refresh(&peer, Duration::from_millis(1_500));
+        // The reservation taking the expected debt to 900 k finds 600 k
+        // applied: 150 k past the refresh's share. Not paid.
+        take(&acc, peer, 2, 300_000);
+        let third = acc.try_reserve(peer, 300_000).expect("admitted");
+        settle_payments().await;
+        assert_eq!(payer.calls(), Vec::new(), "no cheque for a 150 k sliver");
+        // Once that chunk is applied, 450 k is past the refresh's share:
+        // one cheque for all of it.
+        third.apply();
+        settle_payments().await;
+        assert_eq!(payer.calls(), vec![(peer, 450_000)]);
+        assert_eq!(acc.debug_snapshot(&peer), Some((450_000, 0)));
+
+        // Whatever the debt and the time since the refresh, no cheque is
+        // ever smaller than one second of refresh.
+        for backdate_ms in [0, 400, 1_000, 1_300, 1_900, 2_000, 2_500, 3_100] {
+            for chunks in 1..=8 {
+                let payer = Arc::new(Payer::default());
+                let acc = paying(&payer);
+                let peer = PeerId::random();
+                acc.credit(peer, 0);
+                acc.backdate_refresh(&peer, Duration::from_millis(backdate_ms));
+                for _ in 0..chunks {
+                    acc.debit(peer, 290_000);
+                }
+                settle_payments().await;
+                for (_, amount) in payer.calls() {
+                    assert!(
+                        amount >= MINIMUM_CHEQUE,
+                        "cheque of {amount} units ({backdate_ms} ms since the refresh, \
+                         {chunks} chunks)",
+                    );
+                }
+            }
+        }
     }
 
     /// Debt incurred past the overdraft limit (a pushed chunk, debited by
