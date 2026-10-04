@@ -756,6 +756,12 @@ struct JournalIo {
     file: Option<std::fs::File>,
     /// Lines in the current journal.
     lines: u64,
+    /// The open journal was moved away from the ledger's path by someone
+    /// else (an account switch parking the data dir, PR #141 R1-M1): this
+    /// store no longer owns the path. It keeps appending to the handle it
+    /// has (the moved file, its own), but never reopens, compacts or
+    /// folds anything at the path, which belongs to whoever is there now.
+    retired: bool,
 }
 
 impl JournalIo {
@@ -765,6 +771,12 @@ impl JournalIo {
     fn append(&mut self, path: &Path, buf: &[u8]) -> std::io::Result<()> {
         use std::io::{Read, Seek, Write};
         if self.file.is_none() {
+            if self.retired {
+                return Err(std::io::Error::other(
+                    "the cheque journal was moved away from the ledger's path \
+                     (account switched); not reopening it",
+                ));
+            }
             let jp = journal_path(path);
             if let Some(parent) = jp.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
@@ -798,6 +810,21 @@ impl JournalIo {
             self.file = None;
         }
         written
+    }
+}
+
+/// `a` and `b` are the same file (inode); always true where that can't
+/// be told.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        true
     }
 }
 
@@ -846,7 +873,15 @@ impl JournalStore {
     /// [`OUTBOUND_FILE_LOCK`].
     fn for_path(path: &Path) -> Arc<Self> {
         if let Some(live) = live_journal(path) {
-            return live;
+            if !live.retire_if_moved() {
+                return live;
+            }
+            warn!(
+                target: "ant_p2p::swap",
+                file = %path.display(),
+                "outbound ledger: the cheque journal still open from an earlier ledger \
+                 was moved away (account switched); starting a new one on this path",
+            );
         }
         let store = Arc::new(Self {
             path: path.to_path_buf(),
@@ -861,7 +896,7 @@ impl JournalStore {
             let mut reg = JOURNALS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reg.retain(|(_, w)| w.strong_count() > 0);
+            reg.retain(|(p, w)| p != path && w.strong_count() > 0);
             reg.push((path.to_path_buf(), Arc::downgrade(&store)));
         }
         if let Err(e) = store.compact_locked() {
@@ -873,6 +908,34 @@ impl JournalStore {
             );
         }
         store
+    }
+
+    /// Whether this store's open journal is no longer the file at its
+    /// path — moved away outside this process's ledger code, which only
+    /// ever moves the journal with the handle closed (an account switch
+    /// parks the data dir while a blocking cheque write outlived the
+    /// node's shutdown). Retires the store if so, so its handle keeps
+    /// writing to the moved file only, and a new store takes the path.
+    /// Caller holds [`OUTBOUND_FILE_LOCK`].
+    fn retire_if_moved(&self) -> bool {
+        let mut io = self
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if io.retired {
+            return true;
+        }
+        let Some(f) = &io.file else {
+            return false;
+        };
+        let moved = match (f.metadata(), std::fs::metadata(journal_path(&self.path))) {
+            (Ok(open), Ok(at_path)) => !same_file(&open, &at_path),
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => true,
+            // Can't tell: keep using it, as before.
+            _ => false,
+        };
+        io.retired = moved;
+        moved
     }
 
     /// Stage `entries` (`<chequebook>:<beneficiary>` → cumulative) as
@@ -982,6 +1045,14 @@ impl JournalStore {
     /// holds [`OUTBOUND_FILE_LOCK`]. A `.journal.old` left by an earlier,
     /// interrupted compaction is folded first, then the current journal.
     fn compact_locked(&self) -> std::io::Result<()> {
+        if self
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+        {
+            return Ok(());
+        }
         loop {
             let old = journal_old_path(&self.path);
             let leftover = old.try_exists()?;
@@ -1128,13 +1199,17 @@ impl PendingWrite {
         p.store.commit(p.seq)?;
         if let Some((chequebook, generation)) = p.note_known {
             let _file = lock_file();
+            // Not if another loss came in since this rewrite was staged:
+            // the rewrite may have been moved aside with the journal, so
+            // the chequebook is still lost on disk (and stays flagged, to
+            // be rewritten again at its next cheque). Losses are recorded
+            // under the file lock held here, so none can slip in between
+            // this check and the marker update.
+            if p.shared.loss_gen.load(Ordering::SeqCst) != generation {
+                return Ok(());
+            }
             match note_known(&p.store.path, &chequebook) {
-                Ok(()) => {
-                    // Not if another loss came in since this rewrite.
-                    if p.shared.loss_gen.load(Ordering::SeqCst) == generation {
-                        p.shared.survived_loss.store(false, Ordering::SeqCst);
-                    }
-                }
+                Ok(()) => p.shared.survived_loss.store(false, Ordering::SeqCst),
                 Err(e) => warn!(
                     target: "ant_p2p::swap",
                     chequebook = %chequebook,
@@ -3472,6 +3547,102 @@ mod tests {
         assert_eq!(l.cumulative_for(&beneficiary(1)), U256::from(500u64));
         assert_eq!(l.cumulative_for(&beneficiary(2)), U256::from(70u64));
         assert_eq!(l.total_issued(), U256::from(579u64));
+    }
+
+    /// A survivor's rewrite that is on disk but loses its journal to a
+    /// second loss before the waiter takes the file lock must not mark
+    /// the chequebook known: the rewrite went aside with the journal
+    /// (PR #141 R1-F1). It stays flagged and its next cheque rewrites
+    /// all of its figures again.
+    #[test]
+    fn a_loss_between_commit_and_wait_keeps_the_survivor_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xa1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(500u64))
+            .unwrap();
+        l.record_issued(&beneficiary(2), U256::from(70u64)).unwrap();
+        let store = l.shared.store.clone().unwrap();
+        {
+            let _file = lock_file();
+            store.compact_locked().unwrap();
+        }
+        // Loss 1: the file is damaged; `l` survives it in memory.
+        std::fs::write(&path, b"{ not json").unwrap();
+        drop(OutboundLedger::open(Some(path.clone()), [0xa2; 20]));
+        assert!(l.lost_figures().is_none(), "survived in memory");
+
+        // The next cheque stages the full rewrite and it reaches disk...
+        let w = l.stage_issued(&beneficiary(3), U256::from(9u64));
+        let seq = w.pending.as_ref().unwrap().seq;
+        store.commit(seq).unwrap();
+        // ...then, before the waiter takes the file lock, loss 2: a
+        // damaged journal line moves the journal (rewrite and all) aside.
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        std::io::Write::write_all(&mut j, b"garbage\n").unwrap();
+        drop(j);
+        drop(OutboundLedger::open(Some(path.clone()), [0xa3; 20]));
+        w.wait().unwrap();
+        assert!(
+            lost_figures_at(&path, &cb).is_some(),
+            "the rewrite was moved aside: the chequebook is still lost on disk"
+        );
+        assert!(l.shared.survived_loss.load(Ordering::SeqCst));
+
+        // Its next cheque rewrites everything again and marks it known.
+        l.record_issued(&beneficiary(4), U256::from(1u64)).unwrap();
+        drop(store);
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert!(l.lost_figures().is_none(), "known once rewritten again");
+        assert_eq!(l.total_issued(), U256::from(580u64));
+    }
+
+    /// A ledger still alive when its data dir is parked (an account
+    /// switch while a blocking cheque write outlived the shutdown) keeps
+    /// writing to the parked journal only; the next ledger on the path
+    /// gets a journal of its own instead of appending to the parked one
+    /// (PR #141 R1-M1).
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_moved_away_is_not_reused_by_the_next_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let parked = dir.path().join("parked");
+        std::fs::create_dir(&parked).unwrap();
+        let (a, b) = ([0xa1u8; 20], [0xb1u8; 20]);
+        let old = OutboundLedger::open(Some(path.clone()), a);
+        old.record_issued(&beneficiary(1), U256::from(11u64))
+            .unwrap();
+        // The account switch parks the ledger's files.
+        std::fs::rename(journal_path(&path), parked.join("j")).unwrap();
+
+        let new = OutboundLedger::open(Some(path.clone()), b);
+        assert!(!Arc::ptr_eq(
+            old.shared.store.as_ref().unwrap(),
+            new.shared.store.as_ref().unwrap()
+        ));
+        new.record_issued(&beneficiary(2), U256::from(22u64))
+            .unwrap();
+        old.record_issued(&beneficiary(3), U256::from(33u64))
+            .unwrap();
+        // The old ledger closes after the switch: nothing of its is folded
+        // into the new account's path.
+        drop(old);
+        let parked_lines = std::fs::read_to_string(parked.join("j")).unwrap();
+        assert!(parked_lines.contains(&hex::encode(a)), "{parked_lines}");
+        assert!(!parked_lines.contains(&hex::encode(b)), "{parked_lines}");
+        let live = std::fs::read_to_string(journal_path(&path)).unwrap();
+        assert!(!live.contains(&hex::encode(a)), "{live}");
+
+        crash(&path, [new]);
+        let new = OutboundLedger::open(Some(path), b);
+        assert_eq!(new.cumulative_for(&beneficiary(2)), U256::from(22u64));
+        assert_eq!(new.total_issued(), U256::from(22u64));
     }
 
     /// Once the journal holds as many lines as the threshold, it is folded
