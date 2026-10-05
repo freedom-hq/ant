@@ -2957,13 +2957,22 @@ fn handle_control_command(
             // reads, so it must consult the local upload cache to satisfy
             // read-after-own-write; a cached hit short-circuits before any
             // peer round-trip, hence no early-return on an empty peer set.
+            //
+            // A miss here is an answer, not a failure: a live-stream
+            // player polls the next feed slot through it until the slot
+            // is written, so the lookup runs in fast-miss mode and ends
+            // once enough peers said "not found" (issue #146), and a
+            // confirmed miss is typed as `ControlAck::NotFound` so the
+            // gateway answers 404 whichever tail (`storage: not found`
+            // or `no peer found`) the last answer had.
             let peers_rx = state.peers_watch.subscribe();
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             tokio::spawn(async move {
-                let mut builder =
-                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_cache(cache)
+                    .with_fast_miss(true);
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
@@ -2979,9 +2988,7 @@ fn handle_control_command(
                     }
                     Err(e) => {
                         debug!(target: "ant_p2p", "retrieval failed: {e}");
-                        ControlAck::Error {
-                            message: format!("retrieval: {e}"),
-                        }
+                        pre_stream_failure_ack(format!("retrieval: {e}"), e.as_ref())
                     }
                 };
                 let _ = ack.send(reply);
@@ -6048,8 +6055,9 @@ fn is_final_miss(e: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Terminal ack for a `/bytes` or `/bzz` retrieval that failed before
-/// its stream started, typed off the fetcher's error behind `e` rather
-/// than its message (issue #123):
+/// its stream started, or for a single-chunk `GetChunkRaw` read (issue
+/// #146), typed off the fetcher's error behind `e` rather than its
+/// message (issue #123):
 ///
 /// - peers confirmed the chunk missing → [`ControlAck::NotFound`], which
 ///   the gateway answers with bee's 404. That includes a fetch whose

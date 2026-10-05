@@ -112,7 +112,11 @@ impl ChunkFetcher for CommandFetcher {
             .map_err(|_| "node loop unavailable")?;
         match tokio::time::timeout(self.timeout, ack_rx).await {
             Ok(Ok(ControlAck::Bytes { data })) => Ok(data),
-            Ok(Ok(ControlAck::Error { message })) => Err(message.into()),
+            Ok(Ok(
+                ControlAck::Error { message }
+                | ControlAck::NotFound { message }
+                | ControlAck::NotReady { message },
+            )) => Err(message.into()),
             Ok(Ok(other)) => Err(format!("unexpected ack from GetChunkRaw: {other:?}").into()),
             Ok(Err(_)) => Err("node loop dropped the ack".into()),
             Err(_) => Err("chunk fetch timed out".into()),

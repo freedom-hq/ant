@@ -364,6 +364,13 @@ pub async fn chunk(
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
+        // Peers confirmed the chunk missing, typed by the node (issue
+        // #146): bee's 404 even when the last answer was `no peer found`,
+        // which the substring check below would have turned into a 502.
+        ControlAck::NotFound { message } => {
+            debug!(target: "ant_gateway", %message, "chunk not found");
+            return json_error(StatusCode::NOT_FOUND, "chunk not found");
+        }
         ControlAck::Error { message } => {
             // Bee: a miss is `404 "chunk not found"`; anything else is
             // its generic `"read chunk failed"`. Detail goes to the log.
@@ -457,7 +464,7 @@ pub async fn download_soc(
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
-        ControlAck::Error { message } => {
+        ControlAck::NotFound { message } | ControlAck::Error { message } => {
             // Bee: `"requested chunk cannot be retrieved"` for any SOC
             // fetch failure. Detail goes to the log.
             debug!(target: "ant_gateway", %message, "soc fetch failed");
@@ -4568,7 +4575,7 @@ pub async fn download_feed(
             ControlAck::NotReady { message } => {
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
             }
-            ControlAck::Error { message } => {
+            ControlAck::NotFound { message } | ControlAck::Error { message } => {
                 warn!(target: "ant_gateway", %message, "feed root chunk fetch failed");
                 return json_error(StatusCode::NOT_FOUND, "wrapped chunk cannot be retrieved");
             }

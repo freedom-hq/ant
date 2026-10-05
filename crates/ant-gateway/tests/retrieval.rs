@@ -834,6 +834,54 @@ async fn confirmed_missing_root_is_404_and_starved_miss_is_503() {
     }
 }
 
+/// #146: a single chunk / SOC the network confirmed missing (a feed
+/// slot not written yet) reaches the gateway typed as
+/// `ControlAck::NotFound` and answers 404 on `/chunks` and `/soc`,
+/// whichever miss tail the lookup ended in. The `no peer found` tail
+/// used to answer 502 on `/chunks` (the message has no "not found"),
+/// which Freedom's feed reader reports as an error instead of "entry not
+/// found" — about one live-edge poll in five on mainnet.
+#[tokio::test]
+async fn confirmed_missing_chunk_and_soc_are_404() {
+    let missing = "8bb914d8c06c185734f5853acc4b10746d1ccec7462dac2d94b57612f2acbe74";
+    let owner = "b818ff019bc15bc3dfbdad4ce0ab66a6f74e8f1e";
+    let uris = [
+        (format!("/chunks/{missing}"), "chunk not found"),
+        (
+            format!("/soc/{owner}/{missing}"),
+            "requested chunk cannot be retrieved",
+        ),
+    ];
+    for (uri, want) in &uris {
+        for tail in ["no peer found", "storage: not found"] {
+            let message = format!(
+                "retrieval: all peers failed for chunk {missing} after 17 attempts \
+                 (last: remote: retrieve chunk: {tail})"
+            );
+            let router = router_with_dispatcher(move |cmd| {
+                let message = message.clone();
+                async move {
+                    if let ControlCommand::GetChunkRaw { ack, .. } = cmd {
+                        let _ = ack.send(ControlAck::NotFound { message });
+                    }
+                }
+            });
+            let resp = send(
+                router,
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri} ({tail})");
+            let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(json["message"], *want, "{uri} ({tail})");
+        }
+    }
+}
+
 /// Every content-addressed endpoint must emit the `Cache-Control:
 /// public, max-age=..., immutable` header so the browser can serve
 /// reloads from its own HTTP cache without re-walking the manifest.
