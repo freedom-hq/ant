@@ -531,6 +531,34 @@ impl ScanStop {
     }
 }
 
+/// A confirming pass's progress `scan` (read verified from the confirmed
+/// mark up to its `scanned_through`), saved over the provisional scan it
+/// `rewound`: the blocks up to where the pass got are confirmed, with the
+/// transfers it found there; above that, the rewound scan's transfers,
+/// progress and provisional marks are kept — the unverified stretch and
+/// the degraded crawl's verified one ([`TransferScan::confirmed_above`])
+/// only while the pass hasn't reached past the unverified blocks.
+fn confirm_progress(rewound: &TransferScan, scan: &TransferScan) -> TransferScan {
+    let mut partial = scan.clone();
+    partial.provisional_since = rewound.provisional_since;
+    let got_to = scan.scanned_through;
+    if got_to < rewound.scanned_through {
+        partial.transfers.extend(
+            rewound
+                .transfers
+                .iter()
+                .filter(|t| t.block > got_to)
+                .copied(),
+        );
+        partial.scanned_through = rewound.scanned_through;
+        if rewound.provisional_through.is_some_and(|p| p > got_to) {
+            partial.provisional_through = rewound.provisional_through;
+            partial.confirmed_above = rewound.confirmed_above;
+        }
+    }
+    partial
+}
+
 /// Blocks a confirmation doesn't read again: `(after, through]` was read
 /// through the verified route by a confirming pass
 /// ([`TransferScan::confirmed_above`]), with these transfers in it.
@@ -560,12 +588,18 @@ fn unix_now() -> u64 {
 /// unconfirmed, not the whole history. Blocks read from the `fallback`'s
 /// unverified source are never confirmed.
 ///
-/// `unconfirmed_since` is the [`TransferScan::provisional_since`] of the
-/// saved scan a confirming pass rewound: its progress is saved with that
-/// mark until the pass completes, so a confirmation cut short part-way
-/// keeps the original clock (the next continued scan reads the rest from
-/// the unverified source again without restarting the
-/// [`CONFIRM_CRAWL_AFTER_SECS`] wait).
+/// `rewound` is the saved, provisional scan a confirming pass rewound to
+/// its confirmed mark: until the pass completes, its progress is saved
+/// over that scan rather than in place of it ([`confirm_progress`]) — the
+/// confirmed mark moves up to what the pass read, and the blocks above it
+/// keep what the rewound scan had read there, with its
+/// [`TransferScan::provisional_since`] clock and the
+/// [`TransferScan::provisional_through`]/[`TransferScan::confirmed_above`]
+/// stretch the pass didn't get to. A confirmation cut short part-way thus
+/// keeps the original clock (no new [`CONFIRM_CRAWL_AFTER_SECS`] wait),
+/// the next continued scan goes on from where the rewound scan stood
+/// instead of reading the rest from the unverified source again, and the
+/// next try still skips the degraded crawl's verified stretch.
 ///
 /// `reuse` (a confirming re-read only) is a stretch above the scan's
 /// confirmed mark that is already confirmed: it is taken as read, not read
@@ -581,16 +615,14 @@ async fn scan_transfers(
     save_to: Option<&std::path::Path>,
     confirms: bool,
     fallback: Fallback<'_>,
-    unconfirmed_since: Option<u64>,
+    rewound: Option<&TransferScan>,
     reuse: Option<Reuse>,
 ) -> Result<TransferScan, ScanStop> {
-    // Progress of an unfinished pass, saved with the provisional mark it
+    // Progress of an unfinished pass, saved over the provisional scan it
     // rewound (see above).
-    let save = |dir: &std::path::Path, scan: &TransferScan| match unconfirmed_since {
-        Some(since) if scan.provisional_since.is_none() => {
-            let mut partial = scan.clone();
-            partial.provisional_since = Some(since);
-            persist_transfer_scan(dir, &partial);
+    let save = |dir: &std::path::Path, scan: &TransferScan| match rewound {
+        Some(rewound) if scan.provisional_since.is_none() => {
+            persist_transfer_scan(dir, &confirm_progress(rewound, scan));
         }
         _ => persist_transfer_scan(dir, scan),
     };
@@ -886,8 +918,10 @@ pub async fn rescan_transfer_history(
 /// batches and chequebook again, since the unverified read may have
 /// missed some, then call [`wallet_scan_done`]. `Ok(None)` while the
 /// verified route still can't serve the span: the saved scan stays
-/// unconfirmed (its unverified blocks are read again by the next continued
-/// scan, keeping their [`TransferScan::provisional_since`]); try again after
+/// unconfirmed, with what the try did confirm saved under its
+/// [`TransferScan::provisional_since`] (the blocks above stay as the saved
+/// scan had them, so the next continued scan doesn't read them again and
+/// the next try still skips [`TransferScan::confirmed_above`]); try again after
 /// [`confirm_retry_delay`]. It never reads the span window by window —
 /// that is the hour-long crawl the unverified read avoided — except
 /// through [`find_owned_chequebook`] for a deploy decision that has waited
@@ -963,9 +997,10 @@ async fn update_transfer_scan(
     // then carries forward (see below).
     let replacing = saved.is_some() && mode == ScanMode::Full;
     // A confirming re-read clears the saved provisional mark only once it
-    // completes; its progress keeps it until then.
-    let unconfirmed_since = match mode {
-        ScanMode::Confirm { .. } => saved.as_ref().and_then(|p| p.provisional_since),
+    // completes; until then its progress is saved over the scan it
+    // rewound, which keeps the mark (see `scan_transfers`).
+    let rewound = match mode {
+        ScanMode::Confirm { .. } => saved.clone().filter(|p| p.provisional_since.is_some()),
         ScanMode::Continue | ScanMode::Full => None,
     };
     // A confirming re-read keeps the blocks a first scan read through
@@ -1036,8 +1071,8 @@ async fn update_transfer_scan(
     // next check re-reads only the blocks it didn't get to, rather than
     // starting again from the old mark (or from the deploy block, for a
     // scan that had none) every time — also when it gives up part-way.
-    // Until it completes, its saved progress keeps the provisional mark of
-    // the scan it rewound (`unconfirmed_since`).
+    // Until it completes, its saved progress keeps the provisional marks
+    // and the blocks above it of the scan it rewound (`rewound`).
     let save_progress = !replacing;
     let scanned = scan_transfers(
         client,
@@ -1049,7 +1084,7 @@ async fn update_transfer_scan(
         save_progress.then_some(data_dir),
         confirms,
         fallback,
-        unconfirmed_since,
+        rewound.as_ref(),
         reuse,
     )
     .await;
@@ -2875,6 +2910,83 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// R4-M1: a confirmation try that fails part-way saves its progress
+    /// over the scan it rewound, keeping the degraded crawl's verified
+    /// stretch (`provisional_through`/`confirmed_above`) and the blocks
+    /// above: a continued scan in between doesn't read them from the
+    /// unverified source again, and the next try still skips the stretch.
+    #[tokio::test]
+    async fn a_failed_confirmation_keeps_the_crawled_stretch() {
+        const EOA: [u8; 20] = [0x5c; 20];
+        let missed = to_cb(GNOSIS_XBZZ_DEPLOY_BLOCK + 10, [1; 32]);
+        let late = to_cb(45_000_000, [2; 32]);
+        let (client, _, _) = verified_with_unverified(Some(200_000), &[missed, late], &[]);
+        let dir = scratch_dir("scan-confirm-skip-retry");
+        let u = std::sync::Arc::new(GrowingChain {
+            cap: Some(1_000_000),
+            fail_after: Mutex::new(Some(2)),
+            ..GrowingChain::default()
+        });
+        u.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        u.transfers.lock().unwrap().push(late);
+        let client = client.with_unverified_logs_client(Some(
+            ChainClient::new("http://127.0.0.1:2").with_transport(Some(u.clone())),
+        ));
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        let served_to = u.ranges.lock().unwrap().last().unwrap().1;
+        assert_eq!(first.provisional_through, Some(served_to));
+        assert_eq!(first.confirmed_above, Some(first.scanned_through));
+
+        // The first try reads two windows, then hits an RPC error.
+        let (client, v, u2) = verified_with_unverified(Some(100_000), &[missed], &[]);
+        *v.fail_after.lock().unwrap() = Some(2);
+        confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .expect_err("fails part-way");
+        let cut = v.ranges.lock().unwrap()[1].1;
+        assert!(cut < served_to);
+        let saved = load_transfer_scan(&dir, GNOSIS, &EOA).unwrap();
+        assert_eq!(saved.confirmed_through, Some(cut), "progress saved");
+        assert_eq!(saved.scanned_through, first.scanned_through);
+        assert_eq!(saved.provisional_since, first.provisional_since);
+        assert_eq!(saved.provisional_through, first.provisional_through);
+        assert_eq!(saved.confirmed_above, first.confirmed_above, "stretch kept");
+        assert_eq!(saved.transfers, vec![missed, late]);
+
+        // A continued scan in between reads only the tail.
+        *v.fail_after.lock().unwrap() = None;
+        v.ranges.lock().unwrap().clear();
+        let resumed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert!(
+            u2.ranges.lock().unwrap().is_empty(),
+            "no unverified re-read"
+        );
+        assert_eq!(resumed.confirmed_above, first.confirmed_above);
+
+        // The next try confirms, skipping the crawled stretch.
+        v.ranges.lock().unwrap().clear();
+        let confirmed = confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap()
+            .expect("the rest of the unverified part fits the window budget");
+        assert!(
+            v.ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&(from, to)| (from > cut && to <= served_to) || from > first.scanned_through),
+            "neither the confirmed nor the crawled blocks are read again"
+        );
+        assert_eq!(confirmed.transfers, vec![missed, late]);
+        assert_eq!(confirmed.provisional_since, None);
+        assert_eq!(confirmed.confirmed_through, Some(confirmed.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// R2-M1: a scan is marked provisional only once the unverified source
     /// has served a window. One that failed before serving any, with the
     /// verified crawl then cut short too, saves its verified progress
@@ -3052,9 +3164,8 @@ mod tests {
 
     /// R1-M1: a deploy-decision crawl over unverified blocks that is cut
     /// short saves its progress with the original provisional mark, so the
-    /// next continued scan (reading the rest from the unverified source
-    /// again) doesn't restart the six-hour wait: the next deploy decision
-    /// crawls again at once.
+    /// next continued scan doesn't restart the six-hour wait: the next
+    /// deploy decision crawls again at once.
     #[tokio::test]
     async fn an_interrupted_deploy_crawl_keeps_the_six_hour_clock() {
         let (client, v, _) = verified_with_unverified(Some(200_000), &[], &[]);
@@ -3082,10 +3193,11 @@ mod tests {
         .expect_err("the crawl fails part-way");
         let cut = v.ranges.lock().unwrap().last().unwrap().1;
         let partial = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
-        assert_eq!(partial.scanned_through, cut, "progress saved");
+        assert_eq!(partial.confirmed_through, Some(cut), "progress saved");
+        assert_eq!(partial.scanned_through, saved.scanned_through, "rest kept");
         assert_eq!(partial.provisional_since, Some(since), "the clock is kept");
 
-        // The next start reads the rest from the unverified source again.
+        // The next start goes on from there.
         *v.fail_after.lock().unwrap() = None;
         let resumed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
             .await
@@ -3157,8 +3269,9 @@ mod tests {
             .expect_err("fails part-way");
         let cut = v.ranges.lock().unwrap()[1].1;
         let saved = load_transfer_scan(&dir, GNOSIS, &EOA).unwrap();
-        assert_eq!(saved.scanned_through, cut, "progress saved");
-        assert_eq!(saved.confirmed_through, Some(cut));
+        assert_eq!(saved.confirmed_through, Some(cut), "progress saved");
+        assert_eq!(saved.scanned_through, first.scanned_through, "rest kept");
+        assert_eq!(saved.transfers, first.transfers);
         assert_eq!(saved.provisional_since, Some(since));
 
         v.ranges.lock().unwrap().clear();
