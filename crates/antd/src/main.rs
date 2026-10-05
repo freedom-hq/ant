@@ -854,7 +854,7 @@ async fn main() -> Result<()> {
     // and isn't affected; ant-ffi's `ChainInit` has always run this way.
     let rediscover_later = resolve_logs_rpc(&opt).filter(|_| configured_rpc_url(&opt).is_some());
 
-    let upload = build_upload_runtime(
+    let (upload, provisional_at_startup) = build_upload_runtime(
         opt.gnosis_rpc_url.clone(),
         resolve_logs_rpc(&opt).map(|url| scan_client(url, unverified_logs_rpc(&opt))),
         opt.postage_contract.clone(),
@@ -871,6 +871,8 @@ async fn main() -> Result<()> {
     // The node loop takes `upload`; the background rediscovery adds to the
     // same issuer registry.
     let upload_for_rediscovery = upload.clone();
+    let upload_for_confirm = upload.clone();
+    let rediscovered_at_startup = rediscover_later.is_none();
 
     // The node is "light" (publish-capable) once it can stamp + pushsync
     // uploads — i.e. whenever an upload runtime exists. With a chain RPC
@@ -998,6 +1000,14 @@ async fn main() -> Result<()> {
     // host never sees the chain ready with no rediscovery reported.
     if rediscover_later.is_some() {
         ant_chain::discover::wallet_scan_pending(&eth);
+    } else if provisional_at_startup.is_some() {
+        // Without a write RPC the rediscovery ran before the upload
+        // runtime; it read part of the history only from the unverified
+        // source, which the background task below confirms.
+        ant_chain::discover::wallet_scan_track(
+            &eth,
+            ant_chain::discover::WalletScanState::Confirming,
+        );
     }
     let _ = gateway_chain_state.set(ant_gateway::GatewayChainState {
         light_mode,
@@ -1069,7 +1079,8 @@ async fn main() -> Result<()> {
             }
             if let (Some(since), Some(rt)) = (provisional, &upload_for_rediscovery) {
                 confirm_unverified_scan(
-                    rt,
+                    Some(rt),
+                    &rt.batch_owner,
                     &client,
                     &postage_contract,
                     &data_dir,
@@ -1079,6 +1090,33 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
+        });
+    }
+
+    // Without a write RPC, the startup rediscovery's unverified blocks are
+    // confirmed here: the same loop, with nothing to settle (no write RPC
+    // can deploy or switch on a chequebook).
+    if let (true, Some((since, owner)), Some(logs_rpc)) = (
+        rediscovered_at_startup,
+        provisional_at_startup,
+        resolve_logs_rpc(&opt),
+    ) {
+        let client = scan_client(logs_rpc, unverified_logs_rpc(&opt));
+        let postage_contract = opt.postage_contract.clone();
+        let data_dir = data_dir.clone();
+        let rt = upload_for_confirm;
+        tokio::spawn(async move {
+            confirm_unverified_scan(
+                rt.as_deref(),
+                &owner,
+                &client,
+                &postage_contract,
+                &data_dir,
+                &eth,
+                since,
+                None,
+            )
+            .await;
         });
     }
 
@@ -1608,7 +1646,7 @@ async fn build_upload_runtime(
     data_dir: PathBuf,
     rediscover_later: bool,
     full_rescan: bool,
-) -> Result<Option<Arc<UploadRuntime>>> {
+) -> Result<(Option<Arc<UploadRuntime>>, Option<(u64, [u8; 20])>)> {
     let postage_dir = data_dir.join("postage");
 
     let rpc_url = cli_rpc
@@ -1814,6 +1852,11 @@ async fn build_upload_runtime(
     //    range-capped RPC must never stop the daemon from starting. With
     //    a write RPC the caller runs this after chain init instead
     //    (`rediscover_later`).
+    //    A scan that read part of the history only from the unverified
+    //    source returns since when, and for which owner (`provisional`),
+    //    so the caller confirms it in the background, as
+    //    `rediscover_later`'s task does.
+    let mut provisional = None;
     if !rediscover_later {
         if let Some(client) = logs {
             match rediscover_batches(
@@ -1827,7 +1870,10 @@ async fn build_upload_runtime(
             )
             .await
             {
-                Ok((found, _)) => issuers.extend(found),
+                Ok((found, since)) => {
+                    issuers.extend(found);
+                    provisional = since.map(|since| (since, batch_owner));
+                }
                 Err(e) => tracing::warn!(
                     target: "antd",
                     "postage batch rediscovery scan failed: {e}; continuing without it",
@@ -1842,7 +1888,7 @@ async fn build_upload_runtime(
             target: "antd",
             "uploads disabled: no blockchain-rpc-endpoint and no postage batch — node is ultra-light (read-only)",
         );
-        return Ok(None);
+        return Ok((None, provisional));
     }
 
     tracing::info!(
@@ -1853,12 +1899,15 @@ async fn build_upload_runtime(
         "upload runtime ready (postage stamping)",
     );
 
-    Ok(Some(Arc::new(UploadRuntime {
-        issuers: std::sync::Mutex::new(issuers),
-        stamp_key,
-        batch_owner,
-        postage_dir,
-    })))
+    Ok((
+        Some(Arc::new(UploadRuntime {
+            issuers: std::sync::Mutex::new(issuers),
+            stamp_key,
+            batch_owner,
+            postage_dir,
+        })),
+        provisional,
+    ))
 }
 
 /// Batches `owner` holds on chain that `known` doesn't have yet, opened
@@ -2000,8 +2049,16 @@ async fn rediscover_into(
 /// another go once its "none" is confirmed — or once the deploy decision
 /// has waited long enough to read the span window by window
 /// (`CONFIRM_CRAWL_AFTER_SECS`, inside `find_owned_chequebook`).
+///
+/// `owner` is the batch owner whose scan is confirmed (`rt`'s, when there
+/// is one). Without `rt` (no write RPC and no batch: the node is
+/// read-only) there is nothing to register into; the confirmed scan is
+/// saved, so the next start registers what it found, and a batch the
+/// unverified read missed is logged.
+#[allow(clippy::too_many_arguments)]
 async fn confirm_unverified_scan(
-    rt: &UploadRuntime,
+    rt: Option<&UploadRuntime>,
+    owner: &[u8; 20],
     client: &ant_chain::ChainClient,
     postage_contract: &str,
     data_dir: &Path,
@@ -2016,17 +2073,39 @@ async fn confirm_unverified_scan(
         match ant_chain::discover::confirm_transfer_scan(
             client,
             ant_chain::GNOSIS_BZZ_TOKEN,
-            &rt.batch_owner,
+            owner,
             data_dir,
             node_eth,
         )
         .await
         {
-            Ok(Some(_)) => {
-                match rediscover_into(rt, client, postage_contract, data_dir, &mut false, node_eth)
+            Ok(Some(scan)) => {
+                let registered = match rt {
+                    Some(rt) => rediscover_into(
+                        rt,
+                        client,
+                        postage_contract,
+                        data_dir,
+                        &mut false,
+                        node_eth,
+                    )
                     .await
-                {
-                    Ok(_) => {
+                    .map(drop),
+                    None => ant_chain::discover::owned_batches_in(client, postage_contract, &scan)
+                        .await
+                        .map(|found| {
+                            if !found.is_empty() {
+                                tracing::warn!(
+                                    target: "antd",
+                                    batches = found.len(),
+                                    "the confirmed wallet history holds postage batches the \
+                                     unverified source left out; restart antd to stamp with them",
+                                );
+                            }
+                        }),
+                };
+                match registered {
+                    Ok(()) => {
                         ant_chain::discover::wallet_scan_done(node_eth);
                         tracing::info!(
                             target: "antd",
