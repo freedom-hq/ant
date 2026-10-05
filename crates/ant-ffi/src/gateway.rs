@@ -151,6 +151,11 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// after an explicit `ant_storage_discover`, or a fresh `ant_init`
 /// followed by a start with a `gnosis_rpc` (`ant_init` alone only
 /// reloads persisted state; the rescan runs here, in `ChainInit::run`).
+/// A failed rediscovery is also retried in the background with backoff
+/// (15 s, doubling, at most 5 minutes) until it succeeds, through the
+/// latest start's `gnosis_rpc`, while the gateway runs: it ends at
+/// [`ant_stop_gateway`]. `/health.walletScan` reports where it stands
+/// (a stop drops it unless `done` or `confirming`).
 ///
 /// # Safety
 ///
@@ -534,8 +539,12 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
     let eth = handle.eth;
     let slot = handle.gateway_chequebook.clone();
     init.note_pending();
+    // Taken now, not inside the task: an `ant_stop_gateway` landing
+    // before the task first runs must still keep it from starting a
+    // retry loop.
+    let epoch = init.retry_epoch();
     handle.runtime.spawn(async move {
-        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, true, |adopted| {
+        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, Some(epoch), |adopted| {
             crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
         })
         .await;
@@ -685,7 +694,14 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
 /// Returns `true` if a gateway was running and was aborted, `false` if
-/// none was running (or `handle` is null). Safe to call repeatedly.
+/// none was running (or `handle` is null). Safe to call repeatedly. A
+/// background rediscovery retry stops with it, before its next attempt;
+/// the next start with a `gnosis_rpc` tries again. An unfinished
+/// `/health.walletScan` (`pending`, `scanning`, `retrying`) is dropped with it,
+/// so a next start without a `gnosis_rpc` reports none rather than a
+/// status nothing moves on; a finished one (`done`, or `confirming`: the
+/// batches are registered and the history read from the unverified source
+/// is still being confirmed, which a stop doesn't end) is kept.
 ///
 /// # Safety
 ///
@@ -699,11 +715,22 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
         };
         // Poison-tolerant so a panic elsewhere can't unwind out of this
         // `extern "C"` fn and abort the host (matches `ant_start_gateway`).
-        let task = handle
+        let mut slot = handle
             .gateway_task
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = slot.take();
+        // A background rediscovery retry ends with the gateway: nothing
+        // reads its status any more, and a restart may bring another RPC.
+        // Bumped while still holding the `gateway_task` guard, which
+        // `ant_start_gateway` holds across its `retry_epoch()` read: a
+        // concurrent start then reads the epoch either before this stop
+        // (and is stopped with the gateway it served before us) or after
+        // it (and keeps its retry loop) — never in between, where its
+        // freshly served gateway would run with its retry loop suppressed.
+        #[cfg(feature = "chain")]
+        handle.chain_init.stop_retrying();
+        drop(slot);
         match task {
             Some(task) => {
                 task.abort();

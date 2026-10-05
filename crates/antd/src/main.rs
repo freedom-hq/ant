@@ -1019,7 +1019,7 @@ async fn main() -> Result<()> {
         let data_dir = data_dir.clone();
         let settle_wanted =
             matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
-        let full_rescan = opt.rescan_chain_history;
+        let mut full_rescan = opt.rescan_chain_history;
         let client = scan_client(logs_rpc, unverified_logs_rpc(&opt));
         tokio::spawn(async move {
             let mut settle = settle_wanted;
@@ -1027,8 +1027,15 @@ async fn main() -> Result<()> {
             for attempt in 0u32.. {
                 let rediscovered = match &upload_for_rediscovery {
                     Some(rt) => {
-                        rediscover_into(rt, &client, &postage_contract, &data_dir, full_rescan)
-                            .await
+                        rediscover_into(
+                            rt,
+                            &client,
+                            &postage_contract,
+                            &data_dir,
+                            &mut full_rescan,
+                            &eth,
+                        )
+                        .await
                     }
                     None => Ok(None),
                 };
@@ -1814,7 +1821,8 @@ async fn build_upload_runtime(
                 &postage_contract,
                 &batch_owner,
                 &data_dir,
-                full_rescan,
+                &mut { full_rescan },
+                None,
                 &|id| issuers.contains_key(id),
             )
             .await
@@ -1857,19 +1865,35 @@ async fn build_upload_runtime(
 /// as issuers (carrying over bee's counters when a `stamperstore` is
 /// present). Reads the saved transfer scan, so only the first start scans
 /// the full history (#118); with `full_rescan` (`--rescan-chain-history`)
-/// it reads the whole history again and replaces the saved scan. A batch
-/// that can't be opened is logged and skipped; a failed chain read is the
-/// error. Also returns when the scan still holds blocks read only from the
-/// unverified source ([`ant_chain::discover::TransferScan::provisional_since`]).
+/// it reads the whole history again and replaces the saved scan. Once that
+/// rescan has completed, `full_rescan` is cleared, so a retry after a
+/// later step failed only continues the saved scan; a rescan that failed
+/// part-way is continued by the next one, not restarted. With
+/// `status_key` (the node's address) the scan reports to
+/// `/health.walletScan`. A batch that can't be opened is logged and
+/// skipped; a failed chain read is the error. Also returns when the scan
+/// still holds blocks read only from the unverified source
+/// ([`ant_chain::discover::TransferScan::provisional_since`]).
 async fn rediscover_batches(
     client: &ant_chain::ChainClient,
     postage_contract: &str,
     owner: &[u8; 20],
     data_dir: &Path,
-    full_rescan: bool,
+    full_rescan: &mut bool,
+    status_key: Option<&[u8; 20]>,
     known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
 ) -> Result<(Vec<([u8; 32], ant_postage::StampIssuer)>, Option<u64>), ant_chain::RpcError> {
-    let scan = if full_rescan {
+    let scan = if let Some(status_key) = status_key {
+        ant_chain::discover::rediscovery_scan(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+            *full_rescan,
+            status_key,
+        )
+        .await?
+    } else if *full_rescan {
         ant_chain::discover::rescan_transfer_history(
             client,
             ant_chain::GNOSIS_BZZ_TOKEN,
@@ -1886,6 +1910,7 @@ async fn rediscover_batches(
         )
         .await?
     };
+    *full_rescan = false;
     let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
     let stamperstore = data_dir.join("stamperstore");
     let postage_dir = data_dir.join("postage");
@@ -1919,14 +1944,17 @@ async fn rediscover_batches(
 }
 
 /// One background batch rediscovery: register the batches the saved
-/// transfer scan shows that `rt` doesn't hold yet. Returns when the scan
-/// still holds blocks read only from the unverified source.
+/// transfer scan shows that `rt` doesn't hold yet, reporting the scan to
+/// `/health.walletScan` under `status_key` (the node's address; see
+/// [`rediscover_batches`] for `full_rescan`). Returns when the scan still
+/// holds blocks read only from the unverified source.
 async fn rediscover_into(
     rt: &UploadRuntime,
     client: &ant_chain::ChainClient,
     postage_contract: &str,
     data_dir: &Path,
-    full_rescan: bool,
+    full_rescan: &mut bool,
+    status_key: &[u8; 20],
 ) -> Result<Option<u64>, ant_chain::RpcError> {
     let known = |id: &[u8; 32]| {
         rt.issuers
@@ -1940,6 +1968,7 @@ async fn rediscover_into(
         &rt.batch_owner,
         data_dir,
         full_rescan,
+        Some(status_key),
         &known,
     )
     .await?;
@@ -1989,11 +2018,14 @@ async fn confirm_unverified_scan(
             ant_chain::GNOSIS_BZZ_TOKEN,
             &rt.batch_owner,
             data_dir,
+            node_eth,
         )
         .await
         {
             Ok(Some(_)) => {
-                match rediscover_into(rt, client, postage_contract, data_dir, false).await {
+                match rediscover_into(rt, client, postage_contract, data_dir, &mut false, node_eth)
+                    .await
+                {
                     Ok(_) => {
                         ant_chain::discover::wallet_scan_done(node_eth);
                         tracing::info!(

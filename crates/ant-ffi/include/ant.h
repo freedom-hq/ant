@@ -922,8 +922,12 @@ void ant_free_string(char *ptr);
  * adoption that already succeeded is not repeated in this process (a
  * batch bought on another device needs ant_storage_discover, or a fresh
  * ant_init followed by ant_start_gateway with a `gnosis_rpc` — ant_init
- * alone only reloads persisted state and never rescans). Run off the
- * main thread.
+ * alone only reloads persisted state and never rescans). A failed
+ * rediscovery is also retried in the background with backoff (15 s,
+ * doubling, at most 5 minutes) until it succeeds, through the latest
+ * start's `gnosis_rpc`, while the gateway runs: it ends at
+ * ant_stop_gateway. /health.walletScan reports where it stands (a stop
+ * drops it unless done or confirming). Run off the main thread.
  */
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
@@ -1003,7 +1007,14 @@ bool ant_set_gateway_cors(const AntHandle *handle,
 /*
  * Stop the in-process HTTP gateway started by ant_start_gateway.
  * Returns true if a gateway was running and was stopped, false if none
- * was running (or `handle` is NULL). Safe to call repeatedly.
+ * was running (or `handle` is NULL). Safe to call repeatedly. A
+ * background rediscovery retry stops with it, before its next attempt;
+ * the next start with a `gnosis_rpc` tries again. An unfinished
+ * /health.walletScan (pending, scanning, retrying) is dropped with it,
+ * so a next start without a `gnosis_rpc` reports none rather than a
+ * status nothing moves on; a finished one (done, or confirming: the
+ * batches are registered and the history read from the unverified source
+ * is still being confirmed, which ant_stop_gateway doesn't stop) is kept.
  */
 bool ant_stop_gateway(const AntHandle *handle);
 
