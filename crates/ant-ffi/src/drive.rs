@@ -316,7 +316,9 @@ impl ChainInit {
     /// the chain as ready with no rediscovery reported. A run in flight
     /// holds the flag's lock and reports for itself — unless a gateway
     /// stop dropped its status ([`Self::stop_retrying`]), so an
-    /// untracked status is announced as `pending` then too.
+    /// untracked status is announced as `pending` then too; that run
+    /// turns it back into `scanning`, with its progress, at its next
+    /// scan window.
     pub(crate) fn note_pending(&self) {
         use ant_chain::discover::{wallet_scan_pending, wallet_scan_track, WalletScanState};
         let owner = &self.upload.batch_owner;

@@ -550,9 +550,21 @@ async fn scan_transfers(
                 if confirms {
                     scan.confirmed_through = Some(scan.scanned_through);
                 }
+                // `pending` here is a status a gateway stop dropped and a
+                // restart re-tracked while this attempt kept running
+                // (ant-ffi's `note_pending`): it is scanning, so say so.
                 report_status(&|s| {
-                    if s.state == WalletScanState::Scanning {
-                        s.scanned_through = Some(scan.scanned_through);
+                    if matches!(
+                        s.state,
+                        WalletScanState::Pending | WalletScanState::Scanning
+                    ) {
+                        *s = WalletScanStatus {
+                            state: WalletScanState::Scanning,
+                            from: Some(start),
+                            scanned_through: Some(scan.scanned_through),
+                            head: Some(head),
+                            error: None,
+                        };
                     }
                 });
                 if let Some(dir) = save_to {
@@ -1838,6 +1850,8 @@ mod tests {
         /// How far behind `head` the backend serving `eth_getLogs` is: it
         /// answers `[]` for the blocks it hasn't seen, no error.
         logs_lag: std::sync::atomic::AtomicU64,
+        /// Run after each `eth_getLogs` is answered.
+        on_logs: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ChainTransport for GrowingChain {
@@ -1893,6 +1907,9 @@ mod tests {
                         *n -= 1;
                     }
                     self.ranges.lock().unwrap().push((from, to));
+                    if let Some(hook) = self.on_logs.lock().unwrap().as_ref() {
+                        hook();
+                    }
                     let seen_up_to = self.head.load(std::sync::atomic::Ordering::SeqCst)
                         - self.logs_lag.load(std::sync::atomic::Ordering::SeqCst);
                     let logs: Vec<_> = self
@@ -2267,6 +2284,44 @@ mod tests {
         let status = wallet_scan_status(&EOA).unwrap();
         assert_eq!(status.state, WalletScanState::Scanning);
         assert_eq!(status.error, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway stop drops a scanning status and a restart re-tracks it
+    /// as bare `pending` while the attempt keeps running (ant-ffi's
+    /// `stop_retrying` then `note_pending`): the attempt's next window
+    /// reports it as scanning again, with its progress.
+    #[tokio::test]
+    async fn a_retracked_status_shows_the_running_scans_progress() {
+        const EOA: [u8; 20] = [0x55; 20];
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(1_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        *chain.on_logs.lock().unwrap() = Some(Box::new(move || {
+            // After the first window: the stop, then the restart.
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                wallet_scan_abandon(&EOA);
+                assert_eq!(wallet_scan_status(&EOA), None);
+                wallet_scan_track(&EOA, WalletScanState::Pending);
+            }
+        }));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-status-retrack");
+
+        wallet_scan_pending(&EOA);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap();
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 2);
+        let status = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(status.state, WalletScanState::Scanning, "{status:?}");
+        assert_eq!(status.from, Some(GNOSIS_XBZZ_DEPLOY_BLOCK));
+        assert_eq!(status.head, Some(HEAD));
+        assert_eq!(status.scanned_through, Some(HEAD - RESCAN_TAIL));
         std::fs::remove_dir_all(&dir).ok();
     }
 
