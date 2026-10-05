@@ -503,8 +503,9 @@ impl ChainInit {
 
     /// Confirm a rediscovery that read part of the history only from the
     /// unverified source: [`ant_chain::discover::confirm_transfer_scan`]
-    /// through the verified transport, one request at a time with the
-    /// shared backoff, never a crawl — as `antd` does. Once it's
+    /// through the verified transport, at most 64 windows per try (one
+    /// request once the transport serves the whole span) with the shared
+    /// backoff, never a crawl — as `antd` does. Once it's
     /// confirmed, register any batch the unverified read missed, move
     /// `/health.walletScan` to `done`, and adopt the chequebook if
     /// settlement isn't on yet (nothing is deployed here, as in

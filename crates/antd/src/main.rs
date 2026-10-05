@@ -234,7 +234,9 @@ struct Opt {
     /// once instead of window by window; each batch and chequebook found
     /// is still checked through the logs RPC, and `/health.walletScan`
     /// reads `confirming` until the logs RPC confirms the span in the
-    /// background. Falls back to the `GNOSIS_UNVERIFIED_LOGS_RPC_URL` env.
+    /// background. While it fails, the scan reads on window by window
+    /// through the logs RPC, trying it again every 64 windows. Falls back
+    /// to the `GNOSIS_UNVERIFIED_LOGS_RPC_URL` env.
     /// Unset (the default), such a span is read window by window.
     #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL")]
     gnosis_unverified_logs_rpc_url: Option<String>,

@@ -1462,9 +1462,14 @@ pub unsafe extern "C" fn ant_set_swap_enabled(
 /// for a wallet's whole history). What it finds is still checked through
 /// the transport, batch by batch and chequebook by chequebook;
 /// `/health.walletScan` reads `confirming`, and the gateway's chain init
-/// confirms the span in the background through the transport, one
-/// request at a time (1 minute, doubling, at most 30 minutes). A "no
-/// chequebook" it backs never leads to a deploy until it's confirmed.
+/// confirms the span in the background through the transport: each try
+/// reads at most 64 windows (one request once the transport serves the
+/// whole span), retried after 1 minute, doubling, at most 30 minutes. A
+/// "no chequebook" it backs never leads to a deploy until it's confirmed.
+/// While the source fails (down, rate-limited), the scan reads on window
+/// by window through the transport — the slow crawl it would otherwise
+/// avoid, about an hour for a whole history — and tries the source again
+/// every 64 windows, so a scan neither stalls nor fails while it's down.
 /// `antd`'s `--gnosis-unverified-logs-rpc-url` is the same.
 ///
 /// `url` NULL or empty clears it. Call it after [`ant_init`] and before
