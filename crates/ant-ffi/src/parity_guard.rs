@@ -91,12 +91,6 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
          restart may come without an RPC, so it drops the unfinished status; `antd`'s retry \
          runs for the process lifetime, so its status is never abandoned",
     ),
-    (
-        "wallet_scan_track",
-        Side::Ffi,
-        "re-announces a rediscovery whose status `wallet_scan_abandon` dropped, on the C API's \
-         next gateway start; `antd` never abandons one",
-    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

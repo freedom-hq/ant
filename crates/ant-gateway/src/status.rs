@@ -37,10 +37,13 @@ struct HealthBody {
     chain_ready: bool,
     /// The node wallet's background rediscovery (its batches and
     /// chequebook on chain), while the embedder runs one: `pending`,
-    /// `scanning` with progress, `retrying`, or `done`. Absent when the
-    /// node doesn't rediscover in the background. A host shows "looking
-    /// for your existing storage" until `done` instead of offering a plan
-    /// the wallet may already have (freedom-browser#484).
+    /// `scanning` with progress, `retrying`, then `done` — or
+    /// `confirming` when part of the history was read only from an
+    /// unverified source and is still being confirmed (what it found is
+    /// already registered). Absent when the node doesn't rediscover in
+    /// the background. A host shows "looking for your existing storage"
+    /// until `done` or `confirming` instead of offering a plan the wallet
+    /// may already have (freedom-browser#484).
     #[cfg(feature = "chain")]
     #[serde(rename = "walletScan", skip_serializing_if = "Option::is_none")]
     wallet_scan: Option<ant_chain::discover::WalletScanStatus>,
@@ -569,6 +572,7 @@ mod wallet_scan_tests {
             scanned_through: Some(41_230_000),
             head: Some(48_560_000),
             error: None,
+            provisional: false,
         }));
         assert_eq!(scanning["chainReady"], true);
         assert_eq!(

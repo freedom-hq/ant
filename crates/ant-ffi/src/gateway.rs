@@ -155,7 +155,7 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// (15 s, doubling, at most 5 minutes) until it succeeds, through the
 /// latest start's `gnosis_rpc`, while the gateway runs: it ends at
 /// [`ant_stop_gateway`]. `/health.walletScan` reports where it stands
-/// (a stop drops it unless `done`).
+/// (a stop drops it unless `done` or `confirming`).
 ///
 /// # Safety
 ///
@@ -699,7 +699,9 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 /// the next start with a `gnosis_rpc` tries again. An unfinished
 /// `/health.walletScan` (`pending`, `scanning`, `retrying`) is dropped with it,
 /// so a next start without a `gnosis_rpc` reports none rather than a
-/// status nothing moves on; a finished (`done`) one is kept.
+/// status nothing moves on; a finished one (`done`, or `confirming`: the
+/// batches are registered and the history read from the unverified source
+/// is still being confirmed, which a stop doesn't end) is kept.
 ///
 /// # Safety
 ///

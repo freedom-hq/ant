@@ -147,6 +147,17 @@ pub(crate) struct ChainInit {
     /// ([`Self::retry_rediscovery`]): at most one per handle, however
     /// often the host re-calls `ant_start_gateway`.
     rediscovery_retry: std::sync::Mutex<RediscoveryRetry>,
+    /// The rediscovery read part of the history only from the unverified
+    /// source ([`crate::ant_set_unverified_logs_rpc`]), and that isn't
+    /// confirmed yet ([`Self::confirm_unverified`]).
+    unconfirmed: std::sync::atomic::AtomicBool,
+    /// The background confirmation ([`Self::confirm_unverified`]): at
+    /// most one per handle, and the chain client its next attempt reads
+    /// through — the latest one handed to it.
+    confirm_loop: std::sync::Mutex<ConfirmLoop>,
+    /// Wakes a confirmation waiting out its backoff when a client on a
+    /// different route is handed to it (not a re-hand of the same RPC).
+    confirm_wake: tokio::sync::Notify,
     /// Set once settlement has been switched on for an adopted
     /// chequebook, so a later run (every idempotent `ant_start_gateway`
     /// re-call spawns one) doesn't re-resolve it over RPC.
@@ -183,6 +194,19 @@ struct RediscoveryRetry {
     running: bool,
     chain: Option<ant_chain::ChainClient>,
     stops: u64,
+}
+
+/// [`ChainInit::confirm_loop`]: whether the confirmation runs, and the
+/// chain client its next attempt reads through. Every caller of
+/// [`ChainInit::confirm_unverified`] (a gateway start, a discover) hands
+/// over its client, so a host that replaced a broken RPC isn't left with
+/// a loop retrying through the old one — unless it's a gateway start the
+/// gateway has stopped since ([`ChainInit::retry_epoch`]).
+#[cfg(feature = "chain")]
+#[derive(Default)]
+struct ConfirmLoop {
+    running: bool,
+    chain: Option<ant_chain::ChainClient>,
 }
 
 /// How long a persisted batch's first `NotFound` read must stand before
@@ -223,6 +247,9 @@ impl ChainInit {
             unverified: std::sync::Mutex::new(unverified),
             batches_rediscovered: tokio::sync::Mutex::new(false),
             rediscovery_retry: std::sync::Mutex::new(RediscoveryRetry::default()),
+            unconfirmed: std::sync::atomic::AtomicBool::new(false),
+            confirm_loop: std::sync::Mutex::new(ConfirmLoop::default()),
+            confirm_wake: tokio::sync::Notify::new(),
             settlement_on: std::sync::atomic::AtomicBool::new(false),
             pass: tokio::sync::Mutex::new(()),
             not_found_since: std::sync::Mutex::new(HashMap::new()),
@@ -277,7 +304,10 @@ impl ChainInit {
     /// ([`Self::retry_rediscovery`]) alongside step 1's recheck, as `antd`
     /// does, so `/health.walletScan` moves on from `retrying` without
     /// waiting for the host's next start call — unless the gateway has
-    /// stopped since.
+    /// stopped since; and a rediscovery that read part of the history only
+    /// from the unverified source is confirmed afterwards
+    /// ([`Self::confirm_unverified`]), calling `report` again with the
+    /// chequebook that adopts, if any.
     pub(crate) async fn run_reporting(
         &self,
         chain: &ant_chain::ChainClient,
@@ -285,7 +315,7 @@ impl ChainInit {
         data_dir: &std::path::Path,
         swap_secret: [u8; 32],
         retry: Option<u64>,
-        report: impl FnOnce(Option<[u8; 20]>),
+        mut report: impl FnMut(Option<[u8; 20]>),
     ) {
         let recheck_at = self
             .verify_pass(chain, ant_chain::GNOSIS_POSTAGE_STAMP)
@@ -302,17 +332,38 @@ impl ChainInit {
                     .await;
             }
         };
-        let retry_rediscovery = async {
-            if let (Some(epoch), false) = (retry, rediscovered) {
-                self.retry_rediscovery(chain, cmd_tx, data_dir, epoch).await;
+        let follow_up = async {
+            let Some(epoch) = retry else {
+                return;
+            };
+            // The confirmation reads through the RPC the rediscovery last
+            // succeeded with: a retry loop's success may have come through
+            // a later start's.
+            let mut chain = chain.clone();
+            if !rediscovered {
+                if let Some(latest) = self
+                    .retry_rediscovery(&chain, cmd_tx, data_dir, epoch)
+                    .await
+                {
+                    chain = latest;
+                }
+            }
+            if self.unconfirmed.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(chequebook) = self
+                    .confirm_unverified(&chain, cmd_tx, data_dir, swap_secret, Some(epoch))
+                    .await
+                {
+                    report(Some(chequebook));
+                }
             }
         };
-        tokio::join!(recheck, retry_rediscovery);
+        tokio::join!(recheck, follow_up);
     }
 
     /// Report a rediscovery that will run (`/health.walletScan` =
     /// `pending`) unless one already finished for this handle (then
-    /// `done`). Called before the gateway serves, so a host never reads
+    /// `done`, or `confirming` while part of the history it read from the
+    /// unverified source isn't confirmed yet). Called before the gateway serves, so a host never reads
     /// the chain as ready with no rediscovery reported. A run in flight
     /// holds the flag's lock and reports for itself — unless a gateway
     /// stop dropped its status ([`Self::stop_retrying`]), so an
@@ -323,6 +374,10 @@ impl ChainInit {
         use ant_chain::discover::{wallet_scan_pending, wallet_scan_track, WalletScanState};
         let owner = &self.upload.batch_owner;
         match self.batches_rediscovered.try_lock() {
+            // Rediscovered, but part of the history isn't confirmed yet.
+            Ok(done) if *done && self.unconfirmed.load(std::sync::atomic::Ordering::Acquire) => {
+                wallet_scan_track(owner, WalletScanState::Confirming);
+            }
             Ok(done) if *done => wallet_scan_track(owner, WalletScanState::Done),
             Ok(_) => wallet_scan_pending(owner),
             Err(_) => wallet_scan_track(owner, WalletScanState::Pending),
@@ -338,27 +393,32 @@ impl ChainInit {
     /// [`Self::retry_epoch`] the calling start took before its own
     /// attempt: if the gateway stopped since, this does nothing — no new
     /// loop, and no stopped gateway's RPC handed to a running one.
+    ///
+    /// Returns the chain client the loop's successful attempt read
+    /// through, when this call ran the loop and it succeeded (`None` when
+    /// it handed `chain` to a running loop, did nothing, or was stopped).
     async fn retry_rediscovery(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
         data_dir: &std::path::Path,
         epoch: u64,
-    ) {
+    ) -> Option<ant_chain::ChainClient> {
         {
             let mut retry = self
                 .rediscovery_retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if retry.stops != epoch {
-                return;
+                return None;
             }
             retry.chain = Some(chain.clone());
             if retry.running {
-                return;
+                return None;
             }
             retry.running = true;
         }
+        let mut succeeded = None;
         for attempt in 0u32.. {
             let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
             tokio::time::sleep(delay).await;
@@ -369,11 +429,12 @@ impl ChainInit {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let Some(chain) = retry.chain.clone() else {
                     retry.running = false;
-                    return;
+                    return None;
                 };
                 chain
             };
             if self.rediscover_owned(&chain, cmd_tx, data_dir).await {
+                succeeded = Some(chain);
                 break;
             }
         }
@@ -383,6 +444,7 @@ impl ChainInit {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         retry.running = false;
         retry.chain = None;
+        succeeded
     }
 
     /// The gateway stop count a start passes to [`Self::run_reporting`]:
@@ -498,7 +560,11 @@ impl ChainInit {
             return true;
         }
         let found = match owned_batches(chain, &owner, data_dir, false, Some(&owner)).await {
-            Ok(found) => found,
+            Ok((found, unconfirmed)) => {
+                self.unconfirmed
+                    .store(unconfirmed, std::sync::atomic::Ordering::Release);
+                found
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "ant-ffi",
@@ -508,6 +574,29 @@ impl ChainInit {
                 return false;
             }
         };
+        let all_registered = self.register_found(cmd_tx, found).await;
+        // Only a clean pass ends the rediscovery: a batch whose
+        // registration failed is picked up by the next run's scan (the
+        // ones registered now are skipped as known).
+        *rediscovered = all_registered;
+        if all_registered {
+            ant_chain::discover::wallet_scan_done(&owner);
+        } else {
+            ant_chain::discover::wallet_scan_failed(
+                &owner,
+                "could not register a rediscovered batch",
+            );
+        }
+        all_registered
+    }
+
+    /// Register the batches in `found` this handle doesn't hold yet.
+    /// Returns whether every one of them registered.
+    async fn register_found(
+        &self,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        found: Vec<ant_chain::discover::DiscoveredBatch>,
+    ) -> bool {
         let mut all_registered = true;
         for b in found {
             let known = self
@@ -548,19 +637,163 @@ impl ChainInit {
                 }
             }
         }
-        // Only a clean pass ends the rediscovery: a batch whose
-        // registration failed is picked up by the next run's scan (the
-        // ones registered now are skipped as known).
-        *rediscovered = all_registered;
-        if all_registered {
-            ant_chain::discover::wallet_scan_done(&owner);
-        } else {
-            ant_chain::discover::wallet_scan_failed(
-                &owner,
-                "could not register a rediscovered batch",
-            );
-        }
         all_registered
+    }
+
+    /// Confirm a rediscovery that read part of the history only from the
+    /// unverified source: [`ant_chain::discover::confirm_transfer_scan`]
+    /// through the verified transport, at most 64 windows per try (one
+    /// request once the transport serves the whole span) with the shared
+    /// backoff, never a crawl — as `antd` does. Once it's
+    /// confirmed, register any batch the unverified read missed, move
+    /// `/health.walletScan` to `done`, and adopt the chequebook if
+    /// settlement isn't on yet (nothing is deployed here, as in
+    /// [`Self::run`]). Returns the chequebook adopted, if any.
+    ///
+    /// One loop per handle: a call while it runs only hands it `chain`, so
+    /// its next attempt reads through the latest client (a host that
+    /// replaced a broken RPC with a new `ant_start_gateway`). Only a
+    /// client on a different route ([`ant_chain::ChainClient::same_route`])
+    /// cuts the loop's wait to at most the first backoff step and restarts
+    /// its backoff; re-handing the route it already reads through (an
+    /// idempotent start re-call, a discover at every start) leaves the
+    /// backoff where it is.
+    ///
+    /// `epoch` is the calling gateway start's [`Self::retry_epoch`]
+    /// (`None` for a discover, which no gateway stop retires): if the
+    /// gateway stopped since, this does nothing — a stopped start's late
+    /// follow-up must not hand its (possibly replaced) RPC to the loop a
+    /// newer start is feeding, nor start one. Checked under the retry
+    /// state's lock, so a stop can't land between the check and the
+    /// hand-over.
+    async fn confirm_unverified(
+        &self,
+        chain: &ant_chain::ChainClient,
+        cmd_tx: &mpsc::Sender<ControlCommand>,
+        data_dir: &std::path::Path,
+        swap_secret: [u8; 32],
+        epoch: Option<u64>,
+    ) -> Option<[u8; 20]> {
+        use std::sync::atomic::Ordering;
+        {
+            // Lock order: retry state, then the confirmation loop's.
+            let retry = self
+                .rediscovery_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if epoch.is_some_and(|epoch| retry.stops != epoch) {
+                return None;
+            }
+            let mut state = self.lock_confirm_loop();
+            drop(retry);
+            let replaced = !state
+                .chain
+                .as_ref()
+                .is_some_and(|current| current.same_route(chain));
+            state.chain = Some(chain.clone());
+            if state.running {
+                if replaced {
+                    self.confirm_wake.notify_one();
+                }
+                return None;
+            }
+            // A loop that just finished cleared `unconfirmed` before it
+            // released `running`: nothing left to confirm.
+            if !self.unconfirmed.load(Ordering::Acquire) {
+                state.chain = None;
+                return None;
+            }
+            state.running = true;
+        }
+        let owner = self.upload.batch_owner;
+        let mut adopted = None;
+        let mut attempt = 0u32;
+        loop {
+            let first = ant_chain::discover::confirm_retry_delay(0);
+            let mut deadline =
+                tokio::time::Instant::now() + ant_chain::discover::confirm_retry_delay(attempt);
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => break,
+                    () = self.confirm_wake.notified() => {
+                        // A new client: try it within the first step, and
+                        // back off from the start again if it fails too.
+                        deadline = deadline.min(tokio::time::Instant::now() + first);
+                        attempt = 0;
+                    }
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            let Some(chain) = self.lock_confirm_loop().chain.clone() else {
+                break;
+            };
+            let chain = &chain;
+            let scan = match ant_chain::discover::confirm_transfer_scan(
+                chain,
+                ant_chain::GNOSIS_BZZ_TOKEN,
+                &owner,
+                data_dir,
+                &owner,
+            )
+            .await
+            {
+                Ok(Some(scan)) => scan,
+                Ok(None) => {
+                    tracing::info!(
+                        target: "ant-ffi",
+                        "the transport can't confirm the wallet history read from the unverified \
+                         source yet; trying again",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "confirming the wallet history failed: {e}; trying again",
+                    );
+                    continue;
+                }
+            };
+            let found = match ant_chain::discover::owned_batches_in(
+                chain,
+                ant_chain::GNOSIS_POSTAGE_STAMP,
+                &scan,
+            )
+            .await
+            {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "reading the confirmed wallet history failed: {e}; trying again",
+                    );
+                    continue;
+                }
+            };
+            if !self.register_found(cmd_tx, found).await {
+                continue;
+            }
+            self.unconfirmed.store(false, Ordering::Release);
+            ant_chain::discover::wallet_scan_done(&owner);
+            tracing::info!(
+                target: "ant-ffi",
+                "the wallet history read from the unverified source is confirmed",
+            );
+            adopted = self
+                .adopt_settlement(chain, cmd_tx, data_dir, swap_secret)
+                .await;
+            break;
+        }
+        let mut state = self.lock_confirm_loop();
+        state.running = false;
+        state.chain = None;
+        adopted
+    }
+
+    fn lock_confirm_loop(&self) -> std::sync::MutexGuard<'_, ConfirmLoop> {
+        self.confirm_loop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Confirm every still-unverified reloaded batch against the chain
@@ -1143,9 +1376,11 @@ pub(crate) fn storage_connect_batch(
 
 /// The funded postage batches `owner` holds on Gnosis, from the saved
 /// transfer scan in `data_dir` (brought up to the chain head first), or
-/// with `full_rescan` from a scan of the whole history that replaces it.
-/// With `status_key` (the background rediscovery), the scan reports to
-/// `/health.walletScan`; a host's explicit discover doesn't.
+/// with `full_rescan` from a scan of the whole history that replaces it;
+/// and whether that scan still holds blocks read only from the unverified
+/// source ([`crate::ant_set_unverified_logs_rpc`]). With `status_key` (the
+/// background rediscovery), the scan reports to `/health.walletScan`; a
+/// host's explicit discover doesn't.
 #[cfg(feature = "chain")]
 async fn owned_batches(
     chain: &ant_chain::ChainClient,
@@ -1153,7 +1388,7 @@ async fn owned_batches(
     data_dir: &std::path::Path,
     full_rescan: bool,
     status_key: Option<&[u8; 20]>,
-) -> Result<Vec<ant_chain::discover::DiscoveredBatch>, ant_chain::RpcError> {
+) -> Result<(Vec<ant_chain::discover::DiscoveredBatch>, bool), ant_chain::RpcError> {
     let scan = if let Some(status_key) = status_key {
         ant_chain::discover::rediscovery_scan(
             chain,
@@ -1181,7 +1416,10 @@ async fn owned_batches(
         )
         .await?
     };
-    ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan).await
+    let found =
+        ant_chain::discover::owned_batches_in(chain, ant_chain::GNOSIS_POSTAGE_STAMP, &scan)
+            .await?;
+    Ok((found, scan.provisional_since.is_some()))
 }
 
 /// Auto-discover every funded postage batch this account owns on Gnosis
@@ -1192,6 +1430,13 @@ async fn owned_batches(
 /// whole transfer history again and replaces it: the way back from a
 /// saved scan an RPC once answered incompletely, which nothing automatic
 /// revisits. Hosts call the plain form at every start, so it stays cheap.
+///
+/// A plain discover that read part of the history only from the
+/// unverified source ([`crate::ant_set_unverified_logs_rpc`]) starts the
+/// handle's background confirmation ([`ChainInit::confirm_unverified`],
+/// at most one loop per handle) as the gateway's chain init does, so the
+/// blocks don't stay unconfirmed until the next `ant_start_gateway`. A
+/// full rescan reads through the transport only and is never unconfirmed.
 #[cfg(feature = "chain")]
 pub(crate) fn storage_discover(
     h: &AntHandle,
@@ -1204,9 +1449,12 @@ pub(crate) fn storage_discover(
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let found = owned_batches(&chain, &eth, &data_dir, full_rescan, None)
+        let (found, unconfirmed) = owned_batches(&chain, &eth, &data_dir, full_rescan, None)
             .await
             .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
+        if unconfirmed {
+            spawn_confirm_unverified(h, chain.clone());
+        }
         let mut registered = Vec::new();
         for b in &found {
             register_batch(
@@ -1237,6 +1485,30 @@ pub(crate) fn storage_discover(
             status,
         ))
     })
+}
+
+/// Mark `h`'s rediscovery unconfirmed and confirm it in the background
+/// ([`ChainInit::confirm_unverified`]), reporting an adopted chequebook to
+/// the gateway's slot. A no-op while a confirmation already runs.
+#[cfg(feature = "chain")]
+fn spawn_confirm_unverified(h: &AntHandle, chain: ant_chain::ChainClient) {
+    h.chain_init
+        .unconfirmed
+        .store(true, std::sync::atomic::Ordering::Release);
+    let init = std::sync::Arc::clone(&h.chain_init);
+    let cmd_tx = h.cmd_tx.clone();
+    let data_dir = h.data_dir.clone();
+    let secret = h.signing_secret;
+    let eth = h.eth;
+    let slot = h.gateway_chequebook.clone();
+    h.runtime.spawn(async move {
+        if let Some(chequebook) = init
+            .confirm_unverified(&chain, &cmd_tx, &data_dir, secret, None)
+            .await
+        {
+            sync_gateway_chequebook(&slot, &eth, Some(chequebook));
+        }
+    });
 }
 
 #[cfg(feature = "chain")]
@@ -3814,6 +4086,10 @@ mod chain_tests {
         /// "no" (the chain changing its answer between two checks).
         registered_reads: Option<usize>,
         factory_reads: Mutex<usize>,
+        /// Refuse xBZZ `eth_getLogs` ranges wider than this, as a
+        /// verified route that serves a few thousand blocks at a time
+        /// does; `0` serves any range.
+        cap: std::sync::atomic::AtomicU64,
         seen: Mutex<Vec<String>>,
     }
 
@@ -3828,6 +4104,7 @@ mod chain_tests {
                 checks_fail: false,
                 registered_reads: None,
                 factory_reads: Mutex::new(0),
+                cap: std::sync::atomic::AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -3918,6 +4195,20 @@ mod chain_tests {
                 "eth_getLogs" => {
                     let filter = &req["params"][0];
                     let address = filter["address"].as_str().unwrap().to_ascii_lowercase();
+                    let block = |key: &str| {
+                        u64::from_str_radix(&filter[key].as_str().unwrap()[2..], 16).unwrap()
+                    };
+                    let cap = self.cap.load(std::sync::atomic::Ordering::SeqCst);
+                    if cap > 0 && block("toBlock") - block("fromBlock") + 1 > cap {
+                        return Some(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32005, "message": "query exceeds max block range"},
+                            })
+                            .to_string(),
+                        );
+                    }
                     if address == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() {
                         json!(self
                             .transfers
@@ -4530,6 +4821,400 @@ mod chain_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A first rediscovery the transport can only serve window by window
+    /// reads the history once from the unverified source
+    /// (`ant_set_unverified_logs_rpc`), registers what it finds and reads
+    /// `confirming`; the background confirmation registers the batch the
+    /// unverified source left out once the transport serves the span, and
+    /// ends `done`. Its own wallet: the status registry is process-wide.
+    #[tokio::test(start_paused = true)]
+    async fn an_unverified_first_scan_is_confirmed_in_the_background() {
+        use ant_chain::discover::{wallet_scan_status, WalletScanState};
+        const EOA: [u8; 20] = [0x78; 20];
+        let dir = scratch("chain-init-unverified");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let (seen, missed) = ([0xa5u8; 32], [0xa6u8; 32]);
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(std::sync::Arc::clone(&upload));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let mut verified = ChainScript::new(EOA);
+        verified.transfers.push((postage_addr, [0x07; 32]));
+        verified.transfers.push((postage_addr, [0x08; 32]));
+        verified.created.push((seen, [0x07; 32]));
+        verified.created.push((missed, [0x08; 32]));
+        verified
+            .cap
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        let mut unverified = ChainScript::new(EOA);
+        unverified.transfers.push((postage_addr, [0x07; 32]));
+        let (verified, unverified) = (
+            std::sync::Arc::new(verified),
+            std::sync::Arc::new(unverified),
+        );
+        let chain = client(&verified).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, node) = fake_node();
+
+        init.note_pending();
+        assert!(init.rediscover_owned(&chain, &cmd_tx, &dir).await);
+        assert_eq!(node.lock().unwrap().registered, vec![seen]);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming
+        );
+
+        // The transport's second source is back: it serves the span.
+        verified.cap.store(0, std::sync::atomic::Ordering::SeqCst);
+        let adopted = init
+            .confirm_unverified(&chain, &cmd_tx, &dir, NODE_KEY, None)
+            .await;
+        assert_eq!(adopted, None, "no chequebook to adopt, and none deployed");
+        // The fake node doesn't fill the issuer map, so the batch already
+        // registered is sent again here; a real node fills it, and
+        // `register_found` skips the batch as known.
+        let registered = node.lock().unwrap().registered.clone();
+        assert_eq!(registered.last(), Some(&missed), "{registered:?}");
+        assert_eq!(registered.iter().filter(|b| **b == missed).count(), 1);
+        assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A confirmation retrying through an RPC that can't serve the span
+    /// takes the client a later call hands it (a host that replaced the
+    /// broken RPC with a new `ant_start_gateway`): its next attempt reads
+    /// through the new one within the first backoff step, not after the
+    /// 30-minute wait it had reached, and registers the missed batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_confirmation_takes_a_replacement_rpc() {
+        use ant_chain::discover::{wallet_scan_status, WalletScanState};
+        const EOA: [u8; 20] = [0x7c; 20];
+        let dir = scratch("chain-init-confirm-handover");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let (seen, missed) = ([0xb5u8; 32], [0xb6u8; 32]);
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = std::sync::Arc::new(super::ChainInit::new(std::sync::Arc::clone(&upload)));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let verified_script = || {
+            let mut s = ChainScript::new(EOA);
+            s.transfers.push((postage_addr, [0x07; 32]));
+            s.transfers.push((postage_addr, [0x08; 32]));
+            s.created.push((seen, [0x07; 32]));
+            s.created.push((missed, [0x08; 32]));
+            s
+        };
+        // RPC A only serves the span window by window, and never stops.
+        let broken = verified_script();
+        broken
+            .cap
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        // RPC B, the host's replacement, serves it in one request.
+        let replacement = std::sync::Arc::new(verified_script());
+        let mut unverified = ChainScript::new(EOA);
+        unverified.transfers.push((postage_addr, [0x07; 32]));
+        let unverified = std::sync::Arc::new(unverified);
+        let broken = std::sync::Arc::new(broken);
+        let chain_a = client(&broken).with_unverified_logs_client(Some(client(&unverified)));
+        let chain_b = client(&replacement).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, node) = fake_node();
+
+        init.note_pending();
+        assert!(init.rediscover_owned(&chain_a, &cmd_tx, &dir).await);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+
+        let looping = {
+            let (init, cmd_tx, dir, chain_a) = (
+                std::sync::Arc::clone(&init),
+                cmd_tx.clone(),
+                dir.clone(),
+                chain_a.clone(),
+            );
+            tokio::spawn(async move {
+                init.confirm_unverified(&chain_a, &cmd_tx, &dir, NODE_KEY, None)
+                    .await
+            })
+        };
+        // Long enough for the backoff through A to reach its 30-minute cap.
+        tokio::time::sleep(std::time::Duration::from_hours(3)).await;
+        assert!(!looping.is_finished());
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Confirming
+        );
+
+        // The host replaces A: the call hands B to the running loop.
+        assert_eq!(
+            init.confirm_unverified(&chain_b, &cmd_tx, &dir, NODE_KEY, None)
+                .await,
+            None
+        );
+        // The next attempt reads through B: the loop no longer waits out
+        // A's 30-minute step, and A would never confirm. Stepped a virtual
+        // second at a time with some real time in between: the scan takes
+        // a process-wide lock that a crawling test running in parallel
+        // holds for seconds, and the paused clock would otherwise jump
+        // past any bound while the loop waits on it. Alone, this
+        // registers at +60 s (the first backoff step).
+        let handed_over = tokio::time::Instant::now();
+        let mut registered = false;
+        while handed_over.elapsed() < ant_chain::discover::confirm_retry_delay(u32::MAX) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tokio::task::yield_now().await;
+            if node.lock().unwrap().registered.contains(&missed) {
+                registered = true;
+                break;
+            }
+        }
+        assert!(
+            registered,
+            "the loop confirms through the replacement within one capped backoff step"
+        );
+        assert!(!replacement.seen.lock().unwrap().is_empty());
+        looping.await.unwrap();
+        assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        // The loop is over: a later call has nothing left to confirm.
+        assert_eq!(
+            init.confirm_unverified(&chain_b, &cmd_tx, &dir, NODE_KEY, None)
+                .await,
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A confirming setup for the hand-over tests: a rediscovery through
+    /// `verified` (which only serves the span window by window) that read
+    /// part of the history only from the unverified source.
+    fn unconfirmed_init(
+        eoa: [u8; 20],
+        name: &str,
+    ) -> (
+        std::sync::Arc<super::ChainInit>,
+        std::path::PathBuf,
+        impl Fn() -> ChainScript,
+        std::sync::Arc<ChainScript>,
+    ) {
+        let dir = scratch(name);
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: eoa,
+            postage_dir: postage,
+        });
+        let init = std::sync::Arc::new(super::ChainInit::new(upload));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let verified_script = move || {
+            let mut s = ChainScript::new(eoa);
+            s.transfers.push((postage_addr, [0x07; 32]));
+            s.transfers.push((postage_addr, [0x08; 32]));
+            s.created.push(([0xc5; 32], [0x07; 32]));
+            s.created.push(([0xc6; 32], [0x08; 32]));
+            s.cap.store(10_000, std::sync::atomic::Ordering::SeqCst);
+            s
+        };
+        let mut unverified = ChainScript::new(eoa);
+        unverified.transfers.push((postage_addr, [0x07; 32]));
+        let unverified = std::sync::Arc::new(unverified);
+        (init, dir, verified_script, unverified)
+    }
+
+    /// Re-handing the route a running confirmation already reads through
+    /// (an idempotent `ant_start_gateway` re-call, a discover at every
+    /// start, each building its own client for the same RPC) leaves its
+    /// backoff alone: no attempt within the first step, as a real
+    /// replacement would get. A different route still does.
+    #[tokio::test(start_paused = true)]
+    async fn re_handing_the_same_rpc_keeps_the_confirmation_backoff() {
+        const EOA: [u8; 20] = [0x7d; 20];
+        let (init, dir, verified_script, unverified) =
+            unconfirmed_init(EOA, "chain-init-confirm-same-route");
+        let broken = std::sync::Arc::new(verified_script());
+        let route_a = || client(&broken).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, node) = fake_node();
+        init.note_pending();
+        assert!(init.rediscover_owned(&route_a(), &cmd_tx, &dir).await);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+
+        let looping = {
+            let (init, cmd_tx, dir, chain) = (
+                std::sync::Arc::clone(&init),
+                cmd_tx.clone(),
+                dir.clone(),
+                route_a(),
+            );
+            tokio::spawn(async move {
+                init.confirm_unverified(&chain, &cmd_tx, &dir, NODE_KEY, None)
+                    .await
+            })
+        };
+        let requests = || broken.seen.lock().unwrap().len();
+        // Step with some real time in between (see the hand-over test).
+        let step = || async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            tokio::task::yield_now().await;
+        };
+        // Right after the loop's first attempt, so its next is a doubled
+        // step (2 min) away. (Not a long paused sleep to reach the cap: the
+        // paused clock jumps past attempts blocked on the process-wide
+        // scan lock while a parallel test holds it.)
+        let before = requests();
+        while requests() == before {
+            step().await;
+        }
+        let mut quiet = 0;
+        let mut last = requests();
+        while quiet < 5 {
+            step().await;
+            let now = requests();
+            quiet = if now == last { quiet + 1 } else { 0 };
+            last = now;
+        }
+
+        // A fresh client for the same RPC: no wake, no reset.
+        assert_eq!(
+            init.confirm_unverified(&route_a(), &cmd_tx, &dir, NODE_KEY, None)
+                .await,
+            None
+        );
+        // Past the first step a replacement would be tried within, short
+        // of the doubled one this loop is waiting out.
+        for _ in 0..90 {
+            step().await;
+        }
+        assert_eq!(
+            requests(),
+            last,
+            "no attempt within the first step of a same-route re-hand"
+        );
+
+        // A real replacement still cuts the wait to the first step.
+        let replacement = verified_script();
+        replacement
+            .cap
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let replacement = std::sync::Arc::new(replacement);
+        let chain_b = client(&replacement).with_unverified_logs_client(Some(client(&unverified)));
+        assert_eq!(
+            init.confirm_unverified(&chain_b, &cmd_tx, &dir, NODE_KEY, None)
+                .await,
+            None
+        );
+        let handed_over = tokio::time::Instant::now();
+        while !node.lock().unwrap().registered.contains(&[0xc6; 32]) {
+            assert!(
+                handed_over.elapsed() < ant_chain::discover::confirm_retry_delay(u32::MAX),
+                "a different route is tried within one capped step"
+            );
+            step().await;
+        }
+        looping.await.unwrap();
+        assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway start whose follow-up outlives a stop (its rediscovery
+    /// or chequebook adoption still in flight through RPC A when the host
+    /// stopped and restarted with B) hands nothing to the confirmation:
+    /// not A to the loop B's start runs, and no loop of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_start_does_not_hand_its_rpc_to_the_confirmation() {
+        const EOA: [u8; 20] = [0x7e; 20];
+        let (init, dir, verified_script, unverified) =
+            unconfirmed_init(EOA, "chain-init-confirm-stale-epoch");
+        let (a, b) = (
+            std::sync::Arc::new(verified_script()),
+            std::sync::Arc::new(verified_script()),
+        );
+        let chain_a = client(&a).with_unverified_logs_client(Some(client(&unverified)));
+        let chain_b = client(&b).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, _node) = fake_node();
+        init.note_pending();
+        assert!(init.rediscover_owned(&chain_a, &cmd_tx, &dir).await);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+
+        let epoch_a = init.retry_epoch();
+        init.stop_retrying();
+        let epoch_b = init.retry_epoch();
+
+        // A's late follow-up with no loop running: none started (it
+        // returns at once rather than running one through A).
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                init.confirm_unverified(&chain_a, &cmd_tx, &dir, NODE_KEY, Some(epoch_a)),
+            )
+            .await,
+            Ok(None)
+        );
+        {
+            let state = init.lock_confirm_loop();
+            assert!(!state.running && state.chain.is_none());
+        }
+
+        // B's start runs the loop; A's late follow-up then hands it nothing.
+        let looping = {
+            let (init, cmd_tx, dir, chain_b) = (
+                std::sync::Arc::clone(&init),
+                cmd_tx.clone(),
+                dir.clone(),
+                chain_b.clone(),
+            );
+            tokio::spawn(async move {
+                init.confirm_unverified(&chain_b, &cmd_tx, &dir, NODE_KEY, Some(epoch_b))
+                    .await
+            })
+        };
+        while !init.lock_confirm_loop().running {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            init.confirm_unverified(&chain_a, &cmd_tx, &dir, NODE_KEY, Some(epoch_a))
+                .await,
+            None
+        );
+        assert!(init
+            .lock_confirm_loop()
+            .chain
+            .as_ref()
+            .is_some_and(|chain| chain.same_route(&chain_b) && !chain.same_route(&chain_a)));
+        looping.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A gateway stop drops an unfinished `/health.walletScan` status
     /// (nothing retries it until the next start with an RPC) but keeps a
     /// finished one; a next start with an RPC announces `pending` again,
@@ -4602,7 +5287,7 @@ mod chain_tests {
     /// the first start's RPC for the handle's lifetime.
     #[tokio::test(start_paused = true)]
     async fn rediscovery_retry_follows_the_gateway() {
-        const EOA: [u8; 20] = [0x78; 20];
+        const EOA: [u8; 20] = [0x7b; 20];
         let dir = scratch("chain-init-retry-stop");
         let postage = dir.join("postage");
         std::fs::create_dir_all(&postage).unwrap();

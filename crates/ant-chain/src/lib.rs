@@ -110,6 +110,10 @@ pub struct ChainClient {
     /// default — means every request goes straight to [`Self::url`],
     /// which is what ant has always done.
     transport: Option<SharedChainTransport>,
+    /// An unverified source the transfer scan may read a wide span from
+    /// when this (verified) one can't serve it in a few windows; see
+    /// [`Self::with_unverified_logs`].
+    unverified_logs: Option<std::sync::Arc<ChainClient>>,
 }
 
 #[cfg(feature = "chain-rpc")]
@@ -122,7 +126,61 @@ impl ChainClient {
                 .build()
                 .expect("reqwest client"),
             transport: None,
+            unverified_logs: None,
         }
+    }
+
+    /// Give the wallet's transfer scan an explicitly unverified source
+    /// (`None` clears it): a single provider that serves the whole history
+    /// in one `eth_getLogs`, where this client is the verified route (e.g.
+    /// Freedom's quorum bridge) that may only serve a few thousand blocks
+    /// at a time. A span this client can't serve in a few windows is read
+    /// from it once instead of window by window; what it finds is checked
+    /// item by item through this client, and the span stays unconfirmed
+    /// until this client reads it ([`discover::confirm_transfer_scan`]).
+    /// While a read from it fails, the scan reads on window by window
+    /// through this client, as without one, trying it again every 64
+    /// windows; the span is marked unconfirmed only once it has served a
+    /// window. Only the transfer scan uses it.
+    #[must_use]
+    pub fn with_unverified_logs(mut self, url: Option<String>) -> Self {
+        self.unverified_logs = url.map(|u| std::sync::Arc::new(ChainClient::new(u)));
+        self
+    }
+
+    /// [`Self::with_unverified_logs`] with a client of the caller's own,
+    /// e.g. one with a host transport.
+    #[must_use]
+    pub fn with_unverified_logs_client(mut self, client: Option<ChainClient>) -> Self {
+        self.unverified_logs = client.map(std::sync::Arc::new);
+        self
+    }
+
+    /// Whether `other` reads through the same route as `self`: the same
+    /// RPC URL, the same host transport (by identity) and the same
+    /// unverified source. Two clients built separately for one RPC (each
+    /// `ant_start_gateway` re-call builds its own) compare equal, so a
+    /// consumer handed a client again can tell a real replacement from a
+    /// re-hand of the one it already reads through.
+    #[must_use]
+    pub fn same_route(&self, other: &ChainClient) -> bool {
+        let transport = match (&self.transport, &other.transport) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                std::ptr::addr_eq(std::sync::Arc::as_ptr(a), std::sync::Arc::as_ptr(b))
+            }
+            _ => false,
+        };
+        let unverified = match (&self.unverified_logs, &other.unverified_logs) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_route(b),
+            _ => false,
+        };
+        self.url == other.url && transport && unverified
+    }
+
+    pub(crate) fn unverified_logs(&self) -> Option<&ChainClient> {
+        self.unverified_logs.as_deref()
     }
 
     /// Install (or clear, with `None`) a host-provided JSON-RPC
