@@ -138,7 +138,10 @@ impl ChainClient {
     /// from it once instead of window by window; what it finds is checked
     /// item by item through this client, and the span stays unconfirmed
     /// until this client reads it ([`discover::confirm_transfer_scan`]).
-    /// Only the transfer scan uses it.
+    /// A read from it that fails falls back to reading the rest window by
+    /// window through this client, as without one; the span is marked
+    /// unconfirmed only once it has served a window. Only the transfer
+    /// scan uses it.
     #[must_use]
     pub fn with_unverified_logs(mut self, url: Option<String>) -> Self {
         self.unverified_logs = url.map(|u| std::sync::Arc::new(ChainClient::new(u)));

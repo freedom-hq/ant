@@ -467,7 +467,9 @@ enum Fallback<'a> {
     /// Read it window by window, however many windows it takes.
     Crawl,
     /// Read it once from this unverified source; the blocks stay
-    /// unconfirmed ([`TransferScan::provisional_since`]).
+    /// unconfirmed ([`TransferScan::provisional_since`], set by the first
+    /// window it serves). If it fails, read the rest window by window
+    /// through the verified route, as [`Fallback::Crawl`].
     Unverified(&'a ChainClient),
     /// Stop with [`ScanStop::TooWide`]: the span can't be confirmed yet.
     GiveUp,
@@ -608,6 +610,13 @@ async fn scan_transfers(
         if confirms && verified && scan.provisional_since.is_none() {
             scan.confirmed_through = Some(scan.scanned_through);
         }
+        // Stamped by the first window the unverified source actually
+        // served, not when the pass turns to it: a read that fails before
+        // serving one leaves the scan as verified as it was.
+        if !verified && scan.provisional_since.is_none() {
+            scan.provisional_since = Some(unix_now());
+            update_wallet_scan(node_eoa, |s| s.provisional = true);
+        }
         update_wallet_scan(node_eoa, |s| {
             if s.state == WalletScanState::Scanning {
                 s.scanned_through = Some(scan.scanned_through);
@@ -655,15 +664,46 @@ async fn scan_transfers(
                     "the verified log source can't serve this span in a few windows; reading it \
                      from the unverified source, to be confirmed later",
                 );
-                scan.provisional_since.get_or_insert_with(unix_now);
-                update_wallet_scan(node_eoa, |s| s.provisional = true);
-                unverified
+                let mut next = rest;
+                let unverified_read = unverified
                     .scan_logs_with(xbzz_token, &topics, rest, head, 1, u64::MAX, |end, logs| {
+                        next = end.saturating_add(1);
                         take(&mut scan, end, logs, false);
                     })
-                    .await
-                    .map(|_| ())
-                    .map_err(ScanStop::Rpc)
+                    .await;
+                match unverified_read {
+                    Ok(_) => Ok(()),
+                    // The unverified source is a shortcut, not a dependency:
+                    // while it's down, read the rest through the verified
+                    // route window by window, as without one, rather than
+                    // failing every pass and leaving a first or long-offline
+                    // scan stuck for as long as it stays down.
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "ant_chain",
+                            from_block = next,
+                            to_block = head,
+                            error = %without_urls(&e.to_string()),
+                            "the unverified log source failed; reading the rest window by window \
+                             through the verified route",
+                        );
+                        client
+                            .scan_logs_with(
+                                xbzz_token,
+                                &topics,
+                                next,
+                                head,
+                                1,
+                                u64::MAX,
+                                |end, logs| {
+                                    take(&mut scan, end, logs, true);
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(ScanStop::Rpc)
+                    }
+                }
             }
             Fallback::GiveUp | Fallback::Crawl => Err(ScanStop::TooWide),
         },
@@ -2554,6 +2594,63 @@ mod tests {
             wallet_scan_status(&EOA).unwrap().state,
             WalletScanState::Confirming
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-F1: the unverified source is a shortcut, not a dependency. While
+    /// it's down, a wide first scan reads the span window by window through
+    /// the verified route, as without one, instead of failing every pass;
+    /// nothing in it is unverified, so it's confirmed and ends `done`.
+    #[tokio::test]
+    async fn a_failing_unverified_source_degrades_to_the_verified_crawl() {
+        const EOA: [u8; 20] = [0x58; 20];
+        let found = [to_cb(45_000_000, [1; 32])];
+        let (client, v, u) = verified_with_unverified(Some(200_000), &found, &found);
+        *u.fail_after.lock().unwrap() = Some(0);
+        let dir = scratch_dir("scan-unverified-down");
+
+        wallet_scan_pending(&EOA);
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .expect("the verified crawl finishes the scan");
+        assert_eq!(scan.transfers.len(), 1);
+        assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(scan.provisional_since, None, "no unverified block in it");
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        assert!(
+            v.ranges.lock().unwrap().len() > 100,
+            "crawled window by window"
+        );
+        assert!(u.ranges.lock().unwrap().is_empty());
+        wallet_scan_done(&EOA);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2-M1: a scan is marked provisional only once the unverified source
+    /// has served a window. One that failed before serving any, with the
+    /// verified crawl then cut short too, saves its verified progress
+    /// unmarked, so a later deploy decision crawls at once instead of
+    /// waiting out `CONFIRM_CRAWL_AFTER_SECS` for a confirmation of nothing.
+    #[tokio::test]
+    async fn a_failed_unverified_read_doesnt_mark_the_scan_provisional() {
+        const EOA: [u8; 20] = [0x59; 20];
+        let (client, v, u) = verified_with_unverified(Some(200_000), &[], &[]);
+        *u.fail_after.lock().unwrap() = Some(0);
+        *v.fail_after.lock().unwrap() = Some(5);
+        let dir = scratch_dir("scan-unverified-unmarked");
+
+        wallet_scan_pending(&EOA);
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap_err();
+        let saved = load_transfer_scan(&dir, GNOSIS, &EOA).expect("progress saved");
+        assert!(saved.scanned_through >= GNOSIS_XBZZ_DEPLOY_BLOCK);
+        assert_eq!(saved.provisional_since, None);
+        assert!(!wallet_scan_status(&EOA).unwrap().provisional);
         std::fs::remove_dir_all(&dir).ok();
     }
 
