@@ -156,6 +156,29 @@ impl ChainClient {
         self
     }
 
+    /// Whether `other` reads through the same route as `self`: the same
+    /// RPC URL, the same host transport (by identity) and the same
+    /// unverified source. Two clients built separately for one RPC (each
+    /// `ant_start_gateway` re-call builds its own) compare equal, so a
+    /// consumer handed a client again can tell a real replacement from a
+    /// re-hand of the one it already reads through.
+    #[must_use]
+    pub fn same_route(&self, other: &ChainClient) -> bool {
+        let transport = match (&self.transport, &other.transport) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                std::ptr::addr_eq(std::sync::Arc::as_ptr(a), std::sync::Arc::as_ptr(b))
+            }
+            _ => false,
+        };
+        let unverified = match (&self.unverified_logs, &other.unverified_logs) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_route(b),
+            _ => false,
+        };
+        self.url == other.url && transport && unverified
+    }
+
     pub(crate) fn unverified_logs(&self) -> Option<&ChainClient> {
         self.unverified_logs.as_deref()
     }
