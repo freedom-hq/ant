@@ -390,6 +390,15 @@ impl ChainInit {
             .stops
     }
 
+    /// Test hook: hold the retry state's lock, so a concurrent
+    /// [`Self::stop_retrying`] blocks until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_retry_lock(&self) -> impl Sized + '_ {
+        self.rediscovery_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// End the background rediscovery retry before its next attempt: the
     /// gateway stopped (`ant_stop_gateway`), so nothing reads its status,
     /// and its RPC may be one the host is replacing. The next start with

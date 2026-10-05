@@ -709,15 +709,22 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
         };
         // Poison-tolerant so a panic elsewhere can't unwind out of this
         // `extern "C"` fn and abort the host (matches `ant_start_gateway`).
-        let task = handle
+        let mut slot = handle
             .gateway_task
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = slot.take();
         // A background rediscovery retry ends with the gateway: nothing
         // reads its status any more, and a restart may bring another RPC.
+        // Bumped while still holding the `gateway_task` guard, which
+        // `ant_start_gateway` holds across its `retry_epoch()` read: a
+        // concurrent start then reads the epoch either before this stop
+        // (and is stopped with the gateway it served before us) or after
+        // it (and keeps its retry loop) — never in between, where its
+        // freshly served gateway would run with its retry loop suppressed.
         #[cfg(feature = "chain")]
         handle.chain_init.stop_retrying();
+        drop(slot);
         match task {
             Some(task) => {
                 task.abort();

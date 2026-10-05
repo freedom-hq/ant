@@ -722,6 +722,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `ant_stop_gateway` must bump the rediscovery stop count while it
+    /// still holds the `gateway_task` guard. `ant_start_gateway` reads
+    /// that count under the same guard, so a start that slipped in
+    /// between the stop's release and its bump would serve a gateway
+    /// whose first rediscovery failure then starts no retry loop. The
+    /// retry lock is held here so the stop parks inside
+    /// `stop_retrying`; the guard must still be held at that point.
+    #[cfg(feature = "chain")]
+    #[test]
+    fn gateway_stop_bumps_the_retry_epoch_under_the_gateway_guard() {
+        let (handle, _peers) = handle_for_test();
+        *handle.gateway_task.lock().unwrap() =
+            Some(handle.runtime.spawn(std::future::pending::<()>()));
+        let before = handle.chain_init.retry_epoch();
+
+        let retry = handle.chain_init.hold_retry_lock();
+        let addr = std::ptr::from_ref(&handle) as usize;
+        let stopper = std::thread::spawn(move || unsafe {
+            crate::ant_stop_gateway(addr as *const AntHandle)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match handle.gateway_task.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(slot) if slot.is_none() => panic!(
+                    "ant_stop_gateway released the gateway guard before bumping the retry epoch"
+                ),
+                Ok(_) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => panic!("poisoned"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stop never took the guard"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Still parked in `stop_retrying` with the guard held.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            handle.gateway_task.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(retry);
+        assert!(stopper.join().unwrap(), "a running gateway was stopped");
+        assert_eq!(handle.chain_init.retry_epoch(), before + 1);
+        assert!(handle.gateway_task.lock().unwrap().is_none());
+    }
+
     #[test]
     fn null_handle_is_rejected() {
         let rc = unsafe {
