@@ -771,6 +771,97 @@ mod tests {
         assert!(handle.gateway_task.lock().unwrap().is_none());
     }
 
+    /// R4-M1: a rediscovery left `retrying` when the gateway stops must
+    /// not be served frozen by a later start without a `gnosis_rpc`
+    /// (which runs no rediscovery and so never moves it on): `/health`
+    /// then has no `walletScan` at all. Real FFI entry points and a real
+    /// gateway, read over HTTP.
+    #[cfg(feature = "chain")]
+    #[test]
+    fn stop_then_rpc_less_start_serves_no_stale_wallet_scan() {
+        use ant_chain::discover::{
+            wallet_scan_failed, wallet_scan_forget, wallet_scan_status, WalletScanState,
+        };
+        use std::io::{Read, Write};
+        const EOA: [u8; 20] = [0x5c; 20];
+        let (mut handle, peers) = handle_for_test();
+        handle.eth = EOA;
+        handle.signing_secret = [1u8; 32];
+        // `/health` looks `walletScan` up by the identity's address.
+        peers.1.send_modify(|snap| {
+            snap.identity.eth_address = format!("0x{}", hex::encode(EOA));
+        });
+        handle.chain_init = std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(
+            ant_p2p::UploadRuntime {
+                issuers: std::sync::Mutex::new(std::collections::HashMap::new()),
+                stamp_key: [0u8; 32],
+                batch_owner: EOA,
+                postage_dir: std::path::PathBuf::from("/nonexistent/postage"),
+            },
+        )));
+
+        // A start with an RPC whose first rediscovery failed.
+        *handle.gateway_task.lock().unwrap() =
+            Some(handle.runtime.spawn(std::future::pending::<()>()));
+        handle.chain_init.note_pending();
+        wallet_scan_failed(&EOA, "rpc down");
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Retrying
+        );
+
+        assert!(unsafe { crate::ant_stop_gateway(std::ptr::from_ref(&handle)) });
+        assert_eq!(
+            wallet_scan_status(&EOA),
+            None,
+            "stop drops the stale status"
+        );
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = CString::new(format!("127.0.0.1:{port}")).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe {
+            crate::ant_start_gateway(
+                std::ptr::from_ref(&handle),
+                addr.as_ptr(),
+                true,
+                std::ptr::null(),
+                &raw mut err,
+            )
+        };
+        assert!(ok && err.is_null(), "{:?}", unsafe {
+            (!err.is_null()).then(|| std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned())
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                break out;
+            }
+            assert!(std::time::Instant::now() < deadline, "gateway never served");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(!body.contains("walletScan"), "{body}");
+
+        // A later start with an RPC announces the rediscovery again.
+        handle.chain_init.note_pending();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Pending
+        );
+        unsafe { crate::ant_stop_gateway(std::ptr::from_ref(&handle)) };
+        wallet_scan_forget(&EOA);
+    }
+
     #[test]
     fn null_handle_is_rejected() {
         let rc = unsafe {

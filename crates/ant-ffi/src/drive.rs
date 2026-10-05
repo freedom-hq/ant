@@ -311,15 +311,19 @@ impl ChainInit {
     }
 
     /// Report a rediscovery that will run (`/health.walletScan` =
-    /// `pending`) unless one already finished for this handle. Called
-    /// before the gateway serves, so a host never reads the chain as
-    /// ready with no rediscovery reported. A run in flight holds the
-    /// flag's lock and reports for itself.
+    /// `pending`) unless one already finished for this handle (then
+    /// `done`). Called before the gateway serves, so a host never reads
+    /// the chain as ready with no rediscovery reported. A run in flight
+    /// holds the flag's lock and reports for itself — unless a gateway
+    /// stop dropped its status ([`Self::stop_retrying`]), so an
+    /// untracked status is announced as `pending` then too.
     pub(crate) fn note_pending(&self) {
-        if let Ok(done) = self.batches_rediscovered.try_lock() {
-            if !*done {
-                ant_chain::discover::wallet_scan_pending(&self.upload.batch_owner);
-            }
+        use ant_chain::discover::{wallet_scan_pending, wallet_scan_track, WalletScanState};
+        let owner = &self.upload.batch_owner;
+        match self.batches_rediscovered.try_lock() {
+            Ok(done) if *done => wallet_scan_track(owner, WalletScanState::Done),
+            Ok(_) => wallet_scan_pending(owner),
+            Err(_) => wallet_scan_track(owner, WalletScanState::Pending),
         }
     }
 
@@ -403,6 +407,11 @@ impl ChainInit {
     /// gateway stopped (`ant_stop_gateway`), so nothing reads its status,
     /// and its RPC may be one the host is replacing. The next start with
     /// an RPC runs its own attempt and, if that fails, a new loop.
+    ///
+    /// An unfinished `/health.walletScan` status is dropped with it: a
+    /// next start *without* an RPC runs no rediscovery and must not serve
+    /// a frozen `retrying`/`scanning` nothing will move on; a next start
+    /// with one announces `pending` again ([`Self::note_pending`]).
     pub(crate) fn stop_retrying(&self) {
         let mut retry = self
             .rediscovery_retry
@@ -410,6 +419,7 @@ impl ChainInit {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         retry.chain = None;
         retry.stops += 1;
+        ant_chain::discover::wallet_scan_abandon(&self.upload.batch_owner);
     }
 
     /// Step 3 of [`Self::run`]: adopt the chequebook without spending,
@@ -480,6 +490,9 @@ impl ChainInit {
         let owner = self.upload.batch_owner;
         let mut rediscovered = self.batches_rediscovered.lock().await;
         if *rediscovered {
+            // A `pending` announced while an attempt that then succeeded
+            // held the lock (see `note_pending`) ends here.
+            ant_chain::discover::wallet_scan_done(&owner);
             return true;
         }
         let found = match owned_batches(chain, &owner, data_dir, false, Some(&owner)).await {
@@ -4512,6 +4525,73 @@ mod chain_tests {
             wallet_scan_status(&EOA).unwrap().state,
             WalletScanState::Done
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway stop drops an unfinished `/health.walletScan` status
+    /// (nothing retries it until the next start with an RPC) but keeps a
+    /// finished one; a next start with an RPC announces `pending` again,
+    /// even while an attempt from before the stop still holds the
+    /// rediscovery lock, and that `pending` ends once the lock frees.
+    #[tokio::test]
+    async fn gateway_stop_drops_an_unfinished_wallet_scan_status() {
+        use ant_chain::discover::{wallet_scan_failed, wallet_scan_status, WalletScanState};
+        const EOA: [u8; 20] = [0x7a; 20];
+        let dir = scratch("chain-init-stop-status");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = super::ChainInit::new(upload);
+
+        init.note_pending();
+        wallet_scan_failed(&EOA, "rpc down");
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Retrying
+        );
+        init.stop_retrying();
+        assert_eq!(wallet_scan_status(&EOA), None);
+        // An in-flight attempt's late failure doesn't bring it back.
+        wallet_scan_failed(&EOA, "rpc down");
+        assert_eq!(wallet_scan_status(&EOA), None);
+
+        // A start while that attempt still holds the lock re-announces.
+        {
+            let mut held = init.batches_rediscovered.lock().await;
+            init.note_pending();
+            assert_eq!(
+                wallet_scan_status(&EOA).unwrap().state,
+                WalletScanState::Pending
+            );
+            *held = true; // ...and the attempt succeeded.
+        }
+        // The new start's own run finds it done and says so.
+        let script = std::sync::Arc::new(ChainScript::new(EOA));
+        let (cmd_tx, _node) = fake_node();
+        assert!(init.rediscover_owned(&client(&script), &cmd_tx, &dir).await);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+
+        // A finished status survives a stop; a later start keeps it.
+        init.stop_retrying();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        ant_chain::discover::wallet_scan_forget(&EOA);
+        init.note_pending();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Done
+        );
+        ant_chain::discover::wallet_scan_forget(&EOA);
         std::fs::remove_dir_all(&dir).ok();
     }
 

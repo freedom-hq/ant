@@ -345,6 +345,41 @@ pub fn wallet_scan_pending(node_eoa: &[u8; 20]) {
     }
 }
 
+/// Start tracking `node_eoa` in `state` if nothing is tracked for it;
+/// a tracked status is left alone. For an embedder re-announcing a
+/// rediscovery whose earlier status it dropped ([`wallet_scan_abandon`]).
+pub fn wallet_scan_track(node_eoa: &[u8; 20], state: WalletScanState) {
+    WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(*node_eoa)
+        .or_insert(WalletScanStatus {
+            state,
+            from: None,
+            scanned_through: None,
+            head: None,
+            error: None,
+        });
+}
+
+/// The embedder stopped rediscovering for `node_eoa` in the background
+/// (its gateway stopped, ending the retry loop): drop an unfinished
+/// status, so a later start without a logs RPC reports none instead of
+/// a `retrying` nothing will retry. A finished one (`done`) stays —
+/// it's still true. Updates from an attempt still in flight are then
+/// ignored until the status is tracked again.
+pub fn wallet_scan_abandon(node_eoa: &[u8; 20]) {
+    let mut scans = WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if scans
+        .get(node_eoa)
+        .is_some_and(|s| s.state != WalletScanState::Done)
+    {
+        scans.remove(node_eoa);
+    }
+}
+
 /// The rediscovery for `node_eoa` finished: its batches are registered.
 pub fn wallet_scan_done(node_eoa: &[u8; 20]) {
     update_wallet_scan(node_eoa, |s| {

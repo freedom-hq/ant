@@ -154,7 +154,8 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// A failed rediscovery is also retried in the background with backoff
 /// (15 s, doubling, at most 5 minutes) until it succeeds, through the
 /// latest start's `gnosis_rpc`, while the gateway runs: it ends at
-/// [`ant_stop_gateway`]. `/health.walletScan` reports where it stands.
+/// [`ant_stop_gateway`]. `/health.walletScan` reports where it stands
+/// (a stop drops it unless `done`).
 ///
 /// # Safety
 ///
@@ -695,7 +696,10 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 /// Returns `true` if a gateway was running and was aborted, `false` if
 /// none was running (or `handle` is null). Safe to call repeatedly. A
 /// background rediscovery retry stops with it, before its next attempt;
-/// the next start with a `gnosis_rpc` tries again.
+/// the next start with a `gnosis_rpc` tries again. An unfinished
+/// `/health.walletScan` (`pending`, `scanning`, `retrying`) is dropped with it,
+/// so a next start without a `gnosis_rpc` reports none rather than a
+/// status nothing moves on; a finished (`done`) one is kept.
 ///
 /// # Safety
 ///
