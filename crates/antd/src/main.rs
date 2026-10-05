@@ -978,6 +978,11 @@ async fn main() -> Result<()> {
     // stop answering the chain-initializing `503` from here on, and
     // `/health.chainReady` flips to `true`. `set` only fails if the
     // slot were already filled, which nothing else does.
+    // `/health.walletScan` reads `pending` from before `chainReady`, so a
+    // host never sees the chain ready with no rediscovery reported.
+    if rediscover_later.is_some() {
+        ant_chain::discover::wallet_scan_pending(&eth);
+    }
     let _ = gateway_chain_state.set(ant_gateway::GatewayChainState {
         light_mode,
         chain: chain_ctx,
@@ -987,49 +992,72 @@ async fn main() -> Result<()> {
     // owns on chain but not on disk, then — if settlement is still off —
     // the chequebook resolution's rediscovery and auto-deploy steps, as a
     // stamp buy would run them. Both read the saved transfer scan, so only
-    // the first start scans the full history.
+    // the first start scans the full history. A failed batch rediscovery
+    // is retried with backoff (its scan keeps its progress) until it
+    // succeeds; `/health.walletScan` reports each state.
     if let Some(logs_rpc) = rediscover_later {
         let settlement_on_buy = Arc::clone(&settlement_on_buy);
         let postage_contract = opt.postage_contract.clone();
         let data_dir = data_dir.clone();
-        let settle = matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
-        let full_rescan = opt.rescan_chain_history;
+        let mut settle = matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
+        let mut full_rescan = opt.rescan_chain_history;
         tokio::spawn(async move {
-            if let Some(rt) = upload_for_rediscovery {
-                let client = ant_chain::ChainClient::new(logs_rpc);
-                let found = rediscover_batches(
-                    &client,
-                    &postage_contract,
-                    &rt.batch_owner,
-                    &data_dir,
-                    full_rescan,
-                    &|id| {
-                        rt.issuers
+            let client = ant_chain::ChainClient::new(logs_rpc);
+            for attempt in 0u32.. {
+                let rediscovered = match &upload_for_rediscovery {
+                    Some(rt) => rediscover_batches(
+                        &client,
+                        &postage_contract,
+                        &rt.batch_owner,
+                        &data_dir,
+                        &mut full_rescan,
+                        Some(&eth),
+                        &|id| {
+                            rt.issuers
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .contains_key(id)
+                        },
+                    )
+                    .await
+                    .map(|found| {
+                        let added = found.len();
+                        let mut issuers = rt
+                            .issuers
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .contains_key(id)
-                    },
-                )
-                .await;
-                let added = found.len();
-                let mut issuers = rt
-                    .issuers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for (id, issuer) in found {
-                    issuers.entry(id).or_insert(issuer);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for (id, issuer) in found {
+                            issuers.entry(id).or_insert(issuer);
+                        }
+                        tracing::info!(
+                            target: "antd",
+                            rediscovered = added,
+                            batches = issuers.len(),
+                            "background batch rediscovery finished; /stamps lists every batch found",
+                        );
+                    }),
+                    None => Ok(()),
+                };
+                match &rediscovered {
+                    Ok(()) => ant_chain::discover::wallet_scan_done(&eth),
+                    Err(e) => ant_chain::discover::wallet_scan_failed(&eth, &e.to_string()),
                 }
-                tracing::info!(
+                // Settlement once, after the first attempt, through the
+                // coalescer like a stamp buy: a buy that already queued a
+                // run covers this one. Its own scan failing leaves it off
+                // without deploying (see `resolve_chequebook`); the next
+                // buy retries it.
+                if std::mem::take(&mut settle) && settlement_on_buy.pending.request() {
+                    settlement_on_buy.run().await;
+                }
+                let Err(e) = rediscovered else { break };
+                let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
+                tracing::warn!(
                     target: "antd",
-                    rediscovered = added,
-                    batches = issuers.len(),
-                    "background batch rediscovery finished; /stamps lists every batch found",
+                    "postage batch rediscovery scan failed: {e}; retrying in {}s",
+                    delay.as_secs(),
                 );
-            }
-            // Through the coalescer, like a stamp buy: a buy that
-            // already queued a run covers this one.
-            if settle && settlement_on_buy.pending.request() {
-                settlement_on_buy.run().await;
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -1769,16 +1797,23 @@ async fn build_upload_runtime(
     if !rediscover_later {
         if let Some(logs_rpc) = logs_rpc {
             let client = ant_chain::ChainClient::new(logs_rpc);
-            let found = rediscover_batches(
+            match rediscover_batches(
                 &client,
                 &postage_contract,
                 &batch_owner,
                 &data_dir,
-                full_rescan,
+                &mut { full_rescan },
+                None,
                 &|id| issuers.contains_key(id),
             )
-            .await;
-            issuers.extend(found);
+            .await
+            {
+                Ok(found) => issuers.extend(found),
+                Err(e) => tracing::warn!(
+                    target: "antd",
+                    "postage batch rediscovery scan failed: {e}; continuing without it",
+                ),
+            }
         }
     }
 
@@ -1811,24 +1846,40 @@ async fn build_upload_runtime(
 /// as issuers (carrying over bee's counters when a `stamperstore` is
 /// present). Reads the saved transfer scan, so only the first start scans
 /// the full history (#118); with `full_rescan` (`--rescan-chain-history`)
-/// it reads the whole history again and replaces the saved scan.
-/// Best-effort: a failed scan is logged and finds nothing.
+/// it reads the whole history again and replaces the saved scan. Once that
+/// rescan has completed, `full_rescan` is cleared, so a retry after a
+/// later step failed only continues the saved scan; a rescan that failed
+/// part-way is continued by the next one, not restarted. With
+/// `status_key` (the node's address) the scan reports to
+/// `/health.walletScan`. A batch that can't be opened is logged and
+/// skipped; a failed chain read is the error.
 async fn rediscover_batches(
     client: &ant_chain::ChainClient,
     postage_contract: &str,
     owner: &[u8; 20],
     data_dir: &Path,
-    full_rescan: bool,
+    full_rescan: &mut bool,
+    status_key: Option<&[u8; 20]>,
     known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
-) -> Vec<([u8; 32], ant_postage::StampIssuer)> {
-    let scan = if full_rescan {
+) -> Result<Vec<([u8; 32], ant_postage::StampIssuer)>, ant_chain::RpcError> {
+    let scan = if let Some(status_key) = status_key {
+        ant_chain::discover::rediscovery_scan(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+            *full_rescan,
+            status_key,
+        )
+        .await?
+    } else if *full_rescan {
         ant_chain::discover::rescan_transfer_history(
             client,
             ant_chain::GNOSIS_BZZ_TOKEN,
             owner,
             data_dir,
         )
-        .await
+        .await?
     } else {
         ant_chain::discover::refresh_transfer_scan(
             client,
@@ -1836,22 +1887,10 @@ async fn rediscover_batches(
             owner,
             data_dir,
         )
-        .await
+        .await?
     };
-    let found = match scan {
-        Ok(scan) => ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await,
-        Err(e) => Err(e),
-    };
-    let found = match found {
-        Ok(found) => found,
-        Err(e) => {
-            tracing::warn!(
-                target: "antd",
-                "postage batch rediscovery scan failed: {e}; continuing without it",
-            );
-            return Vec::new();
-        }
-    };
+    *full_rescan = false;
+    let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
     let stamperstore = data_dir.join("stamperstore");
     let postage_dir = data_dir.join("postage");
     let mut out = Vec::new();
@@ -1880,7 +1919,7 @@ async fn rediscover_batches(
             ),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on

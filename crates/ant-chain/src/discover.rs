@@ -271,6 +271,188 @@ fn persist_transfer_scan(data_dir: &std::path::Path, scan: &TransferScan) {
     }
 }
 
+/// Where a wallet's rediscovery stands, for `/health.walletScan`: an
+/// embedder that rediscovers in the background reports it, so a host
+/// can show "looking for your existing storage" instead of offering a
+/// plan the wallet may already have.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletScanStatus {
+    pub state: WalletScanState,
+    /// The block this run of the transfer scan started or resumed from.
+    pub from: Option<u64>,
+    /// Scanned up to and including this block; `None` until the first
+    /// window is read.
+    pub scanned_through: Option<u64>,
+    /// The chain head this run scans up to.
+    pub head: Option<u64>,
+    /// Why the last attempt failed. Only in [`WalletScanState::Retrying`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalletScanState {
+    /// A rediscovery will run but hasn't started reading the chain.
+    Pending,
+    /// Reading the wallet's history.
+    Scanning,
+    /// The last attempt failed; the embedder retries in the background.
+    Retrying,
+    /// The scan is up to date and the batches it found are registered.
+    /// Later scans (a stamp buy's chequebook check) don't leave it.
+    Done,
+}
+
+/// The rediscovery status per wallet, for this process. Keyed by the
+/// node's address (what `/health` looks up), which isn't always the
+/// wallet the rediscovery scans: antd's legacy `--postage-owner-key`
+/// scans that key's address, and reports under the node's.
+static WALLET_SCANS: std::sync::Mutex<BTreeMap<[u8; 20], WalletScanStatus>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Change `node_eoa`'s status, if a rediscovery is tracked for it.
+fn update_wallet_scan(node_eoa: &[u8; 20], change: impl FnOnce(&mut WalletScanStatus)) {
+    let mut scans = WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(status) = scans.get_mut(node_eoa) {
+        change(status);
+    }
+}
+
+/// A rediscovery for `node_eoa` is about to run. Call it before the
+/// gateway reports `chainReady`, so a host never sees the chain ready
+/// with no scan reported and briefly offers storage plans. A
+/// rediscovery already running (or retrying) is left as it is.
+pub fn wallet_scan_pending(node_eoa: &[u8; 20]) {
+    let mut scans = WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tracked = scans.get(node_eoa).map(|s| s.state);
+    if matches!(tracked, None | Some(WalletScanState::Done)) {
+        scans.insert(
+            *node_eoa,
+            WalletScanStatus {
+                state: WalletScanState::Pending,
+                from: None,
+                scanned_through: None,
+                head: None,
+                error: None,
+            },
+        );
+    }
+}
+
+/// Start tracking `node_eoa` in `state` if nothing is tracked for it;
+/// a tracked status is left alone. For an embedder re-announcing a
+/// rediscovery whose earlier status it dropped ([`wallet_scan_abandon`]).
+pub fn wallet_scan_track(node_eoa: &[u8; 20], state: WalletScanState) {
+    WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(*node_eoa)
+        .or_insert(WalletScanStatus {
+            state,
+            from: None,
+            scanned_through: None,
+            head: None,
+            error: None,
+        });
+}
+
+/// The embedder stopped rediscovering for `node_eoa` in the background
+/// (its gateway stopped, ending the retry loop): drop an unfinished
+/// status, so a later start without a logs RPC reports none instead of
+/// a `retrying` nothing will retry. A finished one (`done`) stays —
+/// it's still true. Updates from an attempt still in flight are then
+/// ignored until the status is tracked again.
+pub fn wallet_scan_abandon(node_eoa: &[u8; 20]) {
+    let mut scans = WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if scans
+        .get(node_eoa)
+        .is_some_and(|s| s.state != WalletScanState::Done)
+    {
+        scans.remove(node_eoa);
+    }
+}
+
+/// The rediscovery for `node_eoa` finished: its batches are registered.
+pub fn wallet_scan_done(node_eoa: &[u8; 20]) {
+    update_wallet_scan(node_eoa, |s| {
+        s.state = WalletScanState::Done;
+        s.error = None;
+    });
+}
+
+/// The rediscovery for `node_eoa` failed and will be retried after
+/// [`rediscovery_retry_delay`].
+pub fn wallet_scan_failed(node_eoa: &[u8; 20], error: &str) {
+    update_wallet_scan(node_eoa, |s| {
+        if s.state != WalletScanState::Done {
+            s.state = WalletScanState::Retrying;
+            s.error = Some(without_urls(error));
+        }
+    });
+}
+
+/// `error` with every URL replaced by `<url>`. RPC URLs often carry an
+/// API key, and `/health` is readable by any origin the CORS list
+/// allows; the logs keep the full text.
+fn without_urls(error: &str) -> String {
+    error
+        .split(' ')
+        .map(|word| match word.find("://") {
+            Some(scheme_end) => {
+                let start = word[..scheme_end]
+                    .rfind(|c: char| !c.is_ascii_alphanumeric())
+                    .map_or(0, |i| i + 1);
+                let end = word
+                    .rfind(|c: char| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
+                    .map_or(word.len(), |i| i + 1)
+                    .max(scheme_end + 3);
+                format!("{}<url>{}", &word[..start], &word[end..])
+            }
+            None => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Stop tracking `node_eoa`'s rediscovery: an embedder whose node for it
+/// shut down (ant-ffi's `ant_shutdown`) calls this, so a later node for
+/// the same account doesn't serve the old one's `scanning`/`retrying`.
+pub fn wallet_scan_forget(node_eoa: &[u8; 20]) {
+    WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(node_eoa);
+}
+
+/// `node_eoa`'s rediscovery status, or `None` when this process doesn't
+/// rediscover for it in the background.
+#[must_use]
+pub fn wallet_scan_status(node_eoa: &[u8; 20]) -> Option<WalletScanStatus> {
+    WALLET_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(node_eoa)
+        .cloned()
+}
+
+/// How long to wait before retrying a failed rediscovery: 15 s,
+/// doubling, at most 5 minutes. A failed scan keeps its progress, so a
+/// retry only reads what's left.
+#[must_use]
+pub fn rediscovery_retry_delay(attempt: u32) -> std::time::Duration {
+    const FIRST: u64 = 15;
+    const MAX: u64 = 300;
+    std::time::Duration::from_secs(FIRST.saturating_mul(1u64 << attempt.min(10)).min(MAX))
+}
+
 /// Scan the node wallet's xBZZ transfers from `from_block` to the head,
 /// continuing `previous` (same wallet) from where it stopped instead of
 /// starting over. Its transfers in the rescan tail are dropped and read
@@ -282,6 +464,10 @@ fn persist_transfer_scan(data_dir: &std::path::Path, scan: &TransferScan) {
 /// where it got, so a confirming pass cut short and resumed (a first scan
 /// interrupted by the app going to the background) only leaves the blocks
 /// the resumed part read unconfirmed, not the whole history.
+/// With `report`, the scan's progress and failure are reported as the
+/// rediscovery status under that key (see [`rediscovery_scan`]); other
+/// scans (a stamp buy's chequebook check) leave the status alone. A
+/// failed scan hands back what it read ([`ScanFailed::progress`]).
 #[allow(clippy::too_many_arguments)]
 async fn scan_transfers(
     client: &ChainClient,
@@ -292,8 +478,22 @@ async fn scan_transfers(
     previous: Option<TransferScan>,
     save_to: Option<&std::path::Path>,
     confirms: bool,
-) -> Result<TransferScan, RpcError> {
-    let head = client.eth_block_number().await?;
+    report: Option<&[u8; 20]>,
+) -> Result<TransferScan, ScanFailed> {
+    let head = match client.eth_block_number().await {
+        Ok(head) => head,
+        Err(error) => {
+            return Err(ScanFailed {
+                error,
+                progress: previous,
+            })
+        }
+    };
+    let report_status = |change: &dyn Fn(&mut WalletScanStatus)| {
+        if let Some(key) = report {
+            update_wallet_scan(key, change);
+        }
+    };
     let mut scan = match previous.filter(|p| {
         p.node_eoa == *node_eoa
             && p.chain_id == chain_id
@@ -316,6 +516,17 @@ async fn scan_transfers(
     // Blocks up to here count as scanned once read; the tail above is
     // read again next time.
     let settled = head.saturating_sub(RESCAN_TAIL);
+    report_status(&|s| {
+        if s.state != WalletScanState::Done {
+            *s = WalletScanStatus {
+                state: WalletScanState::Scanning,
+                from: Some(start),
+                scanned_through: None,
+                head: Some(head),
+                error: None,
+            };
+        }
+    });
     if start <= head {
         let topics = json!([
             format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC)),
@@ -339,6 +550,23 @@ async fn scan_transfers(
                 if confirms {
                     scan.confirmed_through = Some(scan.scanned_through);
                 }
+                // `pending` here is a status a gateway stop dropped and a
+                // restart re-tracked while this attempt kept running
+                // (ant-ffi's `note_pending`): it is scanning, so say so.
+                report_status(&|s| {
+                    if matches!(
+                        s.state,
+                        WalletScanState::Pending | WalletScanState::Scanning
+                    ) {
+                        *s = WalletScanStatus {
+                            state: WalletScanState::Scanning,
+                            from: Some(start),
+                            scanned_through: Some(scan.scanned_through),
+                            head: Some(head),
+                            error: None,
+                        };
+                    }
+                });
                 if let Some(dir) = save_to {
                     if saved_at.elapsed() >= SCAN_SAVE_EVERY {
                         persist_transfer_scan(dir, &scan);
@@ -347,12 +575,55 @@ async fn scan_transfers(
                 }
             })
             .await;
-        if let (Err(_), Some(dir)) = (&scanned, save_to) {
-            persist_transfer_scan(dir, &scan);
+        if let Err(error) = scanned {
+            if let Some(dir) = save_to {
+                persist_transfer_scan(dir, &scan);
+            }
+            return Err(ScanFailed {
+                error,
+                progress: Some(scan),
+            });
         }
-        scanned?;
     }
     Ok(scan)
+}
+
+/// A [`scan_transfers`] that failed, with what it had read by then.
+struct ScanFailed {
+    error: RpcError,
+    progress: Option<TransferScan>,
+}
+
+/// The node wallet's transfer scan for a background rediscovery, which
+/// reports its progress and failure to `/health.walletScan` under
+/// `status_key` (the node's address; see [`wallet_scan_pending`]). Like
+/// [`refresh_transfer_scan`], or with `full_rescan` like
+/// [`rescan_transfer_history`] — including resuming a full rescan an
+/// earlier attempt in this process didn't finish. Only the rediscovery
+/// reports: a stamp buy's chequebook check scanning the same wallet
+/// meanwhile doesn't hide a `retrying` behind its own `scanning`.
+pub async fn rediscovery_scan(
+    client: &ChainClient,
+    xbzz_token: &str,
+    node_eoa: &[u8; 20],
+    data_dir: &std::path::Path,
+    full_rescan: bool,
+    status_key: &[u8; 20],
+) -> Result<TransferScan, RpcError> {
+    let mode = if full_rescan {
+        ScanMode::Full
+    } else {
+        ScanMode::Continue
+    };
+    update_transfer_scan(
+        client,
+        xbzz_token,
+        node_eoa,
+        data_dir,
+        mode,
+        Some(status_key),
+    )
+    .await
 }
 
 /// Bring the node wallet's transfer scan in `data_dir` up to the chain
@@ -372,7 +643,15 @@ pub async fn refresh_transfer_scan(
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
 ) -> Result<TransferScan, RpcError> {
-    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Continue).await
+    update_transfer_scan(
+        client,
+        xbzz_token,
+        node_eoa,
+        data_dir,
+        ScanMode::Continue,
+        None,
+    )
+    .await
 }
 
 /// [`refresh_transfer_scan`], but reading the whole history from the xBZZ
@@ -387,15 +666,27 @@ pub async fn refresh_transfer_scan(
 /// The saved scan is only replaced once the rescan completes: a rescan
 /// that fails part-way leaves the previous scan as it was (its progress
 /// isn't saved over it), so the next start continues that one rather than
-/// resuming a long scan from a partial cursor.
+/// resuming a long scan from a partial cursor. Within the process, the
+/// failed rescan's progress is kept in memory instead: the next rescan of
+/// the same wallet (antd's retry, another `ant_storage_discover_full`)
+/// continues it rather than reading the history from the deploy block
+/// again.
 pub async fn rescan_transfer_history(
     client: &ChainClient,
     xbzz_token: &str,
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
 ) -> Result<TransferScan, RpcError> {
-    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Full).await
+    update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Full, None).await
 }
+
+/// Full rescans that failed part-way in this process, by data dir, chain
+/// and wallet: what they had read, all of it from the deploy block on.
+/// The next full rescan of the same wallet continues from it.
+#[allow(clippy::type_complexity)]
+static PARTIAL_RESCANS: std::sync::Mutex<
+    BTreeMap<(std::path::PathBuf, u64, [u8; 20]), TransferScan>,
+> = std::sync::Mutex::new(BTreeMap::new());
 
 /// How [`update_transfer_scan`] treats the saved scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +706,7 @@ async fn update_transfer_scan(
     node_eoa: &[u8; 20],
     data_dir: &std::path::Path,
     mode: ScanMode,
+    report: Option<&[u8; 20]>,
 ) -> Result<TransferScan, RpcError> {
     // One scan at a time in this process: a stamp buy's chequebook check
     // that lands during the startup batch rediscovery waits for it, then
@@ -428,9 +720,15 @@ async fn update_transfer_scan(
     // re-read only rewinds it to its confirmed mark, which its progress
     // then carries forward (see below).
     let replacing = saved.is_some() && mode == ScanMode::Full;
+    let partial_key = (data_dir.to_path_buf(), chain_id, *node_eoa);
     let previous = match mode {
         ScanMode::Continue => saved,
-        ScanMode::Full => None,
+        // A full rescan an earlier attempt cut short: every block it read
+        // was read from the deploy block on, so it continues from there.
+        ScanMode::Full => PARTIAL_RESCANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&partial_key),
         // Drop what the routine scans read above the confirmed mark; the
         // scan below reads those blocks again.
         ScanMode::Confirm => saved.and_then(|mut p| {
@@ -439,10 +737,11 @@ async fn update_transfer_scan(
             Some(p)
         }),
     };
-    // A scan read in one pass from the deploy block confirms what it read;
-    // a continued one keeps the mark it had, and a confirming re-read of
-    // the blocks since the mark moves it up to what it read.
-    let confirms = previous.is_none() || mode == ScanMode::Confirm;
+    // A scan read in one pass from the deploy block confirms what it read
+    // (so does a full rescan resuming its own partial pass); a continued
+    // one keeps the mark it had, and a confirming re-read of the blocks
+    // since the mark moves it up to what it read.
+    let confirms = previous.is_none() || mode != ScanMode::Continue;
     let from = previous
         .as_ref()
         .map_or(GNOSIS_XBZZ_DEPLOY_BLOCK, |p| p.scanned_through + 1);
@@ -464,8 +763,29 @@ async fn update_transfer_scan(
         previous,
         (!replacing).then_some(data_dir),
         confirms,
+        report,
     )
-    .await?;
+    .await
+    .map_err(|ScanFailed { error, progress }| {
+        // A tracked rediscovery retries; until it does, it's retrying,
+        // not scanning.
+        if let Some(key) = report {
+            update_wallet_scan(key, |s| {
+                if s.state == WalletScanState::Scanning {
+                    s.state = WalletScanState::Retrying;
+                    s.error = Some(without_urls(&error.to_string()));
+                }
+            });
+        }
+        // Keep a full rescan's progress for the next one to continue.
+        if let (ScanMode::Full, Some(progress)) = (mode, progress) {
+            PARTIAL_RESCANS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(partial_key.clone(), progress);
+        }
+        error
+    })?;
     if confirms {
         scan.confirmed_through = Some(scan.scanned_through);
     }
@@ -516,8 +836,15 @@ pub async fn find_owned_chequebook(
         confirmed_through = ?scan.confirmed_through,
         "no chequebook in the saved transfer scan; reading the unconfirmed blocks again before deploying one",
     );
-    let scan =
-        update_transfer_scan(client, xbzz_token, node_eoa, data_dir, ScanMode::Confirm).await?;
+    let scan = update_transfer_scan(
+        client,
+        xbzz_token,
+        node_eoa,
+        data_dir,
+        ScanMode::Confirm,
+        None,
+    )
+    .await?;
     owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
 }
 
@@ -1053,9 +1380,10 @@ mod tests {
         from_block: u64,
     ) -> Result<Vec<DiscoveredBatch>, RpcError> {
         let scan = scan_transfers(
-            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false, None,
         )
-        .await?;
+        .await
+        .map_err(|f| f.error)?;
         owned_batches_in(client, postage_contract, &scan).await
     }
 
@@ -1069,9 +1397,10 @@ mod tests {
         from_block: u64,
     ) -> Result<Option<[u8; 20]>, RpcError> {
         let scan = scan_transfers(
-            client, 100, xbzz_token, node_eoa, from_block, None, None, false,
+            client, 100, xbzz_token, node_eoa, from_block, None, None, false, None,
         )
-        .await?;
+        .await
+        .map_err(|f| f.error)?;
         owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
     }
 
@@ -1521,6 +1850,8 @@ mod tests {
         /// How far behind `head` the backend serving `eth_getLogs` is: it
         /// answers `[]` for the blocks it hasn't seen, no error.
         logs_lag: std::sync::atomic::AtomicU64,
+        /// Run after each `eth_getLogs` is answered.
+        on_logs: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ChainTransport for GrowingChain {
@@ -1576,6 +1907,9 @@ mod tests {
                         *n -= 1;
                     }
                     self.ranges.lock().unwrap().push((from, to));
+                    if let Some(hook) = self.on_logs.lock().unwrap().as_ref() {
+                        hook();
+                    }
                     let seen_up_to = self.head.load(std::sync::atomic::Ordering::SeqCst)
                         - self.logs_lag.load(std::sync::atomic::Ordering::SeqCst);
                     let logs: Vec<_> = self
@@ -1835,6 +2169,237 @@ mod tests {
         let ranges = chain.ranges.lock().unwrap().clone();
         assert!(ranges.iter().all(|r| r.0 > cut), "resumed: {ranges:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rediscovery status a host reads from `/health.walletScan`:
+    /// untracked until an embedder announces a rediscovery, then pending,
+    /// scanning with progress, and done once the embedder says so. A
+    /// later scan (a stamp buy's chequebook check) doesn't leave done.
+    /// Each status test uses its own wallet: the registry is
+    /// process-wide.
+    #[tokio::test]
+    async fn wallet_scan_status_follows_the_rediscovery() {
+        const EOA: [u8; 20] = [0x51; 20];
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-status");
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet_scan_status(&EOA),
+            None,
+            "untracked without a rediscovery"
+        );
+
+        wallet_scan_pending(&EOA);
+        let pending = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(pending.state, WalletScanState::Pending);
+        assert_eq!(pending.head, None);
+
+        // Behind by a thousand blocks: the scan resumes and reports it.
+        chain
+            .head
+            .store(HEAD + 1_000, std::sync::atomic::Ordering::SeqCst);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap(),
+            WalletScanStatus {
+                state: WalletScanState::Scanning,
+                from: Some(HEAD - RESCAN_TAIL + 1),
+                scanned_through: Some(HEAD + 1_000 - RESCAN_TAIL),
+                head: Some(HEAD + 1_000),
+                error: None,
+            }
+        );
+
+        wallet_scan_done(&EOA);
+        chain
+            .head
+            .store(HEAD + 2_000, std::sync::atomic::Ordering::SeqCst);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap();
+        wallet_scan_failed(&EOA, "late failure");
+        let done = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(done.state, WalletScanState::Done, "{done:?}");
+        assert_eq!(
+            done.head,
+            Some(HEAD + 1_000),
+            "a later scan leaves done alone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed scan reads as retrying, with the error, until the next
+    /// attempt starts scanning again.
+    #[tokio::test]
+    async fn a_failed_tracked_scan_reads_as_retrying() {
+        const EOA: [u8; 20] = [0x52; 20];
+        let chain = std::sync::Arc::new(GrowingChain {
+            fail_after: Mutex::new(Some(0)),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-status-retry");
+
+        wallet_scan_pending(&EOA);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap_err();
+        let status = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(status.state, WalletScanState::Retrying);
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("backend unavailable")),
+            "{status:?}"
+        );
+        // Another announcement doesn't hide the failure.
+        wallet_scan_pending(&EOA);
+        assert_eq!(
+            wallet_scan_status(&EOA).unwrap().state,
+            WalletScanState::Retrying
+        );
+
+        *chain.fail_after.lock().unwrap() = None;
+        // A scan that isn't the rediscovery's (a stamp buy's chequebook
+        // check) succeeding meanwhile doesn't hide the failure.
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        let status = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(status.state, WalletScanState::Retrying, "{status:?}");
+        assert!(status.error.is_some());
+
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap();
+        let status = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(status.state, WalletScanState::Scanning);
+        assert_eq!(status.error, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway stop drops a scanning status and a restart re-tracks it
+    /// as bare `pending` while the attempt keeps running (ant-ffi's
+    /// `stop_retrying` then `note_pending`): the attempt's next window
+    /// reports it as scanning again, with its progress.
+    #[tokio::test]
+    async fn a_retracked_status_shows_the_running_scans_progress() {
+        const EOA: [u8; 20] = [0x55; 20];
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(1_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        *chain.on_logs.lock().unwrap() = Some(Box::new(move || {
+            // After the first window: the stop, then the restart.
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                wallet_scan_abandon(&EOA);
+                assert_eq!(wallet_scan_status(&EOA), None);
+                wallet_scan_track(&EOA, WalletScanState::Pending);
+            }
+        }));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-status-retrack");
+
+        wallet_scan_pending(&EOA);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir, false, &EOA)
+            .await
+            .unwrap();
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 2);
+        let status = wallet_scan_status(&EOA).unwrap();
+        assert_eq!(status.state, WalletScanState::Scanning, "{status:?}");
+        assert_eq!(status.from, Some(GNOSIS_XBZZ_DEPLOY_BLOCK));
+        assert_eq!(status.head, Some(HEAD));
+        assert_eq!(status.scanned_through, Some(HEAD - RESCAN_TAIL));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rediscovery scanning a wallet other than the node's (antd's
+    /// legacy `--postage-owner-key`) reports under the node's address,
+    /// which is what `/health` looks up; forgetting it untracks it.
+    #[tokio::test]
+    async fn a_rediscovery_reports_under_its_status_key() {
+        const NODE: [u8; 20] = [0x53; 20];
+        const OWNER: [u8; 20] = [0x54; 20];
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-status-key");
+
+        wallet_scan_pending(&NODE);
+        rediscovery_scan(&client, crate::GNOSIS_BZZ_TOKEN, &OWNER, &dir, false, &NODE)
+            .await
+            .unwrap();
+        let status = wallet_scan_status(&NODE).unwrap();
+        assert_eq!(status.state, WalletScanState::Scanning, "{status:?}");
+        assert_eq!(status.head, Some(HEAD));
+        assert_eq!(wallet_scan_status(&OWNER), None);
+
+        wallet_scan_forget(&NODE);
+        assert_eq!(wallet_scan_status(&NODE), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wallet_scan_status_wire_shape() {
+        let status = WalletScanStatus {
+            state: WalletScanState::Retrying,
+            from: Some(16_514_506),
+            scanned_through: None,
+            head: Some(48_560_000),
+            error: Some("no RPC quorum".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            json!({
+                "state": "retrying",
+                "from": 16_514_506,
+                "scannedThrough": null,
+                "head": 48_560_000,
+                "error": "no RPC quorum",
+            })
+        );
+        let done = WalletScanStatus {
+            state: WalletScanState::Done,
+            error: None,
+            ..status
+        };
+        assert!(serde_json::to_value(&done).unwrap().get("error").is_none());
+    }
+
+    /// RPC URLs can carry API keys, so `walletScan.error` never shows
+    /// one.
+    #[test]
+    fn wallet_scan_error_hides_urls() {
+        assert_eq!(
+            without_urls("http: error sending request for url (https://rpc.example/v2/SECRET-KEY)"),
+            "http: error sending request for url (<url>)"
+        );
+        assert_eq!(
+            without_urls("rpc https://a.example/k, then wss://b.example/k."),
+            "rpc <url>, then <url>."
+        );
+        assert_eq!(without_urls("no RPC quorum"), "no RPC quorum");
+    }
+
+    #[test]
+    fn rediscovery_retry_backs_off_to_five_minutes() {
+        let secs: Vec<u64> = (0..7)
+            .map(|a| rediscovery_retry_delay(a).as_secs())
+            .collect();
+        assert_eq!(secs, [15, 30, 60, 120, 240, 300, 300]);
+        assert_eq!(rediscovery_retry_delay(u32::MAX).as_secs(), 300);
     }
 
     /// An unreadable saved scan means a full scan, not an error.
@@ -2102,6 +2667,60 @@ mod tests {
             load_transfer_scan(&dir, GNOSIS, &NODE_EOA),
             Some(complete.clone()),
             "the complete scan is kept"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A full rescan that failed part-way is continued by the next one in
+    /// the process (antd's retry of `--rescan-chain-history`), not read
+    /// again from the deploy block, and the completed rescan replaces the
+    /// saved scan, confirmed to its head.
+    #[tokio::test]
+    async fn a_failed_rescan_is_continued_by_the_next() {
+        const EOA: [u8; 20] = [0x55; 20];
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(1_000_000),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-rescan-resume");
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+
+        chain.ranges.lock().unwrap().clear();
+        *chain.fail_after.lock().unwrap() = Some(3);
+        rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .expect_err("the fourth window fails");
+        let first = chain.ranges.lock().unwrap().clone();
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_eq!(first[0].0, GNOSIS_XBZZ_DEPLOY_BLOCK);
+        let read_through = first.last().unwrap().1;
+
+        chain.ranges.lock().unwrap().clear();
+        *chain.fail_after.lock().unwrap() = None;
+        let scan = rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        let second = chain.ranges.lock().unwrap().clone();
+        assert_eq!(
+            second.first().map(|r| r.0),
+            Some(read_through + 1),
+            "continued where the failed rescan stopped: {second:?}"
+        );
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        assert_eq!(load_transfer_scan(&dir, GNOSIS, &EOA), Some(scan));
+
+        // Done: the next rescan reads the history again.
+        chain.ranges.lock().unwrap().clear();
+        rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            chain.ranges.lock().unwrap().first().map(|r| r.0),
+            Some(GNOSIS_XBZZ_DEPLOY_BLOCK)
         );
         std::fs::remove_dir_all(&dir).ok();
     }

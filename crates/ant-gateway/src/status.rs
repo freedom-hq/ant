@@ -35,20 +35,44 @@ struct HealthBody {
     /// bee-js ignores unknown fields.
     #[serde(rename = "chainReady")]
     chain_ready: bool,
+    /// The node wallet's background rediscovery (its batches and
+    /// chequebook on chain), while the embedder runs one: `pending`,
+    /// `scanning` with progress, `retrying`, or `done`. Absent when the
+    /// node doesn't rediscover in the background. A host shows "looking
+    /// for your existing storage" until `done` instead of offering a plan
+    /// the wallet may already have (freedom-browser#484).
+    #[cfg(feature = "chain")]
+    #[serde(rename = "walletScan", skip_serializing_if = "Option::is_none")]
+    wallet_scan: Option<ant_chain::discover::WalletScanStatus>,
+}
+
+impl HealthBody {
+    fn new(status: &'static str, handle: &GatewayHandle) -> Self {
+        Self {
+            status,
+            version: handle.agent.as_str().to_string(),
+            api_version: handle.api_version.as_str().to_string(),
+            chain_ready: handle.chain_state().is_some(),
+            #[cfg(feature = "chain")]
+            wallet_scan: node_eth(&handle.identity.ethereum_hex)
+                .and_then(|eth| ant_chain::discover::wallet_scan_status(&eth)),
+        }
+    }
+}
+
+/// The node's Ethereum address, from the identity's `0x…` hex.
+#[cfg(feature = "chain")]
+fn node_eth(ethereum_hex: &str) -> Option<[u8; 20]> {
+    let mut eth = [0u8; 20];
+    hex::decode_to_slice(ethereum_hex.trim_start_matches("0x"), &mut eth).ok()?;
+    Some(eth)
 }
 
 /// `GET /health`. Bound before chain init; PLAN.md D.2.1 requires this
 /// to answer within 50 ms of socket bind so external supervisors can
 /// poll aggressively, hence no I/O at all here.
 pub async fn health(State(handle): State<GatewayHandle>) -> Response {
-    let chain_ready = handle.chain_state().is_some();
-    Json(HealthBody {
-        status: "ok",
-        version: handle.agent.as_str().to_string(),
-        api_version: handle.api_version.as_str().to_string(),
-        chain_ready,
-    })
-    .into_response()
+    Json(HealthBody::new("ok", &handle)).into_response()
 }
 
 /// `GET /readiness`. `200` once the node can serve a retrieval — a
@@ -72,12 +96,10 @@ pub async fn health(State(handle): State<GatewayHandle>) -> Response {
 pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
     let snap = handle.status.borrow();
     let ready = snap.peers.can_retrieve();
-    let body = Json(HealthBody {
-        status: if ready { "ready" } else { "unready" },
-        version: handle.agent.as_str().to_string(),
-        api_version: handle.api_version.as_str().to_string(),
-        chain_ready: handle.chain_state().is_some(),
-    });
+    let body = Json(HealthBody::new(
+        if ready { "ready" } else { "unready" },
+        &handle,
+    ));
     if ready {
         body.into_response()
     } else {
@@ -518,5 +540,55 @@ mod tests {
         bins[3] = 1;
         bins[4] = 9; // gap after the break is ignored
         assert_eq!(neighborhood_depth(&bins), 3);
+    }
+}
+
+#[cfg(all(test, feature = "chain"))]
+mod wallet_scan_tests {
+    use super::*;
+    use ant_chain::discover::{WalletScanState, WalletScanStatus};
+
+    fn body(wallet_scan: Option<WalletScanStatus>) -> serde_json::Value {
+        serde_json::to_value(HealthBody {
+            status: "ok",
+            version: "antd/test".into(),
+            api_version: "7.2.0".into(),
+            chain_ready: true,
+            wallet_scan,
+        })
+        .unwrap()
+    }
+
+    /// `walletScan` sits next to `chainReady` while a rediscovery is
+    /// tracked, and is left out otherwise (freedom-browser#484).
+    #[test]
+    fn health_reports_the_wallet_scan() {
+        let scanning = body(Some(WalletScanStatus {
+            state: WalletScanState::Scanning,
+            from: Some(16_514_506),
+            scanned_through: Some(41_230_000),
+            head: Some(48_560_000),
+            error: None,
+        }));
+        assert_eq!(scanning["chainReady"], true);
+        assert_eq!(
+            scanning["walletScan"],
+            serde_json::json!({
+                "state": "scanning",
+                "from": 16_514_506,
+                "scannedThrough": 41_230_000,
+                "head": 48_560_000,
+            })
+        );
+        assert!(body(None).get("walletScan").is_none());
+    }
+
+    #[test]
+    fn node_eth_reads_the_identity_hex() {
+        assert_eq!(
+            node_eth("0x0102030405060708090a0b0c0d0e0f1011121314"),
+            Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+        );
+        assert_eq!(node_eth("not hex"), None);
     }
 }

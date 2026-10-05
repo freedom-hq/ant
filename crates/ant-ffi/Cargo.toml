@@ -86,6 +86,9 @@ tracing-subscriber.workspace = true
 # `tests/live_publisher_gateway.rs`); `Gateway::serve` binds its own
 # address, so the test needs `axum::serve` to bind port 0 and learn it.
 axum.workspace = true
+# `test-util` enables `#[tokio::test(start_paused = true)]`, used to
+# auto-advance the clock through the rediscovery retry back-off.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -3267,6 +3267,12 @@ pub(crate) fn shutdown_handle(handle: Box<AntHandle>) {
     // socket open) from hanging the host for good; it leaks the
     // thread rather than the wait.
     handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    // The node's rediscovery status is process-wide: a later `ant_init`
+    // for the same account without an RPC would otherwise serve this
+    // node's `scanning`/`retrying` in `/health.walletScan` for good.
+    // After the runtime stopped, so no task of this node updates it again.
+    #[cfg(feature = "chain")]
+    ant_chain::discover::wallet_scan_forget(&handle.eth);
 }
 
 // ---------------------------------------------------------------------------

@@ -77,6 +77,26 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
          `ant_init` reloads a chequebook without an RPC and starts none; `antd` starts its watch \
          (`watch_retrieval_funds`, which reads through this) with settlement at startup",
     ),
+    (
+        "wallet_scan_forget",
+        Side::Ffi,
+        "a C API host can shut a node down and init another for the same account in one \
+         process (`ant_shutdown` forgets the old node's rediscovery status); `antd` runs one \
+         node per process, which exits with it",
+    ),
+    (
+        "wallet_scan_abandon",
+        Side::Ffi,
+        "`ant_stop_gateway` ends the C API's rediscovery retry while the node lives on, and a \
+         restart may come without an RPC, so it drops the unfinished status; `antd`'s retry \
+         runs for the process lifetime, so its status is never abandoned",
+    ),
+    (
+        "wallet_scan_track",
+        Side::Ffi,
+        "re-announces a rediscovery whose status `wallet_scan_abandon` dropped, on the C API's \
+         next gateway start; `antd` never abandons one",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
