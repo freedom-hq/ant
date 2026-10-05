@@ -80,8 +80,12 @@ pub enum ControlCommand {
     /// issue #146): it ends once enough peers have answered "not found"
     /// instead of asking up to 32 peers one after another. Ends in
     /// [`ControlAck::Bytes`], [`ControlAck::NotFound`] (peers confirmed
-    /// the chunk missing), [`ControlAck::NotReady`] (the last answer was
-    /// a miss but the peer pool was starved) or [`ControlAck::Error`].
+    /// the chunk missing) or [`ControlAck::Error`]. The node runs this
+    /// lookup without retrieval accounting, so no peer is ever
+    /// overdraft-skipped and the pool is never reported starved
+    /// (`FetchExhausted::pool_starved`): a miss is a `NotFound`, not the
+    /// [`ControlAck::NotReady`] a starved `/bytes`/`/bzz` fetch gets.
+    /// A consumer may still map a `NotReady` (to 503) defensively.
     GetChunkRaw {
         reference: [u8; 32],
         /// Run the lookup in fast-miss mode. Set it for reads whose miss
@@ -851,9 +855,8 @@ pub enum ControlAck {
     FeedNotFound,
     /// The node loop accepted the command but isn't ready to serve it
     /// (most commonly: zero connected peers). `StreamBytes` /
-    /// `StreamBzz` also send it, before their stream starts (and
-    /// `GetChunkRaw` as its answer), when a fetch's last answer was a
-    /// miss but the peer pool was starved
+    /// `StreamBzz` also send it, before their stream starts, when a
+    /// fetch's last answer was a miss but the peer pool was starved
     /// (`FetchExhausted::pool_starved`): one cold peer's "not found" is
     /// not the network's answer (issue #114), so it is a 503 to retry,
     /// never a 404. Terminal, like [`Self::Error`]. Distinct from

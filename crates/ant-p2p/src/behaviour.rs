@@ -6070,7 +6070,10 @@ fn is_final_miss(e: &(dyn std::error::Error + 'static)) -> bool {
 ///   502 that Freedom retries for ~50 s;
 /// - the last answer was a miss but the peer pool was starved →
 ///   [`ControlAck::NotReady`] (503): one cold peer's "not found" is not
-///   the network's answer (#114), so it must not read as a 404 either;
+///   the network's answer (#114), so it must not read as a 404 either.
+///   `GetChunkRaw` never reaches this arm: its fetcher has no accounting
+///   attached, so no peer is overdraft-skipped and the pool is never
+///   reported starved;
 /// - anything else → [`ControlAck::Error`], as before.
 fn pre_stream_failure_ack(message: String, e: &(dyn std::error::Error + 'static)) -> ControlAck {
     match ant_retrieval::fetcher::FetchExhausted::find(e) {
