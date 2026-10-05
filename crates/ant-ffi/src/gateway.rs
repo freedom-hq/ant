@@ -538,8 +538,12 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
     let eth = handle.eth;
     let slot = handle.gateway_chequebook.clone();
     init.note_pending();
+    // Taken now, not inside the task: an `ant_stop_gateway` landing
+    // before the task first runs must still keep it from starting a
+    // retry loop.
+    let epoch = init.retry_epoch();
     handle.runtime.spawn(async move {
-        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, true, |adopted| {
+        init.run_reporting(&chain, &cmd_tx, &data_dir, secret, Some(epoch), |adopted| {
             crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
         })
         .await;
