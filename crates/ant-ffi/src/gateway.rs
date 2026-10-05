@@ -151,6 +151,10 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// after an explicit `ant_storage_discover`, or a fresh `ant_init`
 /// followed by a start with a `gnosis_rpc` (`ant_init` alone only
 /// reloads persisted state; the rescan runs here, in `ChainInit::run`).
+/// A failed rediscovery is also retried in the background with backoff
+/// (15 s, doubling, at most 5 minutes) until it succeeds, through the
+/// latest start's `gnosis_rpc`, while the gateway runs: it ends at
+/// [`ant_stop_gateway`]. `/health.walletScan` reports where it stands.
 ///
 /// # Safety
 ///
@@ -685,7 +689,9 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
 /// Returns `true` if a gateway was running and was aborted, `false` if
-/// none was running (or `handle` is null). Safe to call repeatedly.
+/// none was running (or `handle` is null). Safe to call repeatedly. A
+/// background rediscovery retry stops with it, before its next attempt;
+/// the next start with a `gnosis_rpc` tries again.
 ///
 /// # Safety
 ///
@@ -704,6 +710,10 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // A background rediscovery retry ends with the gateway: nothing
+        // reads its status any more, and a restart may bring another RPC.
+        #[cfg(feature = "chain")]
+        handle.chain_init.stop_retrying();
         match task {
             Some(task) => {
                 task.abort();

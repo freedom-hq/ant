@@ -143,10 +143,10 @@ pub(crate) struct ChainInit {
     /// don't both scan and double-register the same batch: the second
     /// waits and then sees the flag.
     batches_rediscovered: tokio::sync::Mutex<bool>,
-    /// A background retry of a failed rediscovery is running
+    /// The background retry of a failed rediscovery
     /// ([`Self::retry_rediscovery`]): at most one per handle, however
     /// often the host re-calls `ant_start_gateway`.
-    rediscovery_retrying: std::sync::atomic::AtomicBool,
+    rediscovery_retry: std::sync::Mutex<RediscoveryRetry>,
     /// Set once settlement has been switched on for an adopted
     /// chequebook, so a later run (every idempotent `ant_start_gateway`
     /// re-call spawns one) doesn't re-resolve it over RPC.
@@ -167,6 +167,16 @@ pub(crate) struct ChainInit {
     /// `ant-gateway`'s `/stamps` applies to a just-registered batch).
     not_found_since: std::sync::Mutex<HashMap<[u8; 32], tokio::time::Instant>>,
     not_found_grace: Duration,
+}
+
+/// [`ChainInit::rediscovery_retry`]: whether the loop runs, and the chain
+/// client its next attempt reads through — the latest gateway start's,
+/// or `None` once the gateway stopped, which ends the loop.
+#[cfg(feature = "chain")]
+#[derive(Default)]
+struct RediscoveryRetry {
+    running: bool,
+    chain: Option<ant_chain::ChainClient>,
 }
 
 /// How long a persisted batch's first `NotFound` read must stand before
@@ -206,7 +216,7 @@ impl ChainInit {
             upload,
             unverified: std::sync::Mutex::new(unverified),
             batches_rediscovered: tokio::sync::Mutex::new(false),
-            rediscovery_retrying: std::sync::atomic::AtomicBool::new(false),
+            rediscovery_retry: std::sync::Mutex::new(RediscoveryRetry::default()),
             settlement_on: std::sync::atomic::AtomicBool::new(false),
             pass: tokio::sync::Mutex::new(()),
             not_found_since: std::sync::Mutex::new(HashMap::new()),
@@ -306,25 +316,60 @@ impl ChainInit {
 
     /// Retry a failed [`Self::rediscover_owned`] with the shared backoff
     /// until it succeeds. A scan that failed kept its progress, so each
-    /// retry only reads what's left. One loop per handle.
+    /// retry only reads what's left. One loop per handle: a call while it
+    /// runs only hands it `chain`, so its next attempt reads through the
+    /// latest gateway start's RPC. [`Self::stop_retrying`] (the gateway
+    /// stopped) ends it before its next attempt.
     async fn retry_rediscovery(
         &self,
         chain: &ant_chain::ChainClient,
         cmd_tx: &mpsc::Sender<ControlCommand>,
         data_dir: &std::path::Path,
     ) {
-        use std::sync::atomic::Ordering;
-        if self.rediscovery_retrying.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            let mut retry = self
+                .rediscovery_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retry.chain = Some(chain.clone());
+            if retry.running {
+                return;
+            }
+            retry.running = true;
         }
         for attempt in 0u32.. {
             let delay = ant_chain::discover::rediscovery_retry_delay(attempt);
             tokio::time::sleep(delay).await;
-            if self.rediscover_owned(chain, cmd_tx, data_dir).await {
+            let chain = {
+                let mut retry = self
+                    .rediscovery_retry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(chain) = retry.chain.clone() else {
+                    retry.running = false;
+                    return;
+                };
+                chain
+            };
+            if self.rediscover_owned(&chain, cmd_tx, data_dir).await {
                 break;
             }
         }
-        self.rediscovery_retrying.store(false, Ordering::Release);
+        *self
+            .rediscovery_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RediscoveryRetry::default();
+    }
+
+    /// End the background rediscovery retry before its next attempt: the
+    /// gateway stopped (`ant_stop_gateway`), so nothing reads its status,
+    /// and its RPC may be one the host is replacing. The next start with
+    /// an RPC runs its own attempt and, if that fails, a new loop.
+    pub(crate) fn stop_retrying(&self) {
+        self.rediscovery_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .chain = None;
     }
 
     /// Step 3 of [`Self::run`]: adopt the chequebook without spending,
@@ -397,7 +442,7 @@ impl ChainInit {
         if *rediscovered {
             return true;
         }
-        let found = match owned_batches(chain, &owner, data_dir, false).await {
+        let found = match owned_batches(chain, &owner, data_dir, false, Some(&owner)).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!(
@@ -1044,14 +1089,27 @@ pub(crate) fn storage_connect_batch(
 /// The funded postage batches `owner` holds on Gnosis, from the saved
 /// transfer scan in `data_dir` (brought up to the chain head first), or
 /// with `full_rescan` from a scan of the whole history that replaces it.
+/// With `status_key` (the background rediscovery), the scan reports to
+/// `/health.walletScan`; a host's explicit discover doesn't.
 #[cfg(feature = "chain")]
 async fn owned_batches(
     chain: &ant_chain::ChainClient,
     owner: &[u8; 20],
     data_dir: &std::path::Path,
     full_rescan: bool,
+    status_key: Option<&[u8; 20]>,
 ) -> Result<Vec<ant_chain::discover::DiscoveredBatch>, ant_chain::RpcError> {
-    let scan = if full_rescan {
+    let scan = if let Some(status_key) = status_key {
+        ant_chain::discover::rediscovery_scan(
+            chain,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+            full_rescan,
+            status_key,
+        )
+        .await?
+    } else if full_rescan {
         ant_chain::discover::rescan_transfer_history(
             chain,
             ant_chain::GNOSIS_BZZ_TOKEN,
@@ -1091,7 +1149,7 @@ pub(crate) fn storage_discover(
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let found = owned_batches(&chain, &eth, &data_dir, full_rescan)
+        let found = owned_batches(&chain, &eth, &data_dir, full_rescan, None)
             .await
             .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
         let mut registered = Vec::new();
@@ -4406,9 +4464,7 @@ mod chain_tests {
             wallet_scan_status(&EOA).unwrap().state,
             WalletScanState::Done
         );
-        assert!(!init
-            .rediscovery_retrying
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!init.rediscovery_retry.lock().unwrap().running);
 
         // A later gateway start finds it done and doesn't announce another.
         init.note_pending();
@@ -4416,6 +4472,79 @@ mod chain_tests {
             wallet_scan_status(&EOA).unwrap().state,
             WalletScanState::Done
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The background retry reads through the latest gateway start's
+    /// chain client, and stops once the gateway does, instead of polling
+    /// the first start's RPC for the handle's lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn rediscovery_retry_follows_the_gateway() {
+        const EOA: [u8; 20] = [0x78; 20];
+        let dir = scratch("chain-init-retry-stop");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: Mutex::new(std::collections::HashMap::new()),
+            stamp_key: NODE_KEY,
+            batch_owner: EOA,
+            postage_dir: postage,
+        });
+        let init = std::sync::Arc::new(super::ChainInit::new(std::sync::Arc::clone(&upload)));
+        let postage_addr = {
+            let mut a = [0u8; 20];
+            hex::decode_to_slice(&ant_chain::GNOSIS_POSTAGE_STAMP[2..], &mut a).unwrap();
+            a
+        };
+        let script = || {
+            let mut script = ChainScript::new(EOA);
+            script.transfers.push((postage_addr, [0x05; 32]));
+            script.created.push(([0xa5u8; 32], [0x05; 32]));
+            std::sync::Arc::new(script)
+        };
+        let (first, second) = (script(), script());
+        let (cmd_tx, node) = fake_node();
+        // Every attempt fails at registration, so the loop keeps going.
+        node.lock().unwrap().fail_registers = usize::MAX;
+
+        let task = {
+            let (init, cmd_tx, dir, chain) = (
+                std::sync::Arc::clone(&init),
+                cmd_tx.clone(),
+                dir.clone(),
+                client(&first),
+            );
+            tokio::spawn(async move { init.retry_rediscovery(&chain, &cmd_tx, &dir).await })
+        };
+        tokio::task::yield_now().await;
+        // A restart with another RPC: the running loop takes it over.
+        init.retry_rediscovery(&client(&second), &cmd_tx, &dir)
+            .await;
+        // Until an attempt (the first after 15 s) has read the chain and
+        // failed its registration. Bounded in real time: the transfer
+        // scan lock is process-wide, so a parallel test can hold it while
+        // the paused clock runs ahead.
+        let waited = std::time::Instant::now();
+        while node.lock().unwrap().fail_registers == usize::MAX
+            && waited.elapsed() < std::time::Duration::from_secs(30)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(first.seen.lock().unwrap().is_empty(), "old RPC unused");
+        assert!(
+            !second.seen.lock().unwrap().is_empty(),
+            "the attempt read through the new RPC"
+        );
+
+        init.stop_retrying();
+        let waited = std::time::Instant::now();
+        while !task.is_finished() && waited.elapsed() < std::time::Duration::from_secs(30) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(task.is_finished(), "the loop ends once the gateway stops");
+        task.await.unwrap();
+        assert!(!init.rediscovery_retry.lock().unwrap().running);
+        ant_chain::discover::wallet_scan_forget(&EOA);
         std::fs::remove_dir_all(&dir).ok();
     }
 

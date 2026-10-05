@@ -1000,7 +1000,7 @@ async fn main() -> Result<()> {
         let postage_contract = opt.postage_contract.clone();
         let data_dir = data_dir.clone();
         let mut settle = matches!(startup_settlement, Settlement::Off) && startup_refused.is_none();
-        let full_rescan = opt.rescan_chain_history;
+        let mut full_rescan = opt.rescan_chain_history;
         tokio::spawn(async move {
             let client = ant_chain::ChainClient::new(logs_rpc);
             for attempt in 0u32.. {
@@ -1010,7 +1010,8 @@ async fn main() -> Result<()> {
                         &postage_contract,
                         &rt.batch_owner,
                         &data_dir,
-                        full_rescan,
+                        &mut full_rescan,
+                        Some(&eth),
                         &|id| {
                             rt.issuers
                                 .lock()
@@ -1801,7 +1802,8 @@ async fn build_upload_runtime(
                 &postage_contract,
                 &batch_owner,
                 &data_dir,
-                full_rescan,
+                &mut { full_rescan },
+                None,
                 &|id| issuers.contains_key(id),
             )
             .await
@@ -1844,18 +1846,33 @@ async fn build_upload_runtime(
 /// as issuers (carrying over bee's counters when a `stamperstore` is
 /// present). Reads the saved transfer scan, so only the first start scans
 /// the full history (#118); with `full_rescan` (`--rescan-chain-history`)
-/// it reads the whole history again and replaces the saved scan. A batch
-/// that can't be opened is logged and skipped; a failed chain read is the
-/// error.
+/// it reads the whole history again and replaces the saved scan. Once that
+/// rescan has completed, `full_rescan` is cleared, so a retry after a
+/// later step failed only continues the saved scan; a rescan that failed
+/// part-way is continued by the next one, not restarted. With
+/// `status_key` (the node's address) the scan reports to
+/// `/health.walletScan`. A batch that can't be opened is logged and
+/// skipped; a failed chain read is the error.
 async fn rediscover_batches(
     client: &ant_chain::ChainClient,
     postage_contract: &str,
     owner: &[u8; 20],
     data_dir: &Path,
-    full_rescan: bool,
+    full_rescan: &mut bool,
+    status_key: Option<&[u8; 20]>,
     known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
 ) -> Result<Vec<([u8; 32], ant_postage::StampIssuer)>, ant_chain::RpcError> {
-    let scan = if full_rescan {
+    let scan = if let Some(status_key) = status_key {
+        ant_chain::discover::rediscovery_scan(
+            client,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            owner,
+            data_dir,
+            *full_rescan,
+            status_key,
+        )
+        .await?
+    } else if *full_rescan {
         ant_chain::discover::rescan_transfer_history(
             client,
             ant_chain::GNOSIS_BZZ_TOKEN,
@@ -1872,6 +1889,7 @@ async fn rediscover_batches(
         )
         .await?
     };
+    *full_rescan = false;
     let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
     let stamperstore = data_dir.join("stamperstore");
     let postage_dir = data_dir.join("postage");

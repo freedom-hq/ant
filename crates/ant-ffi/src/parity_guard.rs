@@ -77,6 +77,13 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
          `ant_init` reloads a chequebook without an RPC and starts none; `antd` starts its watch \
          (`watch_retrieval_funds`, which reads through this) with settlement at startup",
     ),
+    (
+        "wallet_scan_forget",
+        Side::Ffi,
+        "a C API host can shut a node down and init another for the same account in one \
+         process (`ant_shutdown` forgets the old node's rediscovery status); `antd` runs one \
+         node per process, which exits with it",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
