@@ -518,6 +518,13 @@ fn unix_now() -> u64 {
 /// to the background) only leaves the blocks the resumed part read
 /// unconfirmed, not the whole history. Blocks read from the `fallback`'s
 /// unverified source are never confirmed.
+///
+/// `unconfirmed_since` is the [`TransferScan::provisional_since`] of the
+/// saved scan a confirming pass rewound: its progress is saved with that
+/// mark until the pass completes, so a confirmation cut short part-way
+/// keeps the original clock (the next continued scan reads the rest from
+/// the unverified source again without restarting the
+/// [`CONFIRM_CRAWL_AFTER_SECS`] wait).
 #[allow(clippy::too_many_arguments)]
 async fn scan_transfers(
     client: &ChainClient,
@@ -529,7 +536,18 @@ async fn scan_transfers(
     save_to: Option<&std::path::Path>,
     confirms: bool,
     fallback: Fallback<'_>,
+    unconfirmed_since: Option<u64>,
 ) -> Result<TransferScan, ScanStop> {
+    // Progress of an unfinished pass, saved with the provisional mark it
+    // rewound (see above).
+    let save = |dir: &std::path::Path, scan: &TransferScan| match unconfirmed_since {
+        Some(since) if scan.provisional_since.is_none() => {
+            let mut partial = scan.clone();
+            partial.provisional_since = Some(since);
+            persist_transfer_scan(dir, &partial);
+        }
+        _ => persist_transfer_scan(dir, scan),
+    };
     let head = client.eth_block_number().await?;
     let mut scan = match previous.filter(|p| {
         p.node_eoa == *node_eoa
@@ -597,21 +615,34 @@ async fn scan_transfers(
         });
         if let Some(dir) = save_to {
             if saved_at.elapsed() >= SCAN_SAVE_EVERY {
-                persist_transfer_scan(dir, scan);
+                save(dir, scan);
                 saved_at = std::time::Instant::now();
             }
         }
     };
-    let min_window = match fallback {
-        Fallback::Crawl => 1,
-        Fallback::Unverified(_) | Fallback::GiveUp => {
-            (head - start + 1).div_ceil(MAX_VERIFIED_WINDOWS).max(1)
-        }
+    // A pass that may fall back reads at most MAX_VERIFIED_WINDOWS windows
+    // through the verified route: windows narrower than the span allows
+    // stop it at the first refusal, and the window count bounds a route
+    // that serves narrow windows without refusing wider ones.
+    let (min_window, max_windows) = match fallback {
+        Fallback::Crawl => (1, u64::MAX),
+        Fallback::Unverified(_) | Fallback::GiveUp => (
+            (head - start + 1).div_ceil(MAX_VERIFIED_WINDOWS).max(1),
+            MAX_VERIFIED_WINDOWS,
+        ),
     };
     let verified = client
-        .scan_logs_with(xbzz_token, &topics, start, head, min_window, |end, logs| {
-            take(&mut scan, end, logs, true);
-        })
+        .scan_logs_with(
+            xbzz_token,
+            &topics,
+            start,
+            head,
+            min_window,
+            max_windows,
+            |end, logs| {
+                take(&mut scan, end, logs, true);
+            },
+        )
         .await;
     let read = match verified {
         Ok(None) => Ok(()),
@@ -627,21 +658,26 @@ async fn scan_transfers(
                 scan.provisional_since.get_or_insert_with(unix_now);
                 update_wallet_scan(node_eoa, |s| s.provisional = true);
                 unverified
-                    .scan_logs_with(xbzz_token, &topics, rest, head, 1, |end, logs| {
+                    .scan_logs_with(xbzz_token, &topics, rest, head, 1, u64::MAX, |end, logs| {
                         take(&mut scan, end, logs, false);
                     })
                     .await
                     .map(|_| ())
+                    .map_err(ScanStop::Rpc)
             }
-            Fallback::GiveUp | Fallback::Crawl => return Err(ScanStop::TooWide),
+            Fallback::GiveUp | Fallback::Crawl => Err(ScanStop::TooWide),
         },
-        Err(e) => Err(e),
+        Err(e) => Err(ScanStop::Rpc(e)),
     };
     if let Err(e) = read {
+        // What the pass read is kept, also when it gave up part-way: the
+        // next pass goes on from there instead of reading it again.
         if let Some(dir) = save_to {
-            persist_transfer_scan(dir, &scan);
+            if scan.scanned_through >= start {
+                save(dir, &scan);
+            }
         }
-        return Err(e.into());
+        return Err(e);
     }
     Ok(scan)
 }
@@ -675,7 +711,10 @@ pub async fn refresh_transfer_scan(
 /// head, a lossy log index); this is the way back from such a miss. As
 /// slow as the first start's scan behind a range-capped RPC, so it is for
 /// an explicit "search the chain" (`ant_storage_discover_full`, antd's
-/// `--rescan-chain-history`), not for every start.
+/// `--rescan-chain-history`), not for every start. It reads through the
+/// verified route only, never from the unverified source
+/// ([`ChainClient::with_unverified_logs`]): it replaces the saved scan,
+/// which may be confirmed, and must not swap it for a provisional one.
 ///
 /// The saved scan is only replaced once the rescan completes: a rescan
 /// that fails part-way leaves the previous scan as it was (its progress
@@ -692,20 +731,17 @@ pub async fn rescan_transfer_history(
         .map_err(ScanStop::into_rpc)
 }
 
-/// Whether a pass with `fallback` saves its progress: one that may give
-/// up doesn't (see [`update_transfer_scan`]).
-fn fallback_saves(fallback: Fallback<'_>) -> bool {
-    !matches!(fallback, Fallback::GiveUp)
-}
-
 /// Confirm the blocks the transfer scan read only from the unverified
 /// source ([`ChainClient::with_unverified_logs`]): read the blocks above
-/// its confirmed mark again through the verified route, in at most a few
-/// windows — one request once the verified route has a second
-/// full-history source. `Ok(Some(scan))` once they're confirmed: read its
+/// its confirmed mark again through the verified route, in at most
+/// [`MAX_VERIFIED_WINDOWS`] (64) windows — one request once the verified
+/// route has a second full-history source. What a try reads is saved, so
+/// one that fails or gives up part-way is resumed by the next. `Ok(Some(scan))` once they're confirmed: read its
 /// batches and chequebook again, since the unverified read may have
-/// missed some, then call [`wallet_scan_done`]. `Ok(None)` while the verified route still can't serve the
-/// span: the saved scan stays as it was; try again after
+/// missed some, then call [`wallet_scan_done`]. `Ok(None)` while the
+/// verified route still can't serve the span: the saved scan stays
+/// unconfirmed (its unverified blocks are read again by the next continued
+/// scan, keeping their [`TransferScan::provisional_since`]); try again after
 /// [`confirm_retry_delay`]. It never reads the span window by window —
 /// that is the hour-long crawl the unverified read avoided — except
 /// through [`find_owned_chequebook`] for a deploy decision that has waited
@@ -754,7 +790,7 @@ enum ScanMode {
     /// verified route can't serve in a few windows stops the pass
     /// ([`ScanStop::TooWide`]) unless `crawl`.
     Confirm { crawl: bool },
-    /// Read the whole history again.
+    /// Read the whole history again, through the verified route only.
     Full,
 }
 
@@ -777,6 +813,12 @@ async fn update_transfer_scan(
     // re-read only rewinds it to its confirmed mark, which its progress
     // then carries forward (see below).
     let replacing = saved.is_some() && mode == ScanMode::Full;
+    // A confirming re-read clears the saved provisional mark only once it
+    // completes; its progress keeps it until then.
+    let unconfirmed_since = match mode {
+        ScanMode::Confirm { .. } => saved.as_ref().and_then(|p| p.provisional_since),
+        ScanMode::Continue | ScanMode::Full => None,
+    };
     let previous = match mode {
         ScanMode::Continue => saved,
         ScanMode::Full => None,
@@ -794,10 +836,16 @@ async fn update_transfer_scan(
     // a continued one keeps the mark it had, and a confirming re-read of
     // the blocks since the mark moves it up to what it read.
     let confirms = previous.is_none() || matches!(mode, ScanMode::Confirm { .. });
+    // A full rescan is the explicit, slow "search the chain" and replaces a
+    // saved scan that may be confirmed: it reads the whole history through
+    // the verified route, never from the unverified source, so it can't
+    // swap a confirmed scan for a provisional one.
     let fallback = match (client.unverified_logs(), mode) {
-        (None, _) | (Some(_), ScanMode::Confirm { crawl: true }) => Fallback::Crawl,
+        (None, _) | (Some(_), ScanMode::Confirm { crawl: true } | ScanMode::Full) => {
+            Fallback::Crawl
+        }
         (Some(_), ScanMode::Confirm { crawl: false }) => Fallback::GiveUp,
-        (Some(unverified), ScanMode::Continue | ScanMode::Full) => Fallback::Unverified(unverified),
+        (Some(unverified), ScanMode::Continue) => Fallback::Unverified(unverified),
     };
     let from = previous
         .as_ref()
@@ -810,10 +858,10 @@ async fn update_transfer_scan(
     // its progress, with the confirmed mark moved up to it: cut short, the
     // next check re-reads only the blocks it didn't get to, rather than
     // starting again from the old mark (or from the deploy block, for a
-    // scan that had none) every time. A confirming pass that may give up
-    // saves nothing: given up, the saved scan (and the unverified reads it
-    // still holds) stays as it was.
-    let save_progress = !replacing && fallback_saves(fallback);
+    // scan that had none) every time — also when it gives up part-way.
+    // Until it completes, its saved progress keeps the provisional mark of
+    // the scan it rewound (`unconfirmed_since`).
+    let save_progress = !replacing;
     let scanned = scan_transfers(
         client,
         chain_id,
@@ -824,6 +872,7 @@ async fn update_transfer_scan(
         save_progress.then_some(data_dir),
         confirms,
         fallback,
+        unconfirmed_since,
     )
     .await;
     let mut scan = match scanned {
@@ -898,13 +947,16 @@ pub async fn find_owned_chequebook(
         confirmed_through = ?scan.confirmed_through,
         "no chequebook in the saved transfer scan; reading the unconfirmed blocks again before deploying one",
     );
-    // Blocks read only from the unverified source are confirmed in one
-    // request when the verified route can; a deploy decision that has
-    // waited CONFIRM_CRAWL_AFTER_SECS for that reads them window by window
-    // instead, rather than leaving the node without settlement for good.
+    // Blocks read only from the unverified source are confirmed in a few
+    // verified windows when the verified route can; a deploy decision that
+    // has waited CONFIRM_CRAWL_AFTER_SECS for that reads them window by
+    // window instead, rather than leaving the node without settlement for
+    // good. A "none" with no unverified read behind it is confirmed window
+    // by window at once, as without an unverified source: there is nothing
+    // a second source has to vouch for, so nothing to wait on.
     let crawl = scan
         .provisional_since
-        .is_some_and(|since| unix_now().saturating_sub(since) >= CONFIRM_CRAWL_AFTER_SECS);
+        .is_none_or(|since| unix_now().saturating_sub(since) >= CONFIRM_CRAWL_AFTER_SECS);
     let scan = match update_transfer_scan(
         client,
         xbzz_token,
@@ -915,18 +967,7 @@ pub async fn find_owned_chequebook(
     .await
     {
         Ok(scan) => scan,
-        Err(ScanStop::TooWide) => {
-            // Start the clock for a confirm-mode give-up with no
-            // unverified read behind it (a "none" resting on routine
-            // scans the verified route can't re-read in a few windows).
-            if scan.provisional_since.is_none() {
-                let mut waiting = scan;
-                waiting.provisional_since = Some(unix_now());
-                persist_transfer_scan(data_dir, &waiting);
-            }
-            return Err(ScanStop::TooWide.into_rpc());
-        }
-        Err(ScanStop::Rpc(e)) => return Err(e),
+        Err(e) => return Err(e.into_rpc()),
     };
     owned_chequebook_in(client, factory, postage_contract, xbzz_token, &scan).await
 }
@@ -977,9 +1018,17 @@ impl ChainClient {
         to_block: u64,
     ) -> Result<Vec<LogEntry>, RpcError> {
         let mut out = Vec::new();
-        self.scan_logs_with(address, topics, from_block, to_block, 1, |_, mut logs| {
-            out.append(&mut logs);
-        })
+        self.scan_logs_with(
+            address,
+            topics,
+            from_block,
+            to_block,
+            1,
+            u64::MAX,
+            |_, mut logs| {
+                out.append(&mut logs);
+            },
+        )
         .await?;
         Ok(out)
     }
@@ -987,8 +1036,10 @@ impl ChainClient {
     /// [`Self::scan_logs`], handing each window's logs to `window` along
     /// with the window's last block, in block order, so a caller can keep
     /// its progress. A range limit that would shrink the window below
-    /// `min_window` blocks stops the scan: `Ok(Some(block))` is the first
-    /// block not read. `Ok(None)` read it all.
+    /// `min_window` blocks, or a range left after `max_windows` windows,
+    /// stops the scan: `Ok(Some(block))` is the first block not read.
+    /// `Ok(None)` read it all.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_logs_with(
         &self,
         address: &str,
@@ -996,18 +1047,24 @@ impl ChainClient {
         from_block: u64,
         to_block: u64,
         min_window: u64,
+        max_windows: u64,
         mut window: impl FnMut(u64, Vec<LogEntry>),
     ) -> Result<Option<u64>, RpcError> {
         let mut start = from_block;
+        let mut windows = 0u64;
         // The whole range fits one window: `to - from + 1` blocks, not
         // `to - from`, or the last block costs a request of its own.
         let mut chunk =
             INITIAL_SCAN_CHUNK.min(to_block.saturating_sub(from_block).saturating_add(1).max(1));
         while start <= to_block {
+            if windows >= max_windows {
+                return Ok(Some(start));
+            }
             let end = start.saturating_add(chunk.saturating_sub(1)).min(to_block);
             match self.eth_get_logs(address, topics, start, end).await {
                 Ok(logs) => {
                     window(end, logs);
+                    windows += 1;
                     start = end.saturating_add(1);
                     chunk = chunk.saturating_mul(2).min(INITIAL_SCAN_CHUNK);
                 }
@@ -1478,6 +1535,7 @@ mod tests {
             None,
             false,
             Fallback::Crawl,
+            None,
         )
         .await
         .map_err(ScanStop::into_rpc)?;
@@ -1503,6 +1561,7 @@ mod tests {
             None,
             false,
             Fallback::Crawl,
+            None,
         )
         .await
         .map_err(ScanStop::into_rpc)?;
@@ -2616,6 +2675,180 @@ mod tests {
         assert_eq!(scan.provisional_since, None);
         assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-F1: an explicit full rescan replaces the saved scan, which may be
+    /// confirmed, so it reads through the verified route only — never from
+    /// the unverified source, which could leave a transfer out and swap a
+    /// confirmed scan for a provisional one.
+    #[tokio::test]
+    async fn a_full_rescan_never_reads_the_unverified_source() {
+        const EOA: [u8; 20] = [0x57; 20];
+        let all = [to_cb(45_000_000, [1; 32]), to_cb(46_000_000, [2; 32])];
+        let dir = scratch_dir("scan-full-verified");
+        let (client, _, _) = verified_with_unverified(None, &all, &all[..1]);
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(first.confirmed_through, Some(first.scanned_through));
+
+        // The verified route's second source is down: it serves only
+        // narrow windows again.
+        let (client, v, u) = verified_with_unverified(Some(200_000), &all, &all[..1]);
+        let rescanned = rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        assert!(u.ranges.lock().unwrap().is_empty(), "no unverified read");
+        assert!(v.ranges.lock().unwrap().len() > 64, "read window by window");
+        assert_eq!(rescanned.transfers.len(), 2);
+        assert_eq!(rescanned.provisional_since, None);
+        assert_eq!(rescanned.confirmed_through, Some(rescanned.scanned_through));
+        let saved = load_transfer_scan(&dir, GNOSIS, &EOA).unwrap();
+        assert_eq!(saved, rescanned);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M1: a deploy-decision crawl over unverified blocks that is cut
+    /// short saves its progress with the original provisional mark, so the
+    /// next continued scan (reading the rest from the unverified source
+    /// again) doesn't restart the six-hour wait: the next deploy decision
+    /// crawls again at once.
+    #[tokio::test]
+    async fn an_interrupted_deploy_crawl_keeps_the_six_hour_clock() {
+        let (client, v, _) = verified_with_unverified(Some(200_000), &[], &[]);
+        let dir = scratch_dir("scan-crawl-clock");
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        let since = unix_now() - CONFIRM_CRAWL_AFTER_SECS - 60;
+        let mut saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        saved.provisional_since = Some(since);
+        persist_transfer_scan(&dir, &saved);
+
+        // The refresh's tail window, two crawl windows, then a failure.
+        *v.fail_after.lock().unwrap() = Some(3);
+        find_owned_chequebook(
+            &client,
+            &crate::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            crate::GNOSIS_POSTAGE_STAMP,
+            crate::GNOSIS_BZZ_TOKEN,
+            &NODE_EOA,
+            &dir,
+            true,
+        )
+        .await
+        .expect_err("the crawl fails part-way");
+        let cut = v.ranges.lock().unwrap().last().unwrap().1;
+        let partial = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(partial.scanned_through, cut, "progress saved");
+        assert_eq!(partial.provisional_since, Some(since), "the clock is kept");
+
+        // The next start reads the rest from the unverified source again.
+        *v.fail_after.lock().unwrap() = None;
+        let resumed = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(resumed.provisional_since, Some(since));
+        assert_eq!(
+            find_cb(&client, &dir, true).await,
+            None,
+            "crawled at once, no new six-hour wait"
+        );
+        let scan = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(scan.provisional_since, None);
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M2: a "none" that rests on routine verified scans only (no
+    /// unverified read behind it) has nothing for a second source to vouch
+    /// for, so the deploy decision confirms it window by window at once —
+    /// it doesn't stamp a provisional mark nobody tracks and give up.
+    #[tokio::test]
+    async fn a_verified_unconfirmed_none_is_crawled_at_once() {
+        let (client, v, u) = verified_with_unverified(Some(200_000), &[], &[]);
+        let dir = scratch_dir("scan-verified-none");
+        // Saved before the confirmed mark existed: read verified, but
+        // never confirmed.
+        persist_transfer_scan(
+            &dir,
+            &TransferScan {
+                chain_id: GNOSIS,
+                node_eoa: NODE_EOA,
+                scanned_through: HEAD - RESCAN_TAIL,
+                transfers: Vec::new(),
+                confirmed_through: None,
+                provisional_since: None,
+            },
+        );
+        assert_eq!(find_cb(&client, &dir, true).await, None, "a confirmed none");
+        assert!(v.ranges.lock().unwrap().len() > 64, "crawled");
+        assert!(u.ranges.lock().unwrap().is_empty());
+        let scan = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(scan.provisional_since, None);
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M3: a background confirmation that fails part-way keeps what it
+    /// read (with the provisional mark), so the next try goes on from
+    /// there instead of losing it all.
+    #[tokio::test]
+    async fn a_failed_confirmation_keeps_its_progress() {
+        const EOA: [u8; 20] = [0x58; 20];
+        let all = [to_cb(45_000_000, [1; 32])];
+        let dir = scratch_dir("scan-confirm-progress");
+        let (client, _, _) = verified_with_unverified(Some(10_000), &all, &all);
+        let first = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap();
+        let since = first.provisional_since.expect("read unverified");
+
+        // A verified route that serves the span in ~32 windows, failing
+        // after two.
+        let (client, v, _) = verified_with_unverified(Some(1_000_000), &all, &all);
+        *v.fail_after.lock().unwrap() = Some(2);
+        confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .expect_err("fails part-way");
+        let cut = v.ranges.lock().unwrap()[1].1;
+        let saved = load_transfer_scan(&dir, GNOSIS, &EOA).unwrap();
+        assert_eq!(saved.scanned_through, cut, "progress saved");
+        assert_eq!(saved.confirmed_through, Some(cut));
+        assert_eq!(saved.provisional_since, Some(since));
+
+        v.ranges.lock().unwrap().clear();
+        *v.fail_after.lock().unwrap() = None;
+        let confirmed = confirm_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .unwrap()
+            .expect("confirmed");
+        assert!(
+            v.ranges.lock().unwrap().iter().all(|r| r.0 > cut),
+            "resumed"
+        );
+        assert_eq!(confirmed.transfers.len(), 1);
+        assert_eq!(confirmed.provisional_since, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R1-M3: the window budget bounds a scan even when the route never
+    /// refuses a window the budget's minimum width allows.
+    #[tokio::test]
+    async fn the_window_budget_stops_a_scan() {
+        let chain = std::sync::Arc::new(GrowingChain {
+            cap: Some(10),
+            ..GrowingChain::default()
+        });
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        let rest = client
+            .scan_logs_with(crate::GNOSIS_BZZ_TOKEN, &topics, 1, 1_000, 1, 3, |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(chain.ranges.lock().unwrap().len(), 3);
+        assert_eq!(rest, Some(chain.ranges.lock().unwrap()[2].1 + 1));
     }
 
     #[test]

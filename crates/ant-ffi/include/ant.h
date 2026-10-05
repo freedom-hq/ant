@@ -705,7 +705,9 @@ char *ant_storage_discover(const AntHandle *handle,
  * an RPC that once answered part of the history incompletely (a backend
  * far behind the head) leaves a hole the saved scan never revisits. As
  * slow as the first scan behind a range-capped RPC (minutes), so don't
- * call it at every start. Same return value; requires `chain`.
+ * call it at every start. It reads through the transport only, never
+ * from ant_set_unverified_logs_rpc's unverified source: the scan it
+ * replaces may be confirmed. Same return value; requires `chain`.
  */
 char *ant_storage_discover_full(const AntHandle *handle,
                                 const char *gnosis_rpc,

@@ -326,9 +326,10 @@ struct Opt {
     /// an RPC once answered a window incompletely (a backend far behind
     /// the head), a postage batch bought in it isn't rediscovered until
     /// this flag is passed. As slow as a first start behind a
-    /// range-capped log RPC. (Before deploying a chequebook, `antd`
-    /// confirms "none" on its own by reading again every block no full
-    /// pass has confirmed yet.)
+    /// range-capped log RPC; it reads through the logs RPC only, never
+    /// `--gnosis-unverified-logs-rpc-url`. (Before deploying a
+    /// chequebook, `antd` confirms "none" on its own by reading again
+    /// every block no full pass has confirmed yet.)
     #[arg(long, default_value_t = false)]
     rescan_chain_history: bool,
 
@@ -1960,8 +1961,9 @@ async fn rediscover_into(
 
 /// Confirm a transfer scan that read part of the history only from the
 /// unverified source (`--gnosis-unverified-logs-rpc-url`, unconfirmed since
-/// `since`, unix seconds): one verified request at a time, with the shared
-/// backoff, never a crawl. Once it's confirmed, register any batch the
+/// `since`, unix seconds): at most `MAX_VERIFIED_WINDOWS` (64) verified
+/// windows per try — one request once the logs RPC serves the whole span —
+/// with the shared backoff, never a crawl. Once it's confirmed, register any batch the
 /// unverified read missed and move `/health.walletScan` to `done`. With
 /// `settlement` (startup left it off), give the chequebook resolution
 /// another go once its "none" is confirmed — or once the deploy decision

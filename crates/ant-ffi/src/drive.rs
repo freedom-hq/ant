@@ -1205,6 +1205,13 @@ async fn owned_batches(
 /// whole transfer history again and replaces it: the way back from a
 /// saved scan an RPC once answered incompletely, which nothing automatic
 /// revisits. Hosts call the plain form at every start, so it stays cheap.
+///
+/// A plain discover that read part of the history only from the
+/// unverified source ([`crate::ant_set_unverified_logs_rpc`]) starts the
+/// handle's background confirmation ([`ChainInit::confirm_unverified`],
+/// at most one loop per handle) as the gateway's chain init does, so the
+/// blocks don't stay unconfirmed until the next `ant_start_gateway`. A
+/// full rescan reads through the transport only and is never unconfirmed.
 #[cfg(feature = "chain")]
 pub(crate) fn storage_discover(
     h: &AntHandle,
@@ -1217,9 +1224,12 @@ pub(crate) fn storage_discover(
     let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = h.chain_client(rpc);
-        let (found, _) = owned_batches(&chain, &eth, &data_dir, full_rescan)
+        let (found, unconfirmed) = owned_batches(&chain, &eth, &data_dir, full_rescan)
             .await
             .map_err(|e| DriveError::Op(format!("search the chain for your storage: {e}")))?;
+        if unconfirmed {
+            spawn_confirm_unverified(h, chain.clone());
+        }
         let mut registered = Vec::new();
         for b in &found {
             register_batch(
@@ -1250,6 +1260,30 @@ pub(crate) fn storage_discover(
             status,
         ))
     })
+}
+
+/// Mark `h`'s rediscovery unconfirmed and confirm it in the background
+/// ([`ChainInit::confirm_unverified`]), reporting an adopted chequebook to
+/// the gateway's slot. A no-op while a confirmation already runs.
+#[cfg(feature = "chain")]
+fn spawn_confirm_unverified(h: &AntHandle, chain: ant_chain::ChainClient) {
+    h.chain_init
+        .unconfirmed
+        .store(true, std::sync::atomic::Ordering::Release);
+    let init = std::sync::Arc::clone(&h.chain_init);
+    let cmd_tx = h.cmd_tx.clone();
+    let data_dir = h.data_dir.clone();
+    let secret = h.signing_secret;
+    let eth = h.eth;
+    let slot = h.gateway_chequebook.clone();
+    h.runtime.spawn(async move {
+        if let Some(chequebook) = init
+            .confirm_unverified(&chain, &cmd_tx, &data_dir, secret)
+            .await
+        {
+            sync_gateway_chequebook(&slot, &eth, Some(chequebook));
+        }
+    });
 }
 
 #[cfg(feature = "chain")]
