@@ -75,15 +75,22 @@ pub enum ControlCommand {
     /// Used by `ant-gateway` to serve `/chunks/{addr}` in a bee-shaped
     /// way (bee's `chunkstore.Get` returns `Chunk.Data()` which is the
     /// wire form). Routing / peer-pick / CAC verification logic is
-    /// identical to `GetChunk`, except that the lookup runs in
-    /// fast-miss mode (`RoutingFetcher::with_fast_miss`, issue #146): it
-    /// ends once enough peers have answered "not found" instead of
-    /// asking up to 32 peers one after another. Ends in
+    /// identical to `GetChunk`, except that with `fast_miss` set the
+    /// lookup runs in fast-miss mode (`RoutingFetcher::with_fast_miss`,
+    /// issue #146): it ends once enough peers have answered "not found"
+    /// instead of asking up to 32 peers one after another. Ends in
     /// [`ControlAck::Bytes`], [`ControlAck::NotFound`] (peers confirmed
     /// the chunk missing), [`ControlAck::NotReady`] (the last answer was
     /// a miss but the peer pool was starved) or [`ControlAck::Error`].
     GetChunkRaw {
         reference: [u8; 32],
+        /// Run the lookup in fast-miss mode. Set it for reads whose miss
+        /// is an expected answer (`/chunks`, `/soc`: a feed slot polled
+        /// until it is written); leave it off for chunks expected to
+        /// exist (ACT histories and grantee lists, a feed's resolved
+        /// root chunk), where the extra in-flight peers would mostly buy
+        /// duplicate, separately-charged deliveries.
+        fast_miss: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Run a bounded pullsync probe against the closest connected peer to

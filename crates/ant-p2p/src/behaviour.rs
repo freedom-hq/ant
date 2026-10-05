@@ -2948,7 +2948,11 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
-        ControlCommand::GetChunkRaw { reference, ack } => {
+        ControlCommand::GetChunkRaw {
+            reference,
+            fast_miss,
+            ack,
+        } => {
             // Same cache-then-network fetch path as `GetChunk`, but the ack
             // carries the full wire bytes (`span || payload` for a CAC, or
             // `id || sig || span || payload` for a SOC) so `ant-gateway` can
@@ -2958,13 +2962,14 @@ fn handle_control_command(
             // read-after-own-write; a cached hit short-circuits before any
             // peer round-trip, hence no early-return on an empty peer set.
             //
-            // A miss here is an answer, not a failure: a live-stream
-            // player polls the next feed slot through it until the slot
-            // is written, so the lookup runs in fast-miss mode and ends
-            // once enough peers said "not found" (issue #146), and a
-            // confirmed miss is typed as `ControlAck::NotFound` so the
-            // gateway answers 404 whichever tail (`storage: not found`
-            // or `no peer found`) the last answer had.
+            // For `/chunks` and `/soc` a miss is an answer, not a failure:
+            // a live-stream player polls the next feed slot through it
+            // until the slot is written, so those callers set `fast_miss`
+            // and the lookup ends once enough peers said "not found"
+            // (issue #146). Either way a confirmed miss is typed as
+            // `ControlAck::NotFound` so the gateway answers 404 whichever
+            // tail (`storage: not found` or `no peer found`) the last
+            // answer had.
             let peers_rx = state.peers_watch.subscribe();
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
@@ -2972,7 +2977,7 @@ fn handle_control_command(
             tokio::spawn(async move {
                 let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
                     .with_cache(cache)
-                    .with_fast_miss(true);
+                    .with_fast_miss(fast_miss);
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
@@ -10996,6 +11001,7 @@ mod tests {
             0,
             ControlCommand::GetChunkRaw {
                 reference: addr,
+                fast_miss: true,
                 ack: ack_tx,
             },
         );

@@ -132,6 +132,37 @@ const fn fast_miss_width(not_found_answers: usize) -> usize {
     }
 }
 
+/// How many requests the error arm wants in flight after a failure, with
+/// `in_flight` still outstanding and `errors_left` failures left in the
+/// budget (always > 0 here).
+///
+/// A plain fetch replaces the failed request with one new peer, as bee's
+/// `retry()` does, and so does a [`RoutingFetcher::with_fast_miss`]
+/// lookup until a peer has said "not found" (it is a plain fetch until
+/// then). After that it tops up to [`FAST_MISS_FANOUT`], but never past
+/// `errors_left` requests in flight: each outstanding request can still
+/// fail and spend one error, so a request beyond that could only be
+/// answered after the budget is gone. If enough are already in flight it
+/// adds none and waits on them.
+const fn backfill_target(
+    fast_miss: bool,
+    in_flight: usize,
+    not_found_answers: usize,
+    errors_left: usize,
+) -> usize {
+    let replace = in_flight + 1;
+    if !fast_miss || not_found_answers == 0 {
+        return replace;
+    }
+    let width = fast_miss_width(not_found_answers);
+    let want = if replace > width { replace } else { width };
+    if want < errors_left {
+        want
+    } else {
+        errors_left
+    }
+}
+
 /// Whether a [`RoutingFetcher::with_fast_miss`] lookup has heard enough
 /// "not found" answers to call the chunk missing now.
 const fn fast_miss_done(not_found_answers: usize) -> bool {
@@ -2173,16 +2204,14 @@ impl RoutingFetcher {
                             // Backfill immediately on error: don't wait
                             // for the next preemptive tick. Mirrors bee's
                             // `retry()` call inside the error arm. A
-                            // single-chunk lookup that has heard a "not
-                            // found" tops up to `FAST_MISS_FANOUT` peers in
-                            // flight, never more than the error budget
-                            // left can answer for.
-                            let width = if self.fast_miss {
-                                fast_miss_width(not_found_answers).min(errors_left)
-                            } else {
-                                1
-                            };
-                            let target = (in_flight.len() + 1).max(width);
+                            // single-chunk lookup tops up per
+                            // `backfill_target`.
+                            let target = backfill_target(
+                                self.fast_miss,
+                                in_flight.len(),
+                                not_found_answers,
+                                errors_left,
+                            );
                             while in_flight.len() < target {
                                 let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) else {
                                     break;
@@ -4405,6 +4434,29 @@ mod tests {
         assert_eq!(fast_miss_width(FAST_MISS_NOT_FOUND - 1), FAST_MISS_FANOUT);
         assert!(!fast_miss_done(FAST_MISS_NOT_FOUND - 1));
         assert!(fast_miss_done(FAST_MISS_NOT_FOUND));
+    }
+
+    /// Once a "not found" is in, a fast-miss lookup's top-up never puts
+    /// more requests in flight than the error budget left can answer for;
+    /// before that, and in a plain fetch, the failed request is just
+    /// replaced.
+    #[test]
+    fn backfill_target_respects_error_budget() {
+        // Plain fetch: one replacement, whatever the budget.
+        assert_eq!(backfill_target(false, 7, 5, 3), 8);
+        assert_eq!(backfill_target(false, 0, 0, 1), 1);
+        // Fast miss, before any "not found": a plain fetch's replacement.
+        assert_eq!(backfill_target(true, 0, 0, 31), 1);
+        assert_eq!(backfill_target(true, 1, 0, 31), 2);
+        assert_eq!(backfill_target(true, 7, 0, 3), 8);
+        // After a "not found": top up to the fan-out.
+        assert_eq!(backfill_target(true, 0, 1, 31), FAST_MISS_FANOUT);
+        assert_eq!(backfill_target(true, 7, 1, 31), FAST_MISS_FANOUT);
+        // The finding's case: 7 in flight, 3 errors left — no 8th request.
+        assert_eq!(backfill_target(true, 7, 5, 3), 3);
+        // Nothing in flight, budget nearly gone: still one request.
+        assert_eq!(backfill_target(true, 0, 5, 1), 1);
+        assert_eq!(backfill_target(true, 0, 5, 3), 3);
     }
 
     /// Issue #146: a slot that doesn't exist yet. Every peer answers

@@ -861,7 +861,9 @@ async fn confirmed_missing_chunk_and_soc_are_404() {
             let router = router_with_dispatcher(move |cmd| {
                 let message = message.clone();
                 async move {
-                    if let ControlCommand::GetChunkRaw { ack, .. } = cmd {
+                    if let ControlCommand::GetChunkRaw { ack, fast_miss, .. } = cmd {
+                        // A feed slot polled until written: fast-miss lookup.
+                        assert!(fast_miss, "/chunks and /soc must ask for fast miss");
                         let _ = ack.send(ControlAck::NotFound { message });
                     }
                 }
@@ -1309,7 +1311,7 @@ fn router_serving_soc(fixture: &SocFixture) -> axum::Router {
         let wire = wire.clone();
         async move {
             match cmd {
-                ControlCommand::GetChunkRaw { reference, ack } => {
+                ControlCommand::GetChunkRaw { reference, ack, .. } => {
                     let reply = if reference == addr {
                         ControlAck::Bytes { data: wire }
                     } else {
@@ -1757,7 +1759,7 @@ async fn handle_feed_test_command(
     cmd: ControlCommand,
 ) {
     match cmd {
-        ControlCommand::GetChunkRaw { reference, ack } => {
+        ControlCommand::GetChunkRaw { reference, ack, .. } => {
             let reply = match chunks.get(&reference) {
                 Some(wire) => ControlAck::Bytes { data: wire.clone() },
                 None => ControlAck::Error {

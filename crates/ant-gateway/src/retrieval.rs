@@ -334,8 +334,11 @@ pub async fn chunk(
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    // A miss is an answer here (a feed slot not written yet): fast-miss
+    // lookup (issue #146).
     let cmd = ControlCommand::GetChunkRaw {
         reference,
+        fast_miss: true,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -439,8 +442,11 @@ pub async fn download_soc(
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    // A miss is an answer here (a feed slot not written yet): fast-miss
+    // lookup (issue #146).
     let cmd = ControlCommand::GetChunkRaw {
         reference,
+        fast_miss: true,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -4553,8 +4559,11 @@ pub async fn download_feed(
     // at `reference` via the same path `/chunks/{addr}` uses.
     if only_root_chunk {
         let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+        // The resolved root chunk is expected to exist: no fast-miss
+        // fan-out (issue #146).
         let cmd = ControlCommand::GetChunkRaw {
             reference,
+            fast_miss: false,
             ack: ack_tx,
         };
         if handle.commands.send(cmd).await.is_err() {
