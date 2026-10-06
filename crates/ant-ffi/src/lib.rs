@@ -4919,8 +4919,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A handle over `runtime` with everything else inert — enough for
-    /// the [`ant_shutdown`] contract, which only touches the runtime.
     /// A [`test_handle`] with a real disk cache (`cap` or the default)
     /// in a fresh scratch dir, boxed like `ant_init` returns it. Free
     /// with `ant_shutdown`; remove the returned dir after.
@@ -4937,6 +4935,8 @@ mod tests {
         (Box::into_raw(Box::new(h)), dir)
     }
 
+    /// A handle over `runtime` with everything else inert — enough for
+    /// the [`ant_shutdown`] contract, which only touches the runtime.
     fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
