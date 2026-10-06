@@ -602,6 +602,14 @@ fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlit
         conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Cap what a checkpoint leaves behind. Without it a WAL grown
+        // by a big delete (a clear, a shrink, a legacy `VACUUM`) keeps
+        // its high-water size on disk for the rest of the process when
+        // the post-reclaim `wal_checkpoint(TRUNCATE)` loses to a reader:
+        // SQLite reuses the file from the start but never shortens it.
+        // With the limit, the first WAL reset after a later (automatic)
+        // checkpoint cuts it back.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
     }
     Ok(())
@@ -943,17 +951,25 @@ impl WriterState<'_> {
 /// lock another connection holds before giving up.
 const BUSY_TIMEOUT_MS: u64 = 5000;
 
+/// `journal_size_limit` on the write connection: the most WAL a reset
+/// leaves on disk. About one auto-checkpoint's worth (1000 pages of
+/// 8 KiB), the size the WAL grows back to in normal use anyway.
+const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+
 /// Largest database (live pages, after the delete) [`reclaim_space`]
 /// converts from `auto_vacuum = NONE` with a `VACUUM`. The rebuild runs
-/// on the writer thread, so every `put` waits behind it; past this size
-/// the stall is too long to take silently and the file is left as it is
-/// (its free pages are reused by later writes).
-const LEGACY_VACUUM_MAX_LIVE_BYTES: u64 = 256 * 1024 * 1024;
+/// on the writer thread, so every `put` waits behind it, and its temp
+/// copy is built in memory (see [`vacuum_free_pages`]), so this is also
+/// the RAM it can take; past this size the file is left as it is (its
+/// free pages are reused by later writes). After a clear the live data
+/// is just the pinned rows, normally far below this.
+const LEGACY_VACUUM_MAX_LIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Free disk a legacy `VACUUM` must find on top of twice the live size.
-/// In WAL mode the rebuild writes the whole new database into a temp
-/// file and then into the WAL before the checkpoint copies it back, so
-/// the peak is up to ~2× live; the margin keeps the rest of the app (and
+/// In WAL mode the rebuild writes the whole new database into the WAL
+/// (its temp copy is in memory) before the checkpoint copies it back;
+/// asking for 2× live keeps headroom for the WAL's frame overhead and
+/// the old file's pages, and the margin keeps the rest of the app (and
 /// the OS) off a full disk.
 const LEGACY_VACUUM_FREE_MARGIN: u64 = 64 * 1024 * 1024;
 
@@ -997,7 +1013,9 @@ fn available_space(path: &Path) -> Option<u64> {
 /// about twice that in free disk while it runs, with every `put` queued
 /// behind it. It runs only when [`legacy_vacuum_fits`]: the live data is
 /// at most [`LEGACY_VACUUM_MAX_LIVE_BYTES`] and the volume has room for
-/// it. After a clear the live data is just the pinned rows; after a
+/// it. Its temp copy is built in memory (`temp_store = MEMORY`), not in
+/// SQLite's temp directory, which an Android app usually can't write.
+/// After a clear the live data is just the pinned rows; after a
 /// capacity shrink it is ~95% of the new cap plus the pinned rows, so a
 /// large cap stays unconverted (and unshrunk) until a clear. Once
 /// converted, later calls take the incremental path.
@@ -1005,7 +1023,9 @@ fn available_space(path: &Path) -> Option<u64> {
 /// The checkpoint doesn't wait: the busy timeout is dropped to zero for
 /// it, so a reader holding an old snapshot (a stream in progress) makes
 /// it give up at once instead of stalling the writer for the full busy
-/// timeout. The WAL then shrinks at a later checkpoint.
+/// timeout. The WAL then shrinks at a later checkpoint: the write
+/// connection's `journal_size_limit` cuts it back to
+/// [`WAL_SIZE_LIMIT_BYTES`] the first time it resets after one.
 fn reclaim_space(conn: &mut Connection, path: &Path) {
     if let Err(e) = vacuum_free_pages(conn, path) {
         warn!(
@@ -1064,7 +1084,20 @@ fn vacuum_free_pages(conn: &mut Connection, path: &Path) -> Result<(), rusqlite:
         );
         return Ok(());
     }
-    if let Err(e) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
+    // `VACUUM` builds its copy in a temp database. On file, SQLite puts
+    // that in `sqlite3_temp_directory`/`SQLITE_TMPDIR`/`TMPDIR`, else
+    // `/var/tmp`, `/usr/tmp`, `/tmp` or the cwd: none of which an
+    // Android app can write unless the host set one, and none of which
+    // is the volume `available_space` measured. So build it in memory
+    // instead (bounded by `LEGACY_VACUUM_MAX_LIVE_BYTES`); the process-
+    // wide temp-directory knob is left alone, it isn't safe to change
+    // while other connections may be opening temp files.
+    conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    let res = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
+    if let Err(e) = conn.execute_batch("PRAGMA temp_store = DEFAULT;") {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "restoring temp_store failed");
+    }
+    if let Err(e) = res {
         // Rolled back; leave the mode as the file has it so nothing
         // else on this connection picks the pending switch up.
         let _ = conn.execute_batch("PRAGMA auto_vacuum = NONE;");
@@ -2391,6 +2424,117 @@ mod tests {
         cache.put_batch(chunks(0x66, 4)).await.unwrap();
         reader.execute_batch("COMMIT").unwrap();
         assert_counters_match(&cache, "after clear with a reader");
+    }
+
+    fn wal_bytes(path: &Path) -> u64 {
+        let mut s = path.as_os_str().to_owned();
+        s.push("-wal");
+        std::fs::metadata(PathBuf::from(s)).map_or(0, |m| m.len())
+    }
+
+    /// When a reader blocks the post-clear `wal_checkpoint(TRUNCATE)`,
+    /// the WAL the delete grew must not stay at its high-water size for
+    /// the rest of the process: once the reader is gone, later writes
+    /// checkpoint and reset it, and `journal_size_limit` cuts it back.
+    #[tokio::test]
+    async fn wal_shrinks_after_a_reader_blocked_the_clear_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("walcap.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        cache.put_batch(chunks(0x6f, 4)).await.unwrap();
+
+        // A long stream holds its snapshot across the fill and the
+        // clear, so no checkpoint can reset the WAL in between.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        fill_with_pin(&cache, 5000, 4).await;
+        cache.clear_unpinned().await.unwrap();
+        let high = wal_bytes(&path);
+        assert!(
+            high > 2 * WAL_SIZE_LIMIT_BYTES as u64,
+            "the blocked checkpoint left a big WAL: {high}"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+
+        for i in 0..4u8 {
+            cache.put_batch(chunks(0x70 + i, 4)).await.unwrap();
+        }
+        let after = wal_bytes(&path);
+        assert!(
+            after <= WAL_SIZE_LIMIT_BYTES as u64,
+            "WAL cut back after the reader left: {high} -> {after}"
+        );
+        assert_counters_match(&cache, "after WAL reset");
+    }
+
+    /// Paths of this process's open-but-unlinked SQLite temp files.
+    #[cfg(target_os = "linux")]
+    fn open_sqlite_temp_files() -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|p| p.contains("etilqs_"))
+            .collect()
+    }
+
+    /// The legacy conversion's `VACUUM` must not need SQLite's temp
+    /// directory (`/tmp`, `TMPDIR`, ...), which an Android app usually
+    /// can't write: its copy is built in memory. Watches this process's
+    /// fds for SQLite's `etilqs_*` temp file while the rebuild runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_vacuum_builds_its_copy_in_memory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-mem.sqlite");
+        make_legacy_db(&path);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for (i, (addr, wire)) in chunks(0x44, 6000).into_iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO chunks VALUES (?1, ?2, ?3, ?4, ?4)",
+                    rusqlite::params![addr.to_vec(), wire, 4096, i as i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        test_free_space::set(&path, Some(u64::MAX / 4));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    seen.extend(open_sqlite_temp_files());
+                }
+                seen
+            })
+        };
+        vacuum_free_pages(&mut conn, &path).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let mut seen = watcher.join().unwrap();
+        seen.sort();
+        seen.dedup();
+        test_free_space::set(&path, None);
+
+        assert_eq!(auto_vacuum_mode(&path), 2, "converted");
+        assert!(
+            seen.is_empty(),
+            "VACUUM used an on-disk temp file: {seen:?}"
+        );
+        let ts: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ts, 0, "temp_store restored to the default");
     }
 
     /// Lowering the cap evicts down to it at once (unpinned rows only)

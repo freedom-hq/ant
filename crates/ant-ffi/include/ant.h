@@ -345,8 +345,9 @@ char *ant_cache_status(const AntHandle *handle, char **out_err);
  * Remove every unpinned chunk from the disk cache, empty the in-memory
  * cache, and give the space back to the OS (incremental vacuum; a
  * database created by an older build is rebuilt once with VACUUM on a
- * clear, only when the pinned chunks left are at most 256 MiB and the
- * disk has about twice that free; otherwise the file keeps its size
+ * clear, only when the pinned chunks left are at most 64 MiB (the
+ * rebuild's temp copy is held in memory) and the disk has about twice
+ * that free; otherwise the file keeps its size
  * and later cache writes reuse the freed space). Pinned
  * chunks and the pin list are never touched. Blocks until done (well
  * under a second for the default cap, longer for several GB): call it
