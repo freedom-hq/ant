@@ -992,6 +992,20 @@ pub struct DiskCacheInfo {
     /// digging into the binary.
     #[serde(default)]
     pub read_workers: u32,
+    /// Bytes of pinned chunks, held outside `capacity_bytes` (and not
+    /// part of `used_bytes`).
+    #[serde(default)]
+    pub pinned_bytes: u64,
+    /// Number of pinned chunks (included in `chunks`).
+    #[serde(default)]
+    pub pinned_chunks: u64,
+    /// Number of pinned root references.
+    #[serde(default)]
+    pub pin_collections: u64,
+    /// Pin members summed per collection (a chunk shared by two pins
+    /// counts twice) — bee's `/debugstore` `Pinning.TotalChunks`.
+    #[serde(default)]
+    pub pin_member_chunks: u64,
 }
 
 /// Data-plane snapshot read by the `Retrieval` tab in `antop`.

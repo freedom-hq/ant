@@ -83,6 +83,17 @@ impl InMemoryChunkCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Slot capacity (the LRU bound), as built.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().expect("cache mutex poisoned").cap().get()
+    }
+
+    /// Drop every entry. A fetch racing this simply misses and goes to
+    /// the next tier; nothing else depends on an entry staying put.
+    pub fn clear(&self) {
+        self.inner.lock().expect("cache mutex poisoned").clear();
+    }
 }
 
 impl Default for InMemoryChunkCache {
@@ -129,6 +140,18 @@ mod tests {
         assert_eq!(cache.get(&a), Some(vec![10]));
         assert!(cache.get(&b).is_none(), "b should have been evicted");
         assert_eq!(cache.get(&c), Some(vec![30]));
+    }
+
+    #[test]
+    fn clear_empties_and_keeps_capacity() {
+        let cache = InMemoryChunkCache::new(4);
+        cache.put([1u8; 32], vec![1]);
+        cache.put([2u8; 32], vec![2]);
+        assert_eq!(cache.capacity(), 4);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(cache.get(&[1u8; 32]).is_none());
+        assert_eq!(cache.capacity(), 4);
     }
 
     /// Zero-capacity construction shouldn't panic; we clamp to 1.

@@ -46,7 +46,8 @@ struct Opt {
     /// override the built-in defaults. Recognised keys: `api-addr`,
     /// `data-dir`, `password` / `password-file`, `mainnet` /
     /// `network-id`, `blockchain-rpc-endpoint`, `cors-allowed-origins`,
-    /// `verbosity`; other bee keys are accepted and ignored.
+    /// `verbosity`, `swap-enable`, `cache-capacity`; other bee keys are
+    /// accepted and ignored.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -195,6 +196,17 @@ struct Opt {
     /// rows down to ~95% of the cap.
     #[arg(long, default_value_t = 10)]
     disk_cache_max_gb: u64,
+
+    /// Bee's `cache-capacity`: the persistent chunk cache cap in
+    /// *chunks*, turned into bytes the way bee's help text says
+    /// (× 4096; bee's default 1000000 ≈ 4 GB). Also read from the
+    /// `--config` file's `cache-capacity` key, so a bee config keeps its
+    /// cache size. An explicit `--disk-cache-max-gb` wins over the
+    /// file's value (and can't be combined with this flag); with
+    /// neither set, the `--disk-cache-max-gb` default applies. Pinned
+    /// chunks are outside the cap, as in bee.
+    #[arg(long, value_name = "CHUNKS", conflicts_with = "disk_cache_max_gb")]
+    cache_capacity: Option<u64>,
 
     /// Disable the persistent chunk cache entirely. Retrieval falls
     /// back to the legacy `memory -> network` lookup order. Useful
@@ -620,17 +632,13 @@ async fn main() -> Result<()> {
             .disk_cache_path
             .clone()
             .map_or_else(|| data_dir.join("chunks.sqlite"), |p| expand_tilde(&p));
-        // Convert the GB cap to bytes once at startup. Saturating mul
-        // means a hypothetical operator typo of `--disk-cache-max-gb
-        // 18446744073` (a u64 GB count that overflows on multiplication)
-        // produces "as big as we can represent", not a 0-byte cap.
-        let max_bytes = opt.disk_cache_max_gb.saturating_mul(1024 * 1024 * 1024);
+        let max_bytes = disk_cache_max_bytes(&opt);
         match ant_retrieval::DiskChunkCache::open(&path, max_bytes) {
             Ok(c) => {
                 tracing::info!(
                     target: "antd",
                     path = %path.display(),
-                    max_gb = opt.disk_cache_max_gb,
+                    max_bytes,
                     used_bytes = c.used_bytes(),
                     "opened persistent chunk cache",
                 );
@@ -1443,6 +1451,23 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Bee counts `cache-capacity` in chunks and sizes it at 4096 bytes
+/// each ("multiply by 4096 to get approximate capacity in bytes").
+const BEE_CACHE_CHUNK_BYTES: u64 = 4096;
+
+/// The disk cache byte cap: `--cache-capacity` (bee's chunk count, from
+/// the CLI or the config file) when set — `apply_config_file` only lets
+/// the file's value in when `--disk-cache-max-gb` wasn't given — else
+/// `--disk-cache-max-gb`. Saturating, so an absurd value (a GB count
+/// that overflows on multiplication) means "as big as we can
+/// represent", not a wrapped tiny cap.
+fn disk_cache_max_bytes(opt: &Opt) -> u64 {
+    match opt.cache_capacity {
+        Some(chunks) => chunks.saturating_mul(BEE_CACHE_CHUNK_BYTES),
+        None => opt.disk_cache_max_gb.saturating_mul(1024 * 1024 * 1024),
+    }
+}
+
 /// Load `--config` (if given), merging its values into `opt` for every
 /// setting the operator did **not** pass on the command line. Returns
 /// the config keys it doesn't model (for the caller to log once the
@@ -1504,6 +1529,13 @@ fn apply_config_file(
         if !from_cli("swap_enable") {
             if let Some(on) = cfg.swap_enable {
                 opt.swap_enable = on;
+            }
+        }
+        // Either cache flag on the command line beats the file's
+        // `cache-capacity`.
+        if !from_cli("cache_capacity") && !from_cli("disk_cache_max_gb") {
+            if let Some(chunks) = cfg.cache_capacity_chunks()? {
+                opt.cache_capacity = Some(chunks);
             }
         }
     }
@@ -3490,6 +3522,58 @@ mod tests {
             "the flag wins over the file"
         );
         assert!(!opt_from(&["antd", "--config", on, "--swap-enable", "false"]).swap_enable);
+    }
+
+    /// Bee's `cache-capacity` (chunks × 4096) sizes the disk cache from
+    /// the flag or the config file; `--disk-cache-max-gb` on the command
+    /// line beats the file, and the two flags can't be combined.
+    #[test]
+    fn cache_capacity_comes_from_bee_spelling_flag_or_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("bee.yaml");
+        std::fs::write(&cfg, "cache-capacity: \"262144\"\n").unwrap();
+        let cfg = cfg.to_str().unwrap();
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            disk_cache_max_bytes(&opt_from(&["antd"])),
+            10 * GIB,
+            "default"
+        );
+        assert_eq!(
+            disk_cache_max_bytes(&opt_from(&["antd", "--config", cfg])),
+            GIB,
+            "262144 chunks x 4096"
+        );
+        assert_eq!(
+            disk_cache_max_bytes(&opt_from(&["antd", "--cache-capacity", "131072"])),
+            GIB / 2,
+        );
+        assert_eq!(
+            disk_cache_max_bytes(&opt_from(&[
+                "antd",
+                "--config",
+                cfg,
+                "--cache-capacity",
+                "131072"
+            ])),
+            GIB / 2,
+            "the flag wins over the file"
+        );
+        assert_eq!(
+            disk_cache_max_bytes(&opt_from(&[
+                "antd",
+                "--config",
+                cfg,
+                "--disk-cache-max-gb",
+                "3"
+            ])),
+            3 * GIB,
+            "--disk-cache-max-gb wins over the file"
+        );
+        assert!(Opt::command()
+            .try_get_matches_from(["antd", "--cache-capacity", "1", "--disk-cache-max-gb", "1"])
+            .is_err());
     }
 
     /// `--confirm-cheque-liability` clears exactly the named chequebook's

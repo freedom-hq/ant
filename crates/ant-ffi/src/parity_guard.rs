@@ -57,6 +57,7 @@ const FFI_SOURCES: &[&str] = &[
     include_str!("chain_transport.rs"),
     include_str!("stream.rs"),
     include_str!("bench.rs"),
+    include_str!("cache.rs"),
     include_str!("manifest.rs"),
     include_str!("jni.rs"),
 ];

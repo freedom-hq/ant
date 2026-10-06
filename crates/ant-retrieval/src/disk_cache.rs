@@ -132,7 +132,51 @@ enum WriteMsg {
     /// single serialisation point keeps the pin tables and the
     /// `pin_count` budget accounting trivially consistent.
     Pin(PinOp),
+    /// Change the byte cap at runtime; evicts (and reclaims the freed
+    /// file space) at once when the new cap is below the current
+    /// total. See [`DiskChunkCache::set_capacity`].
+    SetCapacity {
+        max_bytes: u64,
+        ack: oneshot::Sender<Result<(), DiskCacheError>>,
+    },
+    /// Drop every unpinned row and give the space back to the OS. See
+    /// [`DiskChunkCache::clear_unpinned`].
+    ClearUnpinned {
+        ack: oneshot::Sender<Result<ClearReport, DiskCacheError>>,
+    },
     Shutdown,
+}
+
+/// Outcome of [`DiskChunkCache::clear_unpinned`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearReport {
+    /// Unpinned rows deleted.
+    pub removed_chunks: u64,
+    /// Chunk bytes those rows held (what [`DiskChunkCache::used_bytes`]
+    /// dropped by).
+    pub freed_bytes: u64,
+    /// [`DiskChunkCache::file_bytes`] before the clear.
+    pub file_bytes_before: u64,
+    /// [`DiskChunkCache::file_bytes`] after the delete, the vacuum and
+    /// the WAL checkpoint.
+    pub file_bytes_after: u64,
+}
+
+/// Pinned-row totals, mirrored the same way as `total_bytes` /
+/// `total_rows`: maintained by the writer thread inside every pin
+/// transaction so a status read never runs a query.
+#[derive(Default)]
+struct PinTotals {
+    /// Bytes of rows with `pin_count > 0` (outside the budget).
+    bytes: AtomicU64,
+    /// Rows with `pin_count > 0`.
+    rows: AtomicU64,
+    /// Rows in `pins` (pinned root references).
+    collections: AtomicU64,
+    /// Rows in `pin_members`: each collection's distinct members,
+    /// summed — a chunk shared by two pins counts twice (bee's
+    /// `/debugstore` `Pinning.TotalChunks`).
+    member_refs: AtomicU64,
 }
 
 /// Pin mutations and queries handled by the writer thread.
@@ -198,7 +242,10 @@ struct Inner {
     read_joins: Mutex<Vec<JoinHandle<()>>>,
     write_tx: CbSender<WriteMsg>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
-    max_bytes: u64,
+    /// Byte cap. Written only by the writer thread (on open and on
+    /// [`WriteMsg::SetCapacity`]) so it always matches the cap the
+    /// eviction sweep actually enforces.
+    max_bytes: Arc<AtomicU64>,
     total_bytes: Arc<AtomicU64>,
     /// Live row count mirrored from `COUNT(*) FROM chunks`. Maintained
     /// by the writer thread alongside `total_bytes` so `antop` can show
@@ -207,6 +254,9 @@ struct Inner {
     /// initial `SELECT COUNT(*)` finishing (cosmetic; same trade-off as
     /// `total_bytes`).
     total_rows: Arc<AtomicU64>,
+    /// Pinned rows / bytes (see [`PinTotals`]). Same backfill caveat as
+    /// `total_rows`.
+    pinned: Arc<PinTotals>,
     /// Read-worker pool size, captured once at open time so the status
     /// snapshot can surface it without re-querying
     /// `available_parallelism`.
@@ -243,9 +293,12 @@ impl DiskChunkCache {
 
         let total_bytes = Arc::new(AtomicU64::new(0));
         let total_rows = Arc::new(AtomicU64::new(0));
+        let pinned = Arc::new(PinTotals::default());
+        let max_bytes_shared = Arc::new(AtomicU64::new(max_bytes));
         let tb = total_bytes.clone();
         let tr = total_rows.clone();
-        let slack_bytes = ((max_bytes as f64) * EVICTION_SLACK_RATIO) as u64;
+        let tp = pinned.clone();
+        let tm = max_bytes_shared.clone();
 
         let (ready_tx, ready_rx) = sync_channel::<()>(0);
         let (write_tx, write_rx) = cb_bounded::<WriteMsg>(65_536);
@@ -255,15 +308,7 @@ impl DiskChunkCache {
         let join = std::thread::Builder::new()
             .name("ant-disk-cache-writer".into())
             .spawn(move || {
-                if let Err(e) = writer_main(
-                    path_thread,
-                    write_rx,
-                    ready_tx,
-                    tb,
-                    tr,
-                    max_bytes,
-                    slack_bytes,
-                ) {
+                if let Err(e) = writer_main(path_thread, write_rx, ready_tx, tb, tr, tp, tm) {
                     warn!(
                         target: "ant_retrieval::disk_cache",
                         "writer thread exited with error: {e}",
@@ -294,7 +339,6 @@ impl DiskChunkCache {
             path = %path.display(),
             initial_total = total_bytes.load(Ordering::Relaxed),
             max_bytes,
-            slack_bytes,
             read_workers = n_read,
             "opened persistent chunk cache",
         );
@@ -307,9 +351,10 @@ impl DiskChunkCache {
                 read_joins: Mutex::new(read_joins),
                 write_tx: write_tx_main,
                 writer_thread: Mutex::new(Some(join)),
-                max_bytes,
+                max_bytes: max_bytes_shared,
                 total_bytes,
                 total_rows,
+                pinned,
                 read_workers: n_read,
             }),
         })
@@ -339,12 +384,103 @@ impl DiskChunkCache {
 
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
-        self.inner.max_bytes
+        self.inner.max_bytes.load(Ordering::Relaxed)
     }
 
+    /// Bytes of *unpinned* rows — the ones counted against
+    /// [`Self::capacity_bytes`] and subject to eviction.
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.inner.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of pinned rows (`pin_count > 0`), held outside the budget.
+    /// Mirrored counter, same backfill caveat as [`Self::used_rows`].
+    #[must_use]
+    pub fn pinned_bytes(&self) -> u64 {
+        self.inner.pinned.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of pinned rows. [`Self::used_rows`] includes these.
+    #[must_use]
+    pub fn pinned_rows(&self) -> u64 {
+        self.inner.pinned.rows.load(Ordering::Relaxed)
+    }
+
+    /// Number of pinned root references (pin collections).
+    #[must_use]
+    pub fn pin_collections(&self) -> u64 {
+        self.inner.pinned.collections.load(Ordering::Relaxed)
+    }
+
+    /// Members summed over every pin collection; a chunk two pins share
+    /// counts twice. Bee reports this as `Pinning.TotalChunks`.
+    #[must_use]
+    pub fn pin_member_refs(&self) -> u64 {
+        self.inner.pinned.member_refs.load(Ordering::Relaxed)
+    }
+
+    /// Size on disk of the database plus its `-wal` and `-shm` files
+    /// (three `stat`s, no query). Missing files count as zero.
+    #[must_use]
+    pub fn file_bytes(&self) -> u64 {
+        db_file_bytes(&self.inner.path)
+    }
+
+    /// Change the byte cap at runtime. When the new cap is below the
+    /// current [`Self::used_bytes`], evicts oldest-by-`last_access`
+    /// unpinned rows down to the usual slack (95% of the cap) before
+    /// returning, then hands the freed pages back to the OS where it can
+    /// (see [`Self::clear_unpinned`] and [`reclaim_space`]: a legacy
+    /// database is only rebuilt when the remaining data is small and the
+    /// disk has room). Pinned rows are never touched.
+    ///
+    /// The new cap is applied before the eviction runs. On `Err` (the
+    /// eviction's SQL failed) it stays applied, part of the eviction may
+    /// have committed, and the next `put` evicts down to it again.
+    /// Runs on the writer thread, so it is ordered with every `put` and
+    /// pin operation.
+    pub async fn set_capacity(&self, max_bytes: u64) -> Result<(), DiskCacheError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .write_tx
+            .send(WriteMsg::SetCapacity {
+                max_bytes,
+                ack: ack_tx,
+            })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ack_rx.await.map_err(|_| DiskCacheError::Panicked)?
+    }
+
+    /// Delete every unpinned row and return the space to the OS. Pinned
+    /// rows and the `pins` / `pin_members` bookkeeping are left exactly
+    /// as they were.
+    ///
+    /// Runs on the writer thread, so it is serialised with `put`s and
+    /// pin operations (a `put` queued behind it lands after the clear;
+    /// one ahead of it is cleared). Reads keep going on their own WAL
+    /// connections throughout: a `get` racing the clear sees the row or
+    /// a miss, never an error.
+    ///
+    /// Space: a database created by this version uses
+    /// `auto_vacuum = INCREMENTAL`, so the freed pages are released with
+    /// `PRAGMA incremental_vacuum`. An older database (created without
+    /// auto-vacuum, which can only be switched on by rebuilding the
+    /// file) is converted with one `VACUUM` on its first clear, but only
+    /// if what's left (the pinned rows) is small enough and the volume
+    /// has room for the rebuild; otherwise the file keeps its size and
+    /// later writes reuse the freed pages. Either way a non-waiting
+    /// `wal_checkpoint(TRUNCATE)` follows so the WAL the delete grew is
+    /// cut back too. Giving space back is best-effort: once the delete
+    /// has committed this returns `Ok`, and `file_bytes_after` shows
+    /// what the file actually shrank to.
+    pub async fn clear_unpinned(&self) -> Result<ClearReport, DiskCacheError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .write_tx
+            .send(WriteMsg::ClearUnpinned { ack: ack_tx })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ack_rx.await.map_err(|_| DiskCacheError::Panicked)?
     }
 
     /// Look up a chunk by address. Trusts stored bytes (bee `chunkstore`
@@ -466,7 +602,15 @@ fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlit
         conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        // Cap what a checkpoint leaves behind. Without it a WAL grown
+        // by a big delete (a clear, a shrink, a legacy `VACUUM`) keeps
+        // its high-water size on disk for the rest of the process when
+        // the post-reclaim `wal_checkpoint(TRUNCATE)` loses to a reader:
+        // SQLite reuses the file from the start but never shortens it.
+        // With the limit, the first WAL reset after a later (automatic)
+        // checkpoint cuts it back.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
     }
     Ok(())
 }
@@ -478,6 +622,16 @@ fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    // A fresh database gets incremental auto-vacuum so a clear or a
+    // capacity shrink can hand pages back to the OS without rebuilding
+    // the file. It has to be set before the first write (the WAL switch
+    // in `apply_shared_pragmas` included); on an existing database the
+    // pragma would only queue a change for the next `VACUUM`, which
+    // `reclaim_space` does explicitly instead.
+    let fresh: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))?;
+    if fresh == 0 {
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    }
     apply_shared_pragmas(&conn, true)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chunks (
@@ -581,12 +735,13 @@ fn process_put_batch_transaction(
     items: &[([u8; 32], Vec<u8>)],
     total_bytes: &Arc<AtomicU64>,
     total_rows: &Arc<AtomicU64>,
+    pinned: &PinTotals,
     max_bytes: u64,
     slack_bytes: u64,
 ) -> Result<(), DiskCacheError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (addr, data) in items {
-        put_upsert_tx(&tx, *addr, data.as_slice(), total_bytes, total_rows)?;
+        put_upsert_tx(&tx, *addr, data.as_slice(), total_bytes, total_rows, pinned)?;
     }
     tx.commit()?;
     let current = total_bytes.load(Ordering::Relaxed);
@@ -610,6 +765,7 @@ fn consume_put_touch_batch(
     batch: Vec<WriteMsg>,
     total_bytes: &Arc<AtomicU64>,
     total_rows: &Arc<AtomicU64>,
+    pinned: &PinTotals,
     max_bytes: u64,
     slack_bytes: u64,
 ) -> Result<bool, DiskCacheError> {
@@ -622,9 +778,12 @@ fn consume_put_touch_batch(
             WriteMsg::Put { addr, data, ack } => put_ops.push((addr, data, ack)),
             WriteMsg::Touch { addr, last_access } => touches.push((addr, last_access)),
             WriteMsg::Shutdown => shutdown = true,
-            // PutBatch / Pin never enter the coalescing buffer — the
-            // writer loop flushes and handles them out-of-band.
-            WriteMsg::PutBatch { .. } | WriteMsg::Pin(_) => {}
+            // Everything else never enters the coalescing buffer — the
+            // writer loop flushes and handles it out-of-band.
+            WriteMsg::PutBatch { .. }
+            | WriteMsg::Pin(_)
+            | WriteMsg::SetCapacity { .. }
+            | WriteMsg::ClearUnpinned { .. } => {}
         }
     }
 
@@ -635,7 +794,7 @@ fn consume_put_touch_batch(
     let batch_res: Result<(), DiskCacheError> = (|| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (addr, data, _) in &put_ops {
-            put_upsert_tx(&tx, *addr, data, total_bytes, total_rows)?;
+            put_upsert_tx(&tx, *addr, data, total_bytes, total_rows, pinned)?;
         }
         for (addr, last) in &touches {
             if let Err(e) = tx.execute(
@@ -677,14 +836,319 @@ fn consume_put_touch_batch(
     }
 }
 
+/// Eviction target for a cap: how far below it a sweep drains.
+fn slack_for(max_bytes: u64) -> u64 {
+    ((max_bytes as f64) * EVICTION_SLACK_RATIO) as u64
+}
+
+/// The writer's mirrored totals, bundled so the out-of-band ops below
+/// don't each take five counters.
+struct WriterState<'a> {
+    path: &'a Path,
+    total_bytes: &'a Arc<AtomicU64>,
+    total_rows: &'a Arc<AtomicU64>,
+    pinned: &'a PinTotals,
+    max_bytes: &'a AtomicU64,
+}
+
+impl WriterState<'_> {
+    fn max(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Every message the coalescing loop doesn't batch: pin ops, a cap
+    /// change, a clear.
+    fn out_of_band(&self, conn: &mut Connection, msg: WriteMsg) {
+        let max = self.max();
+        match msg {
+            WriteMsg::Pin(op) => process_pin_op(
+                conn,
+                op,
+                self.total_bytes,
+                self.total_rows,
+                self.pinned,
+                max,
+                slack_for(max),
+            ),
+            WriteMsg::SetCapacity { max_bytes, ack } => {
+                let _ = ack.send(self.set_capacity(conn, max_bytes));
+            }
+            WriteMsg::ClearUnpinned { ack } => {
+                let _ = ack.send(self.clear_unpinned(conn));
+            }
+            // Batched kinds are routed by the caller.
+            WriteMsg::Put { .. }
+            | WriteMsg::PutBatch { .. }
+            | WriteMsg::Touch { .. }
+            | WriteMsg::Shutdown => {}
+        }
+    }
+
+    fn set_capacity(&self, conn: &mut Connection, max_bytes: u64) -> Result<(), DiskCacheError> {
+        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+        if self.total_bytes.load(Ordering::Relaxed) <= max_bytes {
+            return Ok(());
+        }
+        let before = self.total_bytes.load(Ordering::Relaxed);
+        evict_to_slack(
+            conn,
+            self.total_bytes,
+            self.total_rows,
+            slack_for(max_bytes),
+        )?;
+        debug!(
+            target: "ant_retrieval::disk_cache",
+            max_bytes,
+            before,
+            after = self.total_bytes.load(Ordering::Relaxed),
+            "disk cache capacity lowered; evicted down to it",
+        );
+        reclaim_space(conn, self.path);
+        Ok(())
+    }
+
+    fn clear_unpinned(&self, conn: &mut Connection) -> Result<ClearReport, DiskCacheError> {
+        let file_bytes_before = db_file_bytes(self.path);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (removed, freed): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM chunks WHERE pin_count = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        tx.execute("DELETE FROM chunks WHERE pin_count = 0", [])?;
+        // What's left is exactly the pinned rows: re-derive every
+        // mirrored total from them inside the same transaction, so the
+        // counters are exact after a clear even if they had drifted.
+        let (rows, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM chunks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        tx.commit()?;
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.total_rows.store(rows as u64, Ordering::Relaxed);
+        self.pinned.rows.store(rows as u64, Ordering::Relaxed);
+        self.pinned.bytes.store(bytes as u64, Ordering::Relaxed);
+
+        reclaim_space(conn, self.path);
+        let report = ClearReport {
+            removed_chunks: removed as u64,
+            freed_bytes: freed as u64,
+            file_bytes_before,
+            file_bytes_after: db_file_bytes(self.path),
+        };
+        debug!(
+            target: "ant_retrieval::disk_cache",
+            ?report,
+            pinned_rows = rows,
+            "disk cache cleared (pinned rows kept)",
+        );
+        Ok(report)
+    }
+}
+
+/// Busy timeout on the write connection: how long a write waits for a
+/// lock another connection holds before giving up.
+const BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// `journal_size_limit` on the write connection: the most WAL a reset
+/// leaves on disk. About one auto-checkpoint's worth (1000 pages of
+/// 8 KiB), the size the WAL grows back to in normal use anyway.
+const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Largest database (live pages, after the delete) [`reclaim_space`]
+/// converts from `auto_vacuum = NONE` with a `VACUUM`. The rebuild runs
+/// on the writer thread, so every `put` waits behind it, and its temp
+/// copy is built in memory (see [`vacuum_free_pages`]), so this is also
+/// the RAM it can take; past this size the file is left as it is (its
+/// free pages are reused by later writes). After a clear the live data
+/// is just the pinned rows, normally far below this.
+const LEGACY_VACUUM_MAX_LIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Free disk a legacy `VACUUM` must find on top of twice the live size.
+/// In WAL mode the rebuild writes the whole new database into the WAL
+/// (its temp copy is in memory) before the checkpoint copies it back;
+/// asking for 2× live keeps headroom for the WAL's frame overhead and
+/// the old file's pages, and the margin keeps the rest of the app (and
+/// the OS) off a full disk.
+const LEGACY_VACUUM_FREE_MARGIN: u64 = 64 * 1024 * 1024;
+
+/// Whether a legacy (`auto_vacuum = NONE`) database with `live_bytes` of
+/// live pages may be rebuilt now, given `available` free bytes on its
+/// volume. A failed free-space read is not "plenty of room": skip.
+fn legacy_vacuum_fits(live_bytes: u64, available: Option<u64>) -> bool {
+    live_bytes <= LEGACY_VACUUM_MAX_LIVE_BYTES
+        && available.is_some_and(|free| {
+            free >= live_bytes
+                .saturating_mul(2)
+                .saturating_add(LEGACY_VACUUM_FREE_MARGIN)
+        })
+}
+
+/// Free bytes on the volume holding `path`; `None` if it can't be read.
+fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = test_free_space::get(path) {
+        return Some(free);
+    }
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    fs4::available_space(dir.unwrap_or(path)).ok()
+}
+
+/// Hand free pages back to the OS and cut the WAL back to zero.
+///
+/// Best-effort and infallible on purpose: it runs after the delete or
+/// eviction has committed, so a failure here must not turn a done clear
+/// or shrink into an error (the rows are gone and the cap applied either
+/// way). Anything that goes wrong is logged; the free pages stay on the
+/// freelist, later writes reuse them, and the file is no bigger than
+/// before.
+///
+/// `auto_vacuum = INCREMENTAL` (every database created since this
+/// landed): `PRAGMA incremental_vacuum` moves the free pages to the end
+/// and truncates. Needs no extra disk and no rebuild.
+///
+/// Anything else (an older `NONE` database) can only be converted by a
+/// `VACUUM`, which rebuilds the file at its live size and needs up to
+/// about twice that in free disk while it runs, with every `put` queued
+/// behind it. It runs only when [`legacy_vacuum_fits`]: the live data is
+/// at most [`LEGACY_VACUUM_MAX_LIVE_BYTES`] and the volume has room for
+/// it. Its temp copy is built in memory (`temp_store = MEMORY`), not in
+/// SQLite's temp directory, which an Android app usually can't write.
+/// After a clear the live data is just the pinned rows; after a
+/// capacity shrink it is ~95% of the new cap plus the pinned rows, so a
+/// large cap stays unconverted (and unshrunk) until a clear. Once
+/// converted, later calls take the incremental path.
+///
+/// The checkpoint doesn't wait: the busy timeout is dropped to zero for
+/// it, so a reader holding an old snapshot (a stream in progress) makes
+/// it give up at once instead of stalling the writer for the full busy
+/// timeout. The WAL then shrinks at a later checkpoint: the write
+/// connection's `journal_size_limit` cuts it back to
+/// [`WAL_SIZE_LIMIT_BYTES`] the first time it resets after one.
+fn reclaim_space(conn: &mut Connection, path: &Path) {
+    if let Err(e) = vacuum_free_pages(conn, path) {
+        warn!(
+            target: "ant_retrieval::disk_cache",
+            error = %e,
+            "giving disk space back failed; free pages stay in the file for reuse",
+        );
+    }
+    if let Err(e) = conn.busy_timeout(std::time::Duration::ZERO) {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "busy_timeout(0) failed");
+        return;
+    }
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => {}
+        Ok(_) => debug!(
+            target: "ant_retrieval::disk_cache",
+            "WAL checkpoint after reclaim was blocked by a reader; file shrinks at a later one",
+        ),
+        Err(e) => warn!(
+            target: "ant_retrieval::disk_cache",
+            error = %e,
+            "WAL checkpoint after reclaim failed",
+        ),
+    }
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS)) {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "restoring busy_timeout failed");
+    }
+}
+
+fn vacuum_free_pages(conn: &mut Connection, path: &Path) -> Result<(), rusqlite::Error> {
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if mode == 2 {
+        // Frees one page per step: drain the statement, don't
+        // `execute` it once.
+        let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        return Ok(());
+    }
+    let (pages, free, page_size): (i64, i64, i64) = conn.query_row(
+        "SELECT p.page_count, f.freelist_count, s.page_size \
+         FROM pragma_page_count p, pragma_freelist_count f, pragma_page_size s",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let live_bytes = (pages - free).max(0) as u64 * page_size.max(0) as u64;
+    let available = available_space(path);
+    if !legacy_vacuum_fits(live_bytes, available) {
+        debug!(
+            target: "ant_retrieval::disk_cache",
+            live_bytes,
+            ?available,
+            "legacy database (no auto-vacuum) left unconverted: too large or not enough free disk to rebuild it now",
+        );
+        return Ok(());
+    }
+    // `VACUUM` builds its copy in a temp database. On file, SQLite puts
+    // that in `sqlite3_temp_directory`/`SQLITE_TMPDIR`/`TMPDIR`, else
+    // `/var/tmp`, `/usr/tmp`, `/tmp` or the cwd: none of which an
+    // Android app can write unless the host set one, and none of which
+    // is the volume `available_space` measured. So build it in memory
+    // instead (bounded by `LEGACY_VACUUM_MAX_LIVE_BYTES`); the process-
+    // wide temp-directory knob is left alone, it isn't safe to change
+    // while other connections may be opening temp files.
+    conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    let res = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
+    if let Err(e) = conn.execute_batch("PRAGMA temp_store = DEFAULT;") {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "restoring temp_store failed");
+    }
+    if let Err(e) = res {
+        // Rolled back; leave the mode as the file has it so nothing
+        // else on this connection picks the pending switch up.
+        let _ = conn.execute_batch("PRAGMA auto_vacuum = NONE;");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Test-only override for [`available_space`], keyed by database path
+/// so parallel tests don't see each other's value.
+#[cfg(test)]
+mod test_free_space {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OVERRIDES: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+    pub(super) fn set(path: &Path, free: Option<u64>) {
+        let mut g = OVERRIDES.lock().unwrap();
+        let map = g.get_or_insert_with(HashMap::new);
+        match free {
+            Some(f) => map.insert(path.to_path_buf(), f),
+            None => map.remove(path),
+        };
+    }
+
+    pub(super) fn get(path: &Path) -> Option<u64> {
+        OVERRIDES.lock().unwrap().as_ref()?.get(path).copied()
+    }
+}
+
+/// `path` + `-wal` + `-shm` sizes. A missing file is zero bytes.
+fn db_file_bytes(path: &Path) -> u64 {
+    let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let sidecar = |suffix: &str| {
+        let mut s = path.as_os_str().to_owned();
+        s.push(suffix);
+        PathBuf::from(s)
+    };
+    size(path) + size(&sidecar("-wal")) + size(&sidecar("-shm"))
+}
+
 fn writer_main(
     path: PathBuf,
     rx: CbReceiver<WriteMsg>,
     ready_tx: SyncSender<()>,
     total_bytes: Arc<AtomicU64>,
     total_rows: Arc<AtomicU64>,
-    max_bytes: u64,
-    slack_bytes: u64,
+    pinned: Arc<PinTotals>,
+    max_bytes: Arc<AtomicU64>,
 ) -> Result<(), DiskCacheError> {
     let mut conn = open_write_connection(&path)?;
 
@@ -704,23 +1168,61 @@ fn writer_main(
         .send(())
         .map_err(|_| DiskCacheError::WriterStopped)?;
 
-    // Single combined backfill query: SQLite serves SUM + COUNT from
-    // the same sequential scan, so we pay the cold-cache scan cost
+    // Single combined backfill query: SQLite serves every aggregate
+    // from the same sequential scan, so we pay the cold-cache scan cost
     // once. Pinned rows are outside the budget (see [`PinOp`]), so the
     // byte total only sums evictable rows; the row count covers
-    // everything.
-    let (initial_total, initial_rows): (u64, u64) = conn
+    // everything, and the pinned totals are mirrored separately.
+    let (initial_total, initial_rows, initial_pinned_bytes, initial_pinned_rows): (
+        u64,
+        u64,
+        u64,
+        u64,
+    ) = conn
         .query_row(
-            "SELECT COALESCE(SUM(CASE WHEN pin_count = 0 THEN size ELSE 0 END), 0), COUNT(*) \
+            "SELECT COALESCE(SUM(CASE WHEN pin_count = 0 THEN size ELSE 0 END), 0), COUNT(*), \
+                    COALESCE(SUM(CASE WHEN pin_count > 0 THEN size ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN pin_count > 0 THEN 1 ELSE 0 END), 0) \
              FROM chunks",
             [],
-            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            },
         )
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0, 0));
     total_bytes.store(initial_total, Ordering::Relaxed);
     total_rows.store(initial_rows, Ordering::Relaxed);
+    pinned.bytes.store(initial_pinned_bytes, Ordering::Relaxed);
+    pinned.rows.store(initial_pinned_rows, Ordering::Relaxed);
+    // Pin tables are small (one row per pin / pin member), unlike the
+    // chunks scan above.
+    let count = |table: &str| -> u64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_or(0, |n| n as u64)
+    };
+    pinned.collections.store(count("pins"), Ordering::Relaxed);
+    pinned
+        .member_refs
+        .store(count("pin_members"), Ordering::Relaxed);
+
+    let ws = WriterState {
+        path: &path,
+        total_bytes: &total_bytes,
+        total_rows: &total_rows,
+        pinned: &pinned,
+        max_bytes: &max_bytes,
+    };
 
     'outer: loop {
+        let max = ws.max();
+        let slack = slack_for(max);
         match rx.recv() {
             Err(_) | Ok(WriteMsg::Shutdown) => break,
             Ok(WriteMsg::PutBatch { items, ack }) => {
@@ -729,20 +1231,18 @@ fn writer_main(
                     &items,
                     &total_bytes,
                     &total_rows,
-                    max_bytes,
-                    slack_bytes,
+                    &pinned,
+                    max,
+                    slack,
                 );
                 let _ = ack.send(r);
             }
-            Ok(WriteMsg::Pin(op)) => {
-                process_pin_op(
-                    &mut conn,
-                    op,
-                    &total_bytes,
-                    &total_rows,
-                    max_bytes,
-                    slack_bytes,
-                );
+            Ok(
+                m @ (WriteMsg::Pin(_)
+                | WriteMsg::SetCapacity { .. }
+                | WriteMsg::ClearUnpinned { .. }),
+            ) => {
+                ws.out_of_band(&mut conn, m);
             }
             Ok(first) => {
                 let mut batch = vec![first];
@@ -752,32 +1252,30 @@ fn writer_main(
                             batch.push(WriteMsg::Shutdown);
                             break;
                         }
-                        Ok(WriteMsg::Pin(op)) => {
+                        Ok(
+                            m @ (WriteMsg::Pin(_)
+                            | WriteMsg::SetCapacity { .. }
+                            | WriteMsg::ClearUnpinned { .. }),
+                        ) => {
                             let shutdown_after = match consume_put_touch_batch(
                                 &mut conn,
                                 std::mem::take(&mut batch),
                                 &total_bytes,
                                 &total_rows,
-                                max_bytes,
-                                slack_bytes,
+                                &pinned,
+                                max,
+                                slack,
                             ) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(
                                         target: "ant_retrieval::disk_cache",
-                                        "write batch ahead of pin op failed: {e}",
+                                        "write batch ahead of out-of-band op failed: {e}",
                                     );
                                     false
                                 }
                             };
-                            process_pin_op(
-                                &mut conn,
-                                op,
-                                &total_bytes,
-                                &total_rows,
-                                max_bytes,
-                                slack_bytes,
-                            );
+                            ws.out_of_band(&mut conn, m);
                             if shutdown_after {
                                 break 'outer;
                             }
@@ -789,8 +1287,9 @@ fn writer_main(
                                 batch,
                                 &total_bytes,
                                 &total_rows,
-                                max_bytes,
-                                slack_bytes,
+                                &pinned,
+                                max,
+                                slack,
                             ) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -803,8 +1302,9 @@ fn writer_main(
                                 &items,
                                 &total_bytes,
                                 &total_rows,
-                                max_bytes,
-                                slack_bytes,
+                                &pinned,
+                                max,
+                                slack,
                             );
                             let _ = ack.send(r);
                             if shutdown_after {
@@ -823,8 +1323,9 @@ fn writer_main(
                     batch,
                     &total_bytes,
                     &total_rows,
-                    max_bytes,
-                    slack_bytes,
+                    &pinned,
+                    max,
+                    slack,
                 )?;
                 if shutdown_after {
                     break 'outer;
@@ -842,6 +1343,7 @@ fn put_upsert_tx(
     data: &[u8],
     total_bytes: &AtomicU64,
     total_rows: &AtomicU64,
+    pinned: &PinTotals,
 ) -> Result<(), DiskCacheError> {
     let size = data.len() as u64;
     let now = unix_now();
@@ -868,6 +1370,8 @@ fn put_upsert_tx(
     if let Some((old, pin_count)) = existing {
         if pin_count == 0 {
             update_total(total_bytes, size as i64 - old as i64);
+        } else {
+            update_total(&pinned.bytes, size as i64 - old as i64);
         }
     } else {
         update_total(total_bytes, size as i64);
@@ -971,6 +1475,7 @@ fn process_pin_op(
     op: PinOp,
     total_bytes: &Arc<AtomicU64>,
     total_rows: &Arc<AtomicU64>,
+    pinned: &PinTotals,
     max_bytes: u64,
     slack_bytes: u64,
 ) {
@@ -980,11 +1485,11 @@ fn process_pin_op(
             members,
             ack,
         } => {
-            let r = pin_collection_tx(conn, &reference, &members, total_bytes, total_rows);
+            let r = pin_collection_tx(conn, &reference, &members, total_bytes, total_rows, pinned);
             let _ = ack.send(r);
         }
         PinOp::Unpin { reference, ack } => {
-            let r = unpin_tx(conn, &reference, total_bytes);
+            let r = unpin_tx(conn, &reference, total_bytes, pinned);
             // Bytes returned to the budget may push it over the cap.
             if matches!(r, Ok(true)) && total_bytes.load(Ordering::Relaxed) > max_bytes {
                 if let Err(e) = evict_to_slack(conn, total_bytes, total_rows, slack_bytes) {
@@ -1069,6 +1574,7 @@ fn pin_collection_tx(
     members: &[([u8; 32], Vec<u8>)],
     total_bytes: &Arc<AtomicU64>,
     total_rows: &Arc<AtomicU64>,
+    pinned: &PinTotals,
 ) -> Result<bool, DiskCacheError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let already: i64 = tx.query_row(
@@ -1087,6 +1593,9 @@ fn pin_collection_tx(
     let mut seen = std::collections::HashSet::with_capacity(members.len());
     let mut new_rows = 0u64;
     let mut bytes_leaving_budget = 0u64;
+    // Rows going from unpinned/absent to pinned, and their bytes.
+    let mut newly_pinned_rows = 0u64;
+    let mut newly_pinned_bytes = 0u64;
     let now = unix_now() as i64;
     for (addr, wire) in members {
         if !seen.insert(*addr) {
@@ -1112,6 +1621,8 @@ fn pin_collection_tx(
                     params![&addr[..], wire, wire.len() as i64, now, now],
                 )?;
                 new_rows += 1;
+                newly_pinned_rows += 1;
+                newly_pinned_bytes += wire.len() as u64;
             }
             Some((size, 0)) => {
                 // First pin over a cached row: bytes leave the budget.
@@ -1120,6 +1631,8 @@ fn pin_collection_tx(
                     params![&addr[..]],
                 )?;
                 bytes_leaving_budget += size;
+                newly_pinned_rows += 1;
+                newly_pinned_bytes += size;
             }
             Some((_, n)) => {
                 tx.execute(
@@ -1132,6 +1645,14 @@ fn pin_collection_tx(
     tx.commit()?;
     total_rows.fetch_add(new_rows, Ordering::Relaxed);
     update_total(total_bytes, -(bytes_leaving_budget as i64));
+    pinned.rows.fetch_add(newly_pinned_rows, Ordering::Relaxed);
+    pinned
+        .bytes
+        .fetch_add(newly_pinned_bytes, Ordering::Relaxed);
+    pinned.collections.fetch_add(1, Ordering::Relaxed);
+    pinned
+        .member_refs
+        .fetch_add(seen.len() as u64, Ordering::Relaxed);
     Ok(true)
 }
 
@@ -1142,14 +1663,15 @@ fn unpin_tx(
     conn: &mut Connection,
     reference: &[u8],
     total_bytes: &Arc<AtomicU64>,
+    pinned: &PinTotals,
 ) -> Result<bool, DiskCacheError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let pinned: i64 = tx.query_row(
+    let is_pinned: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pins WHERE reference = ?1",
         params![reference],
         |row| row.get(0),
     )?;
-    if pinned == 0 {
+    if is_pinned == 0 {
         return Ok(false);
     }
     let members: Vec<Vec<u8>> = {
@@ -1158,6 +1680,7 @@ fn unpin_tx(
         rows.collect::<Result<_, _>>()?
     };
     let mut bytes_returning = 0u64;
+    let mut rows_returning = 0u64;
     for addr in &members {
         let existing: Option<(u64, i64)> = tx
             .query_row(
@@ -1174,6 +1697,7 @@ fn unpin_tx(
                 )?;
                 if n == 1 {
                     bytes_returning += size;
+                    rows_returning += 1;
                 }
             }
             Some((_, n)) => {
@@ -1192,6 +1716,14 @@ fn unpin_tx(
     tx.execute("DELETE FROM pins WHERE reference = ?1", params![reference])?;
     tx.commit()?;
     update_total(total_bytes, bytes_returning as i64);
+    update_total(&pinned.bytes, -(bytes_returning as i64));
+    let _ = pinned
+        .rows
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(rows_returning))
+        });
+    update_total(&pinned.collections, -1);
+    update_total(&pinned.member_refs, -(members.len() as i64));
     Ok(true)
 }
 
@@ -1571,5 +2103,612 @@ mod tests {
             "stale last_access must be refreshed on read \
              (was {backdated}, now {after})",
         );
+    }
+
+    /// Ground truth for the mirrored counters, straight from SQL:
+    /// `(unpinned bytes, unpinned rows, pinned bytes, pinned rows)`.
+    fn sql_totals(path: &Path) -> (u64, u64, u64, u64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN pin_count = 0 THEN size ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN pin_count = 0 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN pin_count > 0 THEN size ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN pin_count > 0 THEN 1 ELSE 0 END), 0) \
+             FROM chunks",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// The mirrored counters agree with SQL.
+    fn assert_counters_match(cache: &DiskChunkCache, ctx: &str) {
+        let (ub, ur, pb, pr) = sql_totals(cache.path());
+        assert_eq!(cache.used_bytes(), ub, "{ctx}: used_bytes");
+        assert_eq!(cache.used_rows(), ur + pr, "{ctx}: used_rows (all rows)");
+        assert_eq!(cache.pinned_bytes(), pb, "{ctx}: pinned_bytes");
+        assert_eq!(cache.pinned_rows(), pr, "{ctx}: pinned_rows");
+        let conn = rusqlite::Connection::open(cache.path()).unwrap();
+        let count = |t: &str| -> u64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap() as u64
+        };
+        assert_eq!(
+            cache.pin_collections(),
+            count("pins"),
+            "{ctx}: pin_collections"
+        );
+        assert_eq!(
+            cache.pin_member_refs(),
+            count("pin_members"),
+            "{ctx}: pin_member_refs"
+        );
+    }
+
+    fn auto_vacuum_mode(path: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `n` distinct ~4 KiB chunks keyed by `tag`.
+    fn chunks(tag: u8, n: u32) -> Vec<([u8; 32], Vec<u8>)> {
+        (0..n)
+            .map(|i| {
+                let mut payload = vec![tag; 4096];
+                payload[..4].copy_from_slice(&i.to_le_bytes());
+                make_chunk(&payload)
+            })
+            .collect()
+    }
+
+    /// Fill `cache` with `n` unpinned chunks and one pinned collection
+    /// of `pinned_n` chunks (one of which is also first cached
+    /// unpinned, so both pin paths — fresh row and existing row — run).
+    async fn fill_with_pin(
+        cache: &DiskChunkCache,
+        n: u32,
+        pinned_n: u32,
+    ) -> (Vec<([u8; 32], Vec<u8>)>, Vec<([u8; 32], Vec<u8>)>, Vec<u8>) {
+        let unpinned = chunks(0x11, n);
+        for batch in unpinned.chunks(256) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        let pinned = chunks(0x22, pinned_n);
+        cache.put(pinned[0].0, pinned[0].1.clone()).await.unwrap();
+        let root = pinned[0].0.to_vec();
+        assert!(cache
+            .pin_collection(root.clone(), pinned.clone())
+            .await
+            .unwrap());
+        (unpinned, pinned, root)
+    }
+
+    async fn clear_keeps_pins_and_shrinks(cache: &DiskChunkCache) {
+        let (unpinned, pinned, root) = fill_with_pin(cache, 3000, 8).await;
+        assert_counters_match(cache, "before clear");
+        assert_eq!(cache.pinned_rows(), 8);
+        assert_eq!(cache.used_rows(), 3000 + 8);
+        let used_before = cache.used_bytes();
+        let file_before = cache.file_bytes();
+        assert!(
+            file_before > 3000 * 4096,
+            "file holds the chunks: {file_before}"
+        );
+
+        let report = cache.clear_unpinned().await.unwrap();
+        assert_eq!(report.removed_chunks, 3000);
+        assert_eq!(report.freed_bytes, used_before);
+        assert_eq!(report.file_bytes_before, file_before);
+        assert_eq!(report.file_bytes_after, cache.file_bytes());
+        // Eight pinned 4 KiB chunks plus schema: well under 1 MiB, from
+        // over 12 MiB.
+        assert!(
+            report.file_bytes_after < 1024 * 1024,
+            "file shrank on disk: {} -> {}",
+            report.file_bytes_before,
+            report.file_bytes_after,
+        );
+
+        assert_eq!(cache.used_bytes(), 0);
+        assert_eq!(cache.used_rows(), 8);
+        assert_counters_match(cache, "after clear");
+        for (addr, wire) in &pinned {
+            assert_eq!(
+                cache.get(*addr).await.unwrap().as_deref(),
+                Some(wire.as_slice()),
+                "pinned chunk still retrievable",
+            );
+        }
+        for (addr, _) in unpinned.iter().step_by(97) {
+            assert!(cache.get(*addr).await.unwrap().is_none(), "unpinned gone");
+        }
+        // Pin bookkeeping untouched: still listed, members intact, and
+        // the unpin still returns every member to the budget.
+        assert_eq!(cache.list_pins().await.unwrap(), vec![root.clone()]);
+        let members = cache.pin_members(Some(root.clone())).await.unwrap();
+        assert_eq!(members[0].1.len(), 8);
+        assert_eq!(auto_vacuum_mode(cache.path()), 2, "incremental from now on");
+
+        // The cache keeps working after the clear.
+        let fresh = chunks(0x33, 10);
+        cache.put_batch(fresh.clone()).await.unwrap();
+        assert!(cache.get(fresh[3].0).await.unwrap().is_some());
+        assert!(cache.unpin(root).await.unwrap());
+        assert_eq!(cache.pinned_rows(), 0);
+        assert_eq!(cache.pinned_bytes(), 0);
+        assert_counters_match(cache, "after unpin");
+    }
+
+    /// Fresh database: created with incremental auto-vacuum, cleared
+    /// with `incremental_vacuum`.
+    #[tokio::test]
+    async fn clear_keeps_pins_removes_unpinned_and_shrinks_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clear.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        assert_eq!(
+            auto_vacuum_mode(&path),
+            2,
+            "fresh DB gets incremental auto_vacuum"
+        );
+        clear_keeps_pins_and_shrinks(&cache).await;
+        // A second clear (the refill plus the eight just unpinned) still works.
+        let r = cache.clear_unpinned().await.unwrap();
+        assert_eq!(r.removed_chunks, 18);
+        assert_counters_match(&cache, "second clear");
+    }
+
+    /// A database from before auto-vacuum (mode NONE) is converted by
+    /// one `VACUUM` on its first clear and still shrinks.
+    #[tokio::test]
+    async fn clear_shrinks_a_legacy_database_without_auto_vacuum() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        {
+            // The pre-pin schema, as an old build left it.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size = 8192; PRAGMA journal_mode = WAL;
+                 CREATE TABLE chunks (
+                    address BLOB PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL,
+                    last_access INTEGER NOT NULL, inserted_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+        assert_eq!(auto_vacuum_mode(&path), 0);
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        assert_eq!(
+            auto_vacuum_mode(&path),
+            0,
+            "open never rebuilds an existing file"
+        );
+        clear_keeps_pins_and_shrinks(&cache).await;
+    }
+
+    /// The pre-pin, pre-auto-vacuum schema an old build left behind.
+    fn make_legacy_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 8192; PRAGMA journal_mode = WAL;
+             CREATE TABLE chunks (
+                address BLOB PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL,
+                last_access INTEGER NOT NULL, inserted_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_vacuum_needs_room_and_a_bounded_size() {
+        let mib = 1024 * 1024;
+        assert!(legacy_vacuum_fits(10 * mib, Some(84 * mib)));
+        assert!(
+            !legacy_vacuum_fits(10 * mib, Some(83 * mib)),
+            "2x live + margin"
+        );
+        assert!(
+            !legacy_vacuum_fits(10 * mib, None),
+            "unreadable free space is no room"
+        );
+        assert!(!legacy_vacuum_fits(
+            LEGACY_VACUUM_MAX_LIVE_BYTES + 1,
+            Some(u64::MAX)
+        ));
+        assert!(legacy_vacuum_fits(0, Some(LEGACY_VACUUM_FREE_MARGIN)));
+    }
+
+    /// A legacy database on a disk without room for the rebuild: the
+    /// clear (and a shrink) still succeed with the rows gone, nothing is
+    /// rebuilt, and the freed pages are reused. Once there's room, the
+    /// next clear converts and shrinks the file.
+    #[tokio::test]
+    async fn legacy_clear_without_room_succeeds_and_skips_the_vacuum() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-full.sqlite");
+        make_legacy_db(&path);
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        test_free_space::set(cache.path(), Some(1024));
+
+        let (_unpinned, pinned, _root) = fill_with_pin(&cache, 2000, 8).await;
+        let used = cache.used_bytes();
+        let report = cache.clear_unpinned().await.expect("clear is not an error");
+        assert_eq!(report.removed_chunks, 2000);
+        assert_eq!(report.freed_bytes, used);
+        assert_eq!(cache.used_bytes(), 0);
+        assert_counters_match(&cache, "after clear without room");
+        assert_eq!(auto_vacuum_mode(&path), 0, "not rebuilt");
+        assert!(
+            report.file_bytes_after > 2000 * 4096,
+            "file kept its pages: {}",
+            report.file_bytes_after
+        );
+        for (addr, wire) in &pinned {
+            assert_eq!(
+                cache.get(*addr).await.unwrap().as_deref(),
+                Some(wire.as_slice())
+            );
+        }
+
+        // A shrink without room: applied, evicted, no error, no rebuild.
+        let refill = chunks(0x44, 2000);
+        for batch in refill.chunks(256) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        let file_full = cache.file_bytes();
+        cache
+            .set_capacity(400 * 1024)
+            .await
+            .expect("shrink is not an error");
+        assert_eq!(cache.capacity_bytes(), 400 * 1024);
+        assert!(cache.used_bytes() <= 400 * 1024);
+        assert_counters_match(&cache, "after shrink without room");
+        assert_eq!(auto_vacuum_mode(&path), 0);
+        // Freed pages are reused: refilling doesn't grow the file.
+        cache.set_capacity(1 << 30).await.unwrap();
+        for batch in chunks(0x55, 1500).chunks(256) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        assert!(
+            cache.file_bytes() <= file_full + 1024 * 1024,
+            "refill reused the freelist: {} vs {file_full}",
+            cache.file_bytes()
+        );
+
+        // Room again: the next clear converts and shrinks.
+        test_free_space::set(cache.path(), None);
+        let report = cache.clear_unpinned().await.unwrap();
+        assert_eq!(auto_vacuum_mode(&path), 2, "converted once there was room");
+        assert!(
+            report.file_bytes_after < 1024 * 1024,
+            "file shrank: {}",
+            report.file_bytes_after
+        );
+        assert_counters_match(&cache, "after converting clear");
+    }
+
+    /// A reader holding a snapshot (a stream mid-read) makes the WAL
+    /// checkpoint busy; the clear must give up on it at once rather than
+    /// wait out the write connection's busy timeout.
+    #[tokio::test]
+    async fn clear_does_not_wait_for_a_reader_to_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reader.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        fill_with_pin(&cache, 500, 4).await;
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(n > 0);
+
+        let t = std::time::Instant::now();
+        let report = cache.clear_unpinned().await.unwrap();
+        let took = t.elapsed();
+        assert_eq!(report.removed_chunks, 500);
+        assert!(
+            took < std::time::Duration::from_millis(BUSY_TIMEOUT_MS / 2),
+            "clear stalled on the reader: {took:?}"
+        );
+        // The writer still waits normally for real locks afterwards.
+        cache.put_batch(chunks(0x66, 4)).await.unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        assert_counters_match(&cache, "after clear with a reader");
+    }
+
+    fn wal_bytes(path: &Path) -> u64 {
+        let mut s = path.as_os_str().to_owned();
+        s.push("-wal");
+        std::fs::metadata(PathBuf::from(s)).map_or(0, |m| m.len())
+    }
+
+    /// When a reader blocks the post-clear `wal_checkpoint(TRUNCATE)`,
+    /// the WAL the delete grew must not stay at its high-water size for
+    /// the rest of the process: once the reader is gone, later writes
+    /// checkpoint and reset it, and `journal_size_limit` cuts it back.
+    #[tokio::test]
+    async fn wal_shrinks_after_a_reader_blocked_the_clear_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("walcap.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        cache.put_batch(chunks(0x6f, 4)).await.unwrap();
+
+        // A long stream holds its snapshot across the fill and the
+        // clear, so no checkpoint can reset the WAL in between.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        fill_with_pin(&cache, 5000, 4).await;
+        cache.clear_unpinned().await.unwrap();
+        let high = wal_bytes(&path);
+        assert!(
+            high > 2 * WAL_SIZE_LIMIT_BYTES as u64,
+            "the blocked checkpoint left a big WAL: {high}"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+
+        for i in 0..4u8 {
+            cache.put_batch(chunks(0x70 + i, 4)).await.unwrap();
+        }
+        let after = wal_bytes(&path);
+        assert!(
+            after <= WAL_SIZE_LIMIT_BYTES as u64,
+            "WAL cut back after the reader left: {high} -> {after}"
+        );
+        assert_counters_match(&cache, "after WAL reset");
+    }
+
+    /// Paths of this process's open-but-unlinked SQLite temp files.
+    #[cfg(target_os = "linux")]
+    fn open_sqlite_temp_files() -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|p| p.contains("etilqs_"))
+            .collect()
+    }
+
+    /// The legacy conversion's `VACUUM` must not need SQLite's temp
+    /// directory (`/tmp`, `TMPDIR`, ...), which an Android app usually
+    /// can't write: its copy is built in memory. Watches this process's
+    /// fds for SQLite's `etilqs_*` temp file while the rebuild runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_vacuum_builds_its_copy_in_memory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-mem.sqlite");
+        make_legacy_db(&path);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for (i, (addr, wire)) in chunks(0x44, 6000).into_iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO chunks VALUES (?1, ?2, ?3, ?4, ?4)",
+                    rusqlite::params![addr.to_vec(), wire, 4096, i as i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        test_free_space::set(&path, Some(u64::MAX / 4));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    seen.extend(open_sqlite_temp_files());
+                }
+                seen
+            })
+        };
+        vacuum_free_pages(&mut conn, &path).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let mut seen = watcher.join().unwrap();
+        seen.sort();
+        seen.dedup();
+        test_free_space::set(&path, None);
+
+        assert_eq!(auto_vacuum_mode(&path), 2, "converted");
+        assert!(
+            seen.is_empty(),
+            "VACUUM used an on-disk temp file: {seen:?}"
+        );
+        let ts: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ts, 0, "temp_store restored to the default");
+    }
+
+    /// Lowering the cap evicts down to it at once (unpinned rows only)
+    /// and gives the file space back; raising it evicts nothing.
+    #[tokio::test]
+    async fn set_capacity_evicts_down_to_the_new_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cap.sqlite");
+        let cache = DiskChunkCache::open(&path, 64 * 1024 * 1024).unwrap();
+        let (_unpinned, pinned, _root) = fill_with_pin(&cache, 1000, 4).await;
+        assert_counters_match(&cache, "filled");
+        let used = cache.used_bytes();
+        assert!(used > 1000 * 4096);
+        let file_before = cache.file_bytes();
+
+        // Raising (or keeping) the cap: nothing moves.
+        cache.set_capacity(128 * 1024 * 1024).await.unwrap();
+        assert_eq!(cache.capacity_bytes(), 128 * 1024 * 1024);
+        assert_eq!(cache.used_bytes(), used);
+
+        let cap = 400 * 1024;
+        cache.set_capacity(cap).await.unwrap();
+        assert_eq!(cache.capacity_bytes(), cap);
+        assert!(
+            cache.used_bytes() <= cap,
+            "evicted to the cap: {}",
+            cache.used_bytes()
+        );
+        assert!(cache.used_bytes() > 0, "evicts to the slack, not to empty");
+        assert_counters_match(&cache, "after shrink");
+        assert_eq!(cache.pinned_rows(), 4, "pins untouched");
+        for (addr, _) in &pinned {
+            assert!(cache.get(*addr).await.unwrap().is_some());
+        }
+        assert!(
+            cache.file_bytes() < file_before / 4,
+            "space returned: {file_before} -> {}",
+            cache.file_bytes(),
+        );
+
+        // The new cap holds for later writes too.
+        for batch in chunks(0x44, 300).chunks(100) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        assert!(cache.used_bytes() <= cap);
+        assert_counters_match(&cache, "after refill");
+    }
+
+    /// Reopen backfills the pinned totals from disk.
+    #[tokio::test]
+    async fn pinned_totals_backfill_on_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reopen.sqlite");
+        {
+            let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+            let (_, pinned, _) = fill_with_pin(&cache, 50, 6).await;
+            // A second pin sharing two members: rows stay distinct,
+            // member refs count per collection.
+            let second = vec![pinned[1].clone(), pinned[2].clone()];
+            assert!(cache.pin_collection(vec![0xee; 32], second).await.unwrap());
+            assert_eq!(cache.pinned_rows(), 6);
+            assert_eq!(cache.pin_collections(), 2);
+            assert_eq!(cache.pin_member_refs(), 8);
+            assert_counters_match(&cache, "first open");
+        }
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        // The backfill runs on the writer thread before it serves any
+        // message, so one round trip through it is enough to wait for it.
+        cache.put_batch(chunks(0x55, 1)).await.unwrap();
+        assert_counters_match(&cache, "reopened");
+        assert_eq!(cache.pinned_rows(), 6);
+        assert_eq!(cache.pin_collections(), 2);
+        assert!(cache.unpin(vec![0xee; 32]).await.unwrap());
+        assert_eq!(
+            cache.pinned_rows(),
+            6,
+            "shared members still pinned by the first"
+        );
+        assert_eq!(cache.pin_member_refs(), 6);
+        assert_counters_match(&cache, "after unpinning the overlap");
+    }
+
+    /// Clears racing `put_batch` / `get` traffic: no request errors, no
+    /// corruption, pins survive, counters stay exact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_is_safe_during_concurrent_put_batch_and_get() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("race.sqlite");
+        let cache = Arc::new(DiskChunkCache::open(&path, 1 << 30).unwrap());
+        let (seed, pinned, root) = fill_with_pin(&cache, 1500, 5).await;
+        let seed = Arc::new(seed);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut tasks = Vec::new();
+        for w in 0..3u8 {
+            let cache = cache.clone();
+            let stop = stop.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut round = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let batch: Vec<_> = (0..32u32)
+                        .map(|i| {
+                            let mut p = vec![0x60 + w; 4096];
+                            p[..4].copy_from_slice(&round.to_le_bytes());
+                            p[4..8].copy_from_slice(&i.to_le_bytes());
+                            make_chunk(&p)
+                        })
+                        .collect();
+                    cache
+                        .put_batch(batch)
+                        .await
+                        .expect("put_batch during clear");
+                    round += 1;
+                }
+                round
+            }));
+        }
+        let mut readers = Vec::new();
+        for r in 0..4usize {
+            let cache = cache.clone();
+            let stop = stop.clone();
+            let seed = seed.clone();
+            let pinned = pinned.clone();
+            readers.push(tokio::spawn(async move {
+                let (mut hits, mut misses) = (0u64, 0u64);
+                let mut i = r;
+                while !stop.load(Ordering::Relaxed) {
+                    let (addr, wire) = &seed[i % seed.len()];
+                    match cache.get(*addr).await.expect("get during clear") {
+                        Some(got) => {
+                            assert_eq!(&got, wire, "a hit is never torn");
+                            hits += 1;
+                        }
+                        None => misses += 1,
+                    }
+                    let (paddr, pwire) = &pinned[i % pinned.len()];
+                    assert_eq!(
+                        cache.get(*paddr).await.expect("pinned get").as_deref(),
+                        Some(pwire.as_slice()),
+                        "pinned chunk never misses",
+                    );
+                    i += 7;
+                }
+                (hits, misses)
+            }));
+        }
+
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            cache.clear_unpinned().await.expect("clear under load");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let mut rounds = 0;
+        for t in tasks {
+            rounds += t.await.unwrap();
+        }
+        let (mut hits, mut misses) = (0, 0);
+        for t in readers {
+            let (h, m) = t.await.unwrap();
+            hits += h;
+            misses += m;
+        }
+        assert!(
+            rounds > 0 && hits > 0 && misses > 0,
+            "rounds={rounds} hits={hits} misses={misses}"
+        );
+
+        assert_counters_match(&cache, "after racing clears");
+        assert_eq!(cache.pinned_rows(), 5);
+        assert_eq!(cache.list_pins().await.unwrap(), vec![root]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let ok: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ok, "ok");
     }
 }

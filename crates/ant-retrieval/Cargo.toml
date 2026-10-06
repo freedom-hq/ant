@@ -10,6 +10,9 @@ ant-crypto = { path = "../ant-crypto" }
 ant-postage = { path = "../ant-postage" }
 async-trait = "0.1.89"
 crossbeam-channel = "0.5"
+# Free-space check before rebuilding a legacy chunk cache with VACUUM
+# (statvfs via rustix / GetDiskFreeSpaceEx); already used by ant-postage.
+fs4 = "1.0.2"
 futures = "0.3.31"
 # OS randomness for encrypted-upload ciphertext padding (bee pads the
 # ciphertext tail with crypto/rand bytes; keys come from ant-crypto).

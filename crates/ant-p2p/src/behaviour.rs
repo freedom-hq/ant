@@ -214,6 +214,11 @@ pub struct RunConfig {
     /// `bypass_cache` skips both the memory and disk tiers; see
     /// `cache_for_request` for the wiring.
     pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    /// Embedder-owned process-wide in-memory chunk cache. `Some` makes
+    /// the swarm loop share this `Arc` instead of building its own, so
+    /// the embedder can read and clear it (ant-ffi's `ant_cache_*`).
+    /// Ignored when `per_request_chunk_cache` is set.
+    pub memory_cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
     /// Optional postage stamping + signing runtime for `POST /chunks`
     /// (gateway → control socket → swarm). `None` keeps the upload
     /// command path disabled and `PushChunk` returns a clear "uploads
@@ -1699,6 +1704,10 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
             chunks: c.used_rows(),
             path: c.path().display().to_string(),
             read_workers: c.read_workers() as u32,
+            pinned_bytes: c.pinned_bytes(),
+            pinned_chunks: c.pinned_rows(),
+            pin_collections: c.pin_collections(),
+            pin_member_chunks: c.pin_member_refs(),
         },
         None => DiskCacheInfo::default(),
     };
@@ -1858,6 +1867,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.disk_cache.clone(),
         cfg.peer_eth.clone(),
     );
+    if state.chunk_cache.is_some() {
+        if let Some(shared) = cfg.memory_cache.clone() {
+            state.chunk_cache = Some(shared);
+        }
+    }
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
     state.swap_enabled = cfg.swap_enabled;

@@ -22,6 +22,7 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 pub mod bench;
+mod cache;
 mod chain_transport;
 mod drive;
 mod gateway;
@@ -52,7 +53,7 @@ use ant_crypto::{
 };
 use ant_node::{run_node, NodeConfig, UploadManager};
 use ant_p2p::UploadRuntime;
-use ant_retrieval::DiskChunkCache;
+use ant_retrieval::{DiskChunkCache, InMemoryChunkCache};
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
@@ -100,7 +101,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// app restarts but get reaped by the OS under memory pressure;
 /// half a gigabyte is well under that threshold on every device
 /// shipped in the last five years), and covers thousands of small
-/// media files or a couple of long-form videos.
+/// media files or a couple of long-form videos. The default only: hosts
+/// set their own with `ant_cache_set_capacity` / `ant_init_with_config`
+/// (see [`cache`]).
 const DISK_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Gnosis chain id. Baked into the EIP-712 cheque domain separator for
@@ -173,6 +176,14 @@ pub struct AntHandle {
     /// so it's dead weight in the download-only (`chain`-off) slice.
     #[cfg_attr(not(feature = "chain"), allow(dead_code))]
     data_dir: PathBuf,
+    /// The persistent chunk cache the node loop reads and writes
+    /// (`None` if `chunks.sqlite` failed to open). Shared, not a copy:
+    /// `ant_cache_*` act on the same cache retrievals use.
+    disk_cache: Option<Arc<DiskChunkCache>>,
+    /// The node loop's process-wide in-memory chunk cache, handed to it
+    /// at init (`NodeConfig::with_memory_cache`) so `ant_cache_clear`
+    /// can empty it.
+    memory_cache: Arc<InMemoryChunkCache>,
     /// Background task running the in-process bee-shaped HTTP gateway
     /// (`ant-gateway`) when `ant_start_gateway` has been called. `None`
     /// until started; aborted + cleared by `ant_stop_gateway` (and
@@ -420,7 +431,7 @@ pub unsafe extern "C" fn ant_init_with_options(
             } else {
                 Some(cstr_to_path(source_root)?)
             };
-            init_inner(&path, source_root.as_deref(), IdentitySource::DataDir)
+            init_inner(&path, source_root.as_deref(), IdentitySource::DataDir, None)
         }));
         match result {
             Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
@@ -474,6 +485,7 @@ pub unsafe extern "C" fn ant_init_with_identity(
                 &path,
                 source_root.as_deref(),
                 IdentitySource::Provided(identity),
+                None,
             )
         }));
         match result {
@@ -484,6 +496,71 @@ pub unsafe extern "C" fn ant_init_with_identity(
             }
             Err(_) => {
                 write_out_err(out_err, "panic in ant_init_with_identity");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// The extensible init: every option of [`ant_init_with_options`] and
+/// [`ant_init_with_identity`], plus the ones added since, in one JSON
+/// document so later options don't need yet another entry point.
+/// `config_json` (nullable; NULL or `""` = all defaults, i.e. exactly
+/// [`ant_init`]):
+///
+/// ```json
+/// {"source_root": "/…/imports" | null,
+///  "identity_json": "{\"signing_key\":…}" | null,
+///  "cache_capacity_bytes": 1073741824 | null}
+/// ```
+///
+/// * `source_root`: as in [`ant_init_with_options`].
+/// * `identity_json`: the identity document *as a string*, as
+///   [`ant_init_with_identity`] takes it (host-owned key). Null: the
+///   data dir's `identity.json`, created on first run.
+/// * `cache_capacity_bytes`: the disk chunk cache cap, clamped like
+///   [`cache::ant_cache_set_capacity`] (64 MiB ..= 16 GiB). Null: 512 MiB.
+///   Pass the host's saved choice here so it applies from start-up.
+///
+/// Unknown keys are an error (a typo shouldn't silently fall back to a
+/// default). Returns the handle, or null with `*out_err` set.
+///
+/// # Safety
+///
+/// * `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// * `config_json` must be a valid NUL-terminated UTF-8 string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_init_with_config(
+    data_dir: *const c_char,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntHandle {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
+            let path = cstr_to_path(data_dir)?;
+            let raw = if config_json.is_null() {
+                None
+            } else {
+                Some(cstr_to_str(config_json)?)
+            };
+            let cfg = cache::InitConfig::parse(raw).map_err(FfiError::Runtime)?;
+            let source_root = cfg.source_root.as_deref().map(Path::new);
+            let identity = match cfg.identity_json.as_deref() {
+                Some(json) => IdentitySource::Provided(json),
+                None => IdentitySource::DataDir,
+            };
+            init_inner(&path, source_root, identity, cfg.cache_capacity_bytes)
+        }));
+        match result {
+            Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_init_with_config");
                 std::ptr::null_mut()
             }
         }
@@ -756,6 +833,7 @@ fn init_inner(
     data_dir: &Path,
     source_root: Option<&Path>,
     identity: IdentitySource<'_>,
+    cache_capacity: Option<u64>,
 ) -> Result<AntHandle, FfiError> {
     install_log_subscriber();
 
@@ -829,27 +907,8 @@ fn init_inner(
     // ~100 peer) BZZ peer set. A failed open is non-fatal — the node
     // still serves uploads and live retrievals, it just doesn't
     // amortise them.
-    let disk_cache_path = data_dir.join("chunks.sqlite");
-    let disk_cache = match DiskChunkCache::open(&disk_cache_path, DISK_CACHE_MAX_BYTES) {
-        Ok(c) => {
-            tracing::info!(
-                target: "ant-ffi",
-                path = %disk_cache_path.display(),
-                max_bytes = DISK_CACHE_MAX_BYTES,
-                used_bytes = c.used_bytes(),
-                "opened persistent chunk cache",
-            );
-            Some(Arc::new(c))
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "ant-ffi",
-                path = %disk_cache_path.display(),
-                "failed to open persistent chunk cache: {e}; falling back to in-memory only",
-            );
-            None
-        }
-    };
+    let disk_cache = cache::open_disk_cache(data_dir, cache_capacity);
+    let memory_cache = Arc::new(InMemoryChunkCache::with_default_capacity());
 
     // Upload + postage wiring (`AntDrive`). The node wallet owns every
     // batch it stamps with, so a single `stamp_key` (the node signing
@@ -961,7 +1020,8 @@ fn init_inner(
         .with_process_start(process_start)
         .with_peerstore_path(peerstore_path)
         .with_commands(cmd_rx)
-        .with_disk_cache(disk_cache)
+        .with_disk_cache(disk_cache.clone())
+        .with_memory_cache(Some(memory_cache.clone()))
         .with_upload(Some(upload_runtime))
         .with_swap(Some(swap_cfg))
         .with_pushsync_swap(pushsync_cfg)
@@ -993,6 +1053,8 @@ fn init_inner(
         signing_secret,
         eth,
         data_dir: data_dir.to_path_buf(),
+        disk_cache,
+        memory_cache,
         gateway_task: Mutex::new(None),
         gateway_cors: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
@@ -4857,6 +4919,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A [`test_handle`] with a real disk cache (`cap` or the default)
+    /// in a fresh scratch dir, boxed like `ant_init` returns it. Free
+    /// with `ant_shutdown`; remove the returned dir after.
+    pub(crate) fn cache_test_handle(tag: &str, cap: Option<u64>) -> (*mut AntHandle, PathBuf) {
+        let dir = scratch_dir(tag);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let mut h = test_handle(runtime, &dir);
+        h.disk_cache = Some(cache::open_disk_cache(&dir, cap).expect("open disk cache"));
+        h.memory_cache = Arc::new(InMemoryChunkCache::with_default_capacity());
+        (Box::into_raw(Box::new(h)), dir)
+    }
+
     /// A handle over `runtime` with everything else inert — enough for
     /// the [`ant_shutdown`] contract, which only touches the runtime.
     fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
@@ -4873,6 +4951,8 @@ mod tests {
             signing_secret: [0u8; SECP256K1_SECRET_LEN],
             eth: [0u8; 20],
             data_dir: data_dir.to_path_buf(),
+            disk_cache: None,
+            memory_cache: Arc::new(InMemoryChunkCache::new(8)),
             gateway_task: Mutex::new(None),
             gateway_cors: Mutex::new(Vec::new()),
             bench: Mutex::new(None),

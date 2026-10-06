@@ -157,6 +157,45 @@ async fn node_returns_ultra_light_mode() {
     assert_eq!(json["settlement"]["paying"], false);
 }
 
+/// `/debugstore` answers bee's `storer.Info` shape (`PascalCase` Go field
+/// names, chunk counts) from the disk-cache snapshot.
+#[tokio::test]
+async fn debugstore_reports_cache_and_pins_in_bee_shape() {
+    let mut snap = snapshot_with_one_peer();
+    snap.retrieval.disk = ant_control::DiskCacheInfo {
+        enabled: true,
+        used_bytes: 90 * 4104,
+        capacity_bytes: 512 * 1024 * 1024,
+        chunks: 100,
+        pinned_bytes: 10 * 4104,
+        pinned_chunks: 10,
+        pin_collections: 2,
+        pin_member_chunks: 12,
+        ..ant_control::DiskCacheInfo::default()
+    };
+    let resp = send(
+        status_only_router(snap),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/debugstore")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["Cache"]["Size"], 90, "unpinned chunks");
+    assert_eq!(json["Cache"]["Capacity"], 131_072, "512 MiB / 4096");
+    assert_eq!(json["Pinning"]["TotalCollections"], 2);
+    assert_eq!(json["Pinning"]["TotalChunks"], 12);
+    assert_eq!(json["ChunkStore"]["TotalChunks"], 100);
+    assert_eq!(json["ChunkStore"]["ReferenceCount"], 100);
+    assert_eq!(json["ChunkStore"]["SharedSlots"], 0);
+    assert_eq!(json["Reserve"]["TotalSize"], 0);
+    assert!(json["Reserve"]["LastBinIDs"].is_null());
+    assert_eq!(json["Upload"]["PendingUpload"], 0);
+}
+
 async fn call(
     router: axum::Router,
     method: Method,
