@@ -288,6 +288,7 @@ dependencies = [
  "ant-postage",
  "async-trait",
  "crossbeam-channel",
+ "fs4",
  "futures",
  "getrandom 0.3.4",
  "hex",

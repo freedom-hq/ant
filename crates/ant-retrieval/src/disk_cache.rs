@@ -430,8 +430,14 @@ impl DiskChunkCache {
     /// Change the byte cap at runtime. When the new cap is below the
     /// current [`Self::used_bytes`], evicts oldest-by-`last_access`
     /// unpinned rows down to the usual slack (95% of the cap) before
-    /// returning, then hands the freed pages back to the OS (see
-    /// [`Self::clear_unpinned`] for how). Pinned rows are never touched.
+    /// returning, then hands the freed pages back to the OS where it can
+    /// (see [`Self::clear_unpinned`] and [`reclaim_space`]: a legacy
+    /// database is only rebuilt when the remaining data is small and the
+    /// disk has room). Pinned rows are never touched.
+    ///
+    /// The new cap is applied before the eviction runs. On `Err` (the
+    /// eviction's SQL failed) it stays applied, part of the eviction may
+    /// have committed, and the next `put` evicts down to it again.
     /// Runs on the writer thread, so it is ordered with every `put` and
     /// pin operation.
     pub async fn set_capacity(&self, max_bytes: u64) -> Result<(), DiskCacheError> {
@@ -460,10 +466,14 @@ impl DiskChunkCache {
     /// `auto_vacuum = INCREMENTAL`, so the freed pages are released with
     /// `PRAGMA incremental_vacuum`. An older database (created without
     /// auto-vacuum, which can only be switched on by rebuilding the
-    /// file) is converted with one `VACUUM` on its first clear — cheap
-    /// at that point, since only the pinned rows are left to copy.
-    /// Either way a `wal_checkpoint(TRUNCATE)` follows so the WAL the
-    /// delete grew is cut back too.
+    /// file) is converted with one `VACUUM` on its first clear, but only
+    /// if what's left (the pinned rows) is small enough and the volume
+    /// has room for the rebuild; otherwise the file keeps its size and
+    /// later writes reuse the freed pages. Either way a non-waiting
+    /// `wal_checkpoint(TRUNCATE)` follows so the WAL the delete grew is
+    /// cut back too. Giving space back is best-effort: once the delete
+    /// has committed this returns `Ok`, and `file_bytes_after` shows
+    /// what the file actually shrank to.
     pub async fn clear_unpinned(&self) -> Result<ClearReport, DiskCacheError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner
@@ -592,7 +602,7 @@ fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlit
         conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
     }
     Ok(())
 }
@@ -885,7 +895,8 @@ impl WriterState<'_> {
             after = self.total_bytes.load(Ordering::Relaxed),
             "disk cache capacity lowered; evicted down to it",
         );
-        reclaim_space(conn)
+        reclaim_space(conn, self.path);
+        Ok(())
     }
 
     fn clear_unpinned(&self, conn: &mut Connection) -> Result<ClearReport, DiskCacheError> {
@@ -911,7 +922,7 @@ impl WriterState<'_> {
         self.pinned.rows.store(rows as u64, Ordering::Relaxed);
         self.pinned.bytes.store(bytes as u64, Ordering::Relaxed);
 
-        reclaim_space(conn)?;
+        reclaim_space(conn, self.path);
         let report = ClearReport {
             removed_chunks: removed as u64,
             freed_bytes: freed as u64,
@@ -928,21 +939,105 @@ impl WriterState<'_> {
     }
 }
 
+/// Busy timeout on the write connection: how long a write waits for a
+/// lock another connection holds before giving up.
+const BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Largest database (live pages, after the delete) [`reclaim_space`]
+/// converts from `auto_vacuum = NONE` with a `VACUUM`. The rebuild runs
+/// on the writer thread, so every `put` waits behind it; past this size
+/// the stall is too long to take silently and the file is left as it is
+/// (its free pages are reused by later writes).
+const LEGACY_VACUUM_MAX_LIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Free disk a legacy `VACUUM` must find on top of twice the live size.
+/// In WAL mode the rebuild writes the whole new database into a temp
+/// file and then into the WAL before the checkpoint copies it back, so
+/// the peak is up to ~2× live; the margin keeps the rest of the app (and
+/// the OS) off a full disk.
+const LEGACY_VACUUM_FREE_MARGIN: u64 = 64 * 1024 * 1024;
+
+/// Whether a legacy (`auto_vacuum = NONE`) database with `live_bytes` of
+/// live pages may be rebuilt now, given `available` free bytes on its
+/// volume. A failed free-space read is not "plenty of room": skip.
+fn legacy_vacuum_fits(live_bytes: u64, available: Option<u64>) -> bool {
+    live_bytes <= LEGACY_VACUUM_MAX_LIVE_BYTES
+        && available.is_some_and(|free| {
+            free >= live_bytes
+                .saturating_mul(2)
+                .saturating_add(LEGACY_VACUUM_FREE_MARGIN)
+        })
+}
+
+/// Free bytes on the volume holding `path`; `None` if it can't be read.
+fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = test_free_space::get(path) {
+        return Some(free);
+    }
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    fs4::available_space(dir.unwrap_or(path)).ok()
+}
+
 /// Hand free pages back to the OS and cut the WAL back to zero.
+///
+/// Best-effort and infallible on purpose: it runs after the delete or
+/// eviction has committed, so a failure here must not turn a done clear
+/// or shrink into an error (the rows are gone and the cap applied either
+/// way). Anything that goes wrong is logged; the free pages stay on the
+/// freelist, later writes reuse them, and the file is no bigger than
+/// before.
 ///
 /// `auto_vacuum = INCREMENTAL` (every database created since this
 /// landed): `PRAGMA incremental_vacuum` moves the free pages to the end
-/// and truncates. Anything else (an older `NONE` database): one
-/// `VACUUM` with the mode switched to `INCREMENTAL` first, which
-/// rebuilds the file at its live size *and* converts it, so later calls
-/// take the cheap path. `VACUUM` works in WAL mode; readers on the
-/// other connections keep their snapshot until they finish.
+/// and truncates. Needs no extra disk and no rebuild.
 ///
-/// The checkpoint is best-effort: a reader still holding an old
-/// snapshot makes it report busy (after `busy_timeout`), and the file
-/// shrinks at the next checkpoint instead. Not an error — nothing is
-/// lost, the bytes just come back a little later.
-fn reclaim_space(conn: &mut Connection) -> Result<(), DiskCacheError> {
+/// Anything else (an older `NONE` database) can only be converted by a
+/// `VACUUM`, which rebuilds the file at its live size and needs up to
+/// about twice that in free disk while it runs, with every `put` queued
+/// behind it. It runs only when [`legacy_vacuum_fits`]: the live data is
+/// at most [`LEGACY_VACUUM_MAX_LIVE_BYTES`] and the volume has room for
+/// it. After a clear the live data is just the pinned rows; after a
+/// capacity shrink it is ~95% of the new cap plus the pinned rows, so a
+/// large cap stays unconverted (and unshrunk) until a clear. Once
+/// converted, later calls take the incremental path.
+///
+/// The checkpoint doesn't wait: the busy timeout is dropped to zero for
+/// it, so a reader holding an old snapshot (a stream in progress) makes
+/// it give up at once instead of stalling the writer for the full busy
+/// timeout. The WAL then shrinks at a later checkpoint.
+fn reclaim_space(conn: &mut Connection, path: &Path) {
+    if let Err(e) = vacuum_free_pages(conn, path) {
+        warn!(
+            target: "ant_retrieval::disk_cache",
+            error = %e,
+            "giving disk space back failed; free pages stay in the file for reuse",
+        );
+    }
+    if let Err(e) = conn.busy_timeout(std::time::Duration::ZERO) {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "busy_timeout(0) failed");
+        return;
+    }
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => {}
+        Ok(_) => debug!(
+            target: "ant_retrieval::disk_cache",
+            "WAL checkpoint after reclaim was blocked by a reader; file shrinks at a later one",
+        ),
+        Err(e) => warn!(
+            target: "ant_retrieval::disk_cache",
+            error = %e,
+            "WAL checkpoint after reclaim failed",
+        ),
+    }
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS)) {
+        warn!(target: "ant_retrieval::disk_cache", error = %e, "restoring busy_timeout failed");
+    }
+}
+
+fn vacuum_free_pages(conn: &mut Connection, path: &Path) -> Result<(), rusqlite::Error> {
     let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
     if mode == 2 {
         // Frees one page per step: drain the statement, don't
@@ -950,17 +1045,56 @@ fn reclaim_space(conn: &mut Connection) -> Result<(), DiskCacheError> {
         let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
         let mut rows = stmt.query([])?;
         while rows.next()?.is_some() {}
-    } else {
-        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        return Ok(());
     }
-    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-    if busy != 0 {
+    let (pages, free, page_size): (i64, i64, i64) = conn.query_row(
+        "SELECT p.page_count, f.freelist_count, s.page_size \
+         FROM pragma_page_count p, pragma_freelist_count f, pragma_page_size s",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let live_bytes = (pages - free).max(0) as u64 * page_size.max(0) as u64;
+    let available = available_space(path);
+    if !legacy_vacuum_fits(live_bytes, available) {
         debug!(
             target: "ant_retrieval::disk_cache",
-            "WAL checkpoint after reclaim was blocked by a reader; file shrinks at the next one",
+            live_bytes,
+            ?available,
+            "legacy database (no auto-vacuum) left unconverted: too large or not enough free disk to rebuild it now",
         );
+        return Ok(());
+    }
+    if let Err(e) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
+        // Rolled back; leave the mode as the file has it so nothing
+        // else on this connection picks the pending switch up.
+        let _ = conn.execute_batch("PRAGMA auto_vacuum = NONE;");
+        return Err(e);
     }
     Ok(())
+}
+
+/// Test-only override for [`available_space`], keyed by database path
+/// so parallel tests don't see each other's value.
+#[cfg(test)]
+mod test_free_space {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OVERRIDES: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+    pub(super) fn set(path: &Path, free: Option<u64>) {
+        let mut g = OVERRIDES.lock().unwrap();
+        let map = g.get_or_insert_with(HashMap::new);
+        match free {
+            Some(f) => map.insert(path.to_path_buf(), f),
+            None => map.remove(path),
+        };
+    }
+
+    pub(super) fn get(path: &Path) -> Option<u64> {
+        OVERRIDES.lock().unwrap().as_ref()?.get(path).copied()
+    }
 }
 
 /// `path` + `-wal` + `-shm` sizes. A missing file is zero bytes.
@@ -2126,6 +2260,137 @@ mod tests {
             "open never rebuilds an existing file"
         );
         clear_keeps_pins_and_shrinks(&cache).await;
+    }
+
+    /// The pre-pin, pre-auto-vacuum schema an old build left behind.
+    fn make_legacy_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 8192; PRAGMA journal_mode = WAL;
+             CREATE TABLE chunks (
+                address BLOB PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL,
+                last_access INTEGER NOT NULL, inserted_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_vacuum_needs_room_and_a_bounded_size() {
+        let mib = 1024 * 1024;
+        assert!(legacy_vacuum_fits(10 * mib, Some(84 * mib)));
+        assert!(
+            !legacy_vacuum_fits(10 * mib, Some(83 * mib)),
+            "2x live + margin"
+        );
+        assert!(
+            !legacy_vacuum_fits(10 * mib, None),
+            "unreadable free space is no room"
+        );
+        assert!(!legacy_vacuum_fits(
+            LEGACY_VACUUM_MAX_LIVE_BYTES + 1,
+            Some(u64::MAX)
+        ));
+        assert!(legacy_vacuum_fits(0, Some(LEGACY_VACUUM_FREE_MARGIN)));
+    }
+
+    /// A legacy database on a disk without room for the rebuild: the
+    /// clear (and a shrink) still succeed with the rows gone, nothing is
+    /// rebuilt, and the freed pages are reused. Once there's room, the
+    /// next clear converts and shrinks the file.
+    #[tokio::test]
+    async fn legacy_clear_without_room_succeeds_and_skips_the_vacuum() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-full.sqlite");
+        make_legacy_db(&path);
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        test_free_space::set(cache.path(), Some(1024));
+
+        let (_unpinned, pinned, _root) = fill_with_pin(&cache, 2000, 8).await;
+        let used = cache.used_bytes();
+        let report = cache.clear_unpinned().await.expect("clear is not an error");
+        assert_eq!(report.removed_chunks, 2000);
+        assert_eq!(report.freed_bytes, used);
+        assert_eq!(cache.used_bytes(), 0);
+        assert_counters_match(&cache, "after clear without room");
+        assert_eq!(auto_vacuum_mode(&path), 0, "not rebuilt");
+        assert!(
+            report.file_bytes_after > 2000 * 4096,
+            "file kept its pages: {}",
+            report.file_bytes_after
+        );
+        for (addr, wire) in &pinned {
+            assert_eq!(
+                cache.get(*addr).await.unwrap().as_deref(),
+                Some(wire.as_slice())
+            );
+        }
+
+        // A shrink without room: applied, evicted, no error, no rebuild.
+        let refill = chunks(0x44, 2000);
+        for batch in refill.chunks(256) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        let file_full = cache.file_bytes();
+        cache
+            .set_capacity(400 * 1024)
+            .await
+            .expect("shrink is not an error");
+        assert_eq!(cache.capacity_bytes(), 400 * 1024);
+        assert!(cache.used_bytes() <= 400 * 1024);
+        assert_counters_match(&cache, "after shrink without room");
+        assert_eq!(auto_vacuum_mode(&path), 0);
+        // Freed pages are reused: refilling doesn't grow the file.
+        cache.set_capacity(1 << 30).await.unwrap();
+        for batch in chunks(0x55, 1500).chunks(256) {
+            cache.put_batch(batch.to_vec()).await.unwrap();
+        }
+        assert!(
+            cache.file_bytes() <= file_full + 1024 * 1024,
+            "refill reused the freelist: {} vs {file_full}",
+            cache.file_bytes()
+        );
+
+        // Room again: the next clear converts and shrinks.
+        test_free_space::set(cache.path(), None);
+        let report = cache.clear_unpinned().await.unwrap();
+        assert_eq!(auto_vacuum_mode(&path), 2, "converted once there was room");
+        assert!(
+            report.file_bytes_after < 1024 * 1024,
+            "file shrank: {}",
+            report.file_bytes_after
+        );
+        assert_counters_match(&cache, "after converting clear");
+    }
+
+    /// A reader holding a snapshot (a stream mid-read) makes the WAL
+    /// checkpoint busy; the clear must give up on it at once rather than
+    /// wait out the write connection's busy timeout.
+    #[tokio::test]
+    async fn clear_does_not_wait_for_a_reader_to_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reader.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 30).unwrap();
+        fill_with_pin(&cache, 500, 4).await;
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(n > 0);
+
+        let t = std::time::Instant::now();
+        let report = cache.clear_unpinned().await.unwrap();
+        let took = t.elapsed();
+        assert_eq!(report.removed_chunks, 500);
+        assert!(
+            took < std::time::Duration::from_millis(BUSY_TIMEOUT_MS / 2),
+            "clear stalled on the reader: {took:?}"
+        );
+        // The writer still waits normally for real locks afterwards.
+        cache.put_batch(chunks(0x66, 4)).await.unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        assert_counters_match(&cache, "after clear with a reader");
     }
 
     /// Lowering the cap evicts down to it at once (unpinned rows only)

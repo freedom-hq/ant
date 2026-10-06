@@ -344,8 +344,10 @@ char *ant_cache_status(const AntHandle *handle, char **out_err);
 /*
  * Remove every unpinned chunk from the disk cache, empty the in-memory
  * cache, and give the space back to the OS (incremental vacuum; a
- * database created by an older build is rebuilt once with VACUUM on its
- * first clear, cheap then since only pinned chunks are left). Pinned
+ * database created by an older build is rebuilt once with VACUUM on a
+ * clear, only when the pinned chunks left are at most 256 MiB and the
+ * disk has about twice that free; otherwise the file keeps its size
+ * and later cache writes reuse the freed space). Pinned
  * chunks and the pin list are never touched. Blocks until done (well
  * under a second for the default cap, longer for several GB): call it
  * off the main thread.
@@ -365,7 +367,8 @@ char *ant_cache_status(const AntHandle *handle, char **out_err);
  *
  * freed_bytes: chunk bytes removed (what used_bytes dropped by);
  * file_bytes_before - file_bytes_after: what the files on disk shrank
- * by. Free with ant_free_string. On failure returns NULL and writes an
+ * by (giving space back is best-effort, so this can be 0 while
+ * freed_bytes isn't; the clear still succeeded). Free with ant_free_string. On failure returns NULL and writes an
  * allocated error string into *out_err.
  */
 char *ant_cache_clear(const AntHandle *handle, char **out_err);
@@ -382,9 +385,13 @@ char *ant_cache_clear(const AntHandle *handle, char **out_err);
  * cache_capacity_bytes at the next start.
  *
  * Returns 0 on success, -1 if `handle` is NULL, -2 if the disk cache is
- * unavailable (failed to open at init) or the resize failed; an
+ * unavailable (failed to open at init) or the eviction failed; an
  * allocated error string is written into *out_err (free with
- * ant_free_string).
+ * ant_free_string). On an eviction failure the new cap is still applied
+ * (capacity_bytes shows it), part of the eviction may have happened,
+ * and the next cache write evicts down to it again, so don't revert a
+ * saved setting on -2. Giving file space back is best-effort and never
+ * makes this fail.
  */
 int ant_cache_set_capacity(const AntHandle *handle, uint64_t bytes, char **out_err);
 

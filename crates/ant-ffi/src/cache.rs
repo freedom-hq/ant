@@ -158,7 +158,10 @@ pub unsafe extern "C" fn ant_cache_status(
 ///
 /// `freed_bytes` is the chunk bytes removed (what `used_bytes` dropped
 /// by); `file_bytes_before - file_bytes_after` is what the files on disk
-/// shrank by. `status` is `ant_cache_status` after the clear.
+/// shrank by. Giving space back is best-effort: a database from an older
+/// build is only rebuilt (once) when the pinned data left is small and
+/// the disk has room, so the shrink can be 0 on a successful clear (see
+/// `DiskChunkCache::clear_unpinned`). `status` is `ant_cache_status` after the clear.
 ///
 /// # Safety
 ///
@@ -214,9 +217,13 @@ pub unsafe extern "C" fn ant_cache_clear(
 /// (`cache_capacity_bytes`) at the next start.
 ///
 /// Returns `0` on success, `-1` on a null handle, `-2` if the disk cache
-/// isn't available (failed to open at init) or the resize failed; an
+/// isn't available (failed to open at init) or the eviction failed; an
 /// allocated error string is written into `*out_err` (free with
-/// [`crate::ant_free_string`]).
+/// [`crate::ant_free_string`]). On an eviction failure the new cap is
+/// still applied (`capacity_bytes` shows it), part of the eviction may
+/// have committed, and the next cache write evicts down to it again, so
+/// a host shouldn't revert its saved setting on `-2`. Giving file space
+/// back is best-effort and never makes this fail.
 ///
 /// # Safety
 ///
