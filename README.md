@@ -281,6 +281,10 @@ cargo run -p antd -- \
   environments will need it set explicitly.
 - `--no-http-api` disables the HTTP gateway for headless deployments.
 - `--no-disk-cache` falls back to memory-only caching.
+- `--cache-capacity <chunks>` (or `cache-capacity:` in a bee `--config`
+  file) sizes the disk cache the way bee does: a chunk count, × 4096
+  bytes. `--disk-cache-max-gb` overrides it. Pinned chunks are outside
+  the cap. `GET /debugstore` reports the cache in bee's shape.
 - `--no-peerstore` / `--reset-peerstore` control the warm-restart peer
   snapshot.
 

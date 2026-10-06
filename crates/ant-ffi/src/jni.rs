@@ -79,7 +79,12 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeInit<'call
             // doesn't hold the key yet either (the Keystore-backed
             // counterpart of the iOS Keychain path is future work), so
             // the identity still comes from the data dir.
-            match init_inner(&PathBuf::from(path), None, crate::IdentitySource::DataDir) {
+            match init_inner(
+                &PathBuf::from(path),
+                None,
+                crate::IdentitySource::DataDir,
+                None,
+            ) {
                 Ok(handle) => Ok(Box::into_raw(Box::new(handle)) as jlong),
                 Err(e) => {
                     throw_ant_exception(env, &e.to_string());

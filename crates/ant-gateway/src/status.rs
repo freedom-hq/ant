@@ -596,3 +596,55 @@ mod wallet_scan_tests {
         assert_eq!(node_eth("not hex"), None);
     }
 }
+
+/// Bee's chunk size, the factor its `cache-capacity` help text gives
+/// for turning a chunk count into bytes ("multiply by 4096").
+pub const BEE_CHUNK_BYTES: u64 = 4096;
+
+/// `GET /debugstore` — bee `debugStorage` (`pkg/storer/debug.go`
+/// `Info`). Bee marshals that struct without json tags, so the keys
+/// are its Go field names (`PascalCase`), and every count is in chunks.
+///
+/// Ant fills it from the status snapshot, so unlike bee's (which walks
+/// the whole store) it costs nothing:
+///
+/// * `Cache.Size` — unpinned cached chunks (bee's cache never holds
+///   pinned chunks either). `Cache.Capacity` — the byte cap ÷ 4096,
+///   bee's own conversion.
+/// * `Pinning` — pin collections, and their members summed per
+///   collection, as bee counts them.
+/// * `ChunkStore.TotalChunks` — every chunk on disk, pinned or not.
+///   Ant has no shared slots or per-chunk refcounts (a chunk is one
+///   row), so `SharedSlots` is `0` and `ReferenceCount` equals
+///   `TotalChunks`.
+/// * `Upload` and `Reserve` — zero / `null`, as on a bee light node
+///   with nothing pending: ant keeps no reserve, and its upload
+///   progress lives in `/tags`.
+pub async fn debugstore(State(handle): State<GatewayHandle>) -> Response {
+    let disk = handle.status.borrow().retrieval.disk.clone();
+    let all_chunks = disk.chunks;
+    Json(serde_json::json!({
+        "Upload": {"TotalUploaded": 0, "TotalSynced": 0, "PendingUpload": 0},
+        "Pinning": {
+            "TotalCollections": disk.pin_collections,
+            "TotalChunks": disk.pin_member_chunks,
+        },
+        "Cache": {
+            "Size": all_chunks.saturating_sub(disk.pinned_chunks),
+            "Capacity": disk.capacity_bytes / BEE_CHUNK_BYTES,
+        },
+        "Reserve": {
+            "SizeWithinRadius": 0,
+            "TotalSize": 0,
+            "Capacity": 0,
+            "LastBinIDs": null,
+            "Epoch": 0,
+        },
+        "ChunkStore": {
+            "TotalChunks": all_chunks,
+            "SharedSlots": 0,
+            "ReferenceCount": all_chunks,
+        },
+    }))
+    .into_response()
+}

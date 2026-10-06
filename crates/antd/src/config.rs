@@ -66,6 +66,10 @@ pub struct BeeConfig {
     pub verbosity: Option<String>,
     #[serde(rename = "nat-addr")]
     pub nat_addr: Option<String>,
+    /// Bee's `cache-capacity`, in chunks. Bee's sample config quotes it
+    /// (`cache-capacity: "1000000"`), so a string is accepted too.
+    #[serde(rename = "cache-capacity")]
+    pub cache_capacity: Option<serde_yaml::Value>,
     /// Any other bee keys (e.g. `resolver-options`,
     /// `skip-postage-snapshot`, `storage-incentives-enable`). Captured
     /// so we can log "ignoring N unmodelled keys" rather than erroring.
@@ -147,6 +151,22 @@ impl BeeConfig {
             }
             .to_string()
         })
+    }
+
+    /// `cache-capacity` as a chunk count: a YAML integer or a numeric
+    /// string. Anything else is a config error, not silently dropped.
+    pub fn cache_capacity_chunks(&self) -> Result<Option<u64>> {
+        let Some(v) = &self.cache_capacity else {
+            return Ok(None);
+        };
+        let parsed = match v {
+            serde_yaml::Value::Number(n) => n.as_u64(),
+            serde_yaml::Value::String(s) => s.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        parsed
+            .map(Some)
+            .with_context(|| format!("cache-capacity must be a chunk count, got {v:?}"))
     }
 
     pub fn cors_origins_vec(&self) -> Vec<String> {
@@ -233,6 +253,27 @@ storage-incentives-enable: false
                 "https://a.example".to_string(),
                 "https://b.example".to_string()
             ],
+        );
+    }
+
+    #[test]
+    fn cache_capacity_accepts_bee_spellings() {
+        // bee's packaging/bee.yaml quotes it; a hand-written config may not.
+        let quoted = parse_str("cache-capacity: \"1000000\"").unwrap();
+        assert_eq!(quoted.cache_capacity_chunks().unwrap(), Some(1_000_000));
+        let bare = parse_str("cache-capacity: 250000").unwrap();
+        assert_eq!(bare.cache_capacity_chunks().unwrap(), Some(250_000));
+        assert!(
+            !bare.extra.contains_key("cache-capacity"),
+            "modelled, not ignored"
+        );
+        assert!(parse_str("cache-capacity: lots")
+            .unwrap()
+            .cache_capacity_chunks()
+            .is_err());
+        assert_eq!(
+            parse_str("{}").unwrap().cache_capacity_chunks().unwrap(),
+            None
         );
     }
 

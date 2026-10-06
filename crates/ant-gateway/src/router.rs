@@ -41,6 +41,10 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/addresses", get(status::addresses))
         .route("/peers", get(status::peers))
         .route("/topology", get(status::topology))
+        // Bee's local-store stats (`Cache`, `Pinning`, ...), chunk
+        // counts. Ant's cache clear has no bee equivalent and is not on
+        // this API (ant-ffi `ant_cache_clear` only).
+        .route("/debugstore", get(status::debugstore))
         // Chain-backed wallet / chequebook / status / chainstate
         // (PLAN.md J.5 A2/A3/D1/D2). Real Gnosis balances + block /
         // postage price when an RPC endpoint is configured; bee's

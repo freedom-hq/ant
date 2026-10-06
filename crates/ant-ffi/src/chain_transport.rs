@@ -440,6 +440,8 @@ mod tests {
             signing_secret: [0u8; 32],
             eth: [0u8; 20],
             data_dir: std::path::PathBuf::from("/nonexistent"),
+            disk_cache: None,
+            memory_cache: std::sync::Arc::new(ant_retrieval::InMemoryChunkCache::new(8)),
             gateway_task: std::sync::Mutex::new(None),
             gateway_cors: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),

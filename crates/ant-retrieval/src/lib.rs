@@ -68,7 +68,7 @@ pub mod traversal;
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
-pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
+pub use disk_cache::{ClearReport, DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
 pub use enc_split::{
     split_bytes_encrypted, split_bytes_encrypted_with_keys, EncryptedSplitResult, ENC_REF_SIZE,
 };

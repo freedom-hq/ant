@@ -81,6 +81,11 @@ pub struct NodeConfig {
     /// computed default in `<data-dir>/chunks.sqlite`); embedders can
     /// disable it by passing `None`.
     pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    /// Embedder-owned process-wide in-memory chunk cache. `Some` makes
+    /// the swarm loop share this `Arc` instead of building its own, so
+    /// the embedder can read and clear it (ant-ffi's `ant_cache_*`).
+    /// Ignored when `per_request_chunk_cache` is set.
+    pub memory_cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
     /// Postage stamping + signing runtime for `POST /chunks`. `Some`
     /// enables uploads; `None` returns "uploads not configured".
     pub upload: Option<Arc<UploadRuntime>>,
@@ -152,6 +157,7 @@ impl NodeConfig {
             chunk_record_dir: None,
             gateway_activity: None,
             disk_cache: None,
+            memory_cache: None,
             upload: None,
             swap: None,
             pushsync_swap: None,
@@ -239,6 +245,17 @@ impl NodeConfig {
         self
     }
 
+    /// Share `cache` as the process-wide in-memory chunk cache (see
+    /// [`Self::memory_cache`]).
+    #[must_use]
+    pub fn with_memory_cache(
+        mut self,
+        cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
+    ) -> Self {
+        self.memory_cache = cache;
+        self
+    }
+
     #[must_use]
     pub fn with_upload(mut self, upload: Option<Arc<UploadRuntime>>) -> Self {
         self.upload = upload;
@@ -318,6 +335,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         chunk_record_dir: cfg.chunk_record_dir,
         gateway_activity: cfg.gateway_activity,
         disk_cache: cfg.disk_cache,
+        memory_cache: cfg.memory_cache,
         upload: cfg.upload,
         swap: cfg.swap,
         pushsync_swap: cfg.pushsync_swap.map(|mut c| {

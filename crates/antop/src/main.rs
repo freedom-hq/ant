@@ -1678,6 +1678,7 @@ mod tests {
                 chunks: 3_300_000,
                 path: "/home/op/.antd/chunks.sqlite".to_string(),
                 read_workers: 16,
+                ..DiskCacheInfo::default()
             },
             gateway_requests: Vec::new(),
         };
