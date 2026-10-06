@@ -1451,16 +1451,6 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Load `--config` (if given), merging its values into `opt` for every
-/// setting the operator did **not** pass on the command line. Returns
-/// the config keys it doesn't model (for the caller to log once the
-/// tracing subscriber exists) and the resolved keystore password (from
-/// `--password` / `--password-file`
-/// or the config's `password` / `password-file`), if any.
-///
-/// CLI > config file > default — the same precedence bee uses, so a
-/// Freedom-written config behaves predictably while an operator can
-/// still override one knob on the command line.
 /// Bee counts `cache-capacity` in chunks and sizes it at 4096 bytes
 /// each ("multiply by 4096 to get approximate capacity in bytes").
 const BEE_CACHE_CHUNK_BYTES: u64 = 4096;
@@ -1478,6 +1468,16 @@ fn disk_cache_max_bytes(opt: &Opt) -> u64 {
     }
 }
 
+/// Load `--config` (if given), merging its values into `opt` for every
+/// setting the operator did **not** pass on the command line. Returns
+/// the config keys it doesn't model (for the caller to log once the
+/// tracing subscriber exists) and the resolved keystore password (from
+/// `--password` / `--password-file`
+/// or the config's `password` / `password-file`), if any.
+///
+/// CLI > config file > default — the same precedence bee uses, so a
+/// Freedom-written config behaves predictably while an operator can
+/// still override one knob on the command line.
 fn apply_config_file(
     opt: &mut Opt,
     matches: &clap::ArgMatches,
