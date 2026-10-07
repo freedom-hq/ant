@@ -50,6 +50,7 @@ pub mod pushsync_settlement;
 pub mod accounting;
 pub mod act;
 pub mod cache;
+pub mod cache_control;
 pub mod counters;
 pub mod disk_cache;
 pub mod enc_split;
@@ -67,6 +68,10 @@ pub mod traversal;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
+pub use cache_control::{
+    clamp_capacity, ChunkCaches, SetCapacityError, CACHE_CAPACITY_MAX_BYTES,
+    CACHE_CAPACITY_MIN_BYTES,
+};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
 pub use disk_cache::{ClearReport, DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
 pub use enc_split::{

@@ -38,6 +38,8 @@
 #[cfg(feature = "http-api")]
 mod act;
 #[cfg(feature = "http-api")]
+mod cache;
+#[cfg(feature = "http-api")]
 mod chain;
 #[cfg(feature = "chain")]
 pub mod chainreader;
@@ -137,9 +139,13 @@ impl Gateway {
             .local_addr()
             .map_or_else(|_| addr.to_string(), |a| a.to_string());
         tracing::info!(target: "ant_gateway", "HTTP API listening on {bound}");
-        axum::serve(listener, app)
-            .await
-            .map_err(GatewayError::Serve)
+        // Connect info: the `/v0/cache` writes only answer loopback peers.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(GatewayError::Serve)
     }
 }
 

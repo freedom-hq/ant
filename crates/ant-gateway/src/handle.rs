@@ -138,6 +138,10 @@ pub struct GatewayHandle {
     /// node's chequebook; see [`ChequebookRefusedHook`]. `None`: the
     /// route answers the refusal and nothing else happens.
     pub on_chequebook_refused: Option<ChequebookRefusedHook>,
+    /// The node's chunk caches, for the `/v0/cache` routes (see,
+    /// clear, resize). `None`: those routes answer `501` (an embedder
+    /// that doesn't hand its caches over).
+    pub cache: Option<ant_retrieval::ChunkCaches>,
 }
 
 /// The chain-derived slice of gateway wiring, resolved by `antd`'s

@@ -20,8 +20,8 @@ use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
 use crate::{
-    act, chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, subscribe,
-    tags,
+    act, cache, chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship,
+    subscribe, tags,
 };
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
@@ -34,6 +34,7 @@ const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 pub fn build(handle: GatewayHandle) -> Router {
     let spend_guard =
         middleware::from_fn_with_state(handle.clone(), crate::cors::wallet_spend_guard);
+    let local_host = middleware::from_fn_with_state(handle.clone(), cache::local_host_guard);
     Router::new()
         .route("/health", get(status::health))
         .route("/readiness", get(status::readiness))
@@ -42,9 +43,20 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/peers", get(status::peers))
         .route("/topology", get(status::topology))
         // Bee's local-store stats (`Cache`, `Pinning`, ...), chunk
-        // counts. Ant's cache clear has no bee equivalent and is not on
-        // this API (ant-ffi `ant_cache_clear` only).
+        // counts.
         .route("/debugstore", get(status::debugstore))
+        // Ant extension: see, clear and resize the chunk cache live
+        // (ant-ffi's `ant_cache_*`; bee has no equivalent). The writes
+        // only answer loopback, non-browser callers.
+        .route("/v0/cache", get(cache::status))
+        .route(
+            "/v0/cache/clear",
+            post(cache::clear).route_layer(local_host.clone()),
+        )
+        .route(
+            "/v0/cache/capacity",
+            put(cache::set_capacity).route_layer(local_host),
+        )
         // Chain-backed wallet / chequebook / status / chainstate
         // (PLAN.md J.5 A2/A3/D1/D2). Real Gnosis balances + block /
         // postage price when an RPC endpoint is configured; bee's

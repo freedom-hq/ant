@@ -285,6 +285,11 @@ cargo run -p antd -- \
   file) sizes the disk cache the way bee does: a chunk count, × 4096
   bytes. `--disk-cache-max-gb` overrides it. Pinned chunks are outside
   the cap. `GET /debugstore` reports the cache in bee's shape.
+- `GET /v0/cache` reports the cache in bytes (unpinned, pinned, file
+  size, memory tier); `POST /v0/cache/clear` evicts every unpinned chunk
+  and gives the space back; `PUT /v0/cache/capacity` with `{"bytes": N}`
+  resizes it live (64 MiB–16 GiB, not persisted). The two writes answer
+  only loopback callers that aren't web pages.
 - `--no-peerstore` / `--reset-peerstore` control the warm-restart peer
   snapshot.
 

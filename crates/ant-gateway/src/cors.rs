@@ -341,7 +341,7 @@ pub async fn settlement_switch_guard(
 }
 
 /// The decision behind [`wallet_spend_guard`].
-fn browser_request_allowed(cfg: &CorsConfig, h: &axum::http::HeaderMap) -> bool {
+pub(crate) fn browser_request_allowed(cfg: &CorsConfig, h: &axum::http::HeaderMap) -> bool {
     let origin = h.get(header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
     match origin {
         Some(o) => {

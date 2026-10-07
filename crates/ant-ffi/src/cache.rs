@@ -2,38 +2,27 @@
 //!
 //! The node keeps two chunk caches: the persistent `SQLite` one at
 //! `<data_dir>/chunks.sqlite` ([`DiskChunkCache`], byte-capped) and an
-//! in-memory LRU ([`InMemoryChunkCache`], slot-capped). Pinned chunks
+//! in-memory LRU ([`ant_retrieval::InMemoryChunkCache`], slot-capped). Pinned chunks
 //! (`Swarm-Pin: true` uploads, bee `/pins`) live in the same database
 //! but outside the byte cap, so a host can't just delete the file; these
 //! calls clear and resize the cache while leaving pins alone.
 //!
-//! Bee has no cache-clear endpoint (only the offline `bee db nuke`), so
-//! the clear lives here on the C API and not on the bee-shaped gateway.
-//! Bee's cache figures are on the gateway's `GET /debugstore`.
+//! The work is [`ant_retrieval::ChunkCaches`], shared with the gateway's
+//! `/v0/cache` routes (`antd`'s HTTP API). Bee has no cache-clear
+//! endpoint (only the offline `bee db nuke`); bee's cache figures are on
+//! the gateway's `GET /debugstore`.
 
 use std::ffi::c_char;
 use std::path::Path;
 use std::sync::Arc;
 
-use ant_retrieval::{DiskChunkCache, InMemoryChunkCache};
+use ant_retrieval::clamp_capacity;
+use ant_retrieval::{ChunkCaches, DiskChunkCache};
 use serde::Deserialize;
 
 use crate::{
     clear_out_err, null_handle, run_string_call, write_out_err, AntHandle, DISK_CACHE_MAX_BYTES,
 };
-
-/// Smallest disk cap a host can set: 64 MiB. Below that the cache holds
-/// too little of a manifest + media tree to save a refetch.
-pub const CACHE_CAPACITY_MIN_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Largest disk cap a host can set: 16 GiB.
-pub const CACHE_CAPACITY_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
-/// Clamp a host-requested cap into
-/// [`CACHE_CAPACITY_MIN_BYTES`]..=[`CACHE_CAPACITY_MAX_BYTES`].
-pub fn clamp_capacity(bytes: u64) -> u64 {
-    bytes.clamp(CACHE_CAPACITY_MIN_BYTES, CACHE_CAPACITY_MAX_BYTES)
-}
 
 /// Open `<data_dir>/chunks.sqlite` with the host's saved cap (clamped),
 /// or [`DISK_CACHE_MAX_BYTES`] when it has none. A failed open is
@@ -64,39 +53,15 @@ pub fn open_disk_cache(data_dir: &Path, capacity: Option<u64>) -> Option<Arc<Dis
     }
 }
 
-/// The JSON `ant_cache_status` returns, also embedded in
-/// `ant_cache_clear`'s reply. Mirrored counters and three `stat`s only.
-pub fn status_json(
-    disk: Option<&DiskChunkCache>,
-    memory: &InMemoryChunkCache,
-) -> serde_json::Value {
-    let (used_bytes, capacity_bytes, pinned_bytes, chunks, pinned_chunks, file_bytes) = disk
-        .map_or((0, 0, 0, 0, 0, 0), |d| {
-            let pinned_chunks = d.pinned_rows();
-            (
-                d.used_bytes(),
-                d.capacity_bytes(),
-                d.pinned_bytes(),
-                d.used_rows().saturating_sub(pinned_chunks),
-                pinned_chunks,
-                d.file_bytes(),
-            )
-        });
-    serde_json::json!({
-        "disk_enabled": disk.is_some(),
-        "used_bytes": used_bytes,
-        "capacity_bytes": capacity_bytes,
-        "pinned_bytes": pinned_bytes,
-        "chunks": chunks,
-        "pinned_chunks": pinned_chunks,
-        "file_bytes": file_bytes,
-        "memory_chunks": memory.len(),
-        "memory_capacity_chunks": memory.capacity(),
-    })
+fn caches(h: &AntHandle) -> ChunkCaches {
+    ChunkCaches {
+        disk: h.disk_cache.clone(),
+        memory: h.memory_cache.clone(),
+    }
 }
 
 fn status_string(h: &AntHandle) -> Result<String, String> {
-    serde_json::to_string(&status_json(h.disk_cache.as_deref(), &h.memory_cache))
+    serde_json::to_string(&caches(h).status_json())
         .map_err(|e| format!("serialize cache status: {e}"))
 }
 
@@ -176,37 +141,18 @@ pub unsafe extern "C" fn ant_cache_clear(
     unsafe {
         run_string_call(out_err, "ant_cache_clear", || {
             let h = handle.as_ref().ok_or_else(null_handle)?;
-            let report = match &h.disk_cache {
-                Some(disk) => h
-                    .runtime
-                    .block_on(disk.clear_unpinned())
-                    .map_err(|e| format!("clear disk cache: {e}"))?,
-                None => ant_retrieval::ClearReport::default(),
-            };
-            let memory_chunks_removed = h.memory_cache.len();
-            h.memory_cache.clear();
-            tracing::info!(
-                target: "ant-ffi",
-                ?report,
-                memory_chunks_removed,
-                "chunk cache cleared (pins kept)",
-            );
-            let status = status_json(h.disk_cache.as_deref(), &h.memory_cache);
-            serde_json::to_string(&serde_json::json!({
-                "freed_bytes": report.freed_bytes,
-                "removed_chunks": report.removed_chunks,
-                "file_bytes_before": report.file_bytes_before,
-                "file_bytes_after": report.file_bytes_after,
-                "memory_chunks_removed": memory_chunks_removed,
-                "status": status,
-            }))
-            .map_err(|e| format!("serialize cache clear: {e}"))
+            let cleared = h
+                .runtime
+                .block_on(caches(h).clear())
+                .map_err(|e| format!("clear disk cache: {e}"))?;
+            serde_json::to_string(&cleared).map_err(|e| format!("serialize cache clear: {e}"))
         })
     }
 }
 
 /// Set the disk cache cap at runtime. `bytes` is clamped to
-/// [`CACHE_CAPACITY_MIN_BYTES`] (64 MiB) ..= [`CACHE_CAPACITY_MAX_BYTES`]
+/// [`ant_retrieval::CACHE_CAPACITY_MIN_BYTES`] (64 MiB) ..=
+/// [`ant_retrieval::CACHE_CAPACITY_MAX_BYTES`]
 /// (16 GiB); `ant_cache_status`'s `capacity_bytes` shows the value
 /// applied. Lowering it below `used_bytes` evicts oldest-first down to
 /// ~95% of the new cap before returning and gives the space back to the
@@ -243,22 +189,10 @@ pub unsafe extern "C" fn ant_cache_set_capacity(
             return -1;
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let disk = h
-                .disk_cache
-                .as_ref()
-                .ok_or_else(|| "disk chunk cache is not available".to_string())?;
-            let applied = clamp_capacity(bytes);
             h.runtime
-                .block_on(disk.set_capacity(applied))
-                .map_err(|e| format!("set cache capacity: {e}"))?;
-            tracing::info!(
-                target: "ant-ffi",
-                requested = bytes,
-                applied,
-                used_bytes = disk.used_bytes(),
-                "disk chunk cache capacity set",
-            );
-            Ok::<(), String>(())
+                .block_on(caches(h).set_capacity(bytes))
+                .map(drop)
+                .map_err(|e| e.to_string())
         }));
         match result {
             Ok(Ok(())) => 0,
@@ -305,6 +239,7 @@ impl InitConfig {
 mod tests {
     use super::*;
     use crate::{ant_free_string, tests::cache_test_handle};
+    use ant_retrieval::{CACHE_CAPACITY_MAX_BYTES, CACHE_CAPACITY_MIN_BYTES};
     use std::ffi::CStr;
 
     fn take_string(raw: *mut c_char) -> serde_json::Value {
