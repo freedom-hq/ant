@@ -660,6 +660,14 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The node loop's in-memory chunk cache, built here (not by the
+    // swarm loop) so the gateway's `/v0/cache` routes can empty it.
+    let memory_cache = Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity());
+    let chunk_caches = ant_retrieval::ChunkCaches {
+        disk: disk_cache.clone(),
+        memory: memory_cache.clone(),
+    };
+
     // Single shared registry for in-flight gateway HTTP requests.
     // Built unconditionally so the node loop can read from it; only
     // the gateway side ever writes when `--no-http-api` is set, in
@@ -767,6 +775,7 @@ async fn main() -> Result<()> {
             .with_chunk_record_dir(chunk_record_dir)
             .with_gateway_activity(Some(gateway_activity.clone()))
             .with_disk_cache(disk_cache)
+            .with_memory_cache(Some(memory_cache))
             .with_swap(Some(swap_cfg))
             .with_upload_manager(Some(upload_manager))
             .with_swap_enabled(opt.swap_enable)
@@ -840,6 +849,8 @@ async fn main() -> Result<()> {
             act_secret: Arc::new(signing_secret),
             on_batch_bought: Some(settlement_on_buy.hook()),
             on_chequebook_refused: Some(settlement_on_buy.refused_hook()),
+            // For `/v0/cache`: the caches the node loop uses.
+            cache: Some(chunk_caches),
         };
         Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };

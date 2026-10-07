@@ -215,6 +215,36 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
         on_chequebook_refused: None,
+        cache: None,
+    };
+    build_router(handle)
+}
+
+/// [`status_only_router`] holding `cache` for the `/v0/cache` routes,
+/// with a `cors-allowed-origins` policy.
+pub fn cache_router(cache: Option<ant_retrieval::ChunkCaches>, cors: CorsConfig) -> Router {
+    let (status_tx, status_rx) = watch::channel(empty_snapshot());
+    Box::leak(Box::new(status_tx));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    Box::leak(Box::new(cmd_rx));
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/test".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(test_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(cors),
+        chain_state: GatewayChainState {
+            light_mode: false,
+            chain: None,
+        }
+        .preset(),
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
+        on_batch_bought: None,
+        on_chequebook_refused: None,
+        cache,
     };
     build_router(handle)
 }
@@ -256,6 +286,7 @@ pub fn swap_switch_router(snapshot: StatusSnapshot, cors: CorsConfig) -> Router 
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
         on_chequebook_refused: None,
+        cache: None,
     };
     build_router(handle)
 }
@@ -492,6 +523,7 @@ fn chain_router(
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought,
         on_chequebook_refused,
+        cache: None,
     };
     build_router(handle)
 }
@@ -520,6 +552,7 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
         on_chequebook_refused: None,
+        cache: None,
     };
     build_router(handle)
 }
@@ -563,6 +596,7 @@ pub fn handle_with_fixture_node() -> Router {
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
         on_chequebook_refused: None,
+        cache: None,
     };
     build_router(handle)
 }
@@ -1271,6 +1305,7 @@ where
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
         on_batch_bought: None,
         on_chequebook_refused: None,
+        cache: None,
     };
     build_router(handle)
 }

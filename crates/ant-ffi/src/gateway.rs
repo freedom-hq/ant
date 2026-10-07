@@ -423,6 +423,11 @@ pub unsafe extern "C" fn ant_start_gateway(
             act_secret: Arc::new(handle.signing_secret),
             on_batch_bought,
             on_chequebook_refused,
+            // The same caches `ant_cache_*` act on, for `/v0/cache`.
+            cache: Some(ant_retrieval::ChunkCaches {
+                disk: handle.disk_cache.clone(),
+                memory: handle.memory_cache.clone(),
+            }),
         };
 
         // `/health.walletScan` reads `pending` from the first request on:
