@@ -84,9 +84,14 @@ pub struct DiskCacheTuning {
 }
 
 impl DiskCacheTuning {
-    /// iOS and Android: two read threads, nothing mapped and 8 MiB of
-    /// page cache per connection, so the three connections reserve no
-    /// address space for the file and hold at most 24 MiB of heap.
+    /// iOS and Android (and Apple's other mobile OSes): two read
+    /// threads, nothing mapped and 8 MiB of page cache per connection,
+    /// so the three connections reserve no address space for the file
+    /// and their page caches total at most 24 MiB of heap. On top of
+    /// that each connection maps the small WAL index (`-shm`, 32 KiB
+    /// per 4,000 or so WAL frames), and a one-off legacy `VACUUM`
+    /// builds its temp copy in memory (at most 64 MiB, only for a
+    /// small pre-incremental-vacuum cache file).
     pub const MOBILE: Self = Self {
         read_workers: 2,
         mmap_bytes: 0,
@@ -107,16 +112,28 @@ impl DiskCacheTuning {
     }
 
     /// The tuning for the platform this is built for:
-    /// [`Self::MOBILE`] on iOS and Android, [`Self::desktop`] elsewhere.
+    /// [`Self::MOBILE`] on iOS, Android, tvOS, watchOS and visionOS,
+    /// [`Self::desktop`] elsewhere.
     #[must_use]
     pub fn for_target() -> Self {
-        if cfg!(any(target_os = "ios", target_os = "android")) {
+        if MOBILE_TARGET {
             Self::MOBILE
         } else {
             Self::desktop()
         }
     }
 }
+
+/// Whether this build targets a mobile OS, where the app's address
+/// space and memory are capped (see [`DiskCacheTuning`]). Every Apple
+/// OS but macOS has the iOS address-space limit.
+const MOBILE_TARGET: bool = cfg!(any(
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "android",
+));
 
 /// Default size cap for the persistent chunk cache. 10 GB matches
 /// `PLAN.md` § 6.1's desktop / Raspberry Pi default. Operators on
@@ -1227,9 +1244,10 @@ fn writer_main(
 ) -> Result<(), DiskCacheError> {
     // `open()` doesn't wait for this thread: it opened `conn`, and the
     // schema with it, itself. The initial backfill scan below
-    // (SUM(size) + COUNT(*)) touches every row in the chunks table (sequential disk read on a cold page
-    // cache: ~28 s on a 7 GB DB), and `antd` must be free to start its
-    // libp2p listener + bootstrap dial before we finish that —
+    // (SUM(size) + COUNT(*)) touches every row in the chunks table
+    // (sequential disk read on a cold page cache: ~28 s on a 7 GB DB),
+    // and `antd` must be free to start its libp2p listener + bootstrap
+    // dial before we finish that —
     // `time_to_first_peer_s` is otherwise dominated by this scan on
     // every cold start. Until backfill finishes, `total_bytes` and
     // `total_rows` stay at zero; that just means the eviction trigger
@@ -1855,7 +1873,7 @@ mod tests {
         let connections = m.read_workers as u64 + 1;
         assert_eq!(connections * m.mmap_bytes, 0);
         assert!(connections * m.page_cache_bytes <= 32 * 1024 * 1024);
-        if cfg!(any(target_os = "ios", target_os = "android")) {
+        if MOBILE_TARGET {
             assert_eq!(DiskCacheTuning::for_target(), m);
         } else {
             assert_eq!(DiskCacheTuning::for_target(), DiskCacheTuning::desktop());
