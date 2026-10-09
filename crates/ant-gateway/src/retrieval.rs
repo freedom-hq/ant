@@ -3304,8 +3304,10 @@ async fn consume_stream_prologue(
                 debug!(target: "ant_gateway", %message, "retrieval: chunk not found");
                 return Err(status_text_error(StatusCode::NOT_FOUND));
             }
-            // A miss from a starved peer pool: not the network's answer
-            // (#114), so a retryable 503 rather than a 404.
+            // A miss from a starved peer pool (#114), or a `/bzz`
+            // manifest node whose replica sweep missed only transiently
+            // (#154): not the network's answer, so a retryable 503
+            // rather than a 404.
             Ok(Some(ControlAck::NotReady { message })) => {
                 return Err(json_error(StatusCode::SERVICE_UNAVAILABLE, message));
             }

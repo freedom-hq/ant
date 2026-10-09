@@ -235,7 +235,10 @@ pub enum ControlCommand {
     /// [`ControlAck::StreamDone`] or [`ControlAck::Error`]. As with
     /// `StreamBytes`, a failure before the stream starts can instead end
     /// in [`ControlAck::NotFound`] (the manifest root or data root
-    /// confirmed missing) or [`ControlAck::NotReady`]; both are terminal.
+    /// confirmed missing) or [`ControlAck::NotReady`] (a starved peer
+    /// pool, or a manifest node whose dispersed-replica sweep missed only
+    /// transiently, even when its direct miss is corroborated); both are
+    /// terminal.
     ///
     /// `range` and `head_only` behave identically to `StreamBytes`.
     /// `head_only` is what backs `HEAD /bzz/{ref}/{path}`: the daemon
@@ -859,7 +862,15 @@ pub enum ControlAck {
     /// fetch's last answer was a miss but the peer pool was starved
     /// (`FetchExhausted::pool_starved`): one cold peer's "not found" is
     /// not the network's answer (issue #114), so it is a 503 to retry,
-    /// never a 404. Terminal, like [`Self::Error`]. Distinct from
+    /// never a 404. `StreamBzz` also sends it for a manifest node whose
+    /// direct miss *is* corroborated but whose dispersed-replica sweep
+    /// missed only transiently in the last attempt
+    /// (`ReplicaSweeps::swept_transiently`): a replica-only node (#154) is
+    /// a corroborated direct miss by construction, so under credit
+    /// pressure the content may still be reachable through its replicas
+    /// and the answer is a 503, not a 404 (R4-M1 on PR #155). So a
+    /// corroborated miss does not by itself rule out `NotReady`.
+    /// Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for
     /// genuine I/O failures.
