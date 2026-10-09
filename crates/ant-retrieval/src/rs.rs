@@ -907,7 +907,46 @@ pub async fn fetch_root_with_replicas(
         Ok(wire) => return Ok(wire),
         Err(e) => e,
     };
+    recover_from_replicas(fetcher, addr).await.ok_or(direct_err)
+}
 
+/// The replica half of [`fetch_root_with_replicas`], for a caller that
+/// has already tried the direct fetch its own way: try `addr`'s
+/// dispersed replicas and return the original chunk's wire bytes from
+/// the first valid one, stored via [`ChunkFetcher::put_recovered`].
+/// `None` when no replica could be fetched. The probes never wait for
+/// credit.
+pub(crate) async fn recover_from_replicas(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+) -> Option<Vec<u8>> {
+    recover_from_replicas_classified(fetcher, addr).await.ok()
+}
+
+/// How a replica sweep that recovered nothing failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepMiss {
+    /// Every replica address answered with the network's final word:
+    /// a corroborated miss
+    /// ([`crate::fetcher::FetchExhausted::corroborated_missing`]) or a
+    /// chunk that isn't a valid replica of `addr`. Sweeping again in the
+    /// same request won't change that.
+    Final,
+    /// At least one probe failed in a way a later try can change: a
+    /// starved pool, a miss only one or two peers answered (a cold
+    /// node), a transport error.
+    Transient,
+}
+
+/// [`recover_from_replicas`], reporting on failure whether the sweep's
+/// miss was final or may clear on a later sweep (R2-F1 on PR #155: a
+/// manifest node load memoizes only a final miss across a request's
+/// retries, so a replica-only node whose first sweep lost a credit race
+/// is swept again on the next attempt).
+pub(crate) async fn recover_from_replicas_classified(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+) -> Result<Vec<u8>, SweepMiss> {
     let mut candidates: Vec<[u8; 32]> = Vec::with_capacity(REPLICA_COUNTS[4]);
     for level in (1..=MAX_LEVEL).rev() {
         for soc_addr in replica_addresses(&addr, level) {
@@ -925,32 +964,48 @@ pub async fn fetch_root_with_replicas(
     );
 
     let mut attempts = stream::iter(candidates.into_iter().map(|soc_addr| async move {
-        let wire = fetcher.fetch(soc_addr).await.ok()?;
+        let wire = match fetcher.fetch(soc_addr).await {
+            Ok(wire) => wire,
+            Err(e) => {
+                let final_miss = crate::fetcher::FetchExhausted::find(e.as_ref())
+                    .is_some_and(crate::fetcher::FetchExhausted::corroborated_missing);
+                return Err(if final_miss {
+                    SweepMiss::Final
+                } else {
+                    SweepMiss::Transient
+                });
+            }
+        };
         if !soc_valid(&soc_addr, &wire) || wire.len() <= SOC_HEADER_SIZE {
-            return None;
+            return Err(SweepMiss::Final);
         }
         // The replica's wrapped CAC *is* the original chunk: same wire
         // bytes, and its BMT address is the address we were asked for.
         let inner = wire[SOC_HEADER_SIZE..].to_vec();
         if !cac_valid(&addr, &inner) {
-            return None;
+            return Err(SweepMiss::Final);
         }
-        Some(inner)
+        Ok(inner)
     }))
     .buffered(REPLICA_FETCH_FANOUT);
 
+    let mut miss = SweepMiss::Final;
     while let Some(outcome) = attempts.next().await {
-        if let Some(inner) = outcome {
-            fetcher.put_recovered(addr, &inner).await;
-            tracing::debug!(
-                target: "ant_retrieval::rs",
-                chunk = %hex::encode(addr),
-                "recovered root chunk from a dispersed replica",
-            );
-            return Ok(inner);
+        match outcome {
+            Ok(inner) => {
+                fetcher.put_recovered(addr, &inner).await;
+                tracing::debug!(
+                    target: "ant_retrieval::rs",
+                    chunk = %hex::encode(addr),
+                    "recovered root chunk from a dispersed replica",
+                );
+                return Ok(inner);
+            }
+            Err(SweepMiss::Transient) => miss = SweepMiss::Transient,
+            Err(SweepMiss::Final) => {}
         }
     }
-    Err(direct_err)
+    Err(miss)
 }
 
 #[cfg(test)]

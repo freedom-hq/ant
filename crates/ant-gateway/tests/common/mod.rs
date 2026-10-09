@@ -71,9 +71,34 @@ pub fn fixture_dir() -> PathBuf {
 /// helper from another crate's `tests/`.
 pub struct DirFetcher {
     chunks: HashMap<[u8; 32], Vec<u8>>,
+    /// Chunks handed back through [`ChunkFetcher::put_recovered`] (a
+    /// root rebuilt from a dispersed replica) — the stand-in for the
+    /// node's chunk cache, served by later fetches like `chunks`.
+    recovered: std::sync::Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    /// Every `fetch` call, hit or miss.
+    fetches: std::sync::atomic::AtomicUsize,
 }
 
 impl DirFetcher {
+    /// A fetcher over an in-memory chunk set (address → wire bytes).
+    pub fn from_chunks(chunks: HashMap<[u8; 32], Vec<u8>>) -> Self {
+        Self {
+            chunks,
+            recovered: std::sync::Mutex::default(),
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Has `addr` been stored through `put_recovered`?
+    pub fn was_recovered(&self, addr: &[u8; 32]) -> bool {
+        self.recovered.lock().unwrap().contains_key(addr)
+    }
+
+    /// Number of `fetch` calls so far.
+    pub fn fetch_count(&self) -> usize {
+        self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn from_dir(dir: &Path) -> std::io::Result<Self> {
         let mut chunks = HashMap::new();
         for entry in std::fs::read_dir(dir)? {
@@ -91,19 +116,28 @@ impl DirFetcher {
             }
             chunks.insert(addr, std::fs::read(&path)?);
         }
-        Ok(Self { chunks })
+        Ok(Self::from_chunks(chunks))
     }
 }
 
 #[async_trait]
 impl ChunkFetcher for DirFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(wire) = self.recovered.lock().unwrap().get(&addr) {
+            return Ok(wire.clone());
+        }
         self.chunks
             .get(&addr)
             .cloned()
             .ok_or_else(|| -> Box<dyn StdError + Send + Sync> {
                 format!("chunk {} not found (fixture)", hex::encode(addr)).into()
             })
+    }
+
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.recovered.lock().unwrap().insert(addr, wire.to_vec());
     }
 }
 
@@ -562,12 +596,20 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
 /// Returns the router only — the fake task lives for the test process
 /// lifetime.
 pub fn handle_with_fixture_node() -> Router {
+    handle_with_node(Arc::new(
+        DirFetcher::from_dir(&fixture_dir()).expect("load fixture chunks"),
+    ))
+}
+
+/// [`handle_with_fixture_node`] over a caller-built chunk set, so a test
+/// can construct exactly the chunks the "network" holds and inspect the
+/// fetcher afterwards.
+pub fn handle_with_node(fetcher: Arc<DirFetcher>) -> Router {
     let snapshot = snapshot_with_one_peer();
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
 
-    let fetcher = Arc::new(DirFetcher::from_dir(&fixture_dir()).expect("load fixture chunks"));
     let pins: PinStore = Arc::new(std::sync::Mutex::new(Vec::new()));
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
