@@ -5445,7 +5445,9 @@ async fn run_stream_bzz(
     // reachable through nothing else (R2-F1 on PR #155). Such a sweep
     // keeps the request retrying even when the node's direct miss is
     // corroborated, which every replica-only node's is
-    // (`is_bzz_lookup_retryable`, R3-M1 on PR #155).
+    // (`is_bzz_lookup_retryable`, R3-M1 on PR #155), and, once retries
+    // run out, ends it in a 503 rather than the direct miss's 404
+    // (`bzz_lookup_failure_ack`, R4-M1 on PR #155).
     let replica_sweeps = ant_retrieval::ReplicaSweeps::new();
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
@@ -5552,9 +5554,10 @@ async fn run_stream_bzz(
             }
             Err(e) => {
                 let _ = ack
-                    .send(pre_stream_failure_ack(
+                    .send(bzz_lookup_failure_ack(
                         format!("manifest lookup '{path}': {e}"),
                         &e,
+                        replica_sweeps.swept_transiently(&e),
                     ))
                     .await;
                 return;
@@ -7478,6 +7481,26 @@ fn is_bzz_lookup_retryable(
     sweeps: &ant_retrieval::ReplicaSweeps,
 ) -> bool {
     is_bzz_lookup_transient(e, bare_root) && (!is_final_miss(e) || sweeps.swept_transiently(e))
+}
+
+/// Terminal ack for a manifest lookup `run_stream_bzz` gives up on.
+/// [`pre_stream_failure_ack`], except that a failure on a node whose
+/// dispersed-replica sweep missed only transiently in the last attempt
+/// (`swept_transiently`, [`ant_retrieval::ReplicaSweeps::swept_transiently`])
+/// is `NotReady` (503), not `NotFound` (404): a replica-only node (#154)
+/// is a corroborated direct miss by construction, so the direct error
+/// alone would read as final although [`is_bzz_lookup_retryable`] just
+/// classed the same miss as recoverable, and the content may well be
+/// retrievable once the sweep's pool clears (R4-M1 on PR #155).
+fn bzz_lookup_failure_ack(
+    message: String,
+    e: &ant_retrieval::ManifestError,
+    swept_transiently: bool,
+) -> ControlAck {
+    match pre_stream_failure_ack(message, e) {
+        ControlAck::NotFound { message } if swept_transiently => ControlAck::NotReady { message },
+        ack => ack,
+    }
 }
 
 /// Error for `/bzz/<raw-bytes-ref>/<path>`: raw bytes have no paths, so
@@ -10806,6 +10829,19 @@ mod tests {
             // node in this attempt, a corroborated miss ends the lookup.
             let sweeps = ant_retrieval::ReplicaSweeps::new();
             assert!(!is_bzz_lookup_retryable(&e, false, &sweeps), "{tail}");
+            // R4-M1 on PR #155: once retries run out, the same
+            // corroborated miss is a 404 only if the node's replica sweep
+            // didn't just miss transiently; otherwise it's a 503.
+            assert_eq!(
+                kind(&bzz_lookup_failure_ack("m".into(), &e, false)),
+                "NotFound",
+                "{tail}"
+            );
+            assert_eq!(
+                kind(&bzz_lookup_failure_ack("m".into(), &e, true)),
+                "NotReady",
+                "swept transiently {tail}"
+            );
 
             // R1-M2 on PR #124: a cold node's only peer answering the
             // miss (every ranked peer asked, so not starved) is still the
