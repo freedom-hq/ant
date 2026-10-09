@@ -16,8 +16,8 @@
 //!
 //! - **Dedicated read threads** — `get` is a prepared `SELECT` on a read-only
 //!   WAL connection; jobs are routed round-robin over crossbeam channels (no
-//!   `spawn_blocking` on the hot path). Pool size scales with
-//!   is 2 on every platform (see [`DiskCacheTuning`]).
+//!   `spawn_blocking` on the hot path). Pool size comes from
+//!   [`DiskCacheTuning`] (2 by default on every platform), not the core count.
 //! - **Dedicated writer thread** — all mutating work (batched `put`s,
 //!   `last_access` touches past the freshness window, eviction) runs on
 //!   one thread with **batched transactions** so bursts amortise fsync.
@@ -299,9 +299,9 @@ struct Inner {
     /// Pinned rows / bytes (see [`PinTotals`]). Same backfill caveat as
     /// `total_rows`.
     pinned: Arc<PinTotals>,
-    /// Read-worker pool size, captured once at open time so the status
-    /// snapshot can surface it without re-querying
-    /// `available_parallelism`.
+    /// Read-worker pool size (`DiskCacheTuning::read_workers`, floored
+    /// at 1), captured once at open time so the status snapshot can
+    /// surface the size actually spawned.
     read_workers: usize,
 }
 
