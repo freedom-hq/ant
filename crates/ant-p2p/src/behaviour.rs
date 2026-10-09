@@ -5437,12 +5437,16 @@ async fn run_stream_bzz(
     let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
     // One replica-sweep memo across all attempts: a manifest node whose
     // direct fetch fails is swept for dispersed replicas (#154) at most
-    // once per request, however many times the attempts (and, within
-    // one attempt, the directory-redirect check and index-document
-    // retry) load it. Later loads only repeat the direct fetch.
+    // once per attempt, however many times the directory-redirect check
+    // and index-document retry load it, and never again in this request
+    // once a sweep confirms its replicas missing. A sweep that failed
+    // transiently (starved pool, uncorroborated miss) is retried on the
+    // next attempt, like the direct fetch: a replica-only node is
+    // reachable through nothing else (R2-F1 on PR #155).
     let replica_sweeps = ant_retrieval::ReplicaSweeps::new();
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        replica_sweeps.next_attempt();
         if peers_rx.borrow().is_empty() {
             let _ = ack
                 .send(ControlAck::Error {

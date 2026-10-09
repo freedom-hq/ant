@@ -96,13 +96,19 @@ const MANIFEST_LIST_REPLICA_SWEEPS: usize = 4;
 /// Per-request memo of the dispersed-replica sweeps a manifest node load
 /// runs after its direct fetch fails (#154).
 ///
-/// * A node whose sweep already failed is not swept again: one `/bzz`
-///   lookup can load the same node more than once (the literal walk, the
-///   directory-redirect check, the index- and error-document retries),
-///   and a request that retries its lookup loads it again per attempt.
-///   Sharing one memo across all of those bounds the sweeps to one per
-///   distinct unreachable node per request; later loads of that node
-///   only repeat the direct fetch.
+/// * A node whose sweep ended in a *final* miss (every replica address
+///   a corroborated miss, [`crate::rs::SweepMiss::Final`]) is not swept
+///   again for the rest of the request: one `/bzz` lookup can load the
+///   same node more than once (the literal walk, the directory-redirect
+///   check, the index- and error-document retries), and a request that
+///   retries its lookup loads it again per attempt. Later loads of that
+///   node only repeat the direct fetch.
+/// * A node whose sweep failed *transiently* (a starved pool, a miss
+///   only one or two peers answered, a transport error) is not swept
+///   again within the same attempt, but is swept again after
+///   [`Self::next_attempt`]: a retry exists precisely because such a
+///   miss can clear, and a replica-only node (#154) is reachable through
+///   nothing but the sweep (R2-F1 on PR #155).
 /// * [`Self::capped`] additionally bounds the total number of sweeps
 ///   (used by manifest listings, which load every node of the trie).
 ///
@@ -114,13 +120,17 @@ pub struct ReplicaSweeps {
 
 #[derive(Debug, Default)]
 struct SweepState {
+    /// Nodes whose sweep ended in a final miss: skipped for the request.
     failed: HashSet<[u8; 32]>,
+    /// Nodes whose sweep failed transiently: skipped until the next
+    /// attempt.
+    failed_this_attempt: HashSet<[u8; 32]>,
     /// Sweeps still allowed; `None` is unlimited.
     left: Option<usize>,
 }
 
 impl ReplicaSweeps {
-    /// Unlimited sweeps, but at most one per distinct node.
+    /// Unlimited sweeps, but at most one per distinct node per attempt.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -131,20 +141,30 @@ impl ReplicaSweeps {
     pub fn capped(max: usize) -> Self {
         Self {
             state: std::sync::Mutex::new(SweepState {
-                failed: HashSet::new(),
                 left: Some(max),
+                ..SweepState::default()
             }),
         }
     }
 
-    /// Claim a sweep for `addr`: `false` when `addr`'s sweep already
-    /// failed under this memo or the cap is used up.
-    fn begin(&self, addr: &[u8; 32]) -> bool {
-        let mut st = self
-            .state
+    /// Start a new attempt of the request: nodes whose sweep failed only
+    /// transiently may be swept again. Final misses stay memoized.
+    pub fn next_attempt(&self) {
+        self.lock().failed_this_attempt.clear();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SweepState> {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if st.failed.contains(addr) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claim a sweep for `addr`: `false` when `addr`'s sweep already
+    /// failed under this memo (finally, or transiently in this attempt)
+    /// or the cap is used up.
+    fn begin(&self, addr: &[u8; 32]) -> bool {
+        let mut st = self.lock();
+        if st.failed.contains(addr) || st.failed_this_attempt.contains(addr) {
             return false;
         }
         match &mut st.left {
@@ -157,12 +177,12 @@ impl ReplicaSweeps {
         }
     }
 
-    fn failed(&self, addr: [u8; 32]) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        st.failed.insert(addr);
+    fn failed(&self, addr: [u8; 32], miss: crate::rs::SweepMiss) {
+        let mut st = self.lock();
+        match miss {
+            crate::rs::SweepMiss::Final => st.failed.insert(addr),
+            crate::rs::SweepMiss::Transient => st.failed_this_attempt.insert(addr),
+        };
     }
 }
 
@@ -366,9 +386,11 @@ pub async fn lookup_path(
 ///
 /// A node whose direct fetch fails falls back to its dispersed replicas
 /// (#154), at most once per distinct node under `sweeps`: pass the same
-/// [`ReplicaSweeps`] to every attempt of one request so a node that
-/// loads several times (directory-redirect check then index-document
-/// retry, or a retried attempt) is swept once, not once per load.
+/// [`ReplicaSweeps`] to every attempt of one request (calling
+/// [`ReplicaSweeps::next_attempt`] between them) so a node that loads
+/// several times (directory-redirect check then index-document retry,
+/// or a retried attempt) is swept once per attempt at most, and not at
+/// all again once a sweep has confirmed its replicas missing.
 pub async fn lookup_path_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
@@ -940,8 +962,9 @@ async fn load_node_ref_with_credit(
     // total failure the direct fetch's error comes back unchanged, so
     // retry / not-found classification is as before. Only the direct
     // fetch waits for credit (and only with a window); the replica
-    // probes never do (`rs::recover_from_replicas`). `sweeps` skips the
-    // sweep for a node whose sweep already failed in this request, and
+    // probes never do (`rs::recover_from_replicas_classified`). `sweeps`
+    // skips the sweep for a node whose sweep already ended in a final
+    // miss in this request, or failed transiently in this attempt, and
     // caps a listing's total.
     let budget = credit.map_or(std::time::Duration::ZERO, CreditWindow::budget);
     let root_chunk = if budget.is_zero() {
@@ -952,11 +975,12 @@ async fn load_node_ref_with_credit(
     let root_chunk = match root_chunk {
         Ok(wire) => Ok(wire),
         Err(e) if sweeps.begin(&addr) => {
-            if let Some(wire) = crate::rs::recover_from_replicas(fetcher, addr).await {
-                Ok(wire)
-            } else {
-                sweeps.failed(addr);
-                Err(e)
+            match crate::rs::recover_from_replicas_classified(fetcher, addr).await {
+                Ok(wire) => Ok(wire),
+                Err(miss) => {
+                    sweeps.failed(addr, miss);
+                    Err(e)
+                }
             }
         }
         Err(e) => Err(e),
@@ -2580,8 +2604,135 @@ mod tests {
                 self.misses
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            r
+            // Every miss is the network's final answer (more than
+            // `STARVED_MAX_NOT_FOUND` peers say "not found").
+            r.map_err(|e| -> Box<dyn Error + Send + Sync> {
+                Box::new(
+                    crate::fetcher::FetchExhausted::new(e.to_string(), false, true)
+                        .with_not_found_answers(3),
+                )
+            })
         }
+    }
+
+    /// A redundant upload's site whose manifest root exists only as
+    /// dispersed replicas (#154); every other chunk is present. The
+    /// direct root fetch always misses uncorroborated (a cold node), and
+    /// the replica probes are starved until `open` is set. Recovered
+    /// chunks are kept, like the request cache.
+    struct ReplicaOnlyRootFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        replicas: HashSet<[u8; 32]>,
+        recovered: std::sync::Mutex<HashMap<[u8; 32], Vec<u8>>>,
+        open: std::sync::atomic::AtomicBool,
+        replica_probes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for ReplicaOnlyRootFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if let Some(w) = self.recovered.lock().unwrap().get(&addr) {
+                return Ok(w.clone());
+            }
+            let replica = self.replicas.contains(&addr);
+            if replica {
+                self.replica_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Box::new(crate::fetcher::FetchExhausted::new(
+                        "no BZZ peers available",
+                        true,
+                        false,
+                    )));
+                }
+            }
+            self.chunks.get(&addr).cloned().ok_or_else(|| {
+                Box::new(crate::fetcher::FetchExhausted::new(
+                    format!("no peer found for {}", hex::encode(addr)),
+                    false,
+                    true,
+                )) as Box<dyn Error + Send + Sync>
+            })
+        }
+
+        async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+            self.recovered.lock().unwrap().insert(addr, wire.to_vec());
+        }
+    }
+
+    fn replica_only_site() -> (ReplicaOnlyRootFetcher, [u8; 32]) {
+        use crate::manifest_writer::{build_collection_manifest, IndexAnchor, ManifestFile};
+        let body = b"<html>hi</html>";
+        let page = crate::splitter::split_bytes(body);
+        let manifest = build_collection_manifest(
+            &[ManifestFile {
+                path: "index.html".into(),
+                content_type: Some("text/html".into()),
+                data_ref: page.root.to_vec(),
+            }],
+            Some("index.html"),
+            IndexAnchor::ZeroEntry,
+        )
+        .unwrap();
+        let mut chunks = HashMap::new();
+        let mut root_wire = None;
+        for c in &manifest.chunks {
+            if c.address == manifest.root {
+                root_wire = Some(c.wire.clone());
+            } else {
+                chunks.insert(c.address, c.wire.clone());
+            }
+        }
+        let mut replicas = HashSet::new();
+        for r in crate::rs_encode::replica_chunks(&manifest.root, &root_wire.unwrap(), 2) {
+            replicas.insert(r.address);
+            chunks.insert(r.address, r.wire);
+        }
+        let fetcher = ReplicaOnlyRootFetcher {
+            chunks,
+            replicas,
+            recovered: std::sync::Mutex::default(),
+            open: std::sync::atomic::AtomicBool::new(false),
+            replica_probes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        (fetcher, manifest.root)
+    }
+
+    /// R2-F1 (#155): a sweep that failed only transiently (starved replica
+    /// probes) is not memoized for the rest of the request. The same
+    /// attempt doesn't sweep the node again, but the next attempt does,
+    /// and recovers a manifest root that exists only as replicas.
+    #[tokio::test]
+    async fn retried_lookup_resweeps_after_a_transient_sweep_failure() {
+        let (fetcher, root) = replica_only_site();
+        let credit = CreditWindow::new(std::time::Duration::ZERO);
+        let sweeps = ReplicaSweeps::new();
+        let probes = || {
+            fetcher
+                .replica_probes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let first = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ManifestError::Fetch(_)), "{first:?}");
+        let swept = probes();
+        assert!(swept > 0, "attempt 1 sweeps the root's replicas");
+
+        // Same attempt: no second sweep of the same node.
+        let _ = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps).await;
+        assert_eq!(probes(), swept, "one sweep per node per attempt");
+
+        // The pool refills; the retried attempt sweeps again and recovers.
+        fetcher
+            .open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        sweeps.next_attempt();
+        let found = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps)
+            .await
+            .expect("attempt 2 recovers the replica-only root");
+        assert_eq!(found.content_type.as_deref(), Some("text/html"));
     }
 
     /// Website manifest whose root is the only reachable node: every
@@ -2646,8 +2797,9 @@ mod tests {
     }
 
     /// R1-M1 (#155): retrying a lookup with the same [`ReplicaSweeps`]
-    /// (as `run_stream_bzz` does across its attempts) sweeps an
-    /// unreachable node once; the retry only repeats the direct fetch.
+    /// (as `run_stream_bzz` does across its attempts) sweeps a node whose
+    /// replicas are confirmed missing once; the retry only repeats the
+    /// direct fetch.
     #[tokio::test]
     async fn retried_lookup_sweeps_a_dead_node_once() {
         let (fetcher, root) = site_with_dead_children(&["index.html", "docs/index.html"]);
@@ -2661,6 +2813,7 @@ mod tests {
         let after_first = fetcher.misses();
         assert!(after_first > 1, "the first attempt sweeps the dead node");
 
+        sweeps.next_attempt();
         let second = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps)
             .await
             .unwrap_err();
@@ -2683,9 +2836,20 @@ mod tests {
         let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let unlimited = ReplicaSweeps::new();
         assert!(unlimited.begin(&a));
-        unlimited.failed(a);
-        assert!(!unlimited.begin(&a), "a failed node isn't swept again");
+        unlimited.failed(a, crate::rs::SweepMiss::Final);
+        assert!(
+            !unlimited.begin(&a),
+            "a finally failed node isn't swept again"
+        );
         assert!(unlimited.begin(&b));
+        unlimited.failed(b, crate::rs::SweepMiss::Transient);
+        assert!(!unlimited.begin(&b), "not again in the same attempt");
+        unlimited.next_attempt();
+        assert!(
+            unlimited.begin(&b),
+            "a transient failure is swept next attempt"
+        );
+        assert!(!unlimited.begin(&a), "a final failure stays memoized");
 
         let capped = ReplicaSweeps::capped(2);
         assert!(capped.begin(&a));
