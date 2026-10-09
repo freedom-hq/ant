@@ -16,14 +16,13 @@
 //!
 //! - **Dedicated read threads** — `get` is a prepared `SELECT` on a read-only
 //!   WAL connection; jobs are routed round-robin over crossbeam channels (no
-//!   `spawn_blocking` on the hot path). Pool size scales with
-//!   [`std::thread::available_parallelism`] (8–32 workers) on desktop and
-//!   is 2 on mobile (see [`DiskCacheTuning`]).
+//!   `spawn_blocking` on the hot path). Pool size comes from
+//!   [`DiskCacheTuning`] (2 by default on every platform), not the core count.
 //! - **Dedicated writer thread** — all mutating work (batched `put`s,
 //!   `last_access` touches past the freshness window, eviction) runs on
 //!   one thread with **batched transactions** so bursts amortise fsync.
-//! - **Pragmas** — `mmap_size` / `cache_size` on every connection, large
-//!   on desktop and small on mobile ([`DiskCacheTuning`]).
+//! - **Pragmas** — `mmap_size` / `cache_size` on every connection, kept
+//!   small so memory doesn't grow with the file ([`DiskCacheTuning`]).
 //!
 //! Async rule: `get` / `row_count` ship work to dedicated **read threads**
 //! (each with a prepared `SELECT`) over a bounded channel — no
@@ -65,12 +64,14 @@ const WRITE_BATCH_MAX: usize = 256;
 ///
 /// Both budgets are per connection, so they multiply by
 /// `read_workers + 1`. `SQLite` maps up to `mmap_bytes` of the file
-/// separately on each connection. Desktop has address space to spare,
-/// but iOS caps an app's address space without the
-/// extended-virtual-addressing entitlement: nine 512 MiB mappings of a
-/// cache file larger than that reserved about 4.5 GiB and crashed the
-/// app once anything else needed some. The page cache is heap, which
-/// iOS and Android count against the app's memory limit.
+/// separately on each connection: iOS caps an app's address space
+/// without the extended-virtual-addressing entitlement, and nine
+/// 512 MiB mappings of a cache file larger than that reserved about
+/// 4.5 GiB and crashed the app once anything else needed some. The
+/// page cache is heap: iOS and Android count it against the app's
+/// memory limit, and on desktop a per-core reader pool with 256 MiB
+/// each let antd's memory grow by several GiB once the file passed the
+/// mapped 512 MiB (issue #152).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskCacheTuning {
     /// Dedicated read threads, each with its own read-only connection
@@ -84,56 +85,35 @@ pub struct DiskCacheTuning {
 }
 
 impl DiskCacheTuning {
-    /// iOS and Android (and Apple's other mobile OSes): two read
-    /// threads, nothing mapped and 8 MiB of page cache per connection,
-    /// so the three connections reserve no address space for the file
-    /// and their page caches total at most 24 MiB of heap. On top of
-    /// that each connection maps the small WAL index (`-shm`, 32 KiB
-    /// per 4,000 or so WAL frames), and a one-off legacy `VACUUM`
-    /// builds its temp copy in memory (at most 64 MiB, only for a
-    /// small pre-incremental-vacuum cache file).
-    pub const MOBILE: Self = Self {
+    /// The tuning on every platform: two read threads, nothing mapped
+    /// and 8 MiB of page cache per connection, so the three
+    /// connections reserve no address space for the file and their
+    /// page caches total at most 24 MiB of heap, however big the cache
+    /// file grows. On top of that each connection maps the small WAL
+    /// index (`-shm`, 32 KiB per 4,000 or so WAL frames), and a one-off
+    /// legacy `VACUUM` builds its temp copy in memory (at most 64 MiB,
+    /// only for a small pre-incremental-vacuum cache file).
+    ///
+    /// Measured on a 1.17 GiB cache file with random reads on a
+    /// 14-core Mac (issue #152), this beat the old desktop profile (a
+    /// reader per core, 512 MiB mapped and 256 MiB of page cache per
+    /// connection) on memory and speed alike: +41 MiB footprint
+    /// instead of +922 MiB and growing, 173k instead of 98k reads/s and
+    /// a p99 of 0.9 ms instead of 8.8 ms at 64 concurrent reads. Four
+    /// readers were no faster than two, and a 2 MiB page cache cut
+    /// throughput by a quarter to a third.
+    pub const DEFAULT: Self = Self {
         read_workers: 2,
         mmap_bytes: 0,
         page_cache_bytes: 8 * 1024 * 1024,
     };
-
-    /// Desktop and servers: a read thread per core (8 to 32), and up
-    /// to 512 MiB mapped plus 256 MiB of page cache per connection.
-    #[must_use]
-    pub fn desktop() -> Self {
-        Self {
-            read_workers: std::thread::available_parallelism()
-                .map_or(8, std::num::NonZero::get)
-                .clamp(8, 32),
-            mmap_bytes: 512 * 1024 * 1024,
-            page_cache_bytes: 256 * 1024 * 1024,
-        }
-    }
-
-    /// The tuning for the platform this is built for:
-    /// [`Self::MOBILE`] on iOS, Android, tvOS, watchOS and visionOS,
-    /// [`Self::desktop`] elsewhere.
-    #[must_use]
-    pub fn for_target() -> Self {
-        if MOBILE_TARGET {
-            Self::MOBILE
-        } else {
-            Self::desktop()
-        }
-    }
 }
 
-/// Whether this build targets a mobile OS, where the app's address
-/// space and memory are capped (see [`DiskCacheTuning`]). Every Apple
-/// OS but macOS has the iOS address-space limit.
-const MOBILE_TARGET: bool = cfg!(any(
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos",
-    target_os = "visionos",
-    target_os = "android",
-));
+impl Default for DiskCacheTuning {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// Default size cap for the persistent chunk cache. 10 GB matches
 /// `PLAN.md` § 6.1's desktop / Raspberry Pi default. Operators on
@@ -319,9 +299,9 @@ struct Inner {
     /// Pinned rows / bytes (see [`PinTotals`]). Same backfill caveat as
     /// `total_rows`.
     pinned: Arc<PinTotals>,
-    /// Read-worker pool size, captured once at open time so the status
-    /// snapshot can surface it without re-querying
-    /// `available_parallelism`.
+    /// Read-worker pool size (`DiskCacheTuning::read_workers`, floored
+    /// at 1), captured once at open time so the status snapshot can
+    /// surface the size actually spawned.
     read_workers: usize,
 }
 
@@ -346,10 +326,9 @@ impl Drop for Inner {
 
 impl DiskChunkCache {
     /// Open (or create) a chunk cache database at `path` with a
-    /// `max_bytes` byte cap, tuned for the platform this is built for
-    /// ([`DiskCacheTuning::for_target`]).
+    /// `max_bytes` byte cap and [`DiskCacheTuning::DEFAULT`].
     pub fn open(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, DiskCacheError> {
-        Self::open_with_tuning(path, max_bytes, DiskCacheTuning::for_target())
+        Self::open_with_tuning(path, max_bytes, DiskCacheTuning::DEFAULT)
     }
 
     /// [`Self::open`] with explicit [`DiskCacheTuning`].
@@ -1855,41 +1834,38 @@ mod tests {
             conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
                 .unwrap()
         };
-        apply_shared_pragmas(&conn, DiskCacheTuning::MOBILE, false).unwrap();
+        apply_shared_pragmas(&conn, DiskCacheTuning::DEFAULT, false).unwrap();
         assert_eq!(pragma("mmap_size"), 0);
         assert_eq!(pragma("cache_size"), -8 * 1024, "8 MiB, in KiB");
-        let desktop = DiskCacheTuning::desktop();
-        apply_shared_pragmas(&conn, desktop, false).unwrap();
-        assert_eq!(pragma("mmap_size"), 512 * 1024 * 1024);
-        assert_eq!(pragma("cache_size"), -256 * 1024);
-        assert!((8..=32).contains(&desktop.read_workers));
+        let mapped = DiskCacheTuning {
+            mmap_bytes: 64 * 1024 * 1024,
+            page_cache_bytes: 2 * 1024 * 1024,
+            ..DiskCacheTuning::DEFAULT
+        };
+        apply_shared_pragmas(&conn, mapped, false).unwrap();
+        assert_eq!(pragma("mmap_size"), 64 * 1024 * 1024);
+        assert_eq!(pragma("cache_size"), -2 * 1024);
     }
 
     #[test]
-    fn mobile_tuning_reserves_no_address_space_for_the_file() {
-        // The iOS crash: every connection maps the file on its own, so
-        // the reservation is per connection times the connections.
-        let m = DiskCacheTuning::MOBILE;
-        let connections = m.read_workers as u64 + 1;
-        assert_eq!(connections * m.mmap_bytes, 0);
-        assert!(connections * m.page_cache_bytes <= 32 * 1024 * 1024);
-        if MOBILE_TARGET {
-            assert_eq!(DiskCacheTuning::for_target(), m);
-        } else {
-            assert_eq!(DiskCacheTuning::for_target(), DiskCacheTuning::desktop());
-        }
+    fn default_tuning_memory_does_not_grow_with_the_file_or_cores() {
+        // Both budgets are per connection, times the connections. The
+        // mapping crashed iOS (address space); a 256 MiB page cache per
+        // per-core reader grew antd by GiBs on desktop (#152). Neither
+        // may depend on the core count or the cache file's size.
+        let t = DiskCacheTuning::DEFAULT;
+        assert_eq!(DiskCacheTuning::default(), t);
+        assert!((2..=4).contains(&t.read_workers), "{t:?}");
+        let connections = t.read_workers as u64 + 1;
+        assert_eq!(connections * t.mmap_bytes, 0);
+        assert!(connections * t.page_cache_bytes <= 32 * 1024 * 1024);
     }
 
     #[tokio::test]
-    async fn mobile_tuned_cache_round_trips() {
+    async fn default_open_uses_default_tuning() {
         let dir = tempdir().unwrap();
-        let cache = DiskChunkCache::open_with_tuning(
-            dir.path().join("m.sqlite"),
-            1 << 20,
-            DiskCacheTuning::MOBILE,
-        )
-        .unwrap();
-        assert_eq!(cache.read_workers(), 2);
+        let cache = DiskChunkCache::open(dir.path().join("m.sqlite"), 1 << 20).unwrap();
+        assert_eq!(cache.read_workers(), DiskCacheTuning::DEFAULT.read_workers);
         let chunks: Vec<_> = (0u8..8).map(|i| make_chunk(&[i; 64])).collect();
         cache
             .put_batch(chunks.iter().map(|(a, w)| (*a, w.clone())).collect())

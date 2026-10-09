@@ -1,5 +1,5 @@
 //! Compares [`DiskCacheTuning`] profiles on one cache file larger than
-//! the desktop profile's 512 MiB mapping: random `get` throughput and
+//! the old desktop profile's 512 MiB mapping: random `get` throughput and
 //! latency at several concurrency levels, plus how much address space
 //! (`vsz`) and resident memory (`rss`) the open cache adds to the
 //! process. On macOS it also reports the footprint: dirty memory, the
@@ -46,27 +46,37 @@ async fn main() {
     println!("{} chunks, file {file_mib} MiB", addrs.len());
 
     let profiles = [
-        ("desktop", DiskCacheTuning::desktop()),
-        ("mobile", DiskCacheTuning::MOBILE),
+        // The desktop tuning before #152, kept as the reference point.
         (
-            "mobile, 4 readers",
+            "old desktop",
+            DiskCacheTuning {
+                read_workers: std::thread::available_parallelism()
+                    .map_or(8, std::num::NonZero::get)
+                    .clamp(8, 32),
+                mmap_bytes: 512 * MIB,
+                page_cache_bytes: 256 * MIB,
+            },
+        ),
+        ("default", DiskCacheTuning::DEFAULT),
+        (
+            "default, 4 readers",
             DiskCacheTuning {
                 read_workers: 4,
-                ..DiskCacheTuning::MOBILE
+                ..DiskCacheTuning::DEFAULT
             },
         ),
         (
-            "mobile, 64 MiB mmap",
+            "default, 64 MiB mmap",
             DiskCacheTuning {
                 mmap_bytes: 64 * MIB,
-                ..DiskCacheTuning::MOBILE
+                ..DiskCacheTuning::DEFAULT
             },
         ),
         (
-            "mobile, 2 MiB page cache",
+            "default, 2 MiB page cache",
             DiskCacheTuning {
                 page_cache_bytes: 2 * MIB,
-                ..DiskCacheTuning::MOBILE
+                ..DiskCacheTuning::DEFAULT
             },
         ),
     ];
