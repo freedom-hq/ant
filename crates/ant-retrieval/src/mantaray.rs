@@ -83,6 +83,89 @@ const NODE_TYPE_WITH_METADATA: u8 = 16;
 const MANIFEST_LIST_MAX_DEPTH: usize = 6;
 const MANIFEST_LIST_MAX_ENTRIES: usize = 512;
 
+/// Dispersed-replica sweeps one manifest listing may run, counting its
+/// root (always the first node loaded, so it always gets one). A sweep
+/// only happens after a node's direct fetch failed, and each costs up to
+/// ~30 replica probes (~13-21 s on mainnet for a node that isn't there).
+/// Without a cap a listing with dozens of unreachable children would run
+/// one sweep per child, sequentially, and outlast the gateway's request
+/// timeout instead of returning the partial listing (unexpanded children
+/// listed by reference) it always has.
+const MANIFEST_LIST_REPLICA_SWEEPS: usize = 4;
+
+/// Per-request memo of the dispersed-replica sweeps a manifest node load
+/// runs after its direct fetch fails (#154).
+///
+/// * A node whose sweep already failed is not swept again: one `/bzz`
+///   lookup can load the same node more than once (the literal walk, the
+///   directory-redirect check, the index- and error-document retries),
+///   and a request that retries its lookup loads it again per attempt.
+///   Sharing one memo across all of those bounds the sweeps to one per
+///   distinct unreachable node per request; later loads of that node
+///   only repeat the direct fetch.
+/// * [`Self::capped`] additionally bounds the total number of sweeps
+///   (used by manifest listings, which load every node of the trie).
+///
+/// The lock is never held across an `.await`.
+#[derive(Debug, Default)]
+pub struct ReplicaSweeps {
+    state: std::sync::Mutex<SweepState>,
+}
+
+#[derive(Debug, Default)]
+struct SweepState {
+    failed: HashSet<[u8; 32]>,
+    /// Sweeps still allowed; `None` is unlimited.
+    left: Option<usize>,
+}
+
+impl ReplicaSweeps {
+    /// Unlimited sweeps, but at most one per distinct node.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// At most `max` sweeps in total, and at most one per distinct node.
+    #[must_use]
+    pub fn capped(max: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SweepState {
+                failed: HashSet::new(),
+                left: Some(max),
+            }),
+        }
+    }
+
+    /// Claim a sweep for `addr`: `false` when `addr`'s sweep already
+    /// failed under this memo or the cap is used up.
+    fn begin(&self, addr: &[u8; 32]) -> bool {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.failed.contains(addr) {
+            return false;
+        }
+        match &mut st.left {
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn failed(&self, addr: [u8; 32]) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.failed.insert(addr);
+    }
+}
+
 const VERSION_02_HASH_HEX: &str =
     "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f7b";
 const VERSION_01_HASH_HEX: &str =
@@ -195,7 +278,7 @@ pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    resolve_feed_root_with_credit(fetcher, root_ref, None).await
+    resolve_feed_root_with_credit(fetcher, root_ref, None, &ReplicaSweeps::new()).await
 }
 
 /// [`resolve_feed_root`] whose root-node load may wait for peer credit
@@ -205,8 +288,9 @@ async fn resolve_feed_root_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    let root_node = load_node_ref_with_credit(fetcher, root_ref, credit).await?;
+    let root_node = load_node_ref_with_credit(fetcher, root_ref, credit, sweeps).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
@@ -255,7 +339,7 @@ pub async fn lookup_path(
     root_ref: &[u8],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_inner(fetcher, root_ref, path, None).await
+    lookup_path_inner(fetcher, root_ref, path, None, &ReplicaSweeps::new()).await
 }
 
 /// [`lookup_path`] whose manifest walk may wait for peer credit, within
@@ -279,13 +363,20 @@ pub async fn lookup_path(
 /// window. Everything else stays non-waiting, as in
 /// [`lookup_path`]: the fallback join of a multi-chunk node, feed
 /// probes, and the decrypting join of an encrypted node.
+///
+/// A node whose direct fetch fails falls back to its dispersed replicas
+/// (#154), at most once per distinct node under `sweeps`: pass the same
+/// [`ReplicaSweeps`] to every attempt of one request so a node that
+/// loads several times (directory-redirect check then index-document
+/// retry, or a retried attempt) is swept once, not once per load.
 pub async fn lookup_path_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     path: &str,
     credit: &CreditWindow,
+    sweeps: &ReplicaSweeps,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_inner(fetcher, root_ref, path, Some(credit)).await
+    lookup_path_inner(fetcher, root_ref, path, Some(credit), sweeps).await
 }
 
 async fn lookup_path_inner(
@@ -293,14 +384,15 @@ async fn lookup_path_inner(
     root_ref: &[u8],
     path: &str,
     credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
     // `load_node_ref_with_credit` below reloads the same node for a
     // non-feed manifest from the request's cache.
     let (effective_root, is_feed) =
-        resolve_feed_root_with_credit(fetcher, root_ref, credit).await?;
-    let root_node = load_node_ref_with_credit(fetcher, &effective_root, credit).await?;
+        resolve_feed_root_with_credit(fetcher, root_ref, credit, sweeps).await?;
+    let root_node = load_node_ref_with_credit(fetcher, &effective_root, credit, sweeps).await?;
     debug!(
         target: "ant_retrieval::mantaray",
         root = %hex::encode(root_ref),
@@ -326,7 +418,7 @@ async fn lookup_path_inner(
     // This matches what `bee/pkg/api/bzz.go` does for `bzz://<ref>/`.
     if path.is_empty() {
         if let Some(idx) = &index_doc {
-            if let Some(mut result) = try_walk(fetcher, &root_node, idx, credit).await? {
+            if let Some(mut result) = try_walk(fetcher, &root_node, idx, credit, sweeps).await? {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -343,7 +435,7 @@ async fn lookup_path_inner(
     }
 
     // Non-empty path: try the literal path first.
-    if let Some(mut result) = try_walk(fetcher, &root_node, path, credit).await? {
+    if let Some(mut result) = try_walk(fetcher, &root_node, path, credit, sweeps).await? {
         result.is_feed = is_feed;
         return Ok(result);
     }
@@ -356,7 +448,7 @@ async fn lookup_path_inner(
     // prefix-walk failure (unfetchable node) falls through like bee's
     // `err == nil && exists` guard.
     let dir_path = format!("{path}/");
-    if let Ok(true) = has_prefix(fetcher, &root_node, dir_path.as_bytes(), credit).await {
+    if let Ok(true) = has_prefix(fetcher, &root_node, dir_path.as_bytes(), credit, sweeps).await {
         return Err(ManifestError::Directory {
             path: path.to_string(),
         });
@@ -370,7 +462,9 @@ async fn lookup_path_inner(
     if let Some(idx) = &index_doc {
         if !path.ends_with(idx.as_str()) {
             let with_index = join_index_document(path, idx);
-            if let Some(mut result) = try_walk(fetcher, &root_node, &with_index, credit).await? {
+            if let Some(mut result) =
+                try_walk(fetcher, &root_node, &with_index, credit, sweeps).await?
+            {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -380,7 +474,7 @@ async fn lookup_path_inner(
     // Final fallback: the error document (Bee's `website-error-document`).
     if let Some(err) = &error_doc {
         if path != err {
-            if let Some(mut result) = try_walk(fetcher, &root_node, err, credit).await? {
+            if let Some(mut result) = try_walk(fetcher, &root_node, err, credit, sweeps).await? {
                 result.is_feed = is_feed;
                 return Ok(result);
             }
@@ -402,6 +496,7 @@ async fn try_walk(
     root_node: &Node,
     effective_path: &str,
     credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
 ) -> Result<Option<LookupResult>, ManifestError> {
     match walk(
         fetcher,
@@ -409,6 +504,7 @@ async fn try_walk(
         effective_path.as_bytes(),
         effective_path,
         credit,
+        sweeps,
     )
     .await
     {
@@ -428,6 +524,7 @@ async fn has_prefix(
     root_node: &Node,
     path: &[u8],
     credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
 ) -> Result<bool, ManifestError> {
     let mut node = root_node.clone();
     let mut remaining = path;
@@ -454,7 +551,7 @@ async fn has_prefix(
         if remaining.is_empty() {
             return Ok(true);
         }
-        node = load_node_ref_with_credit(fetcher, &child_ref, credit).await?;
+        node = load_node_ref_with_credit(fetcher, &child_ref, credit, sweeps).await?;
     }
 }
 
@@ -508,8 +605,12 @@ pub async fn list_manifest_paths(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
-    let (effective_root, _is_feed) = resolve_feed_root(fetcher, root_ref).await?;
-    let root_node = load_node_ref(fetcher, &effective_root).await?;
+    // One sweep budget for the whole listing (root included), so
+    // unreachable children can't each add a full replica sweep.
+    let sweeps = ReplicaSweeps::capped(MANIFEST_LIST_REPLICA_SWEEPS);
+    let (effective_root, _is_feed) =
+        resolve_feed_root_with_credit(fetcher, root_ref, None, &sweeps).await?;
+    let root_node = load_node_ref_with_credit(fetcher, &effective_root, None, &sweeps).await?;
     let mut entries = Vec::new();
     let mut visited = HashSet::from([effective_root]);
     collect_entries(
@@ -519,6 +620,7 @@ pub async fn list_manifest_paths(
         &mut entries,
         &mut visited,
         0,
+        &sweeps,
     )
     .await?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -577,6 +679,7 @@ fn walk<'a>(
     remaining: &'a [u8],
     full_path: &'a str,
     credit: Option<&'a CreditWindow>,
+    sweeps: &'a ReplicaSweeps,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<LookupResult, ManifestError>> + Send + 'a>,
 > {
@@ -636,7 +739,8 @@ fn walk<'a>(
             child_ref = %hex::encode(&fork.child_ref),
             "descending into fork",
         );
-        let mut child_node = load_node_ref_with_credit(fetcher, &fork.child_ref, credit).await?;
+        let mut child_node =
+            load_node_ref_with_credit(fetcher, &fork.child_ref, credit, sweeps).await?;
         // Merge fork-level metadata onto the child. In bee's wire format
         // (mantaray 0.2) per-file Content-Type / Filename are stored on
         // the parent fork, not on the child node's own bytes — yet bee's
@@ -645,7 +749,15 @@ fn walk<'a>(
         for (k, v) in fork.metadata {
             child_node.metadata.entry(k).or_insert(v);
         }
-        walk(fetcher, child_node, next_remaining, full_path, credit).await
+        walk(
+            fetcher,
+            child_node,
+            next_remaining,
+            full_path,
+            credit,
+            sweeps,
+        )
+        .await
     })
 }
 
@@ -660,6 +772,7 @@ fn collect_entries<'a>(
     entries: &'a mut Vec<ManifestEntry>,
     visited: &'a mut HashSet<Vec<u8>>,
     depth: usize,
+    sweeps: &'a ReplicaSweeps,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ManifestError>> + Send + 'a>> {
     Box::pin(async move {
         if entries.len() >= MANIFEST_LIST_MAX_ENTRIES {
@@ -736,7 +849,7 @@ fn collect_entries<'a>(
                 continue;
             }
 
-            match load_node_ref(fetcher, &fork.child_ref).await {
+            match load_node_ref_with_credit(fetcher, &fork.child_ref, None, sweeps).await {
                 Ok(mut child_node) => {
                     for (k, v) in fork.metadata {
                         child_node.metadata.entry(k).or_insert(v);
@@ -749,8 +862,16 @@ fn collect_entries<'a>(
                     // manifest_writer.rs), never "append one": deriving a
                     // `/` from it can split a name mid-byte when a fork
                     // boundary falls inside a segment (issue #13).
-                    collect_entries(fetcher, child_node, fork_path, entries, visited, depth + 1)
-                        .await?;
+                    collect_entries(
+                        fetcher,
+                        child_node,
+                        fork_path,
+                        entries,
+                        visited,
+                        depth + 1,
+                        sweeps,
+                    )
+                    .await?;
                 }
                 Err(_) => {
                     entries.push(ManifestEntry {
@@ -777,7 +898,7 @@ pub(crate) async fn load_node_ref(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
 ) -> Result<Node, ManifestError> {
-    load_node_ref_with_credit(fetcher, node_ref, None).await
+    load_node_ref_with_credit(fetcher, node_ref, None, &ReplicaSweeps::new()).await
 }
 
 /// [`load_node_ref`] whose root-chunk fetch (issue #130) and header
@@ -786,11 +907,12 @@ pub(crate) async fn load_node_ref(
 /// join of a multi-chunk node and the decrypting join of an encrypted
 /// node never wait. A plain node's root chunk falls back to its
 /// dispersed replicas when the direct fetch fails (#154), with or
-/// without a window.
+/// without a window, if `sweeps` allows it (see [`ReplicaSweeps`]).
 async fn load_node_ref_with_credit(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
     credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
 ) -> Result<Node, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
@@ -818,7 +940,9 @@ async fn load_node_ref_with_credit(
     // total failure the direct fetch's error comes back unchanged, so
     // retry / not-found classification is as before. Only the direct
     // fetch waits for credit (and only with a window); the replica
-    // probes never do (`rs::recover_from_replicas`).
+    // probes never do (`rs::recover_from_replicas`). `sweeps` skips the
+    // sweep for a node whose sweep already failed in this request, and
+    // caps a listing's total.
     let budget = credit.map_or(std::time::Duration::ZERO, CreditWindow::budget);
     let root_chunk = if budget.is_zero() {
         fetcher.fetch(addr).await
@@ -827,9 +951,15 @@ async fn load_node_ref_with_credit(
     };
     let root_chunk = match root_chunk {
         Ok(wire) => Ok(wire),
-        Err(e) => crate::rs::recover_from_replicas(fetcher, addr)
-            .await
-            .ok_or(e),
+        Err(e) if sweeps.begin(&addr) => {
+            if let Some(wire) = crate::rs::recover_from_replicas(fetcher, addr).await {
+                Ok(wire)
+            } else {
+                sweeps.failed(addr);
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
     };
     let root_chunk = root_chunk.map_err(|e| {
         ManifestError::Fetch(JoinError::FetchChunk {
@@ -2212,10 +2342,15 @@ mod tests {
             // fetched it, waiting, so the walk's waiting root load is a
             // cache hit); everything else needs credit.
             let fetcher = CreditGatedFetcher::new(all.clone(), &[split.root]);
-            let err =
-                lookup_path_with_credit(&fetcher, &split.root, "", &CreditWindow::new(window))
-                    .await
-                    .unwrap_err();
+            let err = lookup_path_with_credit(
+                &fetcher,
+                &split.root,
+                "",
+                &CreditWindow::new(window),
+                &ReplicaSweeps::new(),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(err, ManifestError::NotAManifest),
                 "level {level}: expected NotAManifest, got {err:?}",
@@ -2262,6 +2397,7 @@ mod tests {
             &split.root,
             "",
             &CreditWindow::new(std::time::Duration::from_secs(30)),
+            &ReplicaSweeps::new(),
         )
         .await
         .unwrap_err();
@@ -2305,9 +2441,15 @@ mod tests {
         ] {
             // Nothing is cached: every node load needs credit.
             let fetcher = CreditGatedFetcher::new(site.chunks.clone(), &[]);
-            let found = lookup_path_with_credit(&fetcher, &root, path, &CreditWindow::new(window))
-                .await
-                .unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
+            let found = lookup_path_with_credit(
+                &fetcher,
+                &root,
+                path,
+                &CreditWindow::new(window),
+                &ReplicaSweeps::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
             assert_eq!(found.data_ref, refs[file].to_vec(), "{path:?}");
             let waits = fetcher.waits();
             assert!(waits.len() >= 2, "{path:?}: root and a child: {waits:?}");
@@ -2338,7 +2480,14 @@ mod tests {
             let credit = CreditWindow::new(window);
             tokio::time::advance(window.saturating_sub(left)).await;
             let fetcher = CreditGatedFetcher::new(site.chunks.clone(), &[]);
-            let r = lookup_path_with_credit(&fetcher, &root, "developer/index.html", &credit).await;
+            let r = lookup_path_with_credit(
+                &fetcher,
+                &root,
+                "developer/index.html",
+                &credit,
+                &ReplicaSweeps::new(),
+            )
+            .await;
             let waits = fetcher.waits();
             // A spent window falls back to plain `fetch`.
             assert_eq!(waits.is_empty(), expected.is_zero(), "{left:?} left");
@@ -2408,5 +2557,139 @@ mod tests {
             matches!(err, ManifestError::Fetch(JoinError::FetchChunk { .. })),
             "expected the full join to run, got {err:?}",
         );
+    }
+
+    /// [`MapFetcher`] that counts fetches of addresses it doesn't hold
+    /// (in these tests: dispersed-replica probes and dead node loads).
+    struct MissCountingFetcher {
+        inner: MapFetcher,
+        misses: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MissCountingFetcher {
+        fn misses(&self) -> usize {
+            self.misses.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for MissCountingFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            let r = self.inner.fetch(addr).await;
+            if r.is_err() {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            r
+        }
+    }
+
+    /// Website manifest whose root is the only reachable node: every
+    /// child node chunk is dropped. Returns the fetcher and the root.
+    fn site_with_dead_children(paths: &[&str]) -> (MissCountingFetcher, [u8; 32]) {
+        use crate::manifest_writer::{build_collection_manifest, IndexAnchor, ManifestFile};
+        let files: Vec<ManifestFile> = paths
+            .iter()
+            .map(|p| ManifestFile {
+                path: (*p).to_string(),
+                content_type: Some("text/html".to_string()),
+                data_ref: crate::splitter::split_bytes(p.as_bytes()).root.to_vec(),
+            })
+            .collect();
+        let manifest =
+            build_collection_manifest(&files, Some("index.html"), IndexAnchor::ZeroEntry).unwrap();
+        let mut inner = MapFetcher::new();
+        for c in &manifest.chunks {
+            if c.address == manifest.root {
+                inner.insert(c.address, c.wire.clone());
+            }
+        }
+        let fetcher = MissCountingFetcher {
+            inner,
+            misses: std::sync::atomic::AtomicUsize::new(0),
+        };
+        (fetcher, manifest.root)
+    }
+
+    /// R1-F1 (#155): a listing whose root loads but whose children are
+    /// all unreachable sweeps replicas for at most
+    /// `MANIFEST_LIST_REPLICA_SWEEPS` of them, not one full sweep per
+    /// child, and still returns the partial listing.
+    #[tokio::test]
+    async fn listing_caps_replica_sweeps_for_unreachable_children() {
+        let names: Vec<String> = ('a'..='p').map(|c| format!("{c}.html")).collect();
+        let paths: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (fetcher, root) = site_with_dead_children(&paths);
+
+        let entries = list_manifest_paths(&fetcher, &root).await.unwrap();
+        for p in &paths {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.path == *p && e.reference.is_some()),
+                "{p} listed unexpanded, by reference",
+            );
+        }
+        // One direct miss per dead child, plus the capped sweeps.
+        let children = paths.len();
+        // A sweep probes at most 2 + 4 + 8 + 16 replica addresses.
+        let max_sweep: usize = crate::rs::REPLICA_COUNTS.iter().sum();
+        assert!(
+            fetcher.misses() <= children + MANIFEST_LIST_REPLICA_SWEEPS * max_sweep,
+            "{} misses for {children} dead children: replica sweeps not capped",
+            fetcher.misses(),
+        );
+        assert!(
+            fetcher.misses() > children,
+            "the listing still sweeps (up to the cap) for a replica-only child",
+        );
+    }
+
+    /// R1-M1 (#155): retrying a lookup with the same [`ReplicaSweeps`]
+    /// (as `run_stream_bzz` does across its attempts) sweeps an
+    /// unreachable node once; the retry only repeats the direct fetch.
+    #[tokio::test]
+    async fn retried_lookup_sweeps_a_dead_node_once() {
+        let (fetcher, root) = site_with_dead_children(&["index.html", "docs/index.html"]);
+        let credit = CreditWindow::new(std::time::Duration::ZERO);
+        let sweeps = ReplicaSweeps::new();
+
+        let first = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ManifestError::Fetch(_)), "{first:?}");
+        let after_first = fetcher.misses();
+        assert!(after_first > 1, "the first attempt sweeps the dead node");
+
+        let second = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps)
+            .await
+            .unwrap_err();
+        assert!(matches!(second, ManifestError::Fetch(_)), "{second:?}");
+        assert_eq!(
+            fetcher.misses() - after_first,
+            1,
+            "the retry repeats only the direct fetch",
+        );
+
+        // A fresh memo (a new request) sweeps again.
+        let before = fetcher.misses();
+        let _ =
+            lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &ReplicaSweeps::new()).await;
+        assert_eq!(fetcher.misses() - before, after_first);
+    }
+
+    #[test]
+    fn replica_sweeps_dedupe_and_cap() {
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let unlimited = ReplicaSweeps::new();
+        assert!(unlimited.begin(&a));
+        unlimited.failed(a);
+        assert!(!unlimited.begin(&a), "a failed node isn't swept again");
+        assert!(unlimited.begin(&b));
+
+        let capped = ReplicaSweeps::capped(2);
+        assert!(capped.begin(&a));
+        assert!(capped.begin(&b));
+        assert!(!capped.begin(&c), "cap used up");
     }
 }

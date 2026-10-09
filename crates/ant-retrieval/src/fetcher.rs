@@ -3689,7 +3689,14 @@ mod tests {
                 let credit = crate::accounting::CreditWindow::new(window);
                 tokio::time::advance(window.saturating_sub(left)).await;
                 let started = tokio::time::Instant::now();
-                let r = crate::lookup_path_with_credit(&fetcher, &root, "", &credit).await;
+                let r = crate::lookup_path_with_credit(
+                    &fetcher,
+                    &root,
+                    "",
+                    &credit,
+                    &crate::ReplicaSweeps::new(),
+                )
+                .await;
                 drop(held);
                 assert!(r.is_err(), "pool never refills");
                 started.elapsed()
@@ -3770,7 +3777,14 @@ mod tests {
                     let credit = crate::accounting::CreditWindow::new(window);
                     tokio::time::advance(window.saturating_sub(left)).await;
                     let started = tokio::time::Instant::now();
-                    let r = crate::lookup_path_with_credit(&fetcher, &root, path, &credit).await;
+                    let r = crate::lookup_path_with_credit(
+                        &fetcher,
+                        &root,
+                        path,
+                        &credit,
+                        &crate::ReplicaSweeps::new(),
+                    )
+                    .await;
                     drop(held);
                     let err = r.expect_err("pool never refills");
                     assert!(
@@ -3813,10 +3827,16 @@ mod tests {
         let fetcher = fetcher.with_cache(cache);
         let h = tokio::spawn(async move {
             let credit = crate::accounting::CreditWindow::new(Duration::from_secs(30));
-            crate::lookup_path_with_credit(&fetcher, &root, "", &credit)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            crate::lookup_path_with_credit(
+                &fetcher,
+                &root,
+                "",
+                &credit,
+                &crate::ReplicaSweeps::new(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         });
 
         tokio::time::sleep(Duration::from_millis(300)).await;

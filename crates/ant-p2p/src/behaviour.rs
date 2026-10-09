@@ -5435,6 +5435,12 @@ async fn run_stream_bzz(
     // from the same window. Feed probes, and the fallback join of a
     // multi-chunk node, never wait.
     let credit_window = ant_retrieval::accounting::CreditWindow::new(RESOLUTION_RETRY_BUDGET);
+    // One replica-sweep memo across all attempts: a manifest node whose
+    // direct fetch fails is swept for dispersed replicas (#154) at most
+    // once per request, however many times the attempts (and, within
+    // one attempt, the directory-redirect check and index-document
+    // retry) load it. Later loads only repeat the direct fetch.
+    let replica_sweeps = ant_retrieval::ReplicaSweeps::new();
     let bare_root = is_bare_root_path(&path);
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
@@ -5481,13 +5487,31 @@ async fn run_stream_bzz(
             )
             .await
             {
-                Ok(_) => lookup_path_with_credit(&fetcher, &reference, &path, &credit_window).await,
+                Ok(_) => {
+                    lookup_path_with_credit(
+                        &fetcher,
+                        &reference,
+                        &path,
+                        &credit_window,
+                        &replica_sweeps,
+                    )
+                    .await
+                }
                 Err(source) => Err(ManifestError::Fetch(ant_retrieval::JoinError::FetchChunk {
                     addr: hex::encode(root),
                     source,
                 })),
             },
-            _ => lookup_path_with_credit(&fetcher, &reference, &path, &credit_window).await,
+            _ => {
+                lookup_path_with_credit(
+                    &fetcher,
+                    &reference,
+                    &path,
+                    &credit_window,
+                    &replica_sweeps,
+                )
+                .await
+            }
         };
         let lookup = match looked_up {
             Ok(r) => r,
