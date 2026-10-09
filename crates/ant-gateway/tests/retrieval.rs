@@ -684,6 +684,130 @@ async fn chunks_404_on_missing_reference() {
     assert_eq!(json["code"], 404);
 }
 
+/// A small website whose manifest root chunk is on the "network" only as
+/// its dispersed replicas (`replicas` = the redundancy level they were
+/// uploaded at, 0 = none): the shape of the site in #154, whose root
+/// every peer answers "not found" for while its replicas are retrievable.
+/// Returns the manifest root and the fetcher holding everything else.
+fn site_reachable_only_through_root_replicas(replicas: u8) -> ([u8; 32], Arc<common::DirFetcher>) {
+    use ant_retrieval::{build_collection_manifest, split_bytes, IndexAnchor, ManifestFile};
+    let mut chunks = std::collections::HashMap::new();
+    let mut files = Vec::new();
+    for (path, body) in [
+        ("index.html", &b"<h1>home</h1>"[..]),
+        ("about.html", &b"<h1>about</h1>"[..]),
+    ] {
+        let split = split_bytes(body);
+        chunks.extend(split.chunks.into_iter().map(|c| (c.address, c.wire)));
+        files.push(ManifestFile {
+            path: path.to_string(),
+            content_type: Some("text/html".to_string()),
+            data_ref: split.root.to_vec(),
+        });
+    }
+    let manifest =
+        build_collection_manifest(&files, Some("index.html"), IndexAnchor::EmptyNode).unwrap();
+    let root = manifest.root;
+    for c in manifest.chunks {
+        if c.address == root {
+            for r in ant_retrieval::replica_chunks(&root, &c.wire, replicas) {
+                chunks.insert(r.address, r.wire);
+            }
+        } else {
+            chunks.insert(c.address, c.wire);
+        }
+    }
+    (root, Arc::new(common::DirFetcher::from_chunks(chunks)))
+}
+
+async fn get_bzz(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    (resp.status(), body_bytes(resp).await)
+}
+
+/// #154: on a cold node, a path the manifest doesn't contain answers
+/// bee's `404 "path address not found"` even when the manifest root is
+/// reachable only through its dispersed replicas. The node load falls
+/// back to the replicas like a bare `/bzz/<ref>/` does, so the walk
+/// completes and finds no match, and the recovered root is kept, so the
+/// next lookup doesn't sweep the replicas again. It used to fail the
+/// root fetch and answer the retryable `404 "Not Found"`, every time,
+/// until a bare-root request happened to put the root in the cache.
+#[tokio::test]
+async fn bzz_cold_missing_path_is_path_not_found_when_root_needs_a_replica() {
+    let (root, fetcher) = site_reachable_only_through_root_replicas(2);
+    assert!(
+        ant_retrieval::ChunkFetcher::fetch(fetcher.as_ref(), root)
+            .await
+            .is_err(),
+        "the root itself must not be directly retrievable"
+    );
+    let router = common::handle_with_node(fetcher.clone());
+    let root_hex = hex::encode(root);
+
+    let (status, body) = get_bzz(router.clone(), &format!("/bzz/{root_hex}/nope.html")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"code": 404, "message": "path address not found"}),
+        "a cold miss with every manifest node retrieved is a path miss"
+    );
+    assert!(
+        fetcher.was_recovered(&root),
+        "the replica-recovered root stays cached after a failed lookup"
+    );
+
+    // Warm: the same miss is served from the kept root, no replica sweep.
+    let before = fetcher.fetch_count();
+    let (status, body) = get_bzz(router.clone(), &format!("/bzz/{root_hex}/nope.html")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["message"], "path address not found");
+    let fetched = fetcher.fetch_count() - before;
+    assert!(
+        fetched < ant_retrieval::REPLICA_COUNTS[2],
+        "warm miss swept the replicas again: {fetched} fetches"
+    );
+
+    // A path that exists resolves cold too, through the same fallback.
+    let (_, fresh) = site_reachable_only_through_root_replicas(2);
+    let (status, body) = get_bzz(
+        common::handle_with_node(fresh),
+        &format!("/bzz/{root_hex}/about.html"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>about</h1>");
+}
+
+/// #154, the other side: "Not Found" stays reserved for a manifest node
+/// that couldn't be retrieved. With no replicas to fall back to, the
+/// unreachable root is a retrieval failure, not a path miss.
+#[tokio::test]
+async fn bzz_missing_path_under_an_unretrievable_root_is_not_found() {
+    let (root, fetcher) = site_reachable_only_through_root_replicas(0);
+    let (status, body) = get_bzz(
+        common::handle_with_node(fetcher),
+        &format!("/bzz/{}/nope.html", hex::encode(root)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"code": 404, "message": "Not Found"})
+    );
+}
+
 /// #113: the terminal `StreamBzz` errors `run_stream_bzz` emits for a
 /// raw `/bytes` reference behind `/bzz` are 404s, never a 502 that
 /// Freedom's `bzz://` handler retries for most of a minute. The

@@ -784,7 +784,9 @@ pub(crate) async fn load_node_ref(
 /// sniff (issue #122) wait for peer credit within `credit`, if given:
 /// one fetch at a time, each with [`CreditWindow::budget`]. The fallback
 /// join of a multi-chunk node and the decrypting join of an encrypted
-/// node never wait.
+/// node never wait. A plain node's root chunk falls back to its
+/// dispersed replicas when the direct fetch fails (#154), with or
+/// without a window.
 async fn load_node_ref_with_credit(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
@@ -801,11 +803,33 @@ async fn load_node_ref_with_credit(
     // The node is itself a Swarm file: fetch the root chunk, then join.
     // For tiny manifests (< 4 KiB) the root chunk's payload is already
     // the entire serialised node.
+    //
+    // Like any file root, the node's root chunk falls back to its
+    // dispersed replicas when the direct fetch fails: bee loads every
+    // manifest node through its joiner, whose root getter is
+    // `replicas.NewGetter`, and a redundant upload's manifest root can
+    // be reachable *only* through a replica (#154). Without this a
+    // `/bzz/<ref>/<path>` on a cold node failed to load that root at
+    // all — `404 "Not Found"` instead of `"path address not found"`,
+    // every time, since nothing reached the cache — while a bare
+    // `/bzz/<ref>/` (whose root `run_stream_bzz` fetches with replicas
+    // up front) worked. A recovered chunk is stored via
+    // `put_recovered`, so the next lookup reads it from the cache. On
+    // total failure the direct fetch's error comes back unchanged, so
+    // retry / not-found classification is as before. Only the direct
+    // fetch waits for credit (and only with a window); the replica
+    // probes never do (`rs::recover_from_replicas`).
     let budget = credit.map_or(std::time::Duration::ZERO, CreditWindow::budget);
     let root_chunk = if budget.is_zero() {
         fetcher.fetch(addr).await
     } else {
         fetcher.fetch_waiting_for_credit(addr, budget).await
+    };
+    let root_chunk = match root_chunk {
+        Ok(wire) => Ok(wire),
+        Err(e) => crate::rs::recover_from_replicas(fetcher, addr)
+            .await
+            .ok_or(e),
     };
     let root_chunk = root_chunk.map_err(|e| {
         ManifestError::Fetch(JoinError::FetchChunk {

@@ -907,7 +907,19 @@ pub async fn fetch_root_with_replicas(
         Ok(wire) => return Ok(wire),
         Err(e) => e,
     };
+    recover_from_replicas(fetcher, addr).await.ok_or(direct_err)
+}
 
+/// The replica half of [`fetch_root_with_replicas`], for a caller that
+/// has already tried the direct fetch its own way (a manifest node load,
+/// `mantaray::load_node_ref`): try `addr`'s dispersed replicas and
+/// return the original chunk's wire bytes from the first valid one,
+/// stored via [`ChunkFetcher::put_recovered`]. `None` when no replica
+/// could be fetched. The probes never wait for credit.
+pub(crate) async fn recover_from_replicas(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+) -> Option<Vec<u8>> {
     let mut candidates: Vec<[u8; 32]> = Vec::with_capacity(REPLICA_COUNTS[4]);
     for level in (1..=MAX_LEVEL).rev() {
         for soc_addr in replica_addresses(&addr, level) {
@@ -947,10 +959,10 @@ pub async fn fetch_root_with_replicas(
                 chunk = %hex::encode(addr),
                 "recovered root chunk from a dispersed replica",
             );
-            return Ok(inner);
+            return Some(inner);
         }
     }
-    Err(direct_err)
+    None
 }
 
 #[cfg(test)]
