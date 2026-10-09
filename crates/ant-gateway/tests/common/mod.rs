@@ -754,7 +754,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
             });
         }
-        ControlCommand::GetChunkRaw { reference, ack } => {
+        ControlCommand::GetChunkRaw { reference, ack, .. } => {
             let reply = match fetcher.fetch(reference).await {
                 Ok(data) => ControlAck::Bytes { data },
                 Err(e) => ControlAck::Error {

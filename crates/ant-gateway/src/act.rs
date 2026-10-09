@@ -102,8 +102,12 @@ impl ChunkFetcher for CommandFetcher {
         addr: [u8; 32],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+        // ACT histories, key-value stores and grantee lists are expected
+        // to exist: no fast-miss fan-out, which would mostly buy duplicate,
+        // separately-charged deliveries (issue #146).
         let cmd = ControlCommand::GetChunkRaw {
             reference: addr,
+            fast_miss: false,
             ack: ack_tx,
         };
         self.commands
@@ -112,7 +116,11 @@ impl ChunkFetcher for CommandFetcher {
             .map_err(|_| "node loop unavailable")?;
         match tokio::time::timeout(self.timeout, ack_rx).await {
             Ok(Ok(ControlAck::Bytes { data })) => Ok(data),
-            Ok(Ok(ControlAck::Error { message })) => Err(message.into()),
+            Ok(Ok(
+                ControlAck::Error { message }
+                | ControlAck::NotFound { message }
+                | ControlAck::NotReady { message },
+            )) => Err(message.into()),
             Ok(Ok(other)) => Err(format!("unexpected ack from GetChunkRaw: {other:?}").into()),
             Ok(Err(_)) => Err("node loop dropped the ack".into()),
             Err(_) => Err("chunk fetch timed out".into()),
@@ -923,4 +931,39 @@ async fn update_grantees(
     push_act_chunks(handle, &chunks, batch_id, timeout).await?;
 
     Ok((egranteeref, history_manifest.root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ACT histories, key-value stores and grantee lists are expected to
+    /// exist, so their reads must not ask for the fast-miss fan-out
+    /// (issue #146), which would mostly buy duplicate, separately-charged
+    /// deliveries.
+    #[tokio::test]
+    async fn act_reads_do_not_ask_for_fast_miss() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fetcher = CommandFetcher {
+            commands: tx,
+            timeout: Duration::from_secs(5),
+        };
+        let node = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ControlCommand::GetChunkRaw {
+                    reference,
+                    fast_miss,
+                    ack,
+                }) => {
+                    assert_eq!(reference, [7u8; 32]);
+                    assert!(!fast_miss, "ACT reads must not use fast-miss mode");
+                    let _ = ack.send(ControlAck::Bytes { data: vec![1, 2] });
+                }
+                other => panic!("expected GetChunkRaw, got {other:?}"),
+            }
+        });
+        let data = fetcher.fetch([7u8; 32]).await.expect("served");
+        assert_eq!(data, vec![1, 2]);
+        node.await.expect("dispatcher ran");
+    }
 }

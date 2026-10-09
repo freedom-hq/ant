@@ -2962,7 +2962,11 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
-        ControlCommand::GetChunkRaw { reference, ack } => {
+        ControlCommand::GetChunkRaw {
+            reference,
+            fast_miss,
+            ack,
+        } => {
             // Same cache-then-network fetch path as `GetChunk`, but the ack
             // carries the full wire bytes (`span || payload` for a CAC, or
             // `id || sig || span || payload` for a SOC) so `ant-gateway` can
@@ -2971,13 +2975,23 @@ fn handle_control_command(
             // reads, so it must consult the local upload cache to satisfy
             // read-after-own-write; a cached hit short-circuits before any
             // peer round-trip, hence no early-return on an empty peer set.
+            //
+            // For `/chunks` and `/soc` a miss is an answer, not a failure:
+            // a live-stream player polls the next feed slot through it
+            // until the slot is written, so those callers set `fast_miss`
+            // and the lookup ends once enough peers said "not found"
+            // (issue #146). Either way a confirmed miss is typed as
+            // `ControlAck::NotFound` so the gateway answers 404 whichever
+            // tail (`storage: not found` or `no peer found`) the last
+            // answer had.
             let peers_rx = state.peers_watch.subscribe();
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             tokio::spawn(async move {
-                let mut builder =
-                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_cache(cache)
+                    .with_fast_miss(fast_miss);
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
@@ -2993,9 +3007,7 @@ fn handle_control_command(
                     }
                     Err(e) => {
                         debug!(target: "ant_p2p", "retrieval failed: {e}");
-                        ControlAck::Error {
-                            message: format!("retrieval: {e}"),
-                        }
+                        pre_stream_failure_ack(format!("retrieval: {e}"), e.as_ref())
                     }
                 };
                 let _ = ack.send(reply);
@@ -6062,8 +6074,9 @@ fn is_final_miss(e: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Terminal ack for a `/bytes` or `/bzz` retrieval that failed before
-/// its stream started, typed off the fetcher's error behind `e` rather
-/// than its message (issue #123):
+/// its stream started, or for a single-chunk `GetChunkRaw` read (issue
+/// #146), typed off the fetcher's error behind `e` rather than its
+/// message (issue #123):
 ///
 /// - peers confirmed the chunk missing → [`ControlAck::NotFound`], which
 ///   the gateway answers with bee's 404. That includes a fetch whose
@@ -6071,7 +6084,10 @@ fn is_final_miss(e: &(dyn std::error::Error + 'static)) -> bool {
 ///   502 that Freedom retries for ~50 s;
 /// - the last answer was a miss but the peer pool was starved →
 ///   [`ControlAck::NotReady`] (503): one cold peer's "not found" is not
-///   the network's answer (#114), so it must not read as a 404 either;
+///   the network's answer (#114), so it must not read as a 404 either.
+///   `GetChunkRaw` never reaches this arm: its fetcher has no accounting
+///   attached, so no peer is overdraft-skipped and the pool is never
+///   reported starved;
 /// - anything else → [`ControlAck::Error`], as before.
 fn pre_stream_failure_ack(message: String, e: &(dyn std::error::Error + 'static)) -> ControlAck {
     match ant_retrieval::fetcher::FetchExhausted::find(e) {
@@ -11002,6 +11018,7 @@ mod tests {
             0,
             ControlCommand::GetChunkRaw {
                 reference: addr,
+                fast_miss: true,
                 ack: ack_tx,
             },
         );

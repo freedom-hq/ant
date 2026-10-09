@@ -75,10 +75,26 @@ pub enum ControlCommand {
     /// Used by `ant-gateway` to serve `/chunks/{addr}` in a bee-shaped
     /// way (bee's `chunkstore.Get` returns `Chunk.Data()` which is the
     /// wire form). Routing / peer-pick / CAC verification logic is
-    /// identical to `GetChunk`; the only difference is what the node
-    /// loop puts in `ControlAck::Bytes::data`.
+    /// identical to `GetChunk`, except that with `fast_miss` set the
+    /// lookup runs in fast-miss mode (`RoutingFetcher::with_fast_miss`,
+    /// issue #146): it ends once enough peers have answered "not found"
+    /// instead of asking up to 32 peers one after another. Ends in
+    /// [`ControlAck::Bytes`], [`ControlAck::NotFound`] (peers confirmed
+    /// the chunk missing) or [`ControlAck::Error`]. The node runs this
+    /// lookup without retrieval accounting, so no peer is ever
+    /// overdraft-skipped and the pool is never reported starved
+    /// (`FetchExhausted::pool_starved`): a miss is a `NotFound`, not the
+    /// [`ControlAck::NotReady`] a starved `/bytes`/`/bzz` fetch gets.
+    /// A consumer may still map a `NotReady` (to 503) defensively.
     GetChunkRaw {
         reference: [u8; 32],
+        /// Run the lookup in fast-miss mode. Set it for reads whose miss
+        /// is an expected answer (`/chunks`, `/soc`: a feed slot polled
+        /// until it is written); leave it off for chunks expected to
+        /// exist (ACT histories and grantee lists, a feed's resolved
+        /// root chunk), where the extra in-flight peers would mostly buy
+        /// duplicate, separately-charged deliveries.
+        fast_miss: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Run a bounded pullsync probe against the closest connected peer to
@@ -839,7 +855,7 @@ pub enum ControlAck {
     FeedNotFound,
     /// The node loop accepted the command but isn't ready to serve it
     /// (most commonly: zero connected peers). `StreamBytes` /
-    /// `StreamBzz` also send it, before their stream starts, when a root
+    /// `StreamBzz` also send it, before their stream starts, when a
     /// fetch's last answer was a miss but the peer pool was starved
     /// (`FetchExhausted::pool_starved`): one cold peer's "not found" is
     /// not the network's answer (issue #114), so it is a 503 to retry,
@@ -856,7 +872,9 @@ pub enum ControlAck {
     /// a fetch whose peer pool wasn't starved). Distinct from
     /// [`Self::Error`] so the gateway answers bee's `404` without
     /// substring-matching the message, whichever of the two tails it
-    /// ends in (issue #123). Only sent before a stream starts.
+    /// ends in (issue #123). Only sent before a stream starts, or as the
+    /// whole answer to a single-chunk [`ControlCommand::GetChunkRaw`]
+    /// (issue #146).
     NotFound {
         message: String,
     },

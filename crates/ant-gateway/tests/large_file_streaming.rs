@@ -168,7 +168,7 @@ async fn handle_stream_command(fetcher: Arc<MapFetcher>, cmd: ControlCommand) {
         } => {
             stream_via_fetcher(&fetcher, reference, max_bytes, range, head_only, ack).await;
         }
-        ControlCommand::GetChunkRaw { reference, ack } => {
+        ControlCommand::GetChunkRaw { reference, ack, .. } => {
             let reply = match fetcher.fetch(reference).await {
                 Ok(data) => ControlAck::Bytes { data },
                 Err(e) => ControlAck::Error {

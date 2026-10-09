@@ -334,8 +334,11 @@ pub async fn chunk(
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    // A miss is an answer here (a feed slot not written yet): fast-miss
+    // lookup (issue #146).
     let cmd = ControlCommand::GetChunkRaw {
         reference,
+        fast_miss: true,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -363,6 +366,13 @@ pub async fn chunk(
         ControlAck::Bytes { data } => data,
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
+        // Peers confirmed the chunk missing, typed by the node (issue
+        // #146): bee's 404 even when the last answer was `no peer found`,
+        // which the substring check below would have turned into a 502.
+        ControlAck::NotFound { message } => {
+            debug!(target: "ant_gateway", %message, "chunk not found");
+            return json_error(StatusCode::NOT_FOUND, "chunk not found");
         }
         ControlAck::Error { message } => {
             // Bee: a miss is `404 "chunk not found"`; anything else is
@@ -432,8 +442,11 @@ pub async fn download_soc(
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    // A miss is an answer here (a feed slot not written yet): fast-miss
+    // lookup (issue #146).
     let cmd = ControlCommand::GetChunkRaw {
         reference,
+        fast_miss: true,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -457,7 +470,7 @@ pub async fn download_soc(
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
-        ControlAck::Error { message } => {
+        ControlAck::NotFound { message } | ControlAck::Error { message } => {
             // Bee: `"requested chunk cannot be retrieved"` for any SOC
             // fetch failure. Detail goes to the log.
             debug!(target: "ant_gateway", %message, "soc fetch failed");
@@ -4546,8 +4559,11 @@ pub async fn download_feed(
     // at `reference` via the same path `/chunks/{addr}` uses.
     if only_root_chunk {
         let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+        // The resolved root chunk is expected to exist: no fast-miss
+        // fan-out (issue #146).
         let cmd = ControlCommand::GetChunkRaw {
             reference,
+            fast_miss: false,
             ack: ack_tx,
         };
         if handle.commands.send(cmd).await.is_err() {
@@ -4568,7 +4584,7 @@ pub async fn download_feed(
             ControlAck::NotReady { message } => {
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
             }
-            ControlAck::Error { message } => {
+            ControlAck::NotFound { message } | ControlAck::Error { message } => {
                 warn!(target: "ant_gateway", %message, "feed root chunk fetch failed");
                 return json_error(StatusCode::NOT_FOUND, "wrapped chunk cannot be retrieved");
             }

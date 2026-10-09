@@ -90,6 +90,85 @@ const fn pool_starved(errors_left: usize, unasked_ranked: bool, not_found_answer
 /// 32-attempt error budget for that single chunk.
 const HEDGE_DELAY: Duration = Duration::from_secs(1);
 
+/// How many peers a [`RoutingFetcher::with_fast_miss`] lookup keeps in
+/// flight once a peer has answered that the chunk is missing (issue
+/// #146). Until then it asks one peer at a time, like every other fetch:
+/// most chunks that exist come from the closest peer, so the extra
+/// requests are only spent once a miss is likely.
+pub const FAST_MISS_FANOUT: usize = 8;
+
+/// How many peers must answer "not found" (`storage: not found` or `no
+/// peer found`, [`RetrievalError::is_chunk_not_found`]) before a
+/// [`RoutingFetcher::with_fast_miss`] lookup stops and reports the chunk
+/// missing, instead of spending the whole [`MAX_ORIGIN_ERRORS`] budget
+/// (issue #146). Timeouts, refused streams and other failures don't
+/// count: they say nothing about the chunk, so the lookup carries on
+/// past them to further peers, as before.
+///
+/// Why 16 and not "the closest two or three": a light node's closest
+/// peers are forwarders, not the chunk's storers, and on mainnet a chunk
+/// that exists is sometimes delivered only after several of them said
+/// "not found" — of 147 existing feed chunks fetched cold in issue
+/// #146's measurements, 5 needed four or more such answers first and one
+/// needed fifteen.
+/// Sixteen keeps that one, and still ends a miss well before the 32nd
+/// answer.
+pub const FAST_MISS_NOT_FOUND: usize = 16;
+
+// A fast-miss stop is a corroborated miss (`FetchExhausted::
+// corroborated_missing`, which retry loops trust as final), and it comes
+// before the error budget runs out.
+const _: () =
+    assert!(FAST_MISS_NOT_FOUND > STARVED_MAX_NOT_FOUND && FAST_MISS_NOT_FOUND < MAX_ORIGIN_ERRORS);
+
+/// Peers a [`RoutingFetcher::with_fast_miss`] lookup keeps in flight
+/// after `not_found_answers` "not found" answers: one until the first,
+/// then [`FAST_MISS_FANOUT`].
+const fn fast_miss_width(not_found_answers: usize) -> usize {
+    if not_found_answers == 0 {
+        1
+    } else {
+        FAST_MISS_FANOUT
+    }
+}
+
+/// How many requests the error arm wants in flight after a failure, with
+/// `in_flight` still outstanding and `errors_left` failures left in the
+/// budget (always > 0 here).
+///
+/// A plain fetch replaces the failed request with one new peer, as bee's
+/// `retry()` does, and so does a [`RoutingFetcher::with_fast_miss`]
+/// lookup until a peer has said "not found" (it is a plain fetch until
+/// then). After that it tops up to [`FAST_MISS_FANOUT`], but never past
+/// `errors_left` requests in flight: each outstanding request can still
+/// fail and spend one error, so a request beyond that could only be
+/// answered after the budget is gone. If enough are already in flight it
+/// adds none and waits on them.
+const fn backfill_target(
+    fast_miss: bool,
+    in_flight: usize,
+    not_found_answers: usize,
+    errors_left: usize,
+) -> usize {
+    let replace = in_flight + 1;
+    if !fast_miss || not_found_answers == 0 {
+        return replace;
+    }
+    let width = fast_miss_width(not_found_answers);
+    let want = if replace > width { replace } else { width };
+    if want < errors_left {
+        want
+    } else {
+        errors_left
+    }
+}
+
+/// Whether a [`RoutingFetcher::with_fast_miss`] lookup has heard enough
+/// "not found" answers to call the chunk missing now.
+const fn fast_miss_done(not_found_answers: usize) -> bool {
+    not_found_answers >= FAST_MISS_NOT_FOUND
+}
+
 /// Stateful per-call fetcher. Owns a clone of `Control` and a live
 /// peer-snapshot subscription via `tokio::sync::watch::Receiver`.
 /// Reading from the watch on every `ranked()` call is what keeps the
@@ -256,7 +335,24 @@ pub struct RoutingFetcher {
     /// accept-after-budget behaviour for the gateway's parity endpoints.
     /// See [`Self::with_require_deep`] for why the upload path opts in.
     require_deep: bool,
+    /// Single-chunk lookup mode ([`Self::with_fast_miss`]).
+    fast_miss: bool,
+    /// Test stand-in for [`retrieve_chunk`]: answers each request
+    /// instead of the network.
+    #[cfg(test)]
+    mock_retrieve: Option<MockRetrieve>,
 }
+
+/// A test peer's answer to one retrieval request.
+#[cfg(test)]
+type MockRetrieve = Arc<
+    dyn Fn(
+            PeerId,
+            [u8; 32],
+        ) -> futures::future::BoxFuture<'static, Result<RetrievedChunk, RetrievalError>>
+        + Send
+        + Sync,
+>;
 
 impl RoutingFetcher {
     /// Build a fetcher around a `libp2p` stream control and a *live*
@@ -296,6 +392,9 @@ impl RoutingFetcher {
             push_network_id: None,
             neighborhood_dial: None,
             require_deep: false,
+            fast_miss: false,
+            #[cfg(test)]
+            mock_retrieve: None,
         }
     }
 
@@ -320,6 +419,51 @@ impl RoutingFetcher {
     #[must_use]
     pub const fn with_require_deep(mut self, require_deep: bool) -> Self {
         self.require_deep = require_deep;
+        self
+    }
+
+    /// Single-chunk lookup mode, for a read whose miss is an answer the
+    /// caller acts on rather than a failure: the gateway's `/chunks` and
+    /// `/soc` reads (Freedom's exact-index `swarm_readFeedEntry` reads
+    /// `/chunks/<soc address>`), which a live-stream player polls for the
+    /// next feed slot until it is written (issue #146).
+    ///
+    /// The lookup starts as every fetch does, one closest-first peer at
+    /// a time. Once a peer answers that the chunk is missing it keeps
+    /// [`FAST_MISS_FANOUT`] peers in flight instead of one, and it stops
+    /// at [`FAST_MISS_NOT_FOUND`] "not found" answers instead of running
+    /// the whole [`MAX_ORIGIN_ERRORS`] budget one peer after another
+    /// (~1.7 s on mainnet). Failures that aren't a "not found" answer
+    /// (timeouts, unreachable peers) don't count toward the stop, so the
+    /// lookup still falls through them to further peers. Requests still
+    /// in flight at the stop are drained, not cut off: a late delivery
+    /// lands in the chunk caches, so the next poll is served locally.
+    /// Nothing is cached about the miss itself.
+    ///
+    /// Off by default: a file join fetches chunks that are expected to
+    /// exist, and keeping several peers in flight there would mostly buy
+    /// duplicate deliveries.
+    #[must_use]
+    pub const fn with_fast_miss(mut self, fast_miss: bool) -> Self {
+        self.fast_miss = fast_miss;
+        self
+    }
+
+    /// Answer every retrieval request with `f` instead of the network.
+    #[cfg(test)]
+    #[must_use]
+    fn with_mock_retrieve<F>(mut self, f: F) -> Self
+    where
+        F: Fn(
+                PeerId,
+                [u8; 32],
+            )
+                -> futures::future::BoxFuture<'static, Result<RetrievedChunk, RetrievalError>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.mock_retrieve = Some(Arc::new(f));
         self
     }
 
@@ -1684,6 +1828,8 @@ impl RoutingFetcher {
             let request_sem = self.request_inflight_limit.clone();
             let tracker = self.progress.clone();
             let abandoned = abandoned.clone();
+            #[cfg(test)]
+            let mock = self.mock_retrieve.clone();
             async move {
                 let _request_permit = match request_sem {
                     Some(s) => acquire_request_permit(s).await,
@@ -1707,6 +1853,12 @@ impl RoutingFetcher {
                 if let Some(t) = tracker.as_ref() {
                     t.begin_fetch();
                 }
+                #[cfg(test)]
+                let r = match mock {
+                    Some(mock) => mock(peer, addr).await,
+                    None => retrieve_chunk(&mut control, peer, addr).await,
+                };
+                #[cfg(not(test))]
                 let r = retrieve_chunk(&mut control, peer, addr).await;
                 if let Some(t) = tracker.as_ref() {
                     t.end_fetch();
@@ -2040,13 +2192,30 @@ impl RoutingFetcher {
                             }
                             last_err = Some(e);
                             errors_left = errors_left.saturating_sub(1);
+                            // Single-chunk lookup: enough peers said the
+                            // chunk is missing (issue #146). Whatever is
+                            // still in flight goes to the drain.
+                            if self.fast_miss && fast_miss_done(not_found_answers) {
+                                break;
+                            }
                             if errors_left == 0 {
                                 continue;
                             }
                             // Backfill immediately on error: don't wait
                             // for the next preemptive tick. Mirrors bee's
-                            // `retry()` call inside the error arm.
-                            if let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) {
+                            // `retry()` call inside the error arm. A
+                            // single-chunk lookup tops up per
+                            // `backfill_target`.
+                            let target = backfill_target(
+                                self.fast_miss,
+                                in_flight.len(),
+                                not_found_answers,
+                                errors_left,
+                            );
+                            while in_flight.len() < target {
+                                let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) else {
+                                    break;
+                                };
                                 asked.push(peer);
                                 in_flight.push(make_fut(peer, guard));
                             }
@@ -4154,5 +4323,251 @@ mod tests {
         assert!(!is_stamp_rejection(&E::Timeout(
             std::time::Duration::from_secs(1)
         )));
+    }
+
+    /// How a scripted test peer answers a retrieval request.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Bee's `storage: not found`, after `ms`.
+        NotFound(u64),
+        /// Bee's `no peer found`, after `ms`.
+        NoPeer(u64),
+        /// The request times out after `ms` (a dead link).
+        Timeout(u64),
+        /// The chunk, after `ms`.
+        Deliver(u64),
+    }
+
+    /// What the scripted peers saw: requests made, and the most that
+    /// were ever in flight at once.
+    #[derive(Default)]
+    struct Script {
+        asked: std::sync::atomic::AtomicUsize,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Wire bytes the scripted peers deliver.
+    fn scripted_wire() -> Vec<u8> {
+        let mut wire = 5u64.to_le_bytes().to_vec();
+        wire.extend_from_slice(b"slot!");
+        wire
+    }
+
+    /// A fetcher over `answers.len()` peers, ranked closest-first to
+    /// `addr` (`answers[0]` answers for the closest), each answering as
+    /// scripted. Requests never touch the network.
+    fn scripted_fetcher(
+        addr: [u8; 32],
+        answers: &[Answer],
+        fast_miss: bool,
+    ) -> (RoutingFetcher, Arc<Script>) {
+        let mut peers = Vec::new();
+        let mut table = std::collections::HashMap::new();
+        for (i, answer) in answers.iter().enumerate() {
+            let p = PeerId::random();
+            let mut o = addr;
+            // Distance to `addr` grows with `i`.
+            o[0] ^= u8::try_from(i + 1).expect("< 256 peers");
+            peers.push((p, o));
+            table.insert(p, *answer);
+        }
+        let script = Arc::new(Script::default());
+        let seen = script.clone();
+        let behaviour = libp2p_stream::Behaviour::default();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), peers)
+            .with_fast_miss(fast_miss)
+            .with_mock_retrieve(move |peer, address| {
+                let answer = table[&peer];
+                let seen = seen.clone();
+                Box::pin(async move {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    seen.asked.fetch_add(1, SeqCst);
+                    let now = seen.in_flight.fetch_add(1, SeqCst) + 1;
+                    seen.max_in_flight.fetch_max(now, SeqCst);
+                    let (ms, result) = match answer {
+                        Answer::NotFound(ms) => (
+                            ms,
+                            Err(RetrievalError::Remote(
+                                "retrieve chunk: storage: not found".into(),
+                            )),
+                        ),
+                        Answer::NoPeer(ms) => (
+                            ms,
+                            Err(RetrievalError::Remote(
+                                "retrieve chunk: no peer found".into(),
+                            )),
+                        ),
+                        Answer::Timeout(ms) => {
+                            (ms, Err(RetrievalError::Timeout(Duration::from_millis(ms))))
+                        }
+                        Answer::Deliver(ms) => (
+                            ms,
+                            Ok(RetrievedChunk {
+                                address,
+                                data: scripted_wire(),
+                            }),
+                        ),
+                    };
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    seen.in_flight.fetch_sub(1, SeqCst);
+                    result
+                })
+            });
+        (fetcher, script)
+    }
+
+    fn asked(script: &Script) -> usize {
+        script.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn max_in_flight(script: &Script) -> usize {
+        script
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn fast_miss_rule() {
+        assert_eq!(fast_miss_width(0), 1);
+        assert_eq!(fast_miss_width(1), FAST_MISS_FANOUT);
+        assert_eq!(fast_miss_width(FAST_MISS_NOT_FOUND - 1), FAST_MISS_FANOUT);
+        assert!(!fast_miss_done(FAST_MISS_NOT_FOUND - 1));
+        assert!(fast_miss_done(FAST_MISS_NOT_FOUND));
+    }
+
+    /// Once a "not found" is in, a fast-miss lookup's top-up never puts
+    /// more requests in flight than the error budget left can answer for;
+    /// before that, and in a plain fetch, the failed request is just
+    /// replaced.
+    #[test]
+    fn backfill_target_respects_error_budget() {
+        // Plain fetch: one replacement, whatever the budget.
+        assert_eq!(backfill_target(false, 7, 5, 3), 8);
+        assert_eq!(backfill_target(false, 0, 0, 1), 1);
+        // Fast miss, before any "not found": a plain fetch's replacement.
+        assert_eq!(backfill_target(true, 0, 0, 31), 1);
+        assert_eq!(backfill_target(true, 1, 0, 31), 2);
+        assert_eq!(backfill_target(true, 7, 0, 3), 8);
+        // After a "not found": top up to the fan-out.
+        assert_eq!(backfill_target(true, 0, 1, 31), FAST_MISS_FANOUT);
+        assert_eq!(backfill_target(true, 7, 1, 31), FAST_MISS_FANOUT);
+        // The finding's case: 7 in flight, 3 errors left — no 8th request.
+        assert_eq!(backfill_target(true, 7, 5, 3), 3);
+        // Nothing in flight, budget nearly gone: still one request.
+        assert_eq!(backfill_target(true, 0, 5, 1), 1);
+        assert_eq!(backfill_target(true, 0, 5, 3), 3);
+    }
+
+    /// Issue #146: a slot that doesn't exist yet. Every peer answers
+    /// "not found" in 60 ms. A fast-miss lookup asks the closest peer,
+    /// then keeps `FAST_MISS_FANOUT` in flight and stops at
+    /// `FAST_MISS_NOT_FOUND` answers: three round trips instead of 32,
+    /// with a corroborated miss for the gateway's 404. A plain fetch
+    /// still walks the whole budget one peer at a time (plus its 1 s
+    /// hedges).
+    #[tokio::test(start_paused = true)]
+    async fn fast_miss_stops_once_enough_peers_say_not_found() {
+        let addr = [0x46u8; 32];
+        let mut answers = vec![Answer::NotFound(60); 48];
+        // Both of bee's miss tails count.
+        answers[3] = Answer::NoPeer(60);
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch(addr).await.expect_err("nobody has it");
+        assert_eq!(started.elapsed(), Duration::from_millis(180));
+        let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+        assert!(typed.corroborated_missing(), "{typed:?}");
+        assert_eq!(typed.not_found_answers, FAST_MISS_NOT_FOUND);
+        assert_eq!(max_in_flight(&script), FAST_MISS_FANOUT);
+        assert!(asked(&script) < FAST_MISS_NOT_FOUND + FAST_MISS_FANOUT);
+
+        let (fetcher, script) = scripted_fetcher(addr, &answers, false);
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch(addr).await.expect_err("nobody has it");
+        assert!(started.elapsed() > Duration::from_millis(1_400));
+        let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+        assert!(typed.not_found_answers >= MAX_ORIGIN_ERRORS);
+        assert!(max_in_flight(&script) <= 2);
+    }
+
+    /// A chunk the closest peer has costs one request, as before: the
+    /// lookup only widens after a "not found".
+    #[tokio::test(start_paused = true)]
+    async fn fast_miss_asks_one_peer_until_a_miss() {
+        let addr = [0x46u8; 32];
+        let mut answers = vec![Answer::Deliver(60)];
+        answers.extend([Answer::NotFound(60); 20]);
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let wire = fetcher.fetch(addr).await.expect("closest peer has it");
+        assert_eq!(wire, scripted_wire());
+        assert_eq!(asked(&script), 1);
+    }
+
+    /// On mainnet a chunk that exists sometimes comes only after many
+    /// peers said "not found" (one of 147 feed chunks needed fifteen).
+    /// The lookup finds it as long as it arrives before the
+    /// `FAST_MISS_NOT_FOUND`th "not found".
+    #[tokio::test(start_paused = true)]
+    async fn fast_miss_still_finds_a_chunk_after_many_not_found_answers() {
+        let addr = [0x46u8; 32];
+        let mut answers = vec![Answer::NotFound(60); 40];
+        answers[FAST_MISS_NOT_FOUND - 1] = Answer::Deliver(40);
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let wire = fetcher.fetch(addr).await.expect("rank-15 peer has it");
+        assert_eq!(wire, scripted_wire());
+        assert!(asked(&script) <= FAST_MISS_NOT_FOUND + FAST_MISS_FANOUT);
+    }
+
+    /// Timeouts say nothing about the chunk: they don't count toward the
+    /// stop, so the lookup falls through them to further peers, even
+    /// with `FAST_MISS_NOT_FOUND - 1` "not found" answers already in.
+    #[tokio::test(start_paused = true)]
+    async fn fast_miss_timeouts_fall_through_to_further_peers() {
+        let addr = [0x46u8; 32];
+        let mut answers = vec![Answer::NotFound(60); FAST_MISS_NOT_FOUND - 1];
+        answers.extend([Answer::Timeout(500); 12]);
+        answers.push(Answer::Deliver(60));
+        let deliverer = answers.len();
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let wire = fetcher.fetch(addr).await.expect("found past the timeouts");
+        assert_eq!(wire, scripted_wire());
+        assert_eq!(asked(&script), deliverer);
+
+        // With no "not found" answer at all the lookup is exactly a
+        // plain fetch: same peers, same time, whole error budget.
+        let answers = vec![Answer::Timeout(500); 48];
+        let mut runs = Vec::new();
+        for fast_miss in [true, false] {
+            let (fetcher, script) = scripted_fetcher(addr, &answers, fast_miss);
+            let started = tokio::time::Instant::now();
+            let err = fetcher.fetch(addr).await.expect_err("dead links");
+            let typed = err.downcast_ref::<FetchExhausted>().expect("typed");
+            assert!(!typed.confirmed_missing(), "{typed:?}");
+            runs.push((started.elapsed(), asked(&script), max_in_flight(&script)));
+        }
+        assert_eq!(runs[0], runs[1]);
+        assert!(runs[0].1 >= MAX_ORIGIN_ERRORS);
+    }
+
+    /// No negative caching: a request still in flight when the lookup
+    /// stops is drained, and its late delivery lands in the cache, so the
+    /// next poll for the slot is served at once.
+    #[tokio::test(start_paused = true)]
+    async fn fast_miss_late_delivery_serves_the_next_poll() {
+        let addr = [0x46u8; 32];
+        let mut answers = vec![Answer::NotFound(60); 40];
+        answers[1] = Answer::Deliver(2_000);
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let fetcher = fetcher.with_cache(Arc::new(InMemoryChunkCache::new(16)));
+        fetcher
+            .fetch(addr)
+            .await
+            .expect_err("stops before the slow peer answers");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let asked_before = asked(&script);
+        let wire = fetcher.fetch(addr).await.expect("drained delivery cached");
+        assert_eq!(wire, scripted_wire());
+        assert_eq!(asked(&script), asked_before, "served from cache");
     }
 }
