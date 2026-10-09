@@ -73,7 +73,9 @@ pub use cache_control::{
     CACHE_CAPACITY_MIN_BYTES,
 };
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
-pub use disk_cache::{ClearReport, DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
+pub use disk_cache::{
+    ClearReport, DiskCacheError, DiskCacheTuning, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES,
+};
 pub use enc_split::{
     split_bytes_encrypted, split_bytes_encrypted_with_keys, EncryptedSplitResult, ENC_REF_SIZE,
 };

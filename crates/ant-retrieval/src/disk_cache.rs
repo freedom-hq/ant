@@ -17,11 +17,13 @@
 //! - **Dedicated read threads** — `get` is a prepared `SELECT` on a read-only
 //!   WAL connection; jobs are routed round-robin over crossbeam channels (no
 //!   `spawn_blocking` on the hot path). Pool size scales with
-//!   [`std::thread::available_parallelism`] (8–32 workers).
+//!   [`std::thread::available_parallelism`] (8–32 workers) on desktop and
+//!   is 2 on mobile (see [`DiskCacheTuning`]).
 //! - **Dedicated writer thread** — all mutating work (batched `put`s,
 //!   `last_access` touches past the freshness window, eviction) runs on
 //!   one thread with **batched transactions** so bursts amortise fsync.
-//! - **Pragmas** — large `mmap_size` / `cache_size` on every connection.
+//! - **Pragmas** — `mmap_size` / `cache_size` on every connection, large
+//!   on desktop and small on mobile ([`DiskCacheTuning`]).
 //!
 //! Async rule: `get` / `row_count` ship work to dedicated **read threads**
 //! (each with a prepared `SELECT`) over a bounded channel — no
@@ -33,7 +35,6 @@ use crossbeam_channel::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,24 +55,68 @@ const EVICTION_SLACK_RATIO: f64 = 0.95;
 /// writer queue.
 const LAST_ACCESS_REFRESH_MS: i64 = 60_000;
 
-/// Number of dedicated read threads (each owns one read-only connection +
-/// cached prepared statements). Bounded to keep mobile FD use sane.
-fn read_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(8, std::num::NonZero::get)
-        .clamp(8, 32)
-}
-
 /// Max `put` + `touch` rows coalesced into one writer transaction before commit.
 /// Larger batches amortise WAL fsync against bursty write-through.
 const WRITE_BATCH_MAX: usize = 256;
 
-/// Target mmap size per `SQLite` connection (256 MiB).
-const MMAP_BYTES: i64 = 512 * 1024 * 1024;
+/// How much memory the cache's `SQLite` connections may use: the read
+/// threads (one connection each, next to the writer's), and the file
+/// mapping and page cache of every connection.
+///
+/// Both budgets are per connection, so they multiply by
+/// `read_workers + 1`. `SQLite` maps up to `mmap_bytes` of the file
+/// separately on each connection. Desktop has address space to spare,
+/// but iOS caps an app's address space without the
+/// extended-virtual-addressing entitlement: nine 512 MiB mappings of a
+/// cache file larger than that reserved about 4.5 GiB and crashed the
+/// app once anything else needed some. The page cache is heap, which
+/// iOS and Android count against the app's memory limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskCacheTuning {
+    /// Dedicated read threads, each with its own read-only connection
+    /// and prepared statements.
+    pub read_workers: usize,
+    /// `PRAGMA mmap_size` per connection, in bytes. 0 reads every page
+    /// into the page cache instead.
+    pub mmap_bytes: u64,
+    /// `PRAGMA cache_size` per connection, in bytes.
+    pub page_cache_bytes: u64,
+}
 
-/// Negative `cache_size` pragma value = KiB of page cache per connection
-/// (~128 MiB here).
-const CACHE_KIB: i64 = -256 * 1024;
+impl DiskCacheTuning {
+    /// iOS and Android: two read threads, nothing mapped and 8 MiB of
+    /// page cache per connection, so the three connections reserve no
+    /// address space for the file and hold at most 24 MiB of heap.
+    pub const MOBILE: Self = Self {
+        read_workers: 2,
+        mmap_bytes: 0,
+        page_cache_bytes: 8 * 1024 * 1024,
+    };
+
+    /// Desktop and servers: a read thread per core (8 to 32), and up
+    /// to 512 MiB mapped plus 256 MiB of page cache per connection.
+    #[must_use]
+    pub fn desktop() -> Self {
+        Self {
+            read_workers: std::thread::available_parallelism()
+                .map_or(8, std::num::NonZero::get)
+                .clamp(8, 32),
+            mmap_bytes: 512 * 1024 * 1024,
+            page_cache_bytes: 256 * 1024 * 1024,
+        }
+    }
+
+    /// The tuning for the platform this is built for:
+    /// [`Self::MOBILE`] on iOS and Android, [`Self::desktop`] elsewhere.
+    #[must_use]
+    pub fn for_target() -> Self {
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            Self::MOBILE
+        } else {
+            Self::desktop()
+        }
+    }
+}
 
 /// Default size cap for the persistent chunk cache. 10 GB matches
 /// `PLAN.md` § 6.1's desktop / Raspberry Pi default. Operators on
@@ -284,8 +329,18 @@ impl Drop for Inner {
 
 impl DiskChunkCache {
     /// Open (or create) a chunk cache database at `path` with a
-    /// `max_bytes` byte cap.
+    /// `max_bytes` byte cap, tuned for the platform this is built for
+    /// ([`DiskCacheTuning::for_target`]).
     pub fn open(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, DiskCacheError> {
+        Self::open_with_tuning(path, max_bytes, DiskCacheTuning::for_target())
+    }
+
+    /// [`Self::open`] with explicit [`DiskCacheTuning`].
+    pub fn open_with_tuning(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+        tuning: DiskCacheTuning,
+    ) -> Result<Self, DiskCacheError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -300,7 +355,9 @@ impl DiskChunkCache {
         let tp = pinned.clone();
         let tm = max_bytes_shared.clone();
 
-        let (ready_tx, ready_rx) = sync_channel::<()>(0);
+        // The schema is in place once this returns; the writer thread
+        // takes the connection over for everything after.
+        let conn = open_write_connection(&path, tuning)?;
         let (write_tx, write_rx) = cb_bounded::<WriteMsg>(65_536);
         let path_thread = path.clone();
         let write_tx_main = write_tx.clone();
@@ -308,7 +365,7 @@ impl DiskChunkCache {
         let join = std::thread::Builder::new()
             .name("ant-disk-cache-writer".into())
             .spawn(move || {
-                if let Err(e) = writer_main(path_thread, write_rx, ready_tx, tb, tr, tp, tm) {
+                if let Err(e) = writer_main(conn, path_thread, write_rx, tb, tr, tp, tm) {
                     warn!(
                         target: "ant_retrieval::disk_cache",
                         "writer thread exited with error: {e}",
@@ -317,9 +374,7 @@ impl DiskChunkCache {
             })
             .map_err(|e| DiskCacheError::Io(e.to_string()))?;
 
-        ready_rx.recv().map_err(|_| DiskCacheError::WriterStopped)?;
-
-        let n_read = read_worker_count();
+        let n_read = tuning.read_workers.max(1);
         let mut read_tx = Vec::with_capacity(n_read);
         let mut read_joins = Vec::with_capacity(n_read);
         for i in 0..n_read {
@@ -328,7 +383,7 @@ impl DiskChunkCache {
             let wt = write_tx.clone();
             let j = std::thread::Builder::new()
                 .name(format!("ant-disk-cache-read-{i}"))
-                .spawn(move || read_worker_loop(path_r, job_rx, wt))
+                .spawn(move || read_worker_loop(path_r, tuning, job_rx, wt))
                 .map_err(|e| DiskCacheError::Io(e.to_string()))?;
             read_tx.push(job_tx);
             read_joins.push(j);
@@ -340,6 +395,8 @@ impl DiskChunkCache {
             initial_total = total_bytes.load(Ordering::Relaxed),
             max_bytes,
             read_workers = n_read,
+            mmap_bytes = tuning.mmap_bytes,
+            page_cache_bytes = tuning.page_cache_bytes,
             "opened persistent chunk cache",
         );
 
@@ -595,9 +652,16 @@ impl DiskChunkCache {
     }
 }
 
-fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlite::Error> {
-    conn.pragma_update(None, "mmap_size", MMAP_BYTES)?;
-    conn.pragma_update(None, "cache_size", CACHE_KIB)?;
+fn apply_shared_pragmas(
+    conn: &Connection,
+    tuning: DiskCacheTuning,
+    is_write: bool,
+) -> Result<(), rusqlite::Error> {
+    let mmap = i64::try_from(tuning.mmap_bytes).unwrap_or(i64::MAX);
+    conn.pragma_update(None, "mmap_size", mmap)?;
+    // A negative `cache_size` is KiB rather than pages.
+    let cache_kib = i64::try_from(tuning.page_cache_bytes / 1024).unwrap_or(i64::MAX);
+    conn.pragma_update(None, "cache_size", -cache_kib.max(1))?;
     if is_write {
         conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -615,7 +679,10 @@ fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlit
     Ok(())
 }
 
-fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+fn open_write_connection(
+    path: &Path,
+    tuning: DiskCacheTuning,
+) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -632,7 +699,7 @@ fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     if fresh == 0 {
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     }
-    apply_shared_pragmas(&conn, true)?;
+    apply_shared_pragmas(&conn, tuning, true)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chunks (
                 address     BLOB PRIMARY KEY,
@@ -670,17 +737,25 @@ fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
-fn open_read_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+fn open_read_connection(
+    path: &Path,
+    tuning: DiskCacheTuning,
+) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    apply_shared_pragmas(&conn, false)?;
+    apply_shared_pragmas(&conn, tuning, false)?;
     Ok(conn)
 }
 
-fn read_worker_loop(path: PathBuf, rx: CbReceiver<ReadJob>, write_tx: CbSender<WriteMsg>) {
-    let Ok(conn) = open_read_connection(&path) else {
+fn read_worker_loop(
+    path: PathBuf,
+    tuning: DiskCacheTuning,
+    rx: CbReceiver<ReadJob>,
+    write_tx: CbSender<WriteMsg>,
+) {
+    let Ok(conn) = open_read_connection(&path, tuning) else {
         return;
     };
     let Ok(mut sel_stmt) =
@@ -1142,19 +1217,17 @@ fn db_file_bytes(path: &Path) -> u64 {
 }
 
 fn writer_main(
+    mut conn: Connection,
     path: PathBuf,
     rx: CbReceiver<WriteMsg>,
-    ready_tx: SyncSender<()>,
     total_bytes: Arc<AtomicU64>,
     total_rows: Arc<AtomicU64>,
     pinned: Arc<PinTotals>,
     max_bytes: Arc<AtomicU64>,
 ) -> Result<(), DiskCacheError> {
-    let mut conn = open_write_connection(&path)?;
-
-    // Signal `open()` ready as soon as the schema is in place. The
-    // initial backfill scan below (SUM(size) + COUNT(*)) touches every
-    // row in the chunks table (sequential disk read on a cold page
+    // `open()` doesn't wait for this thread: it opened `conn`, and the
+    // schema with it, itself. The initial backfill scan below
+    // (SUM(size) + COUNT(*)) touches every row in the chunks table (sequential disk read on a cold page
     // cache: ~28 s on a 7 GB DB), and `antd` must be free to start its
     // libp2p listener + bootstrap dial before we finish that —
     // `time_to_first_peer_s` is otherwise dominated by this scan on
@@ -1164,9 +1237,6 @@ fn writer_main(
     // `process_put_batch_transaction`), and `used_bytes()` /
     // `used_rows()` under-report for the first few seconds. Both are
     // acceptable; a frozen daemon is not.
-    ready_tx
-        .send(())
-        .map_err(|_| DiskCacheError::WriterStopped)?;
 
     // Single combined backfill query: SQLite serves every aggregate
     // from the same sequential scan, so we pay the cold-cache scan cost
@@ -1757,6 +1827,59 @@ mod tests {
         assert_eq!(cache.get(a.0).await.unwrap(), Some(a.1));
         assert_eq!(cache.get(b.0).await.unwrap(), Some(b.1));
         assert_eq!(cache.row_count().await.unwrap(), 2);
+    }
+
+    #[test]
+    fn tuning_sets_each_connections_mapping_and_page_cache() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.sqlite")).unwrap();
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        apply_shared_pragmas(&conn, DiskCacheTuning::MOBILE, false).unwrap();
+        assert_eq!(pragma("mmap_size"), 0);
+        assert_eq!(pragma("cache_size"), -8 * 1024, "8 MiB, in KiB");
+        let desktop = DiskCacheTuning::desktop();
+        apply_shared_pragmas(&conn, desktop, false).unwrap();
+        assert_eq!(pragma("mmap_size"), 512 * 1024 * 1024);
+        assert_eq!(pragma("cache_size"), -256 * 1024);
+        assert!((8..=32).contains(&desktop.read_workers));
+    }
+
+    #[test]
+    fn mobile_tuning_reserves_no_address_space_for_the_file() {
+        // The iOS crash: every connection maps the file on its own, so
+        // the reservation is per connection times the connections.
+        let m = DiskCacheTuning::MOBILE;
+        let connections = m.read_workers as u64 + 1;
+        assert_eq!(connections * m.mmap_bytes, 0);
+        assert!(connections * m.page_cache_bytes <= 32 * 1024 * 1024);
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            assert_eq!(DiskCacheTuning::for_target(), m);
+        } else {
+            assert_eq!(DiskCacheTuning::for_target(), DiskCacheTuning::desktop());
+        }
+    }
+
+    #[tokio::test]
+    async fn mobile_tuned_cache_round_trips() {
+        let dir = tempdir().unwrap();
+        let cache = DiskChunkCache::open_with_tuning(
+            dir.path().join("m.sqlite"),
+            1 << 20,
+            DiskCacheTuning::MOBILE,
+        )
+        .unwrap();
+        assert_eq!(cache.read_workers(), 2);
+        let chunks: Vec<_> = (0u8..8).map(|i| make_chunk(&[i; 64])).collect();
+        cache
+            .put_batch(chunks.iter().map(|(a, w)| (*a, w.clone())).collect())
+            .await
+            .unwrap();
+        for (addr, wire) in &chunks {
+            assert_eq!(cache.get(*addr).await.unwrap().as_ref(), Some(wire));
+        }
     }
 
     #[tokio::test]
