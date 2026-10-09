@@ -153,6 +153,26 @@ impl ReplicaSweeps {
         self.lock().failed_this_attempt.clear();
     }
 
+    /// Did the lookup that failed with `e` fail on a node whose replica
+    /// sweep missed only *transiently* in this attempt? Then a retry can
+    /// still recover the node, whatever the direct fetch's error says: a
+    /// replica-only node (#154) answers "not found" from every peer asked
+    /// for its own address, so its direct miss is corroborated and would
+    /// on its own end the request (R3-M1 on PR #155).
+    #[must_use]
+    pub fn swept_transiently(&self, e: &ManifestError) -> bool {
+        let ManifestError::Fetch(JoinError::FetchChunk { addr, .. }) = e else {
+            return false;
+        };
+        let Some(addr) = hex::decode(addr)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            return false;
+        };
+        self.lock().failed_this_attempt.contains(&addr)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, SweepState> {
         self.state
             .lock()
@@ -2647,11 +2667,15 @@ mod tests {
                 }
             }
             self.chunks.get(&addr).cloned().ok_or_else(|| {
-                Box::new(crate::fetcher::FetchExhausted::new(
-                    format!("no peer found for {}", hex::encode(addr)),
-                    false,
-                    true,
-                )) as Box<dyn Error + Send + Sync>
+                // #154's shape: 20 peers agree the address is missing.
+                Box::new(
+                    crate::fetcher::FetchExhausted::new(
+                        format!("no peer found for {}", hex::encode(addr)),
+                        false,
+                        true,
+                    )
+                    .with_not_found_answers(20),
+                ) as Box<dyn Error + Send + Sync>
             })
         }
 
@@ -2719,6 +2743,17 @@ mod tests {
         assert!(matches!(first, ManifestError::Fetch(_)), "{first:?}");
         let swept = probes();
         assert!(swept > 0, "attempt 1 sweeps the root's replicas");
+        // R3-M1: the direct miss alone is final (corroborated), so the
+        // retry hinges on the memo reporting the transient sweep.
+        assert!(
+            crate::fetcher::FetchExhausted::find(&first)
+                .is_some_and(crate::fetcher::FetchExhausted::corroborated_missing),
+            "the direct error comes back unchanged: {first:?}",
+        );
+        assert!(
+            sweeps.swept_transiently(&first),
+            "a transiently failed sweep keeps the request retrying",
+        );
 
         // Same attempt: no second sweep of the same node.
         let _ = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps).await;
@@ -2850,6 +2885,25 @@ mod tests {
             "a transient failure is swept next attempt"
         );
         assert!(!unlimited.begin(&a), "a final failure stays memoized");
+
+        let miss = |addr: [u8; 32]| {
+            ManifestError::Fetch(JoinError::FetchChunk {
+                addr: hex::encode(addr),
+                source: "not found".into(),
+            })
+        };
+        let sweeps = ReplicaSweeps::new();
+        sweeps.failed(a, crate::rs::SweepMiss::Final);
+        sweeps.failed(b, crate::rs::SweepMiss::Transient);
+        assert!(!sweeps.swept_transiently(&miss(a)), "final sweep miss");
+        assert!(sweeps.swept_transiently(&miss(b)), "transient sweep miss");
+        assert!(!sweeps.swept_transiently(&miss(c)), "never swept");
+        assert!(!sweeps.swept_transiently(&ManifestError::NotAManifest));
+        sweeps.next_attempt();
+        assert!(
+            !sweeps.swept_transiently(&miss(b)),
+            "scoped to the attempt that swept it",
+        );
 
         let capped = ReplicaSweeps::capped(2);
         assert!(capped.begin(&a));
