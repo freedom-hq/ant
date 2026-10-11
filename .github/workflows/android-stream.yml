@@ -1,8 +1,8 @@
 name: AntStream Android APK
 
 # Builds the AntStream Android example app (`examples/android-stream`):
-# cross-compiles `crates/ant-ffi` (features `jni,chain`) for arm64 phones
-# and the x86_64 emulator, assembles a release APK signed with the
+# cross-compiles `crates/ant-ffi` (features `jni,chain`) for arm64 phones,
+# assembles a release APK signed with the
 # example key, uploads it as a workflow artifact and publishes it on the
 # rolling `antstream-android-latest` prerelease, so a phone can download
 # it straight from GitHub.
@@ -36,12 +36,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The native library only depends on the Rust sources. When none of
+      # them changed since a previous build, its .so is restored from the
+      # cache and the whole Rust toolchain is skipped: app-only changes
+      # build in about two minutes.
+      - name: Restore libant_ffi.so
+        id: so-cache
+        uses: actions/cache@v4
+        with:
+          path: examples/android-stream/app/src/main/jniLibs
+          key: antstream-so-arm64-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'xtask/**') }}
+
       - name: Install Rust toolchain
+        if: steps.so-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: Cache cargo registry + target
+        if: steps.so-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: android-stream
@@ -55,12 +68,17 @@ jobs:
         run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version 4.1.2 --locked
+        if: steps.so-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
 
-      - name: Build libant_ffi.so (arm64 + x86_64)
-        run: |
-          cargo xtask build-android-arm64 --features chain --app android-stream
-          cargo xtask build-android-x86_64 --features chain --app android-stream
+      # arm64 only: that is every phone this ships to. The x86_64 slice is
+      # for the emulator; build it locally with
+      # `cargo xtask build-android-x86_64 --features chain --app android-stream`.
+      - name: Build libant_ffi.so (arm64)
+        if: steps.so-cache.outputs.cache-hit != 'true'
+        run: cargo xtask build-android-arm64 --features chain --app android-stream
 
       - name: Verify exported JNI symbols
         run: |
@@ -76,11 +94,14 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # Caches Gradle's dependency downloads and build cache across runs.
+      - uses: gradle/actions/setup-gradle@v4
+
       - name: Assemble release APK
         working-directory: examples/android-stream
         run: |
           VERSION_CODE=${{ github.run_number }}
-          ./gradlew --no-daemon assembleRelease \
+          ./gradlew assembleRelease \
             -Pantstream.versionCode="$VERSION_CODE" \
             -Pantstream.versionName="0.1.$VERSION_CODE"
           cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/AntStream.apk"
