@@ -102,6 +102,16 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     // The broadcast's orientation is fixed per broadcast, so the screen is
     // locked to it: the camera's frames are upright (or carry the rotation
     // that makes them so) only for the display rotation the engine assumed.
+    // Start in the orientation the phone is held in: picking the phone up
+    // upright means a vertical broadcast. The choice can still be changed
+    // before going live, and is locked once live.
+    LaunchedEffect(Unit) {
+        if (!broadcast.isBusy) {
+            val heldPortrait = activity.resources.configuration.orientation ==
+                android.content.res.Configuration.ORIENTATION_PORTRAIT
+            broadcast.setPortrait(heldPortrait)
+        }
+    }
     DisposableEffect(Unit) {
         val previous = activity.requestedOrientation
         activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -212,30 +222,6 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
             when (val s = state) {
                 LiveBroadcast.State.Idle, is LiveBroadcast.State.Failed -> {
                     if (s is LiveBroadcast.State.Failed) Text(s.message, color = Amber)
-                    ChannelField(channel) { channel = it }
-                    if (!micOk && cameraOk) Text("No microphone access: video only.", color = Color.Gray)
-                    Text("Quality", color = Color.Gray)
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        CaptureEngine.Quality.entries.forEach { q ->
-                            FilterChip(
-                                selected = quality == q,
-                                onClick = { broadcast.setQuality(q) },
-                                label = { Text(q.label) },
-                            )
-                        }
-                    }
-                    Text(
-                        "${quality.label} uses about ${"%.1f".format(quality.bitrateKbps / 1000.0)} Mbit/s " +
-                            "(${quality.bitrateKbps * 450 / 1000} MB per hour). Lower is more reliable on mobile data.",
-                        color = Color.Gray,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (front) "Camera: front (selfie)" else "Camera: back")
-                    }
-                    OutlinedButton(onClick = { broadcast.setPortrait(!portrait) }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (portrait) "Orientation: portrait" else "Orientation: landscape")
-                    }
                     Button(
                         onClick = {
                             val st = texture ?: return@Button
@@ -245,6 +231,29 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                         colors = ButtonDefaults.buttonColors(containerColor = Red),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Go live") }
+                    if (!micOk && cameraOk) Text("No microphone access: video only.", color = Color.Gray)
+                    ChoiceRow(
+                        listOf("Portrait" to true, "Landscape" to false),
+                        selected = portrait,
+                        onSelect = { broadcast.setPortrait(it) },
+                    )
+                    ChoiceRow(
+                        listOf("Back camera" to false, "Selfie" to true),
+                        selected = front,
+                        onSelect = { if (it != front) broadcast.switchCamera() },
+                    )
+                    ChoiceRow(
+                        CaptureEngine.Quality.entries.map { it.label to it },
+                        selected = quality,
+                        onSelect = { broadcast.setQuality(it) },
+                    )
+                    Text(
+                        "${quality.label} uses about ${"%.1f".format(quality.bitrateKbps / 1000.0)} Mbit/s " +
+                            "(${quality.bitrateKbps * 450 / 1000} MB per hour). Lower is more reliable on mobile data.",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    ChannelField(channel) { channel = it }
                     OutlinedButton(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("Close") }
                 }
                 LiveBroadcast.State.Starting -> Text("Starting the broadcast…")
@@ -318,6 +327,20 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         Row(Modifier.fillMaxSize().background(Color.Black)) {
             previewPane(Modifier.fillMaxHeight().weight(1f))
             controlsPane(Modifier.width(300.dp).fillMaxHeight())
+        }
+    }
+}
+
+/** One-tap choice between a few options, as a row of chips. */
+@Composable
+private fun <T> ChoiceRow(options: List<Pair<String, T>>, selected: T, onSelect: (T) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        options.forEach { (label, value) ->
+            FilterChip(
+                selected = selected == value,
+                onClick = { onSelect(value) },
+                label = { Text(label) },
+            )
         }
     }
 }
