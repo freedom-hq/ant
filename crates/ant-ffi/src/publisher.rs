@@ -382,6 +382,12 @@ const LATENCY_SAMPLES: usize = 2048;
 
 #[derive(Default)]
 struct PublisherState {
+    /// Identifies this broadcast in every playlist it writes
+    /// (`#ANTSTREAM-BROADCAST:<id>`, a comment line players ignore). A
+    /// channel keeps its feed across broadcasts, and a stale feed read can
+    /// return an older playlist; the id lets a viewer tell "a new
+    /// broadcast started" from "this read is behind".
+    broadcast_id: String,
     /// Captured, not yet started. Drop-oldest when longer than
     /// `max_backlog`.
     pending: VecDeque<Pending>,
@@ -609,6 +615,9 @@ impl PublisherState {
         let target_s = self.longest_listed_ms.max(target_ms).div_ceil(1000).max(1);
         use std::fmt::Write as _;
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+        if !self.broadcast_id.is_empty() {
+            let _ = writeln!(out, "#ANTSTREAM-BROADCAST:{}", self.broadcast_id);
+        }
         // Writing into a `String` is infallible, so the `write!` results
         // are deliberately dropped rather than unwrapped.
         let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target_s}");
@@ -1023,7 +1032,12 @@ pub fn start(
     let batch = parse_hex32(&config.batch_id)
         .map_err(|e| PublisherError::Config(format!("batch_id {e}")))?;
 
+    let started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let state = Arc::new(Mutex::new(PublisherState {
+        broadcast_id: format!("{started_ms:x}"),
         feed_index: config.start_index,
         ..PublisherState::default()
     }));
@@ -2151,6 +2165,17 @@ mod tests {
         let report = run.report();
         assert!(report.feed_updates > 0);
         assert_eq!(report.feed_index, 41 + report.feed_updates, "{report:?}");
+        let playlist = lock(&log)
+            .seen
+            .iter()
+            .rev()
+            .find(|r| r.method_path.contains("/bzz?name=stream.m3u8"))
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .expect("playlist uploaded");
+        assert!(
+            playlist.contains("\n#ANTSTREAM-BROADCAST:"),
+            "playlists name their broadcast:\n{playlist}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
