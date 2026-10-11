@@ -129,6 +129,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
             return
         }
         _state.value = State.Live
+        node.liveBroadcastActive = true
         poll = scope.launch {
             while (isActive && selfTestDir == null) {
                 node.publisherProgress()?.let { _progress.value = it }
@@ -149,6 +150,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         }
         if (state.value == State.Stopping) return
         _state.value = State.Stopping
+        node.liveBroadcastActive = false
         poll?.cancel()
         poll = null
         engine?.let { e ->

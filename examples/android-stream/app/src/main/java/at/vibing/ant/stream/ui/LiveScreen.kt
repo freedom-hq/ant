@@ -212,7 +212,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Copy") }
                     OutlinedButton(
-                        onClick = { shareText(context, p.channelReference) },
+                        onClick = { shareText(context, watchLinks(p.channelReference)) },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Share") }
                 }
@@ -236,6 +236,19 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         }
     }
 }
+
+/**
+ * What "Share" sends: the channel opened in the AntStream web player
+ * (examples/antstream-player, on Swarm), for Freedom and for any browser.
+ */
+fun watchLinks(channel: String): String =
+    "Watch my live stream on Swarm:\n" +
+        "Freedom browser: bzz://$PLAYER_REF/#$channel\n" +
+        "Any browser: https://api.gateway.ethswarm.org/bzz/$PLAYER_REF/#$channel\n" +
+        "Channel: $channel"
+
+/** The AntStream web player's Swarm reference. */
+const val PLAYER_REF = "b544057f99ba073bb6c9c88e5ee73f388c5a9da825b16d06eeda878e79b831a0"
 
 @Composable
 private fun Stat(label: String, value: String) {

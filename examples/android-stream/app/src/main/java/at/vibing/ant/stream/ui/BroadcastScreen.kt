@@ -38,6 +38,8 @@ fun BroadcastScreen(
     val plan by node.plan.collectAsState()
     val settlement by node.settlement.collectAsState()
     val gatewayUp by node.gatewayUp.collectAsState()
+    val gatewayError by node.gatewayError.collectAsState()
+    val gatewayAddress by node.gatewayAddress.collectAsState()
     val offline by node.offline.collectAsState()
     val network by node.networkLabel.collectAsState()
     val hardware by node.keyHardwareBacked.collectAsState()
@@ -89,7 +91,15 @@ fun BroadcastScreen(
                     ?: "No plan yet",
             )
             CheckRow("Settlement", settled, if (settled) "Chequebook ready" else "Set up with your plan")
-            CheckRow("Gateway", gatewayUp, if (gatewayUp) "http://${AntNode.GATEWAY_ADDRESS}" else "Not running")
+            CheckRow(
+                "Gateway",
+                gatewayUp,
+                when {
+                    gatewayUp -> "http://$gatewayAddress"
+                    gatewayError != null -> "Not running: $gatewayError (retrying)"
+                    else -> "Starting…"
+                },
+            )
         }
         if (!hasPlan && status == AntNode.Status.Ready) {
             Button(onClick = onGetStarted, modifier = Modifier.fillMaxWidth()) { Text("Get started") }

@@ -59,6 +59,10 @@ class AntNode(private val context: Context) {
     val validity: StateFlow<StorageValidity?> = _validity.asStateFlow()
     private val _gatewayUp = MutableStateFlow(false)
     val gatewayUp: StateFlow<Boolean> = _gatewayUp.asStateFlow()
+    private val _gatewayError = MutableStateFlow<String?>(null)
+    val gatewayError: StateFlow<String?> = _gatewayError.asStateFlow()
+    private val _gatewayAddress = MutableStateFlow(GATEWAY_ADDRESS)
+    val gatewayAddress: StateFlow<String> = _gatewayAddress.asStateFlow()
     private val _offline = MutableStateFlow(false)
     val offline: StateFlow<Boolean> = _offline.asStateFlow()
     private val _networkLabel = MutableStateFlow("Unknown")
@@ -76,7 +80,8 @@ class AntNode(private val context: Context) {
     var gnosisRpc: String = DEFAULT_RPC
         private set
 
-    val gatewayUrl = "http://$GATEWAY_ADDRESS"
+    /** Where the in-process gateway listens; the port can move off 1633. */
+    val gatewayUrl get() = "http://${_gatewayAddress.value}"
 
     // -- lifecycle ---------------------------------------------------------
 
@@ -148,16 +153,40 @@ class AntNode(private val context: Context) {
         body(h)
     }
 
+    /**
+     * Start the gateway on 127.0.0.1:1633, or the next free port up to
+     * 1643 when another app (another Swarm node, a Freedom install)
+     * already holds it — the same fallback range Freedom desktop uses.
+     * The last address that worked is tried first, so a restart after
+     * suspend lands on the same port.
+     */
+    @Synchronized
     private fun startGateway(): Boolean {
-        val ok = runCatching {
-            withHandle { AntNative.nativeStartGateway(it, GATEWAY_ADDRESS, true, gnosisRpc) }
-        }.onFailure { Log.w(TAG, "gateway: ${it.message}") }.isSuccess
-        _gatewayUp.value = ok
-        return ok
+        val preferred = _gatewayAddress.value
+        val candidates = listOf(preferred) + (GATEWAY_PORT..GATEWAY_PORT + 10).map { "127.0.0.1:$it" }
+        var lastError: String? = null
+        for (addr in candidates.distinct()) {
+            val result = runCatching {
+                withHandle { AntNative.nativeStartGateway(it, addr, true, gnosisRpc) }
+            }
+            if (result.isSuccess) {
+                _gatewayAddress.value = addr
+                _gatewayError.value = null
+                _gatewayUp.value = true
+                return true
+            }
+            lastError = result.exceptionOrNull()?.message
+            Log.w(TAG, "gateway on $addr: $lastError")
+            if (handle == 0L) break
+        }
+        _gatewayError.value = lastError ?: "could not start"
+        _gatewayUp.value = false
+        return false
     }
 
     private fun restartGateway() {
         runCatching { withHandle { AntNative.nativeStopGateway(it) } }
+        _gatewayUp.value = false
         startGateway()
     }
 
@@ -172,13 +201,21 @@ class AntNode(private val context: Context) {
         if (handle == 0L) return@withContext
         runCatching { withHandle { AntNative.nativeResume(it) } }
         runCatching { withHandle { AntNative.nativeWake(it) } }
-        restartGateway()
+        // A running broadcast publishes through the gateway: rebinding it
+        // would cut the publisher off mid-stream.
+        if (!liveBroadcastActive) restartGateway()
     }
+
+    /** Set while a broadcast runs, so a wake never rebinds its gateway. */
+    @Volatile var liveBroadcastActive = false
 
     private fun startPollingPeers() {
         peerPoll?.cancel()
         peerPoll = scope.launch {
+            var tick = 0
             while (isActive) {
+                // A gateway that failed to bind is retried every 10 s.
+                if (++tick % 10 == 0 && handle != 0L && !_gatewayUp.value) startGateway()
                 val h = handle
                 _peerCount.value = if (h == 0L) 0 else handleLock.read {
                     if (handle == 0L) 0 else AntNative.nativePeerCount(handle).coerceAtLeast(0)
@@ -323,7 +360,8 @@ class AntNode(private val context: Context) {
 
     companion object {
         private const val TAG = "AntNode"
-        const val GATEWAY_ADDRESS = "127.0.0.1:1633"
+        const val GATEWAY_PORT = 1633
+        const val GATEWAY_ADDRESS = "127.0.0.1:$GATEWAY_PORT"
         const val DEFAULT_RPC = "https://rpc.gnosischain.com"
     }
 }
