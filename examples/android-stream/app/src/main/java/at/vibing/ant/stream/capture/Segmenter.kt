@@ -36,6 +36,19 @@ class Segmenter(
     private var audioNextDts = -1L
     private var lastVideoDuration = Fmp4Muxer.VIDEO_TIMESCALE / 30
     private var restartPending = false
+    /**
+     * Added to every audio timestamp to put it on the video's clock. The
+     * camera stamps frames on a clock the device reports only loosely
+     * (some phones say "unknown" and use boot time, which runs ahead of
+     * the monotonic clock by every second the phone ever slept); audio
+     * stamped on the other clock would then sit hours away from the video
+     * and be dropped as "before the first frame", leaving segments with a
+     * declared but empty audio track that stalls browser playback. So the
+     * offset is measured from the streams themselves: null until both
+     * have produced a frame, 0 when they already agree.
+     */
+    private var audioOffsetUs: Long? = null
+    private var lastVideoPtsUs = Long.MIN_VALUE
     private var nextDiscontinuity = false
 
     @Synchronized
@@ -64,6 +77,8 @@ class Segmenter(
     /** One encoded access unit in AVCC form. */
     @Synchronized
     fun onVideo(avcc: ByteArray, ptsUs: Long, isSync: Boolean) {
+        lastVideoPtsUs = ptsUs
+        if (audioOffsetUs == null && audioQueue.isNotEmpty()) alignAudio(audioQueue.last().ptsUs)
         if (muxer == null) {
             val video = videoConfig ?: return
             if (!isSync) return
@@ -100,8 +115,27 @@ class Segmenter(
     /** One encoded AAC frame (1024 samples). */
     @Synchronized
     fun onAudio(frame: ByteArray, ptsUs: Long) {
-        if (muxer != null && ptsUs < originUs) return
-        audioQueue.addLast(Pending(frame, ptsUs, true))
+        if (audioOffsetUs == null && lastVideoPtsUs != Long.MIN_VALUE) alignAudio(ptsUs)
+        val pts = ptsUs + (audioOffsetUs ?: 0)
+        if (muxer != null && pts < originUs) return
+        audioQueue.addLast(Pending(frame, pts, true))
+    }
+
+    /**
+     * Fix [audioOffsetUs] from an audio timestamp captured about now and
+     * the newest video timestamp. Both were taken within a frame or two of
+     * each other, so a gap of more than a couple of seconds is a clock
+     * mismatch, not latency. Queued audio is shifted onto the video clock.
+     */
+    private fun alignAudio(audioPtsUs: Long) {
+        val delta = lastVideoPtsUs - audioPtsUs
+        val offset = if (kotlin.math.abs(delta) > CLOCK_MISMATCH_US) delta else 0L
+        audioOffsetUs = offset
+        if (offset != 0L && audioQueue.isNotEmpty()) {
+            val shifted = audioQueue.map { Pending(it.data, it.ptsUs + offset, it.isSync) }
+            audioQueue.clear()
+            audioQueue.addAll(shifted)
+        }
     }
 
     /** Emit whatever is buffered as the final segment. */
@@ -146,5 +180,6 @@ class Segmenter(
 
     companion object {
         const val AAC_FRAME = 1024
+        private const val CLOCK_MISMATCH_US = 2_000_000L
     }
 }

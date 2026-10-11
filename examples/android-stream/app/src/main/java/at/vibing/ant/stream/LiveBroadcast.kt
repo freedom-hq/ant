@@ -63,7 +63,24 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
     /** Front (selfie) or back camera; remembered, switchable while live. */
     val frontCamera: StateFlow<Boolean> = _frontCamera.asStateFlow()
 
-    val settings get() = CaptureEngine.Settings(quality = _quality.value, frontCamera = _frontCamera.value)
+    private val _portrait = MutableStateFlow(prefs.getBoolean("portrait", false))
+    /** Broadcast in portrait (vertical video) or landscape; remembered. */
+    val portrait: StateFlow<Boolean> = _portrait.asStateFlow()
+
+    val settings
+        get() = CaptureEngine.Settings(
+            quality = _quality.value,
+            frontCamera = _frontCamera.value,
+            portrait = _portrait.value,
+        )
+
+    /** Pick the orientation before going live; drops a prepared engine. */
+    fun setPortrait(value: Boolean) {
+        if (isBusy || value == _portrait.value) return
+        _portrait.value = value
+        prefs.edit().putBoolean("portrait", value).apply()
+        discardEngine()
+    }
 
     /** Pick the rendition before going live; drops a prepared engine. */
     fun setQuality(q: CaptureEngine.Quality) {
@@ -79,6 +96,9 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         if (isBusy && e != null) {
             if (!e.canSwitchCamera) return
             e.switchCamera()
+        } else {
+            // Not live: the prepared engine was built for the other camera.
+            discardEngine()
         }
         _frontCamera.value = !_frontCamera.value
         prefs.edit().putBoolean("front", _frontCamera.value).apply()

@@ -35,10 +35,11 @@ import kotlin.math.abs
  * [Segmenter], which cuts on keyframes (requested every second) and
  * hands finished segments to [onSegment] in order.
  *
- * The broadcast is landscape: the activity is locked to
- * `ROTATION_90` while live, so the back camera's frames come out upright
- * on the usual sensor orientation of 90°. Any other sensor orientation
- * is recorded as a rotation in the track header.
+ * The activity is locked to the broadcast's orientation while live. The
+ * camera's frames are encoded as the sensor delivers them; the rotation
+ * that makes them upright for that orientation (none for landscape on
+ * usual sensors, 90° or 270° for portrait) is recorded in the track
+ * header, as phone cameras do for portrait video.
  */
 class CaptureEngine(
     private val context: Context,
@@ -63,6 +64,7 @@ class CaptureEngine(
         val segmentSeconds: Int = 2,
         val frameRate: Int = 30,
         val frontCamera: Boolean = false,
+        val portrait: Boolean = false,
     ) {
         val bitrateKbps get() = quality.bitrateKbps
     }
@@ -113,14 +115,18 @@ class CaptureEngine(
         get() = cameraIdFor(true) != null && cameraIdFor(false) != null
 
     /**
-     * Rotation that makes this camera's frames upright with the activity in
-     * landscape (`ROTATION_90`): back cameras turn against the display,
-     * front cameras with it. 0 on the usual 90° back / 270° front sensors.
+     * Rotation that makes this camera's frames upright for the locked
+     * screen orientation (landscape = `ROTATION_90`, portrait =
+     * `ROTATION_0`), written into the track header so players turn the
+     * picture: back cameras turn against the display, front cameras with
+     * it. Landscape on the usual 90° back / 270° front sensors needs none;
+     * portrait needs 90° / 270°, a vertical video like any phone camera's.
      */
     private fun rotationFor(chars: CameraCharacteristics): Int {
         val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-        return if (front) (sensor + 90) % 360 else ((sensor - 90) % 360 + 360) % 360
+        val display = if (settings.portrait) 0 else 90
+        return if (front) (sensor + display) % 360 else ((sensor - display) % 360 + 360) % 360
     }
 
     private var rotation = 0

@@ -75,6 +75,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     val captured by broadcast.captured.collectAsState()
     val quality by broadcast.quality.collectAsState()
     val front by broadcast.frontCamera.collectAsState()
+    val portrait by broadcast.portrait.collectAsState()
     var channel by rememberSaveable { mutableStateOf(node.channel.value?.name ?: "My channel") }
     var texture by remember { mutableStateOf<SurfaceTexture?>(null) }
     var permissionsAsked by remember { mutableStateOf(false) }
@@ -98,9 +99,11 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         }
     }
 
+    // The broadcast's orientation is fixed per broadcast, so the screen is
+    // locked to it: the camera's frames are upright (or carry the rotation
+    // that makes them so) only for the display rotation the engine assumed.
     DisposableEffect(Unit) {
         val previous = activity.requestedOrientation
-        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -108,17 +111,30 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
             broadcast.discardEngine()
         }
     }
+    DisposableEffect(portrait) {
+        activity.requestedOrientation = if (portrait) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
+        onDispose { }
+    }
 
     val active = state is LiveBroadcast.State.Starting || state is LiveBroadcast.State.Live ||
         state is LiveBroadcast.State.Stopping
     BackHandler(enabled = !active) { onClose() }
     BackHandler(enabled = active) { scope.launch { broadcast.stop() } }
 
-    Row(Modifier.fillMaxSize().background(Color.Black)) {
-        // Preview, sized to the encoded frame's aspect.
-        Box(Modifier.fillMaxHeight().weight(1f), contentAlignment = Alignment.Center) {
+    // Preview, sized to the picture viewers get (the encoded frame, turned
+    // upright in portrait).
+    val previewPane = @Composable { paneModifier: Modifier ->
+        Box(paneModifier, contentAlignment = Alignment.Center) {
             if (cameraOk) {
-                val size = remember(quality) { broadcast.prepareEngine(withAudio = micOk).videoSize }
+                // Re-prepared whenever a setting the engine is built with changes
+                // (while live only the camera changes, inside the engine).
+                val size = remember(quality, portrait, if (active) null else front) {
+                    broadcast.prepareEngine(withAudio = micOk).videoSize
+                }
                 val sizeNow by rememberUpdatedState(size)
                 val frontNow by rememberUpdatedState(front)
                 AndroidView(
@@ -159,7 +175,9 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                             tv.setTransform(previewTransform(activity, tv.width, tv.height, size.width, size.height, front))
                         }
                     },
-                    modifier = Modifier.aspectRatio(size.width.toFloat() / size.height),
+                    modifier = Modifier.aspectRatio(
+                        if (portrait) size.height.toFloat() / size.width else size.width.toFloat() / size.height,
+                    ),
                 )
             } else {
                 Text(
@@ -181,11 +199,12 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
             }
         }
 
-        // Controls and counters.
+    }
+
+    // Controls and counters.
+    val controlsPane = @Composable { paneModifier: Modifier ->
         Column(
-            Modifier
-                .width(300.dp)
-                .fillMaxHeight()
+            paneModifier
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -213,6 +232,9 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                     )
                     OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
                         Text(if (front) "Camera: front (selfie)" else "Camera: back")
+                    }
+                    OutlinedButton(onClick = { broadcast.setPortrait(!portrait) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (portrait) "Orientation: portrait" else "Orientation: landscape")
                     }
                     Button(
                         onClick = {
@@ -284,6 +306,18 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                     ) { Text("Watch it") }
                 }
             }
+        }
+    }
+
+    if (portrait) {
+        Column(Modifier.fillMaxSize().background(Color.Black)) {
+            previewPane(Modifier.fillMaxWidth().weight(1.3f))
+            controlsPane(Modifier.fillMaxWidth().weight(1f))
+        }
+    } else {
+        Row(Modifier.fillMaxSize().background(Color.Black)) {
+            previewPane(Modifier.fillMaxHeight().weight(1f))
+            controlsPane(Modifier.width(300.dp).fillMaxHeight())
         }
     }
 }
