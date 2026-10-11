@@ -33,6 +33,8 @@ mod manifest;
 mod parity_guard;
 pub mod publisher;
 mod stream;
+#[cfg(feature = "jni")]
+mod stream_jni;
 
 // The gateway FFI lives in a private submodule; re-export its C-ABI
 // entry points at the crate root so workspace Rust callers (and tests)

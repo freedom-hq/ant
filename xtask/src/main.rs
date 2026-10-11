@@ -122,6 +122,10 @@ fn print_help() {
                  (x86_64-linux-android).\n\
              build-android-all [--profile debug|release]\n\
                  Run build-android-arm64 + -armv7 + -x86_64 in series.\n\
+                 Every build-android-* also takes --features <list> (extra\n\
+                 features on top of jni, e.g. chain) and --app <name> (the\n\
+                 examples/<name> app receiving jniLibs; default\n\
+                 android-download).\n\
                  Requires `cargo-ndk` on PATH and the Android NDK installed.\n"
     );
 }
@@ -140,6 +144,10 @@ struct BuildOpts {
     /// account's postage batch from Gnosis; the download-only
     /// `ios-download` app passes nothing.
     features: Vec<String>,
+    /// Android only: the example app under `examples/` whose
+    /// `app/src/main/jniLibs/<abi>/` receives the built `.so`
+    /// (`--app`, default `android-download`).
+    android_app: String,
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +265,7 @@ fn parse_build_opts(args: Vec<OsString>, flavor: IosFlavor) -> Result<BuildOpts>
         target,
         profile,
         features,
+        android_app: String::new(),
     })
 }
 
@@ -428,6 +437,8 @@ fn build_android_all(args: &[OsString]) -> Result<()> {
 
 fn parse_android_opts(args: &[OsString], target: &'static str) -> Result<BuildOpts> {
     let mut profile = Profile::Release;
+    let mut features: Vec<String> = Vec::new();
+    let mut android_app = "android-download".to_string();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let arg = arg.to_string_lossy().into_owned();
@@ -444,16 +455,36 @@ fn parse_android_opts(args: &[OsString], target: &'static str) -> Result<BuildOp
                     other => bail!("unsupported --profile {other} (try debug or release)"),
                 };
             }
+            "--features" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--features requires a value"))?
+                    .to_string_lossy()
+                    .into_owned();
+                features.extend(
+                    v.split([',', ' '])
+                        .filter(|s| !s.is_empty() && *s != "jni")
+                        .map(ToString::to_string),
+                );
+            }
+            "--app" => {
+                android_app = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--app requires a value"))?
+                    .to_string_lossy()
+                    .into_owned();
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
     Ok(BuildOpts {
         target,
         profile,
-        // Android always builds the cdylib with `--features jni` set
-        // directly in `run_android_build`; no extra features come from
-        // the command line here.
-        features: Vec::new(),
+        // `jni` itself is always added in `run_android_build`; these are
+        // the extras on top (AntStream passes `chain` for its storage
+        // plan and settlement calls).
+        features,
+        android_app,
     })
 }
 
@@ -487,7 +518,12 @@ fn run_android_build(opts: &BuildOpts) -> Result<()> {
         .arg("-p")
         .arg("ant-ffi")
         .arg("--features")
-        .arg("jni")
+        .arg(
+            std::iter::once("jni")
+                .chain(opts.features.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
         .arg("--crate-type")
         .arg("cdylib")
         .current_dir(&workspace_root);
@@ -508,7 +544,8 @@ fn run_android_build(opts: &BuildOpts) -> Result<()> {
 }
 
 /// Copy `libant_ffi.so` into
-/// `examples/android-download/app/src/main/jniLibs/<abi>/`. Tolerates
+/// `examples/<app>/app/src/main/jniLibs/<abi>/` (`--app`, default
+/// `android-download`). Tolerates
 /// the example app not existing yet — phase A of the Android plan
 /// ships the Rust slice before the Gradle project, so the first
 /// `build-android-arm64` after step 1 lands has nothing to copy into.
@@ -522,7 +559,7 @@ fn copy_into_jni_libs(opts: &BuildOpts, lib: &Path) -> Result<()> {
     };
     let main_src = workspace_root
         .join("examples")
-        .join("android-download")
+        .join(&opts.android_app)
         .join("app")
         .join("src")
         .join("main");

@@ -1,0 +1,108 @@
+name: AntStream Android APK
+
+# Builds the AntStream Android example app (`examples/android-stream`):
+# cross-compiles `crates/ant-ffi` (features `jni,chain`) for arm64 phones
+# and the x86_64 emulator, assembles a release APK signed with the
+# example key, uploads it as a workflow artifact and publishes it on the
+# rolling `antstream-android-latest` prerelease, so a phone can download
+# it straight from GitHub.
+
+on:
+  push:
+    branches: [main, "antstream-android*"]
+    paths:
+      - "examples/android-stream/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.lock"
+      - ".github/workflows/android-stream.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-stream-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_NDK_API_LEVEL: "26"
+
+jobs:
+  apk:
+    name: build AntStream APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-stream
+
+      - name: Set up Android SDK + NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ndk;27.2.12479018
+
+      - name: Export ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Build libant_ffi.so (arm64 + x86_64)
+        run: |
+          cargo xtask build-android-arm64 --features chain --app android-stream
+          cargo xtask build-android-x86_64 --features chain --app android-stream
+
+      - name: Verify exported JNI symbols
+        run: |
+          set -euo pipefail
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          SO="examples/android-stream/app/src/main/jniLibs/arm64-v8a/libant_ffi.so"
+          count=$("$NM" -D --defined-only "$SO" | grep -c ' T Java_at_vibing_ant_stream_AntNative_native' || true)
+          echo "AntNative JNI symbols: $count"
+          test "$count" -eq 24
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Assemble release APK
+        working-directory: examples/android-stream
+        run: |
+          VERSION_CODE=${{ github.run_number }}
+          ./gradlew --no-daemon assembleRelease \
+            -Pantstream.versionCode="$VERSION_CODE" \
+            -Pantstream.versionName="0.1.$VERSION_CODE"
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/AntStream.apk"
+          ls -lh "$GITHUB_WORKSPACE/AntStream.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AntStream-apk
+          path: AntStream.apk
+
+      - name: Publish to the antstream-android-latest prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=antstream-android-latest
+          NOTES="AntStream for Android, built from ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7} (run ${{ github.run_number }}). Example app, signed with the public example key in examples/android-stream. Install AntStream.apk on an arm64 phone (Android 8+)."
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --title "AntStream Android (latest build)" --notes "$NOTES"
+          else
+            gh release create "$TAG" --prerelease --title "AntStream Android (latest build)" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" AntStream.apk --clobber

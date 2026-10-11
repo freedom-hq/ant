@@ -22,10 +22,11 @@ crate-type = ["rlib", "staticlib"]
 name = "ant_ffi"
 
 [features]
-# Compile the JNI surface in `src/jni.rs`. Off by default because the
-# only consumer is the Android smoke-test app in
-# `examples/android-download/`; iOS, desktop tests, and `antd` never
-# reference it and don't need to pay the `jni` crate compile cost.
+# Compile the JNI surfaces in `src/jni.rs` (the Android download smoke
+# test, `examples/android-download/`) and `src/stream_jni.rs` (AntStream,
+# `examples/android-stream/`, built with `chain` too). Off by default:
+# iOS, desktop tests, and `antd` never reference them and don't need to
+# pay the `jni` crate compile cost.
 # `cargo xtask build-android-*` flips this on; everything else leaves
 # it off.
 jni = ["dep:jni"]
