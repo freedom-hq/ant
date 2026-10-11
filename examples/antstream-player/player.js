@@ -102,11 +102,79 @@
 
   // -- hls.js wiring --------------------------------------------------------
 
+  // -- playlist guard -------------------------------------------------------
+  //
+  // A Swarm node resolves "the newest feed update" by probing indices with
+  // a short per-probe deadline, so a reload can come back with an *older*
+  // playlist than the last one (an update still propagating loses the
+  // race). Within a broadcast the playlist only moves forward, so an older
+  // one is replaced by the newest seen. The publisher names each broadcast
+  // in its playlists (`#ANTSTREAM-BROADCAST:<id>`): an id never seen before
+  // is a new broadcast on the channel, an id seen earlier is a stale read.
+
+  const guard = { text: null, key: null, id: null, ids: new Set(), newBroadcast: false };
+
+  function resetGuard() {
+    guard.text = null;
+    guard.key = null;
+    guard.id = null;
+    guard.ids = new Set();
+    guard.newBroadcast = false;
+  }
+
+  function playlistInfo(text) {
+    const seq = Number((/#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(text) || [])[1] || 0);
+    const segments = (text.match(/#EXTINF/g) || []).length;
+    const ended = text.includes('#EXT-X-ENDLIST');
+    const id = (/^#ANTSTREAM-BROADCAST:(\S+)/m.exec(text) || [])[1] || null;
+    // Order within one broadcast: later window start, then more segments,
+    // then closed.
+    return { key: [seq, segments, ended ? 1 : 0], id, ended };
+  }
+
+  const newer = (a, b) => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] > b[i];
+    return false;
+  };
+
+  function accept(text, info) {
+    guard.text = text;
+    guard.key = info.key;
+    guard.id = info.id;
+    if (info.id) guard.ids.add(info.id);
+    return text;
+  }
+
+  function guardPlaylist(text) {
+    const info = playlistInfo(text);
+    if (guard.text === null) return accept(text, info);
+    if (info.id && info.id !== guard.id) {
+      // Another broadcast's playlist: a new one starts the channel over,
+      // an earlier one is a stale read.
+      if (guard.ids.has(info.id)) return guard.text;
+      guard.newBroadcast = true;
+      return accept(text, info);
+    }
+    if (newer(info.key, guard.key) || info.key.join() === guard.key.join()) return accept(text, info);
+    return guard.text;
+  }
+
   const BaseLoader = Hls.DefaultConfig.loader;
   class SwarmLoader extends BaseLoader {
     load(context, config, callbacks) {
       let url = toContentUrl(context.url);
-      if (context.type === 'manifest' || context.type === 'level') url = withCacheBust(url);
+      const playlist = context.type === 'manifest' || context.type === 'level';
+      if (playlist) {
+        url = withCacheBust(url);
+        const onSuccess = callbacks.onSuccess;
+        callbacks = {
+          ...callbacks,
+          onSuccess: (response, stats, ctx, network) => {
+            if (typeof response.data === 'string') response.data = guardPlaylist(response.data);
+            onSuccess(response, stats, ctx, network);
+          },
+        };
+      }
       context.url = url;
       super.load(context, config, callbacks);
     }
@@ -149,7 +217,6 @@
   let retryTimer = null;
   let statsTimer = null;
   let endedPoll = null;
-  let lastStartSN = null;
   let lastFragAt = 0;
 
   function setStatus(text) {
@@ -182,7 +249,7 @@
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
-    lastStartSN = null;
+    resetGuard();
     lastFragAt = Date.now();
     els.intro.hidden = true;
     els.stage.hidden = false;
@@ -214,14 +281,13 @@
     });
     hls.on(Hls.Events.LEVEL_LOADED, (_e, data) => {
       const details = data.details;
-      // A channel is permanent: each broadcast continues the same feed,
-      // but numbers its segments from the start again. A playlist whose
-      // numbering went backwards is a new broadcast: start over on it.
-      if (lastStartSN !== null && details.startSN + 1 < lastStartSN) {
+      // A channel is permanent: each broadcast continues the same feed
+      // under its own broadcast id. The guard flags a new one; start over
+      // on it.
+      if (guard.newBroadcast) {
         play(channel);
         return;
       }
-      lastStartSN = details.startSN;
       ended = !details.live;
       if (ended) {
         setStatus('The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
@@ -249,7 +315,11 @@
         const res = await fetch(withCacheBust(contentUrl(channel, PLAYLIST)), { cache: 'no-store' });
         if (!res.ok) return;
         const text = await res.text();
-        if (!text.includes('#EXT-X-ENDLIST')) play(channel);
+        // Only a playlist from a *new* broadcast counts: a stale feed read
+        // can still return an older, not yet closed playlist of the
+        // broadcast that just ended.
+        const info = playlistInfo(text);
+        if (info.id && !guard.ids.has(info.id) && !info.ended) play(channel);
       } catch (_) {
         /* offline for a moment: try again on the next tick */
       }

@@ -16,6 +16,8 @@
 // broadcast on the same channel n ms after one ended (its segment
 // numbering starts over, as the publisher's does). STALL=<n> stops after
 // n segments *without* ENDLIST, like a broadcaster that dropped off.
+// STALE_PCT=<p> answers p% of playlist reads with an older playlist of the
+// same broadcast, like a feed lookup that missed the newest updates.
 //
 // Routes:
 //   /bzz/<PLAYER_REF>/<file>       the player (examples/antstream-player)
@@ -39,6 +41,7 @@ const endAfter = Number(process.env.ENDLIST || 0);
 const slowMs = Number(process.env.SLOW_MS || 0);
 const restartMs = Number(process.env.RESTART_MS || 0);
 const stallAfter = Number(process.env.STALL || 0);
+const stalePct = Number(process.env.STALE_PCT || 0);
 if (!dir) {
   console.error('usage: fake-gateway.mjs <segments-dir> [port]');
   process.exit(2);
@@ -90,19 +93,22 @@ function publishNext() {
 }
 
 function playlist() {
-  const window = published.slice(-6);
-  const target = Math.max(...published.map((p) => Math.ceil(p.ms / 1000)), 2);
-  let out = '#EXTM3U\n#EXT-X-VERSION:7\n';
+  // A stale read: the playlist as it was a few updates ago.
+  const lag = Math.random() * 100 < stalePct ? 1 + Math.floor(Math.random() * 5) : 0;
+  const upto = Math.max(1, published.length - lag);
+  const window = published.slice(0, upto).slice(-6);
+  const target = Math.max(...published.slice(0, upto).map((p) => Math.ceil(p.ms / 1000)), 2);
+  let out = `#EXTM3U\n#EXT-X-VERSION:7\n#ANTSTREAM-BROADCAST:b${broadcast}\n`;
   out += `#EXT-X-TARGETDURATION:${target}\n`;
   out += `#EXT-X-MEDIA-SEQUENCE:${window.length ? window[0].seq : 0}\n`;
-  const discBefore = published.slice(0, published.length - window.length).filter((p) => p.discontinuity).length;
+  const discBefore = published.slice(0, upto - window.length).filter((p) => p.discontinuity).length;
   if (discBefore) out += `#EXT-X-DISCONTINUITY-SEQUENCE:${discBefore}\n`;
   window.forEach((p, i) => {
     if (p.discontinuity && i > 0) out += '#EXT-X-DISCONTINUITY\n';
     if (i === 0 || p.discontinuity) out += `#EXT-X-MAP:URI="/bzz/${initRef}/init-1.mp4"\n`;
     out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
   });
-  if (ended) out += '#EXT-X-ENDLIST\n';
+  if (ended && lag === 0) out += '#EXT-X-ENDLIST\n';
   return out;
 }
 

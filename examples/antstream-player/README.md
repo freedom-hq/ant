@@ -10,8 +10,8 @@ hls.js 1.7.3 light build (`vendor/`, Apache-2.0).
 ## Published build
 
 ```
-bzz://1d7ee3e99ad90cff1275dd3954bb5ef54fbe638c35d6d6ef7c64dfa07f259e4f/#<channel>
-https://api.gateway.ethswarm.org/bzz/1d7ee3e99ad90cff1275dd3954bb5ef54fbe638c35d6d6ef7c64dfa07f259e4f/#<channel>
+bzz://664f9718d0aab34ef463c83e52884eb29fd532cab008eacfcf93241ed7f379fe/#<channel>
+https://api.gateway.ethswarm.org/bzz/664f9718d0aab34ef463c83e52884eb29fd532cab008eacfcf93241ed7f379fe/#<channel>
 ```
 
 The Android app's Share button sends both links. Changing the player
