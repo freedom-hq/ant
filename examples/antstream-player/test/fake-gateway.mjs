@@ -12,7 +12,10 @@
 // absolute URIs, a 6-entry window, `#EXT-X-MAP` per writer, and
 // `#EXT-X-DISCONTINUITY` where the recording loops. ENDLIST=<n> ends the
 // broadcast after n segments. SLOW_MS=<n> delays every segment response by a
-// random 0..n ms, like a cold Swarm read.
+// random 0..n ms, like a cold Swarm read. RESTART_MS=<n> starts a new
+// broadcast on the same channel n ms after one ended (its segment
+// numbering starts over, as the publisher's does). STALL=<n> stops after
+// n segments *without* ENDLIST, like a broadcaster that dropped off.
 //
 // Routes:
 //   /bzz/<PLAYER_REF>/<file>       the player (examples/antstream-player)
@@ -34,6 +37,8 @@ const dir = process.argv[2];
 const port = Number(process.argv[3] || 1733);
 const endAfter = Number(process.env.ENDLIST || 0);
 const slowMs = Number(process.env.SLOW_MS || 0);
+const restartMs = Number(process.env.RESTART_MS || 0);
+const stallAfter = Number(process.env.STALL || 0);
 if (!dir) {
   console.error('usage: fake-gateway.mjs <segments-dir> [port]');
   process.exit(2);
@@ -52,21 +57,33 @@ const blobs = new Map(); // ref -> { name, bytes, type }
 const initRef = refOf('init');
 blobs.set(initRef, { name: 'init-1.mp4', bytes: init, type: 'video/mp4' });
 
-const published = []; // { seq, ref, name, ms, discontinuity, map }
+let published = []; // { seq, ref, name, ms, discontinuity, map }
 let seq = 0;
 let ended = false;
+let broadcast = 0;
 
 function publishNext() {
   if (ended) return;
   const rec = records[seq % records.length];
   const loop = seq > 0 && seq % records.length === 0;
   const name = `seg-${seq + 2}.m4s`;
-  const ref = refOf(`${seq}-${name}`);
+  const ref = refOf(`${broadcast}-${seq}-${name}`);
   blobs.set(ref, { name, bytes: readFileSync(join(dir, rec.file)), type: 'video/iso.segment' });
   published.push({ seq, ref, name, ms: rec.ms, discontinuity: loop });
   seq += 1;
+  if (stallAfter && seq >= stallAfter) return;
   if (endAfter && seq >= endAfter) {
     ended = true;
+    if (restartMs) {
+      setTimeout(() => {
+        broadcast += 1;
+        published = [];
+        seq = 0;
+        ended = false;
+        console.log(`broadcast ${broadcast} starts`);
+        publishNext();
+      }, restartMs);
+    }
     return;
   }
   setTimeout(publishNext, rec.ms);

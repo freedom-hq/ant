@@ -148,6 +148,9 @@
   let lastFetchMs = null;
   let retryTimer = null;
   let statsTimer = null;
+  let endedPoll = null;
+  let lastStartSN = null;
+  let lastFragAt = 0;
 
   function setStatus(text) {
     els.status.textContent = text;
@@ -166,6 +169,8 @@
   function stop() {
     clearTimeout(retryTimer);
     clearInterval(statsTimer);
+    clearInterval(endedPoll);
+    endedPoll = null;
     if (hls) hls.destroy();
     hls = null;
   }
@@ -177,6 +182,8 @@
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
+    lastStartSN = null;
+    lastFragAt = Date.now();
     els.intro.hidden = true;
     els.stage.hidden = false;
     els.channelRef.textContent = ch;
@@ -206,16 +213,47 @@
       video.play().catch(() => {});
     });
     hls.on(Hls.Events.LEVEL_LOADED, (_e, data) => {
-      ended = !data.details.live;
-      if (ended) setStatus('The broadcast has ended: playing the recording.');
+      const details = data.details;
+      // A channel is permanent: each broadcast continues the same feed,
+      // but numbers its segments from the start again. A playlist whose
+      // numbering went backwards is a new broadcast: start over on it.
+      if (lastStartSN !== null && details.startSN + 1 < lastStartSN) {
+        play(channel);
+        return;
+      }
+      lastStartSN = details.startSN;
+      ended = !details.live;
+      if (ended) {
+        setStatus('The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
+        watchForNextBroadcast();
+      }
     });
     hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
       segmentsLoaded += 1;
+      lastFragAt = Date.now();
       const s = data.frag.stats;
       lastFetchMs = s.loading.end - s.loading.start;
     });
     hls.on(Hls.Events.ERROR, (_e, data) => onError(data));
     statsTimer = setInterval(updateStats, 1000);
+  }
+
+  /**
+   * After a broadcast ended, keep an eye on the channel: when a playlist
+   * without #EXT-X-ENDLIST shows up, the channel is live again.
+   */
+  function watchForNextBroadcast() {
+    if (endedPoll) return;
+    endedPoll = setInterval(async () => {
+      try {
+        const res = await fetch(withCacheBust(contentUrl(channel, PLAYLIST)), { cache: 'no-store' });
+        if (!res.ok) return;
+        const text = await res.text();
+        if (!text.includes('#EXT-X-ENDLIST')) play(channel);
+      } catch (_) {
+        /* offline for a moment: try again on the next tick */
+      }
+    }, 10000);
   }
 
   function onError(data) {
@@ -264,7 +302,14 @@
     const target = hls.targetLatency || 6;
     const behind = !ended && Number.isFinite(latency) && latency > 0 ? latency : null;
 
-    if (ended) {
+    // A live playlist that stops growing: the broadcaster dropped off
+    // without closing the stream. hls.js keeps reloading it, so a resumed
+    // or new broadcast still comes through.
+    const stalled = !ended && everPlayed && Date.now() - lastFragAt > 20000 && bufferAhead() < 0.5;
+    if (stalled) {
+      setBadge('', 'NO SIGNAL');
+      setOverlay('No new video from this channel. Waiting for the broadcaster…');
+    } else if (ended) {
       setBadge('ended', 'ENDED');
     } else if (!everPlayed) {
       setBadge('', 'CONNECTING');
