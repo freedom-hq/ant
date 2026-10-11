@@ -95,7 +95,11 @@ jobs:
           java-version: "17"
 
       # Caches Gradle's dependency downloads and build cache across runs.
+      # By default it only *saves* on the default branch; this app is built
+      # from its feature branch too, so let every build save.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
       - name: Assemble release APK
         working-directory: examples/android-stream
