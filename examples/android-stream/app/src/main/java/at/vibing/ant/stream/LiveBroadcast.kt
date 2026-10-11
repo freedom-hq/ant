@@ -50,7 +50,39 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
 
     val isBusy get() = state.value.let { it is State.Starting || it is State.Live || it is State.Stopping }
 
-    var settings = CaptureEngine.Settings()
+    private val prefs = context.getSharedPreferences("antstream.capture", Context.MODE_PRIVATE)
+
+    private val _quality = MutableStateFlow(
+        runCatching { CaptureEngine.Quality.valueOf(prefs.getString("quality", null) ?: "") }
+            .getOrDefault(CaptureEngine.Quality.Low),
+    )
+    /** The rendition the next broadcast encodes; remembered. */
+    val quality: StateFlow<CaptureEngine.Quality> = _quality.asStateFlow()
+
+    private val _frontCamera = MutableStateFlow(prefs.getBoolean("front", false))
+    /** Front (selfie) or back camera; remembered, switchable while live. */
+    val frontCamera: StateFlow<Boolean> = _frontCamera.asStateFlow()
+
+    val settings get() = CaptureEngine.Settings(quality = _quality.value, frontCamera = _frontCamera.value)
+
+    /** Pick the rendition before going live; drops a prepared engine. */
+    fun setQuality(q: CaptureEngine.Quality) {
+        if (isBusy || q == _quality.value) return
+        _quality.value = q
+        prefs.edit().putString("quality", q.name).apply()
+        discardEngine()
+    }
+
+    /** Swap front/back camera, live or not. */
+    fun switchCamera() {
+        val e = engine
+        if (isBusy && e != null) {
+            if (!e.canSwitchCamera) return
+            e.switchCamera()
+        }
+        _frontCamera.value = !_frontCamera.value
+        prefs.edit().putBoolean("front", _frontCamera.value).apply()
+    }
 
     /**
      * Debug self-test (`adb shell am start … --es antstream.selftest <dir>`):

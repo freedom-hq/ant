@@ -28,6 +28,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -39,6 +40,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -53,6 +55,7 @@ import androidx.core.content.ContextCompat
 import at.vibing.ant.stream.AntNode
 import at.vibing.ant.stream.Channel
 import at.vibing.ant.stream.LiveBroadcast
+import at.vibing.ant.stream.capture.CaptureEngine
 import at.vibing.ant.stream.formatBytes
 import kotlinx.coroutines.launch
 
@@ -70,6 +73,8 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     val progress by broadcast.progress.collectAsState()
     val report by broadcast.report.collectAsState()
     val captured by broadcast.captured.collectAsState()
+    val quality by broadcast.quality.collectAsState()
+    val front by broadcast.frontCamera.collectAsState()
     var channel by rememberSaveable { mutableStateOf(node.channel.value?.name ?: "My channel") }
     var texture by remember { mutableStateOf<SurfaceTexture?>(null) }
     var permissionsAsked by remember { mutableStateOf(false) }
@@ -113,13 +118,15 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         // Preview, sized to the encoded frame's aspect.
         Box(Modifier.fillMaxHeight().weight(1f), contentAlignment = Alignment.Center) {
             if (cameraOk) {
-                val size = remember { broadcast.prepareEngine(withAudio = micOk).videoSize }
+                val size = remember(quality) { broadcast.prepareEngine(withAudio = micOk).videoSize }
+                val sizeNow by rememberUpdatedState(size)
+                val frontNow by rememberUpdatedState(front)
                 AndroidView(
                     factory = { ctx ->
                         TextureView(ctx).apply {
                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                                    setTransform(previewTransform(activity, w, h, size.width, size.height))
+                                    setTransform(previewTransform(activity, w, h, sizeNow.width, sizeNow.height, frontNow))
                                     texture = st
                                     broadcast.previewTexture = st
                                     // Back on a broadcast that kept running.
@@ -127,7 +134,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                                 }
 
                                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
-                                    setTransform(previewTransform(activity, w, h, size.width, size.height))
+                                    setTransform(previewTransform(activity, w, h, sizeNow.width, sizeNow.height, frontNow))
                                 }
 
                                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -142,6 +149,14 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
 
                                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
                             }
+                        }
+                    },
+                    update = { tv ->
+                        // Re-fit after a quality change, and mirror the
+                        // selfie camera like any camera app (viewers get the
+                        // unmirrored picture).
+                        if (tv.isAvailable) {
+                            tv.setTransform(previewTransform(activity, tv.width, tv.height, size.width, size.height, front))
                         }
                     },
                     modifier = Modifier.aspectRatio(size.width.toFloat() / size.height),
@@ -180,6 +195,25 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                     if (s is LiveBroadcast.State.Failed) Text(s.message, color = Amber)
                     ChannelField(channel) { channel = it }
                     if (!micOk && cameraOk) Text("No microphone access: video only.", color = Color.Gray)
+                    Text("Quality", color = Color.Gray)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CaptureEngine.Quality.entries.forEach { q ->
+                            FilterChip(
+                                selected = quality == q,
+                                onClick = { broadcast.setQuality(q) },
+                                label = { Text(q.label) },
+                            )
+                        }
+                    }
+                    Text(
+                        "${quality.label} uses about ${"%.1f".format(quality.bitrateKbps / 1000.0)} Mbit/s " +
+                            "(${quality.bitrateKbps * 450 / 1000} MB per hour). Lower is more reliable on mobile data.",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (front) "Camera: front (selfie)" else "Camera: back")
+                    }
                     Button(
                         onClick = {
                             val st = texture ?: return@Button
@@ -193,6 +227,9 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                 }
                 LiveBroadcast.State.Starting -> Text("Starting the broadcast…")
                 LiveBroadcast.State.Live -> {
+                    OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (front) "Switch to back camera" else "Switch to selfie camera")
+                    }
                     Button(
                         onClick = { scope.launch { broadcast.stop() } },
                         colors = ButtonDefaults.buttonColors(containerColor = Red),
@@ -264,7 +301,7 @@ private fun Stat(label: String, value: String) {
  * (the Camera2Basic `configureTransform` recipe): rotate the buffer by
  * the display rotation and scale it to fill the view.
  */
-private fun previewTransform(activity: Activity, viewW: Int, viewH: Int, bufW: Int, bufH: Int): Matrix {
+private fun previewTransform(activity: Activity, viewW: Int, viewH: Int, bufW: Int, bufH: Int, mirror: Boolean): Matrix {
     @Suppress("DEPRECATION")
     val rotation = activity.windowManager.defaultDisplay.rotation
     val matrix = Matrix()
@@ -281,5 +318,6 @@ private fun previewTransform(activity: Activity, viewW: Int, viewH: Int, bufW: I
     } else if (rotation == Surface.ROTATION_180) {
         matrix.postRotate(180f, cx, cy)
     }
+    if (mirror) matrix.postScale(-1f, 1f, cx, cy)
     return matrix
 }

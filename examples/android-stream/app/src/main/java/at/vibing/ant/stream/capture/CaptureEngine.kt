@@ -47,7 +47,25 @@ class CaptureEngine(
     private val onSegment: (Segment) -> Unit,
     private val onFailure: (String) -> Unit,
 ) {
-    data class Settings(val bitrateKbps: Int = 900, val segmentSeconds: Int = 2, val frameRate: Int = 30)
+    /**
+     * Rendition presets. Upload throughput is the constraint (#67: a phone
+     * sustains well under 1 Mbit/s of Swarm publishing on many networks,
+     * #74), so the default is the lightest.
+     */
+    enum class Quality(val label: String, val width: Int, val height: Int, val bitrateKbps: Int) {
+        Low("360p", 640, 360, 600),
+        Medium("540p", 960, 540, 1000),
+        High("720p", 1280, 720, 1800),
+    }
+
+    data class Settings(
+        val quality: Quality = Quality.Low,
+        val segmentSeconds: Int = 2,
+        val frameRate: Int = 30,
+        val frontCamera: Boolean = false,
+    ) {
+        val bitrateKbps get() = quality.bitrateKbps
+    }
 
     private val cameraManager = context.getSystemService(CameraManager::class.java)
     private val cameraThread = HandlerThread("antstream.camera").apply { start() }
@@ -76,12 +94,36 @@ class CaptureEngine(
     lateinit var videoSize: Size
         private set
 
-    private val cameraId: String by lazy {
-        cameraManager.cameraIdList.firstOrNull {
-            cameraManager.getCameraCharacteristics(it)
-                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
-        } ?: cameraManager.cameraIdList.first()
+    /** True while the front (selfie) camera is in use. */
+    @Volatile var frontCamera = settings.frontCamera
+        private set
+
+    private fun cameraIdFor(front: Boolean): String? {
+        val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        return cameraManager.cameraIdList.firstOrNull {
+            cameraManager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == facing
+        }
     }
+
+    private val cameraId: String
+        get() = cameraIdFor(frontCamera) ?: cameraIdFor(!frontCamera) ?: cameraManager.cameraIdList.first()
+
+    /** Whether this device has both a front and a back camera to switch between. */
+    val canSwitchCamera: Boolean
+        get() = cameraIdFor(true) != null && cameraIdFor(false) != null
+
+    /**
+     * Rotation that makes this camera's frames upright with the activity in
+     * landscape (`ROTATION_90`): back cameras turn against the display,
+     * front cameras with it. 0 on the usual 90° back / 270° front sensors.
+     */
+    private fun rotationFor(chars: CameraCharacteristics): Int {
+        val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        return if (front) (sensor + 90) % 360 else ((sensor - 90) % 360 + 360) % 360
+    }
+
+    private var rotation = 0
 
     /** Pick the frame size before the preview surface is laid out. */
     fun prepare(): Size {
@@ -99,8 +141,7 @@ class CaptureEngine(
         this.chars = chars
         realtimeClock = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
             CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
-        val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val rotation = ((sensor - 90) % 360 + 360) % 360
+        rotation = rotationFor(chars)
 
         // Open the mic up front: a broadcast without one is still a
         // broadcast, so a failure here means video only, not an error.
@@ -117,8 +158,43 @@ class CaptureEngine(
 
         preview.setDefaultBufferSize(videoSize.width, videoSize.height)
         previewSurface = Surface(preview)
+        openCamera(cameraId)
+    }
+
+    /**
+     * Switch between the front and back camera, live: the encoder keeps
+     * running and only the camera feeding its input surface changes, so the
+     * broadcast goes on with a short freeze. A camera whose frames need a
+     * different rotation gets a fresh initialization segment.
+     */
+    fun switchCamera() {
+        cameraHandler.post {
+            if (!running || !canSwitchCamera) return@post
+            runCatching { session?.stopRepeating() }
+            runCatching { session?.close() }
+            session = null
+            camera?.close()
+            camera = null
+            frontCamera = !frontCamera
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            this.chars = chars
+            val r = rotationFor(chars)
+            if (r != rotation) {
+                rotation = r
+                segmenter.reconfigure(r)
+            }
+            // Cut promptly: the next segment starts on the new camera.
+            runCatching {
+                videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+            }
+            openCamera(cameraId)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCamera(id: String) {
         cameraManager.openCamera(
-            cameraId,
+            id,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     camera = device
@@ -304,21 +380,32 @@ class CaptureEngine(
         videoCodec = codec
     }
 
+    /**
+     * The encoded size: the size closest to the chosen quality that every
+     * camera (front and back, so a live switch keeps the encoder) and the
+     * encoder support. 16:9 is preferred, but not at the price of a much
+     * bigger frame: many cameras lack a small 16:9 size, and 640x480 beats
+     * 1280x720 for a 360p budget.
+     */
     private fun chooseSize(): Size {
-        val map = cameraManager.getCameraCharacteristics(cameraId)
-            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val cameraSizes = map?.getOutputSizes(MediaCodec::class.java)?.toList().orEmpty()
-        val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
         val caps = avcCapabilities()
-        val usable = cameraSizes.filter { s ->
-            s in previewSizes && (caps?.isSizeSupported(s.width, s.height) ?: true)
+        val ids = listOfNotNull(cameraIdFor(false), cameraIdFor(true)).ifEmpty { listOf(cameraId) }
+        val perCamera = ids.map { id ->
+            val map = cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val encoder = map?.getOutputSizes(MediaCodec::class.java)?.toSet().orEmpty()
+            val preview = map?.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
+            encoder intersect preview
         }
-        // 360p is the stage-1 rendition (#67); take the smallest 16:9
-        // size from 640 wide up, then 4:3, then anything.
-        val wide = usable.filter { abs(it.width * 9 - it.height * 16) <= 16 && it.width in 640..1280 }
-            .minByOrNull { it.width }
-        val standard = usable.filter { it.width in 640..1280 }.minByOrNull { it.width * it.height }
-        return wide ?: standard ?: usable.minByOrNull { abs(it.width - 640) } ?: Size(640, 480)
+        var usable = perCamera.reduce { a, b -> a intersect b }
+            .filter { caps?.isSizeSupported(it.width, it.height) ?: true }
+        if (usable.isEmpty()) usable = perCamera.first().toList()
+        val q = settings.quality
+        val wide = { s: Size -> abs(s.width * 9 - s.height * 16) <= 16 }
+        // Pixel count decides the bandwidth; aspect only breaks near-ties.
+        val cost = { s: Size ->
+            abs(s.width.toLong() * s.height - q.width.toLong() * q.height) + if (wide(s)) 0 else q.width.toLong() * q.height / 4
+        }
+        return usable.minByOrNull(cost) ?: Size(640, 480)
     }
 
     private fun avcCapabilities(): MediaCodecInfo.VideoCapabilities? =

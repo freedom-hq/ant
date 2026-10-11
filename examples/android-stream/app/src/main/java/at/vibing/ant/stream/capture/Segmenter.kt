@@ -35,10 +35,25 @@ class Segmenter(
     private val audioQueue = ArrayDeque<Pending>()
     private var audioNextDts = -1L
     private var lastVideoDuration = Fmp4Muxer.VIDEO_TIMESCALE / 30
+    private var restartPending = false
+    private var nextDiscontinuity = false
 
     @Synchronized
     fun setVideoConfig(config: Fmp4Muxer.VideoConfig) {
         videoConfig = config
+    }
+
+    /**
+     * The video changed rotation (a camera switch): at the next keyframe,
+     * close the current segment and start a new writer with its own
+     * initialization segment, the first media segment after it marked as
+     * a discontinuity. The timeline continues.
+     */
+    @Synchronized
+    fun reconfigure(rotation: Int) {
+        val v = videoConfig ?: return
+        videoConfig = Fmp4Muxer.VideoConfig(v.width, v.height, v.sps, v.pps, rotation)
+        if (muxer != null) restartPending = true
     }
 
     @Synchronized
@@ -69,8 +84,15 @@ class Segmenter(
             if (videoSamples.isEmpty()) videoBase = videoDts(prev.ptsUs)
             videoSamples += Fmp4Muxer.Sample(prev.data, duration, prev.isSync)
         }
-        if (isSync && videoSamples.isNotEmpty() && ptsUs - segmentStartUs >= segmentUs * 9 / 10) {
+        if (isSync && videoSamples.isNotEmpty() && (restartPending || ptsUs - segmentStartUs >= segmentUs * 9 / 10)) {
             flush(cutUs = ptsUs)
+        }
+        if (isSync && restartPending) {
+            restartPending = false
+            val m = Fmp4Muxer(videoConfig!!, if (expectAudio) audioConfig else null)
+            muxer = m
+            onSegment(Segment(isInit = true, data = m.initSegment(), durationMs = 0, discontinuity = false))
+            nextDiscontinuity = true
         }
         pendingVideo = Pending(avcc, ptsUs, isSync)
     }
@@ -115,7 +137,8 @@ class Segmenter(
         val durationMs = ((cutUs - segmentStartUs) / 1000).toInt().coerceAtLeast(1)
         videoSamples.clear()
         segmentStartUs = cutUs
-        onSegment(Segment(isInit = false, data = data, durationMs = durationMs, discontinuity = false))
+        onSegment(Segment(isInit = false, data = data, durationMs = durationMs, discontinuity = nextDiscontinuity))
+        nextDiscontinuity = false
     }
 
     private fun videoDts(ptsUs: Long): Long =
