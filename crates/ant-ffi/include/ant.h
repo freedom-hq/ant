@@ -1315,6 +1315,7 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  *   {
  *     "channel":         "Kitchen",               // required, names the feed
  *     "topic":           "0x<64 hex>",            // omit -> derived per broadcast
+ *     "start_index":     0,                       // first feed index; see below
  *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
  *     "segment_ms":      2000,                    // nominal segment duration
@@ -1324,6 +1325,12 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  *     "playlist_window": 6,                       // segments in the live playlist
  *     "notes":           "iPhone 15 Pro / LTE"
  *   }
+ *
+ * A host that keeps one "topic" across broadcasts, so the channel
+ * reference (the feed manifest of owner + topic) stays the same link,
+ * must pass the previous broadcast's final "feed_index" as
+ * "start_index": the new broadcast then continues the feed rather than
+ * rewriting the indices that hold the old one's playlists.
  *
  * Do NOT raise max_in_flight without re-measuring: stage 1 found
  * window 4 stable (899/899 segments) and window 8 a connection-layer
@@ -1403,7 +1410,8 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
 /*
  * End the broadcast and return its final report as an allocated JSON
  * object (free with ant_free_string): the progress fields above plus
- * duration_s, chunks_published, feed_updates, sustained_chunks_s,
+ * duration_s, chunks_published, feed_updates, feed_index (the next
+ * update's index: a reused channel's next "start_index"), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, and a "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the

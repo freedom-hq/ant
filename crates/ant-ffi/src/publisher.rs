@@ -167,6 +167,14 @@ pub struct PublisherConfig {
     /// previous head (or, restarted quickly, overwriting it).
     #[serde(default)]
     pub topic: String,
+    /// Sequence-feed index of this broadcast's first update. A host that
+    /// reuses one `topic` across broadcasts (a permanent channel link)
+    /// passes the previous broadcast's final `feed_index` here, so the
+    /// new updates continue the feed instead of rewriting index 0 and
+    /// up, which already hold the previous broadcast's playlists. With a
+    /// derived per-broadcast topic it stays 0.
+    #[serde(default)]
+    pub start_index: u64,
     /// Gateway base URL, `http://host:port` (loopback: the in-process
     /// `ant_start_gateway` on iOS, `antd` on desktop).
     #[serde(default = "default_gateway")]
@@ -724,6 +732,10 @@ pub struct PublisherReport {
     pub chunks_published: u64,
     pub playlists_published: u64,
     pub feed_updates: u64,
+    /// Sequence-feed index the *next* update would take: what a host
+    /// reusing this channel's topic passes as the next broadcast's
+    /// [`PublisherConfig::start_index`].
+    pub feed_index: u64,
     pub sustained_mbit_s: f64,
     pub sustained_chunks_s: f64,
     pub publish_ms_p50: u64,
@@ -946,6 +958,7 @@ impl LiveRun {
             chunks_published: state.chunks_published,
             playlists_published: state.playlists_published,
             feed_updates: state.feed_updates,
+            feed_index: state.feed_index,
             sustained_mbit_s: throughput_mbit_s(state.bytes_published, elapsed),
             sustained_chunks_s: if elapsed > 0.0 {
                 state.chunks_published as f64 / elapsed
@@ -1010,7 +1023,10 @@ pub fn start(
     let batch = parse_hex32(&config.batch_id)
         .map_err(|e| PublisherError::Config(format!("batch_id {e}")))?;
 
-    let state = Arc::new(Mutex::new(PublisherState::default()));
+    let state = Arc::new(Mutex::new(PublisherState {
+        feed_index: config.start_index,
+        ..PublisherState::default()
+    }));
     let cancel = Arc::new(AtomicBool::new(false));
     let push_notify = Arc::new(Notify::new());
     let commit_notify = Arc::new(Notify::new());
@@ -1696,6 +1712,7 @@ mod tests {
             max_backlog: 4,
             playlist_window: 3,
             notes: String::new(),
+            start_index: 0,
         }
     }
 
@@ -2089,6 +2106,51 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("publisher never finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reused_channel_continues_the_feed_at_start_index() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.start_index = 41;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        run.cancel();
+        settle(&run).await;
+
+        let first_soc = lock(&log)
+            .seen
+            .iter()
+            .find(|r| r.method_path.contains("/soc/"))
+            .map(|r| r.method_path.clone())
+            .expect("feed update written");
+        let id_hex = first_soc
+            .split_once("?sig=")
+            .unwrap()
+            .0
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            id_hex,
+            hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], 41)),
+            "the first update of a continued channel must sit at start_index",
+        );
+        let report = run.report();
+        assert!(report.feed_updates > 0);
+        assert_eq!(report.feed_index, 41 + report.feed_updates, "{report:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
