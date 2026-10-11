@@ -91,18 +91,15 @@ jobs:
           name: AntStream-apk
           path: AntStream.apk
 
-      - name: Publish to the antstream-android-latest prerelease
+      - name: Publish as a versioned prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG=antstream-android-latest
-          NOTES="AntStream for Android, built from ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7} (run ${{ github.run_number }}). Example app, signed with the public example key in examples/android-stream. Install AntStream.apk on an arm64 phone (Android 8+)."
-          git tag -f "$TAG" "$GITHUB_SHA"
-          git push -f origin "refs/tags/$TAG"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --prerelease --title "AntStream Android (latest build)" --notes "$NOTES"
-          else
-            gh release create "$TAG" --prerelease --title "AntStream Android (latest build)" --notes "$NOTES"
-          fi
-          gh release upload "$TAG" AntStream.apk --clobber
+          VERSION="0.1.${{ github.run_number }}"
+          TAG="antstream-android-v$VERSION"
+          NOTES="AntStream for Android $VERSION, built from ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}. Example app, signed with the public example key in examples/android-stream. Install AntStream-$VERSION.apk on an arm64 phone (Android 8+)."
+          cp AntStream.apk "AntStream-$VERSION.apk"
+          gh release create "$TAG" "AntStream-$VERSION.apk" \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "AntStream Android $VERSION" --notes "$NOTES"

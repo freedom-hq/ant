@@ -11,11 +11,21 @@ Package: `at.vibing.ant.stream`. Data dir: `files/antstream/`.
 
 Every push that touches the app or the crates builds a release APK in
 [`.github/workflows/android-stream.yml`](../../.github/workflows/android-stream.yml)
-and attaches it as `AntStream.apk` to the rolling
-`antstream-android-latest` prerelease. Install it on an arm64 phone
-running Android 8 or newer. Builds are signed with the public example key
-in `app/antstream-example.keystore`, so each build installs over the
+and publishes it as its own prerelease, tagged
+`antstream-android-v0.1.<build>` (the APK's `versionName` matches, its
+`versionCode` is the build number). Install it on an arm64 phone running
+Android 8 or newer. Builds are signed with the public example key in
+`app/antstream-example.keystore`, so each build installs over the
 previous one and keeps the account.
+
+To get updates with [Obtainium](https://github.com/ImranR98/Obtainium),
+add `https://github.com/freedom-hq/ant` and set:
+
+- **Include prereleases**: on
+- **Filter release titles by regular expression**: `^AntStream Android`
+
+The filter matters: the repo's other releases are ant node builds with no
+APK.
 
 ## What's here
 
