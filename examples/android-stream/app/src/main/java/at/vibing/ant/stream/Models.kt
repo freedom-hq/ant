@@ -179,6 +179,7 @@ data class PublisherSnapshot(
 
 data class PublisherReport(
     val channelReference: String,
+    val feedIndex: Long,
     val durationS: Double,
     val segmentsPushed: Long,
     val segmentsListed: Long,
@@ -197,6 +198,7 @@ data class PublisherReport(
             val errs = o.optJSONArray("errors")
             PublisherReport(
                 channelReference = o.optString("channel_reference"),
+                feedIndex = o.optLong("feed_index"),
                 durationS = o.optDouble("duration_s", 0.0),
                 segmentsPushed = o.optLong("segments_pushed"),
                 segmentsListed = o.optLong("segments_listed"),

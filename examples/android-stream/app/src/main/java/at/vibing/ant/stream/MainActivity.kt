@@ -16,11 +16,13 @@ import kotlinx.coroutines.launch
 /**
  * Single-activity host. Starts the node on launch and, like the iOS app's
  * scene-phase handling, checkpoints it when the app leaves the screen
- * (`ant_suspend`) and re-dials on return (`ant_resume` + `ant_wake`),
- * unless a broadcast is running.
+ * (`ant_suspend`) and re-dials on return (`ant_resume` + `ant_wake`).
+ * A running broadcast instead keeps going in the background
+ * ([BroadcastService]); only its preview is detached.
  */
 class MainActivity : ComponentActivity() {
     private var stopped = false
+    private var suspended = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,10 +45,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        val app = application as AntStreamApp
+        app.broadcast.onScreenShown()
         if (stopped) {
             stopped = false
-            val app = application as AntStreamApp
-            app.appScope.launch { app.node.wake() }
+            // A broadcast kept the node awake; only a checkpointed node
+            // needs waking.
+            if (suspended) app.appScope.launch { app.node.wake() }
+            suspended = false
         }
     }
 
@@ -55,14 +61,13 @@ class MainActivity : ComponentActivity() {
         if (isChangingConfigurations) return
         val app = application as AntStreamApp
         stopped = true
-        app.appScope.launch {
-            if (app.broadcast.isBusy) {
-                // The camera goes with the screen; end the broadcast
-                // cleanly so the playlist is closed rather than left
-                // dangling, and only then checkpoint the node.
-                app.broadcast.stop(failure = "The broadcast ended when the app left the screen.")
-            }
-            app.node.suspendNode()
+        if (app.broadcast.isBusy) {
+            // BroadcastService keeps capture and publishing going; only
+            // the preview goes away with the screen.
+            app.broadcast.onScreenHidden()
+            return
         }
+        suspended = true
+        app.appScope.launch { app.node.suspendNode() }
     }
 }

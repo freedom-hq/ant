@@ -67,6 +67,12 @@ class AntNode(private val context: Context) {
     val offline: StateFlow<Boolean> = _offline.asStateFlow()
     private val _networkLabel = MutableStateFlow("Unknown")
     val networkLabel: StateFlow<String> = _networkLabel.asStateFlow()
+    private val _channel = MutableStateFlow<Channel?>(null)
+    /** The account's permanent channel; null until the account is known. */
+    val channel: StateFlow<Channel?> = _channel.asStateFlow()
+    private val _channelReference = MutableStateFlow<String?>(null)
+    /** The channel's shareable reference, once its feed manifest exists. */
+    val channelReference: StateFlow<String?> = _channelReference.asStateFlow()
     private val _keyHardwareBacked = MutableStateFlow<Boolean?>(null)
     val keyHardwareBacked: StateFlow<Boolean?> = _keyHardwareBacked.asStateFlow()
 
@@ -302,17 +308,52 @@ class AntNode(private val context: Context) {
         runCatching { withHandle { AntNative.nativeStorageStatus(it) } }
             .getOrNull()?.let { StoragePlan.parse(it) }?.let { _plan.value = it }
         runCatching { withHandle { AntNative.nativeAccountInfo(it) } }
-            .getOrNull()?.let { AccountInfo.parse(it) }?.let { _account.value = it }
+            .getOrNull()?.let { AccountInfo.parse(it) }?.let { a ->
+                _account.value = a
+                if (a.ethAddress.isNotEmpty() && _channel.value?.owner != a.ethAddress) {
+                    val c = Channel(context, a.ethAddress)
+                    _channel.value = c
+                    _channelReference.value = c.reference
+                }
+            }
         runCatching { withHandle { AntNative.nativeSettlementStatus(it) } }
             .getOrNull()?.let { SettlementInfo.parse(it) }?.let { _settlement.value = it }
     }
 
+    // -- channel -----------------------------------------------------------
+
+    /**
+     * Make sure the permanent channel's feed manifest exists, so its link
+     * can be shared before the first broadcast. Needs a storage plan
+     * (the manifest is a stamped upload) and the gateway.
+     */
+    suspend fun ensureChannelReference(): String? = withContext(Dispatchers.IO) {
+        val c = _channel.value ?: return@withContext null
+        c.reference?.let { return@withContext it.also { r -> _channelReference.value = r } }
+        val batch = plan.value?.takeIf { it.enabled }?.batchId ?: return@withContext null
+        if (!gatewayUp.value) return@withContext null
+        runCatching { c.ensureReference(gatewayUrl, batch) }
+            .onFailure { Log.w(TAG, "channel: ${it.message}") }
+            .getOrNull()
+            ?.also { _channelReference.value = it }
+    }
+
     // -- publisher ---------------------------------------------------------
 
-    suspend fun startPublisher(channel: String, batchId: String, bitrateKbps: Int, segmentMs: Int, notes: String) =
+    suspend fun startPublisher(
+        channel: String,
+        topic: String,
+        startIndex: Long,
+        batchId: String,
+        bitrateKbps: Int,
+        segmentMs: Int,
+        notes: String,
+    ) =
         withContext(Dispatchers.IO) {
             val config = JSONObject()
                 .put("channel", channel)
+                .put("topic", topic)
+                .put("start_index", startIndex)
                 .put("gateway", gatewayUrl)
                 .put("batch_id", batchId)
                 .put("bitrate_kbps", bitrateKbps)

@@ -107,9 +107,17 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
             _state.value = State.Failed("Connect a storage plan before going live.")
             return
         }
+        val ch = node.channel.value
+        if (!selfTest && ch == null) {
+            _state.value = State.Failed("The account is still loading; try again in a moment.")
+            return
+        }
         if (!selfTest) try {
+            ch!!.name = channel
             node.startPublisher(
                 channel = channel,
+                topic = ch.topic,
+                startIndex = ch.nextIndex,
                 batchId = plan!!.batchId,
                 bitrateKbps = settings.bitrateKbps,
                 segmentMs = settings.segmentSeconds * 1000,
@@ -130,9 +138,16 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         }
         _state.value = State.Live
         node.liveBroadcastActive = true
+        // Keeps capture and publishing alive when the app leaves the screen.
+        BroadcastService.start(context, channel, e.hasAudio)
         poll = scope.launch {
             while (isActive && selfTestDir == null) {
-                node.publisherProgress()?.let { _progress.value = it }
+                node.publisherProgress()?.let { p ->
+                    _progress.value = p
+                    // Saved as it advances, so the next broadcast continues
+                    // the feed even if this one is killed mid-stream.
+                    ch?.nextIndex = p.feedIndex
+                }
                 delay(1_000)
             }
         }
@@ -150,7 +165,6 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         }
         if (state.value == State.Stopping) return
         _state.value = State.Stopping
-        node.liveBroadcastActive = false
         poll?.cancel()
         poll = null
         engine?.let { e ->
@@ -161,15 +175,49 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
             pushQueue.shutdown()
             pushQueue.awaitTermination(5, TimeUnit.SECONDS)
         }
-        if (selfTestDir == null) try {
-            _report.value = node.stopPublisher()
+        // The foreground service stays up until the publisher has drained:
+        // in the background, Android freezes the app the moment it goes,
+        // and the closing playlist (#EXT-X-ENDLIST) would never land.
+        try {
+            if (selfTestDir == null) {
+                _report.value = node.stopPublisher().also { r -> node.channel.value?.nextIndex = r.feedIndex }
+            }
         } catch (e: Exception) {
             if (failure == null) {
                 _state.value = State.Failed(e.message ?: "could not stop the broadcast")
                 return
             }
+        } finally {
+            node.liveBroadcastActive = false
+            BroadcastService.stop(context)
         }
         _state.value = failure?.let { State.Failed(it) } ?: State.Idle
+    }
+
+    /**
+     * Swap the live preview: `null` when the screen goes away (capture
+     * continues into the encoder), a texture when it comes back.
+     */
+    fun setPreview(preview: SurfaceTexture?, onSwitched: () -> Unit = {}) {
+        val e = engine
+        if (e == null || !isBusy) {
+            onSwitched()
+            return
+        }
+        e.setPreview(preview, onSwitched)
+    }
+
+    /** The live screen's preview texture while it exists. */
+    @Volatile var previewTexture: SurfaceTexture? = null
+
+    /** The app left the screen: keep broadcasting, without a preview. */
+    fun onScreenHidden() {
+        if (isBusy) setPreview(null)
+    }
+
+    /** The app is back: show the preview again. */
+    fun onScreenShown() {
+        if (isBusy) previewTexture?.let { setPreview(it) }
     }
 
     /** Drop a prepared-but-unused engine (the live screen closed). */

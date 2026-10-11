@@ -14,6 +14,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,6 +31,8 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.playlist.HlsPlaylistTracker
+import kotlinx.coroutines.delay
 import androidx.media3.ui.PlayerView
 import at.vibing.ant.stream.AntNode
 
@@ -71,6 +74,7 @@ fun WatchScreen(node: AntNode, initialReference: String) {
 
         playing?.let { ref ->
             val url = "${node.gatewayUrl}/bzz/$ref/stream.m3u8"
+            var retries by remember(ref) { mutableStateOf(0) }
             val player = remember(ref) {
                 ExoPlayer.Builder(context).build().apply {
                     setMediaItem(
@@ -79,7 +83,21 @@ fun WatchScreen(node: AntNode, initialReference: String) {
                     addListener(
                         object : Player.Listener {
                             override fun onPlayerError(e: PlaybackException) {
-                                error = "${e.errorCodeName}: ${e.message}"
+                                // A live playlist that stops changing (a
+                                // broadcast that ended without closing its
+                                // playlist, or a feed not yet propagated) and
+                                // a 404 on a channel that is not live yet both
+                                // land here. Neither is final: reload the
+                                // channel, which also picks up a new broadcast.
+                                val stuck = generateSequence(e.cause) { it.cause }
+                                    .any { it is HlsPlaylistTracker.PlaylistStuckException }
+                                error = if (stuck) {
+                                    "No new video from this channel. The broadcast may have ended " +
+                                        "without closing; checking again…"
+                                } else {
+                                    "Can't load the channel yet (${e.errorCodeName}); retrying…"
+                                }
+                                retries += 1
                             }
 
                             override fun onPlaybackStateChanged(state: Int) {
@@ -92,6 +110,18 @@ fun WatchScreen(node: AntNode, initialReference: String) {
                 }
             }
             DisposableEffect(player) { onDispose { player.release() } }
+            LaunchedEffect(retries) {
+                if (retries == 0) return@LaunchedEffect
+                delay(8_000)
+                player.prepare()
+            }
+            LaunchedEffect(player) {
+                // Clear a stale retry message once video flows again.
+                while (true) {
+                    if (player.isPlaying) error = null
+                    delay(1_000)
+                }
+            }
             AndroidView(
                 factory = { PlayerView(it).apply { this.player = player } },
                 modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f),

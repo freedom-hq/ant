@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import at.vibing.ant.stream.AntNode
+import at.vibing.ant.stream.Channel
 import at.vibing.ant.stream.LiveBroadcast
 import at.vibing.ant.stream.formatBytes
 import kotlinx.coroutines.launch
@@ -69,7 +70,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     val progress by broadcast.progress.collectAsState()
     val report by broadcast.report.collectAsState()
     val captured by broadcast.captured.collectAsState()
-    var channel by rememberSaveable { mutableStateOf("My channel") }
+    var channel by rememberSaveable { mutableStateOf(node.channel.value?.name ?: "My channel") }
     var texture by remember { mutableStateOf<SurfaceTexture?>(null) }
     var permissionsAsked by remember { mutableStateOf(false) }
 
@@ -81,9 +82,14 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         micOk = granted(Manifest.permission.RECORD_AUDIO)
     }
     LaunchedEffect(Unit) {
-        if (!cameraOk || !micOk) {
+        val needsNotify = android.os.Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)
+        if (!cameraOk || !micOk || needsNotify) {
             permissionsAsked = true
-            launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+            // Notifications: the "Live on Swarm" notification of a broadcast
+            // that keeps running in the background (Android 13+).
+            val wanted = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+            if (android.os.Build.VERSION.SDK_INT >= 33) wanted += Manifest.permission.POST_NOTIFICATIONS
+            launcher.launch(wanted.toTypedArray())
         }
     }
 
@@ -115,6 +121,9 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
                                     setTransform(previewTransform(activity, w, h, size.width, size.height))
                                     texture = st
+                                    broadcast.previewTexture = st
+                                    // Back on a broadcast that kept running.
+                                    if (broadcast.isBusy) broadcast.setPreview(st)
                                 }
 
                                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
@@ -123,7 +132,12 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
 
                                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                                     texture = null
-                                    return true
+                                    broadcast.previewTexture = null
+                                    if (!broadcast.isBusy) return true
+                                    // The broadcast goes on: detach the camera from
+                                    // this texture first, then free it.
+                                    broadcast.setPreview(null) { st.release() }
+                                    return false
                                 }
 
                                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
@@ -212,7 +226,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Copy") }
                     OutlinedButton(
-                        onClick = { shareText(context, watchLinks(p.channelReference)) },
+                        onClick = { shareText(context, Channel.watchLinks(p.channelReference)) },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Share") }
                 }
@@ -236,19 +250,6 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
         }
     }
 }
-
-/**
- * What "Share" sends: the channel opened in the AntStream web player
- * (examples/antstream-player, on Swarm), for Freedom and for any browser.
- */
-fun watchLinks(channel: String): String =
-    "Watch my live stream on Swarm:\n" +
-        "Freedom browser: bzz://$PLAYER_REF/#$channel\n" +
-        "Any browser: https://api.gateway.ethswarm.org/bzz/$PLAYER_REF/#$channel\n" +
-        "Channel: $channel"
-
-/** The AntStream web player's Swarm reference. */
-const val PLAYER_REF = "b544057f99ba073bb6c9c88e5ee73f388c5a9da825b16d06eeda878e79b831a0"
 
 @Composable
 private fun Stat(label: String, value: String) {

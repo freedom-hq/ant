@@ -13,6 +13,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -21,6 +22,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import at.vibing.ant.stream.AntNode
+import at.vibing.ant.stream.Channel
+import kotlinx.coroutines.delay
 import at.vibing.ant.stream.LiveBroadcast
 import at.vibing.ant.stream.formatBytes
 
@@ -44,12 +47,20 @@ fun BroadcastScreen(
     val network by node.networkLabel.collectAsState()
     val hardware by node.keyHardwareBacked.collectAsState()
     val report by broadcast.report.collectAsState()
+    val channelRef by node.channelReference.collectAsState()
+    val channel by node.channel.collectAsState()
     val context = LocalContext.current
 
     val connected = !offline && status == AntNode.Status.Ready && peers > 0
     val hasPlan = plan?.enabled == true
     val settled = settlement?.enabled == true
     val ready = connected && hasPlan && settled && gatewayUp
+
+    // The permanent channel's link exists as soon as there is a plan to
+    // stamp its feed manifest with; retried until it lands.
+    LaunchedEffect(hasPlan, gatewayUp, channel) {
+        while (hasPlan && gatewayUp && node.ensureChannelReference() == null) delay(15_000)
+    }
 
     Column(
         Modifier
@@ -105,6 +116,30 @@ fun BroadcastScreen(
             Button(onClick = onGetStarted, modifier = Modifier.fillMaxWidth()) { Text("Get started") }
         }
         Button(onClick = onGoLive, enabled = ready || broadcast.selfTestDir != null, modifier = Modifier.fillMaxWidth()) { Text("Go live") }
+        if (hasPlan) {
+            SectionCard {
+                Text("Your channel", style = MaterialTheme.typography.titleMedium)
+                val ref = channelRef
+                if (ref == null) {
+                    Text("Creating your channel link…", color = Color.Gray)
+                } else {
+                    Text(
+                        "One link for all your broadcasts. Share it any time: viewers who open it " +
+                            "join whenever you're live, and see your last broadcast otherwise.",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    MonoText(ref)
+                    Button(onClick = { shareText(context, Channel.watchLinks(ref)) }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Share channel link")
+                    }
+                    OutlinedButton(onClick = { copyToClipboard(context, "Channel", ref) }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Copy channel reference")
+                    }
+                    OutlinedButton(onClick = { onWatch(ref) }, modifier = Modifier.fillMaxWidth()) { Text("Watch") }
+                }
+            }
+        }
         report?.let { r ->
             SectionCard {
                 Text("Last broadcast", style = MaterialTheme.typography.titleMedium)

@@ -56,6 +56,8 @@ class CaptureEngine(
     private val encoderHandler = Handler(encoderThread.looper)
 
     private var camera: CameraDevice? = null
+    private var chars: CameraCharacteristics? = null
+    private var previewSurface: Surface? = null
     private var session: CameraCaptureSession? = null
     private var videoCodec: MediaCodec? = null
     private var encoderSurface: Surface? = null
@@ -94,6 +96,7 @@ class CaptureEngine(
         running = true
         if (!::videoSize.isInitialized) prepare()
         val chars = cameraManager.getCameraCharacteristics(cameraId)
+        this.chars = chars
         realtimeClock = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
             CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
         val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -113,13 +116,13 @@ class CaptureEngine(
         audioRecord?.let { record -> audioThread = Thread({ runAudio(record) }, "antstream.audio").apply { start() } }
 
         preview.setDefaultBufferSize(videoSize.width, videoSize.height)
-        val previewSurface = Surface(preview)
+        previewSurface = Surface(preview)
         cameraManager.openCamera(
             cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     camera = device
-                    startSession(device, previewSurface, chars)
+                    startSession(device)
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
@@ -138,20 +141,53 @@ class CaptureEngine(
         )
     }
 
+    /**
+     * Swap the preview while capture keeps running: `null` when the app
+     * leaves the screen (the broadcast continues into the encoder alone),
+     * a fresh texture when it comes back. The camera session is rebuilt
+     * with the new outputs; [onSwitched] runs once the old preview
+     * surface is no longer in use, so the caller can release its texture.
+     */
+    fun setPreview(preview: SurfaceTexture?, onSwitched: () -> Unit = {}) {
+        cameraHandler.post {
+            val old = previewSurface
+            previewSurface = preview?.let {
+                it.setDefaultBufferSize(videoSize.width, videoSize.height)
+                Surface(it)
+            }
+            val device = camera
+            if (!running || device == null) {
+                old?.release()
+                onSwitched()
+                return@post
+            }
+            runCatching { session?.stopRepeating() }
+            runCatching { session?.close() }
+            session = null
+            startSession(device) {
+                old?.release()
+                onSwitched()
+            }
+        }
+    }
+
     @Suppress("DEPRECATION")
-    private fun startSession(device: CameraDevice, previewSurface: Surface, chars: CameraCharacteristics) {
+    private fun startSession(device: CameraDevice, onConfigured: (() -> Unit)? = null) {
         val encoderSurface = encoderSurface ?: return
+        val chars = chars ?: return
+        val preview = previewSurface
         device.createCaptureSession(
-            listOf(previewSurface, encoderSurface),
+            listOfNotNull(preview, encoderSurface),
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
+                    onConfigured?.invoke()
                     if (!running) {
                         s.close()
                         return
                     }
                     session = s
                     val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(previewSurface)
+                        preview?.let { addTarget(it) }
                         addTarget(encoderSurface)
                         chooseFpsRange(chars)?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
                         set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
@@ -161,6 +197,7 @@ class CaptureEngine(
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
+                    onConfigured?.invoke()
                     fail("the camera could not be configured at ${videoSize.width}x${videoSize.height}")
                 }
             },
@@ -184,6 +221,8 @@ class CaptureEngine(
             runCatching { camera?.close() }
             session = null
             camera = null
+            previewSurface?.release()
+            previewSurface = null
             encoderHandler.post {
                 runCatching { videoCodec?.stop() }
                 runCatching { videoCodec?.release() }
