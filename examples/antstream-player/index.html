@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AntStream Player</title>
+<link rel="stylesheet" href="player.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>AntStream <span>Player</span></h1>
+    <form id="channel-form" autocomplete="off">
+      <input id="channel-input" placeholder="Channel reference (64 hex), bzz://… link or ENS name" spellcheck="false">
+      <button type="submit">Watch</button>
+    </form>
+  </header>
+
+  <section id="stage" hidden>
+    <div class="video-wrap">
+      <video id="video" controls playsinline muted></video>
+      <div id="badge" class="badge">CONNECTING</div>
+      <div id="overlay" class="overlay" hidden></div>
+    </div>
+    <div class="bar">
+      <span id="status">Connecting…</span>
+      <span class="spacer"></span>
+      <button id="go-live" type="button" hidden>Jump to live</button>
+      <button id="unmute" type="button">Unmute</button>
+      <button id="copy-link" type="button">Copy link</button>
+    </div>
+    <dl class="stats">
+      <div><dt>Behind live</dt><dd id="stat-latency">–</dd></div>
+      <div><dt>Buffer</dt><dd id="stat-buffer">–</dd></div>
+      <div><dt>Segment fetch</dt><dd id="stat-fetch">–</dd></div>
+      <div><dt>Throughput</dt><dd id="stat-bw">–</dd></div>
+      <div><dt>Segments</dt><dd id="stat-segments">–</dd></div>
+      <div><dt>Resolution</dt><dd id="stat-res">–</dd></div>
+    </dl>
+    <p class="channel">Channel <code id="channel-ref"></code></p>
+  </section>
+
+  <section id="intro">
+    <p>Paste the channel reference an AntStream broadcaster shared (the Android
+      or iOS app shows it on the live screen). The player follows the channel's
+      Swarm feed and keeps you at the live edge; a finished broadcast plays back
+      from the start.</p>
+    <ul id="recent"></ul>
+  </section>
+
+  <footer>Served from Swarm · plays through your browser's own node in
+    <a href="https://freedom.baby">Freedom</a>, or through any bee/ant gateway.</footer>
+</main>
+<script src="vendor/hls.light.min.js"></script>
+<script src="player.js"></script>
+</body>
+</html>
