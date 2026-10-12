@@ -2583,7 +2583,10 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 }
 
 /// Fund this account's chequebook up to the settlement deposit target
-/// (0.001 xBZZ), funding **only with xDAI**: the node swaps the xBZZ
+/// for its storage plan
+/// (`ant_chain::chequebook_store::deposit_target_for_depth` of its
+/// deepest usable batch: 0.1 xBZZ at depth 21, doubling per level;
+/// 0.001 xBZZ with no plan), funding **only with xDAI**: the node swaps the xBZZ
 /// shortfall on-chain if it doesn't already hold it, then transfers the
 /// deposit to the chequebook. The explicit top-up path — a chequebook's
 /// deposit is only read at deploy time, so an already-deployed one can be
@@ -2975,8 +2978,8 @@ pub unsafe extern "C" fn ant_storage_discover_full(
 /// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy —
 /// though one still short of its settlement deposit is topped up from
 /// spare xBZZ. Otherwise this signs an on-chain `factory.deploySimpleSwap`
-/// (issuer = node EOA), funds it with the 0.001 xBZZ settlement deposit
-/// so its cheques are actually backed, persists the association, and
+/// (issuer = node EOA), funds it with the settlement deposit for the
+/// account's storage plan so its cheques are actually backed, persists the association, and
 /// returns the new address. These are on-chain transactions: they spend
 /// gas plus the deposit and **block** until confirmed. Light-mode
 /// (`chain`-feature) builds only.
@@ -3021,9 +3024,9 @@ pub unsafe extern "C" fn ant_deploy_chequebook(
 
 /// Price a storage plan: returns a JSON object with the plan cost
 /// (`total_cost_plur` / `total_cost_bzz`), the one-time settlement
-/// deposit the account's chequebook still needs
-/// (`settlement_deposit_plur` / `settlement_deposit_bzz`, zero once it is
-/// funded), the account's xBZZ / xDAI balances, and whether they cover
+/// deposit the account's chequebook still needs to reach the target for
+/// a `depth` plan (`settlement_deposit_plur` / `settlement_deposit_bzz`,
+/// zero once it is funded that far), the account's xBZZ / xDAI balances, and whether they cover
 /// the lot — the "payment information" the Get Started flow shows before
 /// activating. The all-in figures (`needed_bzz`, `xdai_required`,
 /// `xdai_to_send`, `sufficient_funds`) include the deposit, because

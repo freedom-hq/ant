@@ -344,8 +344,11 @@ pub unsafe extern "C" fn ant_start_gateway(
                 handle.gateway_chequebook.clone(),
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
-                // The storage flows keep the chequebook at the shared
-                // 0.001 xBZZ deposit, so `/v0/storage/quote` prices it in.
+                // The chain writer takes one flat deposit target, so its
+                // `/v0/storage/quote` and `/v0/settlement/deposit` use the
+                // shared 0.001 xBZZ default. The C API's storage flows
+                // size theirs by the plan's depth instead
+                // (`deposit_target_for_depth`).
                 Some(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR),
                 // Host-provided chain transport (issue #77), if the app
                 // installed one with `ant_set_chain_transport` before

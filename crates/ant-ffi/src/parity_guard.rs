@@ -92,6 +92,12 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
          restart may come without an RPC, so it drops the unfinished status; `antd`'s retry \
          runs for the process lifetime, so its status is never abandoned",
     ),
+    (
+        "deposit_target_for_depth",
+        Side::Ffi,
+        "the app library sizes the chequebook deposit by the storage plan's depth; `antd` takes \
+         a flat operator-chosen deposit (`--chequebook-deposit-plur`) instead",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
