@@ -79,3 +79,17 @@ fun shareText(context: Context, text: String) {
     }
     context.startActivity(Intent.createChooser(intent, null))
 }
+
+/**
+ * xDAI must arrive on Gnosis Chain: the same address exists on Ethereum and
+ * every other EVM chain, and funds sent there never reach this node.
+ */
+@Composable
+fun GnosisOnlyNote() {
+    Text(
+        "Only on Gnosis Chain (chain ID 100). Don't send from Ethereum mainnet or another network: " +
+            "the address is the same there, but those funds won't reach your node.",
+        color = Amber,
+        style = MaterialTheme.typography.bodySmall,
+    )
+}

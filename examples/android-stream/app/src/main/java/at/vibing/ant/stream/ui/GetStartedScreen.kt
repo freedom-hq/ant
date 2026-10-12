@@ -3,6 +3,7 @@ package at.vibing.ant.stream.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -145,7 +146,7 @@ fun GetStartedScreen(node: AntNode, onClose: () -> Unit) {
                             }
                             val price = quotes[t.id]
                             when {
-                                price != null -> Text("${price.xdaiToSendDisplay} xDAI", fontWeight = FontWeight.Bold)
+                                price != null -> Text("${roundedUpXdai(price.xdaiToSendDisplay)} xDAI", fontWeight = FontWeight.Bold)
                                 loading -> CircularProgressIndicator()
                                 else -> Text("›")
                             }
@@ -161,14 +162,28 @@ fun GetStartedScreen(node: AntNode, onClose: () -> Unit) {
                 } else if (q.sufficientFunds) {
                     Text("Payment received", color = Green, style = MaterialTheme.typography.titleLarge)
                 } else {
+                    val send = roundedUpXdai(q.xdaiToSendDisplay)
                     SectionCard {
                         Text("Send", color = Color.Gray)
-                        Text("${q.xdaiToSendDisplay} xDAI", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-                        Text("on Gnosis Chain to", color = Color.Gray)
+                        Text("$send xDAI", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                        GnosisOnlyNote()
                         account?.let { a ->
+                            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                PaymentQr(address = a.ethAddress, xdaiAmount = send)
+                            }
+                            Text(
+                                "Scan with your wallet: it fills in the address, the Gnosis network and $send xDAI.",
+                                color = Color.Gray,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                             MonoText(a.ethAddress)
-                            OutlinedButton(onClick = { copyToClipboard(context, "Address", a.ethAddress) }) {
-                                Text("Copy address")
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { copyToClipboard(context, "Address", a.ethAddress) }) {
+                                    Text("Copy address")
+                                }
+                                OutlinedButton(onClick = { copyToClipboard(context, "Amount", send) }) {
+                                    Text("Copy amount")
+                                }
                             }
                         }
                         if ((q.settlementDepositPlur.toBigIntegerOrNull()?.signum() ?: 0) > 0) {

@@ -1,6 +1,7 @@
 package at.vibing.ant.stream.ui
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,6 +24,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -89,7 +91,11 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
         SectionCard {
             Text("Account", style = MaterialTheme.typography.titleMedium)
             account?.let { a ->
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    PaymentQr(address = a.ethAddress, size = 160.dp)
+                }
                 MonoText(a.ethAddress)
+                GnosisOnlyNote()
                 OutlinedButton(onClick = { copyToClipboard(context, "Address", a.ethAddress) }) { Text("Copy address") }
                 Text(a.agent, color = Color.Gray, style = MaterialTheme.typography.bodySmall)
             }
