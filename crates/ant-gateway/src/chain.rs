@@ -553,9 +553,11 @@ struct ChequebookBalanceBody {
     )]
     available_balance_error: Option<String>,
     /// Set while this chequebook's cheque figures are lost — the node's
-    /// outbound ledger was unparseable and moved aside, and no operator
-    /// has confirmed the outstanding liability since — saying so and how
-    /// to clear it. Downloads don't pay from the chequebook meanwhile.
+    /// outbound ledger was unparseable and moved aside, or its pre-section
+    /// figures may belong to this chequebook (an unparsable fresh-chequebook
+    /// marker, or a fresh deploy that couldn't be recorded as such), and no
+    /// operator has confirmed the outstanding liability since — saying
+    /// which and how to clear it. Downloads don't pay from the chequebook meanwhile.
     /// Not a bee field.
     #[serde(rename = "chequeLedgerLost", skip_serializing_if = "Option::is_none")]
     cheque_ledger_lost: Option<String>,
@@ -580,8 +582,9 @@ struct ChequebookBalanceBody {
 /// `totalBalance`, with `availableBalance` set to it and
 /// `availableBalanceError` saying it isn't the real figure. The same
 /// holds when the ledger lost this chequebook's figures (moved aside as
-/// unparseable, PR #126 R4-M1); `chequeLedgerLost` then says so and how
-/// an operator clears it.
+/// unparseable, PR #126 R4-M1, or see `chequeLedgerLost`'s field doc for
+/// the other causes); `chequeLedgerLost` then says which and how an
+/// operator clears it.
 pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response {
     let zero = || {
         Json(ChequebookBalanceBody {

@@ -1642,7 +1642,11 @@ pub unsafe extern "C" fn ant_swap_status(
 /// terminated) after its cheque figures were lost, and let the node pay
 /// cheques from it again, for downloads and uploads alike. When the
 /// node's outbound cheque ledger (`pushsync_outbound.json`) is found
-/// unparseable it is moved aside and a `.lost` marker is left; while that
+/// unparseable it is moved aside and a `.lost` marker is left (as it is
+/// when the ledger written before per-chequebook sections may belong to a
+/// chequebook: its fresh-chequebook marker is unparsable, or a fresh
+/// deploy couldn't be recorded as such — the latter is lifted again once
+/// the record is written); while that
 /// marker names a loss, the node pays no cheques (downloads or uploads;
 /// both stay on the free pseudosettle tier) from any chequebook that
 /// used the file (logged at warn,

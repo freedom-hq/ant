@@ -1921,6 +1921,23 @@ fn mark_legacy_figures_lost(
     Ok(())
 }
 
+/// Prefix of a loss in [`LostMarker::moved_aside`] that isn't a ledger
+/// moved aside to the path it names: the rest of the entry says what it
+/// was (PR #156 R4-M2).
+const NOT_MOVED: &str = "not moved: ";
+
+/// One recorded loss, worded for the operator: a ledger moved aside to
+/// the path an entry names, or an entry's own description.
+fn describe_loss(entry: &str) -> String {
+    if let Some(why) = entry.strip_prefix(NOT_MOVED) {
+        why.to_string()
+    } else if entry.starts_with("unknown: ") {
+        entry.to_string()
+    } else {
+        format!("the outbound cheque ledger was unparseable and moved aside to {entry}")
+    }
+}
+
 /// Why `chequebook`'s figures in the ledger at `path` are unknown, or
 /// `None` if they are known. A marker that can't be read counts as a
 /// loss: the answer gates money.
@@ -1930,11 +1947,15 @@ fn lost_figures_at(path: &Path, chequebook: &[u8; 20]) -> Option<String> {
         Ok(None) => None,
         Ok(Some(m)) if m.clears(&key) => None,
         Ok(Some(m)) => Some(format!(
-            "the outbound cheque ledger was unparseable and moved aside ({}), so the \
-             cheques chequebook 0x{key} issued before are unknown; downloads and \
-             uploads stay on the free tier until an operator confirms its outstanding liability \
+            "outbound cheque figures may have been lost ({}), so the cheques \
+             chequebook 0x{key} issued before are unknown; downloads and uploads stay \
+             on the free tier until an operator confirms its outstanding liability \
              (antd --confirm-cheque-liability 0x{key}, or ant_confirm_cheque_liability)",
-            m.moved_aside.join(", "),
+            m.moved_aside
+                .iter()
+                .map(|l| describe_loss(l))
+                .collect::<Vec<_>>()
+                .join("; "),
         )),
         Err(e) => Some(format!(
             "can't read the lost-ledger marker {} ({e}), so chequebook 0x{key}'s cheque \
@@ -2018,7 +2039,9 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
 /// those cumulatives (PR #156 R2-M1). With no loss on record a new one
 /// is recorded for it, sparing the chequebooks with sections of their
 /// own (PR #156 R3-M1). Until a restart this process also remembers it
-/// as fresh, so it adopts nothing, and retries the record at each load.
+/// as fresh, so it adopts nothing, and retries the record at each load;
+/// once that lands, the gate it was put behind is lifted again (PR #156
+/// R4-M1).
 /// Without a pre-section ledger the
 /// fresh record doesn't matter and the known record is made anyway. The
 /// error names which record failed (and the consequence).
@@ -2041,18 +2064,18 @@ pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Resu
         && read_outbound_file(path)
             .map_or(true, |f| f.is_some_and(|f| f.chequebooks.contains_key("")));
     let known = if adoption_risk {
-        // This process remembers it as fresh whatever happens below, and
-        // retries the record at every load ([`load_outbound_section`]).
-        unrecorded_fresh(path, &key, true);
         // Across a restart only the loss gate holds: put one on record
         // for it if there is none (sparing every chequebook that provably
-        // doesn't own the pre-section figures), and never clear it.
+        // doesn't own the pre-section figures). Only the retried fresh
+        // record lifts it ([`lift_fresh_gate`]).
         let gated = match read_lost_marker(path) {
             Ok(None) => mark_legacy_figures_lost(
                 path,
                 &format!(
-                    "not moved: chequebook 0x{key} was deployed fresh but couldn't be \
-                     recorded as such, so it may adopt the pre-section ledger"
+                    "{NOT_MOVED}chequebook 0x{key} was deployed fresh but couldn't be \
+                     recorded as such in {}, so it may adopt the cheque ledger written \
+                     before per-chequebook sections",
+                    fresh_marker_path(path).display(),
                 ),
                 Some(chequebook),
             )
@@ -2061,6 +2084,21 @@ pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Resu
             Ok(Some(_)) => Ok(()),
             Err(e) => Err(format!("and the lost-ledger marker can't be read ({e})")),
         };
+        // This process remembers it as fresh whatever happened above, and
+        // retries the record at every load ([`load_outbound_section`]).
+        // With the gate in place, how many losses were on record then:
+        // once the record lands, the gate is lifted unless a later loss
+        // came in meanwhile (PR #156 R4-M1).
+        let gate = gated
+            .is_ok()
+            .then(|| {
+                read_lost_marker(path)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.moved_aside.len())
+            })
+            .flatten();
+        unrecorded_fresh_insert(path, &key, gate);
         Err(std::io::Error::other(match gated {
             Ok(()) => "not recorded as known in the lost-ledger marker either, so it can't \
                  pay before adopting another chequebook's cumulatives; downloads and uploads \
@@ -2089,33 +2127,87 @@ pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Resu
     }
 }
 
-/// Chequebooks deployed fresh in this process whose fresh record
-/// couldn't be written, by ledger file (PR #156 R3-M1).
-static UNRECORDED_FRESH: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+/// A chequebook deployed fresh in this process whose fresh record
+/// couldn't be written (PR #156 R3-M1).
+struct UnrecordedFresh {
+    path: PathBuf,
+    key: String,
+    /// Set when [`note_fresh_chequebook`] put it behind the loss gate
+    /// instead: how many losses the marker held then. The gate only
+    /// stands in for the missing record, so it is lifted once the record
+    /// lands, unless a loss came in since (PR #156 R4-M1).
+    gate: Option<usize>,
+}
 
-/// Whether `key` is in [`UNRECORDED_FRESH`] for `path`; `insert` adds it.
-fn unrecorded_fresh(path: &Path, key: &str, insert: bool) -> bool {
-    let mut set = UNRECORDED_FRESH
+/// [`UnrecordedFresh`] chequebooks, all ledger files.
+static UNRECORDED_FRESH: Mutex<Vec<UnrecordedFresh>> = Mutex::new(Vec::new());
+
+fn unrecorded_fresh_set() -> std::sync::MutexGuard<'static, Vec<UnrecordedFresh>> {
+    UNRECORDED_FRESH
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let listed = set.iter().any(|(p, k)| p == path && k == key);
-    if insert && !listed {
-        set.push((path.to_path_buf(), key.to_string()));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Add `key` to [`UNRECORDED_FRESH`] for `path`, or update its gate.
+fn unrecorded_fresh_insert(path: &Path, key: &str, gate: Option<usize>) {
+    let mut set = unrecorded_fresh_set();
+    match set.iter_mut().find(|u| u.path == path && u.key == key) {
+        Some(u) => u.gate = gate,
+        None => set.push(UnrecordedFresh {
+            path: path.to_path_buf(),
+            key: key.to_string(),
+            gate,
+        }),
     }
-    listed
+}
+
+/// Lift the loss gate [`note_fresh_chequebook`] put `key` behind in
+/// place of its fresh record, now that the record is written: a
+/// chequebook deployed fresh issued no cheques before any loss on record
+/// then. Not if a loss came in since (the marker holds more, or was
+/// replaced): the chequebook may have paid in between, after an operator
+/// confirmed it. Caller holds [`OUTBOUND_FILE_LOCK`].
+fn lift_fresh_gate(path: &Path, key: &str, gate: usize) {
+    let lifted = match read_lost_marker(path) {
+        Ok(Some(m)) if m.moved_aside.len() == gate && !m.clears(key) => note_known(path, key),
+        Ok(_) => return,
+        Err(e) => Err(e),
+    };
+    match lifted {
+        Ok(()) => info!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            "recorded the freshly deployed chequebook at last; lifted the loss gate \
+             that stood in for the record",
+        ),
+        Err(e) => warn!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            "recorded the freshly deployed chequebook at last, but can't lift the loss \
+             gate that stood in for the record ({e}); it stays on the free tier until an \
+             operator confirms its liability",
+        ),
+    }
 }
 
 /// Whether `key` counts as deployed fresh for the ledger at `path`:
 /// listed in the fresh marker, or deployed in this process with a fresh
-/// record that failed — then the record is retried. Caller holds
-/// [`OUTBOUND_FILE_LOCK`].
+/// record that failed — then the record is retried, and once it lands
+/// the loss gate standing in for it is lifted ([`lift_fresh_gate`]).
+/// Caller holds [`OUTBOUND_FILE_LOCK`].
 fn is_fresh(path: &Path, key: &str) -> std::io::Result<bool> {
-    if unrecorded_fresh(path, key, false) {
+    let pending = unrecorded_fresh_set()
+        .iter()
+        .find(|u| u.path == path && u.key == key)
+        .map(|u| u.gate);
+    if let Some(gate) = pending {
         match note_fresh(path, key) {
-            Ok(()) => UNRECORDED_FRESH
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|(p, k)| !(p == path && k == key)),
+            Ok(()) => {
+                unrecorded_fresh_set().retain(|u| !(u.path == path && u.key == key));
+                if let Some(gate) = gate {
+                    lift_fresh_gate(path, key, gate);
+                }
+            }
             Err(e) => warn!(
                 target: "ant_p2p::swap",
                 chequebook = %key,
@@ -2198,7 +2290,14 @@ fn recover_fresh_marker(
         // The loss goes on record first: the pre-section figures stop
         // being adopted by anyone once the marker is replaced. Only their
         // owner loses them, and it has no section of its own yet.
-        mark_legacy_figures_lost(path, &aside.display().to_string(), None)
+        let why = format!(
+            "{NOT_MOVED}the fresh-chequebook marker {} was unparsable (kept as {}), so \
+             which chequebook owns the cheque ledger written before per-chequebook \
+             sections is unknown",
+            marker.display(),
+            aside.display(),
+        );
+        mark_legacy_figures_lost(path, &why, None)
             .map_err(|e| unparsable(format!("can't record the loss: {e}")))?;
     }
     std::fs::copy(&marker, &aside)
@@ -2620,8 +2719,10 @@ impl OutboundLedger {
     }
 
     /// Why this chequebook's figures are unknown — the ledger file was
-    /// unparseable and moved aside, and no operator has confirmed the
-    /// chequebook's outstanding liability since (see the type docs) —
+    /// unparseable and moved aside, or the pre-section figures may be
+    /// its own (an unparsable fresh marker, a fresh deploy that couldn't
+    /// be recorded), and no operator has confirmed the chequebook's
+    /// outstanding liability since (see the type docs) —
     /// or `None` while they are known. No cheque, for downloads or
     /// uploads, is paid while this is `Some`. Checked against the marker on
     /// every call, so a loss or a confirmation shows at once in every
@@ -3610,7 +3711,13 @@ mod tests {
 
         let err = note_fresh_chequebook(&path, cb).unwrap_err();
         assert!(err.to_string().contains("free tier"), "{err}");
-        assert!(lost_figures_at(&path, &cb).is_some(), "gated");
+        let why = lost_figures_at(&path, &cb).expect("gated");
+        // Says what was lost, not that a ledger was moved aside (R4-M2).
+        assert!(
+            why.contains("deployed fresh but couldn't be recorded"),
+            "{why}"
+        );
+        assert!(!why.contains("moved aside"), "{why}");
         assert!(
             lost_figures_at(&path, &other).is_none(),
             "own section, spared"
@@ -3626,6 +3733,75 @@ mod tests {
         let fresh: Vec<String> =
             serde_json::from_slice(&std::fs::read(fresh_marker_path(&path)).unwrap()).unwrap();
         assert!(listed_fresh(&fresh, &hex::encode(cb)));
+        // And the gate that stood in for the record is lifted (R4-M1).
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        assert!(
+            ledger.lost_figures().is_none(),
+            "{:?}",
+            ledger.lost_figures()
+        );
+        assert_eq!(
+            ledger.cumulative_for(&peer),
+            U256::zero(),
+            "still not adopted"
+        );
+    }
+
+    /// The retried fresh record lifts the gate only while no loss came
+    /// in after the deploy: once one did, the chequebook may have paid
+    /// in between (after an operator confirmed it), so its figures may
+    /// be lost and it stays gated (PR #156 R4-M1).
+    #[test]
+    fn a_retried_fresh_record_keeps_a_later_loss_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc2u8; 20];
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            format!(r#"{{"{}":"5543284090100"}}"#, hex::encode(peer)),
+        )
+        .unwrap();
+        std::fs::create_dir(fresh_marker_path(&path)).unwrap();
+        note_fresh_chequebook(&path, cb).unwrap_err();
+        assert!(lost_figures_at(&path, &cb).is_some(), "gated");
+        // A later loss, after the operator confirmed it.
+        assert!(confirm_cheque_liability(&path, cb).unwrap());
+        mark_figures_lost(&path, &dir.path().join("later.corrupt")).unwrap();
+
+        std::fs::remove_dir(fresh_marker_path(&path)).unwrap();
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        ledger.ensure_readable().unwrap();
+        let why = ledger.lost_figures().expect("still gated");
+        assert!(why.contains("moved aside to"), "{why}");
+        assert!(why.contains("later.corrupt"), "{why}");
+    }
+
+    /// A loss already on record when the fresh record fails predates the
+    /// deploy, so the retried record lifts the gate on it too (R4-M1).
+    #[test]
+    fn a_retried_fresh_record_lifts_an_earlier_loss_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        std::fs::write(
+            &path,
+            br#"{"1111111111111111111111111111111111111111":"5543284090100"}"#,
+        )
+        .unwrap();
+        mark_figures_lost(&path, &dir.path().join("earlier.corrupt")).unwrap();
+        let cb = [0xc3u8; 20];
+        std::fs::create_dir(fresh_marker_path(&path)).unwrap();
+        note_fresh_chequebook(&path, cb).unwrap_err();
+        assert!(lost_figures_at(&path, &cb).is_some(), "gated");
+
+        std::fs::remove_dir(fresh_marker_path(&path)).unwrap();
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        ledger.ensure_readable().unwrap();
+        assert!(
+            ledger.lost_figures().is_none(),
+            "{:?}",
+            ledger.lost_figures()
+        );
     }
 
     /// Nothing can be written at all (a read-only data dir): the deploy

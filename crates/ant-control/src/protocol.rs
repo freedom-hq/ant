@@ -515,9 +515,11 @@ pub struct AccountingSnapshotView {
     #[serde(default)]
     pub cheques_issued_chequebook: Option<String>,
     /// Set when that chequebook's figures were lost — the outbound
-    /// ledger file was unparseable and moved aside, and no operator has
-    /// confirmed the chequebook's outstanding liability since — saying
-    /// so and how to clear it. `cheques_issued_plur` then counts only
+    /// ledger file was unparseable and moved aside, or its pre-section
+    /// figures may belong to it (an unparsable fresh-chequebook marker,
+    /// or a fresh deploy that couldn't be recorded as such), and no
+    /// operator has confirmed the chequebook's outstanding liability
+    /// since — saying which and how to clear it. `cheques_issued_plur` then counts only
     /// the cheques issued after the loss, and downloads don't pay from
     /// this chequebook (PR #126 R4-M1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
