@@ -1942,9 +1942,59 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
 /// loss on record. A marker that can't be read is left alone (the
 /// chequebook stays lost until an operator confirms it) and the error
 /// returned.
+///
+/// It also records `chequebook` as fresh in `<path>.fresh`, so a ledger
+/// written before per-chequebook sections is never adopted into it: those
+/// cumulatives were issued from some earlier chequebook, and carried into
+/// one that has paid nobody they would make its first cheque to each of
+/// those beneficiaries claim the old total. Bee credits a cheque as its
+/// cumulative minus the last one *from that chequebook*, so the peer
+/// would book (and could cash) far more than it was owed, and our own
+/// funds check would count the old totals as issued and drain the
+/// deposit in minutes. Seen live on 2026-10-12: a fresh 0.01 xBZZ
+/// chequebook read as spent two minutes after deploy.
 pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Result<()> {
     let _file = lock_file();
-    note_known(path, &hex::encode(chequebook))
+    let key = hex::encode(chequebook);
+    note_fresh(path, &key)?;
+    note_known(path, &key)
+}
+
+/// Where [`note_fresh_chequebook`] lists the chequebooks deployed fresh
+/// next to the ledger at `path`.
+fn fresh_marker_path(path: &Path) -> PathBuf {
+    path.with_extension("json.fresh")
+}
+
+/// Chequebooks recorded as freshly deployed for the ledger at `path`.
+/// A missing or unreadable marker lists none.
+fn fresh_chequebooks(path: &Path) -> Vec<String> {
+    std::fs::read(fresh_marker_path(path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Add `key` to the fresh marker (durably). Caller holds
+/// [`OUTBOUND_FILE_LOCK`].
+fn note_fresh(path: &Path, key: &str) -> std::io::Result<()> {
+    let mut fresh = fresh_chequebooks(path);
+    if fresh.iter().any(|k| k == key) {
+        return Ok(());
+    }
+    fresh.push(key.to_string());
+    let marker = fresh_marker_path(path);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = marker.with_extension("fresh.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&fresh).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &marker)?;
+    sync_parent_dir(&marker)
 }
 
 /// Add `key` to the marker's known chequebooks. Caller holds
@@ -1972,7 +2022,15 @@ fn load_outbound_section(
 ) -> std::io::Result<usize> {
     let mut file = read_outbound_file(path)?.unwrap_or_default();
     let entries = file.entries();
-    if let Some(legacy) = file.chequebooks.remove("") {
+    // Never into a chequebook deployed fresh: see `note_fresh_chequebook`.
+    if file.chequebooks.contains_key("") && fresh_chequebooks(path).iter().any(|k| k == key) {
+        info!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            "not adopting the pre-section outbound ledger into a freshly deployed chequebook: \
+             it has paid nobody",
+        );
+    } else if let Some(legacy) = file.chequebooks.remove("") {
         info!(
             target: "ant_p2p::swap",
             chequebook = %key,
@@ -2733,19 +2791,20 @@ pub async fn open_settlement(
     Ok((stream, rates))
 }
 
-/// Write `signed` on a stream from [`open_settlement`] and close our
-/// side. The recipient may hold the cheque from here on (and even if
+/// Write `signed` on a stream from [`open_settlement`]. Our side stays
+/// open until [`await_processed`] has read the recipient's verdict (see
+/// there). The recipient may hold the cheque from here on (and even if
 /// this fails halfway), so the caller counts it as issued before calling
-/// this; [`await_processed`] tells when the recipient is done with it.
+/// this.
 pub async fn write_cheque(stream: &mut Stream, signed: &SignedCheque) -> Result<(), SwapError> {
     let body = encode_signed_cheque_json(signed);
     write_delimited(stream, &EmitChequePb { cheque: body }).await?;
-    stream.close().await?;
+    stream.flush().await?;
     Ok(())
 }
 
 /// Wait for the recipient of a cheque from [`write_cheque`] to finish
-/// with the stream.
+/// with the stream, and learn whether it accepted the cheque.
 ///
 /// Bee's swap handler runs `ReceiveCheque` (signature, chequebook and
 /// balance checks, then `NotifyPaymentReceived`) before it closes the
@@ -2756,23 +2815,121 @@ pub async fn write_cheque(stream: &mut Stream, signed: &SignedCheque) -> Result<
 /// recipient past its disconnect limit, and bee blocklists the payer
 /// (`debitAction.Apply`).
 ///
-/// Bee ends the stream with `FullClose` only after `ReceiveCheque`
-/// succeeded and with `Reset` on any failure (`swapprotocol.handler`,
-/// bee 7515c4c). rust-yamux 0.13 can't tell them apart: a remote `RST`
-/// and a dropped connection (`drop_all_streams`) both move the stream to
-/// `Closed`, which reads as a clean end of stream (`Ok(0)`), exactly like
-/// a `FIN`. So `Ok` here means only that the stream ended, and `Err` that
-/// it failed some other way. The payer adds the signal it does have: no
-/// connection to the peer — the cheque's own or a duplicate — may close
-/// within a moment after (`crate::PushsyncSwap`, `DELIVERY_GRACE`). A refusal that resets only the stream, with the
-/// connection kept, still reads as delivered.
+/// Bee ends the stream with `FullClose` (a `FIN`, then it waits for ours)
+/// only after `ReceiveCheque` succeeded, and with `Reset` on any failure
+/// (`swapprotocol.handler`). rust-yamux 0.13 reads both as a clean end of
+/// stream (`Ok(0)`), so the read alone can't tell an accepted cheque from
+/// a refused one. Their states differ, though, as long as *our* side is
+/// still open: a `FIN` only closes the recipient's half (we can still
+/// write), a `RST` or a dropped connection closes the stream entirely
+/// (every write fails with `WriteZero`). So [`write_cheque`] leaves our
+/// half open, and once the recipient's end is read a zero-length write
+/// asks which it was: it fails on a refused or lost cheque. On an
+/// accepted one we then close our half, which completes bee's
+/// `FullClose`. The payer still watches the connection for a moment
+/// after (`crate::PushsyncSwap`, `DELIVERY_GRACE`).
 pub async fn await_processed(mut stream: Stream) -> Result<(), SwapError> {
+    await_verdict(&mut stream).await
+}
+
+/// [`await_processed`] on any stream.
+async fn await_verdict<S>(stream: &mut S) -> Result<(), SwapError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
     let mut rest = Vec::new();
     stream
         .read_to_end(&mut rest)
         .await
         .map_err(|e| SwapError::Rejected(format!("cheque stream failed: {e}")))?;
+    if let Err(e) = stream.write(&[]).await {
+        return Err(SwapError::Rejected(format!(
+            "the recipient reset the cheque stream (refused or lost): {e}"
+        )));
+    }
+    let _ = stream.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::await_verdict;
+    use futures::future::poll_fn;
+    use futures::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    /// A yamux connection pair over an in-memory pipe: the dialer's side
+    /// of one stream, and the listener's side of it.
+    async fn stream_pair() -> (yamux::Stream, yamux::Stream) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client =
+            yamux::Connection::new(a.compat(), yamux::Config::default(), yamux::Mode::Client);
+        let mut server =
+            yamux::Connection::new(b.compat(), yamux::Config::default(), yamux::Mode::Server);
+        let (out_tx, out_rx) = tokio::sync::oneshot::channel();
+        let (in_tx, in_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let s = poll_fn(|cx| client.poll_new_outbound(cx)).await.unwrap();
+            let _ = out_tx.send(s);
+            // Keep driving the connection.
+            while poll_fn(|cx| client.poll_next_inbound(cx)).await.is_some() {}
+        });
+        tokio::spawn(async move {
+            let mut in_tx = Some(in_tx);
+            while let Some(Ok(s)) = poll_fn(|cx| server.poll_next_inbound(cx)).await {
+                if let Some(tx) = in_tx.take() {
+                    let _ = tx.send(s);
+                }
+            }
+        });
+        let mut ours = out_rx.await.unwrap();
+        // A yamux stream reaches the listener with its first frame.
+        ours.write_all(b"cheque").await.unwrap();
+        ours.flush().await.unwrap();
+        let theirs = in_rx.await.unwrap();
+        (ours, theirs)
+    }
+
+    /// Read the cheque bytes on the recipient's side.
+    async fn read_cheque(theirs: &mut yamux::Stream) {
+        let mut buf = [0u8; 6];
+        theirs.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"cheque");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_cheque_reads_as_delivered() {
+        let (mut ours, mut theirs) = stream_pair().await;
+        let recipient = tokio::spawn(async move {
+            read_cheque(&mut theirs).await;
+            // Bee's FullClose: our FIN, then wait for theirs.
+            theirs.close().await.unwrap();
+            let mut rest = Vec::new();
+            theirs.read_to_end(&mut rest).await.unwrap();
+        });
+        await_verdict(&mut ours)
+            .await
+            .expect("a FIN-closed cheque stream is accepted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), recipient)
+            .await
+            .expect("bee's FullClose completes once we close our half")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_cheque_reads_as_not_delivered() {
+        let (mut ours, mut theirs) = stream_pair().await;
+        tokio::spawn(async move {
+            read_cheque(&mut theirs).await;
+            // Bee's Reset on a refused cheque; the connection stays up.
+            drop(theirs);
+        });
+        let verdict = await_verdict(&mut ours).await;
+        assert!(
+            verdict.is_err(),
+            "a reset cheque stream must not count as delivered"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3064,6 +3221,45 @@ mod tests {
         let reopened_a = OutboundLedger::open(Some(path), a);
         assert_eq!(reopened_a.cumulative_for(&peer), U256::from(1_600u64));
         assert_eq!(reopened_a.total_issued(), U256::from(1_600u64));
+    }
+
+    /// A chequebook deployed fresh never adopts a ledger written before
+    /// per-chequebook sections: those cumulatives came from an earlier
+    /// chequebook, and as the new one's first cheques they would claim
+    /// totals it never paid (and drain its deposit in our own funds
+    /// check). A chequebook that was not deployed fresh still adopts it.
+    #[test]
+    fn a_fresh_chequebook_never_adopts_the_pre_section_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (old, fresh) = ([0xa0u8; 20], [0xf0u8; 20]);
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            br#"{"1111111111111111111111111111111111111111":"5543284090100"}"#,
+        )
+        .unwrap();
+
+        note_fresh_chequebook(&path, fresh).unwrap();
+        let ledger = OutboundLedger::open(Some(path.clone()), fresh);
+        assert_eq!(ledger.cumulative_for(&peer), U256::zero());
+        assert_eq!(ledger.total_issued(), U256::zero());
+        ledger.record_issued(&peer, U256::from(250_000u64)).unwrap();
+        drop(ledger);
+
+        // Across a restart it still starts from what it really issued.
+        let reopened = OutboundLedger::open(Some(path.clone()), fresh);
+        assert_eq!(reopened.cumulative_for(&peer), U256::from(250_000u64));
+        assert_eq!(reopened.total_issued(), U256::from(250_000u64));
+        drop(reopened);
+
+        // The pre-section figures are still there for the chequebook that
+        // wrote them.
+        let legacy = OutboundLedger::open(Some(path), old);
+        assert_eq!(
+            legacy.cumulative_for(&peer),
+            U256::from(5_543_284_090_100u64)
+        );
     }
 
     /// A file that exists but can't be read is not an empty ledger (PR

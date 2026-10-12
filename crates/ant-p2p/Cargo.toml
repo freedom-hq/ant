@@ -45,6 +45,9 @@ unsigned-varint.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# The cheque-verdict test runs bee's FIN-vs-RST endings over real yamux.
+tokio-util = { version = "0.7", features = ["compat"] }
+yamux = "0.13.10"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the probe
 # late-delivery tests resolve their timeouts in virtual time.
