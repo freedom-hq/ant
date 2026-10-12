@@ -12,6 +12,7 @@ pub mod messaging;
 mod peerstore;
 pub mod pseudosettle;
 pub mod pullsync;
+pub mod push_dedup;
 pub mod push_pseudosettle;
 pub mod pushsync_swap;
 pub mod routing;

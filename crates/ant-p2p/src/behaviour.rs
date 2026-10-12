@@ -1035,6 +1035,9 @@ struct SwarmState {
     /// (shared by every push fetcher; see
     /// [`ant_retrieval::ShallowNeighbourhoods`]).
     shallow_neighbourhoods: Arc<ant_retrieval::ShallowNeighbourhoods>,
+    /// Pushes in flight and recently stored, so a duplicate waits for or
+    /// reuses an earlier push (see [`crate::push_dedup`]).
+    push_dedup: Arc<crate::push_dedup::PushDedup>,
     /// Overlay-indexed dial book: every peer we've learned about via hive
     /// gossip (or the on-disk peerstore) that we are *not* currently
     /// connected to, retained with its dial multiaddrs + overlay. Unlike
@@ -1130,6 +1133,7 @@ impl SwarmState {
             bought_batches: HashMap::new(),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shallow_neighbourhoods: Arc::default(),
+            push_dedup: Arc::default(),
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
             stamp_tx: None,
@@ -2609,6 +2613,21 @@ fn handle_control_command(
                 });
                 return;
             };
+            // A duplicate of a push in flight, or of a chunk stored a
+            // moment ago, needs no stamp and no push of its own (see
+            // `push_dedup`). Strict pushes (repairs) and caller-stamped
+            // ones always go out.
+            let ack = if stamp.is_none() && !require_deep {
+                match state
+                    .push_dedup
+                    .begin(crate::push_dedup::push_key(&addr, &wire), addr, ack)
+                {
+                    crate::push_dedup::Begin::Push(ack) => ack,
+                    crate::push_dedup::Begin::Handled => return,
+                }
+            } else {
+                ack
+            };
 
             // Pre-signed stamp (bee's `swarm-postage-stamp` header):
             // push with the caller's stamp instead of issuing one. No
@@ -2749,6 +2768,21 @@ fn handle_control_command(
                 });
                 return;
             }
+            // Same SOC (address *and* bytes) in flight or just stored:
+            // reuse that push (see `push_dedup`). Redundancy replicas of
+            // an unchanged manifest node repeat with every upload.
+            let ack = if stamp.is_none() {
+                match state.push_dedup.begin(
+                    crate::push_dedup::push_key(&address, &wire),
+                    address,
+                    ack,
+                ) {
+                    crate::push_dedup::Begin::Push(ack) => ack,
+                    crate::push_dedup::Begin::Handled => return,
+                }
+            } else {
+                ack
+            };
 
             // Pre-signed stamp: push with the caller's stamp — no local
             // issuer needed. See the matching branch in `PushChunk`.
@@ -4423,7 +4457,12 @@ async fn push_with_patience(
     let mut walk = 0u32;
     loop {
         walk += 1;
-        let strict = strict_first && !patience.exhausted(tokio::time::Instant::now());
+        // A neighbourhood a recent push already found without a reachable
+        // deep storer: hunting the whole patience again (~30 s) ends
+        // shallow anyway, so go straight to the shallow-accepting walk.
+        let strict = strict_first
+            && !patience.exhausted(tokio::time::Instant::now())
+            && !fetcher.in_shallow_neighbourhood(&addr);
         let res = fetcher
             .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, strict)
             .await;
@@ -4476,6 +4515,13 @@ async fn push_with_patience(
                             .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, false)
                             .await
                         {
+                            if let Some(ant_retrieval::pushsync::PushSyncError::ShallowReceipt {
+                                storage_radius,
+                                ..
+                            }) = last_err.as_ref().or(Some(&e))
+                            {
+                                fetcher.mark_shallow_neighbourhood(&addr, *storage_radius);
+                            }
                             warn!(
                                 target: "ant_p2p",
                                 addr = %hex::encode(addr),

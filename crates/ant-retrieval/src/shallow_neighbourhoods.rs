@@ -68,6 +68,20 @@ impl ShallowNeighbourhoods {
         }
     }
 
+    /// Whether `addr` falls in a marked neighbourhood at any radius (for a
+    /// caller that doesn't know the storers' radius yet).
+    #[must_use]
+    pub fn is_marked_any(&self, addr: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        let marked = self
+            .marked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        marked.iter().any(|(&(bits, prefix), &until)| {
+            until > now && Self::key(addr, u32::from(bits)) == (bits, prefix)
+        })
+    }
+
     /// Mark `addr`'s neighbourhood at `radius` for [`TTL`].
     pub fn mark(&self, addr: &[u8; 32], radius: u32) {
         self.mark_at(addr, radius, Instant::now());

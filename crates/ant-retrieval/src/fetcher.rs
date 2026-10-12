@@ -508,6 +508,23 @@ impl RoutingFetcher {
         self
     }
 
+    /// Whether `addr`'s neighbourhood is marked as lacking a reachable
+    /// deep storer (see [`crate::ShallowNeighbourhoods`]).
+    #[must_use]
+    pub fn in_shallow_neighbourhood(&self, addr: &[u8; 32]) -> bool {
+        self.shallow_memory
+            .as_ref()
+            .is_some_and(|m| m.is_marked_any(addr))
+    }
+
+    /// Mark `addr`'s neighbourhood at `radius` as lacking a reachable deep
+    /// storer: a strict push that had to settle for shallow.
+    pub fn mark_shallow_neighbourhood(&self, addr: &[u8; 32], radius: u32) {
+        if let Some(m) = &self.shallow_memory {
+            m.mark(addr, radius);
+        }
+    }
+
     /// Attach the daemon-wide push-side peer skip cache. Same
     /// `PushSkipCache` should be cloned into every fetcher built for
     /// `PushChunk` / `PushSoc` so a peer that just bounced a
