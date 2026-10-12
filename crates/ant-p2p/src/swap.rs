@@ -1744,10 +1744,17 @@ impl LostMarker {
     }
 
     /// The marker that replaces one we can't parse: a loss is on record,
-    /// but neither where it went nor who was confirmed is known.
+    /// but neither where it went nor who was confirmed is known. The
+    /// entry is stamped with when it was written, so it never reads the
+    /// same as a list of losses on record before (PR #156 R5-M2).
     fn replacing_unreadable(e: &std::io::Error) -> Self {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         Self {
-            moved_aside: vec![format!("unknown: the previous marker was unreadable ({e})")],
+            moved_aside: vec![format!(
+                "unknown: the previous marker was unreadable ({e}); replaced at {at}"
+            )],
             ..Self::default()
         }
     }
@@ -2039,9 +2046,11 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
 /// those cumulatives (PR #156 R2-M1). With no loss on record a new one
 /// is recorded for it, sparing the chequebooks with sections of their
 /// own (PR #156 R3-M1). Until a restart this process also remembers it
-/// as fresh, so it adopts nothing, and retries the record at each load;
-/// once that lands, the gate it was put behind is lifted again (PR #156
-/// R4-M1).
+/// as fresh, so it adopts nothing, and retries the record at each load
+/// and, at most every [`FRESH_RETRY_INTERVAL`], from
+/// [`OutboundLedger::ensure_readable`] (which runs before every cheque),
+/// so it lands even once the ledger is live (PR #156 R5-M1); once it
+/// lands, the gate it was put behind is lifted again (PR #156 R4-M1).
 /// Without a pre-section ledger the
 /// fresh record doesn't matter and the known record is made anyway. The
 /// error names which record failed (and the consequence).
@@ -2085,18 +2094,13 @@ pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Resu
             Err(e) => Err(format!("and the lost-ledger marker can't be read ({e})")),
         };
         // This process remembers it as fresh whatever happened above, and
-        // retries the record at every load ([`load_outbound_section`]).
-        // With the gate in place, how many losses were on record then:
-        // once the record lands, the gate is lifted unless a later loss
-        // came in meanwhile (PR #156 R4-M1).
+        // retries the record ([`retry_fresh_record`]). With the gate in
+        // place, the losses on record then: once the record lands, the
+        // gate is lifted unless the list changed meanwhile (PR #156
+        // R4-M1, R5-M2).
         let gate = gated
             .is_ok()
-            .then(|| {
-                read_lost_marker(path)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.moved_aside.len())
-            })
+            .then(|| read_lost_marker(path).ok().flatten().map(|m| m.moved_aside))
             .flatten();
         unrecorded_fresh_insert(path, &key, gate);
         Err(std::io::Error::other(match gated {
@@ -2133,11 +2137,20 @@ struct UnrecordedFresh {
     path: PathBuf,
     key: String,
     /// Set when [`note_fresh_chequebook`] put it behind the loss gate
-    /// instead: how many losses the marker held then. The gate only
-    /// stands in for the missing record, so it is lifted once the record
-    /// lands, unless a loss came in since (PR #156 R4-M1).
-    gate: Option<usize>,
+    /// instead: the losses the marker held then. The gate only stands in
+    /// for the missing record, so it is lifted once the record lands,
+    /// unless the losses on record changed since (PR #156 R4-M1): a
+    /// count wouldn't do, since a marker replaced when unparsable starts
+    /// over at one (PR #156 R5-M2).
+    gate: Option<Vec<String>>,
+    /// When the record was last tried, to space out the retries from
+    /// [`OutboundLedger::ensure_readable`].
+    last_try: std::time::Instant,
 }
+
+/// How often [`OutboundLedger::ensure_readable`] retries a failed fresh
+/// record ([`retry_fresh_record`]); a ledger load always does.
+const FRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// [`UnrecordedFresh`] chequebooks, all ledger files.
 static UNRECORDED_FRESH: Mutex<Vec<UnrecordedFresh>> = Mutex::new(Vec::new());
@@ -2149,14 +2162,19 @@ fn unrecorded_fresh_set() -> std::sync::MutexGuard<'static, Vec<UnrecordedFresh>
 }
 
 /// Add `key` to [`UNRECORDED_FRESH`] for `path`, or update its gate.
-fn unrecorded_fresh_insert(path: &Path, key: &str, gate: Option<usize>) {
+fn unrecorded_fresh_insert(path: &Path, key: &str, gate: Option<Vec<String>>) {
     let mut set = unrecorded_fresh_set();
+    let last_try = std::time::Instant::now();
     match set.iter_mut().find(|u| u.path == path && u.key == key) {
-        Some(u) => u.gate = gate,
+        Some(u) => {
+            u.gate = gate;
+            u.last_try = last_try;
+        }
         None => set.push(UnrecordedFresh {
             path: path.to_path_buf(),
             key: key.to_string(),
             gate,
+            last_try,
         }),
     }
 }
@@ -2164,12 +2182,13 @@ fn unrecorded_fresh_insert(path: &Path, key: &str, gate: Option<usize>) {
 /// Lift the loss gate [`note_fresh_chequebook`] put `key` behind in
 /// place of its fresh record, now that the record is written: a
 /// chequebook deployed fresh issued no cheques before any loss on record
-/// then. Not if a loss came in since (the marker holds more, or was
-/// replaced): the chequebook may have paid in between, after an operator
-/// confirmed it. Caller holds [`OUTBOUND_FILE_LOCK`].
-fn lift_fresh_gate(path: &Path, key: &str, gate: usize) {
+/// then. Not if a loss came in since (the losses on record aren't
+/// exactly `gate`: more were added, or the marker was replaced): the
+/// chequebook may have paid in between, after an operator confirmed it.
+/// Caller holds [`OUTBOUND_FILE_LOCK`].
+fn lift_fresh_gate(path: &Path, key: &str, gate: &[String]) {
     let lifted = match read_lost_marker(path) {
-        Ok(Some(m)) if m.moved_aside.len() == gate && !m.clears(key) => note_known(path, key),
+        Ok(Some(m)) if m.moved_aside == gate && !m.clears(key) => note_known(path, key),
         Ok(_) => return,
         Err(e) => Err(e),
     };
@@ -2192,32 +2211,55 @@ fn lift_fresh_gate(path: &Path, key: &str, gate: usize) {
 
 /// Whether `key` counts as deployed fresh for the ledger at `path`:
 /// listed in the fresh marker, or deployed in this process with a fresh
-/// record that failed — then the record is retried, and once it lands
-/// the loss gate standing in for it is lifted ([`lift_fresh_gate`]).
-/// Caller holds [`OUTBOUND_FILE_LOCK`].
+/// record that failed (retried now, [`retry_fresh_record`]). Caller
+/// holds [`OUTBOUND_FILE_LOCK`].
 fn is_fresh(path: &Path, key: &str) -> std::io::Result<bool> {
-    let pending = unrecorded_fresh_set()
-        .iter()
-        .find(|u| u.path == path && u.key == key)
-        .map(|u| u.gate);
-    if let Some(gate) = pending {
-        match note_fresh(path, key) {
-            Ok(()) => {
-                unrecorded_fresh_set().retain(|u| !(u.path == path && u.key == key));
-                if let Some(gate) = gate {
-                    lift_fresh_gate(path, key, gate);
-                }
-            }
-            Err(e) => warn!(
-                target: "ant_p2p::swap",
-                chequebook = %key,
-                "still can't record a freshly deployed chequebook in {}: {e}",
-                fresh_marker_path(path).display(),
-            ),
-        }
+    if retry_fresh_record(path, key, None) {
         return Ok(true);
     }
     Ok(listed_fresh(&fresh_chequebooks(path)?, key))
+}
+
+/// Retry the fresh record of `key`, deployed in this process, if it
+/// failed ([`note_fresh_chequebook`]); once it lands, lift the loss gate
+/// standing in for it ([`lift_fresh_gate`]). With `min_interval`, not if
+/// the last try was more recent. Returns whether `key` was pending.
+/// Caller holds [`OUTBOUND_FILE_LOCK`].
+fn retry_fresh_record(path: &Path, key: &str, min_interval: Option<std::time::Duration>) -> bool {
+    let gate = {
+        let mut set = unrecorded_fresh_set();
+        let Some(u) = set.iter_mut().find(|u| u.path == path && u.key == key) else {
+            return false;
+        };
+        if min_interval.is_some_and(|min| u.last_try.elapsed() < min) {
+            return true;
+        }
+        u.last_try = std::time::Instant::now();
+        u.gate.clone()
+    };
+    match note_fresh(path, key) {
+        Ok(()) => {
+            unrecorded_fresh_set().retain(|u| !(u.path == path && u.key == key));
+            if let Some(gate) = gate {
+                lift_fresh_gate(path, key, &gate);
+            }
+        }
+        Err(e) => warn!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            "still can't record a freshly deployed chequebook in {}: {e}",
+            fresh_marker_path(path).display(),
+        ),
+    }
+    true
+}
+
+/// Whether a fresh record for `key` at `path` is waiting to be retried
+/// ([`retry_fresh_record`]). Takes no file lock.
+fn fresh_record_pending(path: &Path, key: &str) -> bool {
+    unrecorded_fresh_set()
+        .iter()
+        .any(|u| u.path == path && u.key == key)
 }
 
 /// Where [`note_fresh_chequebook`] lists the chequebooks deployed fresh
@@ -2671,13 +2713,26 @@ impl OutboundLedger {
     /// again now. Call before signing a cheque — while it errs,
     /// [`Self::cumulative_for`] and [`Self::total_issued`] may be short.
     /// The state lock isn't held while the file is read.
+    ///
+    /// It also retries a fresh record of this chequebook that failed at
+    /// deploy, at most every [`FRESH_RETRY_INTERVAL`] ([`note_fresh_chequebook`]):
+    /// once the ledger is live no load runs again to retry it, and the
+    /// loss gate standing in for it would hold until a restart made it
+    /// permanent (PR #156 R5-M1).
     pub fn ensure_readable(&self) -> std::io::Result<()> {
-        if self.lock_state().unread.is_none() {
-            return Ok(());
-        }
         let Some(path) = &self.persist_path else {
             return Ok(());
         };
+        let key = hex::encode(self.chequebook);
+        if fresh_record_pending(path, &key) {
+            let _file = lock_file();
+            if !self.shared.store.as_ref().is_some_and(|s| s.is_retired()) {
+                retry_fresh_record(path, &key, Some(FRESH_RETRY_INTERVAL));
+            }
+        }
+        if self.lock_state().unread.is_none() {
+            return Ok(());
+        }
         let _file = lock_file();
         // Its files moved away (account switch): what is at the path now
         // is someone else's, and must not be read, migrated or moved
@@ -2686,7 +2741,7 @@ impl OutboundLedger {
             return Err(retired_error());
         }
         let mut read = OutboundState::default();
-        let loaded = load_outbound_section(path, &hex::encode(self.chequebook), &mut read);
+        let loaded = load_outbound_section(path, &key, &mut read);
         let mut st = self.lock_state();
         match loaded {
             Ok(_) => {
@@ -3775,6 +3830,98 @@ mod tests {
         let why = ledger.lost_figures().expect("still gated");
         assert!(why.contains("moved aside to"), "{why}");
         assert!(why.contains("later.corrupt"), "{why}");
+    }
+
+    /// Make the next [`OutboundLedger::ensure_readable`] retry `cb`'s
+    /// failed fresh record without waiting out [`FRESH_RETRY_INTERVAL`].
+    fn rewind_fresh_retry(path: &Path, cb: [u8; 20]) {
+        let key = hex::encode(cb);
+        for u in unrecorded_fresh_set()
+            .iter_mut()
+            .filter(|u| u.path == path && u.key == key)
+        {
+            u.last_try = std::time::Instant::now()
+                .checked_sub(FRESH_RETRY_INTERVAL)
+                .unwrap_or(u.last_try);
+        }
+    }
+
+    /// The fresh record is retried on a live ledger too, not only at a
+    /// load: one opened while the record still failed has no later load
+    /// to retry it, so without this the gate stood until a restart made
+    /// it permanent (PR #156 R5-M1).
+    #[test]
+    fn a_live_ledger_retries_a_failed_fresh_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc4u8; 20];
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            format!(r#"{{"{}":"5543284090100"}}"#, hex::encode(peer)),
+        )
+        .unwrap();
+        std::fs::create_dir(fresh_marker_path(&path)).unwrap();
+        note_fresh_chequebook(&path, cb).unwrap_err();
+        // The ledger goes live while the record still fails.
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        ledger.ensure_readable().unwrap();
+        assert!(ledger.lost_figures().is_some(), "gated");
+
+        // The fault clears; the next retry is spaced out...
+        std::fs::remove_dir(fresh_marker_path(&path)).unwrap();
+        ledger.ensure_readable().unwrap();
+        assert!(!fresh_marker_path(&path).exists(), "not retried yet");
+        // ...and once due, the live ledger writes it and lifts the gate.
+        rewind_fresh_retry(&path, cb);
+        ledger.ensure_readable().unwrap();
+        let fresh: Vec<String> =
+            serde_json::from_slice(&std::fs::read(fresh_marker_path(&path)).unwrap()).unwrap();
+        assert!(listed_fresh(&fresh, &hex::encode(cb)));
+        assert!(
+            ledger.lost_figures().is_none(),
+            "{:?}",
+            ledger.lost_figures()
+        );
+        assert_eq!(ledger.cumulative_for(&peer), U256::zero(), "not adopted");
+    }
+
+    /// A later loss hidden by a marker replaced when unparsable (its
+    /// loss list starts over at one entry) still keeps the gate: the
+    /// retried record lifts it only if the losses on record are exactly
+    /// those at the deploy (PR #156 R5-M2).
+    #[test]
+    fn a_retried_fresh_record_keeps_a_loss_hidden_by_a_replaced_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (cb, other) = ([0xc5u8; 20], [0xd5u8; 20]);
+        std::fs::write(
+            &path,
+            br#"{"1111111111111111111111111111111111111111":"5543284090100"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(fresh_marker_path(&path)).unwrap();
+        note_fresh_chequebook(&path, cb).unwrap_err();
+        assert!(lost_figures_at(&path, &cb).is_some(), "gated");
+        // Confirmed, then a later loss; then the marker is corrupted and a
+        // confirm of another chequebook replaces it with one loss again.
+        assert!(confirm_cheque_liability(&path, cb).unwrap());
+        mark_figures_lost(&path, &dir.path().join("later.corrupt")).unwrap();
+        std::fs::write(lost_marker_path(&path), b"{ not json").unwrap();
+        assert!(confirm_cheque_liability(&path, other).unwrap());
+        assert_eq!(
+            read_lost_marker(&path).unwrap().unwrap().moved_aside.len(),
+            1
+        );
+
+        std::fs::remove_dir(fresh_marker_path(&path)).unwrap();
+        let ledger = OutboundLedger::open(Some(path.clone()), cb);
+        ledger.ensure_readable().unwrap();
+        let fresh: Vec<String> =
+            serde_json::from_slice(&std::fs::read(fresh_marker_path(&path)).unwrap()).unwrap();
+        assert!(listed_fresh(&fresh, &hex::encode(cb)), "recorded");
+        let why = ledger.lost_figures().expect("still gated");
+        assert!(why.contains("unreadable"), "{why}");
     }
 
     /// A loss already on record when the fresh record fails predates the
