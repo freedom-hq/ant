@@ -308,6 +308,9 @@ pub struct RoutingFetcher {
     /// legacy per-chunk-only skip behaviour for unit tests.
     push_skip: Option<PushSkipCache>,
     push_load: Option<std::sync::Arc<crate::PushLoadTracker>>,
+    /// Neighbourhoods where a deep-storer hunt already ended shallow
+    /// (see [`crate::ShallowNeighbourhoods`]).
+    shallow_memory: Option<std::sync::Arc<crate::ShallowNeighbourhoods>>,
     /// Swarm network id used to derive the storer overlay when
     /// verifying a pushsync receipt's signature (see
     /// [`crate::pushsync::push_chunk_to_peer`]). `Some(1)` on mainnet;
@@ -389,6 +392,7 @@ impl RoutingFetcher {
             pushsync_settlement: None,
             push_skip: None,
             push_load: None,
+            shallow_memory: None,
             push_network_id: None,
             neighborhood_dial: None,
             require_deep: false,
@@ -488,6 +492,19 @@ impl RoutingFetcher {
     #[must_use]
     pub fn with_network_id(mut self, network_id: u64) -> Self {
         self.push_network_id = Some(network_id);
+        self
+    }
+
+    /// Share a memory of neighbourhoods where a deep-storer hunt ended
+    /// shallow: best-effort pushes of chunks in them then accept their
+    /// first shallow receipt instead of hunting again (see
+    /// [`crate::ShallowNeighbourhoods`]).
+    #[must_use]
+    pub fn with_shallow_memory(
+        mut self,
+        memory: std::sync::Arc<crate::ShallowNeighbourhoods>,
+    ) -> Self {
+        self.shallow_memory = Some(memory);
         self
     }
 
@@ -1259,13 +1276,32 @@ impl RoutingFetcher {
                                 shallow_attempts,
                                 "pushsync got a shallow receipt; chunk stored but shallow — trying for a deeper storer",
                             );
-                            if accept_shallow_after(shallow_attempts) {
-                                // Strict receipts: hand the chunk back to
-                                // the caller's retry queue instead of
-                                // accepting a placement the routed network
-                                // can't see (see `with_require_deep`). The
-                                // debit was recorded above either way.
-                                if require_deep {
+                            let known_shallow = self
+                                .shallow_memory
+                                .as_ref()
+                                .is_some_and(|m| m.is_marked(&chunk_addr, storage_radius));
+                            let verdict = shallow_verdict(shallow_attempts, require_deep, known_shallow);
+                            if matches!(verdict, ShallowVerdict::AcceptAndMark | ShallowVerdict::Strict) {
+                                if let Some(m) = &self.shallow_memory {
+                                    m.mark(&chunk_addr, storage_radius);
+                                }
+                            }
+                            match verdict {
+                                ShallowVerdict::AcceptKnown => {
+                                    debug!(
+                                        target: "ant_retrieval::fetcher",
+                                        addr = %hex::encode(chunk_addr),
+                                        storage_radius,
+                                        "accepting shallow receipt: this neighbourhood recently had no reachable deep storer",
+                                    );
+                                    return Ok(());
+                                }
+                                ShallowVerdict::Strict => {
+                                    // Strict receipts: hand the chunk back to
+                                    // the caller's retry queue instead of
+                                    // accepting a placement the routed network
+                                    // can't see (see `with_require_deep`). The
+                                    // debit was recorded above either way.
                                     warn!(
                                         target: "ant_retrieval::fetcher",
                                         addr = %hex::encode(chunk_addr),
@@ -1274,13 +1310,16 @@ impl RoutingFetcher {
                                     );
                                     return Err(PushSyncError::ShallowReceipt { po, storage_radius });
                                 }
-                                warn!(
-                                    target: "ant_retrieval::fetcher",
-                                    addr = %hex::encode(chunk_addr),
-                                    shallow_attempts,
-                                    "accepting shallow receipt after deeper-storer attempts (bee-aligned: chunk is stored)",
-                                );
-                                return Ok(());
+                                ShallowVerdict::AcceptAndMark => {
+                                    warn!(
+                                        target: "ant_retrieval::fetcher",
+                                        addr = %hex::encode(chunk_addr),
+                                        shallow_attempts,
+                                        "accepting shallow receipt after deeper-storer attempts (bee-aligned: chunk is stored)",
+                                    );
+                                    return Ok(());
+                                }
+                                ShallowVerdict::Hunt => {}
                             }
                             // A shallow receipt is direct evidence we lack a
                             // connected peer in this chunk's neighbourhood.
@@ -1527,6 +1566,43 @@ fn is_transient_pushsync_error(err: &crate::pushsync::PushSyncError) -> bool {
 /// deeper storer first. The threshold matches bee's pusher, which retries
 /// a shallow receipt `DefaultRetryCount` (6) times before reporting the
 /// chunk synced regardless. See [`RoutingFetcher::MAX_SHALLOW_ATTEMPTS`].
+/// What a push does with a shallow receipt (the chunk is stored, but
+/// outside its neighbourhood).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShallowVerdict {
+    /// Keep hunting for a deep storer (dial the neighbourhood, retry).
+    Hunt,
+    /// Accept: the hunt is used up. Mark the neighbourhood so the next
+    /// chunks in it don't hunt again for a while.
+    AcceptAndMark,
+    /// Accept at once: a recent hunt in this neighbourhood already found
+    /// no reachable deep storer.
+    AcceptKnown,
+    /// A strict (`require_deep`) push whose hunt is used up: report the
+    /// shallow placement so the caller re-queues the chunk.
+    Strict,
+}
+
+/// Decide a shallow receipt: the `shallow_attempts`-th one for this
+/// chunk, on a strict push or not, in a neighbourhood marked as lacking
+/// a reachable deep storer or not. Strict pushes never take the
+/// neighbourhood shortcut.
+const fn shallow_verdict(
+    shallow_attempts: u32,
+    require_deep: bool,
+    known_shallow: bool,
+) -> ShallowVerdict {
+    if known_shallow && !require_deep {
+        ShallowVerdict::AcceptKnown
+    } else if !accept_shallow_after(shallow_attempts) {
+        ShallowVerdict::Hunt
+    } else if require_deep {
+        ShallowVerdict::Strict
+    } else {
+        ShallowVerdict::AcceptAndMark
+    }
+}
+
 const fn accept_shallow_after(shallow_attempts: u32) -> bool {
     shallow_attempts >= RoutingFetcher::MAX_SHALLOW_ATTEMPTS
 }
@@ -3279,6 +3355,21 @@ mod tests {
     /// a light node can't lean on pull-sync to deepen a shallow placement
     /// after the fact, so it spends extra rounds — each with an active
     /// neighbourhood dial + bounded wait — hunting for a deep storer first.
+    #[test]
+    fn a_shallow_receipt_hunts_until_used_up_or_known_shallow() {
+        use ShallowVerdict::{AcceptAndMark, AcceptKnown, Hunt, Strict};
+        // Unknown neighbourhood: hunt, then accept and remember it.
+        assert_eq!(shallow_verdict(1, false, false), Hunt);
+        assert_eq!(shallow_verdict(11, false, false), Hunt);
+        assert_eq!(shallow_verdict(12, false, false), AcceptAndMark);
+        // Known neighbourhood: the first shallow receipt is enough.
+        assert_eq!(shallow_verdict(1, false, true), AcceptKnown);
+        // Strict pushes ignore the memory and hand the chunk back.
+        assert_eq!(shallow_verdict(1, true, true), Hunt);
+        assert_eq!(shallow_verdict(12, true, true), Strict);
+        assert_eq!(shallow_verdict(12, true, false), Strict);
+    }
+
     #[test]
     fn shallow_receipt_accepted_after_bounded_attempts() {
         assert_eq!(

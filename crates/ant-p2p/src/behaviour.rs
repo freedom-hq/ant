@@ -1031,6 +1031,10 @@ struct SwarmState {
     /// whole sequence (measured: warm == cold at up to 4.3 s without
     /// this). In-memory only — a restart just pays one cold walk.
     feed_hints: FeedHints,
+    /// Neighbourhoods where a push recently couldn't reach a deep storer
+    /// (shared by every push fetcher; see
+    /// [`ant_retrieval::ShallowNeighbourhoods`]).
+    shallow_neighbourhoods: Arc<ant_retrieval::ShallowNeighbourhoods>,
     /// Overlay-indexed dial book: every peer we've learned about via hive
     /// gossip (or the on-disk peerstore) that we are *not* currently
     /// connected to, retained with its dial multiaddrs + overlay. Unlike
@@ -1125,6 +1129,7 @@ impl SwarmState {
             runtime_registered: HashMap::new(),
             bought_batches: HashMap::new(),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shallow_neighbourhoods: Arc::default(),
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
             stamp_tx: None,
@@ -4834,6 +4839,7 @@ fn build_push_fetcher(
 ) -> ant_retrieval::RoutingFetcher {
     let mut fetcher = ant_retrieval::RoutingFetcher::new(control, state.peers_watch.subscribe())
         .with_push_skip(state.push_skip.clone())
+        .with_shallow_memory(state.shallow_neighbourhoods.clone())
         .with_network_id(network_id);
     if let Some(load) = state.push_load.clone() {
         fetcher = fetcher.with_push_load(load);
