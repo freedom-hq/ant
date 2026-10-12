@@ -5152,7 +5152,14 @@ fn push_with_stamp(
                 );
             }
         }
-        let reply = match push_with_patience(
+        // Nobody waiting for this push any more (the gateway request it
+        // belongs to failed on another chunk, or its HTTP client gave
+        // up): stop instead of spending peer credit, re-walks and paid
+        // hedges on a chunk no one will use. Without this a segment that
+        // failed once kept its other pushes going for up to the push
+        // patience, competing with the segments after it.
+        let mut ack = ack;
+        let push = push_with_patience(
             &fetcher,
             patience_peers,
             addr,
@@ -5160,9 +5167,19 @@ fn push_with_stamp(
             stamp,
             false,
             lag_until,
-        )
-        .await
-        {
+        );
+        let outcome = tokio::select! {
+            outcome = push => outcome,
+            () = ack.closed() => {
+                debug!(
+                    target: "ant_p2p",
+                    addr = %hex::encode(addr),
+                    "push abandoned: its requester went away",
+                );
+                return;
+            }
+        };
+        let reply = match outcome {
             Ok(()) => {
                 note_stamp_outcome(&rejected_batches, &stamp, None);
                 ControlAck::ChunkUploaded {
