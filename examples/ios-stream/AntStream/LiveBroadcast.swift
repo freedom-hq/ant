@@ -64,13 +64,16 @@ final class LiveBroadcast: ObservableObject {
     /// The quality preset the next broadcast encodes, picked on the live
     /// screen before going live and remembered across launches. 360p by
     /// default: the uplink, not the camera, is what limits a phone.
-    @Published var quality: CaptureEngine.Quality =
-        CaptureEngine.Quality(rawValue: UserDefaults.standard.string(forKey: LiveBroadcast.qualityKey) ?? "")
-            ?? .low {
+    @Published var quality: CaptureEngine.Quality {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: Self.qualityKey) }
     }
 
     private static let qualityKey = "antstream.quality"
+
+    init() {
+        let stored = UserDefaults.standard.string(forKey: Self.qualityKey) ?? ""
+        quality = CaptureEngine.Quality(rawValue: stored) ?? .low
+    }
 
     /// The rendition for ``quality``, with 2 s segments. The same values
     /// are handed to both halves so the encoder and the playlist agree.
