@@ -1048,6 +1048,11 @@ struct SwarmState {
     /// knows about (from `known_dialable`) toward that address. `None`
     /// until `run` wires the channel (and in tests).
     neighborhood_dial_tx: Option<mpsc::Sender<[u8; 32]>>,
+    /// Hands chunks to be stamped to the stamper task (see
+    /// [`run_stamper`]), which stamps them in batches off this loop.
+    /// `None` until `run` wires it (and in tests): `PushChunk` then
+    /// stamps inline, one chunk at a time.
+    stamp_tx: Option<mpsc::UnboundedSender<StampJob>>,
     /// Per-connection ping liveness (issue #83): which connections still
     /// answer, which to close as dead, and what `peers.connected` counts.
     liveness: Liveness,
@@ -1122,6 +1127,7 @@ impl SwarmState {
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
+            stamp_tx: None,
             liveness: Liveness::new(LivenessConfig::DEFAULT, Instant::now()),
         }
     }
@@ -2016,6 +2022,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // the dial pipeline.
     let (neighborhood_dial_tx, mut neighborhood_dial_rx) = mpsc::channel::<[u8; 32]>(256);
     state.neighborhood_dial_tx = Some(neighborhood_dial_tx);
+    let (stamp_tx, stamp_rx) = mpsc::unbounded_channel::<StampJob>();
+    let (stamped_tx, mut stamped_rx) = mpsc::unbounded_channel::<StampedPush>();
+    state.stamp_tx = Some(stamp_tx);
+    tokio::spawn(run_stamper(stamp_rx, stamped_tx));
 
     let mut backoff = MIN_BACKOFF;
     let mut last_bootstrap_at = Instant::now();
@@ -2176,6 +2186,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             }
             _ = batch_probe_pulse.tick() => {
                 spawn_due_batch_probes(&state, &control, upload_rt.as_ref(), cfg.network_id);
+            }
+            Some(p) = stamped_rx.recv() => {
+                push_with_stamp(&state, &control, cfg.network_id, p.addr, p.wire, p.stamp, p.require_deep, p.ack);
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
                 match cmd {
@@ -4936,6 +4949,151 @@ fn spawn_due_batch_probes(
             }
         });
     }
+}
+
+/// A chunk waiting for its postage stamp (see [`run_stamper`]).
+struct StampJob {
+    upload: Arc<UploadRuntime>,
+    batch_id: [u8; 32],
+    addr: [u8; 32],
+    wire: Vec<u8>,
+    require_deep: bool,
+    ack: oneshot::Sender<ControlAck>,
+}
+
+/// A stamped chunk on its way back to the swarm loop to be pushed.
+struct StampedPush {
+    addr: [u8; 32],
+    wire: Vec<u8>,
+    stamp: [u8; ant_postage::STAMP_SIZE],
+    require_deep: bool,
+    ack: oneshot::Sender<ControlAck>,
+}
+
+/// Most chunks stamped under one durable write.
+const STAMP_BATCH_MAX: usize = 512;
+
+/// Stamp chunks in batches, off the swarm loop.
+///
+/// Stamping a new chunk persists the batch's bucket table and its stamp
+/// record before the stamp may leave (an index must never be issued
+/// twice, crash or not). Done per chunk on the swarm loop, that was a
+/// 256 KiB rewrite and several `fsync`s per chunk, stalling every other
+/// protocol meanwhile: ~1 ms a chunk on a server SSD, far more on a
+/// phone (`F_FULLFSYNC` on iOS). Here whatever is queued when a batch
+/// starts is stamped with one write of each
+/// ([`ant_postage::sign_stamps_batch`]); while it runs the next batch
+/// queues up, so batches grow with the load (a video segment's chunks
+/// arrive together). Stamps go back to the loop in arrival order.
+async fn run_stamper(
+    mut jobs: mpsc::UnboundedReceiver<StampJob>,
+    stamped: mpsc::UnboundedSender<StampedPush>,
+) {
+    while let Some(first) = jobs.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < STAMP_BATCH_MAX {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let Ok(results) = tokio::task::spawn_blocking(move || stamp_jobs(batch)).await else {
+            // The blocking task panicked: its jobs' acks were dropped,
+            // which their callers see as an error.
+            continue;
+        };
+        for (job, result) in results {
+            match result {
+                Ok(stamp) => {
+                    let push = StampedPush {
+                        addr: job.addr,
+                        wire: job.wire,
+                        stamp,
+                        require_deep: job.require_deep,
+                        ack: job.ack,
+                    };
+                    if let Err(mpsc::error::SendError(push)) = stamped.send(push) {
+                        let _ = push.ack.send(ControlAck::Error {
+                            message: "node stopped".into(),
+                        });
+                    }
+                }
+                Err(message) => {
+                    let _ = job.ack.send(ControlAck::Error { message });
+                }
+            }
+        }
+    }
+}
+
+/// Stamp `jobs`, one durable write per batch they belong to, in order.
+fn stamp_jobs(
+    jobs: Vec<StampJob>,
+) -> Vec<(StampJob, Result<[u8; ant_postage::STAMP_SIZE], String>)> {
+    let mut results: Vec<Option<Result<[u8; ant_postage::STAMP_SIZE], String>>> =
+        (0..jobs.len()).map(|_| None).collect();
+    // Group by (upload runtime, batch), keeping arrival order within each.
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (i, job) in jobs.iter().enumerate() {
+        match groups.iter_mut().find(|(first, _)| {
+            Arc::ptr_eq(&jobs[*first].upload, &job.upload) && jobs[*first].batch_id == job.batch_id
+        }) {
+            Some((_, members)) => members.push(i),
+            None => groups.push((i, vec![i])),
+        }
+    }
+    for (first, members) in groups {
+        let upload = &jobs[first].upload;
+        let batch_id = jobs[first].batch_id;
+        let mut issuers = match upload.issuers.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(issuer) = issuers.get_mut(&batch_id) else {
+            for i in members {
+                results[i] = Some(Err(format!("batch 0x{} not usable", hex::encode(batch_id))));
+            }
+            continue;
+        };
+        let mut to_stamp = Vec::with_capacity(members.len());
+        for i in members {
+            let addr = jobs[i].addr;
+            if !issuer.has_stamp(&addr) && issuer.bucket_is_full(&addr) {
+                if issuer.immutable() {
+                    warn!(
+                        target: "ant_p2p",
+                        batch = %hex::encode(batch_id),
+                        depth = issuer.batch_depth(),
+                        addr = %hex::encode(addr),
+                        "refusing to stamp: collision bucket full on immutable batch — stamping would evict an existing chunk (buy/dilute a larger batch)",
+                    );
+                    results[i] = Some(Err(format!(
+                        "batch 0x{} saturated: collision bucket full at depth {} on an immutable batch — stamping would evict an existing chunk; buy or dilute to a larger batch",
+                        hex::encode(batch_id),
+                        issuer.batch_depth(),
+                    )));
+                    continue;
+                }
+                warn!(
+                    target: "ant_p2p",
+                    batch = %hex::encode(batch_id),
+                    depth = issuer.batch_depth(),
+                    addr = %hex::encode(addr),
+                    "collision bucket full on mutable batch — wrapping (evicting the oldest stamp in this bucket); consider diluting to a larger batch",
+                );
+            }
+            to_stamp.push(i);
+        }
+        let addrs: Vec<[u8; 32]> = to_stamp.iter().map(|&i| jobs[i].addr).collect();
+        let stamps = ant_postage::sign_stamps_batch(&upload.stamp_key, issuer, &addrs);
+        for (i, stamp) in to_stamp.into_iter().zip(stamps) {
+            results[i] = Some(stamp.map_err(|e| format!("stamp issue failed: {e}")));
+        }
+    }
+    jobs.into_iter()
+        .zip(results)
+        .map(|(job, r)| (job, r.unwrap_or_else(|| Err("not stamped".into()))))
+        .collect()
 }
 
 /// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
@@ -11774,6 +11932,66 @@ mod tests {
         assert_eq!(
             snap.cheques_issued_chequebook.as_deref(),
             Some(cb_hex.as_str())
+        );
+    }
+
+    /// The stamper stamps a batch of queued chunks with one write per
+    /// postage batch, answers each chunk in order, and fails only the
+    /// chunks of a batch it doesn't know.
+    #[test]
+    fn the_stamper_stamps_queued_chunks_per_batch_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = [0x0cu8; 32];
+        let issuer = ant_postage::StampIssuer::open_or_new(
+            dir.path().join(format!("{}.bin", hex::encode(known))),
+            known,
+            20,
+            16,
+            false,
+        )
+        .unwrap();
+        let rt = Arc::new(UploadRuntime {
+            issuers: std::sync::Mutex::new(HashMap::from([(known, issuer)])),
+            stamp_key: [1u8; SECP256K1_SECRET_LEN],
+            batch_owner: [0u8; 20],
+            postage_dir: dir.path().to_path_buf(),
+        });
+        let job = |batch_id: [u8; 32], n: u8| StampJob {
+            upload: rt.clone(),
+            batch_id,
+            addr: [n; 32],
+            wire: vec![n],
+            require_deep: false,
+            ack: oneshot::channel().0,
+        };
+        let jobs = vec![
+            job(known, 1),
+            job([0xeeu8; 32], 2),
+            job(known, 3),
+            job(known, 1),
+        ];
+        let out = stamp_jobs(jobs);
+        assert_eq!(
+            out.iter().map(|(j, _)| j.wire[0]).collect::<Vec<_>>(),
+            vec![1, 2, 3, 1]
+        );
+        let stamp = |k: usize| *out[k].1.as_ref().unwrap();
+        assert_eq!(stamp(0)[..32], known, "stamped with its batch");
+        assert!(out[1].1.as_ref().unwrap_err().contains("not usable"));
+        assert_ne!(
+            stamp(0)[32..40],
+            stamp(2)[32..40],
+            "distinct chunks, distinct slots"
+        );
+        assert_eq!(
+            stamp(0)[32..40],
+            stamp(3)[32..40],
+            "a repeated chunk keeps its slot"
+        );
+        let issuers = rt.issuers.lock().unwrap();
+        assert!(
+            issuers[&known].has_stamp(&[3u8; 32]),
+            "recorded before release"
         );
     }
 
