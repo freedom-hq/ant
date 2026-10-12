@@ -139,11 +139,12 @@ jobs:
           xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-getstarted
           sleep 20
           xcrun simctl io booted screenshot shots/08-storage-getstarted-plans.png
-          # 09 — the buy flow's payment step: the "Send xDAI" cost card and
-          # the new one-time settlement-deposit line #75 adds ("Includes a
-          # one-time … xBZZ network deposit …"). A live quote needs funds
-          # and a reachable chain, so this is driven with a representative
-          # quote to capture the deposit line the PR is about.
+          # 09 — the buy flow's payment step: "Send exactly" + the amount,
+          # the "on Gnosis Chain" badge, the EIP-681 QR code, the short
+          # address with Copy and the "Waiting for payment" status. A live
+          # quote needs funds and a reachable chain, so this is driven with
+          # a representative quote. The one-time settlement-deposit line
+          # (#75) moved behind the ⓘ; shot 16 captures it there.
           xcrun simctl terminate booted at.vibing.ant.stream || true
           xcrun simctl launch booted at.vibing.ant.stream \
             -antstream-shot-getstarted -antstream-shot-getstarted-pay
@@ -183,6 +184,42 @@ jobs:
           xcrun simctl io booted screenshot shots/11-live-broadcast.png
           sleep 30
           xcrun simctl io booted screenshot shots/12-live-publish-lag.png
+          # --- Android parity (permanent channel, Watch tab, quality,
+          # payment help) ---
+          # 13 — the Broadcast tab's "Your channel" card: the permanent
+          # channel reference with Share / Watch. The link exists once a
+          # plan has stamped the channel's feed manifest, and a runner
+          # account has no plan, so `-antstream-shot-channel` installs a
+          # sample plan and reference (nothing persisted).
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-channel
+          sleep 25
+          xcrun simctl io booted screenshot shots/13-broadcast-channel-card.png
+          # 14/15 — the Watch tab playing a channel through the in-process
+          # gateway. The sample reference points at nothing, so this
+          # captures the player loading and then the plain-language retry
+          # state a channel that isn't live yet ends up in.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-watch
+          sleep 30
+          xcrun simctl io booted screenshot shots/14-watch-loading.png
+          sleep 60
+          xcrun simctl io booted screenshot shots/15-watch-retrying.png
+          # 16 — the payment step's ⓘ sheet: full address, copy buttons,
+          # the Gnosis-only warning, the deposit line and "activates by
+          # itself".
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-getstarted -antstream-shot-getstarted-pay \
+            -antstream-shot-getstarted-help
+          sleep 30
+          xcrun simctl io booted screenshot shots/16-getstarted-pay-help.png
+          # 17 — the live screen before going live: the quality presets
+          # (360p / 540p / 720p) and what each costs in bandwidth.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-live-idle
+          sleep 25
+          xcrun simctl io booted screenshot shots/17-live-quality-picker.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

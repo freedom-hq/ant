@@ -5,10 +5,12 @@ and plays live streams back, on top of an embedded light node
 ([`crates/ant-ffi`](../../crates/ant-ffi)).
 
 The app shell (node lifecycle, the ported storage-onboarding flow,
-Keychain/Secure-Enclave key storage) now carries a working broadcast:
-camera capture (#65) and the live publisher (#67 stage 2). The viewer
-(#66) is still to come; the **Broadcast** tab's readiness checklist is
-the contract between it and this shell.
+Keychain/Secure-Enclave key storage) carries a working broadcast: camera
+capture (#65) and the live publisher (#67 stage 2), on a permanent
+per-account channel link, plus a **Watch** tab that plays any channel
+through the embedded node. Feature-for-feature it matches the Android
+port in [`examples/android-stream`](../android-stream), with the
+differences listed under [Differences from Android](#differences-from-android).
 
 Bundle id: `at.vibing.ant.stream`. Data dir:
 `Application Support/antstream/`.
@@ -18,12 +20,13 @@ Bundle id: `at.vibing.ant.stream`. Data dir:
 | File | Role |
 |---|---|
 | `AntStreamApp.swift` | App entry + scene-phase lifecycle (`ant_suspend` inside a `beginBackgroundTask`, `ant_resume`/`ant_wake` on foreground). |
-| `AntNode.swift` | Swift wrapper over the C FFI: init with a host-held identity, gateway, storage plan, account. |
+| `AntNode.swift` | Swift wrapper over the C FFI: init with a host-held identity, gateway (with port fallback), storage plan, account, and the account's permanent `Channel`. |
 | `AccountKeystore.swift` | The account key: created, stored and restored through the Keychain / Secure Enclave. |
-| `BroadcastView.swift` | "Ready to broadcast" checklist and the Go-live entry point. |
+| `BroadcastView.swift` | "Ready to broadcast" checklist, the "Your channel" card and the Go-live entry point. |
 | `CaptureEngine.swift` | #65: `AVCaptureSession` → H.264 → `AVAssetWriter` in `.mpeg4AppleHLS` mode, emitting fMP4 segments; interruption handling and the on-disk segment ring. |
 | `LiveBroadcast.swift` | Joins capture to `ant_publisher_*`, holds the foreground keep-alive, polls publish progress. |
-| `LiveView.swift` | The going-live screen: preview, publish-lag indicator, live counters. |
+| `LiveView.swift` | The going-live screen: quality presets, preview, publish-lag indicator, live counters, channel share. |
+| `WatchView.swift` | The Watch tab: `AVPlayer` on a channel's `stream.m3u8` from the in-process gateway, with automatic retry. |
 | `BenchView.swift` | #67 stage 1: the throughput bench sheet. |
 | `GetStartedView.swift` | Ported onboarding: plan tiers → on-chain quote → payment detection → one-shot auto-activation. |
 | `StorageView.swift` | Ported storage tab: plan meter, extend/top-up, settlement warning, account + key backup/restore. |
@@ -41,7 +44,14 @@ Bundle id: `at.vibing.ant.stream`. Data dir:
 4. `ant_start_gateway("127.0.0.1:1633", light_mode: true, gnosisRpc)` —
    the in-process bee-shaped HTTP API. `light_mode` is what permits
    publish / feed / SOC writes; ultra-light is read-only. This is the
-   surface the publisher (#67) uses and the viewer (#66) will.
+   surface the publisher (#67) uses and the Watch tab plays from. When
+   another app (another Swarm node, a Freedom install) already holds
+   1633, the next free port up to 1643 is used instead, the same range
+   Freedom desktop falls back through. The address that worked is
+   remembered and tried first next time; `AntNode.gatewayURL` follows it,
+   and so do the publisher's and the bench's `"gateway"`. If every port
+   fails, the checklist shows the bind error and the node retries every
+   10 s.
 
 `start()`, `shutdown()` and the Restore flow's restart all run on one
 lifecycle queue, so only one of them is ever in flight: a Restore tapped
@@ -182,10 +192,15 @@ does not forward to the unified log, so relaunch with `--console-pty`).
    key is created and stored in the Keychain on this first launch.
 2. Tap **Get started**, pick a plan. Plans are priced live against Gnosis
    (`ant_storage_quote`), quoted in hours of 720p video (~1 GB/hour).
-3. Send the quoted xDAI to the address/QR shown. The screen polls the
-   chain and activates automatically the moment funds land —
-   `ant_storage_buy_xdai` swaps the xBZZ shortfall, buys the batch, and
-   deploys the chequebook.
+3. Pay. The payment screen is kept to what a payer needs: "Send
+   exactly" and the amount rounded up to the cent (tap to copy), an
+   "on Gnosis Chain" badge, an EIP-681 QR code a wallet fills address,
+   chain and amount in from, the short address with one-tap copy, and
+   "Waiting for payment". The ⓘ button has the rest: the full address,
+   copy buttons, the Gnosis-only warning and what the one-time network
+   deposit is for. The screen polls the chain and activates
+   automatically the moment funds land — `ant_storage_buy_xdai` swaps
+   the xBZZ shortfall, buys the batch, and deploys the chequebook.
 4. The checklist goes all-green: connected, key secured, plan active,
    settlement ready, gateway up. No `antctl` at any point.
 
@@ -218,10 +233,14 @@ device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM
    makes the segment playable) the whole time, plus how many segments
    the live-edge discipline dropped to hold it there.
 
-Defaults are the stage-1 go/no-go row: 360p at ~900 kbit/s, 2 s
-segments, a 4-deep publish window. Window 4 is measured, not arbitrary —
-window 8 collapsed the connection layer in the stage-1 soaks — so it is
-not exposed as a UI knob.
+Quality is picked on the live screen before going live and remembered:
+**360p** (640×360, 600 kbit/s, the default), **540p** (960×540,
+1000 kbit/s) or **720p** (1280×720, 1800 kbit/s), the same presets as
+the Android app. The preset sets the encoder's frame size and bitrate
+and the publisher's `bitrate_kbps`. Segments are 2 s and the publish
+window is 4 deep. Window 4 is measured, not arbitrary — window 8
+collapsed the connection layer in the stage-1 soaks — so it is not
+exposed as a UI knob.
 
 Interruptions (incoming call, backgrounding, camera flip, orientation,
 thermal downshift) finish the current segment cleanly and start a fresh
@@ -232,4 +251,55 @@ configured for recording for the broadcast's duration.
 Camera and broadcast paths are device-only — the simulator has no
 capture device. `antstream-visual` covers the screen by running the same
 encoder and publisher from a generated test pattern
-(`-antstream-shot-live`), which is labelled as such on screen.
+(`-antstream-shot-live`), which is labelled as such on screen. Its other
+launch arguments open the app straight onto one surface each:
+`-antstream-shot-live-idle` (quality picker), `-antstream-shot-channel`
+(the channel card, with sample state), `-antstream-shot-watch` (the
+Watch tab on a sample channel), `-antstream-shot-getstarted-help` (the
+payment ⓘ sheet), plus the Storage and Get Started hooks in
+`RootView.swift`.
+
+## Permanent channel
+
+Every account has one channel: a random 32-byte feed topic created on
+first use and kept in `UserDefaults` under the account address (a
+restored account gets its own). The channel reference is the feed
+manifest of owner + topic, so it is one link for all broadcasts.
+
+* As soon as a storage plan exists and the gateway is up, the app
+  creates that manifest itself (`POST /feeds/{owner}/{topic}` with
+  `swarm-postage-batch-id`, retried every 15 s until it lands) and keeps
+  the reference, so the link can be shared before the first broadcast.
+* **Broadcast → Your channel** shows it, with **Share** (the web player
+  links, for the Freedom browser and for any browser), copy, and
+  **Watch**. The live screen's copy/share buttons send the same links.
+* Every broadcast passes the topic and the next feed index as `"topic"`
+  and `"start_index"` to `ant_publisher_start`, so it continues the
+  feed instead of rewriting the indices that hold the last broadcast.
+  The index only moves forward: it is saved from the publisher's
+  progress every second and from the final report, so even an app
+  killed mid-stream resumes at most one update behind.
+
+## Watch
+
+The **Watch** tab plays a channel reference (pasted, or handed over by
+the channel card's Watch button) with `AVPlayer` from
+`http://<gateway address>/bzz/<ref>/stream.m3u8` on the in-process
+gateway. The feed manifest re-resolves to the newest playlist on every
+refresh, so the player follows the live edge. A channel that is not live
+yet, an item that fails to load, and a live playlist that stops moving
+(a broadcast that ended without closing its playlist) all reload the
+channel after a short pause, with a plain message saying so; a closed
+playlist that played to the end says the broadcast has ended. Loopback
+HTTP is covered by the ATS exception in `Info.plist`.
+
+## Differences from Android
+
+* **No background broadcasting.** Android keeps a broadcast running
+  from a foreground service. iOS stops camera capture when the app
+  leaves the foreground, so a broadcast here is foreground-only: going
+  to the background is handled as a capture interruption (the segment in
+  progress is finished cleanly, and capture resumes with a
+  discontinuity on return).
+* **Key storage.** Android wraps the key with the Android Keystore; iOS
+  uses the Keychain and the Secure Enclave (above).

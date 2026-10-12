@@ -11,6 +11,9 @@ import SwiftUI
 /// stamped batch, working settlement) is what this checklist guarantees.
 struct BroadcastView: View {
     @EnvironmentObject var node: AntNode
+    /// Opens a channel on the Watch tab (the channel card's Watch button).
+    private let onWatch: (String) -> Void
+    @StateObject private var banner = BannerState()
     @State private var showGetStarted = false
     /// Opened by the **Run bench** button — and, on launch, by
     /// `-antstreamShowBench YES`, which iOS folds into `UserDefaults`.
@@ -24,6 +27,10 @@ struct BroadcastView: View {
     /// swipe-dismissable sheet would orphan a run in progress.
     @State private var showLive = false
 
+    init(onWatch: @escaping (String) -> Void = { _ in }) {
+        self.onWatch = onWatch
+    }
+
     var body: some View {
         ZStack {
             LiquidGlassBackground(palette: .broadcast)
@@ -32,6 +39,7 @@ struct BroadcastView: View {
                 VStack(spacing: 18) {
                     header
                     liveCard
+                    if node.hasStorage { channelCard }
                     checklistCard
                     benchCard
                     if !node.hasStorage { setUpCard }
@@ -44,10 +52,23 @@ struct BroadcastView: View {
             .refreshable { await node.refreshAll() }
         }
         .preferredColorScheme(.dark)
+        .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .sheet(isPresented: $showBench) { BenchView() }
         .fullScreenCover(isPresented: $showLive) { LiveView() }
-        .task { await node.refreshAll() }
+        .task {
+            // antstream-visual: `-antstream-shot-channel` shows the "Your
+            // channel" card, which needs a plan (a fresh runner account
+            // has none) and a channel link; sample state supplies both.
+            if RootView.shotArgs.contains("-antstream-shot-channel") {
+                for _ in 0..<60 where !node.status.isReady {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                node.installChannelSample()
+                return
+            }
+            await node.refreshAll()
+        }
     }
 
     // MARK: header
@@ -106,6 +127,63 @@ struct BroadcastView: View {
         }
     }
 
+    // MARK: permanent channel
+
+    /// The account's permanent channel link, shareable before the first
+    /// broadcast: viewers who open it join whenever this device is live.
+    private var channelCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Your channel")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                if let ref = node.channelReference {
+                    Text("One link for all your broadcasts. Share it any time: viewers who open it join whenever you're live, and see your last broadcast otherwise.")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.7))
+                    Button {
+                        UIPasteboard.general.string = ref
+                        banner.flash("Channel reference copied")
+                    } label: {
+                        HStack {
+                            Text(ref)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.white)
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Image(systemName: "doc.on.doc")
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        .padding(12)
+                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                    HStack(spacing: 10) {
+                        ShareLink(item: Channel.watchLinks(ref)) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16).padding(.vertical, 10)
+                                .glassEffect(.regular.tint(.blue.opacity(0.35)), in: .capsule)
+                        }
+                        .buttonStyle(.plain)
+                        GlassPillButton(title: "Watch", icon: "play.fill",
+                                        tint: .white.opacity(0.18)) {
+                            onWatch(ref)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Creating your channel link…")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: readiness checklist
 
     private var checklistCard: some View {
@@ -144,12 +222,18 @@ struct BroadcastView: View {
                 checkRow(
                     done: node.gatewayUp,
                     title: "Publishing endpoint up",
-                    detail: node.gatewayUp
-                        ? (node.gatewayURL?.absoluteString ?? AntNode.gatewayAddress)
-                        : "Starting…"
+                    detail: gatewayDetail
                 )
             }
         }
+    }
+
+    /// Where the gateway listens, or why it doesn't: the bind error stays
+    /// on screen while the node retries every 10 s.
+    private var gatewayDetail: String {
+        if node.gatewayUp { return node.gatewayURL?.absoluteString ?? node.gatewayAddress }
+        if let error = node.gatewayError { return "Not running: \(error) (retrying)" }
+        return "Starting…"
     }
 
     private func checkRow(done: Bool, title: String, detail: String) -> some View {

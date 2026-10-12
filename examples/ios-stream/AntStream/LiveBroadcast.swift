@@ -61,10 +61,20 @@ final class LiveBroadcast: ObservableObject {
     private var pumpDrained = true
     private var idleTimerHeld = false
 
-    /// The rendition. Defaults are the stage-1 go/no-go row — 360p at
-    /// ~900 kbit/s with 2 s segments — and the same values are handed to
-    /// both halves so the encoder and the playlist agree.
-    var settings = CaptureEngine.Settings()
+    /// The quality preset the next broadcast encodes, picked on the live
+    /// screen before going live and remembered across launches. 360p by
+    /// default: the uplink, not the camera, is what limits a phone.
+    @Published var quality: CaptureEngine.Quality =
+        CaptureEngine.Quality(rawValue: UserDefaults.standard.string(forKey: LiveBroadcast.qualityKey) ?? "")
+            ?? .low {
+        didSet { UserDefaults.standard.set(quality.rawValue, forKey: Self.qualityKey) }
+    }
+
+    private static let qualityKey = "antstream.quality"
+
+    /// The rendition for ``quality``, with 2 s segments. The same values
+    /// are handed to both halves so the encoder and the playlist agree.
+    var settings: CaptureEngine.Settings { CaptureEngine.Settings(quality: quality) }
 
     /// Which source a broadcast started here would use. The simulator
     /// has no capture device, and CI drives the whole pipeline with the
@@ -90,15 +100,25 @@ final class LiveBroadcast: ObservableObject {
             state = .failed("Connect a storage plan before going live.")
             return
         }
+        // Every broadcast goes out on the account's permanent channel, so
+        // the link shared before going live keeps working.
+        guard let permanent = node.channel else {
+            state = .failed("The account is still loading; try again in a moment.")
+            return
+        }
         let source = source ?? Self.defaultSource
         if let problem = await CaptureEngine.permissionProblem(for: source) {
             state = .failed(problem)
             return
         }
 
+        let settings = self.settings
         do {
+            permanent.name = channel
             try await node.startPublisher(
                 channel: channel,
+                topic: permanent.topic,
+                startIndex: permanent.nextIndex,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),
                 segmentMs: UInt32(settings.segmentSeconds * 1000),
@@ -151,7 +171,7 @@ final class LiveBroadcast: ObservableObject {
         self.engine = engine
         engine.start()
         state = .live
-        startPolling(node: node)
+        startPolling(node: node, channel: permanent)
     }
 
     /// End the broadcast. Capture stops first so the segment in flight
@@ -191,7 +211,9 @@ final class LiveBroadcast: ObservableObject {
         releaseIdleTimer()
         deactivateAudioSession()
         do {
-            report = try await node.stopPublisher()
+            let finished = try await node.stopPublisher()
+            report = finished
+            if let next = finished.feedIndex { node.channel?.advance(to: next) }
         } catch {
             if failure == nil {
                 state = .failed(error.localizedDescription)
@@ -203,13 +225,17 @@ final class LiveBroadcast: ObservableObject {
 
     // MARK: - Progress
 
-    private func startPolling(node: AntNode) {
+    private func startPolling(node: AntNode, channel: Channel) {
         pollTask?.cancel()
         pollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self, self.state.isActive else { return }
                 if let snapshot = await node.publisherProgress() {
                     self.progress = snapshot
+                    // Saved as it advances, so the next broadcast
+                    // continues the feed even if this one is killed
+                    // mid-stream.
+                    channel.advance(to: snapshot.feedIndex)
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }

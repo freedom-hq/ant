@@ -13,9 +13,10 @@ import SwiftUI
 ///   Enclave) and is passed in through `ant_init_with_identity`, so the
 ///   library never writes `identity.json` into the app container.
 /// * After startup we bring up the in-process bee-shaped HTTP gateway
-///   (`ant_start_gateway`, `light_mode`) on localhost. That is the
-///   surface the publisher (#67) and the HLS viewer (#66) will push
-///   segments and feed updates through.
+///   (`ant_start_gateway`, `light_mode`) on localhost, falling back
+///   through ports 1634…1643 when 1633 is taken. That is the surface the
+///   publisher (#67) pushes segments and feed updates through, and the
+///   Watch tab plays channels from.
 @MainActor
 final class AntNode: ObservableObject {
     enum Status: Equatable {
@@ -62,12 +63,35 @@ final class AntNode: ObservableObject {
     @Published private(set) var networkLabel: String = "Unknown"
     /// How the account key is protected at rest, for the Storage tab.
     @Published private(set) var keyProtection: AccountKeystore.Protection?
+    /// Why the gateway is down, when binding failed (another app holds
+    /// every port in the fallback range). Shown in the checklist; the
+    /// peer poll retries every 10 s while it is set.
+    @Published private(set) var gatewayError: String?
+    /// Where the in-process bee gateway listens: 127.0.0.1:1633, or the
+    /// next free port up to 1643 when another app (another Swarm node, a
+    /// Freedom install) already holds it. Remembered, so a restart lands
+    /// on the port that worked last time.
+    @Published private(set) var gatewayAddress: String =
+        UserDefaults.standard.string(forKey: AntNode.gatewayAddressKey) ?? AntNode.defaultGatewayAddress
+    /// The account's permanent channel; `nil` until the account is known.
+    @Published private(set) var channel: Channel?
+    /// The channel's shareable reference, once its feed manifest exists.
+    @Published private(set) var channelReference: String?
 
-    /// Where the in-process bee gateway listens. Fixed rather than
-    /// ephemeral so the publisher/viewer can be pointed at it without
-    /// plumbing the port around.
-    static let gatewayAddress = "127.0.0.1:1633"
-    var gatewayURL: URL? { URL(string: "http://\(Self.gatewayAddress)") }
+    /// The preferred gateway address and the start of the fallback range
+    /// (the same range Freedom desktop uses).
+    static let defaultGatewayPort = 1633
+    static let defaultGatewayAddress = "127.0.0.1:\(defaultGatewayPort)"
+    private static let gatewayAddressKey = "antstream.gatewayAddress"
+    /// The gateway's base URL. Follows ``gatewayAddress``, so everything
+    /// that talks to the gateway (publisher, bench, player) must read it
+    /// here rather than assume port 1633.
+    var gatewayURL: URL? { URL(string: "http://\(gatewayAddress)") }
+    /// Set while ``startGateway()`` walks the port range, so the periodic
+    /// retry never runs two binds at once.
+    private var gatewayBinding = false
+    /// Set while ``ensureChannelReference()`` is creating the manifest.
+    private var channelCreating = false
 
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
@@ -266,6 +290,8 @@ final class AntNode: ObservableObject {
         account = nil
         settlement = nil
         validity = nil
+        channel = nil
+        channelReference = nil
         await Task.detached(priority: .userInitiated) {
             _ = ant_stop_gateway(h)
             ant_shutdown(h)
@@ -276,24 +302,56 @@ final class AntNode: ObservableObject {
     /// Bring up the in-process bee-shaped HTTP gateway in `light_mode`
     /// (publish / feed / SOC writes allowed — exactly what broadcasting
     /// needs; ultra-light is read-only). Idempotent node-side.
+    ///
+    /// Tries the remembered address first, then 127.0.0.1:1633…1643:
+    /// another app holding 1633 must not leave the device unable to
+    /// broadcast. The address that worked is published as
+    /// ``gatewayAddress`` and remembered for the next start; when every
+    /// port fails the last bind error is kept in ``gatewayError``.
     @discardableResult
     func startGateway() async -> Bool {
-        let addr = Self.gatewayAddress
+        guard !gatewayBinding else { return gatewayUp }
+        gatewayBinding = true
+        defer { gatewayBinding = false }
         let rpc = gnosisRpc
-        guard let ok = await withHandle({ h in
-            await Task.detached(priority: .userInitiated) { () -> Bool in
-                var errPtr: UnsafeMutablePointer<CChar>? = nil
-                let ok = addr.withCString { caddr in
-                    rpc.withCString { crpc in
-                        ant_start_gateway(h, caddr, true, crpc, &errPtr)
+        var candidates = [gatewayAddress]
+        for port in Self.defaultGatewayPort...(Self.defaultGatewayPort + 10) {
+            let addr = "127.0.0.1:\(port)"
+            if !candidates.contains(addr) { candidates.append(addr) }
+        }
+        var lastError: String?
+        for addr in candidates {
+            // `nil` from `withHandle` means there is no node; a non-nil
+            // inner value is the bind failure (`nil` inside = listening).
+            let outcome: String?? = await withHandle { h in
+                await Task.detached(priority: .userInitiated) { () -> String? in
+                    var errPtr: UnsafeMutablePointer<CChar>? = nil
+                    let ok = addr.withCString { caddr in
+                        rpc.withCString { crpc in
+                            ant_start_gateway(h, caddr, true, crpc, &errPtr)
+                        }
                     }
-                }
-                if !ok, let errPtr { ant_free_string(errPtr) }
-                return ok
-            }.value
-        }) else { return false }
-        gatewayUp = ok
-        return ok
+                    let detail = ok ? nil : (errPtr.map { String(cString: $0) } ?? "could not start")
+                    if let errPtr { ant_free_string(errPtr) }
+                    return detail
+                }.value
+            }
+            guard let result = outcome else { break }
+            if let failure = result {
+                lastError = failure
+                continue
+            }
+            if gatewayAddress != addr {
+                gatewayAddress = addr
+                UserDefaults.standard.set(addr, forKey: Self.gatewayAddressKey)
+            }
+            gatewayError = nil
+            gatewayUp = true
+            return true
+        }
+        gatewayError = handle == nil ? nil : (lastError ?? "could not start")
+        gatewayUp = false
+        return false
     }
 
     /// System-suspend before the app loses execution (backgrounding) or
@@ -331,7 +389,7 @@ final class AntNode: ObservableObject {
     }
 
     private func restartGateway() async {
-        guard handle != nil else { return }
+        guard handle != nil, !gatewayBinding else { return }
         _ = await withHandle { h in
             await Task.detached(priority: .userInitiated) { _ = ant_stop_gateway(h) }.value
         }
@@ -544,7 +602,7 @@ final class AntNode: ObservableObject {
             // ones would have nothing left to measure.
             "warmup_s": durationSeconds > 120 ? 30 : 5,
             "max_in_flight": 4,
-            "gateway": "http://\(Self.gatewayAddress)",
+            "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId ?? "",
             "notes": notes,
         ]
@@ -605,8 +663,15 @@ final class AntNode: ObservableObject {
     /// The publish window is left at the node's default (4): stage 1
     /// measured 4 as the stable point and 8 as a connection-layer
     /// collapse, so it is not a knob this screen should offer.
+    ///
+    /// `topic` and `startIndex` come from the account's permanent
+    /// ``Channel``: the same topic every time keeps the channel link
+    /// stable, and `startIndex` continues the feed after the previous
+    /// broadcast instead of rewriting the indices that hold it.
     func startPublisher(
         channel: String,
+        topic: String,
+        startIndex: UInt64,
         batchId: String,
         bitrateKbps: UInt32,
         segmentMs: UInt32,
@@ -614,7 +679,9 @@ final class AntNode: ObservableObject {
     ) async throws {
         let config: [String: Any] = [
             "channel": channel,
-            "gateway": "http://\(Self.gatewayAddress)",
+            "topic": topic,
+            "start_index": startIndex,
+            "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId,
             "bitrate_kbps": bitrateKbps,
             "segment_ms": segmentMs,
@@ -701,6 +768,7 @@ final class AntNode: ObservableObject {
         await refreshPlan()
         await refreshAccount()
         await refreshSettlement()
+        await ensureChannelReference()
     }
 
     func refreshPlan() async {
@@ -723,7 +791,39 @@ final class AntNode: ObservableObject {
         }) {
             let decoded = StreamDecoder.account(from: json)
             if decoded != account { account = decoded }
+            // The channel is scoped to the account address: a restored
+            // account gets its own topic and link.
+            if let owner = decoded?.ethAddress, !owner.isEmpty, channel?.owner != owner {
+                let c = Channel(owner: owner)
+                channel = c
+                if !screenshotSampleActive { channelReference = c.reference }
+            }
         }
+    }
+
+    // MARK: - Channel
+
+    /// Make sure the permanent channel's feed manifest exists, so its
+    /// link can be shared before the first broadcast. Needs a storage
+    /// plan (the manifest is a stamped upload) and the gateway; until
+    /// both are there this returns `nil`, and the peer poll calls it
+    /// again every 15 s until the reference lands.
+    @discardableResult
+    func ensureChannelReference() async -> String? {
+        guard let channel, !screenshotSampleActive else { return channelReference }
+        if let ref = channel.reference {
+            if channelReference != ref { channelReference = ref }
+            return ref
+        }
+        guard !channelCreating, hasStorage, gatewayUp,
+              let batchId = plan?.batchId, let gateway = gatewayURL else { return nil }
+        channelCreating = true
+        defer { channelCreating = false }
+        guard let ref = try? await channel.createReference(gateway: gateway, batchId: batchId)
+        else { return nil }
+        // The account may have changed while the request was out.
+        if self.channel?.owner == channel.owner { channelReference = ref }
+        return ref
     }
 
     /// Fetch the connected plan's remaining lifetime from chain. Needs a
@@ -854,12 +954,34 @@ final class AntNode: ObservableObject {
         )
     }
 
+    /// Drive the Broadcast tab to its ready state with a channel link,
+    /// for the "Your channel" card's CI screenshot
+    /// (`-antstream-shot-channel`). The link exists only once a plan has
+    /// stamped the channel's feed manifest, and a fresh runner account
+    /// has no plan, so a sample plan, a deployed chequebook and a sample
+    /// reference are published. Nothing is persisted: the account's real
+    /// channel (topic, index, reference) is left untouched.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-channel`.
+    func installChannelSample() {
+        screenshotSampleActive = true
+        plan = Self.sampleConnectedPlan(
+            batchId: "0x" + String(repeating: "a1", count: 32)
+        )
+        settlement = SettlementInfo(
+            enabled: true,
+            chequebook: "0x370e6965000000000000000000000000000000e1"
+        )
+        channelReference = Channel.sampleReference
+    }
+
     // MARK: - Polling
 
     private func startPollingPeers() {
         peerPollTask?.cancel()
         guard handle != nil else { return }
         peerPollTask = Task { @MainActor [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 // Re-read the handle every tick rather than capturing it
                 // once: a shutdown clears it, and `ant_peer_count` is a
@@ -872,6 +994,17 @@ final class AntNode: ObservableObject {
                 // every observing view.
                 let count = max(0, Int(ant_peer_count(h)))
                 if self.peerCount != count { self.peerCount = count }
+                tick += 1
+                // A gateway that failed to bind is retried every 10 s,
+                // and a channel link that couldn't be created yet (no
+                // plan, gateway down, network) every 15 s. Both run off
+                // this loop so a slow bind never delays the peer count.
+                if tick % 10 == 0, !self.gatewayUp {
+                    Task { await self.startGateway() }
+                }
+                if tick % 15 == 0, self.channelReference == nil {
+                    Task { await self.ensureChannelReference() }
+                }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
@@ -930,6 +1063,116 @@ final class AntNode: ObservableObject {
         guard let bundled = Bundle.main.url(forResource: "peers.seed", withExtension: "json") else { return }
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.copyItem(at: bundled, to: dest)
+    }
+}
+
+/// The account's permanent channel: one feed topic kept across
+/// broadcasts, so the channel reference (the feed manifest of owner +
+/// topic) is one link a viewer can bookmark, shared before going live.
+/// Ported from the Android app's `Channel.kt`.
+///
+/// Every broadcast continues the feed where the last one stopped
+/// (``nextIndex`` becomes the publisher's `start_index`): rewriting
+/// indices that already hold an old broadcast's playlists would collide
+/// with them. The index is saved as the broadcast runs, so even an app
+/// killed mid-stream resumes at most one update behind.
+///
+/// Scoped to the account address: a restored account gets its own
+/// channel. Lives in `UserDefaults` — nothing here is secret, the topic
+/// and owner are public the moment the first feed update lands.
+struct Channel: Equatable {
+    let owner: String
+    /// 32-byte feed topic, hex, created once per account.
+    let topic: String
+
+    private let prefix: String
+    private var defaults: UserDefaults { .standard }
+
+    init(owner: String) {
+        let prefix = "antstream.channel.\(owner.lowercased())."
+        let key = prefix + "topic"
+        let topic: String
+        if let stored = UserDefaults.standard.string(forKey: key), stored.count == 64 {
+            topic = stored
+        } else {
+            // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
+            // platforms.
+            let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+            topic = bytes.map { String(format: "%02x", $0) }.joined()
+            UserDefaults.standard.set(topic, forKey: key)
+        }
+        self.owner = owner
+        self.prefix = prefix
+        self.topic = topic
+    }
+
+    /// The name the last broadcast used; seeds the live screen's field.
+    var name: String? {
+        get { defaults.string(forKey: prefix + "name") }
+        nonmutating set { defaults.set(newValue, forKey: prefix + "name") }
+    }
+
+    /// The feed index the next broadcast starts at.
+    var nextIndex: UInt64 {
+        UInt64(max(0, defaults.integer(forKey: prefix + "nextIndex")))
+    }
+
+    /// Record the publisher's `feed_index`. Only ever forward: a stale
+    /// report must not rewind the feed.
+    func advance(to index: UInt64) {
+        guard index > nextIndex, index <= UInt64(Int.max) else { return }
+        defaults.set(Int(index), forKey: prefix + "nextIndex")
+    }
+
+    /// The shareable channel reference, once its feed manifest exists.
+    var reference: String? { defaults.string(forKey: prefix + "reference") }
+
+    /// Create the channel's feed manifest (`POST /feeds/{owner}/{topic}`,
+    /// bee-js `createFeedManifest`) on the in-process gateway, and keep
+    /// its reference. Content-addressed, so creating it again yields the
+    /// same reference.
+    func createReference(gateway: URL, batchId: String) async throws -> String {
+        if let reference { return reference }
+        let ownerHex = Self.stripHexPrefix(owner).lowercased()
+        let url = gateway.appending(path: "feeds/\(ownerHex)/\(topic)")
+        var request = URLRequest(url: url, timeoutInterval: 120)
+        request.httpMethod = "POST"
+        request.setValue(Self.stripHexPrefix(batchId), forHTTPHeaderField: "swarm-postage-batch-id")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let body = String(data: data.prefix(200), encoding: .utf8) ?? ""
+            throw AntError.op("could not create the channel (\(code)): \(body)")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ref = obj["reference"] as? String, !ref.isEmpty else {
+            throw AntError.op("could not read the channel reference")
+        }
+        defaults.set(ref, forKey: prefix + "reference")
+        return ref
+    }
+
+    /// The AntStream web player's Swarm reference
+    /// (`examples/antstream-player`). Keep in step with the Android
+    /// app's `Channel.PLAYER_REF`.
+    static let playerReference = "664f9718d0aab34ef463c83e52884eb29fd532cab008eacfcf93241ed7f379fe"
+
+    /// What "Share" sends: the channel in the web player, for Freedom and
+    /// any browser. Same text as the Android app's `Channel.watchLinks`.
+    static func watchLinks(_ channel: String) -> String {
+        "Watch my live stream on Swarm:\n"
+            + "Freedom browser: bzz://\(playerReference)/#\(channel)\n"
+            + "Any browser: https://api.gateway.ethswarm.org/bzz/\(playerReference)/#\(channel)\n"
+            + "Channel: \(channel)"
+    }
+
+    /// A well-formed reference for the channel and Watch screenshots
+    /// (`antstream-visual`). It points at nothing, so the Watch tab shows
+    /// its retry state.
+    static let sampleReference = "5c0a5ef4b41d1b3c2e7a9d8f6e4c3b2a19f8e7d6c5b4a39281706f5e4d3c2b1a"
+
+    private static func stripHexPrefix(_ s: String) -> String {
+        s.hasPrefix("0x") || s.hasPrefix("0X") ? String(s.dropFirst(2)) : s
     }
 }
 
