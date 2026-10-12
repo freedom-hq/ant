@@ -1953,11 +1953,36 @@ pub fn confirm_cheque_liability(path: &Path, chequebook: [u8; 20]) -> std::io::R
 /// funds check would count the old totals as issued and drain the
 /// deposit in minutes. Seen live on 2026-10-12: a fresh 0.01 xBZZ
 /// chequebook read as spent two minutes after deploy.
+///
+/// Both records are attempted even if the other fails; the error names
+/// which one failed (and the consequence).
 pub fn note_fresh_chequebook(path: &Path, chequebook: [u8; 20]) -> std::io::Result<()> {
     let _file = lock_file();
     let key = hex::encode(chequebook);
-    note_fresh(path, &key)?;
-    note_known(path, &key)
+    let fresh = note_fresh(path, &key).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "can't record it as fresh in {}: {e}; a ledger written before \
+                 per-chequebook sections may be adopted into it",
+                fresh_marker_path(path).display(),
+            ),
+        )
+    });
+    let known = note_known(path, &key).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "can't record it in the lost-ledger marker: {e}; downloads and uploads \
+                 stay on the free tier until an operator confirms the loss",
+            ),
+        )
+    });
+    match (fresh, known) {
+        (Err(a), Err(b)) => Err(std::io::Error::new(a.kind(), format!("{a}; and {b}"))),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// Where [`note_fresh_chequebook`] lists the chequebooks deployed fresh
@@ -1967,18 +1992,32 @@ fn fresh_marker_path(path: &Path) -> PathBuf {
 }
 
 /// Chequebooks recorded as freshly deployed for the ledger at `path`.
-/// A missing or unreadable marker lists none.
-fn fresh_chequebooks(path: &Path) -> Vec<String> {
-    std::fs::read(fresh_marker_path(path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
-        .unwrap_or_default()
+/// A missing marker lists none. A marker that can't be read or parsed is
+/// an error, not an empty list: read as empty it would let the pre-section
+/// ledger be adopted into a fresh chequebook, and written back it would
+/// erase every fresh entry it held.
+fn fresh_chequebooks(path: &Path) -> std::io::Result<Vec<String>> {
+    let marker = fresh_marker_path(path);
+    let bytes = match std::fs::read(&marker) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "fresh-chequebook marker {} unparsable: {e}",
+                marker.display()
+            ),
+        )
+    })
 }
 
 /// Add `key` to the fresh marker (durably). Caller holds
-/// [`OUTBOUND_FILE_LOCK`].
+/// [`OUTBOUND_FILE_LOCK`]. A marker that can't be read is left as it is.
 fn note_fresh(path: &Path, key: &str) -> std::io::Result<()> {
-    let mut fresh = fresh_chequebooks(path);
+    let mut fresh = fresh_chequebooks(path)?;
     if fresh.iter().any(|k| k == key) {
         return Ok(());
     }
@@ -2023,7 +2062,10 @@ fn load_outbound_section(
     let mut file = read_outbound_file(path)?.unwrap_or_default();
     let entries = file.entries();
     // Never into a chequebook deployed fresh: see `note_fresh_chequebook`.
-    if file.chequebooks.contains_key("") && fresh_chequebooks(path).iter().any(|k| k == key) {
+    // If the fresh marker can't be read, whether `key` is fresh is
+    // unknown: fail the load (no cheques until it reads) rather than
+    // adopt old cumulatives into what may be a fresh chequebook.
+    if file.chequebooks.contains_key("") && fresh_chequebooks(path)?.iter().any(|k| k == key) {
         info!(
             target: "ant_p2p::swap",
             chequebook = %key,
@@ -3221,6 +3263,72 @@ mod tests {
         let reopened_a = OutboundLedger::open(Some(path), a);
         assert_eq!(reopened_a.cumulative_for(&peer), U256::from(1_600u64));
         assert_eq!(reopened_a.total_issued(), U256::from(1_600u64));
+    }
+
+    /// A fresh marker that can't be parsed is neither read as "none fresh"
+    /// (which would adopt the pre-section ledger into a fresh chequebook)
+    /// nor overwritten by the next deploy (which would erase its entries).
+    #[test]
+    fn an_unreadable_fresh_marker_is_not_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let (a, b) = ([0xa0u8; 20], [0xb0u8; 20]);
+        let peer = [0x11u8; 20];
+        std::fs::write(
+            &path,
+            br#"{"1111111111111111111111111111111111111111":"5543284090100"}"#,
+        )
+        .unwrap();
+        note_fresh_chequebook(&path, a).unwrap();
+        let marker = fresh_marker_path(&path);
+        let good = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, b"{ not json").unwrap();
+
+        assert!(note_fresh_chequebook(&path, b).is_err());
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"{ not json",
+            "left as it was, not overwritten"
+        );
+        let ledger = OutboundLedger::open(Some(path.clone()), a);
+        assert_eq!(ledger.cumulative_for(&peer), U256::zero(), "not adopted");
+        assert!(
+            ledger.ensure_readable().is_err(),
+            "no cheques while it can't tell whether the chequebook is fresh"
+        );
+
+        // Readable again: A is still fresh and still starts from zero.
+        std::fs::write(&marker, good).unwrap();
+        ledger.ensure_readable().unwrap();
+        assert_eq!(ledger.cumulative_for(&peer), U256::zero());
+        drop(ledger);
+        let ledger = OutboundLedger::open(Some(path), a);
+        assert_eq!(ledger.cumulative_for(&peer), U256::zero());
+    }
+
+    /// A deploy whose fresh record fails is still recorded as known in
+    /// the lost-ledger marker, so it isn't held behind the loss gate.
+    #[test]
+    fn a_failed_fresh_record_still_clears_the_loss_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let old = OutboundLedger::open(Some(path.clone()), [0xa1u8; 20]);
+        old.record_issued(&[0x22u8; 20], U256::from(5u64)).unwrap();
+        drop(old);
+        // Lose the ledger.
+        std::fs::write(&path, b"{ not json").unwrap();
+        drop(OutboundLedger::open(Some(path.clone()), [0xa2; 20]));
+        let cb = [0xc0u8; 20];
+        assert!(lost_figures_at(&path, &cb).is_some(), "lost before deploy");
+        // The fresh marker can't be written (a directory is in its way).
+        std::fs::create_dir(fresh_marker_path(&path)).unwrap();
+
+        let err = note_fresh_chequebook(&path, cb).unwrap_err();
+        assert!(err.to_string().contains("fresh"), "{err}");
+        assert!(
+            lost_figures_at(&path, &cb).is_none(),
+            "still recorded as known"
+        );
     }
 
     /// A chequebook deployed fresh never adopts a ledger written before

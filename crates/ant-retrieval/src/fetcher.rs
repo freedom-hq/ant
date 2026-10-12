@@ -1572,17 +1572,6 @@ fn is_transient_pushsync_error(err: &crate::pushsync::PushSyncError) -> bool {
     matches!(err, E::Io(_))
 }
 
-/// Given how many distinct peers have answered this chunk with a
-/// *shallow* receipt so far (1-based, counting the current one), decide
-/// whether to stop hunting for a deeper storer and accept the chunk as
-/// stored.
-///
-/// A shallow receipt is proof the chunk was stored (the storer ran its
-/// reserve-put + sign path), so accepting one keeps the chunk
-/// retrievable; we only spend a bounded number of attempts looking for a
-/// deeper storer first. The threshold matches bee's pusher, which retries
-/// a shallow receipt `DefaultRetryCount` (6) times before reporting the
-/// chunk synced regardless. See [`RoutingFetcher::MAX_SHALLOW_ATTEMPTS`].
 /// What a push does with a shallow receipt (the chunk is stored, but
 /// outside its neighbourhood).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1620,6 +1609,17 @@ const fn shallow_verdict(
     }
 }
 
+/// Given how many distinct peers have answered this chunk with a
+/// *shallow* receipt so far (1-based, counting the current one), decide
+/// whether to stop hunting for a deeper storer and accept the chunk as
+/// stored.
+///
+/// A shallow receipt is proof the chunk was stored (the storer ran its
+/// reserve-put + sign path), so accepting one keeps the chunk
+/// retrievable; we only spend a bounded number of attempts looking for a
+/// deeper storer first. The threshold matches bee's pusher, which retries
+/// a shallow receipt `DefaultRetryCount` (6) times before reporting the
+/// chunk synced regardless. See [`RoutingFetcher::MAX_SHALLOW_ATTEMPTS`].
 const fn accept_shallow_after(shallow_attempts: u32) -> bool {
     shallow_attempts >= RoutingFetcher::MAX_SHALLOW_ATTEMPTS
 }
@@ -3365,13 +3365,9 @@ mod tests {
         );
     }
 
-    /// Pin shallow-receipt acceptance: we hunt for a deeper storer for a
-    /// bounded number of shallow hits, then accept (a shallow receipt still
-    /// means the chunk *is* stored, so failing the upload would be wrong).
-    /// The threshold sits above bee's pusher `DefaultRetryCount` (6) because
-    /// a light node can't lean on pull-sync to deepen a shallow placement
-    /// after the fact, so it spends extra rounds — each with an active
-    /// neighbourhood dial + bounded wait — hunting for a deep storer first.
+    /// A shallow receipt hunts for a deep storer until the hunt is used
+    /// up, or not at all in a neighbourhood already known to lack one;
+    /// strict pushes never take that shortcut.
     #[test]
     fn a_shallow_receipt_hunts_until_used_up_or_known_shallow() {
         use ShallowVerdict::{AcceptAndMark, AcceptKnown, Hunt, Strict};
@@ -3387,6 +3383,13 @@ mod tests {
         assert_eq!(shallow_verdict(12, true, false), Strict);
     }
 
+    /// Pin shallow-receipt acceptance: we hunt for a deeper storer for a
+    /// bounded number of shallow hits, then accept (a shallow receipt still
+    /// means the chunk *is* stored, so failing the upload would be wrong).
+    /// The threshold sits above bee's pusher `DefaultRetryCount` (6) because
+    /// a light node can't lean on pull-sync to deepen a shallow placement
+    /// after the fact, so it spends extra rounds — each with an active
+    /// neighbourhood dial + bounded wait — hunting for a deep storer first.
     #[test]
     fn shallow_receipt_accepted_after_bounded_attempts() {
         assert_eq!(

@@ -12,8 +12,12 @@
 //! out the SOC push patience: every segment took ~30 s to publish.
 //!
 //! [`PushDedup`] gives a push two shortcuts, both keyed on the chunk's
-//! address *and* bytes (a SOC can be rewritten in place with new
-//! content, and that must still go out):
+//! address, its bytes (a SOC can be rewritten in place with new content,
+//! and that must still go out) *and* the postage batch it is to be
+//! stamped with (a re-upload under another batch, e.g. a newly bought
+//! one to extend the content's lifetime, must really be stamped with
+//! that batch, and a push under one batch must not inherit another
+//! batch's failure):
 //!
 //! * **in flight**: a push of something already being pushed waits for
 //!   that push and gets its answer, instead of racing it with another
@@ -38,15 +42,17 @@ pub const RECENT_TTL: Duration = Duration::from_mins(10);
 /// Bound on the recently-stored memory (oldest entries go first).
 const RECENT_MAX: usize = 100_000;
 
-/// What identifies a push for deduplication: the chunk's address and a
-/// hash of its wire bytes.
+/// What identifies a push for deduplication: a hash of the chunk's
+/// address, the postage batch it is stamped with and its wire bytes.
 pub type PushKey = [u8; 32];
 
-/// The key for a push of `address` carrying `wire`.
+/// The key for a push of `address` carrying `wire`, stamped with
+/// `batch_id`.
 #[must_use]
-pub fn push_key(address: &[u8; 32], wire: &[u8]) -> PushKey {
-    let mut input = Vec::with_capacity(32 + wire.len());
+pub fn push_key(address: &[u8; 32], batch_id: &[u8; 32], wire: &[u8]) -> PushKey {
+    let mut input = Vec::with_capacity(64 + wire.len());
     input.extend_from_slice(address);
+    input.extend_from_slice(batch_id);
     input.extend_from_slice(wire);
     ant_crypto::keccak256(&input)
 }
@@ -122,13 +128,18 @@ impl PushDedup {
             tokio::select! {
                 r = &mut rx => break r.ok(),
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    let abandoned = self
-                        .lock()
+                    // Decide abandonment and release the entry under one
+                    // lock hold, so a `begin` can't attach to an entry
+                    // already judged abandoned and be told "push
+                    // abandoned" for a live request.
+                    let mut inner = self.lock();
+                    let abandoned = inner
                         .inflight
                         .get(&key)
                         .is_none_or(|w| w.iter().all(oneshot::Sender::is_closed));
                     if abandoned {
-                        break None;
+                        inner.inflight.remove(&key);
+                        return;
                     }
                 }
             }
@@ -170,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_waits_for_the_push_in_flight_and_shares_its_answer() {
         let dedup = Arc::new(PushDedup::default());
-        let key = push_key(&[1u8; 32], b"wire");
+        let key = push_key(&[1u8; 32], &[0u8; 32], b"wire");
         let (a_tx, a_rx) = oneshot::channel();
         let (b_tx, b_rx) = oneshot::channel();
         let Begin::Push(push) = dedup.begin(key, [1u8; 32], a_tx) else {
@@ -194,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn a_recently_stored_chunk_is_answered_without_a_push() {
         let dedup = Arc::new(PushDedup::default());
-        let key = push_key(&[2u8; 32], b"wire");
+        let key = push_key(&[2u8; 32], &[0u8; 32], b"wire");
         let (a_tx, a_rx) = oneshot::channel();
         let Begin::Push(push) = dedup.begin(key, [2u8; 32], a_tx) else {
             panic!()
@@ -210,7 +221,11 @@ mod tests {
         // Same address, different bytes (a SOC rewritten in place): pushed.
         let (c_tx, _c_rx) = oneshot::channel();
         assert!(matches!(
-            dedup.begin(push_key(&[2u8; 32], b"new content"), [2u8; 32], c_tx),
+            dedup.begin(
+                push_key(&[2u8; 32], &[0u8; 32], b"new content"),
+                [2u8; 32],
+                c_tx
+            ),
             Begin::Push(_)
         ));
     }
@@ -218,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_push_is_not_remembered() {
         let dedup = Arc::new(PushDedup::default());
-        let key = push_key(&[3u8; 32], b"wire");
+        let key = push_key(&[3u8; 32], &[0u8; 32], b"wire");
         let (a_tx, a_rx) = oneshot::channel();
         let Begin::Push(push) = dedup.begin(key, [3u8; 32], a_tx) else {
             panic!()
@@ -238,7 +253,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_push_nobody_waits_for_is_released() {
         let dedup = Arc::new(PushDedup::default());
-        let key = push_key(&[4u8; 32], b"wire");
+        let key = push_key(&[4u8; 32], &[0u8; 32], b"wire");
         let (a_tx, a_rx) = oneshot::channel();
         let Begin::Push(mut push) = dedup.begin(key, [4u8; 32], a_tx) else {
             panic!()
@@ -247,5 +262,53 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), push.closed())
             .await
             .expect("the push's ack closes once every waiter is gone");
+    }
+
+    #[tokio::test]
+    async fn a_push_under_another_batch_is_not_coalesced() {
+        let dedup = Arc::new(PushDedup::default());
+        let addr = [5u8; 32];
+        let under_a = push_key(&addr, &[0xa; 32], b"wire");
+        let under_b = push_key(&addr, &[0xb; 32], b"wire");
+        let (a_tx, a_rx) = oneshot::channel();
+        let Begin::Push(push) = dedup.begin(under_a, addr, a_tx) else {
+            panic!()
+        };
+        // In flight under A: B still goes out on its own.
+        let (b_tx, _b_rx) = oneshot::channel();
+        assert!(matches!(dedup.begin(under_b, addr, b_tx), Begin::Push(_)));
+        push.send(ControlAck::ChunkUploaded {
+            reference: "0x05".into(),
+        })
+        .unwrap();
+        a_rx.await.unwrap();
+        // Stored under A a moment ago: a push under C is still stamped.
+        let (c_tx, _c_rx) = oneshot::channel();
+        assert!(matches!(
+            dedup.begin(push_key(&addr, &[0xc; 32], b"wire"), addr, c_tx),
+            Begin::Push(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_push_releases_its_entry_for_the_next_one() {
+        let dedup = Arc::new(PushDedup::default());
+        let key = push_key(&[6u8; 32], &[0u8; 32], b"wire");
+        let (a_tx, a_rx) = oneshot::channel();
+        let Begin::Push(mut push) = dedup.begin(key, [6u8; 32], a_tx) else {
+            panic!()
+        };
+        drop(a_rx);
+        tokio::time::timeout(Duration::from_secs(5), push.closed())
+            .await
+            .unwrap();
+        assert!(
+            !dedup.lock().inflight.contains_key(&key),
+            "the abandoned entry is gone with the decision"
+        );
+        // A later request is a push of its own, not a waiter on the
+        // abandoned one.
+        let (b_tx, _b_rx) = oneshot::channel();
+        assert!(matches!(dedup.begin(key, [6u8; 32], b_tx), Begin::Push(_)));
     }
 }

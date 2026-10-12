@@ -2618,10 +2618,11 @@ fn handle_control_command(
             // `push_dedup`). Strict pushes (repairs) and caller-stamped
             // ones always go out.
             let ack = if stamp.is_none() && !require_deep {
-                match state
-                    .push_dedup
-                    .begin(crate::push_dedup::push_key(&addr, &wire), addr, ack)
-                {
+                match state.push_dedup.begin(
+                    crate::push_dedup::push_key(&addr, &batch_id, &wire),
+                    addr,
+                    ack,
+                ) {
                     crate::push_dedup::Begin::Push(ack) => ack,
                     crate::push_dedup::Begin::Handled => return,
                 }
@@ -2768,12 +2769,12 @@ fn handle_control_command(
                 });
                 return;
             }
-            // Same SOC (address *and* bytes) in flight or just stored:
+            // Same SOC (address, bytes *and* batch) in flight or just stored:
             // reuse that push (see `push_dedup`). Redundancy replicas of
             // an unchanged manifest node repeat with every upload.
             let ack = if stamp.is_none() {
                 match state.push_dedup.begin(
-                    crate::push_dedup::push_key(&address, &wire),
+                    crate::push_dedup::push_key(&address, &batch_id, &wire),
                     address,
                     ack,
                 ) {
