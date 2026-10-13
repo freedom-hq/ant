@@ -279,7 +279,8 @@ pub async fn cors_middleware(
 
 /// Guard for the routes that spend the node wallet's **xDAI**
 /// (`POST /v0/storage/buy`, `POST /v0/storage/extend`,
-/// `POST /v0/settlement/deposit`): refuse any request a web page made,
+/// `POST /v0/settlement/deposit`) or move its chequebook's xBZZ
+/// (`POST /chequebook/withdraw`): refuse any request a web page made,
 /// unless the page's origin is listed exactly in `cors-allowed-origins`.
 ///
 /// These routes take only query parameters, so a page can send them as

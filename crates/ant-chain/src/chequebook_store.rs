@@ -505,7 +505,8 @@ pub async fn top_up_chequebook(
 pub struct RetrievalFunds {
     /// xBZZ ever deposited and not withdrawn, in PLUR: the chequebook's
     /// balance plus what beneficiaries have already cashed
-    /// (`totalPaidOut`). Bee's `AvailableBalance` is this minus every
+    /// (`totalPaidOut`), less any [`withdraw_from_chequebook`] in flight
+    /// in this process. Bee's `AvailableBalance` is this minus every
     /// cheque issued so far, which only the issuing node knows.
     pub deposited_plur: u128,
     /// Bee's oracle exchange rate, PLUR per accounting unit.
@@ -524,7 +525,9 @@ pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::fr
 
 /// Read [`RetrievalFunds`] for `chequebook`: its xBZZ balance, its
 /// `totalPaidOut()`, and bee's price oracle (`getPrice()`). Any failed
-/// read is an error, never a zero: the caller keeps what it knew.
+/// read is an error, never a zero: the caller keeps what it knew. While
+/// [`withdraw_from_chequebook`] runs on `chequebook` in this process, the
+/// deposit it reports is lowered by the amount being withdrawn.
 #[cfg(feature = "chain-rpc")]
 pub async fn read_retrieval_funds(
     client: &crate::ChainClient,
@@ -563,7 +566,11 @@ pub async fn read_retrieval_funds(
         .await
         .map_err(|e| ChequebookError::Chain(format!("priceOracle.getPrice eth_call: {e}")))?;
     Ok(RetrievalFunds {
-        deposited_plur: balance.saturating_add(paid_out),
+        // Less any withdrawal in flight (see [`WITHDRAWING`]), so no read
+        // hands the node credit a pending withdrawal is taking out.
+        deposited_plur: balance
+            .saturating_add(paid_out)
+            .saturating_sub(withdrawing(chequebook)),
         exchange_rate_plur: word(&price, 0, "priceOracle.getPrice")?,
         deduction_plur: word(&price, 32, "priceOracle.getPrice")?,
     })
@@ -607,6 +614,306 @@ pub async fn watch_retrieval_funds<F, Fut>(
         }
         tokio::time::sleep(RETRIEVAL_FUNDS_REFRESH).await;
     }
+}
+
+/// Withdrawals in flight in this process, per chequebook: PLUR a
+/// [`withdraw_from_chequebook`] may be taking out right now.
+/// [`read_retrieval_funds`] reports the deposit less these, so neither
+/// the per-minute [`watch_retrieval_funds`] nor a refresh after a deposit
+/// hands the node, while the withdraw transaction confirms, credit that
+/// is about to leave the chequebook. Released when the withdrawal ends
+/// (see [`WithdrawReservation`]).
+#[cfg(feature = "chain-rpc")]
+static WITHDRAWING: std::sync::Mutex<std::collections::BTreeMap<[u8; 20], u128>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(feature = "chain-rpc")]
+fn withdrawing_map() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<[u8; 20], u128>> {
+    WITHDRAWING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// PLUR being withdrawn from `chequebook` right now (see [`WITHDRAWING`]).
+#[cfg(feature = "chain-rpc")]
+fn withdrawing(chequebook: &[u8; 20]) -> u128 {
+    withdrawing_map().get(chequebook).copied().unwrap_or(0)
+}
+
+/// One withdrawal's entry in [`WITHDRAWING`], removed on drop: on every
+/// way out of [`withdraw_from_chequebook`], including a cancelled
+/// future.
+#[cfg(feature = "chain-rpc")]
+struct WithdrawReservation {
+    chequebook: [u8; 20],
+    amount: u128,
+}
+
+#[cfg(feature = "chain-rpc")]
+impl WithdrawReservation {
+    fn new(chequebook: [u8; 20], amount: u128) -> Self {
+        let mut map = withdrawing_map();
+        let entry = map.entry(chequebook).or_insert(0);
+        *entry = entry.saturating_add(amount);
+        Self { chequebook, amount }
+    }
+}
+
+#[cfg(feature = "chain-rpc")]
+impl Drop for WithdrawReservation {
+    fn drop(&mut self) {
+        let mut map = withdrawing_map();
+        if let Some(left) = map.get_mut(&self.chequebook) {
+            *left = left.saturating_sub(self.amount);
+            if *left == 0 {
+                map.remove(&self.chequebook);
+            }
+        }
+    }
+}
+
+/// What [`withdraw_from_chequebook`] took out of the chequebook.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// PLUR moved back to the node wallet.
+    pub amount_plur: u128,
+    /// The `withdraw` transaction.
+    pub tx: [u8; 32],
+    /// The chequebook's funds read back afterwards and handed to the
+    /// node; `None` when that read failed (the node then keeps the
+    /// lowered figure it was given before the transaction, which is what
+    /// the chain holds now, until the funds watch's next read).
+    pub funds: Option<RetrievalFunds>,
+}
+
+/// Why [`withdraw_from_chequebook`] sent nothing, or what failed.
+/// `Display` is the message the apps show.
+#[cfg(feature = "chain-rpc")]
+#[derive(Debug, thiserror::Error)]
+pub enum WithdrawError {
+    /// A zero amount.
+    #[error("{0}")]
+    Invalid(String),
+    /// More than the chequebook can give back: what isn't backing an
+    /// issued cheque (deposit less every cheque issued), and not more
+    /// than its liquid balance. Nothing was sent.
+    #[error(
+        "can withdraw at most {} xBZZ now: the rest of the chequebook backs cheques already \
+         issued to peers",
+        format_plur_as_bzz(*available_plur)
+    )]
+    ExceedsAvailable {
+        requested_plur: u128,
+        available_plur: u128,
+    },
+    /// The node can't say what it has issued from this chequebook, so no
+    /// amount is known to be free. Nothing was sent.
+    #[error("not withdrawing: {0}")]
+    IssuedUnknown(String),
+    /// The chequebook's `issuer()` is another address; only the issuer
+    /// may withdraw. Nothing was sent.
+    #[error(
+        "chequebook 0x{} is issued by 0x{}, not this node; only its issuer can withdraw",
+        hex::encode(chequebook),
+        hex::encode(issuer)
+    )]
+    NotIssuer {
+        chequebook: [u8; 20],
+        issuer: [u8; 20],
+    },
+    /// A chain read before the transaction failed, or the node is gone.
+    /// Nothing was sent.
+    #[error("{0}")]
+    Chain(String),
+    /// The `withdraw` transaction failed to send, reverted or timed out.
+    #[error("withdraw transaction: {0}")]
+    Tx(String),
+}
+
+/// PLUR as xBZZ (16 decimals), trailing zeros trimmed: `"0.0015"`.
+#[cfg(feature = "chain-rpc")]
+fn format_plur_as_bzz(plur: u128) -> String {
+    const PLUR_PER_BZZ: u128 = 10_000_000_000_000_000;
+    let frac = format!("{:016}", plur % PLUR_PER_BZZ);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        format!("{}", plur / PLUR_PER_BZZ)
+    } else {
+        format!("{}.{frac}", plur / PLUR_PER_BZZ)
+    }
+}
+
+/// `chequebook.liquidBalance()`: xBZZ (PLUR) not held by hard deposits,
+/// the most `withdraw` accepts.
+#[cfg(feature = "chain-rpc")]
+async fn read_liquid_balance(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<u128, ChequebookError> {
+    let v = client
+        .eth_call(
+            &format!("0x{}", hex::encode(chequebook)),
+            &format!(
+                "0x{}",
+                hex::encode(crate::chequebook::chequebook_liquid_balance_selector())
+            ),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("chequebook.liquidBalance eth_call: {e}")))?;
+    let w = v.get(..32).ok_or_else(|| {
+        ChequebookError::Chain(format!(
+            "chequebook.liquidBalance returned {} bytes",
+            v.len()
+        ))
+    })?;
+    if w[..16].iter().any(|&b| b != 0) {
+        // More than u128 holds is more than any withdrawal asks for.
+        return Ok(u128::MAX);
+    }
+    Ok(u128::from_be_bytes(w[16..].try_into().expect("16 bytes")))
+}
+
+/// What a withdrawal may take: the deposit (`funds.deposited_plur`, all
+/// xBZZ ever deposited and not withdrawn) less every cheque `issued`
+/// from it, so the chequebook keeps backing each cheque peers hold (bee's
+/// `availableBalance`), and no more than its `liquid` balance.
+#[cfg(feature = "chain-rpc")]
+fn withdrawable(funds: &RetrievalFunds, issued: u128, liquid: u128) -> u128 {
+    funds.deposited_plur.saturating_sub(issued).min(liquid)
+}
+
+/// Withdraw `amount` PLUR from `chequebook` back to the node wallet
+/// (`SimpleSwap.withdraw`, signed by `wallet`, which must be its
+/// issuer), never touching xBZZ that backs a cheque already issued.
+/// Shared by `antd`'s `POST /chequebook/withdraw` (the gateway's chain
+/// writer) and `ant-ffi`'s `ant_storage_settlement_withdraw_amount`.
+///
+/// The node is told about it through two callbacks: `publish` hands it
+/// the chequebook's funds (`ControlCommand::SetRetrievalFunds`; `false`
+/// when the node is gone), and `issued` asks for the PLUR it has issued
+/// from `chequebook` (an error when that total isn't fully known, see
+/// `ant_control::AccountingSnapshotView::issued_from`; the withdrawal is
+/// then refused, since no amount is known to be free).
+///
+/// Steps: check `issuer()` is the wallet; read the funds and
+/// `liquidBalance()`; refuse an amount above [`withdrawable`]. Then, so
+/// the node can't sign cheques against the xBZZ while the transaction
+/// confirms, the amount is reserved (every [`read_retrieval_funds`] in
+/// this process reports the deposit less it) and the lowered funds are
+/// handed to the node; with them in place the issued total is read
+/// again and checked once more, so a cheque issued in between still
+/// counts. Only then is `withdraw` sent. Afterwards (success or failure)
+/// the reservation is released and the funds are read back and handed
+/// to the node, so its `paying`/`available_plur` follow at once.
+///
+/// A refusal before the transaction sends nothing and gives the node its
+/// unlowered funds back. The caller holds its wallet tx lock around the
+/// call, which also keeps two withdrawals (or a withdrawal and a deposit)
+/// from racing each other's reads.
+///
+/// # Errors
+///
+/// See [`WithdrawError`]; everything but [`WithdrawError::Tx`] means
+/// nothing was sent.
+#[cfg(feature = "chain-rpc")]
+pub async fn withdraw_from_chequebook<P, PF, I, IF>(
+    client: &crate::ChainClient,
+    wallet: &crate::tx::Wallet,
+    chequebook: &[u8; 20],
+    amount: u128,
+    mut publish: P,
+    mut issued: I,
+) -> Result<Withdrawal, WithdrawError>
+where
+    P: FnMut(RetrievalFunds) -> PF,
+    PF: std::future::Future<Output = bool>,
+    I: FnMut() -> IF,
+    IF: std::future::Future<Output = Result<u128, String>>,
+{
+    if amount == 0 {
+        return Err(WithdrawError::Invalid(
+            "a withdrawal must be more than 0 PLUR".into(),
+        ));
+    }
+    let issuer = read_chequebook_issuer(client, chequebook)
+        .await
+        .map_err(|e| WithdrawError::Chain(e.to_string()))?;
+    if issuer != *wallet.address() {
+        return Err(WithdrawError::NotIssuer {
+            chequebook: *chequebook,
+            issuer,
+        });
+    }
+    let funds = read_retrieval_funds(client, chequebook)
+        .await
+        .map_err(|e| WithdrawError::Chain(e.to_string()))?;
+    let liquid = read_liquid_balance(client, chequebook)
+        .await
+        .map_err(|e| WithdrawError::Chain(e.to_string()))?;
+    let free = withdrawable(
+        &funds,
+        issued().await.map_err(WithdrawError::IssuedUnknown)?,
+        liquid,
+    );
+    if amount > free {
+        return Err(WithdrawError::ExceedsAvailable {
+            requested_plur: amount,
+            available_plur: free,
+        });
+    }
+
+    let reservation = WithdrawReservation::new(*chequebook, amount);
+    let lowered = RetrievalFunds {
+        deposited_plur: funds.deposited_plur.saturating_sub(amount),
+        ..funds
+    };
+    if !publish(lowered).await {
+        return Err(WithdrawError::Chain(
+            "the node stopped; nothing was withdrawn".into(),
+        ));
+    }
+    // Cheques issued before the node had the lowered funds count now.
+    let refused = match issued().await {
+        Err(e) => Some(WithdrawError::IssuedUnknown(e)),
+        Ok(now) => {
+            let free = withdrawable(&funds, now, liquid);
+            (amount > free).then_some(WithdrawError::ExceedsAvailable {
+                requested_plur: amount,
+                available_plur: free,
+            })
+        }
+    };
+    if let Some(e) = refused {
+        drop(reservation);
+        publish(funds).await;
+        return Err(e);
+    }
+
+    let sent = wallet
+        .withdraw_from_chequebook(client, chequebook, primitive_types::U256::from(amount))
+        .await;
+    drop(reservation);
+    let after = match read_retrieval_funds(client, chequebook).await {
+        Ok(after) => {
+            publish(after).await;
+            Some(after)
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "ant_chain::chequebook_store",
+                chequebook = %hex::encode(chequebook),
+                "funds not re-read after the withdrawal (the watch retries): {e}",
+            );
+            None
+        }
+    };
+    let receipt = sent.map_err(|e| WithdrawError::Tx(e.to_string()))?;
+    Ok(Withdrawal {
+        amount_plur: amount,
+        tx: receipt.tx_hash,
+        funds: after,
+    })
 }
 
 /// Run the chequebook checks against the chain: factory registration,
@@ -1095,6 +1402,257 @@ mod tests {
         ] {
             assert!(funds_from(broken).await.is_err());
         }
+    }
+
+    /// A scripted chain for [`withdraw_from_chequebook`]: chequebook
+    /// `cb`'s balance, `totalPaidOut`, `liquidBalance` and `issuer()`, the price
+    /// oracle, and a `withdraw` transaction that mines at once and takes
+    /// the amount out of the balance. Records each withdrawal's amount and
+    /// the reservation [`read_retrieval_funds`] saw while it was sent.
+    #[cfg(feature = "chain-rpc")]
+    struct WithdrawChain {
+        /// One per test: tests run in parallel and [`WITHDRAWING`] is
+        /// process-wide, so none may share another's chequebook (nor
+        /// [`CHEQUEBOOK`], whose funds other tests read).
+        cb: [u8; 20],
+        balance: std::sync::Mutex<u128>,
+        paid_out: u128,
+        liquid: Option<u128>,
+        issuer: [u8; 20],
+        /// `(amount, reserved while sending)`.
+        withdrawn: std::sync::Mutex<Vec<(u128, u128)>>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for WithdrawChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            use crate::chequebook::{
+                chequebook_issuer_selector, chequebook_liquid_balance_selector,
+                chequebook_total_paid_out_selector, GNOSIS_SWAP_PRICE_ORACLE,
+            };
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let id = req["id"].clone();
+            let word = |v: u128| format!("0x{v:064x}");
+            let result = match req["method"].as_str().unwrap() {
+                "eth_call" => {
+                    let to = req["params"][0]["to"].as_str().unwrap().to_lowercase();
+                    let data = req["params"][0]["data"].as_str().unwrap();
+                    let sel = &data[2..10];
+                    if data.starts_with("0x70a08231") {
+                        assert_eq!(data[34..74], hex::encode(self.cb));
+                        word(*self.balance.lock().unwrap())
+                    } else if to == format!("0x{}", hex::encode(GNOSIS_SWAP_PRICE_ORACLE)) {
+                        format!("0x{:064x}{:064x}", 100_000, 100)
+                    } else if sel == hex::encode(chequebook_total_paid_out_selector()) {
+                        word(self.paid_out)
+                    } else if sel == hex::encode(chequebook_issuer_selector()) {
+                        format!("0x{}{}", "00".repeat(12), hex::encode(self.issuer))
+                    } else if sel == hex::encode(chequebook_liquid_balance_selector()) {
+                        word(self.liquid.unwrap_or_else(|| *self.balance.lock().unwrap()))
+                    } else {
+                        panic!("unscripted eth_call {data}");
+                    }
+                }
+                "eth_getTransactionCount" => "0x0".into(),
+                "eth_sendRawTransaction" => {
+                    let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
+                    let rlp = rlp::Rlp::new(&raw);
+                    let to: Vec<u8> = rlp.at(3).unwrap().data().unwrap().to_vec();
+                    let input: Vec<u8> = rlp.at(5).unwrap().data().unwrap().to_vec();
+                    assert_eq!(to, self.cb);
+                    assert_eq!(hex::encode(&input[..4]), "2e1a7d4d", "withdraw(uint256)");
+                    let amount = u128::from_be_bytes(input[20..36].try_into().unwrap());
+                    *self.balance.lock().unwrap() -= amount;
+                    self.withdrawn
+                        .lock()
+                        .unwrap()
+                        .push((amount, withdrawing(&self.cb)));
+                    word(1)
+                }
+                "eth_getTransactionReceipt" => {
+                    return Some(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "status": "0x1", "blockNumber": "0x1", "logs": []}})
+                        .to_string(),
+                    )
+                }
+                other => panic!("unscripted method {other}"),
+            };
+            Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+        }
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    fn withdraw_wallet() -> crate::tx::Wallet {
+        crate::tx::Wallet::new([9u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap()
+    }
+
+    /// Balance 1000 + 200 cashed = 1200 deposited.
+    #[cfg(feature = "chain-rpc")]
+    fn withdraw_chain(cb: u8, liquid: Option<u128>) -> std::sync::Arc<WithdrawChain> {
+        std::sync::Arc::new(WithdrawChain {
+            cb: [cb; 20],
+            balance: std::sync::Mutex::new(1000),
+            paid_out: 200,
+            liquid,
+            issuer: *withdraw_wallet().address(),
+            withdrawn: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Run a withdrawal of `amount` with the node's issued total
+    /// answering `issued` in turn. Returns the result and the deposits
+    /// the node was handed.
+    #[cfg(feature = "chain-rpc")]
+    async fn withdraw_with(
+        chain: &std::sync::Arc<WithdrawChain>,
+        amount: u128,
+        issued: &[Result<u128, String>],
+    ) -> (Result<Withdrawal, WithdrawError>, Vec<u128>) {
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let published = std::sync::Mutex::new(Vec::new());
+        let answers = std::sync::Mutex::new(issued.iter().cloned());
+        let result = withdraw_from_chequebook(
+            &client,
+            &withdraw_wallet(),
+            &chain.cb,
+            amount,
+            |funds: RetrievalFunds| {
+                published.lock().unwrap().push(funds.deposited_plur);
+                async { true }
+            },
+            || {
+                let next = answers
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("issued asked too often");
+                async move { next }
+            },
+        )
+        .await;
+        assert_eq!(withdrawing(&chain.cb), 0, "the reservation is released");
+        (result, published.into_inner().unwrap())
+    }
+
+    /// The cap: deposited 1200 less 500 issued leaves 700. One PLUR more
+    /// is refused before anything is sent or the node is touched; 700
+    /// goes through, with the node holding the lowered deposit while the
+    /// transaction confirms and the chain's figure after it.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn withdraw_never_takes_what_issued_cheques_need() {
+        let chain = withdraw_chain(0xc1, None);
+        let (result, published) = withdraw_with(&chain, 701, &[Ok(500)]).await;
+        assert!(
+            matches!(
+                result,
+                Err(WithdrawError::ExceedsAvailable {
+                    requested_plur: 701,
+                    available_plur: 700
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(published, [] as [u128; 0], "the node's funds untouched");
+        assert!(chain.withdrawn.lock().unwrap().is_empty(), "nothing sent");
+
+        let (result, published) = withdraw_with(&chain, 700, &[Ok(500), Ok(500)]).await;
+        let done = result.unwrap();
+        assert_eq!(done.amount_plur, 700);
+        assert_eq!(done.funds.unwrap().deposited_plur, 500);
+        assert_eq!(
+            *chain.withdrawn.lock().unwrap(),
+            [(700, 700)],
+            "reserved while sent"
+        );
+        assert_eq!(*chain.balance.lock().unwrap(), 300);
+        // Lowered before the transaction, the chain's figure after: the
+        // 500 issued stay backed (300 balance + 200 cashed).
+        assert_eq!(published, [500, 500]);
+    }
+
+    /// Hard deposits: never more than `liquidBalance()`.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn withdraw_is_capped_at_the_liquid_balance() {
+        let chain = withdraw_chain(0xc2, Some(100));
+        let (result, _) = withdraw_with(&chain, 101, &[Ok(0)]).await;
+        assert!(
+            matches!(
+                result,
+                Err(WithdrawError::ExceedsAvailable {
+                    available_plur: 100,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(chain.withdrawn.lock().unwrap().is_empty());
+    }
+
+    /// A cheque issued after the first check but before the node had the
+    /// lowered funds still counts: refused, and the node gets its funds
+    /// back.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn withdraw_rechecks_cheques_issued_meanwhile() {
+        let chain = withdraw_chain(0xc3, None);
+        let (result, published) = withdraw_with(&chain, 700, &[Ok(500), Ok(501)]).await;
+        assert!(
+            matches!(
+                result,
+                Err(WithdrawError::ExceedsAvailable {
+                    available_plur: 699,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(chain.withdrawn.lock().unwrap().is_empty(), "nothing sent");
+        assert_eq!(published, [500, 1200], "lowered, then restored");
+    }
+
+    /// An unknown issued total (no ledger loaded, a lost one) is not
+    /// "nothing issued", and only the issuer may withdraw.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn withdraw_refuses_unknown_cheques_and_other_issuers() {
+        let chain = withdraw_chain(0xc4, None);
+        let (result, published) =
+            withdraw_with(&chain, 1, &[Err("ledger unreadable".into())]).await;
+        assert!(
+            matches!(result, Err(WithdrawError::IssuedUnknown(_))),
+            "{result:?}"
+        );
+        assert_eq!(published, [] as [u128; 0], "the node's funds untouched");
+
+        let other = std::sync::Arc::new(WithdrawChain {
+            issuer: [0x5e; 20],
+            ..std::sync::Arc::into_inner(withdraw_chain(0xc5, None)).unwrap()
+        });
+        let (result, _) = withdraw_with(&other, 1, &[]).await;
+        assert!(
+            matches!(result, Err(WithdrawError::NotIssuer { .. })),
+            "{result:?}"
+        );
+
+        let (result, _) = withdraw_with(&chain, 0, &[]).await;
+        assert!(
+            matches!(result, Err(WithdrawError::Invalid(_))),
+            "{result:?}"
+        );
+        assert!(chain.withdrawn.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    #[test]
+    fn plur_formats_as_bzz() {
+        assert_eq!(format_plur_as_bzz(0), "0");
+        assert_eq!(format_plur_as_bzz(15_000_000_000_000), "0.0015");
+        assert_eq!(format_plur_as_bzz(57_600_000_000_000_000), "5.76");
+        assert_eq!(format_plur_as_bzz(1), "0.0000000000000001");
     }
 
     #[cfg(feature = "chain-rpc")]

@@ -526,6 +526,51 @@ pub struct AccountingSnapshotView {
     pub cheques_ledger_lost: Option<String>,
 }
 
+impl AccountingSnapshotView {
+    /// Every cheque this node has issued from `chequebook`, in PLUR, when
+    /// the snapshot knows the full figure, for a withdrawal that must
+    /// leave them backed: an error, never a guess, when settlement hasn't
+    /// run on `chequebook` in this process (its ledger isn't loaded, so
+    /// its cheques aren't counted), the total is another chequebook's,
+    /// the ledger is unreadable, or it lost this chequebook's earlier
+    /// cheques ([`Self::cheques_ledger_lost`]). Unlike
+    /// `/chequebook/balance`'s `availableBalance`, "nothing ran" is not
+    /// read as "nothing issued": a ledger on disk may hold cheques.
+    ///
+    /// # Errors
+    ///
+    /// A message for the user saying why the total isn't known.
+    pub fn issued_from(&self, chequebook: &[u8; 20]) -> Result<u128, String> {
+        let ours = hex::encode(chequebook);
+        match self.cheques_issued_chequebook.as_deref() {
+            None => {
+                return Err(format!(
+                    "settlement isn't running on chequebook 0x{ours} in this session, so its \
+                     issued cheques aren't known"
+                ))
+            }
+            Some(theirs) if !theirs.eq_ignore_ascii_case(&ours) => {
+                return Err(format!(
+                    "the node's issued-cheques total is for chequebook 0x{theirs}, not 0x{ours}"
+                ))
+            }
+            Some(_) => {}
+        }
+        if let Some(lost) = &self.cheques_ledger_lost {
+            return Err(format!(
+                "the node's cheque ledger lost this chequebook's earlier cheques: {lost}"
+            ));
+        }
+        let issued = self
+            .cheques_issued_plur
+            .as_deref()
+            .ok_or_else(|| "the node's outbound cheque ledger is unreadable".to_string())?;
+        issued
+            .parse()
+            .map_err(|_| format!("the node's issued-cheques total {issued:?} is not a number"))
+    }
+}
+
 /// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying
 /// operation, and the Exp-1 viability check. Confirms whether a light
 /// ant node can drive Swarm's pullsync protocol against a real full-node
@@ -1148,6 +1193,45 @@ impl GatewayRequestKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A withdrawal only trusts a complete issued total for its own
+    /// chequebook; "settlement never ran" is unknown, not zero.
+    #[test]
+    fn issued_from_needs_the_full_figure_for_this_chequebook() {
+        let cb = [0xab; 20];
+        let view = |chequebook: Option<&str>, issued: Option<&str>, lost: Option<&str>| {
+            AccountingSnapshotView {
+                peers: Vec::new(),
+                cheques_issued_plur: issued.map(str::to_string),
+                cheques_issued_chequebook: chequebook.map(str::to_string),
+                cheques_ledger_lost: lost.map(str::to_string),
+            }
+        };
+        let ours = hex::encode(cb);
+        assert_eq!(
+            view(Some(&ours), Some("1200"), None).issued_from(&cb),
+            Ok(1200)
+        );
+        assert_eq!(
+            view(Some(&ours.to_uppercase()), Some("0"), None).issued_from(&cb),
+            Ok(0)
+        );
+        let other = "cd".repeat(20);
+        let unknown: [(Option<&str>, Option<&str>, Option<&str>); 6] = [
+            (None, None, None),
+            (None, Some("5"), None),
+            (Some(&other), Some("5"), None),
+            (Some(&ours), None, None),
+            (Some(&ours), Some("5"), Some("moved aside")),
+            (Some(&ours), Some("x"), None),
+        ];
+        for (chequebook, issued, lost) in unknown {
+            assert!(
+                view(chequebook, issued, lost).issued_from(&cb).is_err(),
+                "{chequebook:?} {issued:?} {lost:?}"
+            );
+        }
+    }
 
     /// `can_retrieve` (what `/readiness` reports, #78) follows the routing
     /// table's serving peers only: open libp2p connections (a bootnode

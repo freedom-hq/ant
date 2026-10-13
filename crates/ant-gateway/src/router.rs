@@ -117,6 +117,13 @@ pub fn build(handle: GatewayHandle) -> Router {
         // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
         // chequebook. `501` without a funded wallet key.
         .route("/chequebook/deposit", post(chain::chequebook_deposit))
+        // Chequebook withdrawal (bee's `POST /chequebook/withdraw`):
+        // xBZZ back to the node wallet, capped at what issued cheques
+        // leave free. Refuses web pages like the spending routes below.
+        .route(
+            "/chequebook/withdraw",
+            post(chain::chequebook_withdraw).route_layer(spend_guard.clone()),
+        )
         // Ant-specific xDAI storage funding: price and pay for storage
         // from the node wallet's plain xDAI (the node swaps for xBZZ
         // itself). Namespaced under `/v0/` like `/v0/manifest`.

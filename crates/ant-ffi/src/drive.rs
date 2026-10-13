@@ -2791,6 +2791,127 @@ async fn settlement_topup_xdai_checked(
     }
 }
 
+/// Withdraw `amount` PLUR from this account's chequebook back to its
+/// wallet through the shared
+/// [`ant_chain::chequebook_store::withdraw_from_chequebook`] (`antd`'s
+/// `POST /chequebook/withdraw` runs it too): never more than the
+/// deposit less every cheque this node has issued, nor more than the
+/// chequebook's liquid balance, and nothing while the node can't say
+/// what it has issued. The node stops signing cheques against the amount
+/// before the transaction goes out and gets the chequebook's new funds
+/// once it confirms (`ant_swap_status`'s `available_plur`/`paying`
+/// follow at once), and the funds watch runs afterwards (as after a
+/// top-up: `ant_init` starts none). Returns the refreshed
+/// [`settlement_deposit`] JSON. Sends a real Gnosis transaction, so the
+/// app gates it behind an explicit confirmation.
+#[cfg(feature = "chain")]
+pub(crate) fn settlement_withdraw(
+    h: &AntHandle,
+    rpc: String,
+    amount: u128,
+) -> Result<String, DriveError> {
+    let wallet = node_wallet(h)?;
+    h.runtime.block_on(async move {
+        settlement_withdraw_for(
+            &h.cmd_tx,
+            &h.chain_client(rpc),
+            &wallet,
+            &h.data_dir,
+            amount,
+        )
+        .await
+    })
+}
+
+/// [`settlement_withdraw`]'s body, against an explicit chain client.
+#[cfg(feature = "chain")]
+async fn settlement_withdraw_for(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    amount: u128,
+) -> Result<String, DriveError> {
+    let owner = *wallet.address();
+    let cb = persisted_chequebook(data_dir, &owner)
+        .ok_or_else(|| DriveError::Op("this account has no chequebook to withdraw from".into()))?;
+    let withdrawn = {
+        // One wallet transaction sequence at a time (see
+        // [`wallet_tx_lock`]): a deposit or a second withdrawal can't
+        // move the funds between this one's reads and its transaction.
+        let _tx = wallet_tx_lock(&owner).lock_owned().await;
+        ant_chain::chequebook_store::withdraw_from_chequebook(
+            client,
+            wallet,
+            &cb,
+            amount,
+            |funds| {
+                let cmd_tx = cmd_tx.clone();
+                async move { publish_retrieval_funds(&cmd_tx, cb, funds).await }
+            },
+            || ant_gateway::chainreader::node_issued_from(cmd_tx.clone(), cb),
+        )
+        .await
+    };
+    let withdrawn = withdrawn.map_err(|e| DriveError::Op(e.to_string()))?;
+    tracing::info!(
+        target: "ant-ffi",
+        chequebook = %format!("0x{}", hex::encode(cb)),
+        amount_plur = withdrawn.amount_plur,
+        tx = %format!("0x{}", hex::encode(withdrawn.tx)),
+        "withdrew from the chequebook",
+    );
+    watch_retrieval_funds(cmd_tx, client, cb);
+    let target = plan_deposit_target(cmd_tx).await;
+    settlement_deposit_for(client, wallet, data_dir, &owner, target).await
+}
+
+/// This account's wallet balances as JSON `{"address","bzz_plur","bzz",
+/// "xdai_wei","xdai"}`: the xBZZ a deposit can draw on and the xDAI that
+/// pays for gas (and for swaps). Two light reads over `gnosis_rpc`; a
+/// failed one is an error, never a zero.
+#[cfg(feature = "chain")]
+pub(crate) fn wallet_balance(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    h.runtime
+        .block_on(async move { wallet_balance_for(&h.chain_client(rpc), &h.eth).await })
+}
+
+#[cfg(feature = "chain")]
+async fn wallet_balance_for(
+    client: &ant_chain::ChainClient,
+    owner: &[u8; 20],
+) -> Result<String, DriveError> {
+    let bzz = client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, owner)
+        .await
+        .map_err(|e| DriveError::Op(format!("read the wallet's xBZZ: {e}")))?;
+    let xdai = client
+        .eth_get_balance_lower128(owner)
+        .await
+        .map_err(|e| DriveError::Op(format!("read the wallet's xDAI: {e}")))?;
+    to_json(&WalletBalance {
+        address: format!("0x{}", hex::encode(owner)),
+        bzz_plur: bzz.to_string(),
+        bzz: format_bzz(bzz),
+        xdai_wei: xdai.to_string(),
+        xdai: format_native(xdai),
+    })
+}
+
+/// Wire shape for [`wallet_balance`].
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct WalletBalance {
+    /// The account's address (`0x` + 40 hex).
+    address: String,
+    /// xBZZ, PLUR (decimal) and a short display string (4 dp).
+    bzz_plur: String,
+    bzz: String,
+    /// xDAI, wei (decimal) and a short display string (4 dp).
+    xdai_wei: String,
+    xdai: String,
+}
+
 /// The answer to a deposit top-up whose chequebook refusal may just be
 /// an RPC that hasn't seen our own deploy yet (see [`chequebook_refused`]).
 #[cfg(feature = "chain")]
@@ -4387,6 +4508,9 @@ mod chain_tests {
         /// What `PostageList` answers: the batches registered with the
         /// node (none by default, i.e. no plan).
         postage: Vec<ant_control::PostageStatusView>,
+        /// What `AccountingSnapshot` reports issued, and from which
+        /// chequebook (none by default: settlement never ran).
+        issued: Option<([u8; 20], u128)>,
     }
 
     fn fake_node() -> (
@@ -4449,6 +4573,16 @@ mod chain_tests {
                     ControlCommand::PostageList { ack } => {
                         let views = sink.lock().unwrap().postage.clone();
                         let _ = ack.send(ControlAck::PostageList(views));
+                    }
+                    ControlCommand::AccountingSnapshot { ack } => {
+                        let issued = sink.lock().unwrap().issued;
+                        let _ = ack.send(ControlAck::Accounting(
+                            ant_control::AccountingSnapshotView {
+                                cheques_issued_plur: issued.map(|(_, i)| i.to_string()),
+                                cheques_issued_chequebook: issued.map(|(cb, _)| hex::encode(cb)),
+                                ..Default::default()
+                            },
+                        ));
                     }
                     other => panic!("unexpected command {other:?}"),
                 }
@@ -4619,6 +4753,258 @@ mod chain_tests {
         assert_eq!(slot.refused(), Some(BAD));
         super::lock_disqualified().remove(&(eth, BAD));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chain that moves xBZZ for real (in memory): the node wallet's
+    /// and one chequebook's balances, the chequebook's views, and the
+    /// two transactions the credit card sends, a `transfer` into the
+    /// chequebook and its `withdraw`. Every transaction mines at once.
+    struct MoneyScript {
+        node_eth: [u8; 20],
+        chequebook: [u8; 20],
+        wallet_bzz: Mutex<u128>,
+        chequebook_bzz: Mutex<u128>,
+        /// `kind amount` per transaction sent.
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl MoneyScript {
+        fn new(node_eth: [u8; 20], chequebook: [u8; 20], wallet: u128, deposit: u128) -> Self {
+            Self {
+                node_eth,
+                chequebook,
+                wallet_bzz: Mutex::new(wallet),
+                chequebook_bzz: Mutex::new(deposit),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl ChainTransport for MoneyScript {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            use ant_chain::chequebook::{
+                chequebook_issuer_selector, chequebook_liquid_balance_selector,
+                chequebook_total_paid_out_selector, GNOSIS_CHEQUEBOOK_FACTORY,
+                GNOSIS_SWAP_PRICE_ORACLE,
+            };
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let id = req["id"].clone();
+            let word = |v: u128| json!(format!("0x{v:064x}"));
+            let hex0x = |a: &[u8]| format!("0x{}", hex::encode(a));
+            let result = match req["method"].as_str().unwrap() {
+                "eth_chainId" => json!("0x64"),
+                "eth_blockNumber" => json!("0x10"),
+                "eth_getBalance" => json!(format!("0x{:x}", 10u128.pow(18))),
+                "eth_getTransactionCount" => json!("0x0"),
+                "eth_call" => {
+                    let to = req["params"][0]["to"]
+                        .as_str()
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    let data = req["params"][0]["data"].as_str().unwrap();
+                    let sel = &data[2..10];
+                    if to == ant_chain::GNOSIS_BZZ_TOKEN.to_ascii_lowercase() {
+                        assert_eq!(sel, "70a08231", "balanceOf");
+                        let who = &data[34..74];
+                        if who == hex::encode(self.chequebook) {
+                            word(*self.chequebook_bzz.lock().unwrap())
+                        } else {
+                            assert_eq!(who, hex::encode(self.node_eth));
+                            word(*self.wallet_bzz.lock().unwrap())
+                        }
+                    } else if to == hex0x(&GNOSIS_CHEQUEBOOK_FACTORY) {
+                        word(1) // deployedContracts: registered
+                    } else if to == hex0x(&GNOSIS_SWAP_PRICE_ORACLE) {
+                        json!(format!("0x{:064x}{:064x}", 100_000, 100))
+                    } else {
+                        assert_eq!(to, hex0x(&self.chequebook), "unscripted eth_call {data}");
+                        if sel == hex::encode(chequebook_total_paid_out_selector()) {
+                            word(0)
+                        } else if sel == hex::encode(chequebook_issuer_selector()) {
+                            json!(word_hex(&self.node_eth))
+                        } else if sel == hex::encode(chequebook_liquid_balance_selector()) {
+                            word(*self.chequebook_bzz.lock().unwrap())
+                        } else {
+                            panic!("unscripted chequebook view {data}");
+                        }
+                    }
+                }
+                "eth_sendRawTransaction" => {
+                    let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
+                    let rlp = rlp::Rlp::new(&raw);
+                    let to: Vec<u8> = rlp.at(3).unwrap().data().unwrap().to_vec();
+                    let input: Vec<u8> = rlp.at(5).unwrap().data().unwrap().to_vec();
+                    let amount =
+                        |at: usize| u128::from_be_bytes(input[at..at + 16].try_into().unwrap());
+                    let (mut wallet, mut cb) = (
+                        self.wallet_bzz.lock().unwrap(),
+                        self.chequebook_bzz.lock().unwrap(),
+                    );
+                    let kind = if to == ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES
+                        && input[..4] == [0xa9, 0x05, 0x9c, 0xbb]
+                    {
+                        assert_eq!(input[16..36], self.chequebook, "transfer to the chequebook");
+                        let a = amount(52);
+                        *wallet -= a;
+                        *cb += a;
+                        format!("transfer {a}")
+                    } else if to == self.chequebook && input[..4] == [0x2e, 0x1a, 0x7d, 0x4d] {
+                        let a = amount(20);
+                        *cb -= a;
+                        *wallet += a;
+                        format!("withdraw {a}")
+                    } else {
+                        panic!("unscripted transaction to 0x{}", hex::encode(&to));
+                    };
+                    let mut sent = self.sent.lock().unwrap();
+                    sent.push(kind);
+                    word(sent.len() as u128)
+                }
+                "eth_getTransactionReceipt" => {
+                    json!({"status": "0x1", "blockNumber": "0x10", "logs": []})
+                }
+                other => panic!("unscripted method {other}"),
+            };
+            Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+        }
+    }
+
+    fn money_client(script: &std::sync::Arc<MoneyScript>) -> ChainClient {
+        ChainClient::new("http://127.0.0.1:1").with_transport(Some(script.clone()))
+    }
+
+    const MILLI_BZZ: u128 = 10_000_000_000_000; // 0.001 xBZZ
+
+    /// Issue #165, happy path: 0.005 xBZZ deposited, 0.001 in cheques
+    /// issued, 0.003 withdrawn. The node holds the lowered funds while
+    /// the transaction confirms, then the chain's figure, and the card
+    /// JSON shows the deposit left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn withdraw_moves_free_credit_back_to_the_wallet() {
+        const CB: [u8; 20] = [0xc7; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-withdraw");
+        persist(&dir, CB, eth);
+        let script = std::sync::Arc::new(MoneyScript::new(eth, CB, 0, 5 * MILLI_BZZ));
+        let (cmd_tx, node) = fake_node();
+        node.lock().unwrap().issued = Some((CB, MILLI_BZZ));
+
+        let card = super::settlement_withdraw_for(
+            &cmd_tx,
+            &money_client(&script),
+            &wallet,
+            &dir,
+            3 * MILLI_BZZ,
+        )
+        .await
+        .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["deposit_plur"], (2 * MILLI_BZZ).to_string());
+        assert_eq!(script.sent(), [format!("withdraw {}", 3 * MILLI_BZZ)]);
+        assert_eq!(*script.wallet_bzz.lock().unwrap(), 3 * MILLI_BZZ);
+        let funds: Vec<u128> = node.lock().unwrap().funds.iter().map(|f| f.1).collect();
+        assert!(
+            funds.starts_with(&[2 * MILLI_BZZ, 2 * MILLI_BZZ]),
+            "lowered before the transaction, read back after: {funds:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Never below the issued cheques: one PLUR over deposited − issued
+    /// is refused with the most it can take, and while the node can't
+    /// say what it issued nothing is withdrawn at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn withdraw_refuses_what_backs_issued_cheques() {
+        const CB: [u8; 20] = [0xc8; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-withdraw-cap");
+        persist(&dir, CB, eth);
+        let script = std::sync::Arc::new(MoneyScript::new(eth, CB, 0, 5 * MILLI_BZZ));
+        let (cmd_tx, node) = fake_node();
+
+        let err = super::settlement_withdraw_for(&cmd_tx, &money_client(&script), &wallet, &dir, 1)
+            .await
+            .expect_err("issued total unknown");
+        assert!(err.to_string().contains("not withdrawing"), "got {err}");
+
+        node.lock().unwrap().issued = Some((CB, MILLI_BZZ));
+        let err = super::settlement_withdraw_for(
+            &cmd_tx,
+            &money_client(&script),
+            &wallet,
+            &dir,
+            4 * MILLI_BZZ + 1,
+        )
+        .await
+        .expect_err("over the free credit");
+        assert!(err.to_string().contains("at most 0.004 xBZZ"), "got {err}");
+        assert!(script.sent().is_empty(), "nothing sent");
+        assert!(
+            node.lock().unwrap().funds.is_empty(),
+            "the node's funds untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #165, "Add to credit": an explicit amount from the wallet's
+    /// xBZZ goes into the chequebook (no swap: the wallet holds it), and
+    /// the node is handed the new funds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_amount_moves_wallet_xbzz_into_the_chequebook() {
+        const CB: [u8; 20] = [0xc9; 20];
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-topup-amount");
+        persist(&dir, CB, eth);
+        let script = std::sync::Arc::new(MoneyScript::new(eth, CB, 5 * MILLI_BZZ, MILLI_BZZ));
+        let (cmd_tx, node) = fake_node();
+
+        let card = super::settlement_topup_xdai_checked(
+            &cmd_tx,
+            &money_client(&script),
+            &dir,
+            eth,
+            NODE_KEY,
+            Some(2 * MILLI_BZZ),
+        )
+        .await
+        .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["deposit_plur"], (3 * MILLI_BZZ).to_string());
+        assert_eq!(script.sent(), [format!("transfer {}", 2 * MILLI_BZZ)]);
+        assert_eq!(*script.wallet_bzz.lock().unwrap(), 3 * MILLI_BZZ);
+        assert_eq!(
+            node.lock().unwrap().funds.first().map(|f| (f.0, f.1)),
+            Some((CB, 3 * MILLI_BZZ))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wallet read for the card: both balances, and a failed read is
+    /// an error rather than a zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wallet_balance_reads_both_tokens() {
+        let (_, eth) = node_wallet();
+        let script =
+            std::sync::Arc::new(MoneyScript::new(eth, [0xca; 20], 576 * MILLI_BZZ * 10, 0));
+        let got = super::wallet_balance_for(&money_client(&script), &eth)
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(got["address"], format!("0x{}", hex::encode(eth)));
+        assert_eq!(got["bzz_plur"], (5760 * MILLI_BZZ).to_string());
+        assert_eq!(got["bzz"], "5.7600");
+        assert_eq!(got["xdai"], "1.0000");
+
+        let failing = ChainClient::new("http://127.0.0.1:1").with_transport(Some(
+            std::sync::Arc::new(FailingChain {
+                seen: Mutex::new(Vec::new()),
+            }),
+        ));
+        assert!(super::wallet_balance_for(&failing, &eth).await.is_err());
     }
 
     fn persist(dir: &std::path::Path, cb: [u8; 20], issuer: [u8; 20]) {

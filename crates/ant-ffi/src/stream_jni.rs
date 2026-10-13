@@ -453,6 +453,58 @@ rpc_string_shim!(
     "top up settlement deposit"
 );
 
+rpc_string_shim!(
+    Java_at_vibing_ant_stream_AntNative_nativeWalletBalance,
+    crate::ant_wallet_balance,
+    "wallet balance"
+);
+
+/// `AntNative.<name>(handle, rpc, amountPlur): String` over a C call
+/// taking the handle, an RPC URL and a decimal PLUR amount.
+macro_rules! rpc_amount_string_shim {
+    ($export:ident, $ffi:path, $name:literal) => {
+        #[doc = concat!("`AntNative` shim over `", stringify!($ffi), "`.")]
+        #[unsafe(no_mangle)]
+        pub extern "system" fn $export<'caller>(
+            mut unowned_env: EnvUnowned<'caller>,
+            _class: JClass<'caller>,
+            handle: jlong,
+            rpc: JString<'caller>,
+            amount_plur: JString<'caller>,
+        ) -> JString<'caller> {
+            unowned_env
+                .with_env(|env| -> jni::errors::Result<JString<'caller>> {
+                    let Some(h) = handle_ptr(env, handle) else {
+                        return Ok(JString::null());
+                    };
+                    let Some(rpc) = c_arg(env, &rpc, "rpc") else {
+                        return Ok(JString::null());
+                    };
+                    let Some(amount) = c_arg(env, &amount_plur, "amountPlur") else {
+                        return Ok(JString::null());
+                    };
+                    // SAFETY: live handle; strings outlive the call.
+                    Ok(string_call(env, $name, |err| unsafe {
+                        $ffi(h, rpc.as_ptr(), amount.as_ptr(), err)
+                    }))
+                })
+                .resolve::<ThrowRuntimeExAndDefault>()
+        }
+    };
+}
+
+// Both spend real funds; the app confirms first.
+rpc_amount_string_shim!(
+    Java_at_vibing_ant_stream_AntNative_nativeSettlementTopupAmount,
+    crate::ant_storage_settlement_topup_amount,
+    "add to credit"
+);
+rpc_amount_string_shim!(
+    Java_at_vibing_ant_stream_AntNative_nativeSettlementWithdrawAmount,
+    crate::ant_storage_settlement_withdraw_amount,
+    "withdraw to account"
+);
+
 /// `AntNative.nativeStorageQuote(handle, rpc, depth, days): String` —
 /// `ant_storage_quote`.
 #[unsafe(no_mangle)]

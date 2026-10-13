@@ -49,7 +49,8 @@ struct RootView: View {
         } else if Self.shotArgs.contains("-antstream-shot-storage") {
             // The Storage tab full-screen (settlement / plan / account
             // cards). `-antstream-shot-deposit` additionally drives it to
-            // the deposit-0 top-up state (see StorageView).
+            // the deposit-0 top-up state, `-antstream-shot-credit` to the
+            // Credit card with the account wallet (see StorageView).
             StorageView().preferredColorScheme(.dark)
         } else {
             tabs

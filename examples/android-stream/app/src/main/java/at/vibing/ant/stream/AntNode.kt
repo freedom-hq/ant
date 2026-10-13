@@ -66,6 +66,18 @@ class AntNode(private val context: Context) {
     private var recentPayments = emptyList<Payment>()
     private val _settlement = MutableStateFlow<SettlementInfo?>(null)
     val settlement: StateFlow<SettlementInfo?> = _settlement.asStateFlow()
+    private val _settlementDeposit = MutableStateFlow<SettlementDeposit?>(null)
+
+    /** Whether the chequebook holds its plan's deposit; read from chain on demand. */
+    val settlementDeposit: StateFlow<SettlementDeposit?> = _settlementDeposit.asStateFlow()
+    private val _wallet = MutableStateFlow<WalletBalance?>(null)
+
+    /** The account wallet's xBZZ and xDAI; read from chain ([refreshWallet]). */
+    val wallet: StateFlow<WalletBalance?> = _wallet.asStateFlow()
+    private val _walletError = MutableStateFlow<String?>(null)
+
+    /** Why the last wallet read failed; null once one succeeds. */
+    val walletError: StateFlow<String?> = _walletError.asStateFlow()
     private val _validity = MutableStateFlow<StorageValidity?>(null)
     val validity: StateFlow<StorageValidity?> = _validity.asStateFlow()
     private val _gatewayUp = MutableStateFlow(false)
@@ -146,6 +158,10 @@ class AntNode(private val context: Context) {
         _plan.value = null
         _account.value = null
         _settlement.value = null
+        _settlementDeposit.value = null
+        _wallet.value = null
+        _walletError.value = null
+        _credit.value = null
         _validity.value = null
         AntNative.nativeShutdown(h)
         _status.value = Status.Idle
@@ -335,11 +351,76 @@ class AntNode(private val context: Context) {
     // -- chequebook ----------------------------------------------------------
 
     /**
+     * Read the account wallet's balances from chain. Published while the
+     * handle is still borrowed, so a read that outlives an account switch
+     * can't show the old account's wallet.
+     */
+    suspend fun refreshWallet() = withContext(Dispatchers.IO) {
+        runCatching {
+            withHandle { h ->
+                val w = WalletBalance.parse(AntNative.nativeWalletBalance(h, gnosisRpc))
+                    ?: throw AntException("could not read the wallet")
+                _wallet.value = w
+                _walletError.value = null
+            }
+        }.onFailure { _walletError.value = it.message ?: "could not read the wallet" }
+    }
+
+    /** Read from chain whether the chequebook holds its plan's deposit. */
+    suspend fun refreshSettlementDeposit() = withContext(Dispatchers.IO) {
+        if (settlement.value?.enabled != true) return@withContext
+        runCatching {
+            withHandle { h ->
+                SettlementDeposit.parse(AntNative.nativeSettlementDeposit(h, gnosisRpc))
+                    ?.let { _settlementDeposit.value = it }
+            }
+        }
+    }
+
+    /**
+     * Fund the chequebook up to its plan's deposit, paying with xDAI (the
+     * node swaps for the xBZZ it lacks). Spends real funds.
+     */
+    suspend fun topUpDeposit() = withContext(Dispatchers.IO) {
+        val json = withHandle { AntNative.nativeSettlementTopup(it, gnosisRpc) }
+        afterChequebookChange(json)
+    }
+
+    /**
+     * Move [amountPlur] xBZZ from the account wallet into the chequebook.
+     * Sends a real transaction and blocks until it confirms.
+     */
+    suspend fun addCredit(amountPlur: BigInteger) = withContext(Dispatchers.IO) {
+        val json = withHandle { AntNative.nativeSettlementTopupAmount(it, gnosisRpc, amountPlur.toString()) }
+        afterChequebookChange(json)
+    }
+
+    /**
+     * Move [amountPlur] xBZZ from the chequebook back to the account
+     * wallet; the node refuses more than issued cheques leave free. Sends
+     * a real transaction and blocks until it confirms.
+     */
+    suspend fun withdrawCredit(amountPlur: BigInteger) = withContext(Dispatchers.IO) {
+        val json = withHandle { AntNative.nativeSettlementWithdrawAmount(it, gnosisRpc, amountPlur.toString()) }
+        afterChequebookChange(json)
+    }
+
+    /** After a deposit or withdrawal: show its result and re-read the rest. */
+    private suspend fun afterChequebookChange(depositJson: String) {
+        SettlementDeposit.parse(depositJson)?.let { _settlementDeposit.value = it }
+        runCatching { refreshCredit() }
+        refreshWallet()
+        refreshAll()
+    }
+
+    /**
      * Read the chequebook figures (`ant_swap_status`, from memory) and the
      * per-peer cheque totals (the gateway's `GET /settlements`, also from
      * memory), and publish [credit]. A peer whose total grew since the
-     * last poll was just paid the difference.
+     * last poll was just paid the difference. Synchronized: the poll and
+     * a finished deposit or withdrawal both call it.
      */
+    @Synchronized
     private fun refreshCredit() {
         val swap = handleLock.read {
             if (handle == 0L) null else AntNative.nativeSwapStatus(handle)

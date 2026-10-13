@@ -727,6 +727,41 @@ char *ant_storage_settlement_topup_amount(const AntHandle *handle,
                                           char **out_err);
 
 /*
+ * Withdraw `amount_plur` (a decimal PLUR string, 1 xBZZ = 10^16 PLUR)
+ * from this account's chequebook back to its wallet (the chequebook's
+ * withdraw(uint256), signed by the node key, its issuer). Never takes
+ * xBZZ that backs a cheque already issued: an amount above the node's
+ * available credit (ant_swap_status available_plur: deposited less
+ * issued, bee's availableBalance) or above the chequebook's liquid
+ * balance is refused with the most it can take now, and nothing is sent
+ * while the node can't say what it has issued (its cheque ledger for
+ * this chequebook isn't loaded, or lost its figures). The node stops
+ * signing cheques against the amount before the transaction goes out
+ * and reads the chequebook's funds again once it confirms, so
+ * ant_swap_status available_plur / paying follow at once. Mirrors bee's
+ * (and the gateway's) POST /chequebook/withdraw?amount=. Errors on an
+ * amount that isn't a positive integer. Returns the refreshed
+ * ant_storage_settlement_deposit JSON. SUBMITS A REAL TRANSACTION (a
+ * little xDAI for gas) and BLOCKS until it confirms. Requires the
+ * `chain` cargo feature.
+ */
+char *ant_storage_settlement_withdraw_amount(const AntHandle *handle,
+                                             const char *gnosis_rpc,
+                                             const char *amount_plur,
+                                             char **out_err);
+
+/*
+ * This account's wallet balances as a JSON object:
+ *   {"address":"0x…","bzz_plur","bzz","xdai_wei","xdai"}
+ * (PLUR / wei as decimal strings; bzz / xdai short 4-decimal display
+ * strings): the xBZZ ant_storage_settlement_topup_amount draws on first
+ * and the xDAI that pays for gas and swaps. Two light reads over
+ * `gnosis_rpc`, no gateway needed; a read that fails is an error, never
+ * a zero. Requires the `chain` cargo feature.
+ */
+char *ant_wallet_balance(const AntHandle *handle, const char *gnosis_rpc, char **out_err);
+
+/*
  * Deep read-back propagation check for an uploaded reference. Resolves
  * the manifest to its data root, enumerates the file's chunk tree
  * (fetching every interior node network-only, which proves the skeleton

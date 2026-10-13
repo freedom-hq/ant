@@ -48,6 +48,11 @@ final class AntNode: ObservableObject {
     @Published private(set) var settlementDeposit: SettlementDeposit?
     /// The live chequebook view, refreshed every 2 s (`refreshCredit`).
     @Published private(set) var credit: Credit?
+    /// The account wallet's xBZZ and xDAI, read from chain
+    /// (`refreshWallet`); `nil` until then.
+    @Published private(set) var wallet: WalletBalance?
+    /// Why the last wallet read failed; `nil` once one succeeds.
+    @Published private(set) var walletError: String?
     private var sessionIssued: Decimal?
     private var issuedSamples: [(at: Date, plur: Decimal)] = []
     private var lastSent: [String: Decimal]?
@@ -296,6 +301,14 @@ final class AntNode: ObservableObject {
         plan = nil
         account = nil
         settlement = nil
+        settlementDeposit = nil
+        wallet = nil
+        walletError = nil
+        credit = nil
+        sessionIssued = nil
+        issuedSamples = []
+        lastSent = nil
+        recentPayments = []
         validity = nil
         channel = nil
         channelReference = nil
@@ -878,6 +891,62 @@ final class AntNode: ObservableObject {
         await refreshAll()
     }
 
+    /// Read the account wallet's balances from chain. Best-effort: a
+    /// failed read keeps the last figures and says why in `walletError`.
+    func refreshWallet(rpc: String) async {
+        if screenshotSampleActive { return }
+        guard !rpc.isEmpty else { return }
+        do {
+            let json = try await ffiString(name: "wallet balance") { h, errPtr in
+                rpc.withCString { ant_wallet_balance(h, $0, errPtr) }
+            }
+            // The account may have been switched while the read was out:
+            // never show one account's wallet under another.
+            guard !screenshotSampleActive, handle != nil, let w = WalletBalance.parse(json),
+                  account.map({ $0.ethAddress.lowercased() == w.address.lowercased() }) ?? true
+            else { return }
+            if w != wallet { wallet = w }
+            walletError = nil
+        } catch {
+            if !screenshotSampleActive, handle != nil { walletError = error.localizedDescription }
+        }
+    }
+
+    /// Move `plur` xBZZ from the account wallet into the chequebook
+    /// (`ant_storage_settlement_topup_amount`). Sends a real transaction
+    /// and blocks until it confirms.
+    func addCredit(rpc: String, plur: Decimal) async throws {
+        let amount = plurString(plur)
+        let json = try await ffiString(name: "add to credit") { h, errPtr in
+            rpc.withCString { r in
+                amount.withCString { ant_storage_settlement_topup_amount(h, r, $0, errPtr) }
+            }
+        }
+        await afterChequebookChange(json, rpc: rpc)
+    }
+
+    /// Move `plur` xBZZ from the chequebook back to the account wallet
+    /// (`ant_storage_settlement_withdraw_amount`); the node refuses more
+    /// than its issued cheques leave free. Sends a real transaction and
+    /// blocks until it confirms.
+    func withdrawCredit(rpc: String, plur: Decimal) async throws {
+        let amount = plurString(plur)
+        let json = try await ffiString(name: "withdraw to account") { h, errPtr in
+            rpc.withCString { r in
+                amount.withCString { ant_storage_settlement_withdraw_amount(h, r, $0, errPtr) }
+            }
+        }
+        await afterChequebookChange(json, rpc: rpc)
+    }
+
+    /// After a deposit or withdrawal: show its result and re-read the rest.
+    private func afterChequebookChange(_ depositJson: String, rpc: String) async {
+        if let d = StreamDecoder.settlementDeposit(from: depositJson) { settlementDeposit = d }
+        await refreshCredit()
+        await refreshWallet(rpc: rpc)
+        await refreshAll()
+    }
+
     // MARK: - Screenshot hooks (antstream-visual CI)
 
     /// Set once a screenshot sample has been installed, so the periodic /
@@ -982,6 +1051,47 @@ final class AntNode: ObservableObject {
         channelReference = Channel.sampleReference
     }
 
+    /// Drive the Storage tab's Credit card to the state issue #165 was
+    /// filed from, for its CI screenshots (`-antstream-shot-credit`): a
+    /// wallet holding 5.76 xBZZ next to a chequebook with almost nothing
+    /// left. A fresh runner account has neither, so sample figures are
+    /// published and latched (`refreshCredit`/`refreshWallet` leave them
+    /// alone). Moves no funds; the card's buttons are never pressed.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-credit`.
+    func installCreditSample() {
+        screenshotSampleActive = true
+        let chequebook = "0x370e6965000000000000000000000000000000e1"
+        plan = Self.sampleConnectedPlan(
+            batchId: "0x" + String(repeating: "a1", count: 32)
+        )
+        settlement = SettlementInfo(enabled: true, chequebook: chequebook)
+        let swap = SwapStatus(
+            paying: true,
+            swapEnabled: true,
+            chequebook: chequebook,
+            depositedPlur: Decimal(10_000_000_000_000),  // 0.001 xBZZ
+            issuedPlur: Decimal(9_970_000_000_000),
+            availablePlur: Decimal(30_000_000_000)      // 0.000003 xBZZ
+        )
+        let now = Date()
+        credit = Credit(
+            swap: swap,
+            sessionPlur: Decimal(1_240_000_000_000),
+            perMinutePlur: Decimal(41_000_000_000),
+            recent: [
+                Payment(peer: "8e2c51a0f6b34d7d9a1e", plur: Decimal(18_000_000_000), at: now.addingTimeInterval(-3)),
+                Payment(peer: "c47d09e1b25f6a3e44b0", plur: Decimal(9_000_000_000), at: now.addingTimeInterval(-41)),
+            ]
+        )
+        wallet = WalletBalance(
+            address: account?.ethAddress ?? "",
+            bzzPlur: Decimal(string: "57600000000000000")!,     // 5.76 xBZZ
+            xdaiWei: Decimal(string: "421300000000000000")!     // 0.4213 xDAI
+        )
+        walletError = nil
+    }
+
     // MARK: - Polling
 
     private func startPollingPeers() {
@@ -1029,7 +1139,7 @@ final class AntNode: ObservableObject {
     /// memory), and publish `credit`. A peer whose total grew since the
     /// last poll was just paid the difference.
     func refreshCredit() async {
-        guard let h = handle, !creditRefreshing else { return }
+        guard let h = handle, !creditRefreshing, !screenshotSampleActive else { return }
         creditRefreshing = true
         defer { creditRefreshing = false }
         guard let json = try? await Self.string(name: "swap status", { ant_swap_status(h, $0) }),
@@ -1066,6 +1176,9 @@ final class AntNode: ObservableObject {
             perMinutePlur: perMinute,
             recent: recentPayments
         )
+        // A shutdown (account switch) or a screenshot sample may have
+        // landed while the reads were out.
+        guard !screenshotSampleActive, handle == h else { return }
         if updated != credit { credit = updated }
     }
 

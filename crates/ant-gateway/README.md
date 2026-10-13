@@ -120,7 +120,7 @@ light-node gap — prioritised follow-on"][drop-in].
 | `/chequebook/balance`              | GET        | stub zeros          | drop-in #2   |
 | `/chequebook/cheque[/{peer}]`      | GET        | 501                 | drop-in #2   |
 | `/chequebook/deposit/{amount}`     | POST       | 501                 | drop-in #2   |
-| `/chequebook/withdraw/{amount}`    | POST       | 501                 | drop-in #2   |
+| `/chequebook/withdraw?amount=`     | POST       | 501                 | drop-in #2   |
 | `/stamps`                          | GET        | stub `{stamps:[]}`  | drop-in #3   |
 | `/stamps/{batch-id}`               | GET        | 501                 | drop-in #3   |
 | `/stamps/{amount}/{depth}`         | POST       | 501 (`antctl postage create`) | drop-in #3 |

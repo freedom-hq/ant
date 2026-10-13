@@ -2713,6 +2713,112 @@ pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
     }
 }
 
+/// Withdraw `amount_plur` (a decimal PLUR string, 1 xBZZ = 10^16 PLUR)
+/// from this account's chequebook back to its wallet (the chequebook's
+/// `withdraw(uint256)`, signed by the node key, its issuer). Never takes
+/// xBZZ that backs a cheque already issued: an amount above the node's
+/// available credit (`ant_swap_status`'s `available_plur`, deposited less
+/// issued, bee's `availableBalance`) or above the chequebook's liquid
+/// balance is refused with the most it can take now, and nothing is sent
+/// while the node can't say what it has issued (its cheque ledger for
+/// this chequebook isn't loaded, or lost its figures). The node stops
+/// signing cheques against the amount before the transaction goes out,
+/// and reads the chequebook's funds again once it confirms, so
+/// `ant_swap_status`'s `available_plur` and `paying` follow at once.
+/// Mirrors bee's (and the gateway's) `POST /chequebook/withdraw?amount=`.
+/// Errors on an amount that isn't a positive integer. Returns the
+/// refreshed [`ant_storage_settlement_deposit`] JSON. **Submits a real
+/// transaction** (it costs a little xDAI for gas) and **blocks** until it
+/// confirms, so the app gates it behind explicit confirmation. Requires
+/// the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_plur` must be valid
+/// NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_withdraw_amount(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    amount_plur: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_withdraw_amount", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_plur)?;
+            let amount = match amount.trim().parse::<u128>() {
+                Ok(a) if a > 0 => a,
+                _ => {
+                    return Err(format!(
+                        "ant_storage_settlement_withdraw_amount: amount_plur must be a positive \
+                         integer, got {amount:?}"
+                    ))
+                }
+            };
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err(
+                        "ant_storage_settlement_withdraw_amount: gnosis_rpc required".to_string(),
+                    );
+                }
+                drive::settlement_withdraw(h, rpc, amount).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, amount);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// This account's wallet balances as JSON `{"address","bzz_plur","bzz",
+/// "xdai_wei","xdai"}` (PLUR / wei as decimal strings, `bzz`/`xdai`
+/// short 4-decimal display strings): the xBZZ an
+/// [`ant_storage_settlement_topup_amount`] draws on first and the xDAI
+/// that pays for gas and swaps. Two light reads over `gnosis_rpc`, no
+/// gateway needed; a read that fails is an error, never a zero. Requires
+/// the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_wallet_balance(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_wallet_balance", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_wallet_balance: gnosis_rpc required".to_string());
+                }
+                drive::wallet_balance(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
 /// Deep read-back propagation check for an uploaded `reference`.
 ///
 /// Resolves the manifest at `reference` to its data root, enumerates the

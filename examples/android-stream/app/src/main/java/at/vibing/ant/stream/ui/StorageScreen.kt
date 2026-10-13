@@ -42,14 +42,16 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
     val validity by node.validity.collectAsState()
     val account by node.account.collectAsState()
     val settlement by node.settlement.collectAsState()
-    val credit by node.credit.collectAsState()
+    val deposit by node.settlementDeposit.collectAsState()
     var busy by remember { mutableStateOf<String?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var revealedKey by remember { mutableStateOf<String?>(null) }
     var restoring by remember { mutableStateOf(false) }
     var restoreKey by remember { mutableStateOf("") }
+    var confirmDeposit by remember { mutableStateOf(false) }
 
     LaunchedEffect(plan?.batchId) { node.refreshValidity() }
+    LaunchedEffect(settlement?.enabled) { node.refreshSettlementDeposit() }
 
     Column(
         Modifier
@@ -89,7 +91,33 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        if (settlement?.enabled == true) CreditCard(credit)
+        val d = deposit
+        if (plan?.enabled == true && settlement?.enabled == true && d != null && d.needsTopUp) {
+            // Mirrors the iOS Storage tab's deposit card: a chequebook
+            // deployed with too little behind it signs cheques nobody
+            // can cash, so broadcasts run for a while, then stall.
+            SectionCard {
+                Text("Broadcasts will stall without a deposit", color = Amber, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Your account pays the network as it publishes, and the chequebook it pays from holds " +
+                        "${d.depositBzz} of the ${d.targetBzz} xBZZ it needs. Adding the missing " +
+                        "${d.shortfallBzz} xBZZ keeps segments flowing; it stays yours until it's spent.",
+                )
+                if (!d.sufficientFunds) {
+                    Text(
+                        "Add about ${d.xdaiToSendDisplay} xDAI to your account first.",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Button(
+                    onClick = { confirmDeposit = true },
+                    enabled = busy == null,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Add deposit") }
+            }
+        }
+        if (settlement?.enabled == true) CreditCard(node)
         SectionCard {
             Text("Account", style = MaterialTheme.typography.titleMedium)
             account?.let { a ->
@@ -111,6 +139,32 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
         message?.let { Text(it, color = Amber) }
     }
 
+    if (confirmDeposit) {
+        val d = deposit
+        AlertDialog(
+            onDismissRequest = { confirmDeposit = false },
+            title = { Text("Add the ${d?.shortfallBzz ?: "missing"} xBZZ deposit?") },
+            text = {
+                Text(
+                    "This sends real transactions on Gnosis Chain: the deposit moves from your account into " +
+                        "the chequebook, and the node first swaps xDAI for any xBZZ your account lacks. " +
+                        "It costs a little xDAI for gas.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeposit = false
+                    busy = "Adding the deposit… waiting for the transactions to confirm"
+                    scope.launch {
+                        message = runCatching { node.topUpDeposit() }
+                            .fold({ "Deposit added: broadcasts are paid for." }) { it.message }
+                        busy = null
+                    }
+                }) { Text("Add deposit") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeposit = false }) { Text("Cancel") } },
+        )
+    }
     revealedKey?.let { key ->
         AlertDialog(
             onDismissRequest = { revealedKey = null },
