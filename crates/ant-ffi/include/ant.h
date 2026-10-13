@@ -741,7 +741,10 @@ char *ant_storage_settlement_topup_amount(const AntHandle *handle,
  * ant_swap_status available_plur / paying follow at once. Mirrors bee's
  * (and the gateway's) POST /chequebook/withdraw?amount=. Errors on an
  * amount that isn't a positive integer. Returns the refreshed
- * ant_storage_settlement_deposit JSON. SUBMITS A REAL TRANSACTION (a
+ * ant_storage_settlement_deposit JSON, or the JSON literal `null` when
+ * the withdrawal confirmed but re-reading the deposit failed (not an
+ * error: the xBZZ has moved, so retrying would withdraw again; re-read
+ * the deposit later). SUBMITS A REAL TRANSACTION (a
  * little xDAI for gas) and BLOCKS until it confirms. Requires the
  * `chain` cargo feature.
  */

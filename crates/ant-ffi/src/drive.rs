@@ -2802,8 +2802,11 @@ async fn settlement_topup_xdai_checked(
 /// once it confirms (`ant_swap_status`'s `available_plur`/`paying`
 /// follow at once), and the funds watch runs afterwards (as after a
 /// top-up: `ant_init` starts none). Returns the refreshed
-/// [`settlement_deposit`] JSON. Sends a real Gnosis transaction, so the
-/// app gates it behind an explicit confirmation.
+/// [`settlement_deposit`] JSON, or `null` when the withdrawal confirmed
+/// but that re-read failed (see [`WITHDRAWN_DEPOSIT_UNREAD`]); an error
+/// always means nothing was withdrawn, or the transaction itself failed.
+/// Sends a real Gnosis transaction, so the app gates it behind an
+/// explicit confirmation.
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_withdraw(
     h: &AntHandle,
@@ -2863,8 +2866,28 @@ async fn settlement_withdraw_for(
     );
     watch_retrieval_funds(cmd_tx, client, cb);
     let target = plan_deposit_target(cmd_tx).await;
-    settlement_deposit_for(client, wallet, data_dir, &owner, target).await
+    // The withdrawal has confirmed: a failed re-read must not turn that
+    // into an error, or the app reports "withdraw failed" and a retry
+    // sends a second real transaction.
+    match settlement_deposit_for(client, wallet, data_dir, &owner, target).await {
+        Ok(json) => Ok(json),
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                chequebook = %format!("0x{}", hex::encode(cb)),
+                "withdrawal confirmed, but the deposit was not re-read: {e}",
+            );
+            Ok(WITHDRAWN_DEPOSIT_UNREAD.into())
+        }
+    }
 }
+
+/// What [`settlement_withdraw`] returns when the withdrawal confirmed but
+/// reading the deposit back failed: the JSON literal `null`, which the
+/// apps' deposit parsers reject (they keep the card they had and re-read
+/// it on their next refresh) without reading the withdrawal as failed.
+#[cfg(feature = "chain")]
+const WITHDRAWN_DEPOSIT_UNREAD: &str = "null";
 
 /// This account's wallet balances as JSON `{"address","bzz_plur","bzz",
 /// "xdai_wei","xdai"}`: the xBZZ a deposit can draw on and the xDAI that
@@ -4766,6 +4789,9 @@ mod chain_tests {
         chequebook_bzz: Mutex<u128>,
         /// `kind amount` per transaction sent.
         sent: Mutex<Vec<String>>,
+        /// Fail every read once a transaction has been sent (an RPC
+        /// hiccup right after it confirms).
+        reads_fail_after_send: bool,
     }
 
     impl MoneyScript {
@@ -4776,6 +4802,7 @@ mod chain_tests {
                 wallet_bzz: Mutex::new(wallet),
                 chequebook_bzz: Mutex::new(deposit),
                 sent: Mutex::new(Vec::new()),
+                reads_fail_after_send: false,
             }
         }
 
@@ -4795,7 +4822,18 @@ mod chain_tests {
             let id = req["id"].clone();
             let word = |v: u128| json!(format!("0x{v:064x}"));
             let hex0x = |a: &[u8]| format!("0x{}", hex::encode(a));
-            let result = match req["method"].as_str().unwrap() {
+            let method = req["method"].as_str().unwrap();
+            if self.reads_fail_after_send
+                && !self.sent().is_empty()
+                && matches!(method, "eth_call" | "eth_getBalance")
+            {
+                return Some(
+                    json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32603, "message": "backend hiccup"}})
+                    .to_string(),
+                );
+            }
+            let result = match method {
                 "eth_chainId" => json!("0x64"),
                 "eth_blockNumber" => json!("0x10"),
                 "eth_getBalance" => json!(format!("0x{:x}", 10u128.pow(18))),
@@ -4911,6 +4949,36 @@ mod chain_tests {
             funds.starts_with(&[2 * MILLI_BZZ, 2 * MILLI_BZZ]),
             "lowered before the transaction, read back after: {funds:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A confirmed withdrawal whose deposit re-read then fails is still a
+    /// success (the `null` card), not an error the user would retry into
+    /// a second real transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn withdraw_confirmed_is_not_failed_by_the_re_read() {
+        const CB: [u8; 20] = [0xca; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-withdraw-reread");
+        persist(&dir, CB, eth);
+        let script = std::sync::Arc::new(MoneyScript {
+            reads_fail_after_send: true,
+            ..MoneyScript::new(eth, CB, 0, 5 * MILLI_BZZ)
+        });
+        let (cmd_tx, node) = fake_node();
+        node.lock().unwrap().issued = Some((CB, MILLI_BZZ));
+
+        let card = super::settlement_withdraw_for(
+            &cmd_tx,
+            &money_client(&script),
+            &wallet,
+            &dir,
+            3 * MILLI_BZZ,
+        )
+        .await
+        .expect("the withdrawal confirmed");
+        assert_eq!(card, super::WITHDRAWN_DEPOSIT_UNREAD);
+        assert_eq!(script.sent(), [format!("withdraw {}", 3 * MILLI_BZZ)]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

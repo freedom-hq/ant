@@ -590,11 +590,8 @@ mod tests {
         );
     }
 
-    /// `deployedContracts(address)` selector + ABI layout. Used by
-    /// the daemon startup factory check and `antctl chequebook
-    /// verify`. If the selector is wrong the `eth_call` returns
-    /// "execution reverted" with no useful info — guard against
-    /// that with a unit test rather than an embarrassing prod boot.
+    /// `withdraw(uint256)` selector + ABI layout: the amount
+    /// left-padded to one 32-byte word.
     #[test]
     fn withdraw_calldata_layout() {
         let data = chequebook_withdraw_calldata(U256::from(0x1234u64));
@@ -604,6 +601,11 @@ mod tests {
         assert!(data[4..34].iter().all(|&b| b == 0));
     }
 
+    /// `deployedContracts(address)` selector + ABI layout. Used by
+    /// the daemon startup factory check and `antctl chequebook
+    /// verify`. If the selector is wrong the `eth_call` returns
+    /// "execution reverted" with no useful info — guard against
+    /// that with a unit test rather than an embarrassing prod boot.
     #[test]
     fn factory_deployed_contracts_selector() {
         let cb = [0x11u8; 20];

@@ -915,8 +915,25 @@ final class AntNode: ObservableObject {
     /// Move `plur` xBZZ from the account wallet into the chequebook
     /// (`ant_storage_settlement_topup_amount`). Sends a real transaction
     /// and blocks until it confirms.
+    ///
+    /// That call swaps xDAI for any xBZZ the wallet lacks, but the card
+    /// caps this at a wallet read up to 30 s old and promises a plain
+    /// transfer. So the wallet is read again right before sending, and a
+    /// wallet that no longer holds `plur` stops here with nothing sent
+    /// instead of swapping.
     func addCredit(rpc: String, plur: Decimal) async throws {
         let amount = plurString(plur)
+        let walletJson = try await ffiString(name: "wallet balance") { h, errPtr in
+            rpc.withCString { ant_wallet_balance(h, $0, errPtr) }
+        }
+        guard let w = WalletBalance.parse(walletJson) else {
+            throw AntError.op("could not read the wallet; nothing was sent")
+        }
+        if w.bzzPlur < plur {
+            throw AntError.op(
+                "your wallet now holds \(formatBzz(w.bzzPlur)), less than \(formatBzz(plur)); nothing was sent"
+            )
+        }
         let json = try await ffiString(name: "add to credit") { h, errPtr in
             rpc.withCString { r in
                 amount.withCString { ant_storage_settlement_topup_amount(h, r, $0, errPtr) }
@@ -928,7 +945,9 @@ final class AntNode: ObservableObject {
     /// Move `plur` xBZZ from the chequebook back to the account wallet
     /// (`ant_storage_settlement_withdraw_amount`); the node refuses more
     /// than its issued cheques leave free. Sends a real transaction and
-    /// blocks until it confirms.
+    /// blocks until it confirms. A confirmed withdrawal whose deposit
+    /// re-read failed returns `null` JSON, which keeps the deposit card as
+    /// it was (re-read by `refreshAll`) rather than reporting a failure.
     func withdrawCredit(rpc: String, plur: Decimal) async throws {
         let amount = plurString(plur)
         let json = try await ffiString(name: "withdraw to account") { h, errPtr in

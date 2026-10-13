@@ -389,16 +389,35 @@ class AntNode(private val context: Context) {
     /**
      * Move [amountPlur] xBZZ from the account wallet into the chequebook.
      * Sends a real transaction and blocks until it confirms.
+     *
+     * `ant_storage_settlement_topup_amount` swaps xDAI for any xBZZ the
+     * wallet lacks, but the card caps this at a wallet read up to 30 s old
+     * and promises a plain transfer. So the wallet is read again right
+     * before sending, and a wallet that no longer holds [amountPlur] stops
+     * here with nothing sent instead of swapping.
      */
     suspend fun addCredit(amountPlur: BigInteger) = withContext(Dispatchers.IO) {
-        val json = withHandle { AntNative.nativeSettlementTopupAmount(it, gnosisRpc, amountPlur.toString()) }
+        val json = withHandle { h ->
+            val w = WalletBalance.parse(AntNative.nativeWalletBalance(h, gnosisRpc))
+                ?: throw AntException("could not read the wallet; nothing was sent")
+            _wallet.value = w
+            if (w.bzzPlur < amountPlur) {
+                throw AntException(
+                    "your wallet now holds ${formatBzz(w.bzzPlur)}, less than ${formatBzz(amountPlur)}; nothing was sent",
+                )
+            }
+            AntNative.nativeSettlementTopupAmount(h, gnosisRpc, amountPlur.toString())
+        }
         afterChequebookChange(json)
     }
 
     /**
      * Move [amountPlur] xBZZ from the chequebook back to the account
      * wallet; the node refuses more than issued cheques leave free. Sends
-     * a real transaction and blocks until it confirms.
+     * a real transaction and blocks until it confirms. A confirmed
+     * withdrawal whose deposit re-read failed returns `null` JSON, which
+     * keeps the deposit card as it was (re-read by [refreshAll]) rather
+     * than reporting a failure.
      */
     suspend fun withdrawCredit(amountPlur: BigInteger) = withContext(Dispatchers.IO) {
         val json = withHandle { AntNative.nativeSettlementWithdrawAmount(it, gnosisRpc, amountPlur.toString()) }

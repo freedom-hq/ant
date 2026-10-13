@@ -2727,7 +2727,10 @@ pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
 /// `ant_swap_status`'s `available_plur` and `paying` follow at once.
 /// Mirrors bee's (and the gateway's) `POST /chequebook/withdraw?amount=`.
 /// Errors on an amount that isn't a positive integer. Returns the
-/// refreshed [`ant_storage_settlement_deposit`] JSON. **Submits a real
+/// refreshed [`ant_storage_settlement_deposit`] JSON, or the JSON literal
+/// `null` when the withdrawal confirmed but re-reading the deposit
+/// failed (not an error: the xBZZ has moved, so retrying would withdraw
+/// again; re-read the deposit later). **Submits a real
 /// transaction** (it costs a little xDAI for gas) and **blocks** until it
 /// confirms, so the app gates it behind explicit confirmation. Requires
 /// the `chain` build feature.
