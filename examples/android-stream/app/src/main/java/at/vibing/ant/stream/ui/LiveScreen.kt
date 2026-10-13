@@ -57,6 +57,7 @@ import at.vibing.ant.stream.Channel
 import at.vibing.ant.stream.LiveBroadcast
 import at.vibing.ant.stream.capture.CaptureEngine
 import at.vibing.ant.stream.formatBytes
+import at.vibing.ant.stream.formatBzz
 import kotlinx.coroutines.launch
 
 /**
@@ -70,6 +71,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     val activity = context as Activity
     val scope = rememberCoroutineScope()
     val state by broadcast.state.collectAsState()
+    val credit by node.credit.collectAsState()
     val progress by broadcast.progress.collectAsState()
     val report by broadcast.report.collectAsState()
     val captured by broadcast.captured.collectAsState()
@@ -285,6 +287,8 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                 Stat("Dropped / failed", "${p.segmentsDropped} / ${p.segmentsFailed}")
                 Stat("Uplink", String.format("%.2f Mbit/s", p.sustainedMbitS))
                 Stat("Peers", "${p.peers}")
+                creditSummary(credit)?.let { Stat("Credit", it) }
+                credit?.takeIf { it.swap.issuedPlur != null }?.let { Stat("Paid this session", formatBzz(it.sessionPlur)) }
                 if (p.lastError.isNotEmpty()) Text(p.lastError, color = Amber, style = MaterialTheme.typography.bodySmall)
                 if (p.channelReference.isNotEmpty()) {
                     Text("Channel", color = Color.Gray)

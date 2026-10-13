@@ -42,6 +42,9 @@ struct StorageView: View {
                     } else {
                         connectCard
                     }
+                    if node.settlement?.enabled == true {
+                        CreditCard(credit: node.credit)
+                    }
                     accountCard
                     accountKeyCard
                     advancedCard

@@ -733,6 +733,21 @@ pub struct SettlementInfo {
     /// its cheque ledger known. `false` means the free pseudosettle tier.
     #[serde(default)]
     pub paying: bool,
+    /// xBZZ deposited into the chequebook and not withdrawn, in PLUR
+    /// (decimal), as the node last read it from the chain (re-read every
+    /// minute). `None` until funds have been read.
+    #[serde(default)]
+    pub deposited_plur: Option<String>,
+    /// Every cheque this node has issued from the chequebook, in PLUR
+    /// (decimal): the outbound ledger's lifetime total, current with each
+    /// cheque. `None` without a chequebook.
+    #[serde(default)]
+    pub issued_plur: Option<String>,
+    /// What the chequebook can still put into cheques, in PLUR (decimal):
+    /// `deposited_plur` less `issued_plur` (bee's `availableBalance`),
+    /// with no chain read. `None` until funds have been read.
+    #[serde(default)]
+    pub available_plur: Option<String>,
 }
 
 impl Default for SettlementInfo {
@@ -741,6 +756,9 @@ impl Default for SettlementInfo {
             swap_enabled: true,
             chequebook: None,
             paying: false,
+            deposited_plur: None,
+            issued_plur: None,
+            available_plur: None,
         }
     }
 }

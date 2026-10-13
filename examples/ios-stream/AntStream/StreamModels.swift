@@ -63,6 +63,67 @@ struct SettlementInfo: Codable, Equatable {
     let chequebook: String?
 }
 
+/// `ant_swap_status`: whether the node pays peers with cheques right now
+/// (otherwise the slower free tier), and the chequebook's figures in
+/// PLUR: the deposit as last read from the chain, every cheque issued
+/// from it, and what it can still pay out. Answered from memory, so it
+/// can be polled every couple of seconds.
+struct SwapStatus: Equatable {
+    let paying: Bool
+    let swapEnabled: Bool
+    let chequebook: String?
+    let depositedPlur: Decimal?
+    let issuedPlur: Decimal?
+    let availablePlur: Decimal?
+
+    static func parse(_ json: String) -> SwapStatus? {
+        guard let data = json.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        func plur(_ key: String) -> Decimal? {
+            (o[key] as? String).flatMap { Decimal(string: $0) }
+        }
+        return SwapStatus(
+            paying: o["paying"] as? Bool ?? false,
+            swapEnabled: o["swap_enabled"] as? Bool ?? true,
+            chequebook: o["chequebook"] as? String,
+            depositedPlur: plur("deposited_plur"),
+            issuedPlur: plur("issued_plur"),
+            availablePlur: plur("available_plur")
+        )
+    }
+}
+
+/// One cheque payment to a peer, as seen between two polls.
+struct Payment: Equatable, Identifiable {
+    let id = UUID()
+    let peer: String
+    let plur: Decimal
+    let at: Date
+}
+
+/// The live chequebook view: `swap`, plus what this app run has seen paid
+/// (`sessionPlur`), the pace over the last minute (`perMinutePlur`, nil
+/// until there is enough to measure) and the latest payments.
+struct Credit: Equatable {
+    let swap: SwapStatus
+    let sessionPlur: Decimal
+    let perMinutePlur: Decimal?
+    let recent: [Payment]
+}
+
+/// PLUR as xBZZ with 6 decimals, rounded down; "< 0.000001" for dust.
+func formatBzz(_ plur: Decimal) -> String {
+    guard plur > 0 else { return "0 xBZZ" }
+    var micro = plur / Decimal(sign: .plus, exponent: 10, significand: 1)
+    var floored = Decimal()
+    NSDecimalRound(&floored, &micro, 0, .down)
+    guard floored > 0 else { return "< 0.000001 xBZZ" }
+    var digits = NSDecimalNumber(decimal: floored).stringValue
+    while digits.count < 7 { digits = "0" + digits }
+    return "\(digits.dropLast(6)).\(digits.suffix(6)) xBZZ"
+}
+
 /// What actually stands behind this account's cheques, as returned by
 /// `ant_storage_settlement_deposit`. `SettlementInfo` says a chequebook
 /// exists; this says whether it is funded. A chequebook deployed with no

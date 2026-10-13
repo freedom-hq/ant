@@ -292,7 +292,9 @@ int ant_set_unverified_logs_rpc(const AntHandle *handle,
  * GET /v0/settlement/swap and GET /node's "settlement" report, for a host
  * that doesn't run the gateway:
  *   {"supported":bool,"swap_switch":true,"swap_enabled":bool,
- *    "paying":bool,"chequebook":"0x…"|null,"persisted":false}
+ *    "paying":bool,"chequebook":"0x…"|null,"persisted":false,
+ *    "deposited_plur":"…"|null,"issued_plur":"…"|null,
+ *    "available_plur":"…"|null}
  * supported: this build pays peers with SWAP cheques once a funded
  * chequebook backs settlement (the `chain` feature). swap_switch: the
  * switch can be changed at runtime (ant_set_swap_enabled). swap_enabled:
@@ -300,7 +302,13 @@ int ant_set_unverified_logs_rpc(const AntHandle *handle,
  * alike. paying: cheques are being paid right now (switch on, chequebook
  * funds read from the chain and not spent), otherwise the free
  * pseudosettle tier. persisted: always false, the switch resets at
- * ant_init. Never blocks on the network. Free with ant_free_string.
+ * ant_init. The _plur figures are decimal PLUR strings: deposited_plur
+ * the chequebook's funds as last read from the chain (every minute),
+ * issued_plur every cheque issued from it (current with each cheque),
+ * available_plur what it can still pay out (deposited less issued);
+ * null before funds are read or without a chequebook (new after
+ * 0.5.67). Never blocks on the network: poll it for a live view. Free
+ * with ant_free_string.
  */
 char *ant_swap_status(const AntHandle *handle, char **out_err);
 

@@ -147,6 +147,18 @@ pub(crate) struct SettlementBody {
     pub(crate) paying: bool,
     /// The chequebook settlement runs on (`0x…`), or `null`.
     pub(crate) chequebook: Option<String>,
+    /// Ant extension: xBZZ deposited into the chequebook, PLUR (decimal),
+    /// as last read from the chain (every 60 s); `null` until read.
+    #[serde(rename = "depositedPlur")]
+    pub(crate) deposited_plur: Option<String>,
+    /// Ant extension: every cheque issued from the chequebook, PLUR
+    /// (decimal), current with each cheque; `null` without a chequebook.
+    #[serde(rename = "issuedPlur")]
+    pub(crate) issued_plur: Option<String>,
+    /// Ant extension: what the chequebook can still pay out, PLUR
+    /// (decimal): deposited less issued, no chain read; `null` until read.
+    #[serde(rename = "availablePlur")]
+    pub(crate) available_plur: Option<String>,
 }
 
 impl SettlementBody {
@@ -158,6 +170,9 @@ impl SettlementBody {
             swap_enabled: s.swap_enabled,
             paying: light && s.paying,
             chequebook: s.chequebook,
+            deposited_plur: s.deposited_plur,
+            issued_plur: s.issued_plur,
+            available_plur: s.available_plur,
         }
     }
 }

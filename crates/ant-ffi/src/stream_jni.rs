@@ -418,6 +418,11 @@ handle_string_shim!(
     "settlement status"
 );
 handle_string_shim!(
+    Java_at_vibing_ant_stream_AntNative_nativeSwapStatus,
+    crate::ant_swap_status,
+    "swap status"
+);
+handle_string_shim!(
     Java_at_vibing_ant_stream_AntNative_nativePublisherProgress,
     crate::ant_publisher_progress,
     "broadcast progress"
