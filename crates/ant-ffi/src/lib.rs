@@ -1600,7 +1600,9 @@ pub unsafe extern "C" fn ant_set_unverified_logs_rpc(
 /// that doesn't run the gateway:
 ///
 /// `{"supported":bool,"swap_switch":true,"swap_enabled":bool,
-///   "paying":bool,"chequebook":"0x…"|null,"persisted":false}`
+///   "paying":bool,"chequebook":"0x…"|null,"persisted":false,
+///   "deposited_plur":"…"|null,"issued_plur":"…"|null,
+///   "available_plur":"…"|null}`
 ///
 /// `supported`: this build pays peers with SWAP cheques once a funded
 /// chequebook backs settlement (the `chain` feature). `swap_switch`: the
@@ -1609,7 +1611,12 @@ pub unsafe extern "C" fn ant_set_unverified_logs_rpc(
 /// downloads and uploads alike. `paying`: cheques are being paid right
 /// now (switch on, chequebook funds read from the chain and not spent),
 /// otherwise the free pseudosettle tier. `persisted`: always `false`, the
-/// switch resets at `ant_init`. Never blocks on the network.
+/// switch resets at `ant_init`. The `_plur` figures are decimal PLUR
+/// strings: `deposited_plur` the chequebook's funds as last read from the
+/// chain (every minute), `issued_plur` every cheque issued from it (current
+/// with each cheque), `available_plur` what it can still pay out
+/// (deposited less issued); `null` before funds are read or without a
+/// chequebook. Never blocks on the network: poll it for a live view.
 ///
 /// # Safety
 ///
@@ -1632,6 +1639,9 @@ pub unsafe extern "C" fn ant_swap_status(
                 "paying": s.paying,
                 "chequebook": s.chequebook,
                 "persisted": false,
+                "deposited_plur": s.deposited_plur,
+                "issued_plur": s.issued_plur,
+                "available_plur": s.available_plur,
             }))
             .map_err(|e| format!("serialize swap status: {e}"))
         })
@@ -5018,6 +5028,7 @@ mod tests {
                 swap_enabled: false,
                 chequebook: Some("0xcb".into()),
                 paying: false,
+                ..Default::default()
             };
         });
         let v = read();

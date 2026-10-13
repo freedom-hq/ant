@@ -230,6 +230,9 @@ fn paying_snapshot() -> ant_control::StatusSnapshot {
         swap_enabled: true,
         chequebook: Some("0x370e6965a8c169dbf3456edf852f5a7ffa2f1e81".into()),
         paying: true,
+        deposited_plur: Some("1000000000000000".into()),
+        issued_plur: Some("250000000000000".into()),
+        available_plur: Some("750000000000000".into()),
     };
     snap
 }
@@ -253,6 +256,9 @@ async fn node_reports_the_settlement_switch() {
         s["chequebook"],
         "0x370e6965a8c169dbf3456edf852f5a7ffa2f1e81"
     );
+    assert_eq!(s["depositedPlur"], "1000000000000000");
+    assert_eq!(s["issuedPlur"], "250000000000000");
+    assert_eq!(s["availablePlur"], "750000000000000");
 
     let (status, _) = call(
         router.clone(),

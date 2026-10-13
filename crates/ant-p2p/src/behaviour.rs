@@ -2187,10 +2187,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 state.known.prune(Instant::now());
             }
             _ = status_pulse.tick() => {
-                // No-op arm: the loop-top `sync_peer_pipeline` call
-                // does the actual work. We just need *some* event to
-                // wake the select up regularly so the snapshot stays
-                // live during gateway-only / fully-idle periods.
+                // The loop-top `sync_peer_pipeline` call does most of
+                // the work: this arm wakes the select up regularly so
+                // the snapshot stays live during gateway-only /
+                // fully-idle periods. Cheques are issued off this loop,
+                // so the settlement figures are refreshed here.
+                publish_settlement(&state);
             }
             _ = batch_probe_pulse.tick() => {
                 spawn_due_batch_probes(&state, &control, upload_rt.as_ref(), cfg.network_id);
@@ -2326,23 +2328,35 @@ fn sync_payer(state: &SwarmState) {
 }
 
 /// Publish the node's settlement state (the `swap-enable` switch, the
-/// chequebook, whether cheques are paid now) into
-/// `StatusSnapshot::settlement`, for `GET /node`, `GET
-/// /v0/settlement/swap` and `ant_swap_status`. Only sends on a change.
+/// chequebook, whether cheques are paid now, its funds and what cheques
+/// have taken from them) into `StatusSnapshot::settlement`, for `GET
+/// /node`, `GET /v0/settlement/swap` and `ant_swap_status`. Only sends
+/// on a change; the status pulse calls it so the figures follow each
+/// cheque.
 fn publish_settlement(state: &SwarmState) {
     let Some(status) = state.status.as_ref() else {
         return;
     };
+    let svc = state.pushsync_swap.as_ref();
+    let issued = svc.map(|svc| svc.outbound_ledger().total_issued());
+    let deposited = svc.and_then(|svc| {
+        state
+            .retrieval_funds
+            .filter(|(chequebook, _)| *chequebook == svc.chequebook())
+            .map(|(_, policy)| policy.deposited_plur)
+    });
     let info = ant_control::SettlementInfo {
         swap_enabled: state.swap_enabled,
-        chequebook: state
-            .pushsync_swap
-            .as_ref()
-            .map(|svc| format!("0x{}", hex::encode(svc.chequebook()))),
+        chequebook: svc.map(|svc| format!("0x{}", hex::encode(svc.chequebook()))),
         paying: state
             .accounting
             .as_ref()
             .is_some_and(|a| a.pays_with_swap()),
+        deposited_plur: deposited.map(|d| d.to_string()),
+        issued_plur: issued.map(|i| i.to_string()),
+        available_plur: deposited
+            .zip(issued)
+            .map(|(d, i)| d.saturating_sub(i).to_string()),
     };
     status.send_if_modified(|snap| {
         if snap.settlement == info {
@@ -11705,6 +11719,11 @@ mod tests {
                 swap_enabled: true,
                 chequebook: Some(format!("0x{}", hex::encode(cb))),
                 paying: true,
+                // The funds read before settlement started, nothing
+                // issued yet: all of it is still available.
+                deposited_plur: Some("10000000000000".into()),
+                issued_plur: Some("0".into()),
+                available_plur: Some("10000000000000".into()),
             }
         );
 
