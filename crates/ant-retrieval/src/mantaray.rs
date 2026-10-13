@@ -52,7 +52,9 @@
 //! `bee/pkg/api/bzz.go` does when serving `bzz://<ref>/`.
 
 use crate::accounting::CreditWindow;
-use crate::feed::{feed_from_metadata, resolve_sequence_feed_full, FeedError, FeedType};
+use crate::feed::{
+    feed_from_metadata, resolve_sequence_feed_hinted, FeedError, FeedHints, FeedType,
+};
 use crate::joiner::{join_encrypted, ENCRYPTED_REF_SIZE};
 use crate::ChunkFetcher;
 use crate::{cac_valid, join, JoinError, DEFAULT_MAX_FILE_BYTES};
@@ -318,17 +320,21 @@ pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
 ) -> Result<(Vec<u8>, bool), ManifestError> {
-    resolve_feed_root_with_credit(fetcher, root_ref, None, &ReplicaSweeps::new()).await
+    resolve_feed_root_with_credit(fetcher, root_ref, None, &ReplicaSweeps::new(), None).await
 }
 
 /// [`resolve_feed_root`] whose root-node load may wait for peer credit
 /// within `credit` (see [`lookup_path_with_credit`]). The feed probes
-/// never wait.
+/// never wait. With `hints`, a sequence feed's walk is anchored at the
+/// node's last resolved index for it and raises that index on success,
+/// falling back to the walk from 0 if the hinted walk fails (see
+/// [`resolve_sequence_feed_hinted`], issue #159).
 async fn resolve_feed_root_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     credit: Option<&CreditWindow>,
     sweeps: &ReplicaSweeps,
+    hints: Option<&FeedHints>,
 ) -> Result<(Vec<u8>, bool), ManifestError> {
     let root_node = load_node_ref_with_credit(fetcher, root_ref, credit, sweeps).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
@@ -348,7 +354,7 @@ async fn resolve_feed_root_with_credit(
     );
     match feed.kind {
         FeedType::Sequence => {
-            let resolution = resolve_sequence_feed_full(fetcher, &feed).await?;
+            let resolution = resolve_sequence_feed_hinted(fetcher, &feed, 0, hints).await?;
             let mut resolved = resolution.reference.to_vec();
             if let Some(key) = resolution.decrypt_key {
                 resolved.extend_from_slice(&key);
@@ -379,7 +385,28 @@ pub async fn lookup_path(
     root_ref: &[u8],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_inner(fetcher, root_ref, path, None, &ReplicaSweeps::new()).await
+    lookup_path_inner(fetcher, root_ref, path, None, &ReplicaSweeps::new(), None).await
+}
+
+/// [`lookup_path`] whose feed-manifest dereference is anchored at the
+/// node's last resolved index for the feed in `hints` (issue #159), the
+/// map `GET /feeds` shares. Results are the same as [`lookup_path`];
+/// only the number of feed probes differs.
+pub async fn lookup_path_with_hints(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: &[u8],
+    path: &str,
+    hints: &FeedHints,
+) -> Result<LookupResult, ManifestError> {
+    lookup_path_inner(
+        fetcher,
+        root_ref,
+        path,
+        None,
+        &ReplicaSweeps::new(),
+        Some(hints),
+    )
+    .await
 }
 
 /// [`lookup_path`] whose manifest walk may wait for peer credit, within
@@ -411,14 +438,19 @@ pub async fn lookup_path(
 /// several times (directory-redirect check then index-document retry,
 /// or a retried attempt) is swept once per attempt at most, and not at
 /// all again once a sweep has confirmed its replicas missing.
+///
+/// With `hints`, a feed manifest's sequence feed is walked from the
+/// node's last resolved index for it, as in [`lookup_path_with_hints`]
+/// (issue #159).
 pub async fn lookup_path_with_credit(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
     path: &str,
     credit: &CreditWindow,
     sweeps: &ReplicaSweeps,
+    hints: Option<&FeedHints>,
 ) -> Result<LookupResult, ManifestError> {
-    lookup_path_inner(fetcher, root_ref, path, Some(credit), sweeps).await
+    lookup_path_inner(fetcher, root_ref, path, Some(credit), sweeps, hints).await
 }
 
 async fn lookup_path_inner(
@@ -427,13 +459,14 @@ async fn lookup_path_inner(
     path: &str,
     credit: Option<&CreditWindow>,
     sweeps: &ReplicaSweeps,
+    hints: Option<&FeedHints>,
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
     // `load_node_ref_with_credit` below reloads the same node for a
     // non-feed manifest from the request's cache.
     let (effective_root, is_feed) =
-        resolve_feed_root_with_credit(fetcher, root_ref, credit, sweeps).await?;
+        resolve_feed_root_with_credit(fetcher, root_ref, credit, sweeps, hints).await?;
     let root_node = load_node_ref_with_credit(fetcher, &effective_root, credit, sweeps).await?;
     debug!(
         target: "ant_retrieval::mantaray",
@@ -651,7 +684,7 @@ pub async fn list_manifest_paths(
     // unreachable children can't each add a full replica sweep.
     let sweeps = ReplicaSweeps::capped(MANIFEST_LIST_REPLICA_SWEEPS);
     let (effective_root, _is_feed) =
-        resolve_feed_root_with_credit(fetcher, root_ref, None, &sweeps).await?;
+        resolve_feed_root_with_credit(fetcher, root_ref, None, &sweeps, None).await?;
     let root_node = load_node_ref_with_credit(fetcher, &effective_root, None, &sweeps).await?;
     let mut entries = Vec::new();
     let mut visited = HashSet::from([effective_root]);
@@ -2392,6 +2425,7 @@ mod tests {
                 "",
                 &CreditWindow::new(window),
                 &ReplicaSweeps::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -2442,6 +2476,7 @@ mod tests {
             "",
             &CreditWindow::new(std::time::Duration::from_secs(30)),
             &ReplicaSweeps::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -2491,6 +2526,7 @@ mod tests {
                 path,
                 &CreditWindow::new(window),
                 &ReplicaSweeps::new(),
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
@@ -2530,6 +2566,7 @@ mod tests {
                 "developer/index.html",
                 &credit,
                 &ReplicaSweeps::new(),
+                None,
             )
             .await;
             let waits = fetcher.waits();
@@ -2737,7 +2774,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
         };
 
-        let first = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps)
+        let first = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps, None)
             .await
             .unwrap_err();
         assert!(matches!(first, ManifestError::Fetch(_)), "{first:?}");
@@ -2756,7 +2793,8 @@ mod tests {
         );
 
         // Same attempt: no second sweep of the same node.
-        let _ = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps).await;
+        let _ =
+            lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps, None).await;
         assert_eq!(probes(), swept, "one sweep per node per attempt");
 
         // The pool refills; the retried attempt sweeps again and recovers.
@@ -2764,7 +2802,7 @@ mod tests {
             .open
             .store(true, std::sync::atomic::Ordering::SeqCst);
         sweeps.next_attempt();
-        let found = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps)
+        let found = lookup_path_with_credit(&fetcher, &root, "index.html", &credit, &sweeps, None)
             .await
             .expect("attempt 2 recovers the replica-only root");
         assert_eq!(found.content_type.as_deref(), Some("text/html"));
@@ -2841,7 +2879,7 @@ mod tests {
         let credit = CreditWindow::new(std::time::Duration::ZERO);
         let sweeps = ReplicaSweeps::new();
 
-        let first = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps)
+        let first = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps, None)
             .await
             .unwrap_err();
         assert!(matches!(first, ManifestError::Fetch(_)), "{first:?}");
@@ -2849,7 +2887,7 @@ mod tests {
         assert!(after_first > 1, "the first attempt sweeps the dead node");
 
         sweeps.next_attempt();
-        let second = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps)
+        let second = lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &sweeps, None)
             .await
             .unwrap_err();
         assert!(matches!(second, ManifestError::Fetch(_)), "{second:?}");
@@ -2861,8 +2899,15 @@ mod tests {
 
         // A fresh memo (a new request) sweeps again.
         let before = fetcher.misses();
-        let _ =
-            lookup_path_with_credit(&fetcher, &root, "docs/", &credit, &ReplicaSweeps::new()).await;
+        let _ = lookup_path_with_credit(
+            &fetcher,
+            &root,
+            "docs/",
+            &credit,
+            &ReplicaSweeps::new(),
+            None,
+        )
+        .await;
         assert_eq!(fetcher.misses() - before, after_first);
     }
 

@@ -81,10 +81,6 @@ pub struct UploadRuntime {
     pub postage_dir: PathBuf,
 }
 
-/// Shared last-resolved sequence-feed indices, keyed by
-/// `(owner, topic)` (perf-lab Experiment 6b).
-type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
-
 /// Map a [`ant_postage::BucketStats`] snapshot to the control-plane
 /// [`ant_control::PostageStatusView`] reported over `PostageStatus` /
 /// `PostageList`.
@@ -1030,7 +1026,10 @@ struct SwarmState {
     /// anchor: warm re-polls gallop from it instead of re-walking the
     /// whole sequence (measured: warm == cold at up to 4.3 s without
     /// this). In-memory only — a restart just pays one cold walk.
-    feed_hints: FeedHints,
+    /// Shared by `GET /feeds` (`GetFeed`) and the `/bzz` feed-manifest
+    /// dereference (`StreamBzz`, `GetBzz`; issue #159), so either one
+    /// warms the other.
+    feed_hints: ant_retrieval::FeedHints,
     /// Neighbourhoods where a push recently couldn't reach a deep storer
     /// (shared by every push fetcher; see
     /// [`ant_retrieval::ShallowNeighbourhoods`]).
@@ -1131,7 +1130,7 @@ impl SwarmState {
             rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_registered: HashMap::new(),
             bought_batches: HashMap::new(),
-            feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            feed_hints: ant_retrieval::FeedHints::new(),
             shallow_neighbourhoods: Arc::default(),
             push_dedup: Arc::default(),
             known_dialable: HashMap::new(),
@@ -3487,6 +3486,7 @@ fn handle_control_command(
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
             let counters = state.retrieval_counters.clone();
+            let feed_hints = state.feed_hints.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             // Same rationale as the StreamBytes arm above: gateway-side
             // activity rendering depends on the periodic `Progress`
@@ -3508,6 +3508,7 @@ fn handle_control_command(
                         payment_notify,
                         accounting,
                         counters,
+                        feed_hints,
                         tracker_for_run,
                         reference,
                         path,
@@ -3562,6 +3563,7 @@ fn handle_control_command(
                 None
             };
             let tracker_for_run = tracker;
+            let feed_hints = state.feed_hints.clone();
             tokio::spawn(async move {
                 let reply = unless_client_gone(
                     &ack,
@@ -3575,6 +3577,7 @@ fn handle_control_command(
                         payment_notify,
                         accounting,
                         counters,
+                        feed_hints,
                         tracker_for_run,
                         reference,
                         path,
@@ -3927,32 +3930,23 @@ fn handle_control_command(
                 // hinted walk still errors transiently we retry once
                 // without the hint rather than surfacing a hint-induced
                 // failure for a feed that plain resolution could read.
-                let hint = hints
-                    .lock()
-                    .ok()
-                    .and_then(|h| h.get(&(owner, topic)).copied())
-                    .unwrap_or(0);
-                let anchor = after.max(hint);
-                let mut result =
-                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, anchor).await;
-                if result.is_err() && anchor > after {
-                    result =
-                        ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await;
-                }
+                // The `/bzz` feed-manifest dereference shares the same
+                // map and helper (issue #159).
+                let result = ant_retrieval::resolve_sequence_feed_hinted(
+                    &fetcher,
+                    &feed,
+                    after,
+                    Some(&hints),
+                )
+                .await;
                 let reply = match result {
-                    Ok(resolution) => {
-                        if let Ok(mut h) = hints.lock() {
-                            let e = h.entry((owner, topic)).or_insert(0);
-                            *e = (*e).max(resolution.index);
-                        }
-                        ControlAck::FeedResolved {
-                            reference: resolution.reference,
-                            index: resolution.index,
-                            signature: resolution.signature,
-                            v2: resolution.v2,
-                            decrypt_key: resolution.decrypt_key,
-                        }
-                    }
+                    Ok(resolution) => ControlAck::FeedResolved {
+                        reference: resolution.reference,
+                        index: resolution.index,
+                        signature: resolution.signature,
+                        v2: resolution.v2,
+                        decrypt_key: resolution.decrypt_key,
+                    },
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {
                         message: format!("feed lookup: {e}"),
@@ -5638,6 +5632,7 @@ async fn run_stream_bzz(
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     counters: Arc<RetrievalCounters>,
+    feed_hints: ant_retrieval::FeedHints,
     tracker: Arc<ProgressTracker>,
     reference: Vec<u8>,
     path: String,
@@ -5731,6 +5726,7 @@ async fn run_stream_bzz(
                         &path,
                         &credit_window,
                         &replica_sweeps,
+                        Some(&feed_hints),
                     )
                     .await
                 }
@@ -5746,6 +5742,7 @@ async fn run_stream_bzz(
                     &path,
                     &credit_window,
                     &replica_sweeps,
+                    Some(&feed_hints),
                 )
                 .await
             }
@@ -7496,6 +7493,7 @@ async fn run_get_bzz(
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     counters: Arc<RetrievalCounters>,
+    feed_hints: ant_retrieval::FeedHints,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -7533,6 +7531,7 @@ async fn run_get_bzz(
         let fetcher = builder;
         match try_get_bzz(
             &fetcher,
+            &feed_hints,
             &tracker,
             reference,
             &path,
@@ -7571,15 +7570,16 @@ async fn run_get_bzz(
 #[allow(clippy::too_many_arguments)]
 async fn try_get_bzz(
     fetcher: &ant_retrieval::RoutingFetcher,
+    feed_hints: &ant_retrieval::FeedHints,
     tracker: &ProgressTracker,
     reference: [u8; 32],
     path: &str,
     allow_degraded_redundancy: bool,
     max_bytes: Option<u64>,
 ) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
-    use ant_retrieval::{join_with_options, lookup_path, JoinOptions, ManifestError};
+    use ant_retrieval::{join_with_options, lookup_path_with_hints, JoinOptions, ManifestError};
 
-    let lookup = match lookup_path(fetcher, &reference, path).await {
+    let lookup = match lookup_path_with_hints(fetcher, &reference, path, feed_hints).await {
         Ok(r) => r,
         Err(ManifestError::NotAManifest) => {
             return Err(AttemptError::Permanent(format!(

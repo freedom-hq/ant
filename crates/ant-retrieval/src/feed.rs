@@ -85,6 +85,7 @@ use ant_crypto::{
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::hash::BuildHasher;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -271,8 +272,9 @@ pub struct FeedResolution {
 /// represent the decryption key, so this surfaces
 /// [`FeedError::EncryptedReference`] rather than handing back an
 /// address the plaintext joiner would mis-decode into garbage. All
-/// production paths (the mantaray manifest walk included) use
-/// [`resolve_sequence_feed_full`], which carries `decrypt_key` and can
+/// production paths use [`resolve_sequence_feed_full`] or its anchored
+/// variants ([`resolve_sequence_feed_hinted`] for `GET /feeds` and the
+/// `/bzz` feed-manifest dereference), which carry `decrypt_key` and can
 /// serve encrypted content.
 pub async fn resolve_sequence_feed(
     fetcher: &dyn ChunkFetcher,
@@ -825,6 +827,91 @@ pub async fn resolve_sequence_feed_after(
         v2,
         decrypt_key,
     })
+}
+
+/// Last resolved index per sequence feed, keyed by `(owner, topic)`,
+/// shared by every feed read on one node (perf-lab Experiment 6b):
+/// `GET /feeds/{owner}/{topic}` and the `/bzz` feed-manifest
+/// dereference (issue #159) read and raise the same map, so either one
+/// warms the other. Cloning shares the map.
+///
+/// Sequence feeds are append-only, so an index the node has resolved
+/// stays present and is a safe anchor for the next walk: a steady poll
+/// costs about one probe round instead of the exponential bracket and
+/// binary search from 0. Entries only ever rise. A hint that no longer
+/// resolves (a feed that was reset, e.g. on a local test chain) costs
+/// one failed anchor probe before [`resolve_sequence_feed_hinted`] falls
+/// back to the unhinted walk.
+#[derive(Clone, Debug, Default)]
+pub struct FeedHints(Arc<Mutex<HashMap<FeedKey, u64>>>);
+
+/// `(owner, topic)`: identifies one sequence feed in [`FeedHints`].
+type FeedKey = ([u8; 20], [u8; 32]);
+
+impl FeedHints {
+    /// An empty hint map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The last index resolved for `(owner, topic)`, or `0` when the
+    /// node has none (or the lock is poisoned).
+    #[must_use]
+    pub fn get(&self, owner: &[u8; 20], topic: &[u8; 32]) -> u64 {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|h| h.get(&(*owner, *topic)).copied())
+            .unwrap_or(0)
+    }
+
+    /// Raise the hint for `(owner, topic)` to `index` (never lowers it).
+    pub fn record(&self, owner: &[u8; 20], topic: &[u8; 32], index: u64) {
+        if let Ok(mut h) = self.0.lock() {
+            let e = h.entry((*owner, *topic)).or_insert(0);
+            *e = (*e).max(index);
+        }
+    }
+}
+
+/// [`resolve_sequence_feed_after`] anchored at the best of `after` and
+/// the node's last resolved index for this feed in `hints`.
+///
+/// If the hinted walk errors (a transient anchor miss, or a hint past a
+/// feed that was reset) it retries once from `after` without the hint,
+/// so a hint can never fail a read the plain walk would have served. On
+/// success the hint is raised to the resolved index. `hints = None` is
+/// exactly [`resolve_sequence_feed_after`].
+pub async fn resolve_sequence_feed_hinted(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    after: u64,
+    hints: Option<&FeedHints>,
+) -> Result<FeedResolution, FeedError> {
+    let Some(hints) = hints else {
+        return resolve_sequence_feed_after(fetcher, feed, after).await;
+    };
+    let hint = hints.get(&feed.owner, &feed.topic);
+    let anchor = after.max(hint);
+    let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
+    if let Err(e) = &result {
+        if anchor > after {
+            debug!(
+                target: "ant_retrieval::feed",
+                feed_owner = %hex::encode(feed.owner),
+                feed_topic = %hex::encode(feed.topic),
+                hint,
+                after,
+                "hinted feed walk failed ({e}); retrying without the hint",
+            );
+            result = resolve_sequence_feed_after(fetcher, feed, after).await;
+        }
+    }
+    if let Ok(resolution) = &result {
+        hints.record(&feed.owner, &feed.topic, resolution.index);
+    }
+    result
 }
 
 /// Resolve the reference a verified update points at, distinguishing v1
@@ -1954,5 +2041,312 @@ mod tests {
             let dyn_e: &(dyn StdError + 'static) = &e;
             assert!(!is_chunk_not_found(dyn_e), "should propagate: {msg}");
         }
+    }
+
+    // --- Hinted `/bzz` feed-manifest reads (issue #159) -----------------
+
+    /// Records which feed indices were probed, and makes every absent
+    /// chunk take `absent_delay` before its "not found" (the live shape
+    /// of a probe at an index no peer holds; feed probes give up at
+    /// `FEED_PROBE_TIMEOUT`). Lets a test compare how many indices, and
+    /// how much (paused-clock) time, a hinted and an unhinted walk cost.
+    struct ProbeCountingFetcher<'a> {
+        inner: &'a FlakyFetcher,
+        /// SOC address -> feed index, for the indices a test cares about.
+        soc_index: HashMap<[u8; 32], u64>,
+        probed: std::sync::Mutex<std::collections::HashSet<u64>>,
+        absent_delay: Duration,
+    }
+    impl<'a> ProbeCountingFetcher<'a> {
+        fn new(inner: &'a FlakyFetcher, feed: &Feed, up_to: u64, absent_delay: Duration) -> Self {
+            Self {
+                inner,
+                soc_index: (0..=up_to)
+                    .map(|i| (sequence_update_address(feed, i), i))
+                    .collect(),
+                probed: std::sync::Mutex::new(std::collections::HashSet::new()),
+                absent_delay,
+            }
+        }
+        /// Distinct feed indices probed since the last call.
+        fn take(&self) -> usize {
+            std::mem::take(&mut *self.probed.lock().unwrap()).len()
+        }
+    }
+    #[async_trait]
+    impl ChunkFetcher for ProbeCountingFetcher<'_> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            if let Some(i) = self.soc_index.get(&addr) {
+                self.probed.lock().unwrap().insert(*i);
+            }
+            let r = self.inner.fetch(addr).await;
+            if r.is_err() {
+                tokio::time::sleep(self.absent_delay).await;
+            }
+            r
+        }
+    }
+
+    /// A feed manifest whose sequence feed `(owner, topic)` has an
+    /// update at each of `indices`. Update `i` points at its own
+    /// single-file manifest (`feed.txt` whose body names `i`), so a
+    /// `/bzz/<feed-manifest>/feed.txt` read tells which update it
+    /// resolved. `transient` indices exist but always fail transiently.
+    /// Returns the fetcher, the feed-manifest root and `data_ref -> i`.
+    fn bzz_feed_fixture(
+        secret: &[u8; 32],
+        topic: &[u8; 32],
+        indices: &[u64],
+        transient: &[u64],
+    ) -> (FlakyFetcher, [u8; 32], HashMap<Vec<u8>, u64>) {
+        let owner = deterministic_eth_address(secret);
+        let mut fetcher = FlakyFetcher::new();
+        let manifest = crate::manifest_writer::build_feed_manifest(&owner, topic).unwrap();
+        for c in &manifest.chunks {
+            fetcher.insert(c.address, c.wire.clone());
+        }
+        let mut by_data_ref = HashMap::new();
+        for &i in indices {
+            add_bzz_feed_update(&mut fetcher, secret, topic, i, transient.contains(&i));
+            by_data_ref.insert(bzz_feed_body_ref(i).to_vec(), i);
+        }
+        (fetcher, manifest.root, by_data_ref)
+    }
+
+    fn bzz_feed_body_ref(index: u64) -> [u8; 32] {
+        cac_new(format!("update {index}").as_bytes()).unwrap().0
+    }
+
+    /// Publish update `index` of the fixture feed: its content (one
+    /// chunk + a single-file manifest) and the signed SOC.
+    fn add_bzz_feed_update(
+        fetcher: &mut FlakyFetcher,
+        secret: &[u8; 32],
+        topic: &[u8; 32],
+        index: u64,
+        transient: bool,
+    ) {
+        let owner = deterministic_eth_address(secret);
+        let (body_addr, body_wire) = cac_new(format!("update {index}").as_bytes()).unwrap();
+        fetcher.insert(body_addr, body_wire);
+        let site = crate::manifest_writer::build_single_file_manifest("feed.txt", None, body_addr)
+            .unwrap();
+        for c in &site.chunks {
+            fetcher.insert(c.address, c.wire.clone());
+        }
+        let (soc_addr, soc_wire) =
+            make_sequence_update_v1(secret, &owner, topic, index, &site.root);
+        if transient {
+            fetcher.mark_transient(soc_addr);
+        } else {
+            fetcher.insert(soc_addr, soc_wire);
+        }
+    }
+
+    /// What a `/bzz` read observed: the resolved update index, or the
+    /// error text.
+    fn bzz_outcome(
+        r: Result<crate::mantaray::LookupResult, crate::mantaray::ManifestError>,
+        by_data_ref: &HashMap<Vec<u8>, u64>,
+    ) -> Result<u64, String> {
+        r.map(|l| by_data_ref[&l.data_ref])
+            .map_err(|e| e.to_string())
+    }
+
+    /// Differential: a hinted `/bzz` feed-manifest read returns exactly
+    /// what the unhinted walk does, over the `feeds_matrix` update
+    /// patterns (dense, gappy, sparse, deep, no index 0, transient holes)
+    /// and every hint the node can hold for them: each index up to the
+    /// unhinted head, the head, absent indices, and hints past the head
+    /// (as after a feed reset) — the last two fail their anchor and fall
+    /// back to the walk from 0. Two kinds of hint are left out because
+    /// they only exist if the writer skipped an index, which a sequence
+    /// writer never does: a present index *above* the unhinted head (an
+    /// orphan past a definitive gap; the walk never resolves it), and a
+    /// present index *below* a definitive gap under the head (e.g. `1`
+    /// in `{0, 1, 3}`: a walk anchored there ends at the gap, like bee's
+    /// finder from such an `after`, where the walk from 0 brackets over
+    /// it).
+    #[tokio::test(start_paused = true)]
+    async fn hinted_bzz_feed_read_matches_unhinted_walk() {
+        use crate::mantaray::{lookup_path, lookup_path_with_hints};
+
+        let secret: [u8; 32] = [31u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        // (name, indices, transient indices)
+        let patterns: Vec<(&str, Vec<u64>, Vec<u64>)> = vec![
+            ("single-0", vec![0], vec![]),
+            ("dense-0-1-2", vec![0, 1, 2], vec![]),
+            ("gap-0-2", vec![0, 2], vec![]),
+            ("gap-0-3", vec![0, 3], vec![]),
+            ("bridge-0-1-3", vec![0, 1, 3], vec![]),
+            ("lattice-0-1-2-3-5", vec![0, 1, 2, 3, 5], vec![]),
+            ("no-index-0", vec![1, 2], vec![]),
+            ("dense-0-8", (0..=8).collect(), vec![]),
+            ("deep-0-33", (0..=33).collect(), vec![]),
+            ("only-5", vec![5], vec![]),
+            ("transient-hole-1", vec![0, 1, 2, 3], vec![1]),
+            ("transient-head", (0..=6).collect(), vec![6]),
+        ];
+        for (name, indices, transient) in patterns {
+            let topic = keccak256(format!("hinted-bzz/{name}").as_bytes());
+            let (fetcher, root, by_ref) = bzz_feed_fixture(&secret, &topic, &indices, &transient);
+            let unhinted = bzz_outcome(lookup_path(&fetcher, &root, "feed.txt").await, &by_ref);
+            let head = *unhinted.as_ref().unwrap_or(&0);
+            let max = indices.iter().copied().max().unwrap();
+            let mut hints_to_try: Vec<u64> = (0..=max + 2)
+                .filter(|&h| {
+                    // Orphan above the head: never resolved, never a hint.
+                    let orphan = h > head && indices.contains(&h);
+                    // Present index below a definitive gap under the head.
+                    let below_gap =
+                        indices.contains(&h) && (h..head).any(|j| !indices.contains(&j));
+                    !orphan && (h == 0 || !below_gap)
+                })
+                .collect();
+            hints_to_try.extend([max + 9, 1_000, u64::MAX / 2]);
+            for hint in hints_to_try {
+                let hints = FeedHints::new();
+                hints.record(&owner, &topic, hint);
+                let hinted = bzz_outcome(
+                    lookup_path_with_hints(&fetcher, &root, "feed.txt", &hints).await,
+                    &by_ref,
+                );
+                assert_eq!(hinted, unhinted, "{name}: hint {hint}");
+                // The hint is raised to what was resolved, never lowered.
+                let expect_hint = match &unhinted {
+                    Ok(i) => hint.max(*i),
+                    Err(_) => hint,
+                };
+                assert_eq!(
+                    hints.get(&owner, &topic),
+                    expect_hint,
+                    "{name}: hint {hint}"
+                );
+            }
+        }
+    }
+
+    /// The point of issue #159: once the node has resolved a long feed,
+    /// the next `/bzz` read of its feed manifest anchors at that index
+    /// and costs about one probe round instead of the exponential bracket
+    /// and binary search from 0. Absent probes run into their
+    /// `FEED_PROBE_TIMEOUT` (paused clock), so the elapsed time is the
+    /// number of sequential probe rounds. Also pins read-after-own-write:
+    /// an update published right after the hinted read is what the next
+    /// hinted read returns.
+    #[tokio::test(start_paused = true)]
+    async fn hinted_bzz_feed_read_of_a_long_feed_probes_far_fewer_indices() {
+        use crate::mantaray::{lookup_path, lookup_path_with_hints};
+
+        let secret: [u8; 32] = [32u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/long-feed");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let head: u64 = 600;
+        let indices: Vec<u64> = (0..=head).collect();
+        let (mut fetcher, root, mut by_ref) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
+
+        let (unhinted, hinted) = {
+            let slow = ProbeCountingFetcher::new(&fetcher, &feed, 4 * head, Duration::from_secs(5));
+            let timed = |hints: Option<FeedHints>| {
+                let slow = &slow;
+                let by_ref = &by_ref;
+                async move {
+                    let started = tokio::time::Instant::now();
+                    let r = match &hints {
+                        Some(h) => lookup_path_with_hints(slow, &root, "feed.txt", h).await,
+                        None => lookup_path(slow, &root, "feed.txt").await,
+                    };
+                    assert_eq!(bzz_outcome(r, by_ref), Ok(head));
+                    (slow.take(), started.elapsed())
+                }
+            };
+            let unhinted = timed(None).await;
+            // The first read through a fresh hint map is the cold walk
+            // and seeds the hint; the next one is warm.
+            let hints = FeedHints::new();
+            assert_eq!(
+                timed(Some(hints.clone())).await,
+                unhinted,
+                "cold == unhinted"
+            );
+            assert_eq!(hints.get(&owner, &topic), head);
+            (unhinted, timed(Some(hints)).await)
+        };
+        let ((unhinted_probes, unhinted_time), (hinted_probes, hinted_time)) = (unhinted, hinted);
+        // Measured: 43 indices over 7 sequential rounds (5.6 s) from 0,
+        // 24 indices in one round (0.8 s) from the hint. What the hinted
+        // read still probes is the anchor's single concurrent
+        // speculative window (`prefetch_window`).
+        assert!(
+            hinted_probes * 3 <= unhinted_probes * 2,
+            "hinted read should probe far fewer indices: hinted {hinted_probes}, \
+             unhinted {unhinted_probes}",
+        );
+        assert!(
+            hinted_time <= FEED_PROBE_TIMEOUT * 3 / 2 && unhinted_time >= 5 * hinted_time,
+            "hinted read should cost about one probe round: hinted {hinted_time:?}, \
+             unhinted {unhinted_time:?}",
+        );
+
+        // Read-after-own-write: the publisher adds update head+1 (stashed
+        // locally before pushsync) and reads its channel again.
+        let hints = FeedHints::new();
+        hints.record(&owner, &topic, head);
+        add_bzz_feed_update(&mut fetcher, &secret, &topic, head + 1, false);
+        by_ref.insert(bzz_feed_body_ref(head + 1).to_vec(), head + 1);
+        let after_write = lookup_path_with_hints(&fetcher, &root, "feed.txt", &hints).await;
+        assert_eq!(bzz_outcome(after_write, &by_ref), Ok(head + 1));
+        assert_eq!(hints.get(&owner, &topic), head + 1);
+    }
+
+    /// `GET /feeds` and `/bzz` share one map: a `/feeds` resolution (here
+    /// the helper `GetFeed` calls) warms the `/bzz` feed-manifest read,
+    /// and a hint past a feed that was reset falls back to the walk
+    /// from 0 instead of failing.
+    #[tokio::test]
+    async fn feed_hints_are_shared_and_survive_a_reset_feed() {
+        use crate::mantaray::lookup_path_with_hints;
+
+        let secret: [u8; 32] = [33u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/shared");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let indices: Vec<u64> = (0..=40).collect();
+        let (fetcher, root, by_ref) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
+
+        let hints = FeedHints::new();
+        let r = resolve_sequence_feed_hinted(&fetcher, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(r.index, 40);
+        assert_eq!(hints.get(&owner, &topic), 40);
+        let counting = ProbeCountingFetcher::new(&fetcher, &feed, 200, Duration::ZERO);
+        let read = lookup_path_with_hints(&counting, &root, "feed.txt", &hints).await;
+        assert_eq!(bzz_outcome(read, &by_ref), Ok(40));
+        let warm = counting.take();
+
+        // A reset feed: the node remembers index 5000 from a previous life.
+        let stale = FeedHints::new();
+        stale.record(&owner, &topic, 5_000);
+        let read = lookup_path_with_hints(&fetcher, &root, "feed.txt", &stale).await;
+        assert_eq!(bzz_outcome(read, &by_ref), Ok(40));
+        assert_eq!(stale.get(&owner, &topic), 5_000, "hints never lower");
+
+        let cold = {
+            let read = crate::mantaray::lookup_path(&counting, &root, "feed.txt").await;
+            assert_eq!(bzz_outcome(read, &by_ref), Ok(40));
+            counting.take()
+        };
+        assert!(warm < cold, "warm {warm} should be below cold {cold}");
     }
 }

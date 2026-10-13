@@ -82,8 +82,9 @@ pub use enc_split::{
 };
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_after,
-    resolve_sequence_feed_full, sequence_update_address, sequence_update_id, Feed, FeedError,
-    FeedResolution, FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
+    resolve_sequence_feed_full, resolve_sequence_feed_hinted, sequence_update_address,
+    sequence_update_id, Feed, FeedError, FeedHints, FeedResolution, FeedType, FEED_OWNER_KEY,
+    FEED_TOPIC_KEY, FEED_TYPE_KEY,
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{
@@ -97,9 +98,9 @@ pub use manifest_writer::{
     RawManifestEntry, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
-    list_manifest, lookup_path, lookup_path_with_credit, resolve_feed_root, LookupResult,
-    ManifestEntry, ManifestError, ReplicaSweeps, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY,
-    MANTARAY_INDEX_DOC_KEY,
+    list_manifest, lookup_path, lookup_path_with_credit, lookup_path_with_hints, resolve_feed_root,
+    LookupResult, ManifestEntry, ManifestError, ReplicaSweeps, MANTARAY_CONTENT_TYPE_KEY,
+    MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_load::{PushLoadGuard, PushLoadTracker};
