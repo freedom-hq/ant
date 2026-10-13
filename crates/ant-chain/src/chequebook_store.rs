@@ -531,7 +531,8 @@ pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::fr
 /// [`withdraw_from_chequebook`] runs on `chequebook` in this process, and
 /// for [`LANDED_WITHDRAWAL_TTL`] after it is sent, on any read that
 /// doesn't show it, the deposit it reports is lowered by the amount
-/// withdrawn.
+/// withdrawn. A read still unanswered after [`FUNDS_READ_TIMEOUT`] is an
+/// error too.
 #[cfg(feature = "chain-rpc")]
 pub async fn read_retrieval_funds(
     client: &crate::ChainClient,
@@ -556,12 +557,45 @@ fn with_withdrawals_applied(chequebook: &[u8; 20], raw: RetrievalFunds) -> Retri
     }
 }
 
+/// How long one [`RetrievalFunds`] read (all three calls) may take
+/// before it fails. The reads are adjusted for this process's
+/// withdrawals when they land, not when they were taken, and that only
+/// covers a read taken while a withdrawal's [`Landed`] entry still
+/// exists: a read stalled for longer than [`LANDED_WITHDRAWAL_TTL`]
+/// could carry the pre-withdrawal deposit past the entry's expiry and
+/// be published unadjusted. The RPC client has no timeout of its own,
+/// so this bound is what keeps every read well inside the TTL.
+#[cfg(feature = "chain-rpc")]
+const FUNDS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(feature = "chain-rpc")]
+const _: () = assert!(FUNDS_READ_TIMEOUT.as_secs() * 2 <= LANDED_WITHDRAWAL_TTL.as_secs());
+
 /// [`read_retrieval_funds`] as the chain answered it: the deposit is the
 /// balance plus `totalPaidOut`, with no withdrawal of this process taken
 /// off. Only for [`read_retrieval_funds`] and
-/// [`read_and_publish_retrieval_funds`], which apply them.
+/// [`read_and_publish_retrieval_funds`], which apply them. Fails after
+/// [`FUNDS_READ_TIMEOUT`].
 #[cfg(feature = "chain-rpc")]
 async fn read_raw_retrieval_funds(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<RetrievalFunds, ChequebookError> {
+    tokio::time::timeout(
+        FUNDS_READ_TIMEOUT,
+        read_raw_retrieval_funds_unbounded(client, chequebook),
+    )
+    .await
+    .map_err(|_| {
+        ChequebookError::Chain(format!(
+            "chequebook funds read timed out after {}s",
+            FUNDS_READ_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
+#[cfg(feature = "chain-rpc")]
+async fn read_raw_retrieval_funds_unbounded(
     client: &crate::ChainClient,
     chequebook: &[u8; 20],
 ) -> Result<RetrievalFunds, ChequebookError> {
@@ -674,7 +708,7 @@ where
 /// node has the funds back). Without it a read adjusted just before the
 /// reservation (the full deposit) could land at the node after the
 /// lowered figure and stand while the transaction confirms. Never held
-/// across a chain read (those have no timeout of their own): only across
+/// across a chain read (bounded only by [`FUNDS_READ_TIMEOUT`]): only across
 /// the in-memory adjustment and the hand-off to a local node, so one
 /// node's stalled RPC can't hold up another's funds or a withdrawal. One
 /// lock for every chequebook.
@@ -2121,6 +2155,41 @@ mod tests {
         let (read, published) = watch.await.unwrap();
         assert_eq!(read, 500, "withdrawal taken off when published");
         assert_eq!(published, [500]);
+    }
+
+    /// A funds read whose RPC never answers fails after
+    /// [`FUNDS_READ_TIMEOUT`] instead of hanging (R5-M1): a read stalled
+    /// past [`LANDED_WITHDRAWAL_TTL`] would land after a withdrawal's
+    /// entry expired and be published with the pre-withdrawal deposit.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_funds_read_times_out_inside_the_landed_ttl() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let client = crate::ChainClient::new(url);
+        let cb = [0xcd; 20];
+        let started = tokio::time::Instant::now();
+        let published = std::sync::Mutex::new(Vec::new());
+        let err = read_and_publish_retrieval_funds(&client, &cb, |funds| {
+            published.lock().unwrap().push(funds.deposited_plur);
+            async { true }
+        })
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(elapsed, FUNDS_READ_TIMEOUT);
+        assert!(elapsed < LANDED_WITHDRAWAL_TTL);
+        assert!(published.lock().unwrap().is_empty());
+        assert!(read_retrieval_funds(&client, &cb).await.is_err());
+        hold.abort();
     }
 
     /// A deposit this process makes after a withdrawal counts at once
