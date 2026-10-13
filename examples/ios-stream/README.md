@@ -12,7 +12,7 @@ through the embedded node. Feature-for-feature it matches the Android
 port in [`examples/android-stream`](../android-stream), with the
 differences listed under [Differences from Android](#differences-from-android).
 
-Bundle id: `at.vibing.ant.stream`. Data dir:
+Bundle id: `baby.freedom.antstream`. Data dir:
 `Application Support/antstream/`.
 
 ## What's here

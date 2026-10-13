@@ -307,7 +307,7 @@
 					"-framework",
 					CoreFoundation,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "at.vibing.ant.stream";
+				PRODUCT_BUNDLE_IDENTIFIER = "baby.freedom.antstream";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "AntStream/AntStream-Bridging-Header.h";
@@ -352,7 +352,7 @@
 					"-framework",
 					CoreFoundation,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "at.vibing.ant.stream";
+				PRODUCT_BUNDLE_IDENTIFIER = "baby.freedom.antstream";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRIP_INSTALLED_PRODUCT = YES;
 				STRIP_STYLE = all;

@@ -72,7 +72,7 @@ jobs:
           xcrun simctl boot "${{ steps.sim.outputs.device }}" || true
           xcrun simctl bootstatus "${{ steps.sim.outputs.device }}" -b
           xcrun simctl install booted "$APP"
-          xcrun simctl launch booted at.vibing.ant.stream
+          xcrun simctl launch booted baby.freedom.antstream
           mkdir -p shots
           # The app's first frame, before the node has settled: the Go
           # live gate and the readiness checklist must agree here too,
@@ -89,8 +89,8 @@ jobs:
           # UserDefaults, which is the only way to reach a sheet here:
           # the runner has no tap driver, and a screenshot of the
           # button alone doesn't show that the sheet renders.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstreamShowBench YES
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstreamShowBench YES
           sleep 12
           xcrun simctl io booted screenshot shots/03-bench-sheet.png
           # …and once more with a 60 s run started on appear, so the
@@ -98,8 +98,8 @@ jobs:
           # FFI round trip: ant_bench_start -> _progress -> _stop) and
           # not just the form that starts it. The simulator has no
           # storage plan, so this is the no-network pipeline mode.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream \
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
             -antstreamShowBench YES -antstreamBenchSeconds 60
           # The sheet waits for `ant_init` before starting (~20 s on a
           # cold launch), so the first shot is ~25 s into the run and
@@ -112,8 +112,8 @@ jobs:
           # run is cut 3 s in, inside the 5 s warm-up, so the measured
           # window is empty. The card has to say so instead of showing
           # a 0.00 Mbit/s run as having sustained the rendition.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream \
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
             -antstreamShowBench YES -antstreamBenchSeconds 60 \
             -antstreamBenchStopAfter 3
           sleep 45
@@ -127,16 +127,16 @@ jobs:
           # 07 — Storage tab on a fresh account: the storage meter's
           # no-plan state and the "Set up storage" card — whatever #75
           # renders for settlement when the account has no plan yet.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-storage
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-storage
           sleep 22
           xcrun simctl io booted screenshot shots/07-storage-overview.png
           # 08 — the buy flow (Get Started) plan picker: the storage plans
           # and their prices. Pricing needs the network; the layout renders
           # regardless, so this honestly shows whatever the runner quotes
           # from the public Gnosis RPC (a spinner/chevron if it can't).
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-getstarted
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-getstarted
           sleep 20
           xcrun simctl io booted screenshot shots/08-storage-getstarted-plans.png
           # 09 — the buy flow's payment step: "Send exactly" + the amount,
@@ -145,8 +145,8 @@ jobs:
           # quote needs funds and a reachable chain, so this is driven with
           # a representative quote. The one-time settlement-deposit line
           # (#75) moved behind the ⓘ; shot 16 captures it there.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream \
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-getstarted -antstream-shot-getstarted-pay
           sleep 20
           xcrun simctl io booted screenshot shots/09-storage-getstarted-deposit.png
@@ -155,8 +155,8 @@ jobs:
           # ("Broadcasts will stall without a deposit" → Add deposit). A
           # fresh simulator account has no chequebook to be under-funded,
           # so representative sample state is published to reach the card.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream \
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-storage -antstream-shot-deposit
           sleep 22
           xcrun simctl io booted screenshot shots/10-storage-deposit-topup.png
@@ -177,8 +177,8 @@ jobs:
           # it still covers everything up to the batch check: capture,
           # segmentation, the FFI hand-off, the lag indicator and the
           # error surface.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-live
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live
           # The screen waits for `ant_init` before starting (~20 s cold).
           sleep 40
           xcrun simctl io booted screenshot shots/11-live-broadcast.png
@@ -191,16 +191,16 @@ jobs:
           # plan has stamped the channel's feed manifest, and a runner
           # account has no plan, so `-antstream-shot-channel` installs a
           # sample plan and reference (nothing persisted).
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-channel
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-channel
           sleep 25
           xcrun simctl io booted screenshot shots/13-broadcast-channel-card.png
           # 14/15 — the Watch tab playing a channel through the in-process
           # gateway. The sample reference points at nothing, so this
           # captures the player loading and then the plain-language retry
           # state a channel that isn't live yet ends up in.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-watch
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-watch
           sleep 30
           xcrun simctl io booted screenshot shots/14-watch-loading.png
           sleep 60
@@ -208,16 +208,16 @@ jobs:
           # 16 — the payment step's ⓘ sheet: full address, copy buttons,
           # the Gnosis-only warning, the deposit line and "activates by
           # itself".
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream \
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-getstarted -antstream-shot-getstarted-pay \
             -antstream-shot-getstarted-help
           sleep 30
           xcrun simctl io booted screenshot shots/16-getstarted-pay-help.png
           # 17 — the live screen before going live: the quality presets
           # (360p / 540p / 720p) and what each costs in bandwidth.
-          xcrun simctl terminate booted at.vibing.ant.stream || true
-          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-live-idle
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live-idle
           sleep 25
           xcrun simctl io booted screenshot shots/17-live-quality-picker.png
           xcrun simctl spawn booted log show --last 5m \
