@@ -80,7 +80,7 @@ fun CreditCard(node: AntNode) {
     val walletError by node.walletError.collectAsState()
     val scope = rememberCoroutineScope()
     var picking by remember { mutableStateOf<Move?>(null) }
-    var confirming by remember { mutableStateOf<Pair<Move, BigInteger>?>(null) }
+    var confirming by remember { mutableStateOf<Confirming?>(null) }
     var busy by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var done by remember { mutableStateOf<String?>(null) }
@@ -145,11 +145,13 @@ fun CreditCard(node: AntNode) {
             onDismiss = { picking = null },
             onContinue = { amount ->
                 picking = null
-                confirming = move to amount
+                // The account the amount was picked against: an add
+                // refuses to send if the wallet is another one by then.
+                confirming = Confirming(move, amount, wallet?.address)
             },
         )
     }
-    confirming?.let { (move, amount) ->
+    confirming?.let { (move, amount, address) ->
         ConfirmDialog(
             move = move,
             amount = amount,
@@ -161,7 +163,7 @@ fun CreditCard(node: AntNode) {
                 scope.launch {
                     runCatching {
                         when (move) {
-                            Move.Add -> node.addCredit(amount)
+                            Move.Add -> node.addCredit(amount, address)
                             Move.Withdraw -> node.withdrawCredit(amount)
                         }
                     }.fold(
@@ -179,6 +181,9 @@ fun CreditCard(node: AntNode) {
         )
     }
 }
+
+/** A move awaiting confirmation, with the wallet address it was picked against. */
+private data class Confirming(val move: Move, val amount: BigInteger, val address: String?)
 
 /** The live chequebook figures: credit left, paying or not, payments. */
 @Composable

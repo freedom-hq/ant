@@ -537,6 +537,34 @@ pub async fn read_retrieval_funds(
     client: &crate::ChainClient,
     chequebook: &[u8; 20],
 ) -> Result<RetrievalFunds, ChequebookError> {
+    let raw = read_raw_retrieval_funds(client, chequebook).await?;
+    Ok(with_withdrawals_applied(chequebook, raw))
+}
+
+/// `raw` (as [`read_raw_retrieval_funds`] returned it) less any
+/// withdrawal in flight or landed but maybe not yet seen by the backend
+/// that answered (see [`WITHDRAWING`]), so no read hands the node credit
+/// a withdrawal is taking (or has taken) out. Evaluated against the
+/// withdrawals known *now*, so a read taken a while ago is treated like
+/// one from a backend that far behind, which [`Withdrawals::apply`]
+/// already covers.
+#[cfg(feature = "chain-rpc")]
+fn with_withdrawals_applied(chequebook: &[u8; 20], raw: RetrievalFunds) -> RetrievalFunds {
+    RetrievalFunds {
+        deposited_plur: withdrawals_applied(chequebook, raw.deposited_plur),
+        ..raw
+    }
+}
+
+/// [`read_retrieval_funds`] as the chain answered it: the deposit is the
+/// balance plus `totalPaidOut`, with no withdrawal of this process taken
+/// off. Only for [`read_retrieval_funds`] and
+/// [`read_and_publish_retrieval_funds`], which apply them.
+#[cfg(feature = "chain-rpc")]
+async fn read_raw_retrieval_funds(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<RetrievalFunds, ChequebookError> {
     use crate::chequebook::{
         chequebook_total_paid_out_selector, price_oracle_get_price_selector,
         GNOSIS_SWAP_PRICE_ORACLE,
@@ -570,10 +598,7 @@ pub async fn read_retrieval_funds(
         .await
         .map_err(|e| ChequebookError::Chain(format!("priceOracle.getPrice eth_call: {e}")))?;
     Ok(RetrievalFunds {
-        // Less any withdrawal in flight or landed but maybe not yet seen
-        // by this backend (see [`WITHDRAWING`]), so no read hands the
-        // node credit a withdrawal is taking (or has taken) out.
-        deposited_plur: withdrawals_applied(chequebook, balance.saturating_add(paid_out)),
+        deposited_plur: balance.saturating_add(paid_out),
         exchange_rate_plur: word(&price, 0, "priceOracle.getPrice")?,
         deduction_plur: word(&price, 32, "priceOracle.getPrice")?,
     })
@@ -617,13 +642,15 @@ pub async fn watch_retrieval_funds<F, Fut>(
 }
 
 /// Read `chequebook`'s [`RetrievalFunds`] and hand them to `publish`
-/// (which returns `false` once the node is gone), holding
-/// [`FUNDS_PUBLISH`] across both, so no read taken before a
+/// (which returns `false` once the node is gone). The chain read runs
+/// unlocked; this process's withdrawals are taken off it, and the result
+/// published, under [`FUNDS_PUBLISH`], so no read taken before a
 /// [`withdraw_from_chequebook`] reserves its amount can reach the node
-/// after the lowered funds it publishes. Every publisher of a fresh read
-/// goes through this: [`watch_retrieval_funds`], the entry points'
-/// refresh after a deposit, and the withdrawal's own re-read. A failed
-/// read publishes nothing.
+/// after the lowered funds it publishes: it gets the reservation taken
+/// off when it is published, not when it was read. Every publisher of a
+/// fresh read goes through this: [`watch_retrieval_funds`], the entry
+/// points' refresh after a deposit, and the withdrawal's own re-read. A
+/// failed read publishes nothing.
 #[cfg(feature = "chain-rpc")]
 pub async fn read_and_publish_retrieval_funds<F, Fut>(
     client: &crate::ChainClient,
@@ -634,19 +661,23 @@ where
     F: FnOnce(RetrievalFunds) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    let raw = read_raw_retrieval_funds(client, chequebook).await?;
     let _ordered = FUNDS_PUBLISH.lock().await;
-    let funds = read_retrieval_funds(client, chequebook).await?;
+    let funds = with_withdrawals_applied(chequebook, raw);
     Ok((funds, publish(funds).await))
 }
 
-/// Held from a funds read until the node has it
-/// ([`read_and_publish_retrieval_funds`]), and by [`withdraw_from_chequebook`]
-/// from its reservation until the node has the lowered funds (and, on a
-/// refusal, from releasing it until the node has the funds back). Without
-/// it a read computed just before the reservation (the full deposit)
-/// could land at the node after the lowered figure and stand while the
-/// transaction confirms. One lock for every chequebook: the reads it
-/// covers are once a minute per node.
+/// Held while funds are adjusted for this process's withdrawals and
+/// handed to the node ([`read_and_publish_retrieval_funds`]), and by
+/// [`withdraw_from_chequebook`] from its reservation until the node has
+/// the lowered funds (and, on a refusal, from releasing it until the
+/// node has the funds back). Without it a read adjusted just before the
+/// reservation (the full deposit) could land at the node after the
+/// lowered figure and stand while the transaction confirms. Never held
+/// across a chain read (those have no timeout of their own): only across
+/// the in-memory adjustment and the hand-off to a local node, so one
+/// node's stalled RPC can't hold up another's funds or a withdrawal. One
+/// lock for every chequebook.
 #[cfg(feature = "chain-rpc")]
 static FUNDS_PUBLISH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -2002,6 +2033,94 @@ mod tests {
         assert_eq!(watched.unwrap().0.deposited_plur, 1200);
         withdrawn.unwrap();
         assert_eq!(*published.lock().unwrap(), [1200, 500, 500]);
+    }
+
+    /// A [`WithdrawChain`] whose first request is answered from the
+    /// chain as it stands when it arrives, then held until `release`
+    /// fires: an RPC backend that stalls after reading.
+    #[cfg(feature = "chain-rpc")]
+    struct StalledFirst {
+        chain: std::sync::Arc<WithdrawChain>,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for StalledFirst {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let answer = self.chain.serve(request_json);
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                if let Some(entered) = self.entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                }
+                release.recv().unwrap();
+            }
+            answer
+        }
+    }
+
+    /// A stalled funds read holds no lock (R4-M1): another chequebook's
+    /// withdrawal, its post-send re-read included, and another node's
+    /// funds publish all go ahead while it hangs. When the stalled read
+    /// (the full deposit, read before the withdrawal) finally lands, it
+    /// gets the withdrawal taken off at that point, never the full 1200.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_funds_read_blocks_no_other_publish() {
+        let stalled = withdraw_chain(0xcb, None);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let client = crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(
+            std::sync::Arc::new(StalledFirst {
+                chain: stalled.clone(),
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+        ));
+        let stalled_cb = stalled.cb;
+        let watch = tokio::spawn(async move {
+            let published = std::sync::Mutex::new(Vec::new());
+            let read = read_and_publish_retrieval_funds(&client, &stalled_cb, |funds| {
+                published.lock().unwrap().push(funds.deposited_plur);
+                async { true }
+            })
+            .await
+            .unwrap();
+            (read.0.deposited_plur, published.into_inner().unwrap())
+        });
+        entered_rx.await.unwrap();
+
+        // Another chequebook withdraws, re-read and all, meanwhile.
+        let other = withdraw_chain(0xcc, None);
+        let (result, published) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            withdraw_with(&other, 700, &[Ok(500), Ok(500)]),
+        )
+        .await
+        .expect("not held up by the stalled read");
+        result.unwrap();
+        assert_eq!(published, [500, 500]);
+        // And another node's funds publish.
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(other.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_and_publish_retrieval_funds(&client, &other.cb, |_| async { true }),
+        )
+        .await
+        .expect("not held up by the stalled read")
+        .unwrap();
+
+        // The stalled chequebook withdraws too, while its read hangs on
+        // the full deposit, then the read lands.
+        let (result, published) = withdraw_with(&stalled, 700, &[Ok(500), Ok(500)]).await;
+        result.unwrap();
+        assert_eq!(published, [500, 500]);
+        release_tx.send(()).unwrap();
+        let (read, published) = watch.await.unwrap();
+        assert_eq!(read, 500, "withdrawal taken off when published");
+        assert_eq!(published, [500]);
     }
 
     /// A deposit this process makes after a withdrawal counts at once

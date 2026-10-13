@@ -394,12 +394,18 @@ class AntNode(private val context: Context) {
      * wallet lacks, but the card caps this at a wallet read up to 30 s old
      * and promises a plain transfer. So the wallet is read again right
      * before sending, and a wallet that no longer holds [amountPlur] stops
-     * here with nothing sent instead of swapping.
+     * here with nothing sent instead of swapping. The re-read must also be
+     * [confirmedAddress], the wallet the user confirmed against: if the
+     * account changed since, nothing is sent (and the other account's
+     * wallet isn't published as this one's), as on iOS.
      */
-    suspend fun addCredit(amountPlur: BigInteger) = withContext(Dispatchers.IO) {
+    suspend fun addCredit(amountPlur: BigInteger, confirmedAddress: String?) = withContext(Dispatchers.IO) {
         val json = withHandle { h ->
             val w = WalletBalance.parse(AntNative.nativeWalletBalance(h, gnosisRpc))
                 ?: throw AntException("could not read the wallet; nothing was sent")
+            if (confirmedAddress.isNullOrEmpty() || !w.address.equals(confirmedAddress, ignoreCase = true)) {
+                throw AntException("the account changed (or isn't loaded yet); nothing was sent")
+            }
             _wallet.value = w
             if (w.bzzPlur < amountPlur) {
                 throw AntException(

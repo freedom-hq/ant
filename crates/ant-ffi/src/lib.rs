@@ -2730,7 +2730,15 @@ pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
 /// refreshed [`ant_storage_settlement_deposit`] JSON, or the JSON literal
 /// `null` when the withdrawal confirmed but re-reading the deposit
 /// failed (not an error: the xBZZ has moved, so retrying would withdraw
-/// again; re-read the deposit later). **Submits a real
+/// again; re-read the deposit later). An error once the transaction may
+/// have gone out (a receipt timeout, an RPC error after sending) does not
+/// mean nothing moved: the transaction may still land, so the node keeps
+/// the amount off `available_plur` (and `paying`) for up to 10 minutes
+/// from the error (`ant_chain::chequebook_store`'s
+/// `LANDED_WITHDRAWAL_TTL`), as it does on reads that don't show a
+/// confirmed one yet. Re-read the deposit before retrying, or the retry
+/// may withdraw twice. Only a refusal before sending, or a reverted
+/// transaction, hands the amount back at once. **Submits a real
 /// transaction** (it costs a little xDAI for gas) and **blocks** until it
 /// confirms, so the app gates it behind explicit confirmation. Requires
 /// the `chain` build feature.
