@@ -39,6 +39,11 @@ final class AntNode: ObservableObject {
     /// Fetched on demand (`refreshSettlementDeposit`) since it reads
     /// chain; `nil` until then.
     @Published private(set) var settlementDeposit: SettlementDeposit?
+    /// True while uploads and downloads pay peers with cheques (fast);
+    /// false on the free tier (`ant_swap_status`'s `paying`). A deployed,
+    /// funded chequebook only pays once the node has read its funds from
+    /// the chain, which `adoptSettlement()` starts after every launch.
+    @Published private(set) var paying = false
     /// Remaining lifetime of the connected plan. Fetched on demand
     /// (`refreshValidity`) since it needs a chain RPC; `nil` until then.
     @Published private(set) var validity: StorageValidity?
@@ -109,6 +114,7 @@ final class AntNode: ObservableObject {
         }
         handle = raw
         status = .ready
+        adoptSettlement()
         startPollingPeers()
         startNetworkMonitor()
         await refreshAll()
@@ -153,6 +159,8 @@ final class AntNode: ObservableObject {
             var wakeErr: UnsafeMutablePointer<CChar>? = nil
             if ant_wake(h, &wakeErr) != 0, let wakeErr { ant_free_string(wakeErr) }
         }.value
+        // Retries the chain reads if the network was down at launch.
+        adoptSettlement()
         await refreshJobs()
     }
 
@@ -576,7 +584,43 @@ final class AntNode: ObservableObject {
         }
     }
 
+    /// The RPC the on-chain reads use: whatever the user configured in
+    /// Settings, else the public Gnosis endpoint (the views' fallback).
+    static var activeRpc: String {
+        let r = (UserDefaults.standard.string(forKey: "gnosisRpc") ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        return r.isEmpty ? "https://rpc.gnosischain.com" : r
+    }
+
+    /// Adopt this account's chequebook so uploads pay peers instead of
+    /// staying on the free tier. `ant_init` reloads a persisted
+    /// chequebook without reading its funds from the chain, so the node
+    /// pays nothing until this (or a storage call) runs. Spends nothing,
+    /// returns at once; `paying` flips once the funds are read. Safe to
+    /// call repeatedly (launch, wake, the Storage tab's retry).
+    func adoptSettlement() {
+        guard let h = handle else { return }
+        let rpc = Self.activeRpc
+        Task.detached(priority: .utility) {
+            var errPtr: UnsafeMutablePointer<CChar>? = nil
+            let rc = rpc.withCString { ant_chain_init(h, $0, &errPtr) }
+            if rc != 0, let errPtr { ant_free_string(errPtr) }
+        }
+    }
+
+    /// Whether the node is paying peers right now. Never blocks on the
+    /// network, so the auto-refresh can poll it.
+    func refreshPaying() async {
+        guard let h = handle else { return }
+        if let json = try? await Self.string(name: "swap status", { errPtr in
+            ant_swap_status(h, errPtr)
+        }), let p = DriveDecoder.paying(from: json), p != paying {
+            paying = p
+        }
+    }
+
     func refreshSettlement() async {
+        await refreshPaying()
         guard let h = handle else { return }
         if let json = try? await Self.string(name: "settlement status", { errPtr in
             ant_storage_settlement_status(h, errPtr)
@@ -664,6 +708,7 @@ final class AntNode: ObservableObject {
                 }
                 try? await Task.sleep(nanoseconds: busy ? 1_500_000_000 : 10_000_000_000)
                 if busy || watchable { await self.refreshJobs() }
+                await self.refreshPaying()
             }
         }
     }

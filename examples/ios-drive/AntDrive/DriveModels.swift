@@ -677,6 +677,14 @@ enum DriveDecoder {
         return try? JSONDecoder().decode(SettlementInfo.self, from: data)
     }
 
+    /// `ant_swap_status`'s `paying`: cheques are being paid right now.
+    static func paying(from json: String) -> Bool? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["paying"] as? Bool
+    }
+
     static func settlementDeposit(from json: String) -> SettlementDeposit? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(SettlementDeposit.self, from: data)

@@ -29,6 +29,8 @@ struct StorageView: View {
                             settlementWarningCard
                         } else if node.settlementDeposit?.needsTopUp == true {
                             settlementDepositCard
+                        } else {
+                            paymentStatusCard
                         }
                     } else {
                         connectCard
@@ -213,6 +215,40 @@ struct StorageView: View {
                             if let addr = node.account?.ethAddress { copy(addr) }
                             flash("Send a little xDAI to your account (copied)")
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: payment status
+
+    /// Whether uploads are paying the network right now. With a funded
+    /// chequebook they should be: paid uploads are several times faster
+    /// than the free tier. Until the node has read the deposit from the
+    /// chain (a few seconds after launch, longer on a bad connection)
+    /// they run on the free tier, so offer a retry for when that read
+    /// failed.
+    private var paymentStatusCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                if node.paying {
+                    Label("Fast uploads", systemImage: "bolt.fill")
+                        .font(.headline)
+                        .foregroundStyle(.green)
+                    Text("Your account pays the network as it uploads, from its deposit.")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.75))
+                } else {
+                    Label("Slower uploads for now", systemImage: "tortoise.fill")
+                        .font(.headline)
+                        .foregroundStyle(.orange)
+                    Text("Uploads use the free tier until your deposit is confirmed on the network. This usually takes a few seconds.")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.75))
+                    pillButton("Try again", icon: "arrow.clockwise") {
+                        node.adoptSettlement()
+                        flash("Checking your deposit…")
                     }
                 }
             }
