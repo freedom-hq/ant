@@ -838,12 +838,22 @@ pub async fn resolve_sequence_feed_after(
 /// Sequence feeds are append-only, so an index the node has resolved
 /// stays present and is a safe anchor for the next walk: a steady poll
 /// costs about one probe round instead of the exponential bracket and
-/// binary search from 0. Entries only ever rise. A hint that no longer
-/// resolves (a feed that was reset, e.g. on a local test chain) costs
-/// one failed anchor probe before [`resolve_sequence_feed_hinted`] falls
-/// back to the unhinted walk.
+/// binary search from 0. A successful resolution only ever raises an
+/// entry. A hint whose walk fails (a feed that was reset, e.g. on a
+/// local test chain, a head that became unretrievable, or a transient
+/// anchor miss) is dropped by [`resolve_sequence_feed_hinted`] before it
+/// falls back to the unhinted walk, so the failed anchor fetch is paid
+/// once per stale hint, not on every later read. The map holds at most
+/// [`FEED_HINTS_CAP`] feeds; past that, recording a new feed evicts an
+/// arbitrary one (a lost hint only costs that feed one cold walk).
 #[derive(Clone, Debug, Default)]
 pub struct FeedHints(Arc<Mutex<HashMap<FeedKey, u64>>>);
+
+/// Most feeds one [`FeedHints`] map remembers. Every `/bzz`
+/// feed-manifest read and `GET /feeds` resolution writes an entry, and a
+/// public gateway's clients can name any number of feeds, so the map is
+/// capped (~60 bytes per entry, ~256 KiB at the cap).
+pub const FEED_HINTS_CAP: usize = 4096;
 
 /// `(owner, topic)`: identifies one sequence feed in [`FeedHints`].
 type FeedKey = ([u8; 20], [u8; 32]);
@@ -867,22 +877,53 @@ impl FeedHints {
     }
 
     /// Raise the hint for `(owner, topic)` to `index` (never lowers it).
+    /// A feed the map doesn't hold yet evicts an arbitrary entry once the
+    /// map is at [`FEED_HINTS_CAP`].
     pub fn record(&self, owner: &[u8; 20], topic: &[u8; 32], index: u64) {
         if let Ok(mut h) = self.0.lock() {
-            let e = h.entry((*owner, *topic)).or_insert(0);
+            let key = (*owner, *topic);
+            if !h.contains_key(&key) && h.len() >= FEED_HINTS_CAP {
+                if let Some(victim) = h.keys().next().copied() {
+                    h.remove(&victim);
+                }
+            }
+            let e = h.entry(key).or_insert(0);
             *e = (*e).max(index);
         }
+    }
+
+    /// Drop the hint for `(owner, topic)` if it is still `stale`: the
+    /// value a walk anchored at and failed on. A concurrent read that
+    /// meanwhile raised the entry keeps its newer hint.
+    fn forget(&self, owner: &[u8; 20], topic: &[u8; 32], stale: u64) {
+        if let Ok(mut h) = self.0.lock() {
+            let key = (*owner, *topic);
+            if h.get(&key) == Some(&stale) {
+                h.remove(&key);
+            }
+        }
+    }
+
+    /// Number of feeds the map holds.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().map_or(0, |h| h.len())
     }
 }
 
 /// [`resolve_sequence_feed_after`] anchored at the best of `after` and
 /// the node's last resolved index for this feed in `hints`.
 ///
-/// If the hinted walk errors (a transient anchor miss, or a hint past a
-/// feed that was reset) it retries once from `after` without the hint,
-/// so a hint can never fail a read the plain walk would have served. On
-/// success the hint is raised to the resolved index. `hints = None` is
-/// exactly [`resolve_sequence_feed_after`].
+/// If the hinted walk errors (a transient anchor miss, a hint past a
+/// feed that was reset, or a head that is no longer retrievable) it
+/// drops the hint and retries once from `after`, so a hint can never
+/// fail a read the plain walk would have served. Dropping it first
+/// means the extra failed walk is paid once per stale hint: later reads
+/// (and the caller's own retry attempts, e.g. on a starved pool where
+/// the walk from `after` hits the same transient) walk from `after`
+/// until a success seeds a fresh hint. On success the hint is raised to
+/// the resolved index. `hints = None` is exactly
+/// [`resolve_sequence_feed_after`].
 pub async fn resolve_sequence_feed_hinted(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
@@ -903,8 +944,9 @@ pub async fn resolve_sequence_feed_hinted(
                 feed_topic = %hex::encode(feed.topic),
                 hint,
                 after,
-                "hinted feed walk failed ({e}); retrying without the hint",
+                "hinted feed walk failed ({e}); dropping the hint and retrying without it",
             );
+            hints.forget(&feed.owner, &feed.topic, hint);
             result = resolve_sequence_feed_after(fetcher, feed, after).await;
         }
     }
@@ -2213,10 +2255,13 @@ mod tests {
                     &by_ref,
                 );
                 assert_eq!(hinted, unhinted, "{name}: hint {hint}");
-                // The hint is raised to what was resolved, never lowered.
+                // A hint the walk could anchor at is raised to the head
+                // (here the head is never below a usable hint); a hint
+                // whose walk failed is dropped and replaced by what the
+                // fallback resolved, or by nothing if that failed too.
                 let expect_hint = match &unhinted {
-                    Ok(i) => hint.max(*i),
-                    Err(_) => hint,
+                    Ok(i) => *i,
+                    Err(_) => 0,
                 };
                 assert_eq!(
                     hints.get(&owner, &topic),
@@ -2340,7 +2385,11 @@ mod tests {
         stale.record(&owner, &topic, 5_000);
         let read = lookup_path_with_hints(&fetcher, &root, "feed.txt", &stale).await;
         assert_eq!(bzz_outcome(read, &by_ref), Ok(40));
-        assert_eq!(stale.get(&owner, &topic), 5_000, "hints never lower");
+        assert_eq!(
+            stale.get(&owner, &topic),
+            40,
+            "a hint whose walk failed is replaced by what the fallback resolved"
+        );
 
         let cold = {
             let read = crate::mantaray::lookup_path(&counting, &root, "feed.txt").await;
@@ -2348,5 +2397,117 @@ mod tests {
             counting.take()
         };
         assert!(warm < cold, "warm {warm} should be below cold {cold}");
+    }
+
+    /// A stale hint is paid for once, not on every read (R1-F1 on PR
+    /// #160): the anchor miss at a past-head or unretrievable hint is
+    /// unbounded (it burns the fetcher's whole miss budget), so a hint
+    /// that kept failing would put that cost in front of every later
+    /// `/bzz` feed-manifest read. Absent fetches cost 10 s here (paused
+    /// clock): the first read pays the stale anchor, the next ones cost
+    /// exactly what the unhinted walk does.
+    #[tokio::test(start_paused = true)]
+    async fn stale_feed_hint_costs_one_read_not_every_read() {
+        use crate::mantaray::{lookup_path, lookup_path_with_hints};
+
+        let secret: [u8; 32] = [34u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/stale-once");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let indices: Vec<u64> = (0..=40).collect();
+        let (fetcher, root, by_ref) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
+        let slow = ProbeCountingFetcher::new(&fetcher, &feed, 6_000, Duration::from_secs(10));
+        let timed = |hints: Option<FeedHints>| {
+            let slow = &slow;
+            let by_ref = &by_ref;
+            async move {
+                let started = tokio::time::Instant::now();
+                let r = match &hints {
+                    Some(h) => lookup_path_with_hints(slow, &root, "feed.txt", h).await,
+                    None => lookup_path(slow, &root, "feed.txt").await,
+                };
+                assert_eq!(bzz_outcome(r, by_ref), Ok(40));
+                slow.take();
+                started.elapsed()
+            }
+        };
+        let unhinted = timed(None).await;
+
+        let stale = FeedHints::new();
+        stale.record(&owner, &topic, 5_000);
+        let first = timed(Some(stale.clone())).await;
+        assert!(
+            first >= unhinted + Duration::from_secs(10),
+            "the first read pays the stale anchor: {first:?} vs unhinted {unhinted:?}"
+        );
+        assert_eq!(stale.get(&owner, &topic), 40);
+        for read in 1..=2 {
+            let t = timed(Some(stale.clone())).await;
+            assert!(
+                t <= unhinted,
+                "read {read} after the stale hint should not pay it again: \
+                 {t:?} vs unhinted {unhinted:?}"
+            );
+        }
+    }
+
+    /// R1-M1 on PR #160: on a starved pool both the hinted anchor and
+    /// the fallback's index 0 fail transiently. The hint is dropped
+    /// with the failure, so the caller's retry attempt walks once from
+    /// 0 instead of paying the hinted anchor again before it.
+    #[tokio::test(start_paused = true)]
+    async fn transient_hinted_failure_is_not_paid_on_every_retry() {
+        let secret: [u8; 32] = [35u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/starved");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let indices: Vec<u64> = (0..=10).collect();
+        let (fetcher, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &indices);
+        let counting = ProbeCountingFetcher::new(&fetcher, &feed, 20, Duration::ZERO);
+        let hints = FeedHints::new();
+        hints.record(&owner, &topic, 7);
+
+        let first = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints)).await;
+        assert!(matches!(first, Err(FeedError::Fetch(_))), "{first:?}");
+        assert_eq!(counting.take(), 2, "hinted anchor 7, then index 0");
+        assert_eq!(hints.get(&owner, &topic), 0, "the failing hint is dropped");
+
+        let retry = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints)).await;
+        assert!(matches!(retry, Err(FeedError::Fetch(_))), "{retry:?}");
+        assert_eq!(counting.take(), 1, "the retry only walks from 0");
+    }
+
+    /// R1-M2 on PR #160: the map is capped, and a concurrently raised
+    /// hint survives the drop of the stale value it replaced.
+    #[test]
+    fn feed_hints_are_capped_and_forget_only_the_stale_value() {
+        let hints = FeedHints::new();
+        let owner = [1u8; 20];
+        for i in 0..(FEED_HINTS_CAP as u64 + 100) {
+            hints.record(&owner, &keccak256(&i.to_be_bytes()), i + 1);
+        }
+        assert_eq!(hints.len(), FEED_HINTS_CAP);
+        // The feed just recorded is always kept.
+        let last = FEED_HINTS_CAP as u64 + 99;
+        assert_eq!(hints.get(&owner, &keccak256(&last.to_be_bytes())), last + 1);
+        // Raising a feed already held never evicts.
+        hints.record(&owner, &keccak256(&last.to_be_bytes()), last + 5);
+        assert_eq!(hints.len(), FEED_HINTS_CAP);
+
+        let topic = [9u8; 32];
+        hints.record(&owner, &topic, 50);
+        hints.record(&owner, &topic, 60); // a concurrent read raised it
+        hints.forget(&owner, &topic, 50);
+        assert_eq!(hints.get(&owner, &topic), 60);
+        hints.forget(&owner, &topic, 60);
+        assert_eq!(hints.get(&owner, &topic), 0);
     }
 }
