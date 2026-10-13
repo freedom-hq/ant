@@ -528,8 +528,9 @@ pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::fr
 /// `totalPaidOut()`, and bee's price oracle (`getPrice()`). Any failed
 /// read is an error, never a zero: the caller keeps what it knew. While
 /// [`withdraw_from_chequebook`] runs on `chequebook` in this process, and
-/// after it confirms until a read shows it, the deposit it reports is
-/// lowered by the amount withdrawn.
+/// for [`LANDED_WITHDRAWAL_TTL`] after it confirms on any read that
+/// doesn't show it, the deposit it reports is lowered by the amount
+/// withdrawn.
 #[cfg(feature = "chain-rpc")]
 pub async fn read_retrieval_funds(
     client: &crate::ChainClient,
@@ -631,9 +632,13 @@ static WITHDRAWING: std::sync::Mutex<std::collections::BTreeMap<[u8; 20], Withdr
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// How long a confirmed withdrawal is still taken off reads that don't
-/// show it yet (see [`Landed`]). Far past any RPC backend's lag; it only
-/// matters when a deposit lands meanwhile and lifts the deposit above
-/// the withdrawal's ceiling, so no read can confirm it was seen.
+/// show it (see [`Landed`]). Far past any RPC backend's lag. One read
+/// that shows it proves nothing about the next: behind a load-balanced
+/// RPC, a backend a block behind can still answer the pre-withdrawal
+/// deposit after a caught-up one answered, so the entry stays the whole
+/// TTL. The cost is a deposit landing meanwhile: it lifts the read above
+/// the withdrawal's ceiling and is under-reported (the safe way) by up
+/// to the amount withdrawn until the entry expires.
 #[cfg(feature = "chain-rpc")]
 const LANDED_WITHDRAWAL_TTL: std::time::Duration = std::time::Duration::from_mins(10);
 
@@ -643,7 +648,8 @@ const LANDED_WITHDRAWAL_TTL: std::time::Duration = std::time::Duration::from_min
 struct Withdrawals {
     /// PLUR being withdrawn right now (see [`WithdrawReservation`]).
     in_flight: u128,
-    /// Confirmed withdrawals, oldest first, not yet seen by a read.
+    /// Confirmed withdrawals, oldest first, younger than
+    /// [`LANDED_WITHDRAWAL_TTL`].
     landed: Vec<Landed>,
 }
 
@@ -651,9 +657,10 @@ struct Withdrawals {
 /// above `ceiling` (the deposit right before it, less `amount`) may come
 /// from a backend that hasn't seen the transaction: the deposit only
 /// drops through withdrawals, so it gets `amount` taken off. A read at
-/// or below `ceiling` shows it, and the entry goes. If a deposit lands
-/// meanwhile, the read stays above `ceiling` and is under-reported (the
-/// safe way) until `expires`.
+/// or below `ceiling` shows it and is left as is, but the entry stays
+/// until `expires`: the next read may come from a backend that is still
+/// behind. If a deposit lands meanwhile, the read stays above `ceiling`
+/// and is under-reported (the safe way) until `expires`.
 #[cfg(feature = "chain-rpc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Landed {
@@ -667,11 +674,14 @@ impl Withdrawals {
     /// `raw` (a chequebook's balance plus `totalPaidOut`, as one read
     /// returned it) less what this process knows has left or is leaving:
     /// every withdrawal in flight, and every landed one `raw` doesn't
-    /// show yet. Drops landed entries `raw` shows, or that expired.
+    /// show. Drops only expired landed entries: one read showing a
+    /// withdrawal doesn't mean the next (maybe from a lagging backend)
+    /// will.
     fn apply(&mut self, raw: u128, now: std::time::Instant) -> u128 {
-        self.landed.retain(|l| now < l.expires && raw > l.ceiling);
+        self.landed.retain(|l| now < l.expires);
         self.landed
             .iter()
+            .filter(|l| raw > l.ceiling)
             .fold(raw.saturating_sub(self.in_flight), |d, l| {
                 d.saturating_sub(l.amount)
             })
@@ -893,10 +903,11 @@ fn withdrawable(funds: &RetrievalFunds, issued: u128, liquid: u128) -> u128 {
 /// counts. Only then is `withdraw` sent. Afterwards the funds are read
 /// back and handed to the node, so its `paying`/`available_plur` follow
 /// at once. On success the reservation becomes a landed withdrawal that
-/// every read keeps taking off until one shows it (see [`Landed`]), so
-/// a lagging or load-balanced RPC answering with the pre-withdrawal
-/// deposit doesn't hand the node xBZZ that has left; on failure it is
-/// released.
+/// every read that doesn't show it keeps taking off for
+/// [`LANDED_WITHDRAWAL_TTL`] (see [`Landed`]), so a lagging or
+/// load-balanced RPC answering with the pre-withdrawal deposit, even
+/// after another backend already showed it, doesn't hand the node xBZZ
+/// that has left; on failure it is released.
 ///
 /// A refusal before the transaction sends nothing and gives the node its
 /// unlowered funds back. The caller holds its wallet tx lock around the
@@ -1690,8 +1701,9 @@ mod tests {
     /// The first reads after the withdrawal come from a backend that
     /// hasn't seen its block and answer the old balance: neither the
     /// re-read handed to the node nor the next watch read gives back the
-    /// 700 that left. A read that shows the withdrawal ends that, and
-    /// later reads are the chain's own figure again.
+    /// 700 that left, nor does a lagging read after a caught-up one
+    /// (a load-balanced RPC). Once the entry expires, reads are the
+    /// chain's own figure again.
     #[cfg(feature = "chain-rpc")]
     #[tokio::test]
     async fn withdraw_survives_a_lagging_backend() {
@@ -1712,17 +1724,24 @@ mod tests {
         let read = || async { read_retrieval_funds(&client, &chain.cb).await.unwrap() };
         // Still lagging: the watch's next read.
         assert_eq!(read().await.deposited_plur, 500);
-        // Caught up: shows the withdrawal, which is then forgotten.
+        // Caught up: shows the withdrawal, taken as is.
         assert_eq!(read().await.deposited_plur, 500);
-        assert!(!withdrawing_map().contains_key(&chain.cb));
-        // A later deposit counts in full.
+        // Another backend, still a block behind, answers next.
+        *chain.lagging_reads.lock().unwrap() = 1;
+        assert_eq!(read().await.deposited_plur, 500, "not the stale 1200");
+        assert_eq!(read().await.deposited_plur, 500);
+        // Once the entry expires, a later deposit counts in full.
+        for w in &mut withdrawing_map().get_mut(&chain.cb).unwrap().landed {
+            w.expires = std::time::Instant::now();
+        }
         *chain.balance.lock().unwrap() += 1000;
         assert_eq!(read().await.deposited_plur, 1500);
+        assert!(!withdrawing_map().contains_key(&chain.cb));
     }
 
     /// [`Withdrawals::apply`]: in-flight amounts always come off; a
-    /// landed one only off reads above its ceiling, until one shows it
-    /// or it expires.
+    /// landed one only off reads above its ceiling, until it expires
+    /// (a read that shows it doesn't end it: the next may lag).
     #[cfg(feature = "chain-rpc")]
     #[test]
     fn landed_withdrawals_come_off_until_seen() {
@@ -1740,8 +1759,10 @@ mod tests {
         assert_eq!(w.apply(1200, now), 1050, "sees neither");
         assert_eq!(w.landed.len(), 2);
         assert_eq!(w.apply(1100, now), 1050, "sees the first");
-        assert_eq!(w.landed, [landed(50, 1050)]);
         assert_eq!(w.apply(1050, now), 1050, "sees both");
+        assert_eq!(w.apply(1200, now), 1050, "a lagging read after both");
+        assert_eq!(w.landed.len(), 2, "kept: the next read may lag");
+        assert_eq!(w.apply(1200, now + LANDED_WITHDRAWAL_TTL), 1200, "expired");
         assert!(w.is_empty());
 
         // A deposit landing meanwhile keeps the read above the ceiling:
