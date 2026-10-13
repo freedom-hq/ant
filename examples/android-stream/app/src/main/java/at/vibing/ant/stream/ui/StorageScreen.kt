@@ -42,6 +42,7 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
     val validity by node.validity.collectAsState()
     val account by node.account.collectAsState()
     val settlement by node.settlement.collectAsState()
+    val credit by node.credit.collectAsState()
     var busy by remember { mutableStateOf<String?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var revealedKey by remember { mutableStateOf<String?>(null) }
@@ -88,6 +89,7 @@ fun StorageScreen(node: AntNode, onGetStarted: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        if (settlement?.enabled == true) CreditCard(credit)
         SectionCard {
             Text("Account", style = MaterialTheme.typography.titleMedium)
             account?.let { a ->

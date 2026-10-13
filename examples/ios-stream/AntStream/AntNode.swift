@@ -46,6 +46,13 @@ final class AntNode: ObservableObject {
     /// Fetched on demand (`refreshSettlementDeposit`) since it reads
     /// chain; `nil` until then.
     @Published private(set) var settlementDeposit: SettlementDeposit?
+    /// The live chequebook view, refreshed every 2 s (`refreshCredit`).
+    @Published private(set) var credit: Credit?
+    private var sessionIssued: Decimal?
+    private var issuedSamples: [(at: Date, plur: Decimal)] = []
+    private var lastSent: [String: Decimal]?
+    private var recentPayments: [Payment] = []
+    private var creditRefreshing = false
     /// Remaining lifetime of the connected plan. Fetched on demand
     /// (`refreshValidity`) since it needs a chain RPC; `nil` until then.
     @Published private(set) var validity: StorageValidity?
@@ -1005,12 +1012,82 @@ final class AntNode: ObservableObject {
                 if tick % 15 == 0, self.channelReference == nil {
                     Task { await self.ensureChannelReference() }
                 }
+                if tick % 2 == 0 {
+                    Task { await self.refreshCredit() }
+                }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
     }
 
     // MARK: - FFI string helper
+
+    // MARK: - Chequebook
+
+    /// Read the chequebook figures (`ant_swap_status`, from memory) and the
+    /// per-peer cheque totals (the gateway's `GET /settlements`, also from
+    /// memory), and publish `credit`. A peer whose total grew since the
+    /// last poll was just paid the difference.
+    func refreshCredit() async {
+        guard let h = handle, !creditRefreshing else { return }
+        creditRefreshing = true
+        defer { creditRefreshing = false }
+        guard let json = try? await Self.string(name: "swap status", { ant_swap_status(h, $0) }),
+              let swap = SwapStatus.parse(json)
+        else { return }
+        let now = Date()
+        if let issued = swap.issuedPlur {
+            if sessionIssued == nil { sessionIssued = issued }
+            issuedSamples.append((now, issued))
+            issuedSamples.removeAll { now.timeIntervalSince($0.at) > 60 }
+        }
+        var perMinute: Decimal?
+        if let first = issuedSamples.first, let last = issuedSamples.last {
+            let span = last.at.timeIntervalSince(first.at)
+            if span >= 10 {
+                perMinute = (last.plur - first.plur) * Decimal(60) / Decimal(span)
+            }
+        }
+        if gatewayUp, let sent = await readSettlements() {
+            if let before = lastSent {
+                let paid = sent.compactMap { peer, total -> Payment? in
+                    let delta = total - (before[peer] ?? 0)
+                    return delta > 0 ? Payment(peer: peer, plur: delta, at: now) : nil
+                }
+                if !paid.isEmpty {
+                    recentPayments = Array((paid.sorted { $0.plur > $1.plur } + recentPayments).prefix(8))
+                }
+            }
+            lastSent = sent
+        }
+        let updated = Credit(
+            swap: swap,
+            sessionPlur: swap.issuedPlur.map { $0 - (sessionIssued ?? $0) } ?? 0,
+            perMinutePlur: perMinute,
+            recent: recentPayments
+        )
+        if updated != credit { credit = updated }
+    }
+
+    /// `GET /settlements`: each peer's cheque total sent, PLUR.
+    private func readSettlements() async -> [String: Decimal]? {
+        guard let url = gatewayURL?.appendingPathComponent("settlements") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        var sent: [String: Decimal] = [:]
+        for row in o["settlements"] as? [[String: Any]] ?? [] {
+            guard let peer = row["peer"] as? String,
+                  let total = (row["sent"] as? String).flatMap({ Decimal(string: $0) }),
+                  total > 0
+            else { continue }
+            sent[peer] = total
+        }
+        return sent
+    }
 
     /// Run an FFI call that returns an owned C string + writes an error
     /// string into its `out_err` slot. Frees both. Hops onto a detached

@@ -18,6 +18,7 @@
 		BA00000000000000000000012 /* AccountKeystore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000014 /* AccountKeystore.swift */; };
 		BA00000000000000000000013 /* BenchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000015 /* BenchView.swift */; };
 		BA00000000000000000000014 /* LiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000016 /* LiveView.swift */; };
+		BA000000000000000000000C1 /* CreditCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000000000000000000000C1 /* CreditCard.swift */; };
 		BA00000000000000000000017 /* WatchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000019 /* WatchView.swift */; };
 		BA00000000000000000000015 /* LiveBroadcast.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000017 /* LiveBroadcast.swift */; };
 		BA00000000000000000000016 /* CaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA00000000000000000000018 /* CaptureEngine.swift */; };
@@ -39,6 +40,7 @@
 		FA00000000000000000000014 /* AccountKeystore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountKeystore.swift; sourceTree = "<group>"; };
 		FA00000000000000000000015 /* BenchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchView.swift; sourceTree = "<group>"; };
 		FA00000000000000000000016 /* LiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveView.swift; sourceTree = "<group>"; };
+		FA000000000000000000000C1 /* CreditCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreditCard.swift; sourceTree = "<group>"; };
 		FA00000000000000000000019 /* WatchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchView.swift; sourceTree = "<group>"; };
 		FA00000000000000000000017 /* LiveBroadcast.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveBroadcast.swift; sourceTree = "<group>"; };
 		FA00000000000000000000018 /* CaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureEngine.swift; sourceTree = "<group>"; };
@@ -88,6 +90,7 @@
 				FA00000000000000000000013 /* GetStartedView.swift */,
 				FA00000000000000000000015 /* BenchView.swift */,
 				FA00000000000000000000016 /* LiveView.swift */,
+				FA000000000000000000000C1 /* CreditCard.swift */,
 				FA00000000000000000000019 /* WatchView.swift */,
 				FA00000000000000000000017 /* LiveBroadcast.swift */,
 				FA00000000000000000000018 /* CaptureEngine.swift */,
@@ -211,6 +214,7 @@
 				BA00000000000000000000011 /* GetStartedView.swift in Sources */,
 				BA00000000000000000000013 /* BenchView.swift in Sources */,
 				BA00000000000000000000014 /* LiveView.swift in Sources */,
+				BA000000000000000000000C1 /* CreditCard.swift in Sources */,
 				BA00000000000000000000017 /* WatchView.swift in Sources */,
 				BA00000000000000000000015 /* LiveBroadcast.swift in Sources */,
 				BA00000000000000000000016 /* CaptureEngine.swift in Sources */,

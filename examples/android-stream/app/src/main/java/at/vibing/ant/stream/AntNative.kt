@@ -30,6 +30,7 @@ object AntNative {
     @JvmStatic external fun nativeAccountExportKey(handle: Long): String
     @JvmStatic external fun nativeStorageStatus(handle: Long): String
     @JvmStatic external fun nativeSettlementStatus(handle: Long): String
+    @JvmStatic external fun nativeSwapStatus(handle: Long): String
     @JvmStatic external fun nativeStorageDiscover(handle: Long, rpc: String): String
     @JvmStatic external fun nativeStorageValidity(handle: Long, rpc: String): String
     @JvmStatic external fun nativeSettlementDeposit(handle: Long, rpc: String): String

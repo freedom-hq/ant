@@ -1,5 +1,6 @@
 package at.vibing.ant.stream
 
+import java.math.BigInteger
 import org.json.JSONObject
 
 // JSON documents returned by the FFI, mirroring
@@ -39,6 +40,63 @@ data class SettlementInfo(val enabled: Boolean, val chequebook: String?) {
             SettlementInfo(o.optBoolean("enabled"), o.optString("chequebook").ifEmpty { null })
         }.getOrNull()
     }
+}
+
+/**
+ * `ant_swap_status`: whether the node pays peers with cheques right now
+ * (otherwise the slower free tier), and the chequebook's figures in PLUR:
+ * the deposit as last read from the chain, every cheque issued from it,
+ * and what it can still pay out. Answered from memory, so it can be
+ * polled every couple of seconds.
+ */
+data class SwapStatus(
+    val paying: Boolean,
+    val swapEnabled: Boolean,
+    val chequebook: String?,
+    val depositedPlur: BigInteger?,
+    val issuedPlur: BigInteger?,
+    val availablePlur: BigInteger?,
+) {
+    companion object {
+        fun parse(json: String): SwapStatus? = runCatching {
+            val o = JSONObject(json)
+            fun plur(key: String) = if (o.isNull(key)) null else o.optString(key).toBigIntegerOrNull()
+            SwapStatus(
+                paying = o.optBoolean("paying"),
+                swapEnabled = o.optBoolean("swap_enabled", true),
+                chequebook = if (o.isNull("chequebook")) null else o.optString("chequebook").ifEmpty { null },
+                depositedPlur = plur("deposited_plur"),
+                issuedPlur = plur("issued_plur"),
+                availablePlur = plur("available_plur"),
+            )
+        }.getOrNull()
+    }
+}
+
+/** One cheque payment to a peer, as seen between two polls. */
+data class Payment(val peer: String, val plur: BigInteger, val atMillis: Long)
+
+/**
+ * The live chequebook view: [swap], plus what this app run has seen paid
+ * ([sessionPlur]), the pace over the last minute ([perMinutePlur], null
+ * until there is enough to measure) and the latest payments.
+ */
+data class Credit(
+    val swap: SwapStatus,
+    val sessionPlur: BigInteger,
+    val perMinutePlur: BigInteger?,
+    val recent: List<Payment>,
+)
+
+private val PLUR_PER_BZZ = BigInteger.TEN.pow(16)
+
+/** PLUR as xBZZ with 6 decimals, rounded down; "< 0.000001" for dust. */
+fun formatBzz(plur: BigInteger): String {
+    if (plur.signum() <= 0) return "0 xBZZ"
+    val micro = plur.multiply(BigInteger.valueOf(1_000_000)).divide(PLUR_PER_BZZ)
+    if (micro.signum() == 0) return "< 0.000001 xBZZ"
+    val s = micro.toString().padStart(7, '0')
+    return "${s.dropLast(6)}.${s.takeLast(6)} xBZZ"
 }
 
 data class StorageValidity(val enabled: Boolean, val remainingSeconds: Long, val expiresUnix: Long) {

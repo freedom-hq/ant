@@ -6,6 +6,9 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
 import java.io.File
+import java.math.BigInteger
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -53,6 +56,14 @@ class AntNode(private val context: Context) {
     val plan: StateFlow<StoragePlan?> = _plan.asStateFlow()
     private val _account = MutableStateFlow<AccountInfo?>(null)
     val account: StateFlow<AccountInfo?> = _account.asStateFlow()
+    private val _credit = MutableStateFlow<Credit?>(null)
+
+    /** The live chequebook view, refreshed every 2 s ([refreshCredit]). */
+    val credit: StateFlow<Credit?> = _credit.asStateFlow()
+    private var sessionIssued: BigInteger? = null
+    private val issuedSamples = ArrayDeque<Pair<Long, BigInteger>>()
+    private var lastSent: Map<String, BigInteger>? = null
+    private var recentPayments = emptyList<Payment>()
     private val _settlement = MutableStateFlow<SettlementInfo?>(null)
     val settlement: StateFlow<SettlementInfo?> = _settlement.asStateFlow()
     private val _validity = MutableStateFlow<StorageValidity?>(null)
@@ -226,6 +237,7 @@ class AntNode(private val context: Context) {
                 _peerCount.value = if (h == 0L) 0 else handleLock.read {
                     if (handle == 0L) 0 else AntNative.nativePeerCount(handle).coerceAtLeast(0)
                 }
+                if (tick % 2 == 0) runCatching { refreshCredit() }
                 delay(1_000)
             }
         }
@@ -318,6 +330,72 @@ class AntNode(private val context: Context) {
             }
         runCatching { withHandle { AntNative.nativeSettlementStatus(it) } }
             .getOrNull()?.let { SettlementInfo.parse(it) }?.let { _settlement.value = it }
+    }
+
+    // -- chequebook ----------------------------------------------------------
+
+    /**
+     * Read the chequebook figures (`ant_swap_status`, from memory) and the
+     * per-peer cheque totals (the gateway's `GET /settlements`, also from
+     * memory), and publish [credit]. A peer whose total grew since the
+     * last poll was just paid the difference.
+     */
+    private fun refreshCredit() {
+        val swap = handleLock.read {
+            if (handle == 0L) null else AntNative.nativeSwapStatus(handle)
+        }?.let { SwapStatus.parse(it) } ?: return
+        val now = System.currentTimeMillis()
+        val issued = swap.issuedPlur
+        if (issued != null) {
+            if (sessionIssued == null) sessionIssued = issued
+            issuedSamples.addLast(now to issued)
+            while (issuedSamples.isNotEmpty() && now - issuedSamples.first().first > 60_000) issuedSamples.removeFirst()
+        }
+        val perMinute = issuedSamples.takeIf { it.size >= 2 }?.let { s ->
+            val span = s.last().first - s.first().first
+            if (span < 10_000) null
+            else s.last().second.subtract(s.first().second)
+                .multiply(BigInteger.valueOf(60_000)).divide(BigInteger.valueOf(span))
+        }
+        if (_gatewayUp.value) readSettlements()?.let { sent ->
+            val before = lastSent
+            if (before != null) {
+                val paid = sent.mapNotNull { (peer, total) ->
+                    val delta = total.subtract(before[peer] ?: BigInteger.ZERO)
+                    if (delta.signum() > 0) Payment(peer, delta, now) else null
+                }
+                if (paid.isNotEmpty()) recentPayments = (paid.sortedByDescending { it.plur } + recentPayments).take(8)
+            }
+            lastSent = sent
+        }
+        _credit.value = Credit(
+            swap = swap,
+            sessionPlur = issued?.subtract(sessionIssued ?: issued) ?: BigInteger.ZERO,
+            perMinutePlur = perMinute,
+            recent = recentPayments,
+        )
+    }
+
+    /** `GET /settlements`: each peer's cheque total sent, PLUR. */
+    private fun readSettlements(): Map<String, BigInteger>? {
+        val body = runCatching {
+            val conn = URL("$gatewayUrl/settlements").openConnection() as HttpURLConnection
+            conn.connectTimeout = 1_500
+            conn.readTimeout = 1_500
+            try {
+                if (conn.responseCode == 200) conn.inputStream.bufferedReader().readText() else null
+            } finally {
+                conn.disconnect()
+            }
+        }.getOrNull() ?: return null
+        val rows = runCatching { JSONObject(body).optJSONArray("settlements") }.getOrNull() ?: return emptyMap()
+        val sent = HashMap<String, BigInteger>()
+        for (i in 0 until rows.length()) {
+            val r = rows.optJSONObject(i) ?: continue
+            val total = r.optString("sent").toBigIntegerOrNull() ?: continue
+            if (total.signum() > 0) sent[r.optString("peer")] = total
+        }
+        return sent
     }
 
     // -- channel -----------------------------------------------------------

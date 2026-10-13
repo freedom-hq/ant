@@ -211,6 +211,14 @@ struct LiveView: View {
                 metric("UPLOAD p95", "\(progress.publishMsP95) ms")
                 metric("SENT", formatBytes(progress.bytesPublished))
             }
+            if let summary = creditSummary(node.credit) {
+                HStack(spacing: 18) {
+                    metric("CREDIT", summary, tint: node.credit?.swap.paying == true ? nil : .orange)
+                    if let paid = node.credit?.sessionPlur, node.credit?.swap.issuedPlur != nil {
+                        metric("PAID", formatBzz(paid))
+                    }
+                }
+            }
             if let ref = liveReference(progress) {
                 channelLinkRow(ref)
             }
