@@ -18,7 +18,9 @@
 //!    measured) or `POST /bytes` (`"solar-punk"`, the same content
 //!    chunks without the manifest on top).
 //! 2. Rebuild the HLS media playlist over a sliding window of the most
-//!    recent segments. `"bzz"` lists segments and the `#EXT-X-MAP` as
+//!    recent segments that fit in one chunk ([`LIVE_WINDOW_MAX_BYTES`],
+//!    4096 bytes, issue #171), so each update is a single chunk read for
+//!    a viewer. `"bzz"` lists segments and the `#EXT-X-MAP` as
 //!    gateway-root paths (`/bzz/<ref>/seg-N.m4s`); `"solar-punk"` lists
 //!    their **bare 64-hex reference**, as Solar Punk's uploader does, and
 //!    a viewer resolves each against `/bytes/` on whichever gateway it
@@ -168,11 +170,27 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 4;
 /// still want.
 pub const DEFAULT_MAX_BACKLOG: usize = 4;
 
-/// Segments listed in the rolling media playlist. Apple recommends a
-/// live playlist hold at least 3 target durations; 6 × 2 s = 12 s gives
-/// a joining viewer a little more to buffer without making the playlist
-/// (which is republished per segment) meaningfully bigger.
-pub const DEFAULT_PLAYLIST_WINDOW: usize = 6;
+/// Most bytes a live playlist may take: one Swarm chunk (issue #171).
+///
+/// Under [`StreamFormat::SolarPunk`] the feed update wraps the
+/// playlist's root chunk, so a playlist that fits in one chunk *is* the
+/// SOC payload and a viewer's poll (`GET /soc` or `GET /feeds`) is a
+/// single chunk read. One byte over and the update wraps the root of a
+/// chunk tree instead, and every poll pays for the leaves as well. Under
+/// [`StreamFormat::Bzz`] it keeps the playlist file a single chunk
+/// behind its manifest. Solar Punk's uploader budgets its live window
+/// against the same figure (`LIVE_WINDOW_MAX_BYTES`).
+pub const LIVE_WINDOW_MAX_BYTES: usize = CHUNK_SIZE as usize;
+
+/// Upper bound on the segments listed in the rolling media playlist.
+/// The window is sized by bytes ([`LIVE_WINDOW_MAX_BYTES`]): it holds
+/// the newest segments that fit in one chunk, which at the default 2 s
+/// segments is about 40 (`"bzz"` paths) to 48 (bare references), 80 to
+/// 96 s a joining or slow viewer can buffer from with no extra request.
+/// This cap is set above both so the byte budget is what binds; a host
+/// can still lower it. Apple recommends a live playlist hold at least 3
+/// target durations.
+pub const DEFAULT_PLAYLIST_WINDOW: usize = 64;
 
 /// One live broadcast. Deserialised straight from the host's JSON so the
 /// Swift app configures the same knobs the tests do.
@@ -234,6 +252,9 @@ pub struct PublisherConfig {
     pub max_in_flight: usize,
     #[serde(default = "default_max_backlog")]
     pub max_backlog: usize,
+    /// Most segments the live playlist lists. An upper bound, not the
+    /// size: the playlist holds the newest segments that fit in
+    /// [`LIVE_WINDOW_MAX_BYTES`], and at most this many of them.
     #[serde(default = "default_playlist_window")]
     pub playlist_window: usize,
     /// Free-form host context (device, network, rendition) echoed in the
@@ -655,7 +676,13 @@ impl PublisherState {
     /// into the playlist. Returns the newest committed media segment's
     /// capture instant when the playlist changed (that segment's lag is
     /// only known once the feed update lands), `None` when it didn't.
-    fn advance(&mut self, window: usize) -> Option<Instant> {
+    ///
+    /// The playlist keeps the newest segments that fit, rendered, in
+    /// [`LIVE_WINDOW_MAX_BYTES`], and at most `window` of them.
+    /// `target_ms` is the configured segment duration
+    /// [`PublisherState::render_playlist`] is called with, since it
+    /// shapes the header the budget is measured on.
+    fn advance(&mut self, window: usize, target_ms: u32) -> Option<Instant> {
         let mut newest: Option<Instant> = None;
         while let Some(outcome) = self.done.remove(&self.next_commit) {
             self.next_commit += 1;
@@ -717,7 +744,9 @@ impl PublisherState {
                     // `note_lag` — because a segment nobody can resolve
                     // yet is not the live edge.
                     self.live_edge.get_or_insert(captured_at);
-                    while self.playlist.len() > window {
+                    while self.playlist.len() > window
+                        || (self.playlist.len() > 1 && self.over_budget(target_ms))
+                    {
                         if let Some(evicted) = self.playlist.pop_front() {
                             if evicted.discontinuity {
                                 self.discontinuity_sequence += 1;
@@ -729,6 +758,18 @@ impl PublisherState {
             }
         }
         newest
+    }
+
+    /// The playlist, as it would render now, is past
+    /// [`LIVE_WINDOW_MAX_BYTES`]. Measured on the real rendering, so
+    /// everything a segment brings with it counts (its `#EXTINF` and URI,
+    /// a `#EXT-X-DISCONTINUITY` for a gap or restart in front of it, a
+    /// fresh `#EXT-X-MAP`), as do header values that move with the
+    /// window (`#EXT-X-MEDIA-SEQUENCE`, `#EXT-X-DISCONTINUITY-SEQUENCE`).
+    /// Measured *with* `#EXT-X-ENDLIST`, so the closing playlist, which
+    /// is this same window plus that line, fits too.
+    fn over_budget(&self, target_ms: u32) -> bool {
+        self.render_playlist(target_ms, true).len() > LIVE_WINDOW_MAX_BYTES
     }
 
     /// Render the current playlist. `endlist` closes the broadcast.
@@ -1450,7 +1491,7 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
 
         let newest = {
             let mut state = lock(&ctx.state);
-            state.advance(ctx.config.playlist_window)
+            state.advance(ctx.config.playlist_window, ctx.config.segment_ms)
         };
         if let Some(captured_at) = newest {
             publish_playlist(&ctx, false, Some(captured_at)).await;
@@ -1546,9 +1587,13 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
 /// - [`StreamFormat::SolarPunk`]: `POST /bytes` the playlist and wrap its
 ///   own root chunk, a **v2** update (bee-js `FeedWriter.uploadPayload`,
 ///   what Solar Punk's uploader publishes). The SOC payload *is* the
-///   playlist (up to 4096 bytes; past that the root of its chunk tree),
-///   and both `GET /soc/{owner}/{id}` and `GET /feeds/{owner}/{topic}`
-///   answer with the playlist text, on bee and on ant. (Readers tell a v1
+///   playlist: the live window is budgeted to fit in one chunk
+///   ([`LIVE_WINDOW_MAX_BYTES`]), so a viewer's poll is a single chunk
+///   read. (Only a lone segment whose own lines are past the budget,
+///   which no real reference is, would make it the root of a chunk tree
+///   instead: still readable, at the cost of extra reads.) Both
+///   `GET /soc/{owner}/{id}` and `GET /feeds/{owner}/{topic}` answer
+///   with the playlist text, on bee and on ant. (Readers tell a v1
 ///   update by its 40- or 72-byte payload; the playlist's fixed header
 ///   lines alone are longer, so it is never mistaken for one.)
 async fn upload_playlist(
@@ -2010,7 +2055,7 @@ mod tests {
         // playlist must not.
         state.done.insert(2, media("/bzz/cc/seg-2.m4s", false));
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
-        assert!(state.advance(3).is_some());
+        assert!(state.advance(3, 2000).is_some());
 
         let playlist = state.render_playlist(2000, false);
         assert!(
@@ -2038,7 +2083,7 @@ mod tests {
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
         state.done.insert(2, Committed::Dropped);
         state.done.insert(3, media("/bzz/dd/seg-3.m4s", false));
-        assert!(state.advance(5).is_some());
+        assert!(state.advance(5, 2000).is_some());
 
         let playlist = state.render_playlist(2000, false);
         assert_eq!(
@@ -2074,7 +2119,7 @@ mod tests {
             },
         );
         state.done.insert(3, media("/bzz/dd/seg-3.m4s", true));
-        assert!(state.advance(5).is_some());
+        assert!(state.advance(5, 2000).is_some());
 
         let playlist = state.render_playlist(2000, false);
         assert_eq!(playlist.matches("#EXT-X-MAP").count(), 2, "{playlist}");
@@ -2108,7 +2153,7 @@ mod tests {
         state.done.insert(6, media("/bzz/b6/seg-6.m4s", false));
         // Window of 2: the first two listed segments (including the one
         // carrying the discontinuity) fall out.
-        assert!(state.advance(2).is_some());
+        assert!(state.advance(2, 2000).is_some());
 
         let playlist = state.render_playlist(2000, false);
         assert!(!playlist.contains("/bzz/b1/seg-1.m4s"), "{playlist}");
@@ -2148,7 +2193,7 @@ mod tests {
                 captured_at: Instant::now(),
             },
         );
-        state.advance(2);
+        state.advance(2, 2000);
         assert!(
             state
                 .render_playlist(2000, false)
@@ -2159,7 +2204,7 @@ mod tests {
         // window; the tag must stay ratcheted rather than dropping back.
         state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
         state.done.insert(4, media("/bzz/b4/seg-4.m4s", false));
-        state.advance(2);
+        state.advance(2, 2000);
         let playlist = state.render_playlist(2000, false);
         assert!(!playlist.contains("seg-2.m4s"), "{playlist}");
         assert!(playlist.contains("#EXT-X-TARGETDURATION:4\n"), "{playlist}");
@@ -2172,7 +2217,7 @@ mod tests {
         let mut state = PublisherState::default();
         state.done.insert(0, Committed::Failed(SegmentKind::Init));
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
-        assert!(state.advance(3).is_none());
+        assert!(state.advance(3, 2000).is_none());
         assert!(state.playlist.is_empty());
     }
 
@@ -2186,10 +2231,200 @@ mod tests {
             },
         );
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
-        state.advance(3);
+        state.advance(3, 2000);
         assert!(state
             .render_playlist(2000, true)
             .ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    // -----------------------------------------------------------------
+    // Live window sized to one chunk (#171)
+    // -----------------------------------------------------------------
+
+    /// A bare 64-hex reference, the `"solar-punk"` URI shape, distinct
+    /// per `i`.
+    fn bare_ref(i: u64) -> String {
+        hex::encode(ant_crypto::keccak256(&i.to_be_bytes()))
+    }
+
+    /// A state with a broadcast id (the header line every real playlist
+    /// carries) and an initialization segment committed at sequence 0.
+    fn live_state() -> PublisherState {
+        let mut state = PublisherState {
+            broadcast_id: format!("{:x}", 1_760_000_000_000_u64),
+            ..PublisherState::default()
+        };
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: bare_ref(u64::MAX),
+            },
+        );
+        state.next_commit = 0;
+        state
+    }
+
+    /// Commit `count` more media segments (starting at sequence `from`),
+    /// one at a time the way the committer folds them in, and check the
+    /// budget after every one.
+    fn commit_media(state: &mut PublisherState, from: u64, count: u64, window: usize) {
+        for seq in from..from + count {
+            state.done.insert(seq, media(&bare_ref(seq), false));
+            state.advance(window, 2000);
+            for endlist in [false, true] {
+                let body = state.render_playlist(2000, endlist);
+                assert!(
+                    body.len() <= LIVE_WINDOW_MAX_BYTES,
+                    "after seq {seq} the playlist is {} bytes",
+                    body.len(),
+                );
+            }
+        }
+    }
+
+    /// The bytes one more bare-reference segment would add.
+    fn entry_bytes() -> usize {
+        "#EXTINF:2.000,\n".len() + 64 + 1
+    }
+
+    #[test]
+    fn the_live_window_fills_one_chunk_not_a_segment_count() {
+        let mut state = live_state();
+        commit_media(&mut state, 1, 300, DEFAULT_PLAYLIST_WINDOW);
+        let body = state.render_playlist(2000, false);
+        let listed = state.playlist.len();
+        // About 30 segments is what Solar Punk's uploader fits with a
+        // date-time per segment; without one, bare references fit more.
+        assert!(listed >= 30, "only {listed} segments listed:\n{body}");
+        assert!(listed < 300);
+        // Full: one more segment (and room for the closing line) would
+        // not fit.
+        let closing = state.render_playlist(2000, true);
+        assert!(
+            closing.len() + entry_bytes() > LIVE_WINDOW_MAX_BYTES,
+            "{} bytes leaves room for another segment",
+            closing.len(),
+        );
+        // The newest segments, numbered from where the window starts.
+        assert_eq!(state.playlist.back().unwrap().uri, bare_ref(300));
+        assert!(body.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", 300 - listed)));
+        // The map survives the slide: the first listed segment carries it.
+        assert_eq!(body.matches("#EXT-X-MAP").count(), 1, "{body}");
+
+        // What the feed update wraps is the playlist itself, one chunk:
+        // `span ‖ payload` with the text as the whole payload.
+        for text in [body, closing] {
+            let split = ant_retrieval::split_bytes_with_redundancy(
+                text.as_bytes(),
+                PLAYLIST_REDUNDANCY_LEVEL,
+            );
+            let (root, wire) =
+                playlist_root_chunk(text.as_bytes(), &hex::encode(split.root)).unwrap();
+            assert_eq!(root, split.root);
+            assert_eq!(
+                &wire[8..],
+                text.as_bytes(),
+                "the SOC payload is the playlist"
+            );
+            assert_eq!(
+                u64::from_le_bytes(wire[..8].try_into().unwrap()),
+                text.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_window_is_bounded_by_bytes_not_by_its_count() {
+        // The default cap never binds at default settings: that many
+        // bare-reference segments are already past one chunk.
+        assert!(DEFAULT_PLAYLIST_WINDOW * entry_bytes() > LIVE_WINDOW_MAX_BYTES);
+        // …and a host's lower cap still does.
+        let mut state = live_state();
+        commit_media(&mut state, 1, 40, 6);
+        assert_eq!(state.playlist.len(), 6);
+    }
+
+    #[test]
+    fn gap_lines_count_against_the_budget() {
+        // Every other segment dropped: each listed one carries an
+        // `#EXT-X-DISCONTINUITY` line, which has to come out of the same
+        // 4096 bytes.
+        let mut clean = live_state();
+        commit_media(&mut clean, 1, 200, DEFAULT_PLAYLIST_WINDOW);
+
+        let mut gappy = live_state();
+        for seq in 1..=400u64 {
+            let outcome = if seq % 2 == 0 {
+                Committed::Dropped
+            } else {
+                media(&bare_ref(seq), false)
+            };
+            gappy.done.insert(seq, outcome);
+            gappy.advance(DEFAULT_PLAYLIST_WINDOW, 2000);
+            assert!(gappy.render_playlist(2000, true).len() <= LIVE_WINDOW_MAX_BYTES);
+        }
+        let body = gappy.render_playlist(2000, false);
+        assert!(
+            body.matches("#EXT-X-DISCONTINUITY\n").count() > 20,
+            "{body}"
+        );
+        assert!(
+            gappy.playlist.len() < clean.playlist.len(),
+            "gaps cost bytes: {} vs {}",
+            gappy.playlist.len(),
+            clean.playlist.len(),
+        );
+        // The discontinuities that slid out are carried in the header.
+        assert!(gappy.discontinuity_sequence > 0);
+        assert!(body.contains(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+            gappy.discontinuity_sequence
+        )));
+    }
+
+    #[test]
+    fn writer_restarts_count_their_map_lines_against_the_budget() {
+        // A fresh init before every segment: each listed one brings a
+        // discontinuity and its own `#EXT-X-MAP` line.
+        let mut state = live_state();
+        for i in 1..=100u64 {
+            state.done.insert(
+                2 * i - 1,
+                Committed::Init {
+                    uri: bare_ref(1000 + i),
+                },
+            );
+            state.done.insert(2 * i, media(&bare_ref(i), true));
+            state.advance(DEFAULT_PLAYLIST_WINDOW, 2000);
+            assert!(state.render_playlist(2000, true).len() <= LIVE_WINDOW_MAX_BYTES);
+        }
+        let body = state.render_playlist(2000, false);
+        assert_eq!(
+            body.matches("#EXT-X-MAP").count(),
+            state.playlist.len(),
+            "{body}"
+        );
+        assert!(state.playlist.len() >= 3, "{body}");
+    }
+
+    #[test]
+    fn a_segment_too_big_for_the_budget_alone_is_still_listed() {
+        // A playlist naming nothing is worse than one past a chunk: the
+        // newest segment always stays.
+        let mut state = live_state();
+        commit_media(&mut state, 1, 5, DEFAULT_PLAYLIST_WINDOW);
+        state
+            .done
+            .insert(6, media(&"/x".repeat(LIVE_WINDOW_MAX_BYTES), false));
+        state.advance(DEFAULT_PLAYLIST_WINDOW, 2000);
+        assert_eq!(state.playlist.len(), 1);
+        // The next ordinary segment pushes it straight back out.
+        state.done.insert(7, media(&bare_ref(7), false));
+        state.advance(DEFAULT_PLAYLIST_WINDOW, 2000);
+        assert_eq!(state.playlist.len(), 1);
+        assert_eq!(state.playlist[0].uri, bare_ref(7));
+        commit_media(&mut state, 8, 3, DEFAULT_PLAYLIST_WINDOW);
+        assert_eq!(state.playlist.len(), 4);
     }
 
     #[test]
@@ -3092,12 +3327,12 @@ mod tests {
             },
         );
         state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
-        state.advance(6);
+        state.advance(6, 2000);
         assert_eq!(state.segments_listed, 1);
         // Writer restart whose initialization segment fails to upload.
         state.done.insert(2, Committed::Failed(SegmentKind::Init));
         state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
-        state.advance(6);
+        state.advance(6, 2000);
         // Listed count did not move even though the upload succeeded,
         // which is what keeps `kept_up` honest.
         assert_eq!(state.segments_listed, 1);

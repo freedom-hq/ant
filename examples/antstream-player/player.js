@@ -588,9 +588,9 @@
     fLoader: SegmentLoader,
     enableWorker: true,
     lowLatencyMode: false,
-    // The publisher keeps ~6 segments of 2 s in its live playlist: sit four
-    // behind the newest one, which leaves room to buffer through a slow
-    // read. Only a playhead that falls out of the window jumps forward: a
+    // The publisher keeps as many segments as fit in one 4096-byte chunk
+    // in its live playlist (about 40 of 2 s): sit four behind the newest
+    // one, which leaves room to buffer through a slow read. Only a playhead that falls out of the window jumps forward: a
     // jump throws away what is buffered and stalls again.
     liveSyncDurationCount: 4,
     liveMaxLatencyDurationCount: 10,

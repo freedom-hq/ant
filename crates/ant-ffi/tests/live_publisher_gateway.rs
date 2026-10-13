@@ -37,6 +37,8 @@ struct NodeLog {
     /// Every chunk and SOC pushed, by address: the "network" the
     /// gateway's reads are answered from.
     store: HashMap<[u8; 32], Vec<u8>>,
+    /// Chunk reads served from `store`: what one viewer request costs.
+    reads: usize,
 }
 
 /// A local chunk store over [`NodeLog::store`], so the stub node can run
@@ -46,10 +48,9 @@ struct MemFetcher(Arc<Mutex<NodeLog>>);
 #[async_trait::async_trait]
 impl ant_retrieval::ChunkFetcher for MemFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        self.0
-            .lock()
-            .unwrap()
-            .store
+        let mut log = self.0.lock().unwrap();
+        log.reads += 1;
+        log.store
             .get(&addr)
             .cloned()
             .ok_or_else(|| format!("chunk {} not found", hex::encode(addr)).into())
@@ -493,30 +494,29 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
     }
 }
 
-/// A playlist past one chunk (4096 bytes): the update then wraps the
-/// root of the playlist's chunk tree, as bee-js `uploadPayload` does,
-/// and both reads must still return the whole text, joined.
+/// Issue #171: the live window is sized to one chunk, not a segment
+/// count. A broadcast far longer than fits keeps every feed update a
+/// single chunk (the SOC payload *is* the whole playlist), still lists
+/// as many of the newest segments as fit, and a viewer's poll of the
+/// head slot is one chunk read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_playlist_longer_than_one_chunk_still_reads_back_as_text() {
-    const SEGMENTS: u8 = 60;
+async fn every_live_feed_update_is_a_single_chunk() {
+    const SEGMENTS: u8 = 80;
     let log = Arc::new(Mutex::new(NodeLog::default()));
     let addr = serve_gateway(Arc::clone(&log)).await;
-    let config = PublisherConfig {
-        channel: "integration".into(),
-        topic: String::new(),
-        topic_text: "antstream-integration-long".into(),
-        format: StreamFormat::SolarPunk,
-        gateway: format!("http://{addr}"),
-        batch_id: "ab".repeat(32),
-        segment_ms: 2000,
-        bitrate_kbps: 900,
-        max_in_flight: 4,
+    // The JSON a host sends, `playlist_window` left at its default: the
+    // byte budget, not a segment count, is what sizes the window.
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic_text": "antstream-integration-long",
+        "format": "solar-punk",
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
         // Init + every segment, so none is shed.
-        max_backlog: usize::from(SEGMENTS) + 1,
-        playlist_window: usize::from(SEGMENTS),
-        notes: String::new(),
-        start_index: 0,
-    };
+        "max_backlog": usize::from(SEGMENTS) + 1,
+    }))
+    .unwrap();
+    assert_eq!(config.playlist_window, publisher::DEFAULT_PLAYLIST_WINDOW);
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
         config,
@@ -538,29 +538,88 @@ async fn a_playlist_longer_than_one_chunk_still_reads_back_as_text() {
     }
     assert!(run.is_finished(), "publisher never finished");
     let report = run.report();
+    assert_eq!(report.segments_failed, 0, "{:?}", report.errors);
     assert_eq!(report.segments_listed, u64::from(SEGMENTS), "{report:?}");
     assert!(report.feed_updates > 0, "{report:?}");
 
     let topic = publisher::topic_from_string("antstream-integration-long");
-    let owner_hex = hex::encode(owner());
-    let (status, _, feeds_body) =
-        http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(topic))).await;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&feeds_body));
-    let playlist = String::from_utf8(feeds_body).unwrap();
-    assert!(playlist.len() > 4096, "{} bytes", playlist.len());
-    assert!(playlist.starts_with("#EXTM3U\n"));
-    assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
-    assert_eq!(
-        playlist.matches("#EXTINF").count(),
-        usize::from(SEGMENTS),
-        "{playlist}"
-    );
+    let feed = ant_retrieval::Feed {
+        owner: owner(),
+        topic,
+        kind: ant_retrieval::FeedType::Sequence,
+    };
+    // Every update the node received, at every index: the SOC wraps a
+    // leaf chunk (span = payload length, at most 4096) whose payload is
+    // a whole playlist.
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.invalid_socs, 0);
+        for index in 0..report.feed_updates {
+            let address = ant_retrieval::sequence_update_address(&feed, index);
+            let (_, wire) = log
+                .socs
+                .iter()
+                .find(|(a, _)| *a == address)
+                .unwrap_or_else(|| panic!("feed update {index} never reached the node"));
+            // id(32) ‖ signature(65) ‖ span(8) ‖ payload
+            // The span's top byte carries the redundancy level on an
+            // intermediate chunk; the rest is the length it covers.
+            let mut span = [0u8; 8];
+            span.copy_from_slice(&wire[97..105]);
+            span[7] = 0;
+            let span = u64::from_le_bytes(span);
+            let payload = &wire[105..];
+            assert!(
+                span <= publisher::LIVE_WINDOW_MAX_BYTES as u64,
+                "feed update {index} wraps a {span}-byte tree, not one chunk",
+            );
+            assert_eq!(payload.len() as u64, span, "feed update {index} is a leaf");
+            assert!(payload.starts_with(b"#EXTM3U\n"), "feed update {index}");
+        }
+    }
 
+    // The head, read the way a viewer polls it: one HTTP round trip
+    // answered from one chunk.
+    let owner_hex = hex::encode(owner());
     let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
+    log.lock().unwrap().reads = 0;
     let (status, _, soc_body) =
         http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
-    assert_eq!(status, 200);
-    assert_eq!(String::from_utf8(soc_body).unwrap(), playlist);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&soc_body));
+    assert_eq!(log.lock().unwrap().reads, 1, "GET /soc is one chunk read");
+    let playlist = String::from_utf8(soc_body).unwrap();
+    assert!(
+        playlist.len() <= publisher::LIVE_WINDOW_MAX_BYTES,
+        "{} bytes",
+        playlist.len()
+    );
+    assert!(playlist.starts_with("#EXTM3U\n"));
+    assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+    // Far more than the old 6-segment window, fewer than the broadcast:
+    // the newest segments that fit.
+    let listed = playlist.matches("#EXTINF").count();
+    assert!(
+        (30..usize::from(SEGMENTS)).contains(&listed),
+        "{listed} segments listed:\n{playlist}"
+    );
+    assert!(
+        playlist.contains(&format!(
+            "#EXT-X-MEDIA-SEQUENCE:{}\n",
+            usize::from(SEGMENTS) - listed
+        )),
+        "{playlist}"
+    );
+    // The newest segment is the last one listed, and plays from `/bytes/`.
+    let newest = playlist.lines().rfind(|l| !l.starts_with('#')).unwrap();
+    let (status, _, segment) = http_get(&addr, &format!("/bytes/{newest}")).await;
+    assert_eq!((status, segment), (200, vec![SEGMENTS - 1; 300]));
+
+    // `GET /feeds` finds the same head and answers with the same text.
+    let (status, head, feeds_body) =
+        http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(topic))).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&feeds_body));
+    assert!(head.contains("swarm-feed-resolved-version: v2"), "{head}");
+    assert_eq!(String::from_utf8(feeds_body).unwrap(), playlist);
 }
 
 /// The default format, `"bzz"`: what the Android Watch tab and the web
