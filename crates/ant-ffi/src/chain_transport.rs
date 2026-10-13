@@ -621,6 +621,7 @@ mod tests {
     }
 
     static OWNER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CHAIN_INIT_OWNER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     /// A chain where every batch is gone: `batchOwner` reads the zero
     /// address. Anything else gets a JSON-RPC error.
@@ -628,6 +629,19 @@ mod tests {
         request: *const c_char,
         _ctx: *mut c_void,
     ) -> *mut c_char {
+        unsafe { batch_gone_reply(request, &OWNER_CALLS) }
+    }
+
+    /// [`every_batch_gone_host`] with its own call count, for a test
+    /// that runs alongside the one counting [`OWNER_CALLS`].
+    unsafe extern "C" fn every_batch_gone_host_for_chain_init(
+        request: *const c_char,
+        _ctx: *mut c_void,
+    ) -> *mut c_char {
+        unsafe { batch_gone_reply(request, &CHAIN_INIT_OWNER_CALLS) }
+    }
+
+    unsafe fn batch_gone_reply(request: *const c_char, owner_calls: &AtomicUsize) -> *mut c_char {
         let req: serde_json::Value =
             serde_json::from_str(unsafe { CStr::from_ptr(request) }.to_str().unwrap()).unwrap();
         let data = req["params"][0]["data"].as_str().unwrap_or_default();
@@ -641,7 +655,7 @@ mod tests {
                 .to_string(),
             );
         }
-        OWNER_CALLS.fetch_add(1, Ordering::SeqCst);
+        owner_calls.fetch_add(1, Ordering::SeqCst);
         malloc_cstr(
             &serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
                                 "result": format!("0x{}", "00".repeat(32))})
@@ -723,6 +737,87 @@ mod tests {
         assert_eq!(OWNER_CALLS.load(Ordering::SeqCst), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ant_chain_init` runs the same chain startup work as a gateway
+    /// start with an RPC, with no gateway at all: here, the persisted
+    /// batch check a host without HTTP (Ant Drive) needs after `ant_init`.
+    #[test]
+    fn chain_init_without_a_gateway_runs_the_persisted_batch_check() {
+        let (mut handle, _peers) = handle_for_test();
+        let batch = [0x78; 32];
+        let dir =
+            std::env::temp_dir().join(format!("ant-chain-init-no-gateway-{}", std::process::id()));
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).unwrap();
+        let issuer = ant_postage::StampIssuer::open_or_new(
+            postage.join(format!("{}.bin", hex::encode(batch))),
+            batch,
+            20,
+            16,
+            false,
+        )
+        .unwrap();
+        let upload = std::sync::Arc::new(ant_p2p::UploadRuntime {
+            issuers: std::sync::Mutex::new(std::collections::HashMap::from([(batch, issuer)])),
+            stamp_key: [0u8; 32],
+            batch_owner: [0x0a; 20],
+            postage_dir: postage,
+        });
+        handle.chain_init = std::sync::Arc::new(crate::drive::ChainInit::with_not_found_grace(
+            std::sync::Arc::clone(&upload),
+            std::time::Duration::ZERO,
+        ));
+        let rc = unsafe {
+            ant_set_chain_transport(
+                std::ptr::from_mut(&mut handle),
+                Some(every_batch_gone_host_for_chain_init),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, ANT_CHAIN_TRANSPORT_OK);
+
+        let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::ant_chain_init(std::ptr::from_ref(&handle), rpc.as_ptr(), &raw mut err)
+        };
+        assert!(rc == 0 && err.is_null(), "ant_chain_init should start");
+        assert!(
+            handle.gateway_task.lock().unwrap().is_none(),
+            "ant_chain_init must not start a gateway"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while upload.issuers.lock().unwrap().contains_key(&batch) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ant_chain_init never checked the persisted batch",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(CHAIN_INIT_OWNER_CALLS.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chain_init_rejects_a_missing_rpc() {
+        let (handle, _peers) = handle_for_test();
+        for rpc in [None, Some(CString::new("  ").unwrap())] {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let ptr = rpc.as_ref().map_or(std::ptr::null(), |r| r.as_ptr());
+            let rc =
+                unsafe { crate::ant_chain_init(std::ptr::from_ref(&handle), ptr, &raw mut err) };
+            assert_eq!(rc, -1);
+            assert!(!err.is_null(), "a rejected call explains why");
+            unsafe { crate::ant_free_string(err) };
+        }
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        let rc = unsafe { crate::ant_chain_init(std::ptr::null(), rpc.as_ptr(), &raw mut err) };
+        assert_eq!(rc, -1);
+        unsafe { crate::ant_free_string(err) };
     }
 
     /// `ant_stop_gateway` must bump the rediscovery stop count while it
