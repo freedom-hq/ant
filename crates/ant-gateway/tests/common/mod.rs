@@ -1385,8 +1385,8 @@ async fn stream_via_fetcher(
 ) {
     let is_bzz = path.is_some();
     let result = async {
-        let (data_ref, content_type, filename, mutable) = match path {
-            None => (reference.to_vec(), None, None, false),
+        let (data_ref, content_type, filename, feed) = match path {
+            None => (reference.to_vec(), None, None, None),
             Some(p) => {
                 let lookup = lookup_path(fetcher, reference, &p)
                     .await
@@ -1406,7 +1406,10 @@ async fn stream_via_fetcher(
                     lookup.data_ref,
                     lookup.content_type,
                     filename,
-                    lookup.is_feed,
+                    lookup.feed.map(|f| ant_control::BzzFeed {
+                        index: f.index,
+                        v2: f.v2,
+                    }),
                 )
             }
         };
@@ -1432,7 +1435,7 @@ async fn stream_via_fetcher(
                 reference: data_ref.to_vec(),
                 content_type,
                 filename,
-                mutable,
+                feed,
             }
         } else {
             ControlAck::BytesStreamStart { total_bytes: total }

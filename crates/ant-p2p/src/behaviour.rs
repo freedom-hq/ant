@@ -5818,7 +5818,7 @@ async fn run_stream_bzz(
                 enc_ref,
                 lookup.content_type.clone(),
                 filename,
-                lookup.is_feed,
+                bzz_feed(lookup.feed),
                 max_bytes,
                 range,
                 head_only,
@@ -5890,7 +5890,7 @@ async fn run_stream_bzz(
                 reference: data_ref.to_vec(),
                 content_type: lookup.content_type,
                 filename,
-                mutable: lookup.is_feed,
+                feed: bzz_feed(lookup.feed),
             })
             .await
             .is_err()
@@ -5942,7 +5942,7 @@ async fn stream_encrypted_body(
     enc_ref: [u8; ant_retrieval::ENCRYPTED_REF_SIZE],
     content_type: Option<String>,
     filename: Option<String>,
-    mutable: bool,
+    feed: Option<ant_control::BzzFeed>,
     max_bytes: Option<u64>,
     range: Option<StreamRange>,
     head_only: bool,
@@ -5989,7 +5989,7 @@ async fn stream_encrypted_body(
             reference: enc_ref.to_vec(),
             content_type,
             filename,
-            mutable,
+            feed,
         })
         .await
         .is_err()
@@ -7760,7 +7760,16 @@ fn raw_bytes_lookup(reference: &[u8], path: &str) -> Option<ant_retrieval::Looku
         data_ref: reference.to_vec(),
         content_type: None,
         metadata: HashMap::new(),
-        is_feed: false,
+        feed: None,
+    })
+}
+
+/// The feed update a `/bzz` lookup resolved through, in the shape
+/// [`ControlAck::BzzStreamStart`] carries to the gateway (#161).
+fn bzz_feed(feed: Option<ant_retrieval::ResolvedFeed>) -> Option<ant_control::BzzFeed> {
+    feed.map(|f| ant_control::BzzFeed {
+        index: f.index,
+        v2: f.v2,
     })
 }
 
@@ -12333,7 +12342,7 @@ mod tests {
             assert_eq!(lookup.data_ref, reference);
             assert_eq!(lookup.content_type, None);
             assert!(lookup.metadata.is_empty());
-            assert!(!lookup.is_feed);
+            assert!(!lookup.is_feed());
         }
         // Encrypted `address ‖ key` references pass through whole.
         let encrypted = vec![0xcd; 64];

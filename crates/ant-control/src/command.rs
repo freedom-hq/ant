@@ -693,6 +693,19 @@ pub struct StreamRange {
     pub end_inclusive: u64,
 }
 
+/// The feed update a `/bzz` feed manifest resolved to, carried on
+/// [`ControlAck::BzzStreamStart`]. Mirrors
+/// `ant_retrieval::ResolvedFeed`, kept local for the same reason as
+/// [`StreamRange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BzzFeed {
+    /// Sequence index of the resolved update.
+    pub index: u64,
+    /// `true` for a v2 update (the SOC wraps the content root), `false`
+    /// for v1 (`ts ‖ ref`).
+    pub v2: bool,
+}
+
 /// The transport a lurker message was decoded from (house style: typed,
 /// not stringly — the wire form stays `"gsoc"`/`"pss"` via serde).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -744,12 +757,15 @@ pub enum ControlAck {
         reference: Vec<u8>,
         content_type: Option<String>,
         filename: Option<String>,
-        /// `true` when the resolved reference was a **feed manifest**, so
-        /// the content is mutable at the (stable) bzz URL and the gateway
-        /// must serve it with `Cache-Control: no-cache` instead of the
-        /// immutable cache normal content-addressed bzz responses get.
-        /// Defaults to `false` for static manifests.
-        mutable: bool,
+        /// `Some` when the resolved reference was a **feed manifest**,
+        /// carrying the feed update it resolved to. The content is then
+        /// mutable at the (stable) bzz URL, so the gateway serves it with
+        /// `Cache-Control: no-cache` instead of the immutable cache
+        /// normal content-addressed bzz responses get, and reports the
+        /// update in bee's `swarm-feed-index` /
+        /// `swarm-feed-resolved-version` headers. `None` for static
+        /// manifests.
+        feed: Option<BzzFeed>,
     },
     BytesChunk {
         data: Vec<u8>,

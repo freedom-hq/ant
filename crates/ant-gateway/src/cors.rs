@@ -394,8 +394,40 @@ fn decorate_actual(resp: &mut Response, allow_origin: Option<&str>) {
     if let Ok(v) = HeaderValue::from_str(origin) {
         h.insert(ACA_ORIGIN, v);
     }
-    h.insert(ACA_EXPOSE, HeaderValue::from_static(EXPOSE_HEADERS));
+    merge_expose_headers(h);
     append_vary_origin(h);
+}
+
+/// Set `Access-Control-Expose-Headers` to [`EXPOSE_HEADERS`] plus any
+/// name a handler already exposed that the list lacks (e.g. `/bzz`'s
+/// `Swarm-Feed-Index` on a feed manifest, #161), so a handler's entry
+/// is merged rather than overwritten.
+fn merge_expose_headers(h: &mut axum::http::HeaderMap) {
+    let listed = |name: &str| {
+        EXPOSE_HEADERS
+            .split(',')
+            .any(|n| n.trim().eq_ignore_ascii_case(name))
+    };
+    let mut extra: Vec<String> = Vec::new();
+    for name in h
+        .get_all(&ACA_EXPOSE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+    {
+        if !name.is_empty() && !listed(name) && !extra.iter().any(|e| e.eq_ignore_ascii_case(name))
+        {
+            extra.push(name.to_string());
+        }
+    }
+    let value = if extra.is_empty() {
+        HeaderValue::from_static(EXPOSE_HEADERS)
+    } else {
+        HeaderValue::from_str(&format!("{EXPOSE_HEADERS}, {}", extra.join(", ")))
+            .unwrap_or(HeaderValue::from_static(EXPOSE_HEADERS))
+    };
+    h.insert(ACA_EXPOSE, value);
 }
 
 /// Add `Origin` to the `Vary` header without clobbering an existing
@@ -417,6 +449,23 @@ fn append_vary_origin(h: &mut axum::http::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handler's own expose entries survive the middleware: names the
+    /// static list already covers aren't repeated, others are appended.
+    #[test]
+    fn expose_headers_merge_with_handler_entries() {
+        let mut h = axum::http::HeaderMap::new();
+        merge_expose_headers(&mut h);
+        assert_eq!(h.get(&ACA_EXPOSE).unwrap(), EXPOSE_HEADERS);
+
+        let mut h = axum::http::HeaderMap::new();
+        h.append(&ACA_EXPOSE, HeaderValue::from_static("Swarm-Feed-Index"));
+        h.append(&ACA_EXPOSE, HeaderValue::from_static("X-Extra, swarm-tag"));
+        merge_expose_headers(&mut h);
+        let values: Vec<_> = h.get_all(&ACA_EXPOSE).iter().collect();
+        assert_eq!(values.len(), 1, "one merged value: {values:?}");
+        assert_eq!(values[0], format!("{EXPOSE_HEADERS}, X-Extra").as_str());
+    }
 
     #[test]
     fn disabled_when_empty() {
