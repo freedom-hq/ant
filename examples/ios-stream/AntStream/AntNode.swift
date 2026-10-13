@@ -1155,7 +1155,7 @@ struct Channel: Equatable {
     /// The AntStream web player's Swarm reference
     /// (`examples/antstream-player`). Keep in step with the Android
     /// app's `Channel.PLAYER_REF`.
-    static let playerReference = "664f9718d0aab34ef463c83e52884eb29fd532cab008eacfcf93241ed7f379fe"
+    static let playerReference = "d36e69f559acbed1bbada8690f3231741bb8975fa7e9e764c43a27d095a088e2"
 
     /// What "Share" sends: the channel in the web player, for Freedom and
     /// any browser. Same text as the Android app's `Channel.watchLinks`.
