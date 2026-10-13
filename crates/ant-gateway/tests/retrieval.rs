@@ -3124,3 +3124,58 @@ async fn bzz_plain_manifest_sends_no_feed_headers() {
         assert_eq!(body_bytes(resp).await, body, "{uri}");
     }
 }
+
+/// A single-range `/bzz` read is served by a second, ranged dispatch
+/// that re-resolves the feed. If the feed advances between the two
+/// dispatches, the 206's feed headers and `ETag` must describe the
+/// update whose bytes are in the body (the ranged dispatch), not the
+/// one the size-probing first dispatch saw.
+#[tokio::test]
+async fn bzz_ranged_feed_headers_follow_the_serving_dispatch() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_dispatch = calls.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let calls = calls_for_dispatch.clone();
+        async move {
+            if let ControlCommand::StreamBzz { range, ack, .. } = cmd {
+                // First dispatch sees update 5, the re-dispatch update 6.
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let index = 5 + n;
+                let body: Vec<u8> = format!("version {index:02}").into_bytes();
+                let _ = ack
+                    .send(ControlAck::BzzStreamStart {
+                        total_bytes: body.len() as u64,
+                        reference: vec![u8::try_from(index).unwrap(); 32],
+                        content_type: Some("text/plain".to_string()),
+                        filename: None,
+                        feed: Some(ant_control::BzzFeed { index, v2: false }),
+                    })
+                    .await;
+                let data = match range {
+                    Some(r) => body[r.start as usize..=r.end_inclusive as usize].to_vec(),
+                    None => body,
+                };
+                let _ = ack.send(ControlAck::BytesChunk { data }).await;
+                let _ = ack.send(ControlAck::StreamDone).await;
+            }
+        }
+    });
+
+    let resp = bzz_request(
+        router,
+        Method::GET,
+        &format!("/bzz/{MANIFEST_ROOT}/"),
+        Some("bytes=8-9"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "range must re-dispatch");
+    assert_bzz_feed_headers(&resp, 6, "v1");
+    assert_eq!(
+        resp.headers().get(header::ETAG).unwrap(),
+        format!("\"{}\"", hex::encode([6u8; 32])).as_str(),
+    );
+    assert_eq!(body_bytes(resp).await, b"06");
+}

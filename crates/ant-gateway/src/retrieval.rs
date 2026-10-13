@@ -2922,6 +2922,13 @@ async fn bzz_inner(
         Ok(s) => s,
         Err(e) => return e,
     };
+    // The re-dispatch resolves the manifest (and any feed) again, so a
+    // feed update landing between the two dispatches means the body
+    // below comes from a newer update than `started` saw. Label the
+    // response from the dispatch that actually serves the bytes: its
+    // feed index/version and its resolved reference for the `ETag`.
+    let ranged_ref = ranged.reference.clone();
+    let ranged_feed = ranged.feed;
     let body_len = end - start + 1;
     let mut resp = partial_content_response(
         head_only,
@@ -2933,10 +2940,10 @@ async fn bzz_inner(
         &content_type,
         filename.as_deref(),
     );
-    if let Some(r) = data_ref {
+    if let Some(r) = ranged_ref {
         set_etag(&mut resp, r);
     }
-    if let Some(feed) = feed {
+    if let Some(feed) = ranged_feed {
         apply_bzz_feed_headers(&mut resp, feed);
     }
     resp
