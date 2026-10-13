@@ -3806,6 +3806,7 @@ mod tests {
                     "",
                     &credit,
                     &crate::ReplicaSweeps::new(),
+                    None,
                 )
                 .await;
                 drop(held);
@@ -3894,6 +3895,7 @@ mod tests {
                         path,
                         &credit,
                         &crate::ReplicaSweeps::new(),
+                        None,
                     )
                     .await;
                     drop(held);
@@ -3944,6 +3946,7 @@ mod tests {
                 "",
                 &credit,
                 &crate::ReplicaSweeps::new(),
+                None,
             )
             .await
             .map(|_| ())
