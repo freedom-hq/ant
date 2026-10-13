@@ -839,11 +839,12 @@ pub async fn resolve_sequence_feed_after(
 /// stays present and is a safe anchor for the next walk: a steady poll
 /// costs about one probe round instead of the exponential bracket and
 /// binary search from 0. A successful resolution only ever raises an
-/// entry. A hint whose walk fails (a feed that was reset, e.g. on a
-/// local test chain, a head that became unretrievable, or a transient
-/// anchor miss) is dropped by [`resolve_sequence_feed_hinted`] before it
-/// falls back to the unhinted walk, so the failed anchor fetch is paid
-/// once per stale hint, not on every later read. The map holds at most
+/// entry. A hint whose anchor is definitively absent (a feed that was
+/// reset, e.g. on a local test chain, or a head that became
+/// unretrievable) is dropped by [`resolve_sequence_feed_hinted`] before
+/// it falls back to the unhinted walk, so the failed anchor fetch is
+/// paid once per stale hint, not on every later read. A transient
+/// failure keeps the hint. The map holds at most
 /// [`FEED_HINTS_CAP`] feeds; past that, recording a new feed evicts an
 /// arbitrary one (a lost hint only costs that feed one cold walk).
 #[derive(Clone, Debug, Default)]
@@ -852,7 +853,9 @@ pub struct FeedHints(Arc<Mutex<HashMap<FeedKey, u64>>>);
 /// Most feeds one [`FeedHints`] map remembers. Every `/bzz`
 /// feed-manifest read and `GET /feeds` resolution writes an entry, and a
 /// public gateway's clients can name any number of feeds, so the map is
-/// capped (~60 bytes per entry, ~256 KiB at the cap).
+/// capped. Each entry takes a 64-byte slot (60 bytes of key and value,
+/// padded), and the table keeps its load factor under 7/8, so 4096
+/// entries sit in 8192 buckets: roughly 0.5 MiB at the cap.
 pub const FEED_HINTS_CAP: usize = 4096;
 
 /// `(owner, topic)`: identifies one sequence feed in [`FeedHints`].
@@ -914,15 +917,24 @@ impl FeedHints {
 /// [`resolve_sequence_feed_after`] anchored at the best of `after` and
 /// the node's last resolved index for this feed in `hints`.
 ///
-/// If the hinted walk errors (a transient anchor miss, a hint past a
-/// feed that was reset, or a head that is no longer retrievable) it
-/// drops the hint and retries once from `after`, so a hint can never
-/// fail a read the plain walk would have served. Dropping it first
-/// means the extra failed walk is paid once per stale hint: later reads
-/// (and the caller's own retry attempts, e.g. on a starved pool where
-/// the walk from `after` hits the same transient) walk from `after`
-/// until a success seeds a fresh hint. On success the hint is raised to
-/// the resolved index. `hints = None` is exactly
+/// If the hinted walk errors it retries once from `after`, so a hint
+/// can never fail a read the plain walk would have served. What happens
+/// to the hint depends on why the hinted walk failed:
+///
+/// - [`FeedError::NoUpdates`]: the anchor index is definitively absent
+///   (a hint past a feed that was reset, or a head that is no longer
+///   retrievable). The hint is dropped before the fallback, so the
+///   failed anchor fetch is paid once per stale hint, not on every
+///   later read.
+/// - any other error (a transient anchor miss on a starved pool, a
+///   fetch hiccup while classifying the payload): the hint is kept, as
+///   `GET /feeds` always did, so the next poll still gallops from it
+///   instead of paying a cold walk from 0. If the fallback then
+///   succeeds, the hint is replaced by what it resolved. If it fails
+///   too, the caller's retry pays the hinted anchor and the fallback
+///   again, each bounded by three transient probe retries.
+///
+/// On success the hint is raised to the resolved index. `hints = None` is exactly
 /// [`resolve_sequence_feed_after`].
 pub async fn resolve_sequence_feed_hinted(
     fetcher: &dyn ChunkFetcher,
@@ -938,16 +950,29 @@ pub async fn resolve_sequence_feed_hinted(
     let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
     if let Err(e) = &result {
         if anchor > after {
+            // Only a definitive anchor miss proves the hint stale (a feed
+            // that was reset, a head that became unretrievable). A
+            // transient failure (starved pool, a fetch hiccup) says
+            // nothing about the hint, which stays for the next read.
+            let stale = matches!(e, FeedError::NoUpdates { .. });
             debug!(
                 target: "ant_retrieval::feed",
                 feed_owner = %hex::encode(feed.owner),
                 feed_topic = %hex::encode(feed.topic),
                 hint,
                 after,
-                "hinted feed walk failed ({e}); dropping the hint and retrying without it",
+                stale,
+                "hinted feed walk failed ({e}); retrying without the hint",
             );
-            hints.forget(&feed.owner, &feed.topic, hint);
+            if stale {
+                hints.forget(&feed.owner, &feed.topic, hint);
+            }
             result = resolve_sequence_feed_after(fetcher, feed, after).await;
+            if result.is_ok() && !stale {
+                // The plain walk served what the hinted one couldn't:
+                // replace the hint with what it resolved (below).
+                hints.forget(&feed.owner, &feed.topic, hint);
+            }
         }
     }
     if let Ok(resolution) = &result {
@@ -2455,12 +2480,14 @@ mod tests {
         }
     }
 
-    /// R1-M1 on PR #160: on a starved pool both the hinted anchor and
-    /// the fallback's index 0 fail transiently. The hint is dropped
-    /// with the failure, so the caller's retry attempt walks once from
-    /// 0 instead of paying the hinted anchor again before it.
+    /// R2-M1 on PR #160: a transient failure says nothing about the
+    /// hint, so it is kept (as `GET /feeds` always kept it). On a starved
+    /// pool both the hinted anchor and the fallback's index 0 fail
+    /// transiently and the hint survives; once the pool recovers, the
+    /// next poll gallops from the hint instead of paying a cold walk
+    /// from 0. Only a definitive anchor miss (`NoUpdates`) drops it.
     #[tokio::test(start_paused = true)]
-    async fn transient_hinted_failure_is_not_paid_on_every_retry() {
+    async fn transient_hinted_failure_keeps_the_hint() {
         let secret: [u8; 32] = [35u8; 32];
         let owner = deterministic_eth_address(&secret);
         let topic = keccak256(b"hinted-bzz/starved");
@@ -2469,20 +2496,68 @@ mod tests {
             topic,
             kind: FeedType::Sequence,
         };
-        let indices: Vec<u64> = (0..=10).collect();
-        let (fetcher, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &indices);
-        let counting = ProbeCountingFetcher::new(&fetcher, &feed, 20, Duration::ZERO);
+        let indices: Vec<u64> = (0..=40).collect();
+        let (starved, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &indices);
+        let (healthy, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
         let hints = FeedHints::new();
-        hints.record(&owner, &topic, 7);
+        hints.record(&owner, &topic, 37);
 
+        let counting = ProbeCountingFetcher::new(&starved, &feed, 60, Duration::ZERO);
         let first = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints)).await;
         assert!(matches!(first, Err(FeedError::Fetch(_))), "{first:?}");
-        assert_eq!(counting.take(), 2, "hinted anchor 7, then index 0");
-        assert_eq!(hints.get(&owner, &topic), 0, "the failing hint is dropped");
+        assert_eq!(counting.take(), 2, "hinted anchor 37, then index 0");
+        assert_eq!(
+            hints.get(&owner, &topic),
+            37,
+            "a transient failure keeps the hint"
+        );
 
-        let retry = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints)).await;
-        assert!(matches!(retry, Err(FeedError::Fetch(_))), "{retry:?}");
-        assert_eq!(counting.take(), 1, "the retry only walks from 0");
+        let cold = {
+            let counting = ProbeCountingFetcher::new(&healthy, &feed, 60, Duration::ZERO);
+            let r = resolve_sequence_feed_after(&counting, &feed, 0)
+                .await
+                .unwrap();
+            assert_eq!(r.index, 40);
+            counting.take()
+        };
+        let counting = ProbeCountingFetcher::new(&healthy, &feed, 60, Duration::ZERO);
+        let r = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(r.index, 40);
+        let warm = counting.take();
+        assert!(
+            warm < cold,
+            "the poll after the hiccup gallops from the kept hint: {warm} vs cold {cold}"
+        );
+        assert_eq!(hints.get(&owner, &topic), 40);
+    }
+
+    /// A transient hinted failure whose fallback from `after` succeeds
+    /// replaces the hint with what the fallback resolved, so a hint the
+    /// plain walk outperforms doesn't keep raising the anchor cost.
+    #[tokio::test(start_paused = true)]
+    async fn transient_hinted_failure_with_working_fallback_replaces_the_hint() {
+        let secret: [u8; 32] = [36u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/transient-anchor");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        // Index 500 (the hint) answers only transiently; the feed's
+        // reachable head is 10.
+        let mut indices: Vec<u64> = (0..=10).collect();
+        indices.push(500);
+        let (fetcher, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &[500]);
+        let hints = FeedHints::new();
+        hints.record(&owner, &topic, 500);
+        let r = resolve_sequence_feed_hinted(&fetcher, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(r.index, 10);
+        assert_eq!(hints.get(&owner, &topic), 10);
     }
 
     /// R1-M2 on PR #160: the map is capped, and a concurrently raised

@@ -3927,10 +3927,11 @@ fn handle_control_command(
                 // `after` and the daemon's last-resolved index for this
                 // feed. Append-only sequence feeds can't regress, so a
                 // previously-resolved index is always present; if the
-                // hinted walk still errors (transient, reset feed) the
-                // helper drops the hint and retries once without it
-                // rather than surfacing a hint-induced failure for a feed
-                // that plain resolution could read.
+                // hinted walk still errors the helper retries once
+                // without it rather than surfacing a hint-induced
+                // failure for a feed that plain resolution could read.
+                // Only a definitive anchor miss (a reset feed) drops the
+                // hint; a transient failure keeps it, as before.
                 // The `/bzz` feed-manifest dereference shares the same
                 // map and helper (issue #159).
                 let result = ant_retrieval::resolve_sequence_feed_hinted(
