@@ -3930,8 +3930,9 @@ fn handle_control_command(
                 // hinted walk still errors the helper retries once
                 // without it rather than surfacing a hint-induced
                 // failure for a feed that plain resolution could read.
-                // Only a definitive anchor miss (a reset feed) drops the
-                // hint; a transient failure keeps it, as before.
+                // Only an anchor miss more than a couple of peers agree
+                // on (a reset feed) drops the hint; a transient failure
+                // or one cold peer's "not found" keeps it, as before.
                 // The `/bzz` feed-manifest dereference shares the same
                 // map and helper (issue #159).
                 let result = ant_retrieval::resolve_sequence_feed_hinted(

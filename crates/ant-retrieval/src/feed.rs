@@ -348,7 +348,13 @@ enum ProbeOutcome {
     /// [`PROBE_RETRIES`] retries (at which point we cannot tell it apart
     /// from a genuine gap and must not let it stall the walk — bee's
     /// finder likewise folds any non-delivery into a nil chunk).
-    Absent,
+    ///
+    /// `corroborated` says whether the miss is the network's answer
+    /// ([`anchor_miss_corroborated`]) rather than one or two cold
+    /// peers' "not found". Only the hinted anchor reads it
+    /// ([`resolve_sequence_feed_hinted`]); the walk itself treats every
+    /// miss alike, as bee's finder does.
+    Absent { corroborated: bool },
     /// A transient (non-miss) error that survived every retry. The search
     /// folds this into "absent" for indices *past* a known update, but
     /// the very first probe (index 0) propagates it as
@@ -364,7 +370,7 @@ enum ProbeOutcome {
 /// carries a `Box<dyn Error>`).
 enum CachedOutcome {
     Present(DecodedUpdate),
-    Absent,
+    Absent { corroborated: bool },
     Transient(String),
 }
 
@@ -436,7 +442,7 @@ async fn prefetch_window(
     for (i, outcome) in outcomes {
         let cached = match outcome {
             Ok(ProbeOutcome::Present(u)) => CachedOutcome::Present(u),
-            Ok(ProbeOutcome::Absent) => CachedOutcome::Absent,
+            Ok(ProbeOutcome::Absent { corroborated }) => CachedOutcome::Absent { corroborated },
             Ok(ProbeOutcome::Transient(e)) => CachedOutcome::Transient(e.to_string()),
             // Protocol violations (owner mismatch, bad SOC framing)
             // must surface exactly where the sequential walk would
@@ -465,7 +471,9 @@ async fn probe_cached(
     if let Some(hit) = cache.get(&index) {
         return Ok(match hit {
             CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
-            CachedOutcome::Absent => ProbeOutcome::Absent,
+            CachedOutcome::Absent { corroborated } => ProbeOutcome::Absent {
+                corroborated: *corroborated,
+            },
             CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.clone().into()),
         });
     }
@@ -563,7 +571,9 @@ async fn probe_once(
             }
             Err(e) => {
                 if is_chunk_not_found(e.as_ref()) {
-                    return Ok(ProbeOutcome::Absent);
+                    return Ok(ProbeOutcome::Absent {
+                        corroborated: anchor_miss_corroborated(e.as_ref()),
+                    });
                 }
                 if attempt >= PROBE_RETRIES {
                     debug!(
@@ -647,6 +657,18 @@ pub async fn resolve_sequence_feed_after(
     feed: &Feed,
     after: u64,
 ) -> Result<FeedResolution, FeedError> {
+    resolve_after_inner(fetcher, feed, after, &mut false).await
+}
+
+/// [`resolve_sequence_feed_after`], also setting `*anchor_corroborated`
+/// when it fails with [`FeedError::NoUpdates`] on an anchor miss the
+/// network corroborated ([`anchor_miss_corroborated`]).
+async fn resolve_after_inner(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    after: u64,
+    anchor_corroborated: &mut bool,
+) -> Result<FeedResolution, FeedError> {
     let mut probed: u64 = 0;
 
     // Phase 0 — anchor on index `after` (unbounded: it must resolve;
@@ -655,7 +677,10 @@ pub async fn resolve_sequence_feed_after(
     let (mut latest_index, mut latest) =
         match probe(fetcher, feed, after, &mut probed, None).await? {
             ProbeOutcome::Present(u) => (after, u),
-            ProbeOutcome::Absent => return Err(FeedError::NoUpdates { probed }),
+            ProbeOutcome::Absent { corroborated } => {
+                *anchor_corroborated = corroborated;
+                return Err(FeedError::NoUpdates { probed });
+            }
             ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
         };
 
@@ -750,7 +775,9 @@ pub async fn resolve_sequence_feed_after(
                     i,
                     Ok(match hit {
                         CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
-                        CachedOutcome::Absent => ProbeOutcome::Absent,
+                        CachedOutcome::Absent { corroborated } => ProbeOutcome::Absent {
+                            corroborated: *corroborated,
+                        },
                         CachedOutcome::Transient(msg) => {
                             ProbeOutcome::Transient(msg.clone().into())
                         }
@@ -780,7 +807,7 @@ pub async fn resolve_sequence_feed_after(
                 ProbeOutcome::Transient(_) => {
                     lowest_transient = Some(lowest_transient.map_or(i, |t| t.min(i)));
                 }
-                ProbeOutcome::Absent => {}
+                ProbeOutcome::Absent { .. } => {}
             }
         }
         match higher {
@@ -839,12 +866,13 @@ pub async fn resolve_sequence_feed_after(
 /// stays present and is a safe anchor for the next walk: a steady poll
 /// costs about one probe round instead of the exponential bracket and
 /// binary search from 0. A successful resolution only ever raises an
-/// entry. A hint whose anchor is definitively absent (a feed that was
-/// reset, e.g. on a local test chain, or a head that became
-/// unretrievable) is dropped by [`resolve_sequence_feed_hinted`] before
-/// it falls back to the unhinted walk, so the failed anchor fetch is
-/// paid once per stale hint, not on every later read. A transient
-/// failure keeps the hint. The map holds at most
+/// entry. A hint whose anchor miss the network corroborated (more than
+/// a couple of peers answered "not found": a feed that was reset, e.g.
+/// on a local test chain, or a head that became unretrievable) is
+/// dropped by [`resolve_sequence_feed_hinted`] before it falls back to
+/// the unhinted walk, so the failed anchor fetch is paid once per stale
+/// hint, not on every later read. A transient failure, or one or two
+/// cold peers' "not found", keeps the hint. The map holds at most
 /// [`FEED_HINTS_CAP`] feeds; past that, recording a new feed evicts an
 /// arbitrary one (a lost hint only costs that feed one cold walk).
 #[derive(Clone, Debug, Default)]
@@ -921,13 +949,17 @@ impl FeedHints {
 /// can never fail a read the plain walk would have served. What happens
 /// to the hint depends on why the hinted walk failed:
 ///
-/// - [`FeedError::NoUpdates`]: the anchor index is definitively absent
-///   (a hint past a feed that was reset, or a head that is no longer
-///   retrievable). The hint is dropped before the fallback, so the
-///   failed anchor fetch is paid once per stale hint, not on every
-///   later read.
-/// - any other error (a transient anchor miss on a starved pool, a
-///   fetch hiccup while classifying the payload): the hint is kept, as
+/// - [`FeedError::NoUpdates`] on an anchor miss the network
+///   corroborated (`FetchExhausted::corroborated_missing`: more than a couple of
+///   peers answered "not found"): the hint is taken as stale (a feed
+///   that was reset, a head that is no longer retrievable) and dropped
+///   before the fallback, so the failed anchor fetch is paid once per
+///   stale hint, not on every later read.
+/// - any other error, including a `NoUpdates` that rests on only one or
+///   two peers' "not found" (a cold or peer-thin node can hear `no peer
+///   found` for an index that exists), a transient anchor miss on a
+///   starved pool, or a fetch hiccup while classifying the payload: the
+///   hint is kept, as
 ///   `GET /feeds` always did, so the next poll still gallops from it
 ///   instead of paying a cold walk from 0. If the fallback then
 ///   succeeds, the hint is replaced by what it resolved. If it fails
@@ -947,14 +979,16 @@ pub async fn resolve_sequence_feed_hinted(
     };
     let hint = hints.get(&feed.owner, &feed.topic);
     let anchor = after.max(hint);
-    let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
+    let mut corroborated = false;
+    let mut result = resolve_after_inner(fetcher, feed, anchor, &mut corroborated).await;
     if let Err(e) = &result {
         if anchor > after {
-            // Only a definitive anchor miss proves the hint stale (a feed
-            // that was reset, a head that became unretrievable). A
-            // transient failure (starved pool, a fetch hiccup) says
-            // nothing about the hint, which stays for the next read.
-            let stale = matches!(e, FeedError::NoUpdates { .. });
+            // Only an anchor miss the network corroborated proves the
+            // hint stale (a feed that was reset, a head that became
+            // unretrievable). One cold peer's "not found", a starved
+            // pool or a fetch hiccup says nothing about the hint, which
+            // stays for the next read.
+            let stale = corroborated && matches!(e, FeedError::NoUpdates { .. });
             debug!(
                 target: "ant_retrieval::feed",
                 feed_owner = %hex::encode(feed.owner),
@@ -1061,6 +1095,23 @@ async fn classify_payload(
 pub(crate) fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
     let msg = e.to_string().to_ascii_lowercase();
     msg.contains("not found") || msg.contains("no peer found")
+}
+
+/// Is the "not found" miss behind `e` the network's answer, not one
+/// cold peer's? For the [`RoutingFetcher`]'s typed error that means
+/// [`FetchExhausted::corroborated_missing`]: more than
+/// `STARVED_MAX_NOT_FOUND` peers answered "not found", so a node with
+/// only one or two connected peers (which can hear `no peer found` for
+/// a chunk that exists, issue #114) never counts. Errors from other
+/// fetchers (a local store, test doubles) carry no peer count, so their
+/// "not found" is taken at its word, as
+/// [`crate::rs::shard_confirmed_missing`] does.
+///
+/// [`RoutingFetcher`]: crate::fetcher::RoutingFetcher
+/// [`FetchExhausted::corroborated_missing`]: crate::fetcher::FetchExhausted::corroborated_missing
+fn anchor_miss_corroborated(e: &(dyn StdError + 'static)) -> bool {
+    crate::fetcher::FetchExhausted::find(e)
+        .is_none_or(crate::fetcher::FetchExhausted::corroborated_missing)
 }
 
 /// A verified feed-update SOC, decoded but not yet classified as v1/v2.
@@ -2485,7 +2536,7 @@ mod tests {
     /// pool both the hinted anchor and the fallback's index 0 fail
     /// transiently and the hint survives; once the pool recovers, the
     /// next poll gallops from the hint instead of paying a cold walk
-    /// from 0. Only a definitive anchor miss (`NoUpdates`) drops it.
+    /// from 0. Only a corroborated anchor miss (`NoUpdates`) drops it.
     #[tokio::test(start_paused = true)]
     async fn transient_hinted_failure_keeps_the_hint() {
         let secret: [u8; 32] = [35u8; 32];
@@ -2558,6 +2609,94 @@ mod tests {
             .unwrap();
         assert_eq!(r.index, 10);
         assert_eq!(hints.get(&owner, &topic), 10);
+    }
+
+    /// Wraps a fetcher so every miss comes back as the `RoutingFetcher`'s
+    /// typed [`crate::fetcher::FetchExhausted`] with `answers` peers
+    /// having said "no peer found", the shape a live node's anchor probe
+    /// sees.
+    struct TypedMissFetcher<'a> {
+        inner: &'a dyn ChunkFetcher,
+        answers: usize,
+    }
+    #[async_trait]
+    impl ChunkFetcher for TypedMissFetcher<'_> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            match self.inner.fetch(addr).await {
+                Err(e) if is_chunk_not_found(e.as_ref()) => Err(Box::new(
+                    crate::fetcher::FetchExhausted::new(
+                        format!("retrieval failed (last: remote: no peer found): {e}"),
+                        false,
+                        true,
+                    )
+                    .with_not_found_answers(self.answers),
+                )),
+                other => other,
+            }
+        }
+    }
+
+    /// R3-M1 on PR #160: a hinted anchor miss only drops the hint when
+    /// the network corroborated it. On a cold node whose one or two
+    /// peers answer "no peer found" for everything (the hinted anchor
+    /// *and* the fallback's index 0), the hint is kept, so the read
+    /// after the node warms up gallops from it instead of walking cold
+    /// from 0. A miss more than `STARVED_MAX_NOT_FOUND` peers agree on
+    /// still drops it.
+    #[tokio::test(start_paused = true)]
+    async fn uncorroborated_anchor_miss_keeps_the_hint() {
+        let secret: [u8; 32] = [37u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"hinted-bzz/cold-anchor-miss");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let indices: Vec<u64> = (0..=40).collect();
+        // A cold node: nothing is reachable, every probe a clean miss.
+        let cold = FlakyFetcher::new();
+        let (healthy, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
+
+        for (answers, kept) in [(1, true), (2, true), (3, false)] {
+            let hints = FeedHints::new();
+            hints.record(&owner, &topic, 37);
+            let typed = TypedMissFetcher {
+                inner: &cold,
+                answers,
+            };
+            let r = resolve_sequence_feed_hinted(&typed, &feed, 0, Some(&hints)).await;
+            assert!(matches!(r, Err(FeedError::NoUpdates { .. })), "{r:?}");
+            assert_eq!(
+                hints.get(&owner, &topic),
+                if kept { 37 } else { 0 },
+                "{answers} not-found answers: hint kept = {kept}"
+            );
+        }
+
+        // The kept hint pays off once the node has peers.
+        let hints = FeedHints::new();
+        hints.record(&owner, &topic, 37);
+        let typed = TypedMissFetcher {
+            inner: &cold,
+            answers: 1,
+        };
+        let _ = resolve_sequence_feed_hinted(&typed, &feed, 0, Some(&hints)).await;
+        let cold_walk = {
+            let counting = ProbeCountingFetcher::new(&healthy, &feed, 60, Duration::ZERO);
+            resolve_sequence_feed_after(&counting, &feed, 0)
+                .await
+                .unwrap();
+            counting.take()
+        };
+        let counting = ProbeCountingFetcher::new(&healthy, &feed, 60, Duration::ZERO);
+        let r = resolve_sequence_feed_hinted(&counting, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(r.index, 40);
+        let warm = counting.take();
+        assert!(warm < cold_walk, "{warm} vs cold {cold_walk}");
+        assert_eq!(hints.get(&owner, &topic), 40);
     }
 
     /// R1-M2 on PR #160: the map is capped, and a concurrently raised
