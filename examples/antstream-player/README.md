@@ -28,6 +28,14 @@ curl -X POST http://127.0.0.1:1633/bzz -H 'Content-Type: application/x-tar' \
 
 ## How it plays a channel
 
+> This is the publisher's default `"bzz"` format, the one both apps
+> publish. A channel published with the opt-in `format: "solar-punk"`
+> (#167: each feed update *is* the playlist, read with
+> `GET /feeds/{owner}/{topic}`, and segments are bare references read
+> from `/bytes/<ref>`) has no `stream.m3u8` path, so this player can't
+> play it yet; the iOS Watch tab
+> (`examples/ios-stream/AntStream/WatchView.swift`) reads both.
+
 A channel reference is a feed manifest; `<channel>/stream.m3u8` resolves
 the feed to the newest playlist on every reload, so hls.js follows the
 live edge on its own. Two details make it work under `bzz://`:

@@ -168,6 +168,7 @@ dependencies = [
  "ant-p2p",
  "ant-postage",
  "ant-retrieval",
+ "async-trait",
  "axum",
  "hex",
  "jni",

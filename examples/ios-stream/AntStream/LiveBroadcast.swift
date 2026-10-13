@@ -121,6 +121,7 @@ final class LiveBroadcast: ObservableObject {
             try await node.startPublisher(
                 channel: channel,
                 topic: permanent.topic,
+                topicText: permanent.topicText,
                 startIndex: permanent.nextIndex,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),
