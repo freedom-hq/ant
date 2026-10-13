@@ -48,12 +48,16 @@ APK.
    deploys the chequebook.
 2. **Go live**: the screen turns landscape. Encoding is H.264 at
    ~900 kbit/s (the stage-1 rendition from #67) with AAC audio, in 2 s
-   segments. Each segment is `POST /bzz`'d, the rolling playlist is
+   segments. Each segment is `POST /bytes`'d, the rolling playlist is
    republished and the channel's sequence feed is updated, exactly as on
-   iOS. The screen shows the publish lag and the channel reference.
+   iOS (the Solar Punk stream format since #167; this app still passes
+   its random hex topic as `topic`). The screen shows the publish lag and the channel reference.
 3. **Watch**: paste a channel reference. The player loads
    `http://127.0.0.1:1633/bzz/<channel>/stream.m3u8`, which re-resolves
-   the feed on every playlist refresh.
+   the feed on every playlist refresh. **Not yet updated for #167**: the
+   publisher now writes the Solar Punk format (v2 feed updates whose
+   content is the playlist, bare `/bytes` segment references), which
+   this path cannot read; the iOS Watch tab shows the new read path.
 
 The broadcast is foreground-only: leaving the app ends it cleanly (the
 playlist gets `#EXT-X-ENDLIST`). Without microphone permission it

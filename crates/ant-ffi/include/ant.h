@@ -1336,22 +1336,40 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  * ------------------------------------------------------------------- */
 
 /*
+ * The 32-byte feed topic a text topic names, as 64 lowercase hex:
+ * keccak256(utf8(text)), bee-js Topic.fromString, the way a Solar Punk
+ * catalog entry's "topic" is read; `text` is hashed exactly as given.
+ * The same hash ant_publisher_start applies to "topic_text", so a host
+ * keeping a text topic can create the channel's feed manifest
+ * (POST /feeds/{owner}/{topic}) before going live. Needs no node.
+ * Returns an allocated string (free with ant_free_string), or NULL with
+ * a message in *out_err when `text` is not UTF-8.
+ */
+char *ant_topic_from_string(const char *text, char **out_err);
+
+/*
  * Start a live broadcast from this node.
  *
  * This is the bench loop above with the synthetic generator replaced by
- * the host's camera pipeline. Per segment: POST /bzz the segment,
- * rebuild the HLS media playlist over a sliding window, POST /bzz the
- * playlist, and publish its reference as a sequence-feed update with
- * POST /soc (bee-js shape: id = keccak256(topic || index_be8), payload
- * timestamp_be8 || reference) so any bee gateway resolves the channel.
+ * the host's camera pipeline, in the Solar Punk stream format. Per
+ * segment: POST /bytes the segment, rebuild the HLS media playlist over
+ * a sliding window (segments and EXT-X-MAP listed by bare 64-hex
+ * reference; a viewer fetches each from <its gateway>/bytes/<ref>),
+ * POST /bytes the playlist, and publish it as a v2 sequence-feed update
+ * with POST /soc (bee-js uploadPayload shape: id =
+ * keccak256(topic || index_be8), the SOC wrapping the playlist's own
+ * root chunk). GET /soc/{owner}/{id} and GET /feeds/{owner}/{topic}
+ * then both return the playlist text, on any bee gateway and on ant.
  * A feed manifest is created once at start with POST /feeds; its
- * reference is the single thing a viewer needs.
+ * reference names the channel (owner and topic, in its metadata) in one
+ * value, but does not resolve to the playlist through /bzz.
  *
  * `config_json` is a PublisherConfig document; "channel" and "batch_id"
  * are required:
  *   {
  *     "channel":         "Kitchen",               // required, names the feed
- *     "topic":           "0x<64 hex>",            // omit -> derived per broadcast
+ *     "topic_text":      "kitchen-cam",           // text topic, see below
+ *     "topic":           "0x<64 hex>",            // or raw topic bytes
  *     "start_index":     0,                       // first feed index; see below
  *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
@@ -1363,7 +1381,15 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  *     "notes":           "iPhone 15 Pro / LTE"
  *   }
  *
- * A host that keeps one "topic" across broadcasts, so the channel
+ * "topic_text" is the topic as a Solar Punk catalog entry names it: the
+ * feed topic is keccak256(utf8(topic_text)), bee-js Topic.fromString,
+ * hashed exactly as given. "topic" is raw 32-byte hex instead, for a
+ * host that already has topic bytes. Set one, not both (an error). With
+ * neither, the topic is the text "antstream/<channel>/<unix_ms>/<n>",
+ * fresh per broadcast. Progress and the report carry the topic as hex
+ * ("topic") and its text ("topic_text", empty for a raw topic).
+ *
+ * A host that keeps one topic across broadcasts, so the channel
  * reference (the feed manifest of owner + topic) stays the same link,
  * must pass the previous broadcast's final "feed_index" as
  * "start_index": the new broadcast then continues the feed rather than
@@ -1423,7 +1449,7 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
  * Live progress of the broadcast, as an allocated JSON object (free
  * with ant_free_string):
  *   {"running":true,"elapsed_s":42.0,"channel":"Kitchen",
- *    "topic":"<64 hex>","owner":"<40 hex>",
+ *    "topic":"<64 hex>","topic_text":"kitchen-cam","owner":"<40 hex>",
  *    "channel_reference":"<64 hex>","playlist_reference":"<64 hex>",
  *    "feed_index":21,"segments_pushed":22,"segments_published":21,
  *    "segments_listed":21,"segments_failed":0,"segments_dropped":0,

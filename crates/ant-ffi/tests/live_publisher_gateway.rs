@@ -4,23 +4,28 @@
 //! wire contract; this one drives the router the iOS app actually runs
 //! (`ant_start_gateway` → `ant_gateway`), in `light_mode`, with a stub
 //! node loop standing in for the swarm. That covers the half a stub
-//! gateway cannot: whether `POST /bzz`, `POST /feeds` and `POST /soc`
+//! gateway cannot: whether `POST /bytes`, `POST /feeds` and `POST /soc`
 //! *as this publisher writes them* are accepted by ant's own handlers —
 //! header names, the `?sig=` query, the inner-CAC body shape, and the
 //! SOC signature ant validates with `soc_valid` before it will dispatch
-//! anything.
+//! anything — and whether what they wrote reads back the way a Solar
+//! Punk viewer reads it: the playlist text from `GET /soc/{owner}/{id}`
+//! and from `GET /feeds/{owner}/{topic}`.
 
+use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ant_control::{ControlAck, ControlCommand, StatusSnapshot};
 use ant_ffi::publisher::{self, PublisherConfig, SegmentKind};
 use ant_gateway::{CorsConfig, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 const SECRET: [u8; 32] = [0x5e; 32];
 
-/// What the stub node loop was asked to push.
+/// What the stub node loop was asked to push, and everything it stores.
 #[derive(Default)]
 struct NodeLog {
     chunks: usize,
@@ -29,11 +34,33 @@ struct NodeLog {
     /// gateway rejects those with 401 before they reach the node, so an
     /// entry here would mean the gateway let a bad SOC through.
     invalid_socs: usize,
+    /// Every chunk and SOC pushed, by address: the "network" the
+    /// gateway's reads are answered from.
+    store: HashMap<[u8; 32], Vec<u8>>,
 }
 
-/// Answer the upload commands the gateway dispatches, the way a healthy
-/// node would: ack each chunk/SOC with its own address as the reference.
+/// A local chunk store over [`NodeLog::store`], so the stub node can run
+/// ant's real feed finder and joiner instead of re-implementing them.
+struct MemFetcher(Arc<Mutex<NodeLog>>);
+
+#[async_trait::async_trait]
+impl ant_retrieval::ChunkFetcher for MemFetcher {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.0
+            .lock()
+            .unwrap()
+            .store
+            .get(&addr)
+            .cloned()
+            .ok_or_else(|| format!("chunk {} not found", hex::encode(addr)).into())
+    }
+}
+
+/// Answer the commands the gateway dispatches, the way a healthy node
+/// would: ack each chunk/SOC push with its own address as the reference,
+/// and serve reads (`GET /soc`, `GET /feeds`) from what was pushed.
 async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLog>>) {
+    let fetcher = MemFetcher(Arc::clone(&log));
     while let Some(cmd) = rx.recv().await {
         match cmd {
             ControlCommand::PushChunk { wire, ack, .. } => {
@@ -43,7 +70,11 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                     });
                     continue;
                 };
-                log.lock().unwrap().chunks += 1;
+                {
+                    let mut log = log.lock().unwrap();
+                    log.chunks += 1;
+                    log.store.insert(address, wire);
+                }
                 let _ = ack.send(ControlAck::ChunkUploaded {
                     reference: hex::encode(address),
                 });
@@ -56,15 +87,119 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                     if !ant_crypto::soc_valid(&address, &wire) {
                         log.invalid_socs += 1;
                     }
-                    log.socs.push((address, wire));
+                    log.socs.push((address, wire.clone()));
+                    log.store.insert(address, wire);
                 }
                 let _ = ack.send(ControlAck::ChunkUploaded {
                     reference: hex::encode(address),
                 });
             }
+            ControlCommand::GetChunkRaw { reference, ack, .. } => {
+                use ant_retrieval::ChunkFetcher as _;
+                let reply = match fetcher.fetch(reference).await {
+                    Ok(data) => ControlAck::Bytes { data },
+                    Err(e) => ControlAck::NotFound {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::GetFeed {
+                owner,
+                topic,
+                after,
+                ack,
+            } => {
+                let feed = ant_retrieval::Feed {
+                    owner,
+                    topic,
+                    kind: ant_retrieval::FeedType::Sequence,
+                };
+                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
+                    .await
+                {
+                    Ok(r) => ControlAck::FeedResolved {
+                        reference: r.reference,
+                        index: r.index,
+                        signature: r.signature,
+                        v2: r.v2,
+                        decrypt_key: r.decrypt_key,
+                    },
+                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
+                    Err(e) => ControlAck::Error {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::StreamBytes {
+                reference,
+                head_only,
+                ack,
+                ..
+            } => {
+                use ant_retrieval::ChunkFetcher as _;
+                let root = match fetcher.fetch(reference).await {
+                    Ok(root) => root,
+                    Err(e) => {
+                        let _ = ack
+                            .send(ControlAck::NotFound {
+                                message: e.to_string(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&root[..8]);
+                span[7] = 0;
+                let total_bytes = u64::from_le_bytes(span);
+                let _ = ack.send(ControlAck::BytesStreamStart { total_bytes }).await;
+                if head_only {
+                    continue;
+                }
+                match ant_retrieval::join(&fetcher, &root, ant_retrieval::DEFAULT_MAX_FILE_BYTES)
+                    .await
+                {
+                    Ok(data) => {
+                        let _ = ack.send(ControlAck::BytesChunk { data }).await;
+                        let _ = ack.send(ControlAck::StreamDone).await;
+                    }
+                    Err(e) => {
+                        let _ = ack
+                            .send(ControlAck::Error {
+                                message: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            }
             other => drop(other),
         }
     }
+}
+
+/// One plain `GET` against the gateway: status, lower-cased head and
+/// body. HTTP/1.0, so the body arrives unchunked and ends at EOF.
+async fn http_get(addr: &str, path: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.0\r\nhost: {addr}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head");
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("status code");
+    (status, head, raw[split + 4..].to_vec())
 }
 
 fn bmt_address(wire: &[u8]) -> Option<[u8; 32]> {
@@ -119,6 +254,8 @@ fn owner() -> [u8; 20] {
     ant_crypto::ethereum_address_from_public_key(sk.verifying_key())
 }
 
+const TOPIC_TEXT: &str = "antstream-integration";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
     let log = Arc::new(Mutex::new(NodeLog::default()));
@@ -126,7 +263,9 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
 
     let config = PublisherConfig {
         channel: "integration".into(),
-        topic: "33".repeat(32),
+        // A text topic, the way a Solar Punk catalog entry names one.
+        topic: String::new(),
+        topic_text: TOPIC_TEXT.into(),
         gateway: format!("http://{addr}"),
         batch_id: "ab".repeat(32),
         segment_ms: 2000,
@@ -171,31 +310,201 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
     );
     assert!(report.kept_up, "{report:?}");
 
-    let log = log.lock().unwrap();
-    assert_eq!(log.invalid_socs, 0, "gateway dispatched an invalid SOC");
-    // Every feed update reached the node as a single-owner chunk at the
-    // bee sequence address for its index. (The node also sees the
-    // dispersed-replica SOCs bee's default redundancy level mints for
-    // every upload, so match by address rather than by count.)
-    let feed = ant_retrieval::Feed {
-        owner: owner(),
-        topic: [0x33; 32],
-        kind: ant_retrieval::FeedType::Sequence,
-    };
-    for index in 0..report.feed_updates {
-        let expected = ant_retrieval::sequence_update_address(&feed, index);
+    let topic = publisher::topic_from_string(TOPIC_TEXT);
+    assert_eq!(report.topic, hex::encode(topic));
+    assert_eq!(report.topic_text, TOPIC_TEXT);
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.invalid_socs, 0, "gateway dispatched an invalid SOC");
+        // Every feed update reached the node as a single-owner chunk at the
+        // bee sequence address for its index. (The node also sees the
+        // dispersed-replica SOCs bee's default redundancy level mints for
+        // every upload, so match by address rather than by count.)
+        let feed = ant_retrieval::Feed {
+            owner: owner(),
+            topic,
+            kind: ant_retrieval::FeedType::Sequence,
+        };
+        for index in 0..report.feed_updates {
+            let expected = ant_retrieval::sequence_update_address(&feed, index);
+            assert!(
+                log.socs.iter().any(|(address, _)| *address == expected),
+                "feed update {index} never reached the node at its sequence address",
+            );
+        }
+        // …and nothing was written past the last index the publisher
+        // reported, which is what a viewer's feed walk relies on.
+        let past_end = ant_retrieval::sequence_update_address(&feed, report.feed_updates);
         assert!(
-            log.socs.iter().any(|(address, _)| *address == expected),
-            "feed update {index} never reached the node at its sequence address",
+            !log.socs.iter().any(|(address, _)| *address == past_end),
+            "a feed update landed past the reported head index",
         );
+        // Segments, playlists and the feed manifest all went out as chunks.
+        assert!(log.chunks > 0);
     }
-    // …and nothing was written past the last index the publisher
-    // reported, which is what a viewer's feed walk relies on.
-    let past_end = ant_retrieval::sequence_update_address(&feed, report.feed_updates);
-    assert!(
-        !log.socs.iter().any(|(address, _)| *address == past_end),
-        "a feed update landed past the reported head index",
+
+    // Read the channel back the two ways a Solar Punk viewer does, from
+    // nothing but the owner and the topic.
+    let owner_hex = hex::encode(owner());
+    let (status, head, feeds_body) =
+        http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(topic))).await;
+    assert_eq!(
+        status,
+        200,
+        "GET /feeds: {}",
+        String::from_utf8_lossy(&feeds_body)
     );
-    // Segments, playlists and the feed manifest all went out as chunks.
-    assert!(log.chunks > 0);
+    assert!(head.contains("swarm-feed-resolved-version: v2"), "{head}");
+    let head_index = format!(
+        "swarm-feed-index: {}",
+        hex::encode((report.feed_updates - 1).to_be_bytes())
+    );
+    assert!(
+        head.contains(&head_index),
+        "the head is the last update: {head}"
+    );
+    let playlist = String::from_utf8(feeds_body).expect("GET /feeds returns the playlist text");
+    assert!(playlist.starts_with("#EXTM3U\n"), "{playlist}");
+    assert!(
+        playlist.contains("#EXT-X-ENDLIST"),
+        "the head is the closing playlist:\n{playlist}"
+    );
+    assert_eq!(playlist.matches("#EXTINF").count(), 3, "{playlist}");
+
+    // The head's own slot, by address: the same text, not a pointer.
+    let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
+    let (status, _, soc_body) =
+        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
+    assert_eq!(
+        status,
+        200,
+        "GET /soc: {}",
+        String::from_utf8_lossy(&soc_body)
+    );
+    assert_eq!(
+        String::from_utf8(soc_body).unwrap(),
+        playlist,
+        "GET /soc and GET /feeds agree"
+    );
+    // The first slot is a playlist too: every update is one.
+    let first_id = ant_retrieval::sequence_update_id(&topic, 0);
+    let (status, _, first) = http_get(
+        &addr,
+        &format!("/soc/{owner_hex}/{}", hex::encode(first_id)),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        first.starts_with(b"#EXTM3U\n"),
+        "{}",
+        String::from_utf8_lossy(&first)
+    );
+
+    // The channel reference names the feed: its manifest node carries
+    // the owner and topic as plain JSON metadata, which is how the
+    // AntStream viewers get from a shared channel reference to the
+    // `GET /feeds/{owner}/{topic}` above (the manifest's own `/bzz` path
+    // can't reach a v2 update's content).
+    let (status, _, manifest) =
+        http_get(&addr, &format!("/bytes/{}", report.channel_reference)).await;
+    assert_eq!(status, 200);
+    let manifest = String::from_utf8_lossy(&manifest);
+    assert!(
+        manifest.contains(&format!("\"swarm-feed-owner\":\"{owner_hex}\"")),
+        "{manifest:?}"
+    );
+    assert!(
+        manifest.contains(&format!("\"swarm-feed-topic\":\"{}\"", hex::encode(topic))),
+        "{manifest:?}"
+    );
+
+    // Segments and the map are bare references, and each one fetched
+    // from this gateway's `/bytes/` — what a Solar Punk viewer builds
+    // from them — is the segment that was pushed.
+    let map = playlist
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"")?.strip_suffix('"'))
+        .expect("map line");
+    let (status, _, init) = http_get(&addr, &format!("/bytes/{map}")).await;
+    assert_eq!((status, init), (200, vec![0x11; 900]));
+    let uris: Vec<&str> = playlist.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(uris.len(), 3, "{playlist}");
+    for (i, uri) in uris.iter().enumerate() {
+        assert!(
+            uri.len() == 64 && hex::decode(uri).is_ok(),
+            "bare reference: {uri}"
+        );
+        let (status, _, segment) = http_get(&addr, &format!("/bytes/{uri}")).await;
+        assert_eq!(status, 200, "segment {i}");
+        assert_eq!(segment, vec![i as u8; 40_000], "segment {i}");
+    }
+}
+
+/// A playlist past one chunk (4096 bytes): the update then wraps the
+/// root of the playlist's chunk tree, as bee-js `uploadPayload` does,
+/// and both reads must still return the whole text, joined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_playlist_longer_than_one_chunk_still_reads_back_as_text() {
+    const SEGMENTS: u8 = 60;
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config = PublisherConfig {
+        channel: "integration".into(),
+        topic: String::new(),
+        topic_text: "antstream-integration-long".into(),
+        gateway: format!("http://{addr}"),
+        batch_id: "ab".repeat(32),
+        segment_ms: 2000,
+        bitrate_kbps: 900,
+        max_in_flight: 4,
+        // Init + every segment, so none is shed.
+        max_backlog: usize::from(SEGMENTS) + 1,
+        playlist_window: usize::from(SEGMENTS),
+        notes: String::new(),
+        start_index: 0,
+    };
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    for i in 0..SEGMENTS {
+        let _ = run.push(SegmentKind::Media, vec![i; 300], 2000, false);
+    }
+    run.cancel();
+    for _ in 0..800 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.segments_listed, u64::from(SEGMENTS), "{report:?}");
+    assert!(report.feed_updates > 0, "{report:?}");
+
+    let topic = publisher::topic_from_string("antstream-integration-long");
+    let owner_hex = hex::encode(owner());
+    let (status, _, feeds_body) =
+        http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(topic))).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&feeds_body));
+    let playlist = String::from_utf8(feeds_body).unwrap();
+    assert!(playlist.len() > 4096, "{} bytes", playlist.len());
+    assert!(playlist.starts_with("#EXTM3U\n"));
+    assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+    assert_eq!(
+        playlist.matches("#EXTINF").count(),
+        usize::from(SEGMENTS),
+        "{playlist}"
+    );
+
+    let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
+    let (status, _, soc_body) =
+        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(soc_body).unwrap(), playlist);
 }

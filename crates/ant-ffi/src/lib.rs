@@ -3649,15 +3649,46 @@ const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
 /// Poll interval while waiting for a cancelled broadcast to settle.
 const PUBLISHER_STOP_POLL: Duration = Duration::from_millis(50);
 
+/// The 32-byte feed topic a text topic names, as 64 lowercase hex:
+/// `keccak256(utf8(text))`, bee-js `Topic.fromString`, the way a Solar
+/// Punk catalog entry's `topic` is read (see
+/// [`publisher::topic_from_string`]). `text` is hashed exactly as given.
+/// Lets a host that keeps a text topic create the channel's feed manifest
+/// (`POST /feeds/{owner}/{topic}`) before going live. Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when `text` is null or not UTF-8.
+///
+/// # Safety
+///
+/// * `text` must be a valid NUL-terminated string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_topic_from_string(
+    text: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_topic_from_string", || {
+            let text = cstr_to_str(text).map_err(|e| e.to_string())?;
+            Ok(hex::encode(publisher::topic_from_string(text)))
+        })
+    }
+}
+
 /// Start a live broadcast from this node.
 ///
 /// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
 /// and `batch_id` are required (a broadcast needs a name and a storage
 /// plan). Segments come from the host's capture pipeline through
 /// [`ant_publisher_push_segment`]; per segment the publisher does one
-/// `POST /bzz`, rebuilds the HLS playlist, and publishes it as a
-/// sequence-feed update with `POST /soc` — all against `gateway`, which
-/// must already be listening (see [`ant_start_gateway`]).
+/// `POST /bytes`, rebuilds the HLS playlist (segments listed by bare
+/// reference), uploads it with `POST /bytes`, and publishes it as a v2
+/// sequence-feed update with `POST /soc` whose single-owner chunk wraps
+/// the playlist itself — all against `gateway`, which must already be
+/// listening (see [`ant_start_gateway`]). The topic is text
+/// (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
+/// (`topic`); see [`publisher::PublisherConfig`].
 ///
 /// Returns immediately — the loop drives itself on the node's runtime.
 /// Poll it with [`ant_publisher_progress`] and finish it with
@@ -4185,6 +4216,23 @@ mod android_log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host-facing topic hash is the publisher's: bee-js
+    /// `Topic.fromString`, checked against the vector Solar Punk's
+    /// `ladderMarker.test.ts` freezes.
+    #[test]
+    fn topic_from_string_ffi_matches_bee_js() {
+        let text = CString::new("ladder-marker-vector-group").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let raw = unsafe { ant_topic_from_string(text.as_ptr(), &raw mut err) };
+        assert!(!raw.is_null() && err.is_null());
+        let hex = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        unsafe { ant_free_string(raw) };
+        assert_eq!(
+            hex,
+            "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5"
+        );
+    }
 
     /// `log_layer`'s filter must stay scoped to itself: a host composing
     /// it with another layer (freedom-ipfs's progress recorder) needs

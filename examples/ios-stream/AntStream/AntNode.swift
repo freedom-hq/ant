@@ -671,22 +671,24 @@ final class AntNode: ObservableObject {
     /// measured 4 as the stable point and 8 as a connection-layer
     /// collapse, so it is not a knob this screen should offer.
     ///
-    /// `topic` and `startIndex` come from the account's permanent
-    /// ``Channel``: the same topic every time keeps the channel link
-    /// stable, and `startIndex` continues the feed after the previous
-    /// broadcast instead of rewriting the indices that hold it.
+    /// `topic`, `topicText` and `startIndex` come from the account's
+    /// permanent ``Channel``: the same topic every time keeps the
+    /// channel link stable, and `startIndex` continues the feed after the
+    /// previous broadcast instead of rewriting the indices that hold it.
+    /// A channel with a text topic hands the publisher the text (it
+    /// hashes it to the same bytes) so the report names it too.
     func startPublisher(
         channel: String,
         topic: String,
+        topicText: String?,
         startIndex: UInt64,
         batchId: String,
         bitrateKbps: UInt32,
         segmentMs: UInt32,
         notes: String
     ) async throws {
-        let config: [String: Any] = [
+        var config: [String: Any] = [
             "channel": channel,
-            "topic": topic,
             "start_index": startIndex,
             "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId,
@@ -694,6 +696,12 @@ final class AntNode: ObservableObject {
             "segment_ms": segmentMs,
             "notes": notes,
         ]
+        // One or the other: the publisher refuses both at once.
+        if let topicText {
+            config["topic_text"] = topicText
+        } else {
+            config["topic"] = topic
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: config),
               let json = String(data: data, encoding: .utf8) else {
             throw AntError.op("could not encode the broadcast configuration")
@@ -1161,6 +1169,13 @@ struct Channel: Equatable {
     let owner: String
     /// 32-byte feed topic, hex, created once per account.
     let topic: String
+    /// The topic's text name (`topic` is `keccak256` of it, bee-js
+    /// `Topic.fromString`): what a Solar Punk catalog entry carries, so
+    /// a broadcast on this channel plays in their viewers given only the
+    /// owner and this text. `nil` for a channel created before text
+    /// topics, whose random topic bytes no text names; it keeps them, so
+    /// its link stays the same.
+    let topicText: String?
 
     private let prefix: String
     private var defaults: UserDefaults { .standard }
@@ -1168,19 +1183,46 @@ struct Channel: Equatable {
     init(owner: String) {
         let prefix = "antstream.channel.\(owner.lowercased())."
         let key = prefix + "topic"
+        let textKey = prefix + "topicText"
+        let defaults = UserDefaults.standard
         let topic: String
-        if let stored = UserDefaults.standard.string(forKey: key), stored.count == 64 {
+        var topicText: String? = nil
+        if let stored = defaults.string(forKey: key), stored.count == 64 {
             topic = stored
+            topicText = defaults.string(forKey: textKey)
         } else {
-            // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
-            // platforms.
-            let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
-            topic = bytes.map { String(format: "%02x", $0) }.joined()
-            UserDefaults.standard.set(topic, forKey: key)
+            let text = "antstream-\(UUID().uuidString.lowercased())"
+            if let hex = Self.topicHex(text) {
+                topic = hex
+                topicText = text
+                // Text first: a topic stored without its text would be
+                // read back as a pre-text-topic channel.
+                defaults.set(text, forKey: textKey)
+            } else {
+                // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
+                // platforms.
+                let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+                topic = bytes.map { String(format: "%02x", $0) }.joined()
+            }
+            defaults.set(topic, forKey: key)
         }
         self.owner = owner
         self.prefix = prefix
         self.topic = topic
+        self.topicText = topicText
+    }
+
+    /// `keccak256(utf8(text))` as hex, from the library (the publisher
+    /// hashes `topic_text` the same way).
+    private static func topicHex(_ text: String) -> String? {
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        guard let raw = text.withCString({ ant_topic_from_string($0, &errPtr) }) else {
+            if let errPtr { ant_free_string(errPtr) }
+            return nil
+        }
+        defer { ant_free_string(raw) }
+        let hex = String(cString: raw)
+        return hex.count == 64 ? hex : nil
     }
 
     /// The name the last broadcast used; seeds the live screen's field.

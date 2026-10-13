@@ -11,16 +11,29 @@
 //!
 //! What stage 2 adds on top of the measured path, per segment:
 //!
-//! 1. `POST /bzz` the segment (and, when the writer restarts, its fMP4
-//!    initialization segment).
+//! 1. `POST /bytes` the segment (and, when the writer restarts, its fMP4
+//!    initialization segment). Stage 1 measured `POST /bzz`; a raw
+//!    upload is the same content chunks without the manifest on top.
 //! 2. Rebuild the HLS media playlist over a sliding window of the most
-//!    recent segments.
-//! 3. `POST /bzz` the playlist, then publish its reference as a
-//!    **sequence-feed update** with `POST /soc/{owner}/{id}` — the
-//!    bee-js shape (`id = keccak256(topic ‖ index_be8)`, payload
-//!    `timestamp_be8 ‖ reference`), so any bee gateway resolves the
-//!    channel with `GET /feeds/{owner}/{topic}` or through the feed
-//!    manifest this module creates at start with `POST /feeds`.
+//!    recent segments. Segments and the `#EXT-X-MAP` are listed by their
+//!    **bare 64-hex reference**, as Solar Punk's uploader lists them; a
+//!    viewer resolves each against `/bytes/` on whichever gateway it
+//!    reads from.
+//! 3. `POST /bytes` the playlist, then publish it as a **v2
+//!    sequence-feed update** with `POST /soc/{owner}/{id}`
+//!    (`id = keccak256(topic ‖ index_be8)`): the single-owner chunk wraps
+//!    the playlist's own root chunk, the shape bee-js
+//!    `FeedWriter.uploadPayload` writes. So `GET /soc/{owner}/{id}` and
+//!    `GET /feeds/{owner}/{topic}` both answer with the playlist text,
+//!    on any bee gateway and on ant. The feed manifest this module
+//!    creates at start with `POST /feeds` names the channel (owner and
+//!    topic) in one reference; it does not resolve to the playlist
+//!    through `/bzz`, because the feed's content is not a manifest.
+//!
+//! The topic is either text, hashed the way Solar Punk catalog entries
+//! and bee-js `Topic.fromString` name a feed ([`topic_from_string`]), or
+//! raw bytes from the host. A broadcast with a text topic plays in a
+//! Solar Punk viewer given only the owner and that text.
 //!
 //! Live-edge discipline, straight from the stage-1 findings:
 //!
@@ -79,10 +92,11 @@ pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_mins(1);
 /// Number of chunks a `payload_bytes`-long body splits into: the data
 /// leaves plus every intermediate level of the Swarm chunk tree.
 ///
-/// Excludes the 1–2 mantaray manifest chunks a `POST /bzz` adds on top
-/// (< 0.5 % at segment sizes, and they are the same for every mode), so
-/// the reported `chunks/s` is strictly the *content* rate — directly
-/// comparable to the desktop `--target-peers` sweep in PLAN.md.
+/// Excludes the 1–2 mantaray manifest chunks a `POST /bzz` (the bench's
+/// upload) adds on top (< 0.5 % at segment sizes, and they are the same
+/// for every mode), so the reported `chunks/s` is strictly the *content*
+/// rate — directly comparable to the desktop `--target-peers` sweep in
+/// PLAN.md. The live loop's `POST /bytes` adds none.
 #[must_use]
 pub const fn data_chunk_count(payload_bytes: u64) -> u64 {
     if payload_bytes <= CHUNK_SIZE {
@@ -159,14 +173,25 @@ pub struct PublisherConfig {
     /// Human-readable channel name. Also the default topic seed (see
     /// [`PublisherConfig::topic`]).
     pub channel: String,
-    /// Feed topic, 32-byte hex (`0x` optional). Empty derives a topic
-    /// unique to this broadcast —
-    /// `keccak256("antstream/<channel>/<unix_ms>/<nonce>")`, the nonce a
-    /// process-wide counter — so a second broadcast of the same channel
-    /// starts a fresh feed at index 0 instead of having to discover the
-    /// previous head (or, restarted quickly, overwriting it).
+    /// Feed topic as raw bytes: 32-byte hex (`0x` optional). Use
+    /// [`PublisherConfig::topic_text`] instead for a topic a catalog can
+    /// name. Setting both is a configuration error.
+    ///
+    /// With neither set, the topic is the text
+    /// `antstream/<channel>/<unix_ms>/<nonce>` (the nonce a process-wide
+    /// counter), unique to this broadcast, so a second broadcast of the
+    /// same channel starts a fresh feed at index 0 instead of having to
+    /// discover the previous head (or, restarted quickly, overwriting
+    /// it). That text is reported as `topic_text`.
     #[serde(default)]
     pub topic: String,
+    /// Feed topic as text, the way Solar Punk catalog entries and every
+    /// bee-js reader name one: the 32 topic bytes are
+    /// `keccak256(utf8(topic_text))`, bee-js `Topic.fromString` (see
+    /// [`topic_from_string`]). Used verbatim: no trimming, no case
+    /// folding, since a reader hashes exactly the string it was given.
+    #[serde(default)]
+    pub topic_text: String,
     /// Sequence-feed index of this broadcast's first update. A host that
     /// reuses one `topic` across broadcasts (a permanent channel link)
     /// passes the previous broadcast's final `feed_index` here, so the
@@ -251,28 +276,74 @@ impl PublisherConfig {
         Ok(())
     }
 
-    /// The feed topic this broadcast writes to: the configured one, or a
-    /// per-broadcast derivation of the channel name.
-    fn resolve_topic(&self) -> Result<[u8; 32], PublisherError> {
+    /// The feed topic this broadcast writes to, and its text form when
+    /// it has one: the configured raw topic, the configured text topic,
+    /// or a per-broadcast text derived from the channel name.
+    fn resolve_topic(&self) -> Result<([u8; 32], String), PublisherError> {
         // A wall-clock seed alone is not unique enough: stop + restart
         // of the same channel inside one clock tick would silently reuse
         // the topic, and the new broadcast's index 0 would overwrite the
         // old feed's head. The process-wide counter makes every
         // derivation distinct regardless of clock granularity.
         static TOPIC_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let trimmed = self.topic.trim();
-        if trimmed.is_empty() {
+        let raw = self.topic.trim();
+        if !raw.is_empty() && !self.topic_text.is_empty() {
+            return Err(PublisherError::Config(
+                "set topic (raw hex) or topic_text, not both: they name different feeds".into(),
+            ));
+        }
+        if !raw.is_empty() {
+            let topic =
+                parse_hex32(raw).map_err(|e| PublisherError::Config(format!("topic {e}")))?;
+            return Ok((topic, String::new()));
+        }
+        let text = if self.topic_text.is_empty() {
             let unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
             let nonce = TOPIC_NONCE.fetch_add(1, Ordering::Relaxed);
-            return Ok(ant_crypto::keccak256(
-                format!("antstream/{}/{unix_ms}/{nonce}", self.channel).as_bytes(),
-            ));
-        }
-        parse_hex32(trimmed).map_err(|e| PublisherError::Config(format!("topic {e}")))
+            format!("antstream/{}/{unix_ms}/{nonce}", self.channel)
+        } else {
+            self.topic_text.clone()
+        };
+        Ok((topic_from_string(&text), text))
     }
+}
+
+/// A feed topic from its text name: `keccak256(utf8(text))`, byte for
+/// byte what bee-js `Topic.fromString` computes, and so what every Solar
+/// Punk reader computes from a catalog entry's `topic`.
+#[must_use]
+pub fn topic_from_string(text: &str) -> [u8; 32] {
+    ant_crypto::keccak256(text.as_bytes())
+}
+
+/// Length of one ladder-marker period, in seconds of global (epoch)
+/// time. `MARKER_PERIOD_SECONDS` in Solar Punk's `ladderMarker.ts`.
+pub const LADDER_MARKER_PERIOD_SECONDS: u64 = 10;
+
+/// The single-owner-chunk identifier of a ladder's time marker for one
+/// period, the convention Solar Punk's uploader writes and its players
+/// read (`ladderMarkerIdentifier` in `src/shared/ladderMarker.ts`,
+/// marker version 2):
+/// `keccak256("ladder-marker" ‖ group topic ‖ period as u64 big-endian)`,
+/// `group` being the ladder's master feed topic
+/// ([`topic_from_string`] of the group id) and `period`
+/// `unix_ms / (LADDER_MARKER_PERIOD_SECONDS × 1000)`.
+///
+/// A marker names the newest index of every rung of an ABR ladder. This
+/// publisher writes a single rendition, which Solar Punk players find by
+/// searching the feed, so it writes no markers; this is the address it
+/// would write them at.
+#[must_use]
+pub fn ladder_marker_identifier(group: &[u8; 32], period: u64) -> [u8; 32] {
+    const PREFIX: &[u8] = b"ladder-marker";
+    let mut input = Vec::with_capacity(PREFIX.len() + 32 + 8);
+    input.extend_from_slice(PREFIX);
+    input.extend_from_slice(group);
+    input.extend_from_slice(&period.to_be_bytes());
+    ant_crypto::keccak256(&input)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -669,9 +740,15 @@ pub struct PublisherSnapshot {
     /// Feed topic, hex. With `owner` this is the address any bee gateway
     /// resolves the live playlist from (`GET /feeds/{owner}/{topic}`).
     pub topic: String,
+    /// The topic's text name, what a Solar Punk catalog entry carries
+    /// (`topic` is `keccak256` of it). Empty when the host configured
+    /// raw topic bytes, which no catalog entry can name.
+    pub topic_text: String,
     pub owner: String,
     /// Feed-manifest reference created at start (`POST /feeds`) — the
-    /// single reference that identifies the channel to a viewer.
+    /// single reference that identifies the channel to a viewer. It
+    /// carries the feed's owner and topic; the playlist itself is read
+    /// with `GET /feeds/{owner}/{topic}`.
     pub channel_reference: String,
     /// Reference of the most recently published playlist.
     pub playlist_reference: String,
@@ -689,7 +766,7 @@ pub struct PublisherSnapshot {
     pub segments_dropped: u64,
     pub bytes_published: u64,
     pub playlists_published: u64,
-    /// Publish latency of one `POST /bzz`, milliseconds.
+    /// Publish latency of one segment's `POST /bytes`, milliseconds.
     pub publish_ms_p50: u64,
     pub publish_ms_p95: u64,
     /// **The live-edge lag**: how far behind live a viewer is right
@@ -717,6 +794,8 @@ pub struct PublisherSnapshot {
 pub struct PublisherReport {
     pub channel: String,
     pub topic: String,
+    /// See [`PublisherSnapshot::topic_text`].
+    pub topic_text: String,
     pub owner: String,
     pub channel_reference: String,
     pub playlist_reference: String,
@@ -774,6 +853,9 @@ pub struct PublisherReport {
 pub struct LiveRun {
     config: PublisherConfig,
     topic: [u8; 32],
+    /// The topic's text name ([`topic_from_string`]), empty when the
+    /// host configured raw topic bytes.
+    topic_text: String,
     owner: [u8; 20],
     state: Arc<Mutex<PublisherState>>,
     cancel: Arc<AtomicBool>,
@@ -891,6 +973,7 @@ impl LiveRun {
             elapsed_s: elapsed,
             channel: self.config.channel.clone(),
             topic: hex::encode(self.topic),
+            topic_text: self.topic_text.clone(),
             owner: hex::encode(self.owner),
             channel_reference: state.channel_reference.clone().unwrap_or_default(),
             playlist_reference: state.playlist_reference.clone().unwrap_or_default(),
@@ -950,6 +1033,7 @@ impl LiveRun {
         PublisherReport {
             channel: self.config.channel.clone(),
             topic: hex::encode(self.topic),
+            topic_text: self.topic_text.clone(),
             owner: hex::encode(self.owner),
             channel_reference: state.channel_reference.clone().unwrap_or_default(),
             playlist_reference: state.playlist_reference.clone().unwrap_or_default(),
@@ -1027,7 +1111,7 @@ pub fn start(
     status_rx: Option<watch::Receiver<StatusSnapshot>>,
 ) -> Result<Arc<LiveRun>, PublisherError> {
     config.validate()?;
-    let topic = config.resolve_topic()?;
+    let (topic, topic_text) = config.resolve_topic()?;
     let target = Target::parse(&config.gateway).map_err(PublisherError::Config)?;
     let batch = parse_hex32(&config.batch_id)
         .map_err(|e| PublisherError::Config(format!("batch_id {e}")))?;
@@ -1047,6 +1131,7 @@ pub fn start(
     let run = Arc::new(LiveRun {
         config: config.clone(),
         topic,
+        topic_text,
         owner,
         state: Arc::clone(&state),
         cancel: Arc::clone(&cancel),
@@ -1117,8 +1202,10 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 async fn drive(ctx: Arc<RunCtx>) {
     let sampler = spawn_peer_sampler(&ctx);
     // The channel's feed manifest: one immutable reference a viewer can
-    // be handed (`bzz://<ref>`) that resolves through any bee gateway to
-    // whatever the latest feed update points at.
+    // be handed that names the feed (owner and topic, in its metadata).
+    // A viewer reads the playlist from that feed with `GET /feeds`; the
+    // manifest does not resolve to it through `/bzz`, because a v2
+    // update's content is the playlist itself, not a manifest.
     //
     // Concurrent with the loop, not before it: this is a real upload and
     // can sit on the 60 s publish deadline if the peer set is still
@@ -1231,17 +1318,9 @@ async fn pump(ctx: Arc<RunCtx>) {
 }
 
 async fn publish_pending(ctx: &RunCtx, pending: Pending) {
-    let name = match pending.kind {
-        SegmentKind::Init => format!("init-{}.mp4", pending.seq),
-        SegmentKind::Media => format!("seg-{}.m4s", pending.seq),
-    };
-    let content_type = match pending.kind {
-        SegmentKind::Init => "video/mp4",
-        SegmentKind::Media => "video/iso.segment",
-    };
     let bytes = pending.data.len() as u64;
     let started = Instant::now();
-    let result = publish_bzz(&ctx.target, ctx.batch, &name, content_type, &pending.data).await;
+    let result = publish_bytes(&ctx.target, ctx.batch, &pending.data, &[]).await;
     let elapsed = started.elapsed();
 
     {
@@ -1249,7 +1328,8 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
         match result {
             Ok(reference) => {
                 PublisherState::record_latency(&mut state.publish_ms, ms(elapsed));
-                let uri = bzz_uri(&reference, &name);
+                // The bare reference is the URI: see `publish_bytes`.
+                let uri = reference;
                 match pending.kind {
                     SegmentKind::Init => {
                         state.done.insert(pending.seq, Committed::Init { uri });
@@ -1331,22 +1411,32 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
     }
 }
 
-/// Upload the current playlist and publish its reference as the next
-/// feed update. `captured_at`, when present, is the newest committed
-/// segment — its live-edge lag is only known once the feed update lands.
+/// Upload the current playlist and publish it as the next feed update.
+/// `captured_at`, when present, is the newest committed segment — its
+/// live-edge lag is only known once the feed update lands.
+///
+/// The update is a **v2** feed update, the shape bee-js
+/// `FeedWriter.uploadPayload` writes and Solar Punk's uploader
+/// publishes: the single-owner chunk wraps the playlist's own root
+/// chunk rather than a `timestamp ‖ reference` pointer. So the SOC
+/// payload *is* the playlist (for a playlist up to 4096 bytes; past that
+/// it is the root of the playlist's chunk tree), and both
+/// `GET /soc/{owner}/{id}` and `GET /feeds/{owner}/{topic}` answer with
+/// the playlist text, on bee and on ant. (Readers tell a v1 update by
+/// its 40- or 72-byte payload; the playlist's fixed header lines alone
+/// are longer, so it is never mistaken for one.)
 async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<Instant>) {
     let body = {
         let state = lock(&ctx.state);
         state.render_playlist(ctx.config.segment_ms, endlist)
     };
-    let playlist_ref = match publish_bzz(
-        &ctx.target,
-        ctx.batch,
-        PLAYLIST_NAME,
-        "application/vnd.apple.mpegurl",
-        body.as_bytes(),
-    )
-    .await
+    // The level is sent rather than left to the gateway's default so the
+    // root chunk rebuilt below is the one the gateway stored. It is that
+    // default (bee's MEDIUM), which is also what bee-js `uploadPayload`
+    // gets for a playlist too big for one chunk.
+    let level = PLAYLIST_REDUNDANCY_LEVEL.to_string();
+    let headers = [("swarm-redundancy-level".to_string(), level)];
+    let playlist_ref = match publish_bytes(&ctx.target, ctx.batch, body.as_bytes(), &headers).await
     {
         Ok(reference) => reference,
         Err(message) => {
@@ -1354,10 +1444,10 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
             return;
         }
     };
-    let reference = match parse_hex32(&playlist_ref) {
-        Ok(r) => r,
-        Err(e) => {
-            lock(&ctx.state).record_error(format!("playlist reference {e}"));
+    let root = match playlist_root_chunk(body.as_bytes(), &playlist_ref) {
+        Ok(root) => root,
+        Err(message) => {
+            lock(&ctx.state).record_error(format!("playlist: {message}"));
             return;
         }
     };
@@ -1368,7 +1458,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
     }
 
     let index = lock(&ctx.state).feed_index;
-    match publish_feed_update(ctx, index, &reference).await {
+    match publish_feed_update(ctx, index, &root).await {
         Ok(()) => {
             let mut state = lock(&ctx.state);
             state.feed_index += 1;
@@ -1396,9 +1486,26 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
     }
 }
 
-/// Playlist file name. Constant so every republish lands at the same
-/// manifest path and a viewer's URI stays stable across updates.
-const PLAYLIST_NAME: &str = "stream.m3u8";
+/// Redundancy level the playlist is uploaded at: bee's
+/// `DefaultUploadLevel` (MEDIUM), what both bee and ant apply to an
+/// upload that names none.
+const PLAYLIST_REDUNDANCY_LEVEL: u8 = 1;
+
+/// The root chunk (`span ‖ payload` wire) of `body` uploaded with
+/// `POST /bytes` at [`PLAYLIST_REDUNDANCY_LEVEL`], rebuilt locally rather
+/// than read back from the gateway, and checked against the reference
+/// the gateway answered: a feed update must never wrap a chunk that
+/// isn't the stored playlist's root.
+fn playlist_root_chunk(body: &[u8], reference: &str) -> Result<([u8; 32], Vec<u8>), String> {
+    let split = ant_retrieval::split_bytes_with_redundancy(body, PLAYLIST_REDUNDANCY_LEVEL);
+    if hex::encode(split.root) != reference {
+        return Err(format!(
+            "gateway stored it as {reference}, expected root {}",
+            hex::encode(split.root),
+        ));
+    }
+    Ok((split.root, split.root_wire))
+}
 
 /// Create the channel's feed manifest (`POST /feeds/{owner}/{topic}`,
 /// bee-js `createFeedManifest`). Idempotent in effect: the manifest is
@@ -1428,36 +1535,29 @@ async fn ensure_channel_manifest(ctx: &RunCtx) {
 }
 
 /// Write one sequence-feed update: a single-owner chunk at
-/// `id = keccak256(topic ‖ index_be8)` whose payload is bee's v1 update
-/// layout `timestamp_be8 ‖ reference`.
+/// `id = keccak256(topic ‖ index_be8)` wrapping `wrapped` (the
+/// playlist's root chunk, see [`publish_playlist`]) — bee's v2 update.
 ///
-/// This is the shape bee-js's `FeedWriter.upload` produces and every bee
-/// version's feed getter resolves, which is what lets a **public** bee
+/// This is the shape bee-js's `FeedWriter.uploadPayload` produces and
+/// bee's feed getter resolves, which is what lets a **public** bee
 /// gateway serve the channel even though the segments were pushed from a
 /// phone.
-async fn publish_feed_update(ctx: &RunCtx, index: u64, reference: &[u8; 32]) -> Result<(), String> {
+async fn publish_feed_update(
+    ctx: &RunCtx,
+    index: u64,
+    wrapped: &([u8; 32], Vec<u8>),
+) -> Result<(), String> {
     let id = ant_retrieval::sequence_update_id(&ctx.topic, index);
-    let mut payload = Vec::with_capacity(8 + 32);
-    payload.extend_from_slice(
-        &SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_be_bytes(),
-    );
-    payload.extend_from_slice(reference);
-
-    // Inner content-addressed chunk: `span(8 LE) ‖ payload`, which is
-    // both what the SOC signature covers and what `POST /soc` takes as
-    // its body.
-    let (cac_address, cac_wire) =
-        ant_crypto::cac_new(&payload).ok_or_else(|| "feed payload too large".to_string())?;
+    // `wrapped` is `span(8 LE) ‖ payload`, which is both what the SOC
+    // signature covers (through its address) and what `POST /soc` takes
+    // as its body.
+    let (cac_address, cac_wire) = wrapped;
     // Bee signs `keccak256(id ‖ inner_cac_address)` through its default
     // (EIP-191-wrapping) signer — see `bee/pkg/soc/soc.go::Sign` and
     // `ant_crypto::soc_valid`, which recovers the owner the same way.
     let mut digest_input = [0u8; 64];
     digest_input[..32].copy_from_slice(&id);
-    digest_input[32..].copy_from_slice(&cac_address);
+    digest_input[32..].copy_from_slice(cac_address);
     let signature =
         ant_crypto::sign_handshake_data(&ctx.signing_secret, &ant_crypto::keccak256(&digest_input))
             .map_err(|e| format!("sign feed update: {e}"))?;
@@ -1476,25 +1576,43 @@ async fn publish_feed_update(ctx: &RunCtx, index: u64, reference: &[u8; 32]) -> 
         ),
         ("swarm-postage-batch-id".to_string(), hex::encode(ctx.batch)),
     ];
-    post_reference(&ctx.target, &path, &headers, &cac_wire).await?;
+    post_reference(&ctx.target, &path, &headers, cac_wire).await?;
     Ok(())
-}
-
-/// The URI a viewer's HLS client fetches an uploaded object from.
-/// Root-relative so the same playlist works against the in-process
-/// gateway, `antd`, and a public bee gateway (all serve `/bzz/` at the
-/// root of their API).
-fn bzz_uri(reference: &str, name: &str) -> String {
-    format!("/bzz/{reference}/{name}")
 }
 
 // ---------------------------------------------------------------------------
 // Publish path
 // ---------------------------------------------------------------------------
 
+/// Publish one body with `POST /bytes`, returning its reference.
+///
+/// Segments, initialization segments and playlists all go up this way.
+/// A segment is listed in the playlist by this **bare reference**, the
+/// form Solar Punk's uploader writes: a viewer turns it into
+/// `<the gateway it chose>/bytes/<ref>`, which is what lets it pick a
+/// gateway or its own node. A raw upload also carries none of the
+/// mantaray chunks a `POST /bzz` adds on top of every body.
+async fn publish_bytes(
+    target: &Target,
+    batch: [u8; 32],
+    payload: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<String, String> {
+    let path = format!("{}/bytes", target.prefix);
+    let mut headers = vec![
+        (
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        ),
+        ("swarm-postage-batch-id".to_string(), hex::encode(batch)),
+    ];
+    headers.extend_from_slice(extra_headers);
+    post_reference(target, &path, &headers, payload).await
+}
+
 /// Publish one body with `POST /bzz`, returning its reference. This is
-/// the call stage 1 measured; the live loop and the bench both go
-/// through it.
+/// the call stage 1 measured with the bench; the live loop has since
+/// moved to [`publish_bytes`].
 pub(crate) async fn publish_bzz(
     target: &Target,
     batch: [u8; 32],
@@ -1718,6 +1836,7 @@ mod tests {
         PublisherConfig {
             channel: "test channel".into(),
             topic: format!("0x{}", "11".repeat(32)),
+            topic_text: String::new(),
             gateway: "http://127.0.0.1:1633".into(),
             batch_id: "ab".repeat(32),
             segment_ms: 2000,
@@ -1952,18 +2071,156 @@ mod tests {
     fn an_omitted_topic_is_derived_per_broadcast() {
         let mut c = config();
         c.topic = String::new();
-        let a = c.resolve_topic().unwrap();
+        let (a, a_text) = c.resolve_topic().unwrap();
         assert_ne!(a, [0u8; 32]);
+        // The derived topic is a text topic, so even a broadcast whose
+        // host named none can be put in a catalog entry by its text.
+        assert!(a_text.starts_with("antstream/test channel/"), "{a_text}");
+        assert_eq!(a, topic_from_string(&a_text));
         // Two derivations must differ even inside one clock tick —
         // otherwise a quick stop + restart of the same channel would
         // write its fresh index 0 over the old feed's head.
-        let b = c.resolve_topic().unwrap();
+        let (b, _) = c.resolve_topic().unwrap();
         assert_ne!(a, b, "derived topics must be per-broadcast");
         // An explicit topic is honoured verbatim, with or without `0x`.
         c.topic = "cd".repeat(32);
-        assert_eq!(c.resolve_topic().unwrap(), [0xcd; 32]);
+        assert_eq!(c.resolve_topic().unwrap(), ([0xcd; 32], String::new()));
         c.topic = "0xnothex".into();
         assert!(c.resolve_topic().is_err());
+    }
+
+    #[test]
+    fn a_text_topic_is_hashed_like_bee_js_and_raw_hex_stays_an_option() {
+        let mut c = config();
+        c.topic = String::new();
+        c.topic_text = "ladder-marker-vector-group".into();
+        let (topic, text) = c.resolve_topic().unwrap();
+        assert_eq!(text, "ladder-marker-vector-group");
+        assert_eq!(
+            hex::encode(topic),
+            "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5",
+        );
+        // Hashed exactly as given: a reader hashes the catalog's string
+        // as it is, so trimming here would name a different feed.
+        c.topic_text = " ladder-marker-vector-group".into();
+        assert_ne!(c.resolve_topic().unwrap().0, topic);
+        // Both at once name two different feeds: refused, not guessed.
+        c.topic = "cd".repeat(32);
+        assert!(c.resolve_topic().is_err());
+    }
+
+    /// `Topic.fromString` vectors. The 64-bit prefixes are the frozen
+    /// literals in Solar Punk's own test (streaming-monorepo
+    /// `apps/hls-stream/packages/shared/test/ladderMarker.test.ts`,
+    /// copied into stream-event-client's `src/shared/ladderMarker.ts`);
+    /// the full values were computed with bee-js 13.1.0's
+    /// `Topic.fromString(..).toHex()`, the version both pin.
+    #[test]
+    fn topic_from_string_matches_bee_js() {
+        for (text, expected) in [
+            (
+                "ladder-marker-vector-group",
+                "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5",
+            ),
+            (
+                "3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b",
+                "3ee91f4778abbdde6476c3653851338239c10ed60b490f58919d9efa35567aa5",
+            ),
+            (
+                "swarm-hls-feed-follow-vector",
+                "e0324f32e2edd73e3cd532076d203c397b9764eac2395fc3baab5738ad1b29bf",
+            ),
+            // UTF-8, not UTF-16 or Latin-1.
+            (
+                "Straßenfest 🎥",
+                "c1a81655ca877863b2cf445cd6fe3ace95d99b9a9068e6a35bd472a8fce6251c",
+            ),
+        ] {
+            assert_eq!(hex::encode(topic_from_string(text)), expected, "{text}");
+        }
+    }
+
+    /// The feed slot addresses Solar Punk freezes from bee-js 9.8.1's
+    /// `feed/identifier.js` (stream-event-client
+    /// `test/shared/feedFollow.test.ts`, topic
+    /// `Topic.fromString('swarm-hls-feed-follow-vector')`): the same
+    /// `keccak256(topic ‖ index_be8)` this publisher writes its updates
+    /// at, from a text topic.
+    #[test]
+    fn feed_slots_from_a_text_topic_match_solar_punk() {
+        let topic = topic_from_string("swarm-hls-feed-follow-vector");
+        for (index, expected) in [
+            (
+                0,
+                "1c2c0e3309184791ad5ec0ec2c97568088ecb784e970cd2ef67aa19889f029b3",
+            ),
+            (
+                1,
+                "4727d6cdbe1096edddda633d60d2ca9afd372ea0bcf4f9dcd6ba1f58c7caf807",
+            ),
+            (
+                42,
+                "8f8e0d58b0b180e8e8ad8775cfb8f9349f4ecfb28973b655e5cff650beee4654",
+            ),
+        ] {
+            assert_eq!(
+                hex::encode(ant_retrieval::sequence_update_id(&topic, index)),
+                expected,
+                "index {index}",
+            );
+        }
+    }
+
+    /// Ladder-marker identifiers (v2). Prefixes: the frozen vectors in
+    /// Solar Punk's `ladderMarker.test.ts`; full values: its
+    /// `ladderMarkerIdentifier` run against bee-js 13.1.0. The last
+    /// period is past 32 bits, so a four-byte or little-endian period
+    /// disagrees there.
+    #[test]
+    fn ladder_marker_identifier_matches_solar_punk() {
+        for (group, period, expected) in [
+            (
+                "ladder-marker-vector-group",
+                0,
+                "f6b46271eff0479daab3bddee009a929d51ded30f493479af48849a28195261c",
+            ),
+            (
+                "ladder-marker-vector-group",
+                175_983_840,
+                "a2f6848ee95311e3284ba21a2ea0380175074fdf3a698d82bf75b4d96c372df5",
+            ),
+            (
+                "3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b",
+                1_099_511_627_781,
+                "3359b2fcd770d32e242160a25918bc56c2393bf4d7b3c29238e8d814ea780669",
+            ),
+        ] {
+            let id = ladder_marker_identifier(&topic_from_string(group), period);
+            assert_eq!(hex::encode(id), expected, "{group} @ {period}");
+        }
+        assert_eq!(LADDER_MARKER_PERIOD_SECONDS, 10);
+    }
+
+    #[test]
+    fn a_large_playlist_wraps_its_tree_root_and_a_small_one_itself() {
+        // Up to one chunk the root *is* the playlist: the SOC payload a
+        // Solar Punk viewer reads from `GET /soc` is the text.
+        let small = b"#EXTM3U\n#EXT-X-VERSION:7\n".to_vec();
+        let (address, wire) = ant_crypto::cac_new(&small).unwrap();
+        let root = playlist_root_chunk(&small, &hex::encode(address)).unwrap();
+        assert_eq!(root, (address, wire.clone()));
+        assert_eq!(&wire[8..], small.as_slice());
+        // Past one chunk the SOC wraps the tree's root, as bee-js
+        // `uploadPayload` does, at the redundancy level the upload asked
+        // for.
+        let large = vec![b'#'; 9000];
+        let split = ant_retrieval::split_bytes_with_redundancy(&large, 1);
+        let root = playlist_root_chunk(&large, &hex::encode(split.root)).unwrap();
+        assert_eq!(root.0, split.root);
+        assert_ne!(&root.1[8..], &large[..root.1.len() - 8]);
+        // A gateway that stored something else is an error, never a
+        // feed update wrapping the wrong chunk.
+        assert!(playlist_root_chunk(&large, &"00".repeat(32)).is_err());
     }
 
     // -----------------------------------------------------------------
@@ -1990,11 +2247,13 @@ mod tests {
     #[derive(Default)]
     struct StubLog {
         seen: Vec<SeenRequest>,
-        /// `POST /bzz` responses are content-addressed in the stub too
-        /// (a counter, not a real BMT hash) so the publisher's playlist
-        /// URIs are distinguishable.
+        /// `POST /feeds` and `POST /soc` answer a counter, not a real
+        /// address; `POST /bytes` answers the real one (see
+        /// [`bytes_reference`]), since the publisher checks the playlist's
+        /// against the root chunk it wraps.
         next_reference: u64,
-        fail_bzz: bool,
+        /// Refuse every `POST /bytes` (segments and playlists alike).
+        fail_bytes: bool,
         /// Refuse every feed update from now on, the segments
         /// themselves still uploading fine.
         fail_soc: bool,
@@ -2004,8 +2263,28 @@ mod tests {
         feeds_delay: Duration,
     }
 
+    /// The reference bee and ant answer a `POST /bytes` with: the root of
+    /// the body's chunk tree at the requested redundancy level (default
+    /// MEDIUM, as on both).
+    fn bytes_reference(request: &SeenRequest) -> String {
+        let level = request
+            .header("swarm-redundancy-level")
+            .map_or(1, |l| l.parse().unwrap());
+        hex::encode(ant_retrieval::split_bytes_with_redundancy(&request.body, level).root)
+    }
+
+    /// Requests that uploaded a playlist (`POST /bytes` of an HLS text).
+    fn is_playlist(request: &SeenRequest) -> bool {
+        request.method_path.ends_with("/bytes") && request.body.starts_with(b"#EXTM3U")
+    }
+
+    /// Requests that uploaded a segment (any other `POST /bytes`).
+    fn is_segment(request: &SeenRequest) -> bool {
+        request.method_path.ends_with("/bytes") && !is_playlist(request)
+    }
+
     /// A gateway stub that answers bee-shaped `{"reference":...}` to
-    /// `/bzz`, `/feeds` and `/soc`, recording every request.
+    /// `/bytes`, `/feeds` and `/soc`, recording every request.
     async fn stub_gateway(log: Arc<Mutex<StubLog>>, delay: Duration) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -2054,7 +2333,8 @@ mod tests {
                                         slot.fail_feeds -= 1;
                                     }
                                     let fail = fail_feeds
-                                        || (slot.fail_bzz && request.method_path.contains("/bzz"))
+                                        || (slot.fail_bytes
+                                            && request.method_path.ends_with("/bytes"))
                                         || (slot.fail_soc && request.method_path.contains("/soc/"));
                                     (
                                         fail,
@@ -2076,7 +2356,9 @@ mod tests {
                                     r.extend_from_slice(body);
                                     r
                                 } else {
-                                    let reference = {
+                                    let reference = if request.method_path.ends_with("/bytes") {
+                                        bytes_reference(&request)
+                                    } else {
                                         let mut slot = lock(&log);
                                         slot.next_reference += 1;
                                         let mut r = [0u8; 32];
@@ -2169,7 +2451,7 @@ mod tests {
             .seen
             .iter()
             .rev()
-            .find(|r| r.method_path.contains("/bzz?name=stream.m3u8"))
+            .find(|r| is_playlist(r))
             .map(|r| String::from_utf8(r.body.clone()).unwrap())
             .expect("playlist uploaded");
         assert!(
@@ -2243,37 +2525,62 @@ mod tests {
             "{}",
             manifest.method_path,
         );
-        // 2. segments, stamped with the batch.
-        let segment = seen
-            .iter()
-            .find(|r| r.method_path.contains("/bzz?name=seg-"))
-            .expect("segment uploaded");
+        // 2. segments, raw `POST /bytes` uploads stamped with the batch.
+        let segments: Vec<&SeenRequest> = seen.iter().filter(|r| is_segment(r)).collect();
+        assert_eq!(segments.len(), 4, "init + 3 media segments");
+        assert!(
+            !seen.iter().any(|r| r.method_path.contains("/bzz")),
+            "nothing goes up as a /bzz manifest any more",
+        );
+        // Uploads run concurrently, so find each by its bytes rather
+        // than by arrival order.
+        let by_body = |body: &[u8]| {
+            *segments
+                .iter()
+                .find(|r| r.body == body)
+                .expect("segment uploaded")
+        };
+        let segment = by_body(&[1u8; 4096]);
         assert_eq!(
             segment.header("swarm-postage-batch-id"),
             Some("ab".repeat(32).as_str()),
         );
-        assert_eq!(segment.header("content-type"), Some("video/iso.segment"));
-        // 3. the playlist, as an HLS media playlist.
-        let playlist = seen
-            .iter()
-            .rev()
-            .find(|r| r.method_path.contains("/bzz?name=stream.m3u8"))
-            .expect("playlist uploaded");
         assert_eq!(
-            playlist.header("content-type"),
-            Some("application/vnd.apple.mpegurl"),
+            segment.header("content-type"),
+            Some("application/octet-stream")
         );
+        // 3. the playlist, as an HLS media playlist listing every
+        //    segment and its map by bare reference — the form Solar
+        //    Punk's viewers resolve against `<gateway>/bytes/`.
+        let playlists: Vec<&SeenRequest> = seen.iter().filter(|r| is_playlist(r)).collect();
+        let playlist = playlists.last().expect("playlist uploaded");
+        assert_eq!(playlist.header("swarm-redundancy-level"), Some("1"));
         let body = String::from_utf8(playlist.body.clone()).unwrap();
         assert!(body.starts_with("#EXTM3U"), "{body}");
         assert!(body.contains("#EXT-X-ENDLIST"), "final playlist:\n{body}");
         assert_eq!(body.matches("#EXTINF").count(), 3, "{body}");
+        let init_ref = bytes_reference(by_body(&[7u8; 800]));
+        assert!(
+            body.contains(&format!("#EXT-X-MAP:URI=\"{init_ref}\"\n")),
+            "{body}"
+        );
+        let uris: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+        let media_refs: Vec<String> = (0..3u8)
+            .map(|i| bytes_reference(by_body(&[i; 4096])))
+            .collect();
+        assert_eq!(
+            uris, media_refs,
+            "segment lines are bare references:\n{body}"
+        );
+        assert!(uris.iter().all(|u| u.len() == 64 && hex::decode(u).is_ok()));
 
         // 4. the feed update: a single-owner chunk ant's own validator
         //    accepts, at the bee-js sequence id for index 0.
-        let soc = seen
+        let socs: Vec<&SeenRequest> = seen
             .iter()
-            .find(|r| r.method_path.contains("/soc/"))
-            .expect("feed update written");
+            .filter(|r| r.method_path.contains("/soc/"))
+            .collect();
+        let soc = socs[0];
         let (path, sig_hex) = soc.method_path.split_once("?sig=").expect("sig query");
         let id_hex = path.rsplit('/').next().unwrap();
         assert_eq!(
@@ -2294,13 +2601,76 @@ mod tests {
             ant_crypto::soc_valid(&ant_crypto::keccak256(&addr_input), &wire),
             "the SOC ant's own gateway validates must accept our feed update",
         );
-        // v1 update payload: `timestamp_be8 ‖ reference`, after the
-        // 8-byte little-endian CAC span.
-        assert_eq!(soc.body.len(), 8 + 8 + 32, "bee v1 feed payload shape");
+        // v2 update: the wrapped chunk is the playlist itself, `span(8
+        // LE) ‖ playlist`, so the SOC payload a viewer reads is the text
+        // — not bee's v1 `timestamp ‖ reference` pointer.
         assert_eq!(
             u64::from_le_bytes(soc.body[..8].try_into().unwrap()),
-            40,
-            "inner CAC span covers the 40-byte update payload",
+            playlists[0].body.len() as u64,
+        );
+        assert_eq!(&soc.body[8..], playlists[0].body.as_slice());
+        // …and every update wraps the playlist uploaded right before it.
+        assert_eq!(socs.len(), playlists.len(), "one update per playlist");
+        for (soc, playlist) in socs.iter().zip(&playlists) {
+            assert_eq!(&soc.body[8..], playlist.body.as_slice());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_text_topic_writes_where_a_solar_punk_reader_looks() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.topic_text = "swarm-hls-feed-follow-vector".into();
+        let owner = test_owner();
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            owner,
+            None,
+        )
+        .unwrap();
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.topic_text, "swarm-hls-feed-follow-vector");
+        assert_eq!(
+            snapshot.topic,
+            "e0324f32e2edd73e3cd532076d203c397b9764eac2395fc3baab5738ad1b29bf",
+        );
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(run.report().topic_text, "swarm-hls-feed-follow-vector");
+
+        let seen = lock(&log).seen.clone();
+        // Index 0 of `Topic.fromString('swarm-hls-feed-follow-vector')`,
+        // the slot stream-event-client's frozen bee-js vector names.
+        let soc = seen
+            .iter()
+            .find(|r| r.method_path.contains("/soc/"))
+            .expect("feed update written");
+        assert!(
+            soc.method_path.starts_with(&format!(
+                "POST /soc/{}/1c2c0e3309184791ad5ec0ec2c97568088ecb784e970cd2ef67aa19889f029b3?sig=",
+                hex::encode(owner),
+            )),
+            "{}",
+            soc.method_path,
+        );
+        let manifest = seen
+            .iter()
+            .find(|r| r.method_path.contains("/feeds/"))
+            .expect("feed manifest created");
+        assert!(
+            manifest
+                .method_path
+                .ends_with("/e0324f32e2edd73e3cd532076d203c397b9764eac2395fc3baab5738ad1b29bf"),
+            "{}",
+            manifest.method_path,
         );
     }
 
@@ -2363,7 +2733,7 @@ mod tests {
         let playlist = seen
             .iter()
             .rev()
-            .find(|r| r.method_path.contains("stream.m3u8"))
+            .find(|r| is_playlist(r))
             .expect("playlist uploaded");
         let body = String::from_utf8(playlist.body.clone()).unwrap();
         assert!(body.contains("#EXT-X-DISCONTINUITY"), "{body}");
@@ -2372,7 +2742,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rejecting_gateway_is_reported_rather_than_counted_as_published() {
         let log = Arc::new(Mutex::new(StubLog {
-            fail_bzz: true,
+            fail_bytes: true,
             ..StubLog::default()
         }));
         let addr = stub_gateway(Arc::clone(&log), Duration::ZERO).await;
