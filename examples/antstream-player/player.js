@@ -590,8 +590,11 @@
     lowLatencyMode: false,
     // The publisher keeps as many segments as fit in one 4096-byte chunk
     // in its live playlist (about 40 of 2 s): sit four behind the newest
-    // one, which leaves room to buffer through a slow read. Only a playhead that falls out of the window jumps forward: a
-    // jump throws away what is buffered and stalls again.
+    // one, which leaves room to buffer through a slow read. A playhead more
+    // than ten target durations (~20 s) behind the live edge jumps forward,
+    // long before it would fall out of that window, so the longer playlist
+    // does not let a web viewer lag further behind. A jump throws away what
+    // is buffered and stalls again.
     liveSyncDurationCount: 4,
     liveMaxLatencyDurationCount: 10,
     maxBufferLength: 30,
