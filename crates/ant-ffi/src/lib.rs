@@ -3681,13 +3681,18 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
 /// and `batch_id` are required (a broadcast needs a name and a storage
 /// plan). Segments come from the host's capture pipeline through
-/// [`ant_publisher_push_segment`]; per segment the publisher does one
-/// `POST /bytes`, rebuilds the HLS playlist (segments listed by bare
-/// reference), uploads it with `POST /bytes`, and publishes it as a v2
-/// sequence-feed update with `POST /soc` whose single-owner chunk wraps
-/// the playlist itself — all against `gateway`, which must already be
-/// listening (see [`ant_start_gateway`]). The topic is text
-/// (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
+/// [`ant_publisher_push_segment`]; per segment the publisher uploads the
+/// segment, rebuilds the HLS playlist, uploads it, and publishes it as a
+/// sequence-feed update with `POST /soc` — all against `gateway`, which
+/// must already be listening (see [`ant_start_gateway`]). The `format`
+/// field picks the shape ([`publisher::StreamFormat`]): `"bzz"`, the
+/// default, uploads with `POST /bzz`, lists `/bzz/<ref>/<name>` paths and
+/// writes v1 updates, so viewers play `/bzz/<channel>/stream.m3u8` (the
+/// web player and the Android Watch tab read this); `"solar-punk"`
+/// uploads with `POST /bytes`, lists bare references and writes v2
+/// updates wrapping the playlist itself, so `GET /feeds/{owner}/{topic}`
+/// returns the playlist (what Solar Punk's viewers read). The topic is
+/// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
 /// (`topic`); see [`publisher::PublisherConfig`].
 ///
 /// Returns immediately — the loop drives itself on the node's runtime.

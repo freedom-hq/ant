@@ -1343,7 +1343,7 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  * keeping a text topic can create the channel's feed manifest
  * (POST /feeds/{owner}/{topic}) before going live. Needs no node.
  * Returns an allocated string (free with ant_free_string), or NULL with
- * a message in *out_err when `text` is not UTF-8.
+ * a message in *out_err when `text` is NULL or not UTF-8.
  */
 char *ant_topic_from_string(const char *text, char **out_err);
 
@@ -1351,18 +1351,29 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * Start a live broadcast from this node.
  *
  * This is the bench loop above with the synthetic generator replaced by
- * the host's camera pipeline, in the Solar Punk stream format. Per
- * segment: POST /bytes the segment, rebuild the HLS media playlist over
- * a sliding window (segments and EXT-X-MAP listed by bare 64-hex
- * reference; a viewer fetches each from <its gateway>/bytes/<ref>),
- * POST /bytes the playlist, and publish it as a v2 sequence-feed update
- * with POST /soc (bee-js uploadPayload shape: id =
- * keccak256(topic || index_be8), the SOC wrapping the playlist's own
- * root chunk). GET /soc/{owner}/{id} and GET /feeds/{owner}/{topic}
- * then both return the playlist text, on any bee gateway and on ant.
+ * the host's camera pipeline. Per segment it uploads the segment,
+ * rebuilds the HLS media playlist over a sliding window, uploads the
+ * playlist, and publishes it as a sequence-feed update with POST /soc
+ * (id = keccak256(topic || index_be8)), in one of two formats ("format"):
+ *
+ *   "bzz" (the default): POST /bzz for segments and the playlist
+ *     (stream.m3u8), segments listed as gateway-root /bzz/<ref>/<name>
+ *     paths, and a v1 update (bee-js upload shape: payload
+ *     timestamp_be8 || reference of the playlist's manifest). A viewer
+ *     plays /bzz/<channel reference>/stream.m3u8, which re-resolves the
+ *     feed; the web player and the Android Watch tab read this.
+ *   "solar-punk": POST /bytes for segments and the playlist, segments
+ *     and EXT-X-MAP listed by bare 64-hex reference (a viewer fetches
+ *     each from <its gateway>/bytes/<ref>), and a v2 update (bee-js
+ *     uploadPayload shape: the SOC wraps the playlist's own root chunk).
+ *     GET /soc/{owner}/{id} and GET /feeds/{owner}/{topic} then both
+ *     return the playlist text, on any bee gateway and on ant; this is
+ *     what Solar Punk's viewers read. The channel reference does not
+ *     resolve to the playlist through /bzz.
+ *
  * A feed manifest is created once at start with POST /feeds; its
  * reference names the channel (owner and topic, in its metadata) in one
- * value, but does not resolve to the playlist through /bzz.
+ * value, the single thing a viewer needs.
  *
  * `config_json` is a PublisherConfig document; "channel" and "batch_id"
  * are required:
@@ -1370,6 +1381,7 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *     "channel":         "Kitchen",               // required, names the feed
  *     "topic_text":      "kitchen-cam",           // text topic, see below
  *     "topic":           "0x<64 hex>",            // or raw topic bytes
+ *     "format":          "bzz",                   // or "solar-punk"; see above
  *     "start_index":     0,                       // first feed index; see below
  *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
@@ -1387,7 +1399,8 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * host that already has topic bytes. Set one, not both (an error). With
  * neither, the topic is the text "antstream/<channel>/<unix_ms>/<n>",
  * fresh per broadcast. Progress and the report carry the topic as hex
- * ("topic") and its text ("topic_text", empty for a raw topic).
+ * ("topic") and its text ("topic_text", empty for a raw topic), and
+ * the "format".
  *
  * A host that keeps one topic across broadcasts, so the channel
  * reference (the feed manifest of owner + topic) stays the same link,
@@ -1450,7 +1463,8 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
  * with ant_free_string):
  *   {"running":true,"elapsed_s":42.0,"channel":"Kitchen",
  *    "topic":"<64 hex>","topic_text":"kitchen-cam","owner":"<40 hex>",
- *    "channel_reference":"<64 hex>","playlist_reference":"<64 hex>",
+ *    "channel_reference":"<64 hex>","format":"bzz",
+ *    "playlist_reference":"<64 hex>",
  *    "feed_index":21,"segments_pushed":22,"segments_published":21,
  *    "segments_listed":21,"segments_failed":0,"segments_dropped":0,
  *    "bytes_published":4725000,

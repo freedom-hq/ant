@@ -695,6 +695,11 @@ final class AntNode: ObservableObject {
             "bitrate_kbps": bitrateKbps,
             "segment_ms": segmentMs,
             "notes": notes,
+            // The `/bzz` format, not Solar Punk's (#167): the web player
+            // the Share links open and the Android Watch tab read only
+            // `/bzz/<channel>/stream.m3u8`, so a "solar-punk" broadcast
+            // would be unplayable there. The Watch tab here reads both.
+            "format": "bzz",
         ]
         // One or the other: the publisher refuses both at once.
         if let topicText {
@@ -1171,8 +1176,9 @@ struct Channel: Equatable {
     let topic: String
     /// The topic's text name (`topic` is `keccak256` of it, bee-js
     /// `Topic.fromString`): what a Solar Punk catalog entry carries, so
-    /// a broadcast on this channel plays in their viewers given only the
-    /// owner and this text. `nil` for a channel created before text
+    /// once the app publishes the "solar-punk" format (see
+    /// ``AntNode/startPublisher``) a broadcast on this channel plays in
+    /// their viewers given only the owner and this text. `nil` for a channel created before text
     /// topics, whose random topic bytes no text names; it keeps them, so
     /// its link stays the same.
     let topicText: String?

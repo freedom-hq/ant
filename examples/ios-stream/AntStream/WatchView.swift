@@ -4,15 +4,16 @@ import SwiftUI
 /// The Watch tab: plays a channel through the in-process gateway, ported
 /// from the Android app's `WatchScreen.kt`.
 ///
-/// A channel is published in the Solar Punk stream format (issue #167):
-/// every feed update *is* the newest playlist, read with
-/// `GET /feeds/{owner}/{topic}`, and it lists segments by bare
-/// reference. The channel reference is the feed manifest naming that
-/// owner and topic (``FeedAddress``); ``FeedPlaylistLoader`` hands
-/// `AVPlayer` each playlist read with the bare references turned into
-/// `<gateway>/bytes/<ref>`, the rewrite the Solar Punk viewers do, and
-/// `AVPlayer`'s HLS engine follows the live edge on its own. Loopback
-/// HTTP is allowed by the app's ATS exceptions (Info.plist).
+/// A channel reference is the feed manifest naming the channel's owner
+/// and topic (``FeedAddress``). The publisher writes one of two formats
+/// and this tab plays both through ``FeedPlaylistLoader``: the Solar
+/// Punk format (issue #167), where every feed update *is* the newest
+/// playlist (`GET /feeds/{owner}/{topic}`) listing bare references,
+/// turned into `<gateway>/bytes/<ref>` the way the Solar Punk viewers do;
+/// and the default `/bzz` format, read from `/bzz/<ref>/stream.m3u8` with
+/// its gateway-root paths made absolute. `AVPlayer`'s HLS engine follows
+/// the live edge on its own. Loopback HTTP is allowed by the app's ATS
+/// exceptions (Info.plist).
 ///
 /// Neither failure a viewer runs into is final: a channel that is not
 /// live yet (the playlist 404s) and a live playlist that stops changing
@@ -260,7 +261,8 @@ final class ChannelWatcher: ObservableObject {
             guard let self, !Task.isCancelled, self.source == source else { return }
             self.loadTask = nil
             self.resolved = (source.reference, address)
-            let loader = FeedPlaylistLoader(gateway: source.gateway, address: address)
+            let loader = FeedPlaylistLoader(
+                gateway: source.gateway, address: address, channel: source.reference)
             self.loader = loader
             self.feedURL = loader.feedURL
             let asset = AVURLAsset(url: loader.playlistURL)
@@ -367,7 +369,7 @@ struct FeedAddress: Equatable {
     /// and `"swarm-feed-topic":"<64 hex>"`, in the clear (bee and ant
     /// write feed manifests unobfuscated). The node is read raw with
     /// `GET /bytes`, since its `/bzz` path can't reach a v2 update's
-    /// content.
+    /// content. The manifest is the same in both publisher formats.
     static func resolve(reference: String, gateway: URL) async throws -> FeedAddress {
         let url = gateway.appending(path: "bytes/\(reference)")
         let request = URLRequest(url: url, timeoutInterval: 60)
@@ -397,28 +399,47 @@ struct FeedAddress: Equatable {
     }
 }
 
-/// Serves a channel's live playlist to `AVPlayer`: every request for
-/// ``playlistURL`` (the first load and each live reload) reads
-/// `GET <gateway>/feeds/<owner>/<topic>`, whose body is the newest
-/// playlist, and answers with its bare segment and map references
-/// turned into `<gateway>/bytes/<ref>` — the rewrite Solar Punk's
-/// viewers do, which leaves the publisher out of the choice of gateway.
-/// Segments themselves are plain `http://` URLs, fetched by `AVPlayer`
-/// directly.
+/// Serves a channel's live playlist to `AVPlayer`, in either of the
+/// publisher's formats. Every request for ``playlistURL`` (the first
+/// load and each live reload) reads `GET <gateway>/feeds/<owner>/<topic>`:
 ///
-/// A custom URL scheme is what routes the playlist through a
+/// - `"solar-punk"` (#167): the body *is* the newest playlist, listing
+///   bare segment and map references, which are turned into
+///   `<gateway>/bytes/<ref>` — the rewrite Solar Punk's viewers do,
+///   which leaves the publisher out of the choice of gateway.
+/// - `"bzz"` (the default, what this app and the Android app publish):
+///   a v1 update's content is the playlist's `/bzz` manifest, not a
+///   playlist, so the channel is read the way the web player reads it,
+///   `GET <gateway>/bzz/<channel>/stream.m3u8`, and its gateway-root
+///   `/bzz/<ref>/<name>` paths are made absolute on `gateway`. Once seen,
+///   later reloads go straight there.
+///
+/// Segments themselves are plain `http://` URLs, fetched by `AVPlayer`
+/// directly. A custom URL scheme is what routes the playlist through a
 /// resource-loader delegate at all; `AVPlayer` never asks one for
 /// `http` URLs.
+///
+/// Requests are tracked so a cancelled one (the item replaced on retry
+/// or stop) cancels its read and is never answered. All state is touched
+/// only on ``queue``, the queue `AVAssetResourceLoader` calls in on.
 final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
     static let scheme = "antstream-feed"
 
     let gateway: URL
     let address: FeedAddress
+    /// The channel reference (the feed manifest), for the `"bzz"` read.
+    let channel: String
     let queue = DispatchQueue(label: "antstream.feed-playlist")
 
-    init(gateway: URL, address: FeedAddress) {
+    /// The read in flight for each loading request, by identity.
+    private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
+    /// The channel turned out to be in the `"bzz"` format.
+    private var bzzFormat = false
+
+    init(gateway: URL, address: FeedAddress, channel: String) {
         self.gateway = gateway
         self.address = address
+        self.channel = channel
     }
 
     /// What `AVPlayer` is given. The `.m3u8` suffix is what tells it the
@@ -431,67 +452,118 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
         gateway.appending(path: "feeds/\(address.owner)/\(address.topic)")
     }
 
+    /// The `"bzz"` format's playlist path, as the web player reads it.
+    var bzzPlaylistURL: URL {
+        gateway.appending(path: "bzz/\(channel)/stream.m3u8")
+    }
+
     func resourceLoader(
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
         guard loadingRequest.request.url?.scheme == Self.scheme else { return false }
-        // Feed reads are mutable: never answer a live reload from cache.
-        let request = URLRequest(
-            url: feedURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
-        let gateway = self.gateway
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard error == nil, code == 200, let data,
-                  let playlist = String(data: data, encoding: .utf8)
-            else {
-                // A channel that has not gone live yet 404s here; the
-                // item fails and the watcher retries it.
-                loadingRequest.finishLoading(with: error ?? NSError(
-                    domain: NSURLErrorDomain,
-                    code: code == 404 ? NSURLErrorFileDoesNotExist : NSURLErrorBadServerResponse))
-                return
-            }
-            let body = Data(Self.rewrite(playlist, gateway: gateway).utf8)
-            if let info = loadingRequest.contentInformationRequest {
-                info.contentType = "public.m3u-playlist"
-                info.contentLength = Int64(body.count)
-                info.isByteRangeAccessSupported = false
-            }
-            loadingRequest.dataRequest?.respond(with: body)
-            loadingRequest.finishLoading()
-        }.resume()
+        read(bzzFormat ? bzzPlaylistURL : feedURL, for: loadingRequest)
         return true
     }
 
-    /// `playlist` with each bare reference — a segment line, or the URI
-    /// of an `#EXT-X-MAP` — made absolute on `gateway`'s `/bytes/`.
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        tasks.removeValue(forKey: ObjectIdentifier(loadingRequest))?.cancel()
+    }
+
+    /// Start one read of `url` answering `loadingRequest`. On ``queue``.
+    private func read(_ url: URL, for loadingRequest: AVAssetResourceLoadingRequest) {
+        // Feed reads are mutable: never answer a live reload from cache.
+        let request = URLRequest(
+            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            self.queue.async {
+                self.finished(url, data: data, response: response, error: error, for: loadingRequest)
+            }
+        }
+        tasks[ObjectIdentifier(loadingRequest)] = task
+        task.resume()
+    }
+
+    /// One read came back. On ``queue``.
+    private func finished(
+        _ url: URL, data: Data?, response: URLResponse?, error: Error?,
+        for loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        // Cancelled meanwhile (its entry is gone): nobody is waiting.
+        guard tasks.removeValue(forKey: ObjectIdentifier(loadingRequest)) != nil,
+              !loadingRequest.isCancelled, !loadingRequest.isFinished
+        else { return }
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard error == nil, code == 200, let data else {
+            // A channel that has not gone live yet 404s here; the item
+            // fails and the watcher retries it.
+            loadingRequest.finishLoading(with: error ?? NSError(
+                domain: NSURLErrorDomain,
+                code: code == 404 ? NSURLErrorFileDoesNotExist : NSURLErrorBadServerResponse))
+            return
+        }
+        guard data.starts(with: Data("#EXTM3U".utf8)),
+              let playlist = String(data: data, encoding: .utf8)
+        else {
+            if url == feedURL {
+                // A v1 update: the feed's content is the playlist's
+                // manifest. Read the channel's `/bzz` path instead.
+                bzzFormat = true
+                read(bzzPlaylistURL, for: loadingRequest)
+            } else {
+                loadingRequest.finishLoading(with: NSError(
+                    domain: NSURLErrorDomain, code: NSURLErrorCannotParseResponse))
+            }
+            return
+        }
+        let body = Data(Self.rewrite(playlist, gateway: gateway).utf8)
+        if let info = loadingRequest.contentInformationRequest {
+            info.contentType = "public.m3u-playlist"
+            info.contentLength = Int64(body.count)
+            info.isByteRangeAccessSupported = false
+        }
+        loadingRequest.dataRequest?.respond(with: body)
+        loadingRequest.finishLoading()
+    }
+
+    /// `playlist` with every segment line and `#EXT-X-MAP` URI made
+    /// absolute on `gateway`: a bare reference (`"solar-punk"`) becomes
+    /// `<gateway>/bytes/<ref>`, a gateway-root path (`"bzz"`,
+    /// `/bzz/<ref>/<name>`) becomes `<gateway>/bzz/<ref>/<name>`.
     /// Everything else, absolute URLs included, passes through.
     static func rewrite(_ playlist: String, gateway: URL) -> String {
         let map = "#EXT-X-MAP:URI=\""
         return playlist.split(separator: "\n", omittingEmptySubsequences: false)
             .map { line -> String in
-                if let ref = reference(line) {
-                    return bytesURL(ref, gateway)
+                if !line.hasPrefix("#"), let url = absolute(line, gateway) {
+                    return url
                 }
                 if line.hasPrefix(map), line.hasSuffix("\""),
-                   let ref = reference(line.dropFirst(map.count).dropLast()) {
-                    return map + bytesURL(ref, gateway) + "\""
+                   let url = absolute(line.dropFirst(map.count).dropLast(), gateway) {
+                    return map + url + "\""
                 }
                 return String(line)
             }
             .joined(separator: "\n")
     }
 
-    /// A bare Swarm reference: 64 hex (128 for an encrypted one).
-    private static func reference(_ text: Substring) -> String? {
+    /// `text` as an absolute URL on `gateway`, or `nil` when it is neither
+    /// a bare reference nor a gateway-root path.
+    private static func absolute(_ text: Substring, _ gateway: URL) -> String? {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard value.count == 64 || value.count == 128, value.allSatisfy(\.isHexDigit)
-        else { return nil }
-        return value.lowercased()
-    }
-
-    private static func bytesURL(_ ref: String, _ gateway: URL) -> String {
-        gateway.appending(path: "bytes/\(ref)").absoluteString
+        // A bare Swarm reference: 64 hex (128 for an encrypted one).
+        if value.count == 64 || value.count == 128, value.allSatisfy(\.isHexDigit) {
+            return gateway.appending(path: "bytes/\(value.lowercased())").absoluteString
+        }
+        if value.hasPrefix("/"), !value.hasPrefix("//") {
+            var base = gateway.absoluteString
+            while base.hasSuffix("/") { base.removeLast() }
+            return base + value
+        }
+        return nil
     }
 }

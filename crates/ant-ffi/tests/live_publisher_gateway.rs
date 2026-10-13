@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ant_control::{ControlAck, ControlCommand, StatusSnapshot};
-use ant_ffi::publisher::{self, PublisherConfig, SegmentKind};
+use ant_ffi::publisher::{self, PublisherConfig, SegmentKind, StreamFormat};
 use ant_gateway::{CorsConfig, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -174,6 +174,58 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                     }
                 }
             }
+            ControlCommand::StreamBzz {
+                reference,
+                path,
+                head_only,
+                ack,
+                ..
+            } => {
+                use ant_retrieval::ChunkFetcher as _;
+                let found = match ant_retrieval::lookup_path(&fetcher, &reference, &path).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        let _ = ack
+                            .send(ControlAck::NotFound {
+                                message: e.to_string(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+                let mut data_ref = [0u8; 32];
+                data_ref.copy_from_slice(&found.data_ref[..32]);
+                let Ok(root) = fetcher.fetch(data_ref).await else {
+                    let _ = ack
+                        .send(ControlAck::NotFound {
+                            message: "file root missing".into(),
+                        })
+                        .await;
+                    continue;
+                };
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&root[..8]);
+                span[7] = 0;
+                let _ = ack
+                    .send(ControlAck::BzzStreamStart {
+                        total_bytes: u64::from_le_bytes(span),
+                        reference: found.data_ref.clone(),
+                        content_type: found.content_type.clone(),
+                        filename: None,
+                        feed: None,
+                    })
+                    .await;
+                if head_only {
+                    continue;
+                }
+                if let Ok(data) =
+                    ant_retrieval::join(&fetcher, &root, ant_retrieval::DEFAULT_MAX_FILE_BYTES)
+                        .await
+                {
+                    let _ = ack.send(ControlAck::BytesChunk { data }).await;
+                    let _ = ack.send(ControlAck::StreamDone).await;
+                }
+            }
             other => drop(other),
         }
     }
@@ -266,6 +318,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         // A text topic, the way a Solar Punk catalog entry names one.
         topic: String::new(),
         topic_text: TOPIC_TEXT.into(),
+        format: StreamFormat::SolarPunk,
         gateway: format!("http://{addr}"),
         batch_id: "ab".repeat(32),
         segment_ms: 2000,
@@ -452,6 +505,7 @@ async fn a_playlist_longer_than_one_chunk_still_reads_back_as_text() {
         channel: "integration".into(),
         topic: String::new(),
         topic_text: "antstream-integration-long".into(),
+        format: StreamFormat::SolarPunk,
         gateway: format!("http://{addr}"),
         batch_id: "ab".repeat(32),
         segment_ms: 2000,
@@ -507,4 +561,79 @@ async fn a_playlist_longer_than_one_chunk_still_reads_back_as_text() {
         http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
     assert_eq!(status, 200);
     assert_eq!(String::from_utf8(soc_body).unwrap(), playlist);
+}
+
+/// The default format, `"bzz"`: what the Android Watch tab and the web
+/// player (the target of both apps' Share links) read. A host that sets
+/// no `format` must keep producing a channel those viewers play through
+/// `/bzz/<channel>/stream.m3u8`, with segments at gateway-root
+/// `/bzz/<ref>/<name>` paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_format_plays_through_the_channel_bzz_path() {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    // The JSON a host that predates `format` sends (the Android app).
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic": "cd".repeat(32),
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+    }))
+    .unwrap();
+    assert_eq!(config.format, StreamFormat::Bzz);
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    for i in 0..3u8 {
+        let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.segments_failed, 0, "{:?}", report.errors);
+    assert_eq!(report.format, StreamFormat::Bzz);
+    assert!(report.feed_updates > 0, "{report:?}");
+    assert!(!report.channel_reference.is_empty(), "{report:?}");
+    assert_eq!(log.lock().unwrap().invalid_socs, 0);
+
+    let (status, _, body) = http_get(
+        &addr,
+        &format!("/bzz/{}/stream.m3u8", report.channel_reference),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let playlist = String::from_utf8(body).unwrap();
+    assert!(playlist.starts_with("#EXTM3U\n"), "{playlist}");
+    assert!(playlist.contains("#EXT-X-ENDLIST"), "{playlist}");
+    let map = playlist
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"")?.strip_suffix('"'))
+        .expect("map line");
+    assert!(
+        map.starts_with("/bzz/") && map.ends_with("/init-0.mp4"),
+        "{map}"
+    );
+    let (status, _, init) = http_get(&addr, map).await;
+    assert_eq!((status, init), (200, vec![0x11; 900]));
+    let uris: Vec<&str> = playlist.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(uris.len(), 3, "{playlist}");
+    for (i, uri) in uris.iter().enumerate() {
+        assert!(uri.starts_with("/bzz/") && uri.contains("/seg-"), "{uri}");
+        let (status, _, segment) = http_get(&addr, uri).await;
+        assert_eq!(status, 200, "segment {i}");
+        assert_eq!(segment, vec![i as u8; 40_000], "segment {i}");
+    }
 }
