@@ -131,3 +131,66 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(-
 
 footer { margin-top: 32px; color: var(--muted); font-size: 12px; }
 footer a { color: var(--muted); }
+
+/* -- debug panel (debug.js) ------------------------------------------------ */
+
+#debug-toggle.on { background: var(--amber); color: #2b1d00; }
+
+.debug[hidden] { display: none; }
+.debug {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--card);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.debug .head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.debug .head b { font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--amber); }
+.debug button { padding: 5px 10px; border-radius: 8px; font-size: 12px; }
+.debug button.on { background: var(--amber); color: #2b1d00; }
+.debug .muted { color: var(--muted); }
+.debug .bad { color: var(--live); }
+
+.debug .buf { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.debug .buf-num { font-size: 22px; font-weight: 700; min-width: 140px; }
+.debug .buf-num.ok { color: var(--accent); }
+.debug .buf-num.low { color: var(--amber); }
+.debug .buf-num.bad { color: var(--live); }
+.debug .buf-bar { position: relative; flex: 1; min-width: 160px; height: 12px; border-radius: 6px; background: #2c2c34; }
+.debug .buf-fill { height: 100%; border-radius: 6px; transition: width .2s; }
+.debug .buf-fill.ok { background: var(--accent); }
+.debug .buf-fill.low { background: var(--amber); }
+.debug .buf-fill.bad { background: var(--live); }
+.debug .buf-target { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+.debug .buf-target[hidden] { display: none; }
+.debug .buf-scale { position: absolute; right: 0; top: 14px; color: var(--muted); font-size: 10px; }
+.debug .buf-note { color: var(--muted); }
+
+.debug .spark { display: block; width: 100%; height: 60px; margin: 14px 0 8px; background: #111116; border-radius: 6px; }
+.debug .spark .line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.debug .spark .target { stroke: var(--muted); stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.debug .spark .stall { fill: rgba(255, 69, 58, .45); }
+.debug .spark .held { fill: rgba(255, 176, 32, .25); }
+
+.debug .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 4px 16px; margin: 8px 0; }
+
+.debug .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin: 10px 0; }
+.debug .controls input {
+  width: 56px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.debug .table-wrap { max-height: 360px; overflow: auto; border-top: 1px solid #2c2c34; }
+.debug table { width: 100%; border-collapse: collapse; }
+.debug th { position: sticky; top: 0; background: var(--card); text-align: left; color: var(--muted); font-weight: 500; padding: 6px 6px; }
+.debug td { padding: 3px 6px; border-top: 1px solid #222229; white-space: nowrap; }
+.debug td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.debug td.slow { color: var(--amber); }
+.debug tr.playlist td { color: #9fc3ff; }
+.debug tr.marker td { color: var(--muted); font-style: italic; }
+.debug tr.warn td { color: var(--amber); }
+.debug tr.bad td { color: var(--live); }
+.debug tr.dim td { color: #5a5a64; }
