@@ -19,8 +19,9 @@ struct LiveView: View {
     @StateObject private var banner = BannerState()
     @Environment(\.dismiss) private var dismiss
 
-    /// Channel name, seeded from the device on appear so a first
-    /// broadcast needs no typing but stays editable.
+    /// Channel name, seeded on appear from the last broadcast's name (or
+    /// the device's, the first time) so going live needs no typing but
+    /// stays editable.
     @State private var channel = ""
 
     var body: some View {
@@ -44,12 +45,24 @@ struct LiveView: View {
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .task {
-            if channel.isEmpty { channel = UIDevice.current.name }
+            if channel.isEmpty { channel = node.channel?.name ?? UIDevice.current.name }
+            // `-antstream-shot-live-idle` shows the screen before going
+            // live (the quality picker), with the sample plan installed
+            // so it reads as a device that could go live.
+            if RootView.shotArgs.contains("-antstream-shot-live-idle") {
+                for _ in 0..<60 where !node.status.isReady {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                node.installBroadcastSample()
+                return
+            }
             // `-antstream-shot-live` drives the whole pipeline from the
             // generated test pattern, which is the only way a runner (no
             // camera, no tap driver) can reach this screen's live state.
             guard RootView.shotArgs.contains("-antstream-shot-live") else { return }
-            for _ in 0..<60 where !node.status.isReady {
+            // Broadcasts go out on the account's permanent channel, which
+            // exists once the account has been read after `ant_init`.
+            for _ in 0..<60 where !node.status.isReady || node.channel == nil {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
             // A runner account has no storage plan, and going live is
@@ -174,11 +187,10 @@ struct LiveView: View {
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.7))
                 } else {
-                    Text("Publishes \(Int(broadcast.settings.segmentSeconds)) s segments at "
-                         + "\(broadcast.settings.bitrateKbps) kbit/s straight to Swarm, and updates "
-                         + "the channel's feed so viewers follow the live edge.")
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.7))
+                    qualityPicker
+                    if let ref = node.channelReference {
+                        channelLinkRow(ref)
+                    }
                 }
             }
         }
@@ -199,16 +211,8 @@ struct LiveView: View {
                 metric("UPLOAD p95", "\(progress.publishMsP95) ms")
                 metric("SENT", formatBytes(progress.bytesPublished))
             }
-            if !progress.channelReference.isEmpty {
-                Button {
-                    UIPasteboard.general.string = progress.channelReference
-                    banner.flash("Channel link copied")
-                } label: {
-                    Label("Copy channel link", systemImage: "link")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                .buttonStyle(.plain)
+            if let ref = liveReference(progress) {
+                channelLinkRow(ref)
             }
             if !progress.lastError.isEmpty {
                 Text(progress.lastError)
@@ -256,7 +260,64 @@ struct LiveView: View {
                         .foregroundStyle(.white.opacity(0.55))
                         .lineLimit(3)
                 }
+                if !report.channelReference.isEmpty {
+                    channelLinkRow(report.channelReference)
+                }
             }
+        }
+    }
+
+    // MARK: quality
+
+    /// The rendition, picked before going live (the encoder and the
+    /// playlist are set up for one). Remembered by ``LiveBroadcast``.
+    private var qualityPicker: some View {
+        let quality = broadcast.quality
+        let mbit = Double(quality.bitrateKbps) / 1000
+        let mbPerHour = quality.bitrateKbps * 450 / 1000
+        return VStack(alignment: .leading, spacing: 8) {
+            Picker("Quality", selection: $broadcast.quality) {
+                ForEach(CaptureEngine.Quality.allCases) { q in
+                    Text(q.label).tag(q)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text("\(quality.label) uses about \(String(format: "%.1f", mbit)) Mbit/s "
+                 + "(\(mbPerHour) MB per hour) in \(Int(broadcast.settings.segmentSeconds)) s "
+                 + "segments. Lower is more reliable on mobile data.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.7))
+        }
+    }
+
+    // MARK: channel link
+
+    /// The reference the running broadcast reports, or the permanent
+    /// channel's before the publisher has created its manifest.
+    private func liveReference(_ progress: PublisherSnapshot) -> String? {
+        progress.channelReference.isEmpty ? node.channelReference : progress.channelReference
+    }
+
+    /// Copy the reference, or share the web player links for it (the
+    /// same text the Broadcast tab's channel card sends).
+    private func channelLinkRow(_ reference: String) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                UIPasteboard.general.string = reference
+                banner.flash("Channel reference copied")
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            ShareLink(item: Channel.watchLinks(reference)) {
+                Label("Share channel link", systemImage: "square.and.arrow.up")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            Spacer()
         }
     }
 

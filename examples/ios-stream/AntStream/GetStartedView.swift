@@ -28,6 +28,10 @@ struct GetStartedView: View {
     /// One-shot guard so funds-detected auto-activation fires only once per
     /// payment session (a failed activation must not re-trigger a loop).
     @State private var didAutoActivate = false
+    /// The payment step's ⓘ sheet: everything a payer may need beyond
+    /// the amount and the code.
+    @State private var showPaymentHelp = false
+    @StateObject private var banner = BannerState()
 
     var body: some View {
         NavigationStack {
@@ -39,14 +43,27 @@ struct GetStartedView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if step == .payment {
-                        Button("Back") {
+                        Button {
                             withAnimation { step = .plan; quote = nil; didAutoActivate = false }
+                        } label: {
+                            Image(systemName: "chevron.left")
                         }
+                        .accessibilityLabel("Back")
                     } else if step == .plan {
                         Button("Close") { dismiss() }
                     }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if step == .payment {
+                        Button { showPaymentHelp = true } label: {
+                            Image(systemName: "info.circle")
+                        }
+                        .accessibilityLabel("How to pay")
+                    }
+                }
             }
+            .overlay(alignment: .top) { BannerView(message: banner.message) }
+            .sheet(isPresented: $showPaymentHelp) { paymentHelp }
         }
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled(step == .activating)
@@ -61,6 +78,14 @@ struct GetStartedView: View {
                 selected = StoragePlanTier.all.first
                 quote = Self.screenshotSampleQuote
                 step = .payment
+                // `-antstream-shot-getstarted-help` also opens the ⓘ sheet,
+                // where the deposit line and the Gnosis-only warning live.
+                if RootView.shotArgs.contains("-antstream-shot-getstarted-help") {
+                    for _ in 0..<30 where node.account == nil {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                    showPaymentHelp = true
+                }
             } else {
                 await loadPlans()
             }
@@ -175,41 +200,49 @@ struct GetStartedView: View {
 
     // MARK: Step 2 — payment information
 
-    /// Stripped to the essentials: how much xDAI to send, where to send it,
-    /// a live waiting/received status (driven by the balance poll), and
-    /// Activate. No price breakdown, no manual refresh, no prose.
+    /// Kept to what a payer needs, like the Android app's payment step
+    /// and what payment processors (Coinbase Commerce, BitPay) show: the
+    /// exact amount, the network, a QR code a wallet fills everything in
+    /// from (address, Gnosis, amount), the address with one-tap copy and
+    /// a sign that we're waiting. The plan activates by itself once the
+    /// funds land. Everything else (the full address, copy buttons, the
+    /// Gnosis-only warning, what the deposit is for) sits behind the ⓘ.
     @ViewBuilder private var paymentStep: some View {
         if let quote {
             VStack(spacing: 22) {
                 Spacer(minLength: 0)
 
                 if quote.sufficientFunds {
-                    Label("Payment received", systemImage: "checkmark.circle.fill")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.green)
-                } else {
-                    sendCard(quote)
+                    receivedState
+                } else if let addr = node.account?.ethAddress {
+                    let send = PriceOracle.roundedUpXdai(quote.xdaiToSendDisplay)
+                    amountHeader(send)
+                    AddressQRCode(address: addr, xdaiAmount: send, size: 200)
+                    Button {
+                        UIPasteboard.general.string = addr
+                        banner.flash("Address copied")
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text("to \(addr.prefix(8))…\(addr.suffix(6))")
+                                .font(.subheadline.monospaced())
+                                .foregroundStyle(.white)
+                            Text("Copy")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.blue)
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(.white.opacity(0.08), in: .rect(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
                     HStack(spacing: 8) {
-                        ProgressView().controlSize(.small).tint(.white)
-                        Text("Waiting for payment…")
+                        ProgressView().controlSize(.small).tint(.white.opacity(0.7))
+                        Text("Waiting for payment")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
                     }
+                } else {
+                    ProgressView().tint(.white)
                 }
-
-                Spacer(minLength: 0)
-
-                Button { activate() } label: {
-                    Text("Activate")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .glassEffect(.regular.tint(.blue.opacity(quote.sufficientFunds ? 0.6 : 0.2)),
-                                     in: .capsule)
-                        .foregroundStyle(.white.opacity(quote.sufficientFunds ? 1 : 0.5))
-                }
-                .buttonStyle(.plain)
-                .disabled(!quote.sufficientFunds)
 
                 if let error {
                     Text(error)
@@ -217,58 +250,121 @@ struct GetStartedView: View {
                         .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
                 }
+
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity)
             .padding(24)
             .task { await pollForPayment() }
         }
     }
 
-    /// The single instruction: send this much xDAI to this address (tap to
-    /// copy). Everything else the user needs is already on the plan picker.
-    private func sendCard(_ quote: StorageQuote) -> some View {
-        let send = PriceOracle.roundedUpXdai(quote.xdaiToSendDisplay)
-        return GlassCard {
-            VStack(spacing: 16) {
-                VStack(spacing: 2) {
-                    Text("Send")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.6))
-                    Text("\(send) xDAI")
-                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
-                        .foregroundStyle(.white)
-                }
-                if let addr = node.account?.ethAddress {
-                    AddressQRCode(address: addr, xdaiAmount: send)
-                        .frame(maxWidth: .infinity)
-                    Button {
-                        UIPasteboard.general.string = addr
-                    } label: {
-                        HStack {
-                            Text(addr)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.white)
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer()
-                            Image(systemName: "doc.on.doc")
-                                .foregroundStyle(.white.opacity(0.85))
-                        }
-                        .padding(12)
-                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
-                    }
-                    .buttonStyle(.plain)
-                }
-                if includesSettlementDeposit(quote) {
-                    // Say what the extra buys. The price also covers a
-                    // one-time deposit the node puts behind the account it
-                    // pays the network from — without it publishing stalls
-                    // once peers stop extending credit.
-                    Text("Includes a one-time \(quote.settlementDepositBzz) xBZZ network deposit that keeps your broadcast flowing.")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
-                        .multilineTextAlignment(.center)
+    /// "Send exactly" + the amount (tap to copy) + the network badge.
+    private func amountHeader(_ send: String) -> some View {
+        VStack(spacing: 6) {
+            Text("Send exactly")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.6))
+            Button {
+                UIPasteboard.general.string = send
+                banner.flash("Amount copied")
+            } label: {
+                Text("\(send) xDAI")
+                    .font(.system(size: 40, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+            HStack(spacing: 6) {
+                Circle().fill(.green).frame(width: 8, height: 8)
+                Text("on Gnosis Chain")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 5)
+            .background(.green.opacity(0.15), in: .capsule)
+            .padding(.top, 4)
+        }
+    }
+
+    /// The funds are in. Activation normally starts by itself; this is
+    /// only on screen around it, or after a failed activation, when
+    /// Activate is the manual retry.
+    private var receivedState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.green)
+            Text("Received")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.8))
+            if error != nil {
+                GlassPillButton(title: "Activate", icon: "bolt.fill",
+                                tint: .blue.opacity(0.5)) {
+                    activate()
                 }
             }
         }
+    }
+
+    /// The ⓘ sheet.
+    @ViewBuilder private var paymentHelp: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let quote, let addr = node.account?.ethAddress {
+                        let send = PriceOracle.roundedUpXdai(quote.xdaiToSendDisplay)
+                        Text("Scan the code with your wallet, or send \(send) xDAI to:")
+                            .font(.subheadline)
+                        Text(addr)
+                            .font(.footnote.monospaced())
+                            .textSelection(.enabled)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                        HStack(spacing: 10) {
+                            GlassPillButton(title: "Copy address", icon: "doc.on.doc") {
+                                UIPasteboard.general.string = addr
+                                banner.flash("Address copied")
+                            }
+                            GlassPillButton(title: "Copy amount", icon: "doc.on.doc") {
+                                UIPasteboard.general.string = send
+                                banner.flash("Amount copied")
+                            }
+                        }
+                        Label("Only on Gnosis Chain (chain ID 100). Don't send from Ethereum mainnet or another network: the address is the same there, but those funds won't reach your node.",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                        if includesSettlementDeposit(quote) {
+                            // Say what the extra buys. The price also covers
+                            // a one-time deposit the node puts behind the
+                            // account it pays the network from — without it
+                            // publishing stalls once peers stop extending
+                            // credit.
+                            Text("Includes a one-time \(quote.settlementDepositBzz) xBZZ network deposit that keeps your broadcast flowing.")
+                                .font(.footnote)
+                                .foregroundStyle(.white.opacity(0.65))
+                        }
+                        Text("This screen notices the payment by itself and activates your plan; keep the app open until it does.")
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.65))
+                    } else {
+                        ProgressView().frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(20)
+            }
+            .navigationTitle("How to pay")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showPaymentHelp = false }
+                }
+            }
+        }
+        .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .presentationDetents([.medium, .large])
+        .preferredColorScheme(.dark)
     }
 
     /// Whether this price carries the one-time settlement deposit — i.e.

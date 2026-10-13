@@ -405,7 +405,7 @@ struct StorageView: View {
                     .foregroundStyle(.white.opacity(0.6))
                 row("Status", node.status.label)
                 row("Connections", "\(node.peerCount)")
-                row("Gateway", node.gatewayUp ? AntNode.gatewayAddress : "not running")
+                row("Gateway", node.gatewayUp ? node.gatewayAddress : (node.gatewayError ?? "not running"))
                 if let agent = node.account?.agent { row("Version", agent) }
             }
         }

@@ -38,7 +38,11 @@
         <!--
             BZZ / libp2p traffic is Noise XX over raw TCP, not TLS, so ATS
             would reject every dial. The in-process bee gateway also serves
-            plain HTTP on 127.0.0.1. Scoped to this demo app; a production
+            plain HTTP on 127.0.0.1: the publisher posts to it, and the
+            Watch tab's AVPlayer plays channels from it. (Adding
+            NSAllowsLocalNetworking here would make iOS ignore
+            NSAllowsArbitraryLoads, so it is left out: arbitrary loads
+            already cover loopback.) Scoped to this demo app; a production
             artefact keeps ATS on and punches host-scoped holes instead.
         -->
         <key>NSAllowsArbitraryLoads</key>
@@ -59,5 +63,7 @@
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>

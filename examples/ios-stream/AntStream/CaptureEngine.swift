@@ -58,6 +58,48 @@ final class CaptureEngine: NSObject {
         }
     }
 
+    /// The renditions the live screen offers, as on Android
+    /// (`CaptureEngine.Quality`). Mobile uplinks are what limits a
+    /// broadcast (the stage-1 bench, #74), so the default is the
+    /// lightest.
+    enum Quality: String, CaseIterable, Identifiable {
+        case low, medium, high
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .low: return "360p"
+            case .medium: return "540p"
+            case .high: return "720p"
+            }
+        }
+
+        var width: Int {
+            switch self {
+            case .low: return 640
+            case .medium: return 960
+            case .high: return 1280
+            }
+        }
+
+        var height: Int {
+            switch self {
+            case .low: return 360
+            case .medium: return 540
+            case .high: return 720
+            }
+        }
+
+        var bitrateKbps: Int {
+            switch self {
+            case .low: return 600
+            case .medium: return 1000
+            case .high: return 1800
+            }
+        }
+    }
+
     /// Where the frames come from.
     enum Source: Equatable {
         /// The device camera and microphone.
@@ -799,5 +841,17 @@ extension CaptureEngine: AVAssetWriterDelegate {
                 fileURL: url
             )
         )
+    }
+}
+
+extension CaptureEngine.Settings {
+    /// The rendition for a quality preset; segment length, frame rate and
+    /// the ring keep their defaults. In an extension so the memberwise
+    /// and default initializers stay available.
+    init(quality: CaptureEngine.Quality) {
+        self.init()
+        width = quality.width
+        height = quality.height
+        bitrateKbps = quality.bitrateKbps
     }
 }

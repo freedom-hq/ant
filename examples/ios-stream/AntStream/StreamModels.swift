@@ -505,6 +505,10 @@ struct PublisherReport: Codable, Equatable {
     let chunksPublished: UInt64
     let playlistsPublished: UInt64
     let feedUpdates: UInt64
+    /// The next feed update's index: where the permanent channel's next
+    /// broadcast starts (its `start_index`). Optional so a report from a
+    /// node without it still decodes.
+    let feedIndex: UInt64?
     let sustainedMbitS: Double
     let sustainedChunksS: Double
     let publishMsP50: UInt64
@@ -537,6 +541,7 @@ struct PublisherReport: Codable, Equatable {
         case chunksPublished = "chunks_published"
         case playlistsPublished = "playlists_published"
         case feedUpdates = "feed_updates"
+        case feedIndex = "feed_index"
         case sustainedMbitS = "sustained_mbit_s"
         case sustainedChunksS = "sustained_chunks_s"
         case publishMsP50 = "publish_ms_p50"

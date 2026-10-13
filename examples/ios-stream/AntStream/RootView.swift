@@ -1,9 +1,21 @@
 import SwiftUI
 
-/// Two-tab shell: Broadcast (going live) and Storage (plan / account).
-/// iOS 26 renders the tab bar as a floating glass pill for free.
+/// Three-tab shell, as on Android: Broadcast (going live), Watch (play a
+/// channel) and Storage (plan / account). iOS 26 renders the tab bar as
+/// a floating glass pill for free.
 struct RootView: View {
     @EnvironmentObject var node: AntNode
+
+    enum TabID: Hashable { case broadcast, watch, storage }
+
+    @State private var tab: TabID = RootView.shotArgs.contains("-antstream-shot-watch")
+        ? .watch : .broadcast
+    /// The Watch tab's reference field and what it plays. Owned here so
+    /// the Broadcast tab's channel card can hand a channel over.
+    @State private var watchReference = RootView.shotArgs.contains("-antstream-shot-watch")
+        ? Channel.sampleReference : ""
+    @State private var watchPlaying: String? = RootView.shotArgs.contains("-antstream-shot-watch")
+        ? Channel.sampleReference : nil
 
     /// Launch-argument hooks for the `antstream-visual` CI workflow.
     ///
@@ -15,16 +27,18 @@ struct RootView: View {
     /// channel as `-antstreamShowBench` on the Broadcast side.
     ///
     /// Inert in normal use: nothing passes these arguments outside CI, so
-    /// the app boots into the two-tab shell exactly as before.
+    /// the app boots into the tab shell exactly as before.
     static let shotArgs = Set(ProcessInfo.processInfo.arguments)
 
     var body: some View {
-        if Self.shotArgs.contains("-antstream-shot-live") {
+        if Self.shotArgs.contains("-antstream-shot-live")
+            || Self.shotArgs.contains("-antstream-shot-live-idle") {
             // The going-live screen (#67 stage 2 / #65) full-screen, so
             // CI can capture a broadcast actually running: `LiveView`
             // sees the same flag and starts one from the generated test
             // pattern, since a runner has neither a camera nor a tap
-            // driver.
+            // driver. `-antstream-shot-live-idle` stops short of going
+            // live, to capture the quality picker.
             LiveView().preferredColorScheme(.dark)
         } else if Self.shotArgs.contains("-antstream-shot-getstarted") {
             // The buy flow (Get Started) full-screen, so CI can capture
@@ -42,16 +56,30 @@ struct RootView: View {
         }
     }
 
+    /// `-antstream-shot-channel` and `-antstream-shot-watch` land here
+    /// too: the first on the Broadcast tab's channel card (BroadcastView
+    /// installs the sample state), the second on the Watch tab already
+    /// playing a sample channel (see the `@State` seeds above).
     private var tabs: some View {
-        TabView {
-            Tab("Broadcast", systemImage: "dot.radiowaves.left.and.right") {
-                BroadcastView()
+        TabView(selection: $tab) {
+            Tab("Broadcast", systemImage: "dot.radiowaves.left.and.right", value: TabID.broadcast) {
+                BroadcastView(onWatch: { watch($0) })
             }
-            Tab("Storage", systemImage: "externaldrive.fill") {
+            Tab("Watch", systemImage: "play.rectangle.fill", value: TabID.watch) {
+                WatchView(reference: $watchReference, playing: $watchPlaying)
+            }
+            Tab("Storage", systemImage: "externaldrive.fill", value: TabID.storage) {
                 StorageView()
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .preferredColorScheme(.dark)
+    }
+
+    /// Open a channel on the Watch tab, already playing.
+    private func watch(_ reference: String) {
+        watchReference = reference
+        watchPlaying = WatchView.normalised(reference)
+        tab = .watch
     }
 }
