@@ -2206,10 +2206,14 @@ async fn refresh_retrieval_funds(
     client: &ant_chain::ChainClient,
     chequebook: [u8; 20],
 ) {
-    match ant_chain::chequebook_store::read_retrieval_funds(client, &chequebook).await {
-        Ok(funds) => {
-            publish_retrieval_funds(cmd_tx, chequebook, funds).await;
-        }
+    match ant_chain::chequebook_store::read_and_publish_retrieval_funds(
+        client,
+        &chequebook,
+        |funds| publish_retrieval_funds(cmd_tx, chequebook, funds),
+    )
+    .await
+    {
+        Ok(_) => {}
         Err(e) => tracing::debug!(
             target: "ant-ffi",
             chequebook = %format!("0x{}", hex::encode(chequebook)),

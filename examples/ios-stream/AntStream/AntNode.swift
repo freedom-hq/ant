@@ -921,23 +921,37 @@ final class AntNode: ObservableObject {
     /// transfer. So the wallet is read again right before sending, and a
     /// wallet that no longer holds `plur` stops here with nothing sent
     /// instead of swapping.
+    ///
+    /// The re-read and the top-up run inside one handle borrow, so both go
+    /// to the same node: an account switch can't land between them and
+    /// top up (or swap from) another account's wallet than the one just
+    /// checked. The wallet read must also be the account the card showed
+    /// when the user confirmed.
     func addCredit(rpc: String, plur: Decimal) async throws {
         let amount = plurString(plur)
-        let walletJson = try await ffiString(name: "wallet balance") { h, errPtr in
-            rpc.withCString { ant_wallet_balance(h, $0, errPtr) }
-        }
-        guard let w = WalletBalance.parse(walletJson) else {
-            throw AntError.op("could not read the wallet; nothing was sent")
-        }
-        if w.bzzPlur < plur {
-            throw AntError.op(
-                "your wallet now holds \(formatBzz(w.bzzPlur)), less than \(formatBzz(plur)); nothing was sent"
-            )
-        }
-        let json = try await ffiString(name: "add to credit") { h, errPtr in
-            rpc.withCString { r in
-                amount.withCString { ant_storage_settlement_topup_amount(h, r, $0, errPtr) }
+        let confirmedAddress = account?.ethAddress.lowercased()
+        guard let json = try await withHandle({ h -> String in
+            let walletJson = try await Self.string(name: "wallet balance") { errPtr in
+                rpc.withCString { ant_wallet_balance(h, $0, errPtr) }
             }
+            guard let w = WalletBalance.parse(walletJson) else {
+                throw AntError.op("could not read the wallet; nothing was sent")
+            }
+            guard let confirmedAddress, w.address.lowercased() == confirmedAddress else {
+                throw AntError.op("the account changed (or isn't loaded yet); nothing was sent")
+            }
+            if w.bzzPlur < plur {
+                throw AntError.op(
+                    "your wallet now holds \(formatBzz(w.bzzPlur)), less than \(formatBzz(plur)); nothing was sent"
+                )
+            }
+            return try await Self.string(name: "add to credit") { errPtr in
+                rpc.withCString { r in
+                    amount.withCString { ant_storage_settlement_topup_amount(h, r, $0, errPtr) }
+                }
+            }
+        }) else {
+            throw AntError.notReady
         }
         await afterChequebookChange(json, rpc: rpc)
     }

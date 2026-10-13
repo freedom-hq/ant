@@ -376,6 +376,8 @@ impl ChainWriter for AntChainWriter {
             .erc20_transfer(&self.client, &self.bzz_token, &cb, U256::from(amount))
             .await
             .map_err(|e| format!("deposit transfer: {e}"))?;
+        // A withdrawal from the last minutes mustn't hide this deposit.
+        ant_chain::chequebook_store::note_deposit(&cb, amount);
         Ok(receipt.tx_hash)
     }
 

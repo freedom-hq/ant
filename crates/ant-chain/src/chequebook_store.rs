@@ -491,6 +491,7 @@ pub async fn top_up_chequebook(
         )
         .await
         .map_err(|e| ChequebookError::Chain(format!("deposit transfer: {e}")))?;
+    note_deposit(chequebook, amount);
     Ok(TopUp::Funded {
         amount,
         tx: receipt.tx_hash,
@@ -506,7 +507,7 @@ pub struct RetrievalFunds {
     /// xBZZ ever deposited and not withdrawn, in PLUR: the chequebook's
     /// balance plus what beneficiaries have already cashed
     /// (`totalPaidOut`), less any [`withdraw_from_chequebook`] in this
-    /// process that is in flight or confirmed but not yet shown by the
+    /// process that is in flight or sent but not yet shown by the
     /// read (see [`WITHDRAWING`]). Bee's `AvailableBalance` is this minus every
     /// cheque issued so far, which only the issuing node knows.
     pub deposited_plur: u128,
@@ -528,7 +529,7 @@ pub const RETRIEVAL_FUNDS_REFRESH: std::time::Duration = std::time::Duration::fr
 /// `totalPaidOut()`, and bee's price oracle (`getPrice()`). Any failed
 /// read is an error, never a zero: the caller keeps what it knew. While
 /// [`withdraw_from_chequebook`] runs on `chequebook` in this process, and
-/// for [`LANDED_WITHDRAWAL_TTL`] after it confirms on any read that
+/// for [`LANDED_WITHDRAWAL_TTL`] after it is sent, on any read that
 /// doesn't show it, the deposit it reports is lowered by the amount
 /// withdrawn.
 #[cfg(feature = "chain-rpc")]
@@ -602,12 +603,9 @@ pub async fn watch_retrieval_funds<F, Fut>(
     Fut: std::future::Future<Output = bool>,
 {
     loop {
-        match read_retrieval_funds(&client, &chequebook).await {
-            Ok(funds) => {
-                if !publish(funds).await {
-                    return;
-                }
-            }
+        match read_and_publish_retrieval_funds(&client, &chequebook, &mut publish).await {
+            Ok((_, true)) => {}
+            Ok((_, false)) => return,
             Err(e) => tracing::debug!(
                 target: "ant_chain::chequebook_store",
                 chequebook = %hex::encode(chequebook),
@@ -617,6 +615,40 @@ pub async fn watch_retrieval_funds<F, Fut>(
         tokio::time::sleep(RETRIEVAL_FUNDS_REFRESH).await;
     }
 }
+
+/// Read `chequebook`'s [`RetrievalFunds`] and hand them to `publish`
+/// (which returns `false` once the node is gone), holding
+/// [`FUNDS_PUBLISH`] across both, so no read taken before a
+/// [`withdraw_from_chequebook`] reserves its amount can reach the node
+/// after the lowered funds it publishes. Every publisher of a fresh read
+/// goes through this: [`watch_retrieval_funds`], the entry points'
+/// refresh after a deposit, and the withdrawal's own re-read. A failed
+/// read publishes nothing.
+#[cfg(feature = "chain-rpc")]
+pub async fn read_and_publish_retrieval_funds<F, Fut>(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+    publish: F,
+) -> Result<(RetrievalFunds, bool), ChequebookError>
+where
+    F: FnOnce(RetrievalFunds) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let _ordered = FUNDS_PUBLISH.lock().await;
+    let funds = read_retrieval_funds(client, chequebook).await?;
+    Ok((funds, publish(funds).await))
+}
+
+/// Held from a funds read until the node has it
+/// ([`read_and_publish_retrieval_funds`]), and by [`withdraw_from_chequebook`]
+/// from its reservation until the node has the lowered funds (and, on a
+/// refusal, from releasing it until the node has the funds back). Without
+/// it a read computed just before the reservation (the full deposit)
+/// could land at the node after the lowered figure and stand while the
+/// transaction confirms. One lock for every chequebook: the reads it
+/// covers are once a minute per node.
+#[cfg(feature = "chain-rpc")]
+static FUNDS_PUBLISH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Withdrawals in this process, per chequebook, that a chain read may
 /// not show yet: PLUR a [`withdraw_from_chequebook`] may be taking out
@@ -636,9 +668,17 @@ static WITHDRAWING: std::sync::Mutex<std::collections::BTreeMap<[u8; 20], Withdr
 /// that shows it proves nothing about the next: behind a load-balanced
 /// RPC, a backend a block behind can still answer the pre-withdrawal
 /// deposit after a caught-up one answered, so the entry stays the whole
-/// TTL. The cost is a deposit landing meanwhile: it lifts the read above
-/// the withdrawal's ceiling and is under-reported (the safe way) by up
-/// to the amount withdrawn until the entry expires.
+/// TTL. A deposit this process makes meanwhile raises the ceiling with
+/// it ([`note_deposit`]), so it counts in full at once; one made from
+/// elsewhere (another process, a plain transfer) lifts the read above
+/// the ceiling and is under-reported (the safe way) by up to the amount
+/// withdrawn until the entry expires.
+///
+/// A withdrawal whose transaction was sent but not seen to confirm (the
+/// receipt wait timed out, an RPC error after the send, the call was
+/// cancelled) is kept the same way, from when the call gave up: if it
+/// is still pending it may land at any moment. One still unmined
+/// [`LANDED_WITHDRAWAL_TTL`] after that is no longer covered.
 #[cfg(feature = "chain-rpc")]
 const LANDED_WITHDRAWAL_TTL: std::time::Duration = std::time::Duration::from_mins(10);
 
@@ -653,14 +693,17 @@ struct Withdrawals {
     landed: Vec<Landed>,
 }
 
-/// A confirmed withdrawal of `amount` PLUR. A read whose deposit is
-/// above `ceiling` (the deposit right before it, less `amount`) may come
-/// from a backend that hasn't seen the transaction: the deposit only
-/// drops through withdrawals, so it gets `amount` taken off. A read at
-/// or below `ceiling` shows it and is left as is, but the entry stays
+/// A withdrawal of `amount` PLUR that confirmed (or may still: sent, but
+/// the call gave up before its receipt). A read whose deposit is above
+/// `ceiling` (the deposit right before it, less `amount`, plus every
+/// deposit this process made since, see [`note_deposit`]) may come from
+/// a backend that hasn't seen the transaction: the deposit only drops
+/// through withdrawals, so it gets `amount` taken off. A read at or
+/// below `ceiling` shows it and is left as is, but the entry stays
 /// until `expires`: the next read may come from a backend that is still
-/// behind. If a deposit lands meanwhile, the read stays above `ceiling`
-/// and is under-reported (the safe way) until `expires`.
+/// behind. If a deposit from elsewhere lands meanwhile, the read stays
+/// above `ceiling` and is under-reported (the safe way) until
+/// `expires`.
 #[cfg(feature = "chain-rpc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Landed {
@@ -714,6 +757,26 @@ fn withdrawals_applied(chequebook: &[u8; 20], raw: u128) -> u128 {
     deposited
 }
 
+/// `amount` PLUR were just deposited into `chequebook` by this process
+/// (a confirmed transfer): raise the ceiling of every [`Landed`]
+/// withdrawal on it by as much, so a read that shows both the
+/// withdrawal and the deposit isn't taken for one that shows neither
+/// and the deposit counts at once. Still safe on a lagging backend: one
+/// that shows the deposit but not the withdrawal reads above the raised
+/// ceiling and still has it taken off; one that shows neither reads at
+/// most the pre-withdrawal deposit, which is then either taken off
+/// (above the ceiling) or not more than what the chain now holds.
+/// Called by [`top_up_chequebook`] and `ant-gateway`'s
+/// `POST /chequebook/deposit`.
+#[cfg(feature = "chain-rpc")]
+pub fn note_deposit(chequebook: &[u8; 20], amount: u128) {
+    if let Some(w) = withdrawing_map().get_mut(chequebook) {
+        for l in &mut w.landed {
+            l.ceiling = l.ceiling.saturating_add(amount);
+        }
+    }
+}
+
 /// PLUR being withdrawn from `chequebook` right now (see [`WITHDRAWING`]).
 #[cfg(all(test, feature = "chain-rpc"))]
 fn withdrawing(chequebook: &[u8; 20]) -> u128 {
@@ -722,37 +785,46 @@ fn withdrawing(chequebook: &[u8; 20]) -> u128 {
 
 /// One withdrawal's in-flight PLUR in [`WITHDRAWING`], removed on drop:
 /// on every way out of [`withdraw_from_chequebook`], including a
-/// cancelled future. [`WithdrawReservation::landed`] first adds a
-/// [`Landed`] entry for it.
+/// cancelled future. Once [`WithdrawReservation::sending`] was called
+/// the transaction may be on its way, so the drop first adds a
+/// [`Landed`] entry for it, unless [`WithdrawReservation::not_sent`]
+/// says it can't have taken anything out. The landed entry goes in
+/// before the in-flight amount comes out (one lock), so no read sees
+/// neither.
 #[cfg(feature = "chain-rpc")]
 struct WithdrawReservation {
     chequebook: [u8; 20],
     amount: u128,
+    /// The deposit right before the withdrawal.
+    before: u128,
+    sending: bool,
 }
 
 #[cfg(feature = "chain-rpc")]
 impl WithdrawReservation {
-    fn new(chequebook: [u8; 20], amount: u128) -> Self {
+    fn new(chequebook: [u8; 20], amount: u128, before: u128) -> Self {
         let mut map = withdrawing_map();
         let entry = map.entry(chequebook).or_default();
         entry.in_flight = entry.in_flight.saturating_add(amount);
-        Self { chequebook, amount }
+        Self {
+            chequebook,
+            amount,
+            before,
+            sending: false,
+        }
     }
 
-    /// The withdrawal confirmed, from a deposit of `before`: keep taking
-    /// it off reads that don't show it yet (see [`Landed`]). The landed
-    /// entry goes in before the in-flight amount comes out, so a read in
-    /// between sees both (under-reports, the safe way), never neither.
-    fn landed(self, before: u128) {
-        withdrawing_map()
-            .entry(self.chequebook)
-            .or_default()
-            .landed
-            .push(Landed {
-                amount: self.amount,
-                ceiling: before.saturating_sub(self.amount),
-                expires: std::time::Instant::now() + LANDED_WITHDRAWAL_TTL,
-            });
+    /// The transaction goes out now: from here on, however the call
+    /// ends (confirmed, a receipt timeout, an RPC error, a cancelled
+    /// future), the withdrawal is kept off reads that don't show it.
+    fn sending(&mut self) {
+        self.sending = true;
+    }
+
+    /// The transaction took nothing out (it reverted, or was never
+    /// signed): just release the amount.
+    fn not_sent(mut self) {
+        self.sending = false;
     }
 }
 
@@ -760,6 +832,13 @@ impl WithdrawReservation {
 impl Drop for WithdrawReservation {
     fn drop(&mut self) {
         let mut map = withdrawing_map();
+        if self.sending {
+            map.entry(self.chequebook).or_default().landed.push(Landed {
+                amount: self.amount,
+                ceiling: self.before.saturating_sub(self.amount),
+                expires: std::time::Instant::now() + LANDED_WITHDRAWAL_TTL,
+            });
+        }
         if let Some(w) = map.get_mut(&self.chequebook) {
             w.in_flight = w.in_flight.saturating_sub(self.amount);
             if w.is_empty() {
@@ -902,12 +981,15 @@ fn withdrawable(funds: &RetrievalFunds, issued: u128, liquid: u128) -> u128 {
 /// again and checked once more, so a cheque issued in between still
 /// counts. Only then is `withdraw` sent. Afterwards the funds are read
 /// back and handed to the node, so its `paying`/`available_plur` follow
-/// at once. On success the reservation becomes a landed withdrawal that
-/// every read that doesn't show it keeps taking off for
-/// [`LANDED_WITHDRAWAL_TTL`] (see [`Landed`]), so a lagging or
+/// at once. Once the transaction is sent, the reservation becomes a
+/// landed withdrawal that every read that doesn't show it keeps taking
+/// off for [`LANDED_WITHDRAWAL_TTL`] (see [`Landed`]), so a lagging or
 /// load-balanced RPC answering with the pre-withdrawal deposit, even
 /// after another backend already showed it, doesn't hand the node xBZZ
-/// that has left; on failure it is released.
+/// that has left. The same holds when the call never sees the receipt
+/// (a timeout, an RPC error, a cancelled future), since the transaction
+/// may still land; only a revert, or a transaction never signed,
+/// releases it.
 ///
 /// A refusal before the transaction sends nothing and gives the node its
 /// unlowered funds back. The caller holds its wallet tx lock around the
@@ -965,7 +1047,10 @@ where
         });
     }
 
-    let reservation = WithdrawReservation::new(*chequebook, amount);
+    // Held until the node has the lowered funds: a funds read taken
+    // before the reservation can't reach the node after them.
+    let ordered = FUNDS_PUBLISH.lock().await;
+    let mut reservation = WithdrawReservation::new(*chequebook, amount, funds.deposited_plur);
     let lowered = RetrievalFunds {
         deposited_plur: funds.deposited_plur.saturating_sub(amount),
         ..funds
@@ -975,6 +1060,7 @@ where
             "the node stopped; nothing was withdrawn".into(),
         ));
     }
+    drop(ordered);
     // Cheques issued before the node had the lowered funds count now.
     let refused = match issued().await {
         Err(e) => Some(WithdrawError::IssuedUnknown(e)),
@@ -987,26 +1073,34 @@ where
         }
     };
     if let Some(e) = refused {
+        let _ordered = FUNDS_PUBLISH.lock().await;
         drop(reservation);
         publish(funds).await;
         return Err(e);
     }
 
+    // From here the transaction may be out: the reservation becomes a
+    // landed withdrawal however this ends, a cancelled future included
+    // (the gateway's client hanging up mid-wait), unless the chain says
+    // it took nothing. The backend answering the next reads may not
+    // have the block yet, or the transaction may still be pending: keep
+    // the amount off every read that doesn't show it.
+    reservation.sending();
     let sent = wallet
         .withdraw_from_chequebook(client, chequebook, primitive_types::U256::from(amount))
         .await;
-    if sent.is_ok() {
-        // The backend answering the next reads may not have the block
-        // yet: keep the amount off every read that doesn't show it.
-        reservation.landed(funds.deposited_plur);
-    } else {
-        drop(reservation);
+    match &sent {
+        Err(
+            crate::tx::TxError::Reverted { .. }
+            | crate::tx::TxError::Crypto(_)
+            | crate::tx::TxError::Rlp(_),
+        ) => reservation.not_sent(),
+        // Confirmed, or maybe still pending (a receipt timeout, an RPC
+        // error that may have come after the send).
+        _ => drop(reservation),
     }
-    let after = match read_retrieval_funds(client, chequebook).await {
-        Ok(after) => {
-            publish(after).await;
-            Some(after)
-        }
+    let after = match read_and_publish_retrieval_funds(client, chequebook, &mut publish).await {
+        Ok((after, _)) => Some(after),
         Err(e) => {
             tracing::debug!(
                 target: "ant_chain::chequebook_store",
@@ -1534,6 +1628,10 @@ mod tests {
         lagging_reads: std::sync::Mutex<u32>,
         /// The balance before the last withdrawal.
         before: std::sync::Mutex<Option<u128>>,
+        /// The `withdraw` receipt's status: `Some("0x1")` mines it at
+        /// once (the amount leaves the balance), `Some("0x0")` reverts
+        /// it, `None` leaves it pending (no receipt, balance untouched).
+        receipt: std::sync::Mutex<Option<&'static str>>,
     }
 
     #[cfg(feature = "chain-rpc")]
@@ -1582,10 +1680,11 @@ mod tests {
                     assert_eq!(to, self.cb);
                     assert_eq!(hex::encode(&input[..4]), "2e1a7d4d", "withdraw(uint256)");
                     let amount = u128::from_be_bytes(input[20..36].try_into().unwrap());
-                    let mut balance = self.balance.lock().unwrap();
-                    *self.before.lock().unwrap() = Some(*balance);
-                    *balance -= amount;
-                    drop(balance);
+                    if *self.receipt.lock().unwrap() == Some("0x1") {
+                        let mut balance = self.balance.lock().unwrap();
+                        *self.before.lock().unwrap() = Some(*balance);
+                        *balance -= amount;
+                    }
                     self.withdrawn
                         .lock()
                         .unwrap()
@@ -1593,11 +1692,13 @@ mod tests {
                     word(1)
                 }
                 "eth_getTransactionReceipt" => {
+                    let result = self.receipt.lock().unwrap().map(|status| {
+                        serde_json::json!({"status": status, "blockNumber": "0x1", "logs": []})
+                    });
                     return Some(
-                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-                            "status": "0x1", "blockNumber": "0x1", "logs": []}})
-                        .to_string(),
-                    )
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    );
                 }
                 other => panic!("unscripted method {other}"),
             };
@@ -1622,6 +1723,7 @@ mod tests {
             withdrawn: std::sync::Mutex::new(Vec::new()),
             lagging_reads: std::sync::Mutex::new(0),
             before: std::sync::Mutex::new(None),
+            receipt: std::sync::Mutex::new(Some("0x1")),
         })
     }
 
@@ -1634,13 +1736,24 @@ mod tests {
         amount: u128,
         issued: &[Result<u128, String>],
     ) -> (Result<Withdrawal, WithdrawError>, Vec<u128>) {
+        withdraw_waiting(chain, amount, issued, withdraw_wallet()).await
+    }
+
+    /// [`withdraw_with`], signing with `wallet` (its receipt wait).
+    #[cfg(feature = "chain-rpc")]
+    async fn withdraw_waiting(
+        chain: &std::sync::Arc<WithdrawChain>,
+        amount: u128,
+        issued: &[Result<u128, String>],
+        wallet: crate::tx::Wallet,
+    ) -> (Result<Withdrawal, WithdrawError>, Vec<u128>) {
         let client =
             crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let published = std::sync::Mutex::new(Vec::new());
         let answers = std::sync::Mutex::new(issued.iter().cloned());
         let result = withdraw_from_chequebook(
             &client,
-            &withdraw_wallet(),
+            &wallet,
             &chain.cb,
             amount,
             |funds: RetrievalFunds| {
@@ -1774,6 +1887,165 @@ mod tests {
         assert_eq!(w.apply(1400, now), 1270);
         assert_eq!(w.apply(1400, now + LANDED_WITHDRAWAL_TTL), 1370);
         assert_eq!(w.landed, []);
+    }
+
+    /// A withdrawal sent but not seen to confirm may still land: a
+    /// receipt timeout, or the call cancelled mid-wait (the gateway's
+    /// client hanging up), keeps the amount off every read that doesn't
+    /// show it, as a confirmed one does. Only a revert releases it.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn an_unconfirmed_withdrawal_stays_off_the_funds() {
+        // Receipt wait times out: 1200 deposited, 500 issued, 700 out.
+        let chain = withdraw_chain(0xc7, None);
+        *chain.receipt.lock().unwrap() = None;
+        let impatient = withdraw_wallet().wait_for(std::time::Duration::ZERO);
+        let (result, published) =
+            withdraw_waiting(&chain, 700, &[Ok(500), Ok(500)], impatient).await;
+        assert!(matches!(result, Err(WithdrawError::Tx(_))), "{result:?}");
+        assert_eq!(*chain.balance.lock().unwrap(), 1000, "still pending");
+        assert_eq!(published, [500, 500], "never the full 1200");
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let read = || async { read_retrieval_funds(&client, &chain.cb).await.unwrap() };
+        assert_eq!(read().await.deposited_plur, 500, "pending");
+        // It mines later: shown, taken as is.
+        *chain.balance.lock().unwrap() = 300;
+        assert_eq!(read().await.deposited_plur, 500, "mined");
+
+        // Cancelled while waiting for the receipt.
+        let chain = withdraw_chain(0xc8, None);
+        *chain.receipt.lock().unwrap() = None;
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let issued = std::sync::Mutex::new([Ok(500), Ok(500)].into_iter());
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            withdraw_from_chequebook(
+                &client,
+                &withdraw_wallet(),
+                &chain.cb,
+                700,
+                |_| async { true },
+                || {
+                    let next: Result<u128, String> = issued.lock().unwrap().next().unwrap();
+                    async move { next }
+                },
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "cancelled mid-wait");
+        assert_eq!(withdrawing(&chain.cb), 0, "no longer in flight");
+        let read = || async { read_retrieval_funds(&client, &chain.cb).await.unwrap() };
+        assert_eq!(read().await.deposited_plur, 500, "not the full 1200");
+
+        // Reverted: nothing left, nothing kept.
+        let chain = withdraw_chain(0xc9, None);
+        *chain.receipt.lock().unwrap() = Some("0x0");
+        let (result, published) = withdraw_with(&chain, 700, &[Ok(500), Ok(500)]).await;
+        assert!(matches!(result, Err(WithdrawError::Tx(_))), "{result:?}");
+        assert_eq!(published, [500, 1200], "lowered, then the chain's figure");
+        assert!(!withdrawing_map().contains_key(&chain.cb));
+    }
+
+    /// A funds read taken before the withdrawal reserved its amount (the
+    /// full deposit) can't reach the node after the lowered funds: the
+    /// withdrawal waits for it to be published first.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn a_stale_funds_read_never_lands_after_the_lowered_funds() {
+        let chain = withdraw_chain(0xca, None);
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let published = std::sync::Mutex::new(Vec::new());
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let watch = read_and_publish_retrieval_funds(&client, &chain.cb, |funds| {
+            read_tx.send(()).unwrap();
+            let published = &published;
+            async move {
+                // The node is slow to take this one.
+                gate_rx.await.unwrap();
+                published.lock().unwrap().push(funds.deposited_plur);
+                true
+            }
+        });
+        let issued = std::sync::Mutex::new([Ok(500), Ok(500)].into_iter());
+        let withdraw = async {
+            read_rx.await.unwrap();
+            withdraw_from_chequebook(
+                &client,
+                &withdraw_wallet(),
+                &chain.cb,
+                700,
+                |funds: RetrievalFunds| {
+                    published.lock().unwrap().push(funds.deposited_plur);
+                    async { true }
+                },
+                || {
+                    let next: Result<u128, String> = issued.lock().unwrap().next().unwrap();
+                    async move { next }
+                },
+            )
+            .await
+        };
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                *published.lock().unwrap(),
+                [] as [u128; 0],
+                "withdrawal waits"
+            );
+            gate_tx.send(()).unwrap();
+        };
+        let (watched, withdrawn, ()) = tokio::join!(watch, withdraw, release);
+        assert_eq!(watched.unwrap().0.deposited_plur, 1200);
+        withdrawn.unwrap();
+        assert_eq!(*published.lock().unwrap(), [1200, 500, 500]);
+    }
+
+    /// A deposit this process makes after a withdrawal counts at once
+    /// ([`note_deposit`]), and no backend, however far behind, reads
+    /// above what the chain holds.
+    #[cfg(feature = "chain-rpc")]
+    #[test]
+    fn a_deposit_after_a_withdrawal_counts_at_once() {
+        let cb = [0xcc; 20];
+        let now = std::time::Instant::now();
+        // 1200, withdraw 700 (500 left), then deposit 500: 1000 now.
+        withdrawing_map().insert(
+            cb,
+            Withdrawals {
+                in_flight: 0,
+                landed: vec![Landed {
+                    amount: 700,
+                    ceiling: 500,
+                    expires: now + LANDED_WITHDRAWAL_TTL,
+                }],
+            },
+        );
+        assert_eq!(withdrawals_applied(&cb, 1000), 300, "before the note");
+        note_deposit(&cb, 500);
+        assert_eq!(withdrawals_applied(&cb, 1000), 1000, "sees both");
+        assert_eq!(
+            withdrawals_applied(&cb, 500),
+            500,
+            "sees the withdrawal only"
+        );
+        assert_eq!(
+            withdrawals_applied(&cb, 1700),
+            1000,
+            "sees the deposit only"
+        );
+        assert!(withdrawals_applied(&cb, 1200) <= 1000, "sees neither");
+        // Less than withdrawn: a lagging read is still taken off.
+        note_deposit(&cb, 0);
+        withdrawing_map().get_mut(&cb).unwrap().landed[0].ceiling = 600;
+        assert_eq!(withdrawals_applied(&cb, 1200), 500, "sees neither, 100 in");
+        withdrawing_map().remove(&cb);
+        // No withdrawal on record: nothing to do.
+        note_deposit(&cb, 500);
+        assert!(!withdrawing_map().contains_key(&cb));
     }
 
     /// Hard deposits: never more than `liquidBalance()`.
