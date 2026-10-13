@@ -559,6 +559,86 @@ fn spawn_chain_init(handle: &AntHandle, chain: ant_chain::ChainClient) {
     });
 }
 
+/// Run the chain-derived startup work [`crate::ant_init`] can't, without
+/// starting the gateway: what [`ant_start_gateway`] runs when given a
+/// `gnosis_rpc`, for a host that serves no HTTP. It drops batches the
+/// chain disowns, registers batches this account owns on-chain but not
+/// on disk, and adopts the persisted or on-chain chequebook. Adopting
+/// switches outbound settlement on and starts the funds watch, so
+/// uploads and downloads pay with cheques instead of staying on the free
+/// tier. Nothing is deployed or funded: it spends nothing.
+///
+/// Returns at once; the work runs in the background. Unlike the gateway
+/// start it doesn't retry a failed step on its own: call it again (on
+/// foreground, or once the network is back) to retry. Re-calling is
+/// cheap once settlement is on. [`crate::ant_swap_status`] `paying`
+/// reports when cheques start.
+///
+/// Returns `0` once the work is started, or `-1` with `*out_err` set on a
+/// null handle, a null, empty or non-UTF-8 `gnosis_rpc`, or a build
+/// without the `chain` feature.
+///
+/// # Safety
+///
+/// `handle` must come from [`crate::ant_init`] and must not have been
+/// passed to [`crate::ant_shutdown`]. `gnosis_rpc` must be a
+/// NUL-terminated string. `out_err`, if non-null, must point to a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_chain_init(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_chain_init: null handle");
+            return -1;
+        };
+        let rpc = if gnosis_rpc.is_null() {
+            None
+        } else {
+            CStr::from_ptr(gnosis_rpc)
+                .to_str()
+                .ok()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let Some(rpc) = rpc else {
+            write_out_err(
+                out_err,
+                "ant_chain_init: gnosis_rpc must be a non-empty UTF-8 URL",
+            );
+            return -1;
+        };
+        #[cfg(feature = "chain")]
+        {
+            let init = Arc::clone(&handle.chain_init);
+            let chain = handle.chain_client(rpc);
+            let cmd_tx = handle.cmd_tx.clone();
+            let data_dir = handle.data_dir.clone();
+            let secret = handle.signing_secret;
+            let eth = handle.eth;
+            let slot = handle.gateway_chequebook.clone();
+            init.note_pending();
+            handle.runtime.spawn(async move {
+                init.run_reporting(&chain, &cmd_tx, &data_dir, secret, None, |adopted| {
+                    crate::drive::sync_gateway_chequebook(&slot, &eth, adopted);
+                })
+                .await;
+            });
+            0
+        }
+        #[cfg(not(feature = "chain"))]
+        {
+            let _ = (handle, rpc);
+            write_out_err(out_err, "ant_chain_init: built without the `chain` feature");
+            -1
+        }
+    }
+}
+
 /// Set the CORS origins the in-process gateway allows. Takes effect at
 /// the next [`ant_start_gateway`]; must be called while no gateway is
 /// running on `handle` (before the first start, or after

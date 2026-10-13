@@ -1067,6 +1067,23 @@ bool ant_start_gateway(const AntHandle *handle,
                        char **out_err);
 
 /*
+ * Run the chain startup work ant_start_gateway runs with a `gnosis_rpc`,
+ * for a host that serves no HTTP (new after 0.5.66). It drops batches the
+ * chain disowns, registers batches this account owns on-chain but not on
+ * disk, and adopts the persisted or on-chain chequebook. Adopting
+ * switches outbound settlement on and starts the funds watch, so uploads
+ * and downloads pay with cheques instead of staying on the free tier
+ * after an ant_init. Spends nothing: no deploy, no funding. Returns at
+ * once (the work runs in the background) and doesn't retry on its own:
+ * call it again on foreground or once the network is back. Re-calling is
+ * cheap once settlement is on. ant_swap_status's `paying` reports when
+ * cheques start.
+ * Returns 0 once started; -1 with *out_err set on a null handle, a null,
+ * empty or non-UTF-8 gnosis_rpc, or a build without the `chain` feature.
+ */
+int ant_chain_init(const AntHandle *handle, const char *gnosis_rpc, char **out_err);
+
+/*
  * Set the CORS origins the in-process gateway allows (new after 0.5.48).
  * Takes effect at the next ant_start_gateway; call it before the first
  * start or after ant_stop_gateway — while a gateway is running it fails

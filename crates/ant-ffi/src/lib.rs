@@ -44,7 +44,7 @@ pub use chain_transport::{
     ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
     ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
 };
-pub use gateway::{ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
+pub use gateway::{ant_chain_init, ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
