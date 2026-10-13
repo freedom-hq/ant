@@ -2608,8 +2608,7 @@ async fn resolve_chequebook(
             if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
                 tracing::warn!(
                     target: "antd",
-                    "can't record the new chequebook in the lost-ledger marker: {e}; \
-                     downloads and uploads stay on the free tier until confirmed",
+                    "new chequebook not fully recorded: {e}",
                 );
             }
             // Freshly factory-deployed, so it's registered by construction

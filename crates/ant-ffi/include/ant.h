@@ -401,7 +401,11 @@ int ant_cache_set_capacity(const AntHandle *handle, uint64_t bytes, char **out_e
  * its cheque figures were lost, and let the node pay cheques from it
  * again, for downloads and uploads alike.
  * When the node's outbound cheque ledger (pushsync_outbound.json) is
- * found unparseable it is moved aside and a ".lost" marker is left;
+ * found unparseable it is moved aside and a ".lost" marker is left (as
+ * it is when the ledger written before per-chequebook sections may
+ * belong to a chequebook: its fresh-chequebook marker is unparsable, or
+ * a fresh deploy couldn't be recorded as such — the latter is lifted
+ * again once the record is written);
  * while that marker names a loss, the node pays no cheques (downloads
  * or uploads; both stay on the free pseudosettle tier) from any
  * chequebook that used the file (logged at warn, and /chequebook/balance
@@ -656,6 +660,9 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
  * at deposit 0 publishes fine until the peers' payment tolerance runs
  * out, then collapses into pushsync timeouts — so the Storage tab reads
  * this to detect that and offer ant_storage_settlement_topup.
+ * `target_*` is the deposit for the account's storage plan (its deepest
+ * usable batch; see ant_storage_settlement_topup), 0.001 xBZZ with no
+ * plan.
  * `enabled=false` (zeroed, needs_top_up=false) when this account has no
  * chequebook yet (buying/connecting a plan deploys one, funded), or when
  * this process's chain check disqualified its chequebook (settlement is
@@ -669,7 +676,9 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
 
 /*
  * Fund this account's chequebook up to the settlement deposit target
- * (0.001 xBZZ), funding ONLY with xDAI: the node swaps the xBZZ
+ * for its storage plan (0.1 xBZZ at depth 21, doubling per extra depth
+ * level and halving per level below, between 0.001 and 1 xBZZ; 0.001
+ * xBZZ with no plan), funding ONLY with xDAI: the node swaps the xBZZ
  * shortfall on-chain if it doesn't already hold it, then transfers the
  * deposit to the chequebook. The explicit top-up path — a chequebook's
  * deposit is only read at deploy time, so an already-deployed one can be
@@ -844,7 +853,8 @@ char *ant_storage_discover_full(const AntHandle *handle,
  * as-is (no redeploy — though one still short of its settlement deposit
  * is topped up from spare xBZZ); otherwise this signs an on-chain
  * factory.deploySimpleSwap (issuer = node EOA), funds it with the
- * 0.001 xBZZ settlement deposit so its cheques are actually backed,
+ * settlement deposit for the account's storage plan (see
+ * ant_storage_settlement_topup) so its cheques are actually backed,
  * persists the association, and returns the new address. SUBMITS REAL
  * ON-CHAIN TRANSACTIONS: spends gas (xDAI) plus the deposit (xBZZ, capped
  * to the wallet's balance) and BLOCKS until they confirm. Light-mode only (requires the `chain` cargo feature;
@@ -874,8 +884,10 @@ char *ant_deploy_chequebook(const AntHandle *handle,
  * For the xDAI-only flow, `xdai_to_send_display` is exactly how much more
  * xDAI to send; the node swaps it to xBZZ and buys the plan itself.
  * `settlement_deposit_*` is the one-time xBZZ deposit this purchase also
- * puts behind the node's chequebook so its cheques are backed (0 once it
- * is funded). It is part of the all-in figures (`needed_bzz`,
+ * puts behind the node's chequebook so its cheques are backed: what it
+ * is short of the target for a `depth` plan (0.1 xBZZ at depth 21,
+ * doubling per extra depth level and halving per level below, between
+ * 0.001 and 1 xBZZ), 0 once it is funded that far. It is part of the all-in figures (`needed_bzz`,
  * `xdai_required`, `xdai_to_send`, `sufficient_funds`), not of
  * `total_cost_*`, which stays the plan's own price.
  * Requires the `chain` cargo feature.
@@ -1315,6 +1327,7 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  *   {
  *     "channel":         "Kitchen",               // required, names the feed
  *     "topic":           "0x<64 hex>",            // omit -> derived per broadcast
+ *     "start_index":     0,                       // first feed index; see below
  *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
  *     "segment_ms":      2000,                    // nominal segment duration
@@ -1324,6 +1337,12 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
  *     "playlist_window": 6,                       // segments in the live playlist
  *     "notes":           "iPhone 15 Pro / LTE"
  *   }
+ *
+ * A host that keeps one "topic" across broadcasts, so the channel
+ * reference (the feed manifest of owner + topic) stays the same link,
+ * must pass the previous broadcast's final "feed_index" as
+ * "start_index": the new broadcast then continues the feed rather than
+ * rewriting the indices that hold the old one's playlists.
  *
  * Do NOT raise max_in_flight without re-measuring: stage 1 found
  * window 4 stable (899/899 segments) and window 8 a connection-layer
@@ -1403,7 +1422,8 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
 /*
  * End the broadcast and return its final report as an allocated JSON
  * object (free with ant_free_string): the progress fields above plus
- * duration_s, chunks_published, feed_updates, sustained_chunks_s,
+ * duration_s, chunks_published, feed_updates, feed_index (the next
+ * update's index: a reused channel's next "start_index"), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, and a "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the

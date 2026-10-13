@@ -1,0 +1,25 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!--
+      Placeholder launcher icon — a single solid-fill ant body in
+      green over a black background. Replaces the AGP default that
+      otherwise leaks the AGP version through the icon style. The
+      proper mobile artefact (PLAN.md § 9 Phase 4) ships a real
+      adaptive icon with monochrome + foreground + background layers.
+    -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M54,32 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M54,54 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0" />
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M54,76 m-8,0 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0" />
+</vector>

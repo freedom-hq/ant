@@ -1,0 +1,17 @@
+# Gradle / Android Studio build output. Mirrors the iOS app's
+# `examples/ios-download/build*` exclusion in the repo root .gitignore.
+build/
+.gradle/
+local.properties
+captures/
+.cxx/
+.kotlin/
+
+# Native libs are populated by `cargo xtask build-android-*` from
+# `target/<triple>/release/libant_ffi.so`. They're 6-15 MB per ABI so
+# checking them in would dwarf the rest of the example.
+app/src/main/jniLibs/
+
+# IDE noise
+*.iml
+.idea/

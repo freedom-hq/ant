@@ -517,7 +517,8 @@ impl ChainInit {
             data_dir,
             swap_secret,
             node_eth,
-            false,
+            // Adopt only: spends nothing, so no deposit target.
+            None,
         )
         .await
         {
@@ -1555,9 +1556,12 @@ use crate::GNOSIS_CHAIN_ID;
 #[cfg(feature = "chain")]
 use ant_chain::funding::{self, DepositPolicy, Payer, POSTAGE_BUCKET_DEPTH};
 
-/// The settlement deposit the storage flows fund the chequebook to:
-/// **0.001 xBZZ**, the same default `antd` uses (rationale at the
-/// constant).
+/// The settlement deposit the storage flows fund the chequebook to
+/// scales with the storage plan: [`deposit_target_for_depth`] of the
+/// plan's batch depth (0.1 xBZZ at depth 21, doubling per level), so a
+/// bigger plan's uploads stay paid for longer. A quote and a buy use the
+/// depth being bought; the deposit card and top-ups use the account's
+/// plan ([`plan_deposit_target`]).
 ///
 /// A chequebook with deposit 0 backs no cheque: swap is enabled and
 /// peers accept the cheques, so publishing runs clean right up until the
@@ -1566,7 +1570,13 @@ use ant_chain::funding::{self, DepositPolicy, Payer, POSTAGE_BUCKET_DEPTH};
 /// 25 failures and a 10-minute live-edge lag). The same soak with a
 /// funded chequebook ran 899/899 segments at 0.89 Mbit/s flat.
 #[cfg(feature = "chain")]
-use ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR as DEPOSIT_TARGET_PLUR;
+use ant_chain::chequebook_store::deposit_target_for_depth;
+
+/// The deposit target while the account has no storage plan registered:
+/// **0.001 xBZZ**, the same default `antd` uses (rationale at the
+/// constant).
+#[cfg(feature = "chain")]
+use ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR as NO_PLAN_DEPOSIT_PLUR;
 
 /// Swarm chunk size in bytes (capacity math).
 #[cfg(feature = "chain")]
@@ -1580,12 +1590,13 @@ fn node_wallet(h: &AntHandle) -> Result<ant_chain::tx::Wallet, DriveError> {
         .map_err(|e| DriveError::Op(format!("wallet: {e}")))
 }
 
-/// What a storage buy funds besides the plan: this account's chequebook
-/// deposit, from the persisted association (`None` when the buy will
-/// deploy the chequebook).
+/// What a storage buy of a `depth` plan funds besides the plan: this
+/// account's chequebook deposit up to [`deposit_target_for_depth`], from
+/// the persisted association (`None` when the buy will deploy the
+/// chequebook).
 #[cfg(feature = "chain")]
-fn deposit_policy(h: &AntHandle) -> DepositPolicy {
-    deposit_policy_for(&h.data_dir, &h.eth)
+fn deposit_policy(h: &AntHandle, depth: u8) -> DepositPolicy {
+    deposit_policy_for(&h.data_dir, &h.eth, depth)
 }
 
 /// [`deposit_policy`] for `owner`'s record in `data_dir`. A chequebook
@@ -1593,14 +1604,37 @@ fn deposit_policy(h: &AntHandle) -> DepositPolicy {
 /// neither funded nor replaced by a buy (see [`setup_settlement`]), so
 /// there's no deposit to price in or acquire: the plan goes alone.
 #[cfg(feature = "chain")]
-fn deposit_policy_for(data_dir: &std::path::Path, owner: &[u8; 20]) -> DepositPolicy {
+fn deposit_policy_for(data_dir: &std::path::Path, owner: &[u8; 20], depth: u8) -> DepositPolicy {
     match persisted_chequebook(data_dir, owner) {
         Some(cb) if lock_disqualified().contains(&(*owner, cb)) => DepositPolicy::Unmanaged,
         chequebook => DepositPolicy::Managed {
             chequebook,
-            target: DEPOSIT_TARGET_PLUR,
+            target: deposit_target_for_depth(depth),
         },
     }
+}
+
+/// The deposit target for the account's current storage plan:
+/// [`deposit_target_for_depth`] of the deepest batch registered with
+/// the node that it can stamp with (usable, or a just-bought one still
+/// propagating; a batch peers rejected doesn't count).
+/// [`NO_PLAN_DEPOSIT_PLUR`] when there is none, or the node can't say.
+#[cfg(feature = "chain")]
+async fn plan_deposit_target(cmd_tx: &mpsc::Sender<ControlCommand>) -> u128 {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let views = match send(cmd_tx, ControlCommand::PostageList { ack: ack_tx }).await {
+        Ok(()) => match recv_oneshot(ack_rx).await {
+            Ok(ControlAck::PostageList(views)) => views,
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    views
+        .iter()
+        .filter(|v| v.enabled && (v.usable || v.propagating))
+        .map(|v| v.batch_depth)
+        .max()
+        .map_or(NO_PLAN_DEPOSIT_PLUR, deposit_target_for_depth)
 }
 
 #[cfg(feature = "chain")]
@@ -1655,9 +1689,10 @@ fn quote_json(q: &funding::PlanQuote) -> Result<String, DriveError> {
 ///
 /// The all-in figures (`needed_bzz` / `xdai_required` / `xdai_to_send` /
 /// `sufficient_funds`) include the one-time settlement deposit this
-/// account's chequebook still needs (`settlement_deposit_plur`, zero once
-/// it is funded), because activating a plan is also what deploys and
-/// funds that chequebook — see [`ensure_settlement`].
+/// account's chequebook still needs to reach the target for a `depth`
+/// plan ([`deposit_target_for_depth`]; `settlement_deposit_plur`, zero
+/// once it is funded that far), because activating a plan is also what
+/// deploys and funds that chequebook — see [`ensure_settlement`].
 /// `total_cost_plur` / `total_cost_bzz` stay the plan's own cost.
 #[cfg(feature = "chain")]
 pub(crate) fn storage_quote(
@@ -1667,7 +1702,7 @@ pub(crate) fn storage_quote(
     days: u64,
 ) -> Result<String, DriveError> {
     let wallet = node_wallet(h)?;
-    let policy = deposit_policy(h);
+    let policy = deposit_policy(h, depth);
     h.runtime.block_on(async move {
         let client = h.chain_client(rpc);
         let payer = Payer::gnosis(&client, &wallet);
@@ -1870,7 +1905,7 @@ pub(crate) fn storage_buy_xdai(
 ) -> Result<String, DriveError> {
     let amount = parse_amount(&amount_per_chunk, "plan")?;
     let wallet = node_wallet(h)?;
-    let policy = deposit_policy(h);
+    let policy = deposit_policy(h, depth);
     h.runtime.block_on(async move {
         let client = h.chain_client(rpc);
         let payer = Payer::gnosis(&client, &wallet);
@@ -1889,8 +1924,10 @@ pub(crate) fn storage_buy_xdai(
 
 /// After a buy: register the batch with the running node so uploads can
 /// stamp against it immediately, then make sure outbound settlement is
-/// on so the upload actually reaches the network (best-effort; never
-/// fails the purchase). Returns the refreshed [`storage_status`] JSON.
+/// on so the upload actually reaches the network, with the chequebook
+/// funded to the bought plan's [`deposit_target_for_depth`]
+/// (best-effort; never fails the purchase). Returns the refreshed
+/// [`storage_status`] JSON.
 #[cfg(feature = "chain")]
 async fn activate_bought_batch(
     h: &AntHandle,
@@ -1917,6 +1954,7 @@ async fn activate_bought_batch(
         h.signing_secret,
         h.eth,
         &h.gateway_chequebook,
+        deposit_target_for_depth(depth),
     )
     .await;
     postage_status_json(&h.cmd_tx).await
@@ -1939,13 +1977,13 @@ async fn activate_bought_batch(
 ///      adopt + persist it rather than stranding its balance.
 ///   3. **Auto-deploy** — first run with a funded wallet: deploy a
 ///      fresh factory-registered chequebook (issuer = node EOA),
-///      persist it, and fund it with [`DEPOSIT_TARGET_PLUR`] xBZZ so
-///      the cheques it signs are actually backed.
+///      persist it, and fund it with `deposit_target` xBZZ so the
+///      cheques it signs are actually backed.
 ///
 /// A chequebook reached through step 1 or 2 predates this and can be
-/// sitting at deposit 0 (every install before #73 is), so it is topped
-/// up to the same target from spare wallet xBZZ before settlement is
-/// switched on.
+/// sitting at deposit 0 (every install before #73 is) or below the
+/// target of a bigger plan, so it is topped up to the same target from
+/// spare wallet xBZZ before settlement is switched on.
 ///
 /// Best-effort: never fails the surrounding storage purchase. A thin
 /// wallet (no spare xDAI for the one-time deploy, no spare xBZZ for the
@@ -1967,6 +2005,7 @@ pub(crate) async fn ensure_settlement(
     data_dir: &std::path::Path,
     swap_secret: [u8; 32],
     node_eth: [u8; 20],
+    deposit_target: u128,
 ) -> Option<[u8; 20]> {
     match setup_settlement(
         cmd_tx,
@@ -1975,7 +2014,7 @@ pub(crate) async fn ensure_settlement(
         data_dir,
         swap_secret,
         node_eth,
-        true,
+        Some(deposit_target),
     )
     .await
     {
@@ -2004,14 +2043,14 @@ static CHEQUEBOOK_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 /// The one chequebook routine behind every settlement path: resolve the
 /// account's chequebook, optionally spend on it, and switch outbound
 /// settlement on in the running node. Returns the chequebook, or `None`
-/// when there is none to use yet (no chequebook and either `may_spend`
-/// is off or the wallet can't pay for the deploy).
+/// when there is none to use yet (no chequebook and either `spend_to`
+/// is `None` or the wallet can't pay for the deploy).
 ///
-/// `may_spend` allows deploying a chequebook and topping up an adopted
-/// one's deposit (a chequebook reached as persisted or rediscovered can
-/// be sitting at deposit 0, as every install before #73 is). Only host
-/// calls and buys pass `true`; the gateway-start chain init passes
-/// `false`.
+/// `spend_to` (the deposit target) allows deploying a chequebook funded
+/// to it and topping up an adopted one's deposit to it (a chequebook
+/// reached as persisted or rediscovered can be sitting at deposit 0, as
+/// every install before #73 is). Only host calls and buys pass `Some`;
+/// the gateway-start chain init passes `None`.
 #[cfg(feature = "chain")]
 pub(crate) async fn setup_settlement(
     cmd_tx: &mpsc::Sender<ControlCommand>,
@@ -2020,11 +2059,11 @@ pub(crate) async fn setup_settlement(
     data_dir: &std::path::Path,
     swap_secret: [u8; 32],
     node_eth: [u8; 20],
-    may_spend: bool,
+    spend_to: Option<u128>,
 ) -> Result<Option<[u8; 20]>, DriveError> {
     let _setup = CHEQUEBOOK_SETUP.lock().await;
     let resolved =
-        match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth, may_spend).await? {
+        match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth, spend_to).await? {
             Resolution::Use(resolved) => resolved,
             Resolution::NoneYet => return Ok(None),
             Resolution::Disqualified { chequebook, reason } => {
@@ -2054,10 +2093,16 @@ pub(crate) async fn setup_settlement(
     // A chequebook we just deployed was funded as part of the deploy; an
     // adopted one carries whatever deposit it already had and is topped
     // up — the top-up re-runs the chain checks right before it sends.
-    if may_spend && !resolved.deployed {
-        if let Some(reason) =
-            fund_chequebook_best_effort(client, wallet, data_dir, &node_eth, &resolved.address)
-                .await
+    if let Some(target) = spend_to.filter(|_| !resolved.deployed) {
+        if let Some(reason) = fund_chequebook_best_effort(
+            client,
+            wallet,
+            data_dir,
+            &node_eth,
+            &resolved.address,
+            target,
+        )
+        .await
         {
             lock_disqualified().insert((node_eth, resolved.address));
             disable_settlement(cmd_tx, resolved.address).await;
@@ -2255,13 +2300,17 @@ pub(crate) fn sync_gateway_chequebook(
     }
 }
 
-/// [`ensure_settlement`] for a C-API storage call, then point the
+/// [`ensure_settlement`] for a C-API storage call (funding to
+/// `deposit_target`), then point the
 /// in-process gateway's chequebook `slot` at the outcome, as the
 /// gateway's own after-buy hook and chain init do. Without that, a
 /// chequebook set up by `ant_storage_buy*` stayed invisible to the
 /// running gateway's `/chequebook/*`, `/wallet` and
 /// `POST /chequebook/deposit` until the next `ant_start_gateway`.
 #[cfg(feature = "chain")]
+// The handle's pieces plus the deposit target; bundling them into a
+// struct for this one caller would only move the list.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_settlement_for_gateway(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
@@ -2270,14 +2319,24 @@ async fn ensure_settlement_for_gateway(
     secret: [u8; 32],
     node_eth: [u8; 20],
     slot: &ant_gateway::ChequebookSlot,
+    deposit_target: u128,
 ) -> Option<[u8; 20]> {
-    let chequebook = ensure_settlement(cmd_tx, client, wallet, data_dir, secret, node_eth).await;
+    let chequebook = ensure_settlement(
+        cmd_tx,
+        client,
+        wallet,
+        data_dir,
+        secret,
+        node_eth,
+        deposit_target,
+    )
+    .await;
     sync_gateway_chequebook(slot, &node_eth, chequebook);
     chequebook
 }
 
-/// [`setup_settlement`] with spending allowed (`ant_deploy_chequebook`),
-/// then point the in-process gateway's chequebook `slot` at the outcome.
+/// [`setup_settlement`] with spending up to the account's
+/// [`plan_deposit_target`] allowed (`ant_deploy_chequebook`), then point the in-process gateway's chequebook `slot` at the outcome.
 /// The slot is synced on the error path too: a persisted chequebook the
 /// chain check disqualifies makes [`setup_settlement`] return `Err` (not
 /// `Ok(None)`), and the gateway must stop reporting and funding it.
@@ -2291,7 +2350,17 @@ async fn setup_settlement_for_gateway(
     node_eth: [u8; 20],
     slot: &ant_gateway::ChequebookSlot,
 ) -> Result<Option<[u8; 20]>, DriveError> {
-    let result = setup_settlement(cmd_tx, client, wallet, data_dir, secret, node_eth, true).await;
+    let deposit_target = plan_deposit_target(cmd_tx).await;
+    let result = setup_settlement(
+        cmd_tx,
+        client,
+        wallet,
+        data_dir,
+        secret,
+        node_eth,
+        Some(deposit_target),
+    )
+    .await;
     sync_gateway_chequebook(slot, &node_eth, result.as_ref().ok().copied().flatten());
     result
 }
@@ -2363,8 +2432,9 @@ async fn enable_settlement(
 }
 
 /// Build the node wallet and run [`ensure_settlement`] — the wrapper the
-/// discover / connect flows use so they share the buy flow's settlement
-/// bootstrap. Best-effort: a wallet-init failure (bad key) just logs and
+/// discover / connect flows (and the gateway's after-buy hook) use so
+/// they share the buy flow's settlement bootstrap — funding to the
+/// account's [`plan_deposit_target`]. Best-effort: a wallet-init failure (bad key) just logs and
 /// leaves settlement off; the Storage UI then shows the "settlement not
 /// set up" state via [`settlement_status`].
 #[cfg(feature = "chain")]
@@ -2376,7 +2446,10 @@ pub(crate) async fn ensure_settlement_best_effort(
     node_eth: [u8; 20],
 ) -> Option<[u8; 20]> {
     match ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID) {
-        Ok(wallet) => ensure_settlement(cmd_tx, client, &wallet, data_dir, secret, node_eth).await,
+        Ok(wallet) => {
+            let target = plan_deposit_target(cmd_tx).await;
+            ensure_settlement(cmd_tx, client, &wallet, data_dir, secret, node_eth, target).await
+        }
         Err(e) => {
             tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}");
             None
@@ -2430,7 +2503,7 @@ fn persisted_chequebook(data_dir: &std::path::Path, owner: &[u8; 20]) -> Option<
     }
 }
 
-/// Bring `chequebook` up to [`DEPOSIT_TARGET_PLUR`] from the node
+/// Bring `chequebook` up to `target` (PLUR) from the node
 /// wallet's spare xBZZ. Best-effort in every direction: an already-funded
 /// chequebook, an unreadable balance, an empty wallet or a failed
 /// transfer all just log — the caller is a storage flow that must not
@@ -2450,12 +2523,13 @@ async fn fund_chequebook_best_effort(
     data_dir: &std::path::Path,
     node_eth: &[u8; 20],
     chequebook: &[u8; 20],
+    target: u128,
 ) -> Option<String> {
     use ant_chain::chequebook_store::{top_up_chequebook, TopUp};
 
     let funded = {
         let _tx = wallet_tx_lock(node_eth).lock_owned().await;
-        top_up_chequebook(client, wallet, node_eth, chequebook, DEPOSIT_TARGET_PLUR).await
+        top_up_chequebook(client, wallet, node_eth, chequebook, target).await
     };
     match funded {
         Ok(TopUp::Refused(_)) => {
@@ -2498,7 +2572,7 @@ async fn fund_chequebook_best_effort(
 }
 
 /// The chequebook's settlement deposit, read from chain, plus what a
-/// top-up to [`DEPOSIT_TARGET_PLUR`] would cost — the "is this
+/// top-up to the account's [`plan_deposit_target`] would cost — the "is this
 /// chequebook actually backing its cheques?" card in the Storage tab,
 /// and the migration path for every install that deployed one at deposit
 /// 0 (issue #73).
@@ -2516,11 +2590,13 @@ async fn fund_chequebook_best_effort(
 pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
     let wallet = node_wallet(h)?;
     h.runtime.block_on(async move {
-        settlement_deposit_for(&h.chain_client(rpc), &wallet, &h.data_dir, &h.eth).await
+        let target = plan_deposit_target(&h.cmd_tx).await;
+        settlement_deposit_for(&h.chain_client(rpc), &wallet, &h.data_dir, &h.eth, target).await
     })
 }
 
-/// [`settlement_deposit`]'s body, against an explicit chain client. A
+/// [`settlement_deposit`]'s body, against an explicit chain client and
+/// deposit `target` (PLUR). A
 /// chequebook this process's chain check disqualified reads as "none",
 /// the same answer [`settlement_status`] gives: its settlement is off,
 /// so the card must not offer to top it up.
@@ -2530,21 +2606,23 @@ async fn settlement_deposit_for(
     wallet: &ant_chain::tx::Wallet,
     data_dir: &std::path::Path,
     owner: &[u8; 20],
+    target: u128,
 ) -> Result<String, DriveError> {
     let Some(cb) = persisted_chequebook(data_dir, owner) else {
-        return to_json(&SettlementDeposit::none());
+        return to_json(&SettlementDeposit::none(target));
     };
     if lock_disqualified().contains(&(*owner, cb)) {
-        return to_json(&SettlementDeposit::none());
+        return to_json(&SettlementDeposit::none(target));
     }
     let payer = Payer::gnosis(client, wallet);
-    let status = funding::deposit_status(&payer, &cb, DEPOSIT_TARGET_PLUR)
+    let status = funding::deposit_status(&payer, &cb, target)
         .await
         .map_err(funding_err)?;
     to_json(&SettlementDeposit::of(&status))
 }
 
-/// Fund the node's chequebook up to [`DEPOSIT_TARGET_PLUR`], funding
+/// Fund the node's chequebook up to the account's
+/// [`plan_deposit_target`], funding
 /// **only with xDAI**: swap the xBZZ shortfall through the on-chain
 /// helper if the wallet doesn't already hold it, then transfer the
 /// deposit to the chequebook. The explicit top-up path — a deposit is
@@ -2677,6 +2755,7 @@ async fn settlement_topup_xdai_checked(
     let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
         .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
     let payer = Payer::gnosis(client, &wallet);
+    let target = plan_deposit_target(cmd_tx).await;
     // Deposit read, balance reads, swap and deposit transfer all under
     // the account's wallet tx lock (see [`wallet_tx_lock`]). The
     // shortfall is read *after* taking the lock (inside
@@ -2686,7 +2765,7 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, DEPOSIT_TARGET_PLUR, amount).await
+        funding::fund_deposit_with_xdai(&payer, &cb, target, amount).await
     };
     match funded {
         Ok(status) => {
@@ -2764,8 +2843,8 @@ pub(crate) async fn chequebook_refused(
 /// if `<data_dir>/chequebook.json` already records a chequebook, it's
 /// returned without a redeploy (though a chequebook still short of its
 /// settlement deposit is topped up); otherwise this signs an on-chain
-/// `factory.deploySimpleSwap`, funds it with [`DEPOSIT_TARGET_PLUR`]
-/// xBZZ so its cheques are backed, persists the association, and returns
+/// `factory.deploySimpleSwap`, funds it with the account's
+/// [`plan_deposit_target`] xBZZ so its cheques are backed, persists the association, and returns
 /// the new address. Blocks on the handle's tokio runtime.
 ///
 /// It also switches outbound settlement on in the running node, so a
@@ -2910,7 +2989,7 @@ struct ResolvedChequebook {
     /// The 20-byte chequebook contract address.
     address: [u8; 20],
     /// `true` when *this* call deployed it — and therefore already
-    /// funded it with [`DEPOSIT_TARGET_PLUR`] as part of the deploy.
+    /// funded it with the deposit target as part of the deploy.
     /// `false` for a persisted / rediscovered chequebook, whose deposit
     /// is whatever it happens to hold (zero, for anything deployed
     /// before #73).
@@ -2926,7 +3005,8 @@ struct ResolvedChequebook {
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
 /// resolved chequebook, [`Resolution::NoneYet`] when there's none to
-/// use (the account has no chequebook and either `may_deploy` is off or
+/// use (the account has no chequebook and either `deploy_with` (the
+/// deposit to fund a new one with) is `None` or
 /// the wallet can't afford the one-time deploy — a soft skip, not an
 /// error), or [`Resolution::Disqualified`] when the persisted one fails
 /// its chain checks. A rediscovery scan that *failed* is an error, never
@@ -2944,8 +3024,9 @@ async fn resolve_or_deploy_chequebook(
     wallet: &ant_chain::tx::Wallet,
     data_dir: &std::path::Path,
     node_eth: [u8; 20],
-    may_deploy: bool,
+    deploy_with: Option<u128>,
 ) -> Result<Resolution, DriveError> {
+    let may_deploy = deploy_with.is_some();
     use ant_chain::chequebook_store::{self, ChequebookError, ChequebookFile};
 
     let persist_path = data_dir.join("chequebook.json");
@@ -3124,23 +3205,20 @@ async fn resolve_or_deploy_chequebook(
         }
     }
 
-    // 3. Auto-deploy, funded with [`DEPOSIT_TARGET_PLUR`]: bee accepts
+    // 3. Auto-deploy, funded with `deploy_with`: bee accepts
     //    the cheques either way, but a chequebook backing nothing only
     //    publishes until the peers' payment tolerance runs out and then
     //    stalls (#73) — so the deposit goes in at deploy time, capped by
     //    the wallet's xBZZ balance (a thin wallet gets a smaller deposit
     //    rather than a failed transfer). Insufficient gas is a soft skip
     //    — settlement turns on once the wallet has a little more xDAI.
+    let Some(deposit) = deploy_with else {
+        return Ok(Resolution::NoneYet);
+    };
     let deployed = {
         let _tx = wallet_tx_lock(&node_eth).lock_owned().await;
-        chequebook_store::auto_deploy_chequebook(
-            client,
-            wallet,
-            &node_eth,
-            DEPOSIT_TARGET_PLUR,
-            &persist_path,
-        )
-        .await
+        chequebook_store::auto_deploy_chequebook(client, wallet, &node_eth, deposit, &persist_path)
+            .await
     };
     match deployed {
         Ok(cb) => {
@@ -3151,8 +3229,7 @@ async fn resolve_or_deploy_chequebook(
             {
                 tracing::warn!(
                     target: "ant-ffi",
-                    "can't record the new chequebook in the lost-ledger marker: {e}; \
-                     downloads and uploads stay on the free tier until confirmed",
+                    "new chequebook not fully recorded: {e}",
                 );
             }
             Ok(Resolution::Use(ResolvedChequebook {
@@ -3351,7 +3428,7 @@ struct SettlementDeposit {
     /// accepted, but nothing backs them.
     deposit_plur: String,
     deposit_bzz: String,
-    /// The deposit we aim for — [`DEPOSIT_TARGET_PLUR`].
+    /// The deposit we aim for — the account's [`plan_deposit_target`].
     target_plur: String,
     target_bzz: String,
     /// What is still missing (`target − deposit`, saturating).
@@ -3400,14 +3477,14 @@ impl SettlementDeposit {
         }
     }
 
-    fn none() -> Self {
+    fn none(target: u128) -> Self {
         Self {
             enabled: false,
             chequebook: None,
             deposit_plur: "0".into(),
             deposit_bzz: format_bzz(0),
-            target_plur: DEPOSIT_TARGET_PLUR.to_string(),
-            target_bzz: format_bzz(DEPOSIT_TARGET_PLUR),
+            target_plur: target.to_string(),
+            target_bzz: format_bzz(target),
             shortfall_plur: "0".into(),
             shortfall_bzz: format_bzz(0),
             needs_top_up: false,
@@ -3564,7 +3641,7 @@ mod chain_tests {
             None,
             crate::GNOSIS_CHAIN_ID,
             Some([0x5a; 32]),
-            Some(super::DEPOSIT_TARGET_PLUR),
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
             None,
             lock.clone(),
         )
@@ -3583,8 +3660,15 @@ mod chain_tests {
         let task = {
             let dir = dir.clone();
             tokio::spawn(async move {
-                super::fund_chequebook_best_effort(&client, &wallet, &dir, &node_eth, &[0xcb; 20])
-                    .await
+                super::fund_chequebook_best_effort(
+                    &client,
+                    &wallet,
+                    &dir,
+                    &node_eth,
+                    &[0xcb; 20],
+                    super::NO_PLAN_DEPOSIT_PLUR,
+                )
+                .await
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3698,7 +3782,15 @@ mod chain_tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // `Resolution` is not `Debug`, so unwrap by hand.
-        let err = match resolve_or_deploy_chequebook(&client, &wallet, &dir, node_eth, true).await {
+        let err = match resolve_or_deploy_chequebook(
+            &client,
+            &wallet,
+            &dir,
+            node_eth,
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
+        )
+        .await
+        {
             Err(e) => e,
             Ok(super::Resolution::Use(r)) => panic!(
                 "a failed scan must not resolve to a chequebook: 0x{} (deployed = {})",
@@ -4159,7 +4251,7 @@ mod chain_tests {
                     .balances
                     .get(&addr)
                     .copied()
-                    .unwrap_or(super::DEPOSIT_TARGET_PLUR);
+                    .unwrap_or(super::NO_PLAN_DEPOSIT_PLUR);
                 return Some(json!(format!("0x{bal:064x}")));
             }
             if to
@@ -4292,6 +4384,9 @@ mod chain_tests {
         funds: Vec<([u8; 20], u128, u128)>,
         /// Fail this many `RegisterBatch` commands before accepting.
         fail_registers: usize,
+        /// What `PostageList` answers: the batches registered with the
+        /// node (none by default, i.e. no plan).
+        postage: Vec<ant_control::PostageStatusView>,
     }
 
     fn fake_node() -> (
@@ -4351,6 +4446,10 @@ mod chain_tests {
                             message: "funds".into(),
                         });
                     }
+                    ControlCommand::PostageList { ack } => {
+                        let views = sink.lock().unwrap().postage.clone();
+                        let _ = ack.send(ControlAck::PostageList(views));
+                    }
                     other => panic!("unexpected command {other:?}"),
                 }
             }
@@ -4398,7 +4497,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .expect("recovered");
@@ -4438,7 +4537,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .expect("adopted");
@@ -4449,7 +4548,7 @@ mod chain_tests {
         }
         assert_eq!(
             node.lock().unwrap().funds.first().copied(),
-            Some((CANDIDATE, super::DEPOSIT_TARGET_PLUR, 100_000)),
+            Some((CANDIDATE, super::NO_PLAN_DEPOSIT_PLUR, 100_000)),
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4476,6 +4575,7 @@ mod chain_tests {
             NODE_KEY,
             eth,
             &slot,
+            super::NO_PLAN_DEPOSIT_PLUR,
         )
         .await;
 
@@ -4548,7 +4648,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .unwrap();
@@ -4587,7 +4687,7 @@ mod chain_tests {
                 &dir,
                 NODE_KEY,
                 eth,
-                true,
+                Some(super::NO_PLAN_DEPOSIT_PLUR),
             )
             .await
             .expect_err("a disqualified chequebook must not be used");
@@ -4624,7 +4724,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .unwrap();
@@ -5458,7 +5558,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .expect("a lagging read is not a disqualification");
@@ -5484,7 +5584,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .expect_err("past the grace, an unregistered chequebook is disqualified");
@@ -5507,7 +5607,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .expect_err("no deploy tx, so the factory answer stands");
@@ -5548,7 +5648,7 @@ mod chain_tests {
                 &dir,
                 NODE_KEY,
                 eth,
-                may_spend,
+                may_spend.then_some(super::NO_PLAN_DEPOSIT_PLUR),
             )
             .await
             .unwrap();
@@ -5597,7 +5697,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            false,
+            None,
         )
         .await
         .unwrap();
@@ -5614,7 +5714,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            true,
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
         )
         .await;
         assert_eq!(node.lock().unwrap().enabled, [] as [[u8; 20]; 0]);
@@ -5651,9 +5751,15 @@ mod chain_tests {
         let script = std::sync::Arc::new(ChainScript::new(eth));
         super::lock_disqualified().insert((eth, BAD));
 
-        let card = super::settlement_deposit_for(&client(&script), &wallet, &dir, &eth)
-            .await
-            .unwrap();
+        let card = super::settlement_deposit_for(
+            &client(&script),
+            &wallet,
+            &dir,
+            &eth,
+            super::NO_PLAN_DEPOSIT_PLUR,
+        )
+        .await
+        .unwrap();
         let card: serde_json::Value = serde_json::from_str(&card).unwrap();
         assert_eq!(card["enabled"], false);
         assert_eq!(card["needs_top_up"], false);
@@ -5670,7 +5776,7 @@ mod chain_tests {
             "got {err}"
         );
         assert_eq!(
-            super::deposit_policy_for(&dir, &eth),
+            super::deposit_policy_for(&dir, &eth, 22),
             ant_chain::funding::DepositPolicy::Unmanaged,
             "no deposit is priced in or bought for it",
         );
@@ -5732,6 +5838,108 @@ mod chain_tests {
         }
     }
 
+    /// A registered batch the node can stamp with, as `PostageList`
+    /// reports it.
+    fn plan(depth: u8, usable: bool, propagating: bool) -> ant_control::PostageStatusView {
+        ant_control::PostageStatusView {
+            enabled: true,
+            usable,
+            propagating,
+            batch_id: format!("0x{}", hex::encode([depth; 32])),
+            batch_depth: depth,
+            ..Default::default()
+        }
+    }
+
+    /// The deposit card and top-ups aim at the account's plan: the
+    /// deepest batch the node can stamp with (a just-bought one still
+    /// propagating counts, one peers rejected doesn't), and the 0.001
+    /// xBZZ default with no plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_deposit_target_follows_the_deepest_stampable_batch() {
+        use ant_chain::chequebook_store::{
+            deposit_target_for_depth, DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+        };
+
+        let (cmd_tx, node) = fake_node();
+        assert_eq!(
+            super::plan_deposit_target(&cmd_tx).await,
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+            "no plan",
+        );
+        node.lock().unwrap().postage = vec![
+            plan(20, true, false),
+            plan(24, false, false),
+            plan(22, false, true),
+        ];
+        assert_eq!(
+            super::plan_deposit_target(&cmd_tx).await,
+            deposit_target_for_depth(22),
+        );
+        node.lock().unwrap().postage = vec![plan(24, false, false)];
+        assert_eq!(
+            super::plan_deposit_target(&cmd_tx).await,
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+            "a rejected batch is no plan",
+        );
+    }
+
+    /// A quote (and a buy) prices in the deposit for the depth being
+    /// bought: with no chequebook yet that is the whole
+    /// `deposit_target_for_depth`, which the quote reports as
+    /// `settlement_deposit_plur` (via `funding::quote_plan`).
+    #[test]
+    fn quote_prices_the_deposit_for_the_quoted_depth() {
+        const BZZ: u128 = 10_000_000_000_000_000;
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-quote-depth");
+        for (depth, target) in [
+            (20, BZZ / 20),
+            (21, BZZ / 10),
+            (22, BZZ / 5),
+            (23, 2 * BZZ / 5),
+        ] {
+            assert_eq!(
+                super::deposit_policy_for(&dir, &eth, depth),
+                ant_chain::funding::DepositPolicy::Managed {
+                    chequebook: None,
+                    target,
+                },
+                "depth {depth}",
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The top-up reads the account's plan target: a chequebook holding
+    /// the depth-22 target is at target under a depth-22 plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_aims_at_the_plan_deposit_target() {
+        const GOOD: [u8; 20] = [0xd9; 20];
+        let target = ant_chain::chequebook_store::deposit_target_for_depth(22);
+        let (_, eth) = node_wallet();
+        let dir = scratch("cb-topup-plan");
+        persist(&dir, GOOD, eth);
+        let mut script = ChainScript::new(eth);
+        script.chequebooks.insert(GOOD, (true, eth));
+        script.balances.insert(GOOD, target);
+        let script = std::sync::Arc::new(script);
+        let (cmd_tx, node) = fake_node();
+        node.lock().unwrap().postage = vec![plan(22, true, false)];
+        let slot = ant_gateway::ChequebookSlot::default();
+        slot.set(GOOD);
+
+        let card =
+            super::settlement_topup_xdai_for(&cmd_tx, &client(&script), &dir, eth, NODE_KEY, &slot)
+                .await
+                .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["target_plur"], target.to_string());
+        assert_eq!(card["needs_top_up"], false);
+        assert_eq!(script.seen("eth_sendRawTransaction"), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// R3-M1: a chequebook that passes its checks goes on to the deposit
     /// read (here: already at target, so a no-op), nothing disqualified.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5763,7 +5971,7 @@ mod chain_tests {
         // and leaves the funds watch running.
         assert_eq!(
             node.lock().unwrap().funds.first().copied(),
-            Some((GOOD, super::DEPOSIT_TARGET_PLUR, 100_000)),
+            Some((GOOD, super::NO_PLAN_DEPOSIT_PLUR, 100_000)),
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while node.lock().unwrap().funds.len() < 2 && tokio::time::Instant::now() < deadline {
@@ -5928,16 +6136,22 @@ mod chain_tests {
         super::lock_disqualified().insert((A, X));
 
         assert_eq!(
-            super::deposit_policy_for(&dir, &b),
+            super::deposit_policy_for(&dir, &b, 22),
             ant_chain::funding::DepositPolicy::Managed {
                 chequebook: Some(X),
-                target: super::DEPOSIT_TARGET_PLUR,
+                target: super::deposit_target_for_depth(22),
             },
             "B's chequebook is priced in, not treated as disqualified",
         );
-        let card = super::settlement_deposit_for(&client(&script), &wallet, &dir, &b)
-            .await
-            .unwrap();
+        let card = super::settlement_deposit_for(
+            &client(&script),
+            &wallet,
+            &dir,
+            &b,
+            super::NO_PLAN_DEPOSIT_PLUR,
+        )
+        .await
+        .unwrap();
         let card: serde_json::Value = serde_json::from_str(&card).unwrap();
         assert_eq!(card["enabled"], true);
         assert!(script.seen("eth_call") > 0, "B's deposit was read on-chain");
@@ -6061,7 +6275,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            true,
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
         )
         .await
         .unwrap();
@@ -6102,7 +6316,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            true,
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
         )
         .await
         .expect_err("still disqualified");
@@ -6143,7 +6357,7 @@ mod chain_tests {
             &dir,
             NODE_KEY,
             eth,
-            true,
+            Some(super::NO_PLAN_DEPOSIT_PLUR),
         )
         .await
         .expect_err("rejected before the transfer");

@@ -662,6 +662,49 @@ impl StampIssuer {
         Ok(())
     }
 
+    /// [`Self::record_stamp`] for a batch: one sidecar append, one
+    /// `fsync`. Same poisoning on a torn write as a single append.
+    fn record_stamps(
+        &mut self,
+        records: &[([u8; 32], [u8; STAMP_SIZE])],
+    ) -> Result<(), PostageError> {
+        for (addr, stamp) in records {
+            self.seen.insert(*addr, *stamp);
+        }
+        let Some(path) = self.stamps_path.clone() else {
+            return Ok(()); // in-memory issuer
+        };
+        if let Err(e) = append_stamp_records(&path, &self.batch_id, records) {
+            if !e.rolled_back {
+                self.stamp_persistence_failed =
+                    Some("torn sidecar append could not be rolled back");
+            }
+            return Err(PostageError::Persist(e.msg));
+        }
+        self.stamp_record_count += records.len();
+        if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
+            rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
+            self.stamp_record_count = self.seen.len();
+        }
+        Ok(())
+    }
+
+    /// Reserve the next index for `addr` in memory only. The caller must
+    /// [`Self::persist`] before any stamp built on it leaves the process.
+    fn reserve_index(&mut self, addr: &[u8; 32]) -> Result<[u8; INDEX_SIZE], PostageError> {
+        let b_idx = collision_bucket_from_addr(self.bucket_depth, addr);
+        let mut cnt = self.buckets.get(b_idx as usize).copied().unwrap_or(0);
+        if cnt == self.bucket_upper_bound() {
+            if self.immutable {
+                return Err(PostageError::BucketFull);
+            }
+            cnt = 0;
+        }
+        cnt += 1;
+        self.buckets[b_idx as usize] = cnt;
+        Ok(index_bytes(b_idx, cnt - 1))
+    }
+
     /// Reserve the next index in the bucket the chunk address falls in.
     ///
     /// **Persistence**: when this issuer was built via
@@ -963,6 +1006,120 @@ pub fn sign_stamp_bytes(
     stamp[48..113].copy_from_slice(&sig);
     issuer.record_stamp(*chunk_address, stamp)?;
     Ok(stamp)
+}
+
+/// Stamp many chunks with one durable write instead of one per chunk.
+///
+/// [`sign_stamp_bytes`] persists the bucket table (a full rewrite plus
+/// `fsync`s) and appends a sidecar record (another `fsync`) for every new
+/// chunk. On a phone a `fsync` costs milliseconds to tens of
+/// milliseconds (`F_FULLFSYNC` on iOS), so a 100-chunk video segment
+/// spent most of its time waiting on the disk. Here every new index is
+/// reserved in memory, the table is persisted **once**, the stamps are
+/// signed, and their sidecar records are appended **once**, all before
+/// any stamp is returned. The crash rule is unchanged: no stamp leaves
+/// before both its index and its record are durable, so an index is
+/// never issued twice.
+///
+/// Results come back in input order, one per address, with the same
+/// per-chunk semantics as [`sign_stamp_bytes`]: a known address (or one
+/// repeated in the batch) keeps its slot and gets a strictly newer
+/// timestamp; a full bucket on an immutable batch is
+/// [`PostageError::BucketFull`] for that chunk alone. A persistence
+/// failure fails every chunk that needed it.
+pub fn sign_stamps_batch(
+    secret: &[u8; SECP256K1_SECRET_LEN],
+    issuer: &mut StampIssuer,
+    addrs: &[[u8; 32]],
+) -> Vec<Result<[u8; STAMP_SIZE], PostageError>> {
+    if let Some(reason) = issuer.stamp_persistence_failed {
+        return addrs
+            .iter()
+            .map(|_| {
+                Err(PostageError::Persist(format!(
+                    "stamp sidecar unusable ({reason}); refusing to issue a non-durable \
+                     stamp — fix the data dir and restart to recover"
+                )))
+            })
+            .collect();
+    }
+    // Slot + timestamp per address, decided before anything is written.
+    enum Plan {
+        Ready([u8; INDEX_SIZE], [u8; TIMESTAMP_SIZE]),
+        Failed(PostageError),
+    }
+    let mut last_ts: HashMap<[u8; 32], ([u8; INDEX_SIZE], u64)> = HashMap::new();
+    let mut fresh_indices = false;
+    let now = u64::from_be_bytes(unix_now_nanos_be());
+    let plans: Vec<Plan> = addrs
+        .iter()
+        .map(|addr| {
+            let known = last_ts.get(addr).copied().or_else(|| {
+                issuer.cached_stamp(addr).map(|prev| {
+                    let index: [u8; INDEX_SIZE] = prev[32..40].try_into().expect("stamp layout");
+                    (
+                        index,
+                        u64::from_be_bytes(prev[40..48].try_into().expect("stamp layout")),
+                    )
+                })
+            });
+            let (index, ts) = match known {
+                // Strictly newer than the stamp it replaces (bee rejects a
+                // same-index put that isn't), as in `sign_stamp_bytes`.
+                Some((index, prev_ts)) => (index, now.max(prev_ts.saturating_add(1))),
+                None => match issuer.reserve_index(addr) {
+                    Ok(index) => {
+                        fresh_indices = true;
+                        (index, now)
+                    }
+                    Err(e) => return Plan::Failed(e),
+                },
+            };
+            last_ts.insert(*addr, (index, ts));
+            Plan::Ready(index, ts.to_be_bytes())
+        })
+        .collect();
+
+    if fresh_indices {
+        if let Err(e) = issuer.persist() {
+            let msg = e.to_string();
+            return addrs
+                .iter()
+                .map(|_| Err(PostageError::Persist(msg.clone())))
+                .collect();
+        }
+    }
+
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut records = Vec::with_capacity(addrs.len());
+    for (addr, plan) in addrs.iter().zip(plans) {
+        match plan {
+            Plan::Failed(e) => out.push(Err(e)),
+            Plan::Ready(index, ts) => {
+                let digest = postage_sign_digest(addr, &issuer.batch_id, &index, &ts);
+                match sign_handshake_data(secret, &digest) {
+                    Ok(sig) => {
+                        let mut stamp = [0u8; STAMP_SIZE];
+                        stamp[0..32].copy_from_slice(&issuer.batch_id);
+                        stamp[32..40].copy_from_slice(&index);
+                        stamp[40..48].copy_from_slice(&ts);
+                        stamp[48..113].copy_from_slice(&sig);
+                        records.push((*addr, stamp));
+                        out.push(Ok(stamp));
+                    }
+                    Err(e) => out.push(Err(e.into())),
+                }
+            }
+        }
+    }
+    if let Err(e) = issuer.record_stamps(&records) {
+        let msg = e.to_string();
+        return addrs
+            .iter()
+            .map(|_| Err(PostageError::Persist(msg.clone())))
+            .collect();
+    }
+    out
 }
 
 /// Sidecar path for the per-chunk stamp cache: the counter file's path
@@ -1291,6 +1448,69 @@ struct AppendError {
 /// write failure the file is truncated back to its pre-append length;
 /// if that truncation itself fails, the error says so
 /// (`rolled_back = false`) and the caller must poison the issuer.
+/// [`append_stamp_record`] for several records with one write and one
+/// `fsync`: the batch lands or (on a failed write) is truncated back off
+/// as a whole.
+fn append_stamp_records(
+    path: &Path,
+    batch_id: &[u8; 32],
+    records: &[([u8; 32], [u8; STAMP_SIZE])],
+) -> Result<(), AppendError> {
+    use std::io::Write as _;
+
+    let fail = |msg: String| AppendError {
+        rolled_back: true, // nothing written yet
+        msg,
+    };
+    if records.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+    let pre_len = f
+        .metadata()
+        .map_err(|e| fail(format!("{}: {e}", path.display())))?
+        .len();
+
+    let mut buf = Vec::with_capacity(STAMP_STORE_HEADER_LEN + records.len() * STAMP_RECORD_LEN);
+    if pre_len == 0 {
+        buf.extend_from_slice(STAMP_STORE_MAGIC);
+        buf.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
+        buf.extend_from_slice(batch_id);
+    }
+    for (addr, stamp) in records {
+        buf.extend_from_slice(addr);
+        buf.extend_from_slice(stamp);
+        buf.extend_from_slice(&stamp_record_checksum(addr, stamp));
+    }
+
+    let write_result = f.write_all(&buf).and_then(|()| f.sync_all());
+    if let Err(e) = write_result {
+        let rolled_back = f.set_len(pre_len).and_then(|()| f.sync_all()).is_ok();
+        return Err(AppendError {
+            rolled_back,
+            msg: if rolled_back {
+                format!("{}: batch append failed (rolled back): {e}", path.display())
+            } else {
+                format!(
+                    "{}: batch append failed AND rollback truncate failed: {e}",
+                    path.display()
+                )
+            },
+        });
+    }
+    Ok(())
+}
+
 fn append_stamp_record(
     path: &Path,
     batch_id: &[u8; 32],
@@ -1436,6 +1656,120 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn addr(i: u32) -> [u8; 32] {
+        ant_crypto::keccak256(&i.to_be_bytes())
+    }
+
+    /// A batch reserves exactly the indices one-by-one stamping would,
+    /// and everything it issued is on disk when it returns: a reopened
+    /// issuer has the same counters and the same stamps.
+    #[test]
+    fn a_batch_issues_what_single_stamps_would_and_persists_it() {
+        let secret = random_secp256k1_secret();
+        let batch = [0x5au8; 32];
+        let addrs: Vec<[u8; 32]> = (0..200).map(addr).collect();
+
+        let dir_a = tmpdir();
+        let mut batched =
+            StampIssuer::open_or_new(dir_a.join("b.bin"), batch, 20, 16, false).unwrap();
+        let stamps: Vec<_> = sign_stamps_batch(&secret, &mut batched, &addrs)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+
+        let dir_b = tmpdir();
+        let mut single =
+            StampIssuer::open_or_new(dir_b.join("b.bin"), batch, 20, 16, false).unwrap();
+        for (a, s) in addrs.iter().zip(&stamps) {
+            let one = sign_stamp_bytes(&secret, &mut single, a).unwrap();
+            assert_eq!(one[32..40], s[32..40], "same bucket index");
+        }
+        assert_eq!(batched.buckets, single.buckets);
+
+        drop(batched);
+        let reopened = StampIssuer::open_or_new(dir_a.join("b.bin"), batch, 20, 16, false).unwrap();
+        assert_eq!(reopened.buckets, single.buckets, "counters persisted");
+        for (a, s) in addrs.iter().zip(&stamps) {
+            assert_eq!(reopened.cached_stamp(a), Some(*s), "stamp recorded");
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// A chunk stamped before, or twice in one batch, keeps its slot and
+    /// gets a strictly newer timestamp each time.
+    #[test]
+    fn a_batch_restamps_known_and_repeated_chunks_in_place() {
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let mut issuer =
+            StampIssuer::open_or_new(dir.join("b.bin"), [1u8; 32], 20, 16, false).unwrap();
+        let first = sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap();
+        let counters = issuer.buckets.clone();
+        let out: Vec<_> = sign_stamps_batch(&secret, &mut issuer, &[addr(7), addr(7)])
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(issuer.buckets, counters, "no new slot for a known chunk");
+        let ts = |s: &[u8; STAMP_SIZE]| u64::from_be_bytes(s[40..48].try_into().unwrap());
+        assert_eq!(out[0][32..40], first[32..40]);
+        assert_eq!(out[1][32..40], first[32..40]);
+        assert!(ts(&out[0]) > ts(&first) && ts(&out[1]) > ts(&out[0]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On an immutable batch a full bucket fails that chunk only.
+    #[test]
+    fn a_batch_fails_only_the_chunks_whose_bucket_is_full() {
+        let secret = random_secp256k1_secret();
+        // Depth one above the bucket depth: two slots per bucket.
+        let mut issuer = StampIssuer::new([2u8; 32], 17, 16, true).unwrap();
+        let a = addr(1);
+        let bucket = collision_bucket_from_addr(16, &a);
+        let mut same_bucket = (2..1_000_000)
+            .map(addr)
+            .filter(|c| collision_bucket_from_addr(16, c) == bucket);
+        sign_stamp_bytes(&secret, &mut issuer, &a).unwrap();
+        sign_stamp_bytes(&secret, &mut issuer, &same_bucket.next().unwrap()).unwrap();
+        // A third chunk in the same (now full) bucket.
+        let third = same_bucket.next().unwrap();
+        let out = sign_stamps_batch(&secret, &mut issuer, &[third, addr(1_000_001)]);
+        assert!(matches!(out[0], Err(PostageError::BucketFull)));
+        assert!(out[1].is_ok());
+    }
+
+    /// Not an assertion, a figure: how much a batch saves on this disk.
+    /// `cargo test -p ant-postage --release -- --ignored --nocapture batch_vs_single`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn batch_vs_single_stamping_cost() {
+        let secret = random_secp256k1_secret();
+        let addrs: Vec<[u8; 32]> = (0..110).map(addr).collect(); // one 720p segment
+        let dir = tmpdir();
+        let mut one =
+            StampIssuer::open_or_new(dir.join("one.bin"), [3u8; 32], 22, 16, false).unwrap();
+        let t = std::time::Instant::now();
+        for a in &addrs {
+            sign_stamp_bytes(&secret, &mut one, a).unwrap();
+        }
+        let single = t.elapsed();
+        let mut many =
+            StampIssuer::open_or_new(dir.join("many.bin"), [4u8; 32], 22, 16, false).unwrap();
+        let t = std::time::Instant::now();
+        for r in sign_stamps_batch(&secret, &mut many, &addrs) {
+            r.unwrap();
+        }
+        let batched = t.elapsed();
+        println!(
+            "110 chunks: one by one {:?} ({:?}/chunk), batched {:?} ({:?}/chunk)",
+            single,
+            single / 110,
+            batched,
+            batched / 110
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The store lock must actually be taken — not error out as

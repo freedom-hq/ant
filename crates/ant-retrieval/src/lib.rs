@@ -63,6 +63,7 @@ pub mod priority;
 pub mod progress;
 pub mod rs;
 pub mod rs_encode;
+pub mod shallow_neighbourhoods;
 pub mod splitter;
 pub mod traversal;
 
@@ -108,6 +109,7 @@ pub use rs::{fetch_root_with_replicas, replica_addresses, REPLICAS_OWNER, REPLIC
 pub use rs_encode::{
     replica_chunks, split_bytes_with_redundancy, RedundantSplitResult, RedundantSplitter,
 };
+pub use shallow_neighbourhoods::ShallowNeighbourhoods;
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 pub use traversal::{traverse_chunk_addresses, traverse_encrypted_chunk_addresses, TraversalError};
 

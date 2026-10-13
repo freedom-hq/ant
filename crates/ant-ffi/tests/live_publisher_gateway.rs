@@ -135,6 +135,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         max_backlog: 4,
         playlist_window: 6,
         notes: String::new(),
+        start_index: 0,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),

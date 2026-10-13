@@ -18,7 +18,9 @@
 use std::path::Path;
 
 /// Target xBZZ deposit behind a node's chequebook, in PLUR (1 xBZZ =
-/// 1e16 PLUR): **0.001 xBZZ**, the one default for `antd` and `ant-ffi`.
+/// 1e16 PLUR): **0.001 xBZZ**. It is `antd`'s default
+/// (`--chequebook-deposit-plur`), `ant-ffi`'s target while the account
+/// has no storage plan, and the floor of [`deposit_target_for_depth`].
 /// It is grounded in the #67 benchmark, where that deposit backed 65 K+
 /// cheques with a wide margin (~300× one soak's measured settlement
 /// demand). That is small enough not to compete with the postage the
@@ -27,6 +29,44 @@ use std::path::Path;
 /// an adopted chequebook is topped back up to it
 /// ([`top_up_chequebook`]).
 pub const DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR: u128 = 10_000_000_000_000;
+
+/// The batch depth [`deposit_target_for_depth`] is anchored at.
+const PLAN_DEPOSIT_BASE_DEPTH: u8 = 21;
+
+/// [`deposit_target_for_depth`] at [`PLAN_DEPOSIT_BASE_DEPTH`]: 0.1 xBZZ.
+const PLAN_DEPOSIT_AT_BASE_PLUR: u128 = 1_000_000_000_000_000;
+
+/// The most [`deposit_target_for_depth`] asks for: 1 xBZZ.
+const PLAN_DEPOSIT_MAX_PLUR: u128 = 10_000_000_000_000_000;
+
+/// The chequebook deposit to keep behind a storage plan of batch depth
+/// `depth`, in PLUR: **0.1 xBZZ at depth 21**, doubling per extra depth
+/// level and halving per level below (depth 22 → 0.2 xBZZ, 20 → 0.05
+/// xBZZ), never below [`DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`] and never above
+/// 1 xBZZ.
+///
+/// The deposit backs the cheques that pay peers for upload bandwidth.
+/// Mainnet streaming measured that at ~0.03 xBZZ/GB (360p) to ~0.17
+/// xBZZ/GB (720p); the flat 0.001 xBZZ covered ~6 MB of 720p before
+/// uploads fell back to the slow free tier. A plan's depth is what it
+/// can hold, so the deposit grows with it, and the user pays it with the
+/// plan. The cap keeps a huge batch from locking up an absurd deposit.
+///
+/// The app library (`ant-ffi`) prices it into a plan quote, funds it on
+/// a buy and tops up against it. `antd` keeps an operator-chosen flat
+/// deposit (`--chequebook-deposit-plur`) instead.
+#[must_use]
+pub fn deposit_target_for_depth(depth: u8) -> u128 {
+    let target = if depth >= PLAN_DEPOSIT_BASE_DEPTH {
+        1u128
+            .checked_shl(u32::from(depth - PLAN_DEPOSIT_BASE_DEPTH))
+            .and_then(|factor| PLAN_DEPOSIT_AT_BASE_PLUR.checked_mul(factor))
+            .unwrap_or(u128::MAX)
+    } else {
+        PLAN_DEPOSIT_AT_BASE_PLUR >> (PLAN_DEPOSIT_BASE_DEPTH - depth)
+    };
+    target.clamp(DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR, PLAN_DEPOSIT_MAX_PLUR)
+}
 
 /// On-disk record of the chequebook a node auto-deployed (or
 /// rediscovered) for outbound settlement, persisted at
@@ -724,6 +764,40 @@ pub async fn auto_deploy_chequebook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deposit_target_scales_with_plan_depth() {
+        const BZZ: u128 = 10_000_000_000_000_000;
+        assert_eq!(deposit_target_for_depth(21), BZZ / 10);
+        assert_eq!(deposit_target_for_depth(22), BZZ / 5);
+        assert_eq!(deposit_target_for_depth(23), 2 * BZZ / 5);
+        assert_eq!(deposit_target_for_depth(24), 4 * BZZ / 5);
+        assert_eq!(deposit_target_for_depth(20), BZZ / 20);
+        assert_eq!(deposit_target_for_depth(17), BZZ / 160);
+    }
+
+    #[test]
+    fn deposit_target_is_floored_at_the_default() {
+        // 0.1 xBZZ / 2^7 = 0.00078 xBZZ, under the 0.001 floor.
+        assert_eq!(
+            deposit_target_for_depth(14),
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR
+        );
+        assert_eq!(deposit_target_for_depth(0), DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR);
+        // 0.1 xBZZ / 2^6 = 0.0016 xBZZ, still above it.
+        assert!(deposit_target_for_depth(15) > DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR);
+    }
+
+    #[test]
+    fn deposit_target_is_capped_at_one_bzz() {
+        const BZZ: u128 = 10_000_000_000_000_000;
+        assert_eq!(deposit_target_for_depth(25), BZZ, "1.6 xBZZ caps at 1");
+        assert_eq!(deposit_target_for_depth(40), BZZ);
+        // Shifts past u128's width don't wrap.
+        assert_eq!(deposit_target_for_depth(149), BZZ);
+        assert_eq!(deposit_target_for_depth(255), BZZ);
+        assert!((0..=u8::MAX).all(|d| deposit_target_for_depth(d) <= BZZ));
+    }
 
     #[test]
     fn persist_then_load_round_trips() {

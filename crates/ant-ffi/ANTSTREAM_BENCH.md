@@ -102,6 +102,47 @@ What the measured rows do establish:
   runner via `antstream-visual`, i.e. through the whole
   `ant_bench_start` → `_progress` → `_stop` FFI round trip.
 
+### Paid uploads on mainnet, 2026-10-12/13
+
+Linux x86_64 (24 cores, datacenter link), `antd` built from the
+`antstream-android` branch, `--target-peers 400`, a funded chequebook
+(SWAP cheques on), depth-20 mutable batch, 2 s segments, window 4,
+**fresh content per run** (`ANT_BENCH_SEED` randomised: with the default
+seed every run at one bitrate re-uploads byte-identical segments, which
+measures re-uploads, not a broadcast).
+
+| build | target | sustained | publish p50/p95/max ms | final lag ms | kept up |
+|---|---|---|---|---|---|
+| before | 360p 600 kbit/s, 10 min | 0.59 Mbit/s | 2881 / 5892 / 10358 | 5156 | yes |
+| before | 540p 1000 kbit/s, 10 min | 0.30 Mbit/s | 28297 / 31015 / 33234 | 522682 | **no** |
+| before | 720p 1800 kbit/s, 10 min | 0.60 Mbit/s | 28379 / 31020 / 33531 | 481144 | **no** |
+| fixes | 360p, 10 min | 0.60 Mbit/s | 2996 / 6633 / 12746 | 789 | yes |
+| fixes | 540p, 10 min | 0.98 Mbit/s | 3341 / 7767 / 8781 | 3359 | yes |
+| fixes + dedup | 720p, 10 min | 1.77 Mbit/s | 3455 / 8505 / 15546 | 5513 | yes |
+| fixes + dedup | 360p, **30 min** | 0.60 Mbit/s | 3087 / 8164 / 15703 | 2889 | yes (899/899) |
+
+Every run published every segment; every one of ~20 000 cheques was
+accepted. What the "before" stalls were (~30 s a segment):
+
+* **A neighbourhood without a reachable deep storer.** After the storage
+  radius rose to 9, one depth-9 neighbourhood with a single node caught a
+  chunk of nearly every segment, and each such chunk hunted for a deep
+  storer for the full 12 shallow receipts × 2.5 s. Fixed by
+  `ShallowNeighbourhoods`: a hunt that ends shallow marks the
+  neighbourhood for 10 minutes.
+* **Re-pushed redundancy replicas.** At redundancy level 1 each upload
+  also pushes replica SOCs of its manifest nodes; one manifest node is
+  identical in every segment, so its replica was re-pushed with every
+  segment on the strict SOC path (patience ~30 s) and in-flight copies
+  raced with different stamps ("overwriting chunk with newer timestamp",
+  1071 refusals in 30 min). Fixed by `push_dedup` (coalesce in-flight
+  duplicates, answer chunks stored in the last 10 minutes from memory)
+  and the neighbourhood memory on the strict path.
+
+Paid bandwidth cost: ~0.03 xBZZ/GB at 360p (the free pseudosettle
+allowance carries most of it), ~0.17 xBZZ/GB at 720p. The 0.001 xBZZ
+default chequebook deposit therefore covers only ~6 MB of 720p.
+
 ### Owed
 
 | environment | what's needed |
