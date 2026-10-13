@@ -18,6 +18,9 @@
 // n segments *without* ENDLIST, like a broadcaster that dropped off.
 // STALE_PCT=<p> answers p% of playlist reads with an older playlist of the
 // same broadcast, like a feed lookup that missed the newest updates.
+// PLAYLIST_MS=<min>-<max> answers every playlist read after a random delay
+// in that range, with the playlist as it was when the read started, like a
+// feed lookup that probes Swarm for seconds.
 //
 // Routes:
 //   /bzz/<PLAYER_REF>/<file>       the player (examples/antstream-player)
@@ -42,6 +45,7 @@ const slowMs = Number(process.env.SLOW_MS || 0);
 const restartMs = Number(process.env.RESTART_MS || 0);
 const stallAfter = Number(process.env.STALL || 0);
 const stalePct = Number(process.env.STALE_PCT || 0);
+const [playlistMin, playlistMax] = (process.env.PLAYLIST_MS || '0').split('-').map(Number);
 if (!dir) {
   console.error('usage: fake-gateway.mjs <segments-dir> [port]');
   process.exit(2);
@@ -104,7 +108,9 @@ function playlist() {
   const discBefore = published.slice(0, upto - window.length).filter((p) => p.discontinuity).length;
   if (discBefore) out += `#EXT-X-DISCONTINUITY-SEQUENCE:${discBefore}\n`;
   window.forEach((p, i) => {
-    if (p.discontinuity && i > 0) out += '#EXT-X-DISCONTINUITY\n';
+    // Like the publisher: the tag stays on a segment heading the window,
+    // and counts in the sequence only once that segment has slid out.
+    if (p.discontinuity) out += '#EXT-X-DISCONTINUITY\n';
     if (i === 0 || p.discontinuity) out += `#EXT-X-MAP:URI="/bzz/${initRef}/init-1.mp4"\n`;
     out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
   });
@@ -146,8 +152,12 @@ createServer((req, res) => {
       res.writeHead(404).end('feed has no updates yet');
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
-    res.end(playlist());
+    const text = playlist();
+    const delay = playlistMin + Math.random() * ((playlistMax || playlistMin) - playlistMin);
+    setTimeout(() => {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
+      res.end(text);
+    }, delay);
     return;
   }
   const blob = blobs.get(ref);

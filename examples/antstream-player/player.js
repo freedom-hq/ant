@@ -23,6 +23,10 @@
  * Freedom forwards no `Cache-Control` request header to its node, so
  * playlist reloads carry a `t=` query instead. Feed-resolved responses are
  * `no-cache` on the node side; segments are immutable and cache normally.
+ *
+ * Playlist reads and segment fetches bypass hls.js's one-at-a-time loading
+ * (see "playlist reads" and "segment fetches" below), and debug.js shows
+ * what they did.
  */
 (function () {
   'use strict';
@@ -100,7 +104,97 @@
     return null;
   }
 
-  // -- hls.js wiring --------------------------------------------------------
+  // -- settings and debug log ------------------------------------------------
+  //
+  // The tuning knobs below can be changed from the debug panel (debug.js)
+  // and are kept in localStorage. The log holds every playlist read and
+  // segment fetch with its timings plus markers (stalls, errors, new
+  // broadcasts). It runs whether or not the panel is open, so opening it
+  // after a hiccup still shows what happened.
+
+  const SETTINGS_KEY = 'antstream.settings';
+  const DEFAULTS = {
+    // Segments fetched ahead of the one hls.js loads. 0: hls.js alone.
+    prefetch: 3,
+    // Feed reads kept overlapping while live. 0: hls.js's own reloads only.
+    polls: 3,
+    // Seconds to buffer before playing after a start, seek or stall. 0: off.
+    rebuffer: 4,
+  };
+  const settings = (() => {
+    try {
+      return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+    } catch (_) {
+      return { ...DEFAULTS };
+    }
+  })();
+
+  function setSetting(key, value) {
+    settings[key] = value;
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (_) {
+      /* storage unavailable: the setting lasts for this page */
+    }
+  }
+
+  const MAX_LOG = 400;
+  const MAX_SAMPLES = 240; // two minutes at two a second
+
+  const log = {
+    version: 0,
+    entries: [],
+    samples: [],
+    session: null,
+    touch() {
+      this.version += 1;
+    },
+    add(entry) {
+      entry.at = Date.now();
+      this.entries.push(entry);
+      if (this.entries.length > MAX_LOG) this.entries.shift();
+      this.touch();
+      return entry;
+    },
+    marker(text) {
+      return this.add({ kind: 'marker', text });
+    },
+    begin(ch) {
+      if (this.session && this.session.channel === ch) {
+        // Same channel (a new broadcast, or a retry): keep the history,
+        // time the first frame again.
+        this.session.startedAt = Date.now();
+        this.session.firstPlayingAt = null;
+        this.marker('player restarted');
+        return;
+      }
+      this.entries = [];
+      this.samples = [];
+      this.session = {
+        channel: ch,
+        startedAt: Date.now(),
+        firstPlayingAt: null,
+        stalls: 0,
+        stallMs: 0,
+        stallSince: null,
+        claims: { ready: 0, joined: 0, miss: 0 },
+      };
+      this.touch();
+    },
+  };
+
+  // A fresh LoaderStats, as hls.js's own loaders keep one.
+  const newStats = () => ({
+    aborted: false,
+    loaded: 0,
+    retry: 0,
+    total: 0,
+    chunkCount: 0,
+    bwEstimate: 0,
+    loading: { start: 0, first: 0, end: 0 },
+    parsing: { start: 0, end: 0 },
+    buffering: { start: 0, first: 0, end: 0 },
+  });
 
   // -- playlist guard -------------------------------------------------------
   //
@@ -159,23 +253,320 @@
     return guard.text;
   }
 
+  // -- playlist reads -------------------------------------------------------
+  //
+  // Every read of `<channel>/stream.m3u8` makes the node resolve the feed on
+  // Swarm, which takes seconds. hls.js reloads a live playlist one read at
+  // a time, so it hears of a new segment a whole read plus a reload
+  // interval late, and the buffer drains meanwhile. Here reads overlap
+  // instead: while live, a new one starts every POLL_MS, at most
+  // `settings.polls` at once, and hls.js's reload is answered at once with
+  // the newest playlist any of them returned (or with the next read to
+  // finish, if none is newer than what hls.js has).
+
+  const POLL_MS = 1500;
+  // A channel whose playlist stopped moving (broadcaster gone, or paused)
+  // is read less often.
+  const IDLE_AFTER_MS = 20000;
+  const IDLE_POLL_MS = 5000;
+  const READ_TIMEOUT_MS = 30000;
+  const reads = { gen: 0, url: null, inflight: 0, lastStart: 0, lastNewer: 0, waiters: [], delivered: null };
+
+  function resetReads(url) {
+    reads.gen += 1;
+    reads.url = url;
+    reads.inflight = 0;
+    reads.lastStart = 0;
+    reads.lastNewer = Date.now();
+    reads.waiters = [];
+    reads.delivered = null;
+  }
+
+  async function readPlaylist() {
+    const gen = reads.gen;
+    reads.inflight += 1;
+    reads.lastStart = Date.now();
+    const row = log.add({ kind: 'playlist', start: performance.now(), ms: null, status: 'loading', seq: null, segments: null, note: '' });
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), READ_TIMEOUT_MS);
+    let text = null;
+    let error = null;
+    try {
+      const res = await fetch(withCacheBust(reads.url), { cache: 'no-store', signal: ctl.signal });
+      row.status = res.status;
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { code: res.status });
+      text = await res.text();
+    } catch (err) {
+      error = err;
+      if (row.status === 'loading') row.status = err.name === 'AbortError' ? 'timeout' : 'error';
+      row.note = err.message;
+    } finally {
+      clearTimeout(timer);
+    }
+    row.ms = performance.now() - row.start;
+    log.touch();
+    if (gen !== reads.gen) return;
+    reads.inflight -= 1;
+    let result = { error };
+    if (text !== null) {
+      const info = playlistInfo(text);
+      row.seq = info.key[0];
+      row.segments = info.key[1];
+      const before = guard.text;
+      const kept = guardPlaylist(text);
+      row.note = kept !== text ? 'stale: kept the newer one' : kept === before ? 'unchanged' : 'newer';
+      if (row.note === 'newer') reads.lastNewer = Date.now();
+      result = { text: kept };
+    }
+    const waiters = reads.waiters;
+    reads.waiters = [];
+    for (const w of waiters) w(result);
+  }
+
+  function nextPlaylist() {
+    if (guard.text !== null && guard.text !== reads.delivered) return Promise.resolve({ text: guard.text });
+    const p = new Promise((resolve) => reads.waiters.push(resolve));
+    if (reads.inflight === 0) readPlaylist();
+    return p;
+  }
+
+  /** Called twice a second: keep `settings.polls` reads overlapping while live. */
+  function pollPlaylist() {
+    if (!hls || ended || guard.text === null) return;
+    const now = Date.now();
+    const every = now - reads.lastNewer > IDLE_AFTER_MS ? IDLE_POLL_MS : POLL_MS;
+    if (reads.inflight < settings.polls && now - reads.lastStart >= every) readPlaylist();
+  }
+
+  /** hls.js's playlist loader (`pLoader`), served by the reads above. */
+  class PlaylistLoader {
+    constructor() {
+      this.stats = newStats();
+      this.context = null;
+      this.callbacks = null;
+    }
+
+    load(context, _config, callbacks) {
+      this.context = context;
+      this.callbacks = callbacks;
+      const stats = this.stats;
+      stats.loading.start = performance.now();
+      nextPlaylist().then((r) => {
+        const cb = this.callbacks;
+        if (stats.aborted || !cb) return;
+        stats.loading.first = stats.loading.end = performance.now();
+        if (r.error) {
+          cb.onError({ code: r.error.code || 0, text: r.error.message }, context, null, stats);
+          return;
+        }
+        reads.delivered = r.text;
+        stats.loaded = stats.total = r.text.length;
+        cb.onSuccess({ url: context.url, data: r.text, code: 200 }, stats, context, null);
+      });
+    }
+
+    abort() {
+      this.stats.aborted = true;
+      const cb = this.callbacks;
+      if (cb && cb.onAbort) cb.onAbort(this.stats, this.context, null);
+    }
+
+    destroy() {
+      this.stats.aborted = true;
+      this.callbacks = null;
+    }
+
+    getCacheAge() {
+      return null;
+    }
+
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  // -- segment fetches ------------------------------------------------------
+  //
+  // hls.js fetches one segment at a time, and a Swarm read of a fresh
+  // segment spends most of its time finding chunks, not moving bytes. So
+  // when hls.js asks for segment N, N+1 … N+`settings.prefetch` start too,
+  // side by side, and hls.js's later request for one of them is served from
+  // memory or joins the fetch already running. Fetches outside that window
+  // (after a seek, or once played past) are cancelled.
+
+  const MAX_SEGMENTS = 12;
+  const segs = new Map(); // content URL -> fetch
+  let cursorSn = -1; // the segment hls.js asked for last
+
+  function fetchSegment(url, sn, prefetched) {
+    const ctl = new AbortController();
+    const row = log.add({
+      kind: 'segment',
+      sn,
+      name: url.split('?')[0].split('/').pop(),
+      start: performance.now(),
+      ttfb: null,
+      ms: null,
+      bytes: null,
+      status: 'loading',
+      via: prefetched ? 'prefetch' : 'hls.js',
+      note: '',
+    });
+    const f = { url, sn, ctl, row, data: null, ttfb: 0, ms: 0 };
+    f.promise = fetch(url, { signal: ctl.signal }).then(async (res) => {
+      row.ttfb = f.ttfb = performance.now() - row.start;
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { code: res.status });
+      const data = await res.arrayBuffer();
+      row.ms = f.ms = performance.now() - row.start;
+      row.bytes = data.byteLength;
+      row.status = 'ok';
+      f.data = data;
+      log.touch();
+      return data;
+    });
+    f.promise.catch((err) => {
+      if (row.status === 'loading') {
+        row.status = 'error';
+        row.note = err.message;
+      }
+      if (row.ms === null) row.ms = performance.now() - row.start;
+      if (segs.get(url) === f) segs.delete(url);
+      log.touch();
+    });
+    segs.set(url, f);
+    return f;
+  }
+
+  function cancelSegment(f, why) {
+    if (f.row.status === 'loading') {
+      f.row.status = 'cancelled';
+      f.row.note = why;
+      f.ctl.abort();
+    }
+    segs.delete(f.url);
+  }
+
+  function clearSegments() {
+    for (const f of [...segs.values()]) cancelSegment(f, 'player stopped');
+    cursorSn = -1;
+  }
+
+  /** Keep only fetches for the segment hls.js wants and the ones after it. */
+  function trimSegments() {
+    for (const f of [...segs.values()]) {
+      if (typeof f.sn !== 'number') continue;
+      if (f.sn < cursorSn) cancelSegment(f, 'behind the playhead');
+      else if (f.sn > cursorSn + Math.max(settings.prefetch, 0)) cancelSegment(f, 'outside the prefetch window');
+    }
+    while (segs.size > MAX_SEGMENTS) cancelSegment(segs.values().next().value, 'cache full');
+  }
+
+  function prefetchAfter(sn) {
+    const depth = settings.prefetch;
+    if (!hls || !depth || typeof sn !== 'number' || sn < 0) return;
+    const level = hls.levels[Math.max(hls.currentLevel, 0)];
+    const frags = (level && level.details && level.details.fragments) || [];
+    for (const frag of frags) {
+      if (frag.sn <= sn || frag.sn > sn + depth) continue;
+      const url = toContentUrl(frag.url);
+      if (!segs.has(url)) fetchSegment(url, frag.sn, true);
+    }
+  }
+
+  /** hls.js's fragment loader (`fLoader`), served by the fetches above. */
+  class SegmentLoader {
+    constructor() {
+      this.stats = newStats();
+      this.context = null;
+      this.callbacks = null;
+      this.timer = null;
+    }
+
+    load(context, config, callbacks) {
+      this.context = context;
+      this.callbacks = callbacks;
+      const stats = this.stats;
+      stats.loading.start = performance.now();
+      const url = toContentUrl(context.url);
+      const sn = context.frag ? context.frag.sn : null;
+      if (typeof sn === 'number') {
+        cursorSn = sn;
+        trimSegments();
+      }
+      let f = segs.get(url);
+      if (f) {
+        const ready = f.data !== null;
+        f.row.via = ready ? 'prefetch, ready' : 'prefetch, joined';
+        if (log.session) log.session.claims[ready ? 'ready' : 'joined'] += 1;
+      } else {
+        f = fetchSegment(url, sn, false);
+        if (log.session && typeof sn === 'number') log.session.claims.miss += 1;
+      }
+      prefetchAfter(sn);
+      if (config.timeout) {
+        this.timer = setTimeout(() => {
+          const cb = this.callbacks;
+          if (stats.aborted || !cb) return;
+          this.callbacks = null;
+          f.row.status = 'timeout';
+          cancelSegment(f, 'timed out');
+          cb.onTimeout(stats, context, null);
+        }, config.timeout);
+      }
+      f.promise.then(
+        (data) => {
+          clearTimeout(this.timer);
+          const cb = this.callbacks;
+          if (stats.aborted || !cb) return;
+          // Handed over once: hls.js may transfer the buffer to its worker.
+          if (segs.get(url) === f) segs.delete(url);
+          // The fetch's own timings, ending now: a prefetch that finished
+          // early must not read as an instant download.
+          const now = performance.now();
+          stats.loading.start = now - f.ms;
+          stats.loading.first = stats.loading.start + f.ttfb;
+          stats.loading.end = now;
+          stats.loaded = stats.total = data.byteLength;
+          cb.onSuccess({ url: context.url, data, code: 200 }, stats, context, null);
+        },
+        (err) => {
+          clearTimeout(this.timer);
+          const cb = this.callbacks;
+          if (stats.aborted || !cb) return;
+          stats.loading.end = performance.now();
+          cb.onError({ code: err.code || 0, text: err.message }, context, null, stats);
+        },
+      );
+    }
+
+    abort() {
+      // The shared fetch keeps running: hls.js often asks again right away.
+      clearTimeout(this.timer);
+      this.stats.aborted = true;
+      const cb = this.callbacks;
+      if (cb && cb.onAbort) cb.onAbort(this.stats, this.context, null);
+    }
+
+    destroy() {
+      clearTimeout(this.timer);
+      this.stats.aborted = true;
+      this.callbacks = null;
+    }
+
+    getCacheAge() {
+      return null;
+    }
+
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  // Anything else hls.js loads (keys, steering) only needs its URL mapped.
   const BaseLoader = Hls.DefaultConfig.loader;
   class SwarmLoader extends BaseLoader {
     load(context, config, callbacks) {
-      let url = toContentUrl(context.url);
-      const playlist = context.type === 'manifest' || context.type === 'level';
-      if (playlist) {
-        url = withCacheBust(url);
-        const onSuccess = callbacks.onSuccess;
-        callbacks = {
-          ...callbacks,
-          onSuccess: (response, stats, ctx, network) => {
-            if (typeof response.data === 'string') response.data = guardPlaylist(response.data);
-            onSuccess(response, stats, ctx, network);
-          },
-        };
-      }
-      context.url = url;
+      context.url = toContentUrl(context.url);
       super.load(context, config, callbacks);
     }
   }
@@ -193,18 +584,103 @@
 
   const HLS_CONFIG = {
     loader: SwarmLoader,
+    pLoader: PlaylistLoader,
+    fLoader: SegmentLoader,
     enableWorker: true,
     lowLatencyMode: false,
-    // The publisher keeps ~6 segments of 2 s in its live playlist: sit three
-    // behind the edge and resync if more than five behind.
-    liveSyncDurationCount: 3,
-    liveMaxLatencyDurationCount: 5,
+    // The publisher keeps ~6 segments of 2 s in its live playlist: sit four
+    // behind the newest one, which leaves room to buffer through a slow
+    // read. Only a playhead that falls out of the window jumps forward: a
+    // jump throws away what is buffered and stalls again.
+    liveSyncDurationCount: 4,
+    liveMaxLatencyDurationCount: 10,
     maxBufferLength: 30,
     backBufferLength: 30,
     manifestLoadPolicy: patient(30000, 60000, 6),
-    playlistLoadPolicy: patient(20000, 40000, 6),
+    playlistLoadPolicy: patient(30000, 40000, 6),
     fragLoadPolicy: patient(30000, 90000, 6),
   };
+
+  // -- rebuffer gate --------------------------------------------------------
+  //
+  // Playing the moment one segment lands only buys a second or two before
+  // the next stall. After a start, seek or stall, playback is held until
+  // `settings.rebuffer` seconds are buffered ahead (or the broadcast ended,
+  // or HOLD_MAX_MS passed). It holds with playbackRate 0, not pause():
+  // hls.js keeps loading and treats rate 0 as halted rather than stalled.
+
+  const HOLD_MAX_MS = 15000;
+  const MAX_GAP_S = 1;
+  const gate = { holding: false, why: '', since: 0 };
+
+  function hold(why) {
+    if (!settings.rebuffer) return;
+    if (!gate.holding) {
+      gate.holding = true;
+      gate.since = Date.now();
+    }
+    gate.why = why;
+    if (video.playbackRate !== 0) video.playbackRate = 0;
+  }
+
+  function release(how) {
+    if (!gate.holding) return;
+    gate.holding = false;
+    video.playbackRate = 1;
+    log.marker(`${gate.why}: playing after ${((Date.now() - gate.since) / 1000).toFixed(1)} s held (${how})`);
+    firstPlaying();
+    endStall();
+  }
+
+  function firstPlaying() {
+    const s = log.session;
+    if (!s || s.firstPlayingAt !== null || video.paused) return;
+    s.firstPlayingAt = Date.now();
+    log.marker(`first frame after ${((s.firstPlayingAt - s.startedAt) / 1000).toFixed(1)} s`);
+  }
+
+  function checkGate() {
+    if (!gate.holding) return;
+    if (!settings.rebuffer) release('gate off');
+    else if (bufferAheadAcrossGaps() >= settings.rebuffer) release(`${bufferAheadAcrossGaps().toFixed(1)} s buffered`);
+    else if (ended && video.buffered.length) release('broadcast ended');
+    else if (Date.now() - gate.since > HOLD_MAX_MS) release('waited long enough');
+    else if (video.playbackRate !== 0) video.playbackRate = 0; // attaching media resets it
+  }
+
+  function endStall() {
+    const s = log.session;
+    if (s && s.stallSince !== null) {
+      s.stallMs += Date.now() - s.stallSince;
+      s.stallSince = null;
+      log.touch();
+    }
+  }
+
+  video.addEventListener('waiting', () => {
+    const s = log.session;
+    if (!hls || !s || s.firstPlayingAt === null || video.seeking || video.paused) return;
+    if (s.stallSince === null) {
+      s.stalls += 1;
+      s.stallSince = Date.now();
+      log.marker(`stall at ${video.currentTime.toFixed(1)} s, ${bufferAhead().toFixed(1)} s buffered`);
+    }
+    // Stuck at a hole with video beyond it: hls.js skips it, but only
+    // while playback runs.
+    if (bufferAheadAcrossGaps() < settings.rebuffer) hold('stall');
+  });
+
+  video.addEventListener('seeking', () => {
+    const s = log.session;
+    if (hls && s && s.firstPlayingAt !== null && bufferAheadAcrossGaps() < settings.rebuffer) hold('seek');
+  });
+
+  video.addEventListener('playing', () => {
+    const s = log.session;
+    if (!s || gate.holding || video.playbackRate === 0) return;
+    firstPlaying();
+    endStall();
+  });
 
   // -- state ----------------------------------------------------------------
 
@@ -216,6 +692,7 @@
   let lastFetchMs = null;
   let retryTimer = null;
   let statsTimer = null;
+  let tickTimer = null;
   let endedPoll = null;
   let lastFragAt = 0;
 
@@ -236,10 +713,15 @@
   function stop() {
     clearTimeout(retryTimer);
     clearInterval(statsTimer);
+    clearInterval(tickTimer);
     clearInterval(endedPoll);
     endedPoll = null;
     if (hls) hls.destroy();
     hls = null;
+    resetReads(null);
+    clearSegments();
+    gate.holding = false;
+    video.playbackRate = 1;
   }
 
   function play(ch) {
@@ -250,6 +732,7 @@
     segmentsLoaded = 0;
     lastFetchMs = null;
     resetGuard();
+    log.begin(ch);
     lastFragAt = Date.now();
     els.intro.hidden = true;
     els.stage.hidden = false;
@@ -272,6 +755,8 @@
       return;
     }
 
+    resetReads(contentUrl(ch, PLAYLIST));
+    hold('start');
     hls = new Hls(HLS_CONFIG);
     hls.attachMedia(video);
     hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(contentUrl(ch, PLAYLIST)));
@@ -285,10 +770,15 @@
       // under its own broadcast id. The guard flags a new one; start over
       // on it.
       if (guard.newBroadcast) {
+        log.marker('a new broadcast started on the channel');
         play(channel);
         return;
       }
+      const wasEnded = ended;
       ended = !details.live;
+      // New segments may have come into the prefetch window.
+      prefetchAfter(cursorSn);
+      if (ended && !wasEnded) log.marker('the broadcast ended');
       if (ended) {
         setStatus('The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
         watchForNextBroadcast();
@@ -302,6 +792,7 @@
     });
     hls.on(Hls.Events.ERROR, (_e, data) => onError(data));
     statsTimer = setInterval(updateStats, 1000);
+    tickTimer = setInterval(tick, 250);
   }
 
   /**
@@ -326,7 +817,30 @@
     }, 10000);
   }
 
+  /** Four times a second: the gate, overlapping reads, buffer samples. */
+  let ticks = 0;
+  function tick() {
+    checkGate();
+    pollPlaylist();
+    ticks += 1;
+    if (ticks % 2) return;
+    const s = log.session;
+    log.samples.push({
+      t: Date.now(),
+      ahead: bufferAhead(),
+      latency: hls && Number.isFinite(hls.latency) ? hls.latency : null,
+      stalled: !!s && s.stallSince !== null,
+      holding: gate.holding,
+    });
+    if (log.samples.length > MAX_SAMPLES) log.samples.shift();
+    log.touch();
+  }
+
   function onError(data) {
+    if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) return;
+    if (data.fatal || data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      log.marker(`hls.js ${data.details}${data.fatal ? ' (fatal)' : ''}${data.response && data.response.code ? ` ${data.response.code}` : ''}`);
+    }
     if (!data.fatal) return;
     if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
       setStatus('Recovering from a decode error…');
@@ -361,6 +875,24 @@
     return 0;
   }
 
+  /**
+   * Buffered ahead counting past small holes (a discontinuity often leaves
+   * one), which hls.js jumps by itself once playback runs.
+   */
+  function bufferAheadAcrossGaps() {
+    const t = video.currentTime;
+    let end = t;
+    let total = 0;
+    for (let i = 0; i < video.buffered.length; i++) {
+      const s = video.buffered.start(i);
+      const e = video.buffered.end(i);
+      if (e <= end || s > end + MAX_GAP_S) continue;
+      total += e - Math.max(s, end);
+      end = e;
+    }
+    return total;
+  }
+
   function updateStats() {
     if (!hls) return;
     const playing = !video.paused && video.readyState >= 3;
@@ -390,7 +922,8 @@
     }
     els.goLive.hidden = ended || behind === null || behind <= target + 6;
 
-    if (everPlayed && playing && !ended) setStatus('Playing live');
+    if (gate.holding && everPlayed) setStatus(`Buffering… ${bufferAhead().toFixed(1)} of ${settings.rebuffer} s`);
+    else if (everPlayed && playing && !ended) setStatus('Playing live');
     else if (everPlayed && !playing && !video.paused) setStatus('Buffering…');
 
     els.latency.textContent = behind !== null ? `${behind.toFixed(1)} s` : '–';
@@ -483,5 +1016,18 @@
   fromHash();
 
   // Exposed for the test harness and for debugging from the console.
-  window.antstreamPlayer = { toContentUrl, parseChannel, contentUrl, get hls() { return hls; } };
+  window.antstreamPlayer = {
+    toContentUrl,
+    parseChannel,
+    contentUrl,
+    log,
+    settings,
+    setSetting,
+    DEFAULTS,
+    bufferAhead,
+    gate,
+    get hls() {
+      return hls;
+    },
+  };
 })();
