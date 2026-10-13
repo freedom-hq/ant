@@ -151,7 +151,7 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
                             reference: vec![0u8; 32],
                             content_type: Some("text/plain".to_string()),
                             filename: None,
-                            mutable: false,
+                            feed: None,
                         })
                         .await;
                     let _ = ack
@@ -481,7 +481,7 @@ async fn head_dispatches_head_only_flag() {
                         reference: vec![0u8; 32],
                         content_type: Some("video/mp4".to_string()),
                         filename: Some("clip.mp4".to_string()),
-                        mutable: false,
+                        feed: None,
                     })
                     .await;
                 if !head_only {
@@ -2904,5 +2904,223 @@ async fn pss_send_accepts_a_propagating_batch_but_not_a_rejected_one() {
         let status = resp.status();
         let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
         assert_eq!(status, want, "propagating={propagating}: {text}");
+    }
+}
+
+// =====================================================================
+// `/bzz` through a feed manifest (#161): bee's `swarm-feed-index` /
+// `swarm-feed-resolved-version` headers and the `Swarm-Feed-Index`
+// expose entry (`pkg/api/bzz.go` since ethersphere/bee#5287).
+// =====================================================================
+
+/// A two-page website (`index.html` as index document, `about.html`),
+/// each page's body tagged with `tag`. Returns the manifest root and
+/// its chunks.
+fn tagged_site(tag: &str) -> ([u8; 32], HashMap<[u8; 32], Vec<u8>>) {
+    use ant_retrieval::{build_collection_manifest, split_bytes, IndexAnchor, ManifestFile};
+    let mut chunks = HashMap::new();
+    let mut files = Vec::new();
+    for page in ["index", "about"] {
+        let split = split_bytes(format!("<h1>{page} {tag}</h1>").as_bytes());
+        chunks.extend(split.chunks.into_iter().map(|c| (c.address, c.wire)));
+        files.push(ManifestFile {
+            path: format!("{page}.html"),
+            content_type: Some("text/html".to_string()),
+            data_ref: split.root.to_vec(),
+        });
+    }
+    let manifest =
+        build_collection_manifest(&files, Some("index.html"), IndexAnchor::EmptyNode).unwrap();
+    chunks.extend(manifest.chunks.into_iter().map(|c| (c.address, c.wire)));
+    (manifest.root, chunks)
+}
+
+/// Add a feed manifest for `scenario`'s feed to `chunks`; returns its
+/// reference.
+fn stage_feed_manifest(
+    scenario: &FeedScenario,
+    chunks: &mut HashMap<[u8; 32], Vec<u8>>,
+) -> [u8; 32] {
+    let manifest = ant_retrieval::build_feed_manifest(&scenario.owner, &scenario.topic).unwrap();
+    chunks.extend(manifest.chunks.into_iter().map(|c| (c.address, c.wire)));
+    manifest.root
+}
+
+/// A feed manifest whose v1 feed has updates 0 → `old` site and 1 →
+/// `new` site, so it resolves to index 1.
+fn v1_feed_site() -> ([u8; 32], Arc<common::DirFetcher>) {
+    let scenario = FeedScenario::new(0x61, 0xc1);
+    let mut chunks = HashMap::new();
+    for (index, tag) in [(0u64, "old"), (1, "new")] {
+        let (site, site_chunks) = tagged_site(tag);
+        chunks.extend(site_chunks);
+        let (addr, wire) = make_feed_update(
+            &scenario.secret,
+            &scenario.owner,
+            &scenario.topic,
+            index,
+            1_000 + index,
+            &site,
+        );
+        chunks.insert(addr, wire);
+    }
+    let manifest = stage_feed_manifest(&scenario, &mut chunks);
+    (manifest, Arc::new(common::DirFetcher::from_chunks(chunks)))
+}
+
+/// A feed manifest whose only update, at index 0, is v2: the SOC wraps
+/// the site's manifest root chunk itself.
+fn v2_feed_site() -> ([u8; 32], Arc<common::DirFetcher>) {
+    let scenario = FeedScenario::new(0x62, 0xc2);
+    let (site, mut chunks) = tagged_site("v2");
+    let root_payload = chunks[&site][8..].to_vec();
+    let (soc_addr, soc_wire, wrapped, _) = make_feed_update_v2(
+        &scenario.secret,
+        &scenario.owner,
+        &scenario.topic,
+        0,
+        &root_payload,
+    );
+    assert_eq!(wrapped, site, "the v2 update wraps the site root chunk");
+    chunks.insert(soc_addr, soc_wire);
+    let manifest = stage_feed_manifest(&scenario, &mut chunks);
+    (manifest, Arc::new(common::DirFetcher::from_chunks(chunks)))
+}
+
+async fn bzz_request(
+    router: axum::Router,
+    method: Method,
+    uri: &str,
+    range: Option<&str>,
+) -> axum::response::Response {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(r) = range {
+        req = req.header(header::RANGE, r);
+    }
+    send(router, req.body(Body::empty()).unwrap()).await
+}
+
+/// Assert bee's feed-manifest `/bzz` headers for a feed resolved at
+/// `index` as `version`.
+fn assert_bzz_feed_headers(resp: &axum::response::Response, index: u64, version: &str) {
+    let h = resp.headers();
+    assert_eq!(
+        h.get("swarm-feed-index").expect("swarm-feed-index"),
+        index_hex(index).as_str(),
+        "same 8-byte big-endian hex as GET /feeds",
+    );
+    assert_eq!(
+        h.get("swarm-feed-resolved-version")
+            .expect("swarm-feed-resolved-version"),
+        version,
+    );
+    let exposed: Vec<&str> = h
+        .get_all("access-control-expose-headers")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    assert!(
+        exposed
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("swarm-feed-index")),
+        "Swarm-Feed-Index must be exposed, got {exposed:?}",
+    );
+    let cc = h.get(header::CACHE_CONTROL).unwrap().to_str().unwrap();
+    assert!(cc.contains("no-cache"), "feed content is mutable: {cc}");
+    // Bee's `/bzz` sends neither of the other `/feeds` headers.
+    assert!(h.get("swarm-feed-index-next").is_none());
+    assert!(h.get("swarm-soc-signature").is_none());
+}
+
+#[tokio::test]
+async fn bzz_v1_feed_manifest_sends_feed_index_and_version() {
+    let (manifest, fetcher) = v1_feed_site();
+    let router = common::handle_with_node(fetcher);
+    let m = hex::encode(manifest);
+
+    // Root: the index document of the latest update's site.
+    let resp = bzz_request(router.clone(), Method::GET, &format!("/bzz/{m}/"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_bzz_feed_headers(&resp, 1, "v1");
+    assert_eq!(body_bytes(resp).await, b"<h1>index new</h1>");
+
+    // Sub-path.
+    let resp = bzz_request(
+        router.clone(),
+        Method::GET,
+        &format!("/bzz/{m}/about.html"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_bzz_feed_headers(&resp, 1, "v1");
+    assert_eq!(body_bytes(resp).await, b"<h1>about new</h1>");
+
+    // A ranged read is re-dispatched; the headers come along.
+    let resp = bzz_request(
+        router.clone(),
+        Method::GET,
+        &format!("/bzz/{m}/about.html"),
+        Some("bytes=4-8"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_bzz_feed_headers(&resp, 1, "v1");
+    assert_eq!(body_bytes(resp).await, b"about");
+
+    // So does a buffered multi-range read.
+    let resp = bzz_request(
+        router.clone(),
+        Method::GET,
+        &format!("/bzz/{m}/about.html"),
+        Some("bytes=0-1,4-8"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_bzz_feed_headers(&resp, 1, "v1");
+
+    // HEAD carries them too.
+    let resp = bzz_request(router, Method::HEAD, &format!("/bzz/{m}/"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_bzz_feed_headers(&resp, 1, "v1");
+}
+
+#[tokio::test]
+async fn bzz_v2_feed_manifest_sends_feed_index_and_version() {
+    let (manifest, fetcher) = v2_feed_site();
+    let router = common::handle_with_node(fetcher);
+    let m = hex::encode(manifest);
+
+    let resp = bzz_request(router.clone(), Method::GET, &format!("/bzz/{m}/"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_bzz_feed_headers(&resp, 0, "v2");
+    assert_eq!(body_bytes(resp).await, b"<h1>index v2</h1>");
+
+    let resp = bzz_request(router, Method::GET, &format!("/bzz/{m}/about.html"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_bzz_feed_headers(&resp, 0, "v2");
+    assert_eq!(body_bytes(resp).await, b"<h1>about v2</h1>");
+}
+
+#[tokio::test]
+async fn bzz_plain_manifest_sends_no_feed_headers() {
+    let (site, chunks) = tagged_site("plain");
+    let router = common::handle_with_node(Arc::new(common::DirFetcher::from_chunks(chunks)));
+    let s = hex::encode(site);
+    for (uri, body) in [
+        (format!("/bzz/{s}/"), &b"<h1>index plain</h1>"[..]),
+        (format!("/bzz/{s}/about.html"), &b"<h1>about plain</h1>"[..]),
+    ] {
+        let resp = bzz_request(router.clone(), Method::GET, &uri, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let h = resp.headers();
+        assert!(h.get("swarm-feed-index").is_none(), "{uri}");
+        assert!(h.get("swarm-feed-resolved-version").is_none(), "{uri}");
+        assert!(h.get("access-control-expose-headers").is_none(), "{uri}");
+        let cc = h.get(header::CACHE_CONTROL).unwrap().to_str().unwrap();
+        assert!(cc.contains("immutable"), "{uri}: {cc}");
+        assert_eq!(body_bytes(resp).await, body, "{uri}");
     }
 }

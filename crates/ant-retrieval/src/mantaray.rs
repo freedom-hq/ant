@@ -270,12 +270,35 @@ pub struct LookupResult {
     /// All metadata at the matched value node. Caller may inspect for
     /// `Filename` etc.
     pub metadata: HashMap<String, String>,
-    /// `true` when `root_addr` was a **feed manifest** that we
-    /// dereferenced to reach `data_ref`. The resolved content is then
-    /// *mutable* at the (stable) manifest reference — the same bzz URL
-    /// returns newer content as the feed advances — so callers must not
-    /// cache the response immutably. `false` for a plain static manifest.
-    pub is_feed: bool,
+    /// `Some` when `root_addr` was a **feed manifest** that we
+    /// dereferenced to reach `data_ref`, carrying the feed update it
+    /// resolved to (see [`LookupResult::is_feed`]). `None` for a plain
+    /// static manifest.
+    pub feed: Option<ResolvedFeed>,
+}
+
+impl LookupResult {
+    /// `true` when the lookup went through a **feed manifest**. The
+    /// resolved content is then *mutable* at the (stable) manifest
+    /// reference — the same bzz URL returns newer content as the feed
+    /// advances — so callers must not cache the response immutably.
+    #[must_use]
+    pub const fn is_feed(&self) -> bool {
+        self.feed.is_some()
+    }
+}
+
+/// The feed update a feed manifest dereferenced to: what bee's `/bzz`
+/// handler reports in its `swarm-feed-index` and
+/// `swarm-feed-resolved-version` response headers (`pkg/api/bzz.go`,
+/// ethersphere/bee#5287).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedFeed {
+    /// Sequence index of the resolved update.
+    pub index: u64,
+    /// `true` when the update was resolved as v2 (the SOC wraps the
+    /// content root itself), `false` for v1 (`ts ‖ ref`).
+    pub v2: bool,
 }
 
 /// One path/value discovered while walking a mantaray manifest.
@@ -310,16 +333,17 @@ pub struct ManifestEntry {
 /// to whichever rolling content root is current. Callers wrap their
 /// usual lookup against the returned address, so the rest of the
 /// manifest decoder doesn't need to know feeds exist.
-/// Returns `(effective_root, is_feed)`: `is_feed` is `true` when
-/// `root_ref` was a feed manifest (so the resolved content is mutable at
-/// the stable manifest reference and must not be cached immutably). The
+/// Returns `(effective_root, feed)`: `feed` is `Some` when `root_ref`
+/// was a feed manifest (so the resolved content is mutable at the
+/// stable manifest reference and must not be cached immutably), with
+/// the index and payload version of the update it resolved to. The
 /// returned reference is 32 bytes, or 64 when the feed points at
 /// encrypted content (bee's 80-byte v1 payload) — the subsequent
 /// manifest load decrypts transparently.
 pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
-) -> Result<(Vec<u8>, bool), ManifestError> {
+) -> Result<(Vec<u8>, Option<ResolvedFeed>), ManifestError> {
     resolve_feed_root_with_credit(fetcher, root_ref, None, &ReplicaSweeps::new(), None).await
 }
 
@@ -335,16 +359,16 @@ async fn resolve_feed_root_with_credit(
     credit: Option<&CreditWindow>,
     sweeps: &ReplicaSweeps,
     hints: Option<&FeedHints>,
-) -> Result<(Vec<u8>, bool), ManifestError> {
+) -> Result<(Vec<u8>, Option<ResolvedFeed>), ManifestError> {
     let root_node = load_node_ref_with_credit(fetcher, root_ref, credit, sweeps).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
     let Some(slash_fork) = root_node.forks.get(&b'/') else {
-        return Ok((root_ref.to_vec(), false));
+        return Ok((root_ref.to_vec(), None));
     };
     let Some(feed) = feed_from_metadata(&slash_fork.metadata)? else {
-        return Ok((root_ref.to_vec(), false));
+        return Ok((root_ref.to_vec(), None));
     };
     debug!(
         target: "ant_retrieval::mantaray",
@@ -359,7 +383,13 @@ async fn resolve_feed_root_with_credit(
             if let Some(key) = resolution.decrypt_key {
                 resolved.extend_from_slice(&key);
             }
-            Ok((resolved, true))
+            Ok((
+                resolved,
+                Some(ResolvedFeed {
+                    index: resolution.index,
+                    v2: resolution.v2,
+                }),
+            ))
         }
     }
 }
@@ -465,7 +495,7 @@ async fn lookup_path_inner(
 
     // `load_node_ref_with_credit` below reloads the same node for a
     // non-feed manifest from the request's cache.
-    let (effective_root, is_feed) =
+    let (effective_root, feed) =
         resolve_feed_root_with_credit(fetcher, root_ref, credit, sweeps, hints).await?;
     let root_node = load_node_ref_with_credit(fetcher, &effective_root, credit, sweeps).await?;
     debug!(
@@ -494,7 +524,7 @@ async fn lookup_path_inner(
     if path.is_empty() {
         if let Some(idx) = &index_doc {
             if let Some(mut result) = try_walk(fetcher, &root_node, idx, credit, sweeps).await? {
-                result.is_feed = is_feed;
+                result.feed = feed;
                 return Ok(result);
             }
         }
@@ -511,7 +541,7 @@ async fn lookup_path_inner(
 
     // Non-empty path: try the literal path first.
     if let Some(mut result) = try_walk(fetcher, &root_node, path, credit, sweeps).await? {
-        result.is_feed = is_feed;
+        result.feed = feed;
         return Ok(result);
     }
 
@@ -540,7 +570,7 @@ async fn lookup_path_inner(
             if let Some(mut result) =
                 try_walk(fetcher, &root_node, &with_index, credit, sweeps).await?
             {
-                result.is_feed = is_feed;
+                result.feed = feed;
                 return Ok(result);
             }
         }
@@ -550,7 +580,7 @@ async fn lookup_path_inner(
     if let Some(err) = &error_doc {
         if path != err {
             if let Some(mut result) = try_walk(fetcher, &root_node, err, credit, sweeps).await? {
-                result.is_feed = is_feed;
+                result.feed = feed;
                 return Ok(result);
             }
         }
@@ -683,7 +713,7 @@ pub async fn list_manifest_paths(
     // One sweep budget for the whole listing (root included), so
     // unreachable children can't each add a full replica sweep.
     let sweeps = ReplicaSweeps::capped(MANIFEST_LIST_REPLICA_SWEEPS);
-    let (effective_root, _is_feed) =
+    let (effective_root, _feed) =
         resolve_feed_root_with_credit(fetcher, root_ref, None, &sweeps, None).await?;
     let root_node = load_node_ref_with_credit(fetcher, &effective_root, None, &sweeps).await?;
     let mut entries = Vec::new();
@@ -785,7 +815,7 @@ fn walk<'a>(
                 // Set by `lookup_path` once it knows whether the root was a
                 // feed manifest; the walker itself works on the resolved
                 // (post-dereference) root and can't tell.
-                is_feed: false,
+                feed: None,
             });
         }
 

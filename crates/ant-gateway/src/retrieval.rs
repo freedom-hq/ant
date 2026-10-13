@@ -2835,8 +2835,8 @@ async fn bzz_inner(
     // URL; serving them immutably (as `streaming_response` does by
     // default) makes browsers/proxies pin a stale resolution and never
     // re-fetch — the exact "feed never updates" failure. Downgrade to
-    // `no-cache` for these.
-    let mutable = started.mutable;
+    // `no-cache` for these, and report the resolved update like bee.
+    let feed = started.feed;
 
     let parsed_range = match parsed {
         GoRanges::Invalid => {
@@ -2855,8 +2855,8 @@ async fn bzz_inner(
                 if let Some(r) = data_ref {
                     set_etag(&mut resp, r);
                 }
-                if mutable {
-                    set_mutable_cache_headers(&mut resp);
+                if let Some(feed) = feed {
+                    apply_bzz_feed_headers(&mut resp, feed);
                 }
                 return resp;
             }
@@ -2877,8 +2877,8 @@ async fn bzz_inner(
             if let Some(r) = data_ref {
                 set_etag(&mut resp, r);
             }
-            if mutable {
-                set_mutable_cache_headers(&mut resp);
+            if let Some(feed) = feed {
+                apply_bzz_feed_headers(&mut resp, feed);
             }
             return resp;
         }
@@ -2895,8 +2895,8 @@ async fn bzz_inner(
         if let Some(r) = data_ref {
             set_etag(&mut resp, r);
         }
-        if mutable {
-            set_mutable_cache_headers(&mut resp);
+        if let Some(feed) = feed {
+            apply_bzz_feed_headers(&mut resp, feed);
         }
         return resp;
     }
@@ -2936,8 +2936,8 @@ async fn bzz_inner(
     if let Some(r) = data_ref {
         set_etag(&mut resp, r);
     }
-    if mutable {
-        set_mutable_cache_headers(&mut resp);
+    if let Some(feed) = feed {
+        apply_bzz_feed_headers(&mut resp, feed);
     }
     resp
 }
@@ -3012,10 +3012,11 @@ struct Started {
     /// Resolved data reference of the served manifest entry — only
     /// populated for `StreamBzz`. Bee quotes it in the `ETag` header.
     reference: Option<Vec<u8>>,
-    /// `true` when the bzz reference resolved through a feed manifest, so
-    /// the response is mutable and must be served `no-cache`. Always
-    /// `false` for `StreamBytes`.
-    mutable: bool,
+    /// `Some` when the bzz reference resolved through a feed manifest:
+    /// the response is mutable and must be served `no-cache`, with the
+    /// resolved update in the feed headers. Always `None` for
+    /// `StreamBytes`.
+    feed: Option<ant_control::BzzFeed>,
     first_chunk: Option<Vec<u8>>,
     rx: mpsc::Receiver<ControlAck>,
     /// RAII guard for the gateway-activity registry slot. Lives for
@@ -3266,7 +3267,7 @@ async fn consume_stream_prologue(
     let mut content_type = None;
     let mut filename = None;
     let mut reference = None;
-    let mut mutable = false;
+    let mut feed = None;
     loop {
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(ControlAck::BytesStreamStart { total_bytes: t })) if !expect_bzz => {
@@ -3278,13 +3279,13 @@ async fn consume_stream_prologue(
                 reference: r,
                 content_type: ct,
                 filename: fn_,
-                mutable: m,
+                feed: f,
             })) if expect_bzz => {
                 total_bytes = t;
                 content_type = ct;
                 filename = fn_;
                 reference = Some(r);
-                mutable = m;
+                feed = f;
                 break;
             }
             Ok(Some(ControlAck::Progress(p))) => {
@@ -3338,7 +3339,7 @@ async fn consume_stream_prologue(
             content_type,
             filename,
             reference,
-            mutable,
+            feed,
             first_chunk: None,
             rx,
             activity_guard,
@@ -3406,7 +3407,7 @@ async fn consume_stream_prologue(
         content_type,
         filename,
         reference,
-        mutable,
+        feed,
         first_chunk,
         rx,
         activity_guard,
@@ -4281,8 +4282,9 @@ const SWARM_FEED_INDEX: HeaderName = HeaderName::from_static("swarm-feed-index")
 /// address the next write without rescanning the feed.
 const SWARM_FEED_INDEX_NEXT: HeaderName = HeaderName::from_static("swarm-feed-index-next");
 
-/// `swarm-feed-resolved-version` — `"v1"` or `"v2"`. We only resolve
-/// the legacy v1 payload layout, so this is always `v1`.
+/// `swarm-feed-resolved-version` — `"v1"` (the update's payload is
+/// `ts ‖ ref`) or `"v2"` (the update wraps the content root itself).
+/// Sent on `GET /feeds` and on `/bzz` reads through a feed manifest.
 const SWARM_FEED_RESOLVED_VERSION: HeaderName =
     HeaderName::from_static("swarm-feed-resolved-version");
 
@@ -4770,6 +4772,40 @@ fn apply_feed_headers(
         if let Ok(v) = HeaderValue::from_str(name.as_str()) {
             h.append(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
         }
+    }
+}
+
+/// Overlay bee's `/bzz` feed-manifest headers (`pkg/api/bzz.go` since
+/// ethersphere/bee#5287) onto a response whose manifest was a feed:
+/// `swarm-feed-index` (same 8-byte big-endian hex as `GET /feeds`),
+/// `swarm-feed-resolved-version` (`v1` / `v2`), and `Swarm-Feed-Index`
+/// added to `Access-Control-Expose-Headers`. Bee overwrites that header
+/// (its own comment flags it as a known problem); we add to whatever it
+/// already lists instead. Also forces `Cache-Control: no-cache`, since
+/// the content at the stable manifest reference changes as the feed
+/// advances. Unlike `/feeds`, bee sends no `swarm-feed-index-next` or
+/// `swarm-soc-signature` here, and neither do we.
+fn apply_bzz_feed_headers(resp: &mut Response, feed: ant_control::BzzFeed) {
+    set_mutable_cache_headers(resp);
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&hex::encode(feed.index.to_be_bytes())) {
+        h.insert(SWARM_FEED_INDEX, v);
+    }
+    h.insert(
+        SWARM_FEED_RESOLVED_VERSION,
+        HeaderValue::from_static(if feed.v2 { "v2" } else { "v1" }),
+    );
+    let exposed = h
+        .get_all(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim().eq_ignore_ascii_case(SWARM_FEED_INDEX.as_str()));
+    if !exposed {
+        h.append(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Swarm-Feed-Index"),
+        );
     }
 }
 
