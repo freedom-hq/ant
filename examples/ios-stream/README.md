@@ -302,7 +302,9 @@ reference is rewritten to `http://<gateway address>/bytes/<ref>`, the
 same rewrite Solar Punk's viewers do; for a `"bzz"` channel (what the
 app publishes) it is not, so the delegate reads `/bzz/<ref>/stream.m3u8`
 instead and makes its `/bzz/...` segment paths absolute on the gateway.
-The player follows the live edge. A channel that is not live
+Once a channel is known to be `"bzz"`, the tab's automatic reloads go
+straight to `/bzz` without the feed lookup; playing it again by hand
+checks the format afresh. The player follows the live edge. A channel that is not live
 yet, an item that fails to load, and a live playlist that stops moving
 (a broadcast that ended without closing its playlist) all reload the
 channel after a short pause, with a plain message saying so; a closed

@@ -198,6 +198,12 @@ final class ChannelWatcher: ObservableObject {
     /// The feed a channel reference names, once read. A reference never
     /// changes what it names, so a retry does not read it again.
     private var resolved: (reference: String, address: FeedAddress)?
+    /// The reference whose feed turned out to hold the `"bzz"` format,
+    /// so an automatic retry reads `/bzz/<ref>/stream.m3u8` straight
+    /// away instead of paying another feed lookup first. Unlike the feed
+    /// address, the format is the publisher's choice and could change
+    /// between broadcasts, so playing by hand detects it afresh.
+    private var bzzChannel: String?
     /// Held here: `AVAssetResourceLoader` keeps its delegate weakly.
     private var loader: FeedPlaylistLoader?
     private var loadTask: Task<Void, Never>?
@@ -219,6 +225,7 @@ final class ChannelWatcher: ObservableObject {
         let next = Source(reference: reference, gateway: gateway)
         guard restart || next != source || (player.currentItem == nil && loadTask == nil)
         else { return }
+        if restart || next.reference != source?.reference { bzzChannel = nil }
         source = next
         message = nil
         load()
@@ -261,8 +268,16 @@ final class ChannelWatcher: ObservableObject {
             guard let self, !Task.isCancelled, self.source == source else { return }
             self.loadTask = nil
             self.resolved = (source.reference, address)
+            let reference = source.reference
             let loader = FeedPlaylistLoader(
-                gateway: source.gateway, address: address, channel: source.reference)
+                gateway: source.gateway, address: address, channel: reference,
+                bzzFormat: self.bzzChannel == reference
+            ) { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.source?.reference == reference else { return }
+                    self.bzzChannel = reference
+                }
+            }
             self.loader = loader
             self.feedURL = loader.feedURL
             let asset = AVURLAsset(url: loader.playlistURL)
@@ -433,13 +448,22 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// The read in flight for each loading request, by identity.
     private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
-    /// The channel turned out to be in the `"bzz"` format.
-    private var bzzFormat = false
+    /// The channel is in the `"bzz"` format: known up front from an
+    /// earlier load of the same channel, or found out by the first read.
+    private var bzzFormat: Bool
+    /// Called (on ``queue``) when a feed read finds the `"bzz"` format,
+    /// so the watcher can skip the feed lookup on its next retry.
+    private let onBzzFormat: (() -> Void)?
 
-    init(gateway: URL, address: FeedAddress, channel: String) {
+    init(
+        gateway: URL, address: FeedAddress, channel: String,
+        bzzFormat: Bool = false, onBzzFormat: (() -> Void)? = nil
+    ) {
         self.gateway = gateway
         self.address = address
         self.channel = channel
+        self.bzzFormat = bzzFormat
+        self.onBzzFormat = onBzzFormat
     }
 
     /// What `AVPlayer` is given. The `.m3u8` suffix is what tells it the
@@ -512,7 +536,10 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
             if url == feedURL {
                 // A v1 update: the feed's content is the playlist's
                 // manifest. Read the channel's `/bzz` path instead.
-                bzzFormat = true
+                if !bzzFormat {
+                    bzzFormat = true
+                    onBzzFormat?()
+                }
                 read(bzzPlaylistURL, for: loadingRequest)
             } else {
                 loadingRequest.finishLoading(with: NSError(
