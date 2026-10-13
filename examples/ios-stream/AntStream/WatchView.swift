@@ -204,6 +204,10 @@ final class ChannelWatcher: ObservableObject {
     /// address, the format is the publisher's choice and could change
     /// between broadcasts, so playing by hand detects it afresh.
     private var bzzChannel: String?
+    /// Bumped whenever ``bzzChannel`` is cleared, so a detection reported
+    /// late by a loader built before the clear (its main-actor hop still
+    /// queued when the user played by hand) can't latch the format again.
+    private var bzzEpoch = 0
     /// Held here: `AVAssetResourceLoader` keeps its delegate weakly.
     private var loader: FeedPlaylistLoader?
     private var loadTask: Task<Void, Never>?
@@ -225,7 +229,10 @@ final class ChannelWatcher: ObservableObject {
         let next = Source(reference: reference, gateway: gateway)
         guard restart || next != source || (player.currentItem == nil && loadTask == nil)
         else { return }
-        if restart || next.reference != source?.reference { bzzChannel = nil }
+        if restart || next.reference != source?.reference {
+            bzzChannel = nil
+            bzzEpoch += 1
+        }
         source = next
         message = nil
         load()
@@ -269,12 +276,15 @@ final class ChannelWatcher: ObservableObject {
             self.loadTask = nil
             self.resolved = (source.reference, address)
             let reference = source.reference
+            let epoch = self.bzzEpoch
             let loader = FeedPlaylistLoader(
                 gateway: source.gateway, address: address, channel: reference,
                 bzzFormat: self.bzzChannel == reference
             ) { [weak self] in
                 Task { @MainActor in
-                    guard let self, self.source?.reference == reference else { return }
+                    guard let self, self.bzzEpoch == epoch,
+                          self.source?.reference == reference
+                    else { return }
                     self.bzzChannel = reference
                 }
             }
