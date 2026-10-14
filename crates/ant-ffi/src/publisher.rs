@@ -2299,8 +2299,11 @@ pub struct CapacityEstimate {
     /// batch whatever its room.
     pub immutable: bool,
     /// The node will stamp with the batch at all (see the node's
-    /// `PostageStatusView::usable`). A host does not offer going live on
-    /// one that isn't: every upload would be refused.
+    /// `PostageStatusView::usable`). On one that isn't, every upload
+    /// would be refused: a host warns, and asks for a confirmation
+    /// before going live on it (the iOS example's "Go live anyway")
+    /// rather than blocking it outright. A batch still propagating
+    /// after a buy counts as usable here.
     pub usable: bool,
     /// See [`BroadcastCost::chunks_per_minute`].
     pub chunks_per_minute: u64,

@@ -119,9 +119,12 @@ struct CapacityEstimate: Codable, Equatable {
         return minutes == 0 ? "About \(hours) h" : "About \(hours) h \(minutes) min"
     }
 
-    /// The "about N minutes left on this plan" line, for `quality`.
+    /// The "about N minutes left on this plan" line, for `quality`. A
+    /// plan Swarm won't stamp with has no room whatever its buckets say,
+    /// so it never reports hours next to ``warning``'s refusal.
     func summary(quality: String) -> String {
-        minutesLeft == 0
+        if !usable { return "No \(quality) video fits on this plan right now" }
+        return minutesLeft == 0
             ? "No room left on this plan for \(quality) video"
             : "\(timeLabel) of \(quality) left on this plan"
     }
