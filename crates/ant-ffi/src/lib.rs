@@ -3779,6 +3779,16 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// `start_index` overrides all of that with an exact index; see
 /// [`publisher::PublisherConfig::start_index`].
 ///
+/// `recovery_path` keeps a recovery entry for the broadcast (issue #175),
+/// written ahead of every feed update and removed once the recording is
+/// the feed's head; after a kill or crash, starting with `resume: true`
+/// and the same path carries the same broadcast on in the same feed (or,
+/// stopped straight away, finalizes it into its recording). A resume is
+/// refused at start for another account's, topic's or format's entry,
+/// and ends by itself with nothing written when the feed's head shows the
+/// channel moved on since. See [`publisher::PublisherConfig::recovery_path`]
+/// and [`publisher::PublisherConfig::resume`].
+///
 /// An interruption pauses the broadcast rather than ending it (issue
 /// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on
 /// [`ant_publisher_stop`] or, with `reap_ms` set, by itself once that

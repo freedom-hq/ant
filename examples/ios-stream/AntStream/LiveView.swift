@@ -23,6 +23,14 @@ struct LiveView: View {
     /// the device's, the first time) so going live needs no typing but
     /// stays editable.
     @State private var channel = ""
+    /// The first go-live here carries on the broadcast the app was killed
+    /// in the middle of (#175) rather than starting a new one. Cleared
+    /// once used: a later go-live from this screen is a new broadcast.
+    @State private var resumePending: Bool
+
+    init(resume: Bool = false) {
+        _resumePending = State(initialValue: resume)
+    }
 
     var body: some View {
         ZStack {
@@ -45,6 +53,9 @@ struct LiveView: View {
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .task {
+            if resumePending, let unfinished = node.unfinishedBroadcast {
+                channel = unfinished.channel
+            }
             if channel.isEmpty { channel = node.channel?.name ?? UIDevice.current.name }
             // `-antstream-shot-live-idle` shows the screen before going
             // live (the quality picker), with the sample plan installed
@@ -253,6 +264,14 @@ struct LiveView: View {
                     .foregroundStyle(.orange.opacity(0.9))
                     .lineLimit(2)
             }
+            if let recovery = progress.recoveryError, !recovery.isEmpty {
+                // The crash-recovery entry (#175) isn't saving: a kill now
+                // could not be resumed. Viewers are unaffected.
+                Text("Crash recovery off: \(recovery)")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -397,10 +416,17 @@ struct LiveView: View {
                 if broadcast.state.isActive {
                     await broadcast.stop(node: node)
                 } else {
+                    let resume = resumePending
+                    resumePending = false
                     await broadcast.start(
                         node: node,
-                        channel: channel.isEmpty ? "AntStream" : channel
+                        channel: channel.isEmpty ? "AntStream" : channel,
+                        resume: resume
                     )
+                    // Refused (no plan, the camera, an entry the node
+                    // won't resume): still a resume, not a new broadcast
+                    // that would replace the unfinished one's entry.
+                    if case .failed = broadcast.state, resume { resumePending = true }
                 }
             }
         } label: {
@@ -423,7 +449,7 @@ struct LiveView: View {
         case .starting: return "Starting…"
         case .stopping: return "Publishing the last segments…"
         case .live: return "Stop broadcast"
-        case .idle, .failed: return "Go live"
+        case .idle, .failed: return resumePending ? "Resume broadcast" : "Go live"
         }
     }
 }

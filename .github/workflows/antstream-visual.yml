@@ -216,6 +216,16 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-channel
           sleep 25
           xcrun simctl io booted screenshot shots/13-broadcast-channel-card.png
+          # 20 — the Broadcast tab after a relaunch that finds a broadcast
+          # the app was killed in the middle of (#175): the "Unfinished
+          # broadcast" card with Resume / End broadcast / Discard, and Go
+          # live held until it is dealt with. A runner never has a
+          # broadcast killed under it, so `-antstream-shot-unfinished`
+          # installs a sample entry (nothing on disk).
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-unfinished
+          sleep 25
+          xcrun simctl io booted screenshot shots/20-broadcast-unfinished.png
           # 14/15 — the Watch tab playing a channel through the in-process
           # gateway. The sample reference points at nothing, so this
           # captures the player loading and then the plain-language retry

@@ -519,9 +519,13 @@ struct PublisherSnapshot: Codable, Equatable {
     /// The broadcast is ending by itself: a minute passed with nothing
     /// reaching the playlist (`reap_ms`).
     let reaped: Bool?
+    /// Why the crash-recovery entry (#175) could not be saved, empty
+    /// while it saves fine. Optional so a node without it decodes.
+    let recoveryError: String?
 
     enum CodingKeys: String, CodingKey {
         case running, channel, topic, owner, peers, paused, reaped
+        case recoveryError = "recovery_error"
         case segmentsWithheld = "segments_withheld"
         case elapsedS = "elapsed_s"
         case channelReference = "channel_reference"
@@ -550,6 +554,60 @@ struct PublisherSnapshot: Codable, Equatable {
     var lagLabel: String {
         guard playlistsPublished > 0 else { return "Connecting…" }
         return String(format: "%.1f s behind", Double(lagMs) / 1000.0)
+    }
+}
+
+/// A broadcast the app was killed or crashed in the middle of (#175):
+/// the publisher's recovery entry (`recovery_path`), read back at
+/// launch. Only what the Broadcast tab shows; resuming hands the node
+/// the file itself, and the node checks it is this account's feed.
+struct UnfinishedBroadcast: Equatable {
+    let channel: String
+    /// The feed's owner, 40 lowercase hex.
+    let owner: String
+    let broadcastId: String
+    /// When the entry was last written: ahead of the broadcast's last
+    /// feed update before the app went.
+    let savedAt: Date
+    /// Playable segments it holds (gaps left out), and their media.
+    let segments: Int
+    let seconds: Double
+
+    /// Decode a recovery entry, or `nil` for one this build can't read
+    /// (left on disk all the same: it is the only record of the
+    /// broadcast).
+    static func decode(_ data: Data) -> UnfinishedBroadcast? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["version"] as? Int == 1,
+              let channel = obj["channel"] as? String,
+              let owner = obj["owner"] as? String,
+              let id = obj["broadcast_id"] as? String,
+              let savedMs = (obj["saved_at_ms"] as? NSNumber)?.doubleValue,
+              let recording = obj["recording"] as? [[String: Any]]
+        else { return nil }
+        let media = recording.filter { ($0["gap"] as? Bool) != true }
+        let ms = media.reduce(0.0) { $0 + ((($1["duration_ms"] as? NSNumber)?.doubleValue) ?? 0) }
+        return UnfinishedBroadcast(
+            channel: channel,
+            owner: owner.lowercased(),
+            broadcastId: id,
+            savedAt: Date(timeIntervalSince1970: savedMs / 1000),
+            segments: media.count,
+            seconds: ms / 1000
+        )
+    }
+
+    /// Recent enough to carry on as the same broadcast: the app came back
+    /// inside the reap window (a minute), the time a viewer would have
+    /// waited for it anyway. Older, it can only be ended into its
+    /// recording.
+    func canResume(now: Date = Date(), reapMs: UInt64) -> Bool {
+        now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
+    }
+
+    var durationLabel: String {
+        let total = Int(seconds.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 }
 

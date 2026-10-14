@@ -405,6 +405,8 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         ladder: false,
         width: 0,
         height: 0,
+        recovery_path: String::new(),
+        resume: false,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -999,6 +1001,8 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         ladder: false,
         width: 0,
         height: 0,
+        recovery_path: String::new(),
+        resume: false,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -1754,4 +1758,192 @@ async fn a_viewer_two_hours_in_joins_from_the_marker_in_two_round_trips() {
     assert!(report.markers_written >= 1, "{report:?}");
     assert!(!report.master_reference.is_empty(), "{report:?}");
     assert_eq!(log.lock().unwrap().invalid_socs, 0);
+}
+
+/// The host config for a broadcast on channel `kitchen` keeping its
+/// recovery entry at `path`, the way the iOS app starts one.
+fn recoverable_config(
+    addr: &str,
+    format: StreamFormat,
+    path: &str,
+    resume: bool,
+) -> PublisherConfig {
+    serde_json::from_value(serde_json::json!({
+        "channel": "kitchen",
+        "format": format.as_str(),
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "max_backlog": 16,
+        "playlist_window": 3,
+        "recovery_path": path,
+        "resume": resume,
+    }))
+    .unwrap()
+}
+
+/// Issue #175, the acceptance case through the real gateway: the app is
+/// killed mid-broadcast (here the runtime the broadcast runs on is shut
+/// down under it, which stops every task where it stands, as a kill
+/// does) after four segments landed, leaving the channel on a live
+/// playlist that will never advance. The relaunch either resumes the
+/// broadcast (`more` segments) or, with none, finalizes it. Either way
+/// the feed continues after the last update with no slot rewritten, as
+/// one broadcast (one id, the media sequence never moving back), and
+/// the head ends as the recording of every segment that landed before
+/// the kill and after it, each one readable, with one seam where the
+/// relaunch's writer took over. The recovery entry is gone after.
+async fn a_killed_broadcast_comes_back(format: StreamFormat, more: u8) {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let dir = std::env::temp_dir().join(format!(
+        "ant-live-recovery-{}-{more}-{}",
+        format.as_str(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("broadcast.json").to_string_lossy().into_owned();
+    let topic = publisher::topic_from_string("antstream/kitchen");
+
+    // The first launch, on a runtime of its own so it can be killed.
+    let app = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let run = publisher::start(
+        app.handle(),
+        recoverable_config(&addr, format, &path, false),
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![0x10; 900], 0, false);
+    for i in 0..4 {
+        let _ = run.push(SegmentKind::Media, vec![0x11 + i; 300], 2000, false);
+    }
+    let saved = || -> Option<(usize, u64)> {
+        let raw = std::fs::read(&path).ok()?;
+        let v = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+        Some((v["recording"].as_array()?.len(), v["feed_index"].as_u64()?))
+    };
+    // Killed once the update listing all four landed: the entry was
+    // saved ahead of it, naming its index. (A kill with it still on the
+    // wire is the unit tests' `a_resume_writes_the_update_that_never_landed`.)
+    wait_for(&run, |s| {
+        saved().is_some_and(|(listed, index)| {
+            listed == 4 && s.feed_index == Some(index + 1) && !run.feed_update_in_flight()
+        })
+    })
+    .await;
+    let killed_at = run.snapshot().feed_index.unwrap();
+    let channel = run.snapshot().channel_reference;
+    app.shutdown_background();
+    drop(run);
+
+    // What a viewer is left with: the last live window, no end.
+    let stuck = update_playlist(&addr, format, &topic, killed_at - 1).await;
+    assert!(!stuck.contains("#EXT-X-ENDLIST"), "{stuck}");
+    let id = broadcast_id(&stuck).to_string();
+    let entry: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(entry["owner"], hex::encode(owner()));
+    assert_eq!(entry["topic"], hex::encode(topic));
+    assert_eq!(entry["broadcast_id"], id.as_str());
+    assert!(entry["saved_at_ms"].as_u64().unwrap() <= now_ms());
+
+    // The relaunch.
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        recoverable_config(&addr, format, &path, true),
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    if more > 0 {
+        let _ = run.push(SegmentKind::Init, vec![0x40; 900], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![0x41; 300], 2000, false);
+        wait_for(&run, |s| s.keeping_up).await;
+        for i in 1..more {
+            let _ = run.push(SegmentKind::Media, vec![0x41 + i; 300], 2000, false);
+        }
+    }
+    run.cancel();
+    for _ in 0..800 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "the relaunched run never finished");
+    let report = run.report();
+    assert_eq!(report.error_count, 0, "{:?}", report.errors);
+    assert!(report.recovery_error.is_empty(), "{report:?}");
+    assert_eq!(report.segments_listed, u64::from(more));
+    let end = report.feed_index.unwrap();
+    assert_eq!(end, killed_at + report.feed_updates, "{report:?}");
+
+    // One feed, one broadcast, no slot rewritten: every update from 0
+    // on reads back, all naming the same broadcast, and a live viewer's
+    // media sequence never moves back.
+    let mut updates = Vec::new();
+    for index in 0..end {
+        updates.push(update_playlist(&addr, format, &topic, index).await);
+    }
+    assert!(updates.iter().all(|p| broadcast_id(p) == id));
+    let windows: Vec<u64> = updates
+        .iter()
+        .filter(|p| !p.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
+        .map(|p| media_sequence(p))
+        .collect();
+    assert!(windows.windows(2).all(|w| w[0] <= w[1]), "{windows:?}");
+    assert_eq!(updates[usize::try_from(killed_at - 1).unwrap()], stuck);
+
+    // The head: the recording of the whole broadcast.
+    let head = channel_head(&addr, format, &topic, &channel).await;
+    assert!(head.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"), "{head}");
+    assert_eq!(head, updates[updates.len() - 1]);
+    assert_eq!(media_sequence(&head), 0, "{head}");
+    let seams = usize::from(more > 0);
+    assert_eq!(
+        head.matches("#EXT-X-DISCONTINUITY\n").count(),
+        seams,
+        "{head}"
+    );
+    assert_eq!(head.matches("#EXT-X-MAP:").count(), 1 + seams, "{head}");
+    let dates: Vec<u64> = head
+        .lines()
+        .filter_map(|l| l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:"))
+        .map(parse_program_date_time)
+        .collect();
+    assert!(dates.windows(2).all(|w| w[0] <= w[1]), "{head}");
+    let uris = entries(&head);
+    assert_eq!(uris.len(), 4 + usize::from(more), "{head}");
+    for (i, uri) in uris.iter().enumerate() {
+        let fill = if i < 4 { 0x11 + i } else { 0x41 + i - 4 } as u8;
+        let path = match format {
+            StreamFormat::SolarPunk => format!("/bytes/{uri}"),
+            StreamFormat::Bzz => (*uri).to_string(),
+        };
+        let (status, _, segment) = http_get(&addr, &path).await;
+        assert_eq!((status, segment), (200, vec![fill; 300]), "entry {i}");
+    }
+    assert!(!std::path::Path::new(&path).exists(), "entry left behind");
+    assert_eq!(log.lock().unwrap().invalid_socs, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_broadcast_resumes_in_the_solar_punk_format() {
+    a_killed_broadcast_comes_back(StreamFormat::SolarPunk, 3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_broadcast_resumes_in_the_default_format() {
+    a_killed_broadcast_comes_back(StreamFormat::Bzz, 3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_broadcast_finalizes_into_a_recording() {
+    a_killed_broadcast_comes_back(StreamFormat::Bzz, 0).await;
 }

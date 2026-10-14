@@ -1414,7 +1414,9 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default)
  *     "ladder":          true,                       // master playlist + ladder time markers; false (default)
  *     "width":           640,                        // the master's RESOLUTION, left out unless both set
- *     "height":          360
+ *     "height":          360,
+ *     "recovery_path":   "<app support>/antstream/broadcast-recovery.json", // crash recovery; "" = none (default)
+ *     "resume":          false                       // continue the broadcast saved there; see below
  *   }
  *
  * "topic_text" is the topic as a Solar Punk catalog entry names it: the
@@ -1480,6 +1482,38 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * recording holds this broadcast alone. A host passing the previous
  * broadcast's "feed_index" there must get it right, or it rewrites the
  * indices that hold earlier playlists.
+ *
+ * "recovery_path" keeps a recovery entry for the broadcast (issue
+ * #175): a small JSON file, written (to a temporary file, then renamed
+ * over it) ahead of every feed update once that update's playlist has
+ * uploaded. It holds "saved_at_ms", "channel", "owner", "topic",
+ * "topic_text", "format", "broadcast_id", "feed_index" (the index of
+ * the update it was written ahead of), the media and discontinuity
+ * sequence, the dating clock and "recording" (every entry listed so
+ * far; gap entries have "gap": true). It is removed once the recording
+ * is the feed's head, and kept when the recording or its update fails.
+ * A fresh broadcast with the same path replaces it at its first feed
+ * update. The whole list is rewritten each time, about 250 bytes an
+ * entry (some 450 KB after an hour at 2 s segments). A failure to write
+ * it shows as "recovery_error" in progress and the report, never in
+ * "errors": the broadcast goes on regardless.
+ *
+ * After a kill or crash, start again with "resume": true and the same
+ * "recovery_path" to carry that broadcast on: the same broadcast id,
+ * numbering and dating (never before the last saved segment), its first
+ * new segment behind one EXT-X-DISCONTINUITY, and a recording that
+ * holds every saved entry plus the new ones. The topic and "format" must
+ * be the entry's and the node's owner its "owner"; a mismatch, a
+ * missing or an unreadable entry fails the start and leaves the file
+ * as it was. The feed head is read once (retried as for a new broadcast)
+ * only to learn whether the update the entry was written ahead of
+ * landed; the run writes after it, and its playlist is not read as a
+ * predecessor. A head anywhere else means the channel moved on since:
+ * the run then ends by itself with nothing written and the reason in
+ * "errors", the entry left in place. To finalize instead, start with
+ * "resume" and call ant_publisher_stop straight away: the closing window
+ * and the recording go up as on any stop. "resume" with "start_index"
+ * is an error.
  *
  * An interruption pauses a broadcast, it never ends it (issue #172):
  * see ant_publisher_pause / ant_publisher_resume. It ends on
@@ -1599,7 +1633,7 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0,
  *    "paused":false,"segments_withheld":0,"reaped":false,
  *    "ladder_group":"","master_reference":"","markers_written":0,
- *    "ladder_failures":0,"ladder_error":""}
+ *    "ladder_failures":0,"ladder_error":"","recovery_error":""}
  *
  * "paused" is ant_publisher_pause in force; "segments_withheld" counts
  * the media segments outages withheld (never uploaded, never listed);
@@ -1612,7 +1646,9 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  * "ladder_error" (the newest), never in "errors", "last_error" or
  * "error_count": a ladder write is a shortcut a viewer can do without,
  * retried every period, so it would otherwise crowd out the segment and
- * feed failures those fields are for.
+ * feed failures those fields are for. "recovery_error" is the newest
+ * failure to write or remove the "recovery_path" entry, "" while none
+ * has failed: a kill now may lose what the entry missed.
  *
  * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
  * behind live a viewer is right now, i.e. the age of the newest segment

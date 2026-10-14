@@ -26,6 +26,15 @@ struct BroadcastView: View {
     /// broadcast owns the camera and the screen for its duration, and a
     /// swipe-dismissable sheet would orphan a run in progress.
     @State private var showLive = false
+    /// The going-live screen opens to resume the unfinished broadcast
+    /// (#175) rather than start a new one.
+    @State private var resumeLive = false
+    /// "End broadcast" on the unfinished card is publishing its closing
+    /// window and recording.
+    @State private var endingUnfinished = false
+    /// What ending it said, shown on the card until it goes.
+    @State private var unfinishedOutcome: String?
+    @State private var confirmDiscard = false
 
     init(onWatch: @escaping (String) -> Void = { _ in }) {
         self.onWatch = onWatch
@@ -38,6 +47,13 @@ struct BroadcastView: View {
             ScrollView {
                 VStack(spacing: 18) {
                     header
+                    if let unfinished = node.unfinishedBroadcast {
+                        // Re-read every few seconds: "Resume" goes once
+                        // the reap window has passed.
+                        TimelineView(.periodic(from: .now, by: 5)) { context in
+                            unfinishedCard(unfinished, now: context.date)
+                        }
+                    }
                     liveCard
                     if node.hasStorage { channelCard }
                     checklistCard
@@ -55,8 +71,22 @@ struct BroadcastView: View {
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .sheet(isPresented: $showBench) { BenchView() }
-        .fullScreenCover(isPresented: $showLive) { LiveView() }
+        .fullScreenCover(isPresented: $showLive, onDismiss: {
+            resumeLive = false
+            node.refreshUnfinishedBroadcast()
+        }) { LiveView(resume: resumeLive) }
         .task {
+            // antstream-visual: `-antstream-shot-unfinished` shows the
+            // card a relaunch after a killed broadcast opens on (#175). A
+            // runner never has a broadcast killed under it, so a sample
+            // entry stands in (nothing on disk).
+            if RootView.shotArgs.contains("-antstream-shot-unfinished") {
+                for _ in 0..<60 where !node.status.isReady || node.channel == nil {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                node.installUnfinishedSample()
+                return
+            }
             // antstream-visual: `-antstream-shot-channel` shows the "Your
             // channel" card, which needs a plan (a fresh runner account
             // has none) and a channel link; sample state supplies both.
@@ -107,7 +137,15 @@ struct BroadcastView: View {
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
 
+                if node.unfinishedBroadcast != nil {
+                    Text("Resume or end your unfinished broadcast first: a new one would leave it without its recording.")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Button {
+                    resumeLive = false
                     showLive = true
                 } label: {
                     Text("Go live")
@@ -121,10 +159,108 @@ struct BroadcastView: View {
                         .foregroundStyle(.white.opacity(node.isReadyToBroadcast ? 1 : 0.5))
                 }
                 .buttonStyle(.plain)
-                .disabled(!node.isReadyToBroadcast)
+                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil)
             }
             .frame(maxWidth: .infinity)
         }
+    }
+
+    // MARK: unfinished broadcast (#175)
+
+    /// The broadcast the app was killed or crashed in the middle of. Its
+    /// viewers are on a live playlist that stopped advancing; carrying it
+    /// on (within the reap window, the minute a viewer would wait anyway)
+    /// or ending it closes that and leaves the channel's head the
+    /// recording of every segment that landed.
+    private func unfinishedCard(_ unfinished: UnfinishedBroadcast, now: Date) -> some View {
+        let resumable = unfinished.canResume(now: now, reapMs: AntNode.broadcastReapMs)
+        let since: String = Self.ago(unfinished.savedAt, now: now)
+        let what: String = "\"\(unfinished.channel)\" stopped \(since) when the app closed, "
+            + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
+        let next: String = resumable
+            ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."
+            : "End it so viewers get its recording instead of a stalled live stream."
+        let detail: String = what + next
+        return GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Unfinished broadcast", systemImage: "exclamationmark.arrow.circlepath")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Text(detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let outcome = unfinishedOutcome {
+                    Text(outcome)
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if endingUnfinished {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Publishing its recording…")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                } else {
+                    HStack(spacing: 10) {
+                        if resumable {
+                            GlassPillButton(title: "Resume", icon: "dot.radiowaves.left.and.right",
+                                            tint: .red.opacity(0.6)) {
+                                resumeLive = true
+                                showLive = true
+                            }
+                        }
+                        GlassPillButton(title: "End broadcast", icon: "stop.circle",
+                                        tint: .white.opacity(0.18)) {
+                            Task { await endUnfinished() }
+                        }
+                    }
+                    .disabled(!node.isReadyToBroadcast)
+                    Button("Discard it") { confirmDiscard = true }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .buttonStyle(.plain)
+                }
+            }
+        }
+        .confirmationDialog("Discard the unfinished broadcast?",
+                            isPresented: $confirmDiscard, titleVisibility: .visible) {
+            Button("Discard", role: .destructive) {
+                unfinishedOutcome = nil
+                node.discardUnfinishedBroadcast()
+            }
+        } message: {
+            Text("Its segments stay on Swarm, but it is never closed: viewers keep its last live window and get no recording.")
+        }
+    }
+
+    private func endUnfinished() async {
+        endingUnfinished = true
+        unfinishedOutcome = nil
+        defer { endingUnfinished = false }
+        do {
+            let report = try await node.finishUnfinishedBroadcast()
+            if let recording = report.recordingReference, !recording.isEmpty,
+               node.unfinishedBroadcast == nil {
+                banner.flash("Broadcast ended: its recording is on the channel")
+            } else {
+                unfinishedOutcome = report.errors.first
+                    ?? "Its recording did not go up; try again in a moment."
+            }
+        } catch {
+            unfinishedOutcome = error.localizedDescription
+        }
+    }
+
+    /// "20 s ago", "3 min ago", "2 h ago".
+    private static func ago(_ date: Date, now: Date) -> String {
+        let s = max(0, Int(now.timeIntervalSince(date)))
+        if s < 90 { return "\(s) s ago" }
+        if s < 90 * 60 { return "\(s / 60) min ago" }
+        if s < 48 * 3600 { return "\(s / 3600) h ago" }
+        return "\(s / 86_400) days ago"
     }
 
     // MARK: permanent channel

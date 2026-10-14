@@ -86,6 +86,15 @@
 //! over a topic that outlives a session. See
 //! [`PublisherConfig::start_index`].
 //!
+//! **A killed app resumes or finalizes its broadcast** (issue #175,
+//! [`PublisherConfig::recovery_path`]): ahead of every feed update the
+//! publisher saves a small recovery entry (the feed, the index that update
+//! takes, the numbering and dating, and every entry listed so far), so a
+//! relaunch can start with [`PublisherConfig::resume`] and carry the same
+//! broadcast on in the same feed, or stop straight away to close it into
+//! its recording. Solar Punk's uploader keeps the same per stream
+//! (`RecoveryStore`).
+//!
 //! **A channel can be a one-rung ladder** (issue #174,
 //! [`PublisherConfig::ladder`]), so a viewer joining hours in doesn't
 //! walk thousands of feed updates from index 0: every ten seconds a
@@ -422,6 +431,60 @@ pub struct PublisherConfig {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    /// Where to keep this broadcast's **recovery entry** (issue #175), a
+    /// small JSON file the host names (the iOS app keeps it in
+    /// `Application Support/antstream/`). Empty, the default, keeps none.
+    ///
+    /// Written ahead of every feed update, once the playlist it points at
+    /// has uploaded and before the update itself goes out
+    /// ([`RecoveryEntry`]): the topic and owner, the index that update
+    /// takes, the media and discontinuity sequence, the dating clock, and
+    /// every entry the broadcast has listed so far, so whatever a viewer
+    /// could have seen is on disk before the feed can name it. Replaced
+    /// atomically (a temporary file, then a rename), so a kill mid-write
+    /// leaves the previous entry. Removed once the recording is the feed's
+    /// head; left in place when the recording or its update fails, so the
+    /// broadcast can still be finalized. A fresh broadcast with the same
+    /// path replaces an entry left there at its first feed update, so a
+    /// host offers [`PublisherConfig::resume`] first.
+    ///
+    /// The whole list is rewritten every time, as Solar Punk's
+    /// `RecoveryStore` does: about 250 bytes an entry, so some 450 KB
+    /// after an hour at 2 s segments.
+    #[serde(default)]
+    pub recovery_path: String,
+    /// Continue the broadcast whose recovery entry is at
+    /// [`PublisherConfig::recovery_path`] instead of starting a new one:
+    /// the app was killed or crashed mid-broadcast (issue #175). The rest
+    /// of the config is this run's as usual (gateway, batch, rendition),
+    /// but its topic and format must name the entry's feed, and the node's
+    /// owner must be the entry's: anything else is refused at start, as is
+    /// a missing or unreadable entry (which is left where it is).
+    ///
+    /// The broadcast carries on as one: the same broadcast id, its
+    /// numbering, `#EXT-X-DISCONTINUITY-SEQUENCE` and `#EXT-X-TARGETDURATION`
+    /// where the entry left them, its first new segment behind one
+    /// `#EXT-X-DISCONTINUITY` and dated from the wall clock, never before
+    /// the last saved segment ended, and a recording that holds every
+    /// entry the entry saved plus whatever this run lists. The entry's
+    /// own head playlist (Solar Punk's recovered sessions do the same)
+    /// is never read as a predecessor: that would glue the broadcast in
+    /// front of itself.
+    ///
+    /// The feed head is still read once (as for a new broadcast, retried
+    /// until it answers) to settle the one thing the entry can't know:
+    /// whether the update it was written ahead of landed. The run writes
+    /// after the head if the head is that update or the one before it; any
+    /// other head means the channel moved on since (another broadcast
+    /// wrote to it), and the run is refused there and ends with nothing
+    /// written, the error in its `errors`.
+    ///
+    /// To finalize instead of continuing (the entry is older than the reap
+    /// window, or the host chose to end it), start with `resume` and stop
+    /// straight away: the closing window and the recording go up as on any
+    /// stop.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 /// The reap window Solar Punk's uploader runs with (`ORPHAN_REAP_MS`, 60
@@ -509,6 +572,18 @@ impl PublisherConfig {
         }
         if self.playlist_window == 0 {
             return Err(PublisherError::Config("playlist_window must be > 0".into()));
+        }
+        if self.resume && self.recovery_path.is_empty() {
+            return Err(PublisherError::Config(
+                "resume needs recovery_path: the entry of the broadcast to continue".into(),
+            ));
+        }
+        if self.resume && self.start_index.is_some() {
+            return Err(PublisherError::Config(
+                "set resume or start_index, not both: a resumed broadcast continues its own feed \
+                 index"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -805,8 +880,8 @@ struct Pending {
 }
 
 /// One playlist entry: a segment that landed, or the gap a lost one
-/// left.
-#[derive(Debug, Clone)]
+/// left. Saved as it is in the recovery entry ([`RecoveryEntry`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MediaEntry {
     /// HLS media sequence number. Every media segment the capture side
     /// pushed under a landed `#EXT-X-MAP` takes one, lost ones included,
@@ -1098,6 +1173,14 @@ struct PublisherState {
     /// window or recording landing late would take the index the next
     /// broadcast starts at. See [`LiveRun::seal_feed`].
     feed_sealed: bool,
+    /// Resumed from a recovery entry written ahead of the update at this
+    /// index (issue #175): [`resume_feed_position`] reads the head to
+    /// settle where the run writes instead of [`settle_feed_position`].
+    resume_index: Option<u64>,
+    /// The newest failure to write or remove the recovery entry. Kept out
+    /// of `errors`: it costs a viewer nothing, and a full disk would
+    /// otherwise fill the eight kept errors every segment.
+    recovery_error: Option<String>,
     channel_reference: Option<String>,
     /// A `POST /feeds` is already in flight. The start-time attempt and
     /// the committer's retry would otherwise both fire while the first
@@ -1260,7 +1343,7 @@ impl PublisherState {
                     // encoder timeline: whatever follows is discontinuous
                     // with what came before.
                     self.init_uri = Some(uri);
-                    if self.segments_listed > 0 || !self.pending_gaps.is_empty() {
+                    if self.listed_any() || !self.pending_gaps.is_empty() {
                         self.break_since_last_entry = true;
                     }
                 }
@@ -1268,7 +1351,7 @@ impl PublisherState {
                     // The broadcast went silent here: whatever is listed
                     // next is a new run of the timeline. Only a break
                     // once something was listed, as for a fresh init.
-                    if self.segments_listed > 0 || !self.pending_gaps.is_empty() {
+                    if self.listed_any() || !self.pending_gaps.is_empty() {
                         self.break_since_last_entry = true;
                     }
                 }
@@ -1305,10 +1388,7 @@ impl PublisherState {
                     program_ms,
                     bytes,
                 } => {
-                    if self.segments_listed == 0
-                        && self.predecessor.is_some()
-                        && self.init_uri.is_some()
-                    {
+                    if !self.listed_any() && self.predecessor.is_some() && self.init_uri.is_some() {
                         // Gaps in front of the first segment are never
                         // listed (no playlist starts on one), so their
                         // numbers are nobody's. Continuing a predecessor,
@@ -1393,7 +1473,7 @@ impl PublisherState {
         self.break_since_last_entry = false;
         let number = self.next_number;
         self.next_number += 1;
-        let seam = self.segments_listed == 0 && self.predecessor.is_some() && uri.is_some();
+        let seam = !self.listed_any() && self.predecessor.is_some() && uri.is_some();
         Some(MediaEntry {
             number,
             gap: uri.is_none(),
@@ -1404,10 +1484,10 @@ impl PublisherState {
             // it continues an earlier broadcast's numbering: that seam
             // is a break, said once, on the first segment (not on a gap
             // in front of it, which no playlist starts on).
-            discontinuity: if self.segments_listed == 0 {
-                seam
-            } else {
+            discontinuity: if self.listed_any() {
                 discontinuous
+            } else {
+                seam
             },
             init_uri,
             program_ms,
@@ -1657,7 +1737,7 @@ fn render_entries<'a>(
 /// [`settle_feed_position`] and parsed by [`Predecessor::parse`], which
 /// reads only what Solar Punk's uploader reads (`continuesFrom` and
 /// `inheritedTimeline` in its `ManifestManager.ts`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Predecessor {
     /// Where its numbering ended: its `#EXT-X-MEDIA-SEQUENCE` plus the
     /// entries it lists (one `#EXTINF` each, gap entries included). A
@@ -1739,6 +1819,216 @@ impl Predecessor {
             lines: timeline,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery entry (issue #175)
+// ---------------------------------------------------------------------------
+
+/// Version of the [`RecoveryEntry`] layout. An entry of any other version
+/// is refused rather than half-read.
+const RECOVERY_VERSION: u32 = 1;
+
+/// What survives the app: everything a relaunch needs to carry a killed
+/// broadcast on, or finalize it, at [`PublisherConfig::recovery_path`].
+/// Solar Punk's uploader keeps the same per stream (`RecoveryStore`'s
+/// `StreamState`: the feed index, the segments, the anchor, the offset
+/// it continued from and the timeline it inherited).
+///
+/// Written ahead of each feed update ([`publish_playlist`]), so it holds
+/// every entry that update's playlist lists, and `feed_index` is the
+/// index that update takes: if it landed before the kill, the head is
+/// there; if not, the head is the one before it. Read back by
+/// [`load_recovery`] when a run starts with [`PublisherConfig::resume`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RecoveryEntry {
+    version: u32,
+    /// When it was written, Unix ms: a host compares it with the reap
+    /// window to offer a resume or only a finalize.
+    saved_at_ms: u64,
+    channel: String,
+    /// The feed's owner, 40 hex: only that signer can continue it.
+    owner: String,
+    /// The feed's topic, 64 hex, and its text when it has one.
+    topic: String,
+    topic_text: String,
+    format: StreamFormat,
+    /// The broadcast's id, which every playlist names
+    /// (`#ANTSTREAM-BROADCAST`). A resumed run keeps it: it is the same
+    /// broadcast.
+    broadcast_id: String,
+    /// The index of the feed update this entry was written ahead of.
+    feed_index: u64,
+    /// The media sequence number the next listed entry takes.
+    next_number: u64,
+    discontinuity_sequence: u64,
+    /// How many of `recording`'s last entries the live window held.
+    window: usize,
+    /// Where the dating clock would place the next media segment, Unix
+    /// ms: past the last listed entry when media after it was dropped.
+    next_program_ms: Option<u64>,
+    longest_listed_ms: u32,
+    /// The run's [`PublisherConfig::segment_ms`]: with
+    /// `longest_listed_ms`, the floor of `#EXT-X-TARGETDURATION`, which
+    /// must not drop when a resumed run is configured with a shorter one.
+    #[serde(default)]
+    segment_ms: u32,
+    /// Every entry the broadcast listed, in order: what the recording
+    /// is rendered from.
+    recording: Vec<MediaEntry>,
+    /// The playlist the broadcast continued at go-live (issue #173),
+    /// glued in front of its recording.
+    predecessor: Option<Predecessor>,
+}
+
+/// Read the entry at `path`. A missing file and an unreadable one are
+/// both errors, worded apart, and neither touches the file: an entry
+/// that won't parse is still the only record of the broadcast it saved.
+fn load_recovery(path: &str) -> Result<RecoveryEntry, String> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("no broadcast to resume: {path} does not exist"));
+        }
+        Err(e) => return Err(format!("could not read {path}: {e}")),
+    };
+    let entry: RecoveryEntry = serde_json::from_slice(&raw)
+        .map_err(|e| format!("{path} is not a recovery entry this build can read: {e}"))?;
+    if entry.version != RECOVERY_VERSION {
+        return Err(format!(
+            "{path} is a version {} recovery entry; this build reads version {RECOVERY_VERSION}",
+            entry.version,
+        ));
+    }
+    if entry.window > entry.recording.len() {
+        return Err(format!(
+            "{path} is damaged: its live window holds {} entries of {}",
+            entry.window,
+            entry.recording.len(),
+        ));
+    }
+    Ok(entry)
+}
+
+/// Replace the entry at `path` with `entry`: written to `<path>.tmp`
+/// and renamed over it, so a kill mid-write leaves the previous entry
+/// whole. Not flushed to the disk: what it guards against is the app
+/// being killed, which leaves the written pages to the OS.
+fn save_recovery(path: &str, entry: &RecoveryEntry) -> Result<(), String> {
+    let json = serde_json::to_vec(entry).map_err(|e| format!("encode: {e}"))?;
+    let target = std::path::Path::new(path);
+    if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp} over {path}: {e}"))
+}
+
+/// Remove the entry at `path` once the broadcast it saved is finished,
+/// but only if it is still that broadcast's (`broadcast_id`): never one a
+/// later broadcast wrote over it. A missing entry is fine; an entry that
+/// can't be read is left alone.
+fn clear_recovery(path: &str, broadcast_id: &str) -> Result<(), String> {
+    let entry = match load_recovery(path) {
+        Ok(entry) => entry,
+        Err(_) if !std::path::Path::new(path).exists() => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if entry.broadcast_id != broadcast_id {
+        return Ok(());
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {path}: {e}")),
+    }
+}
+
+impl PublisherState {
+    /// The recovery entry for the state as it stands, written ahead of
+    /// the feed update at `feed_index`.
+    fn recovery_entry(&self, run: &RunIdentity<'_>, feed_index: u64) -> RecoveryEntry {
+        // Gaps still waiting for media took numbers nobody saw; a resumed
+        // run hands them out again, so the recording's numbering (its
+        // media sequence plus the position) matches the live windows'.
+        let next_number = self
+            .pending_gaps
+            .first()
+            .map_or(self.next_number, |gap| gap.number);
+        RecoveryEntry {
+            version: RECOVERY_VERSION,
+            saved_at_ms: unix_ms_now(),
+            channel: run.channel.to_string(),
+            owner: hex::encode(run.owner),
+            topic: hex::encode(run.topic),
+            topic_text: run.topic_text.to_string(),
+            format: run.format,
+            broadcast_id: self.broadcast_id.clone(),
+            feed_index,
+            next_number,
+            discontinuity_sequence: self.discontinuity_sequence,
+            window: self.playlist.len(),
+            next_program_ms: self.program_clock.next_ms,
+            longest_listed_ms: self.longest_listed_ms,
+            segment_ms: run.segment_ms,
+            recording: self.recording.clone(),
+            predecessor: self.predecessor.clone(),
+        }
+    }
+
+    /// A state that carries on the broadcast `entry` saved (see
+    /// [`PublisherConfig::resume`]). Where it stands in the feed is not
+    /// settled yet: [`resume_feed_position`] reads the head for that.
+    fn resumed(entry: RecoveryEntry) -> Self {
+        let window = entry.recording.len() - entry.window;
+        let playlist: VecDeque<MediaEntry> = entry.recording[window..].iter().cloned().collect();
+        // Never before the last saved segment ended, whatever the saved
+        // clock says (hls.js reads a date that moves back as an error).
+        let last_end = entry
+            .recording
+            .last()
+            .map(|e| e.program_ms + u64::from(e.duration_ms));
+        let next_ms = entry.next_program_ms.max(last_end);
+        Self {
+            broadcast_id: entry.broadcast_id,
+            playlist,
+            recording: entry.recording,
+            next_number: entry.next_number,
+            discontinuity_sequence: entry.discontinuity_sequence,
+            // `#EXT-X-TARGETDURATION` stays where the broadcast had it.
+            longest_listed_ms: entry.longest_listed_ms.max(entry.segment_ms),
+            predecessor: entry.predecessor,
+            // A new process is a new writer: no map is in force until its
+            // init segment lands, the next entry is behind a break, and
+            // its date is re-anchored on the wall clock.
+            init_uri: None,
+            break_since_last_entry: true,
+            program_clock: ProgramClock {
+                next_ms,
+                reanchor: next_ms.is_some(),
+            },
+            feed_index: entry.feed_index,
+            resume_index: Some(entry.feed_index),
+            ..Self::default()
+        }
+    }
+
+    /// Something was listed in this broadcast, by this run or by the run
+    /// it resumed.
+    fn listed_any(&self) -> bool {
+        !self.recording.is_empty()
+    }
+}
+
+/// The parts of a run a recovery entry names it by.
+struct RunIdentity<'a> {
+    channel: &'a str,
+    owner: &'a [u8; 20],
+    topic: &'a [u8; 32],
+    topic_text: &'a str,
+    format: StreamFormat,
+    segment_ms: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,6 +2123,12 @@ pub struct PublisherSnapshot {
     /// The newest marker or master failure, empty while none has
     /// failed. Not in `last_error`/`errors`, for the same reason.
     pub ladder_error: String,
+    /// The newest failure to write or remove the recovery entry
+    /// ([`PublisherConfig::recovery_path`]), empty while none has failed:
+    /// a kill now may lose what the entry missed. Not in
+    /// `last_error`/`errors`: it costs a viewer nothing.
+    #[serde(default)]
+    pub recovery_error: String,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -1934,6 +2230,9 @@ pub struct PublisherReport {
     pub ladder_failures: u64,
     /// See [`PublisherSnapshot::ladder_error`].
     pub ladder_error: String,
+    /// See [`PublisherSnapshot::recovery_error`].
+    #[serde(default)]
+    pub recovery_error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,6 +2492,7 @@ impl LiveRun {
             markers_written: state.markers_written,
             ladder_failures: state.ladder_failures,
             ladder_error: state.ladder_error.clone().unwrap_or_default(),
+            recovery_error: state.recovery_error.clone().unwrap_or_default(),
         }
     }
 
@@ -2328,6 +2628,7 @@ impl LiveRun {
             markers_written: state.markers_written,
             ladder_failures: state.ladder_failures,
             ladder_error: state.ladder_error.clone().unwrap_or_default(),
+            recovery_error: state.recovery_error.clone().unwrap_or_default(),
         }
     }
 }
@@ -2378,14 +2679,21 @@ pub fn start_with_wall_offset(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let state = Arc::new(Mutex::new(PublisherState {
-        broadcast_id: format!("{started_ms:x}"),
-        // An override is the index, as given: nothing to read. Without
-        // one the committer reads the head first (issue #173).
-        feed_index: config.start_index.unwrap_or(0),
-        feed_settled: config.start_index.is_some(),
-        ..PublisherState::default()
-    }));
+    let state = if config.resume {
+        let entry = load_recovery(&config.recovery_path).map_err(PublisherError::Config)?;
+        check_resumable(&entry, &config, &owner, &topic)?;
+        PublisherState::resumed(entry)
+    } else {
+        PublisherState {
+            broadcast_id: format!("{started_ms:x}"),
+            // An override is the index, as given: nothing to read. Without
+            // one the committer reads the head first (issue #173).
+            feed_index: config.start_index.unwrap_or(0),
+            feed_settled: config.start_index.is_some(),
+            ..PublisherState::default()
+        }
+    };
+    let state = Arc::new(Mutex::new(state));
     let cancel = Arc::new(AtomicBool::new(false));
     let push_notify = Arc::new(Notify::new());
     let commit_notify = Arc::new(Notify::new());
@@ -2425,6 +2733,40 @@ pub fn start_with_wall_offset(
     });
     runtime.spawn(async move { drive(ctx).await });
     Ok(run)
+}
+
+/// Refuse to resume `entry` with a run that would write somewhere else:
+/// another signer (a different account on the same device), another
+/// topic or another format.
+fn check_resumable(
+    entry: &RecoveryEntry,
+    config: &PublisherConfig,
+    owner: &[u8; 20],
+    topic: &[u8; 32],
+) -> Result<(), PublisherError> {
+    let path = &config.recovery_path;
+    if entry.owner != hex::encode(owner) {
+        return Err(PublisherError::Config(format!(
+            "{path} is a broadcast by 0x{}, not this account (0x{})",
+            entry.owner,
+            hex::encode(owner),
+        )));
+    }
+    if entry.topic != hex::encode(topic) {
+        return Err(PublisherError::Config(format!(
+            "{path} is a broadcast on topic {}, not this config's {}",
+            entry.topic,
+            hex::encode(topic),
+        )));
+    }
+    if entry.format != config.format {
+        return Err(PublisherError::Config(format!(
+            "{path} is a \"{}\" broadcast; resume it with that format, not \"{}\"",
+            entry.format.as_str(),
+            config.format.as_str(),
+        )));
+    }
+    Ok(())
 }
 
 struct RunCtx {
@@ -2473,6 +2815,48 @@ impl RunCtx {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Write the recovery entry ahead of the feed update at `index`, when
+    /// the host asked for one. A failure is reported in `recovery_error`
+    /// and the update goes out all the same: the broadcast matters more
+    /// than its insurance.
+    async fn save_recovery_entry(&self, entry: Option<RecoveryEntry>) {
+        let Some(entry) = entry else { return };
+        let path = self.config.recovery_path.clone();
+        let result = tokio::task::spawn_blocking(move || save_recovery(&path, &entry))
+            .await
+            .unwrap_or_else(|e| Err(format!("write task: {e}")));
+        if let Err(message) = result {
+            lock(&self.state).recovery_error = Some(format!("recovery entry: {message}"));
+        }
+    }
+
+    /// The broadcast is finished on the feed (its recording is the head):
+    /// remove its recovery entry.
+    async fn clear_recovery_entry(&self) {
+        if self.config.recovery_path.is_empty() {
+            return;
+        }
+        let path = self.config.recovery_path.clone();
+        let id = lock(&self.state).broadcast_id.clone();
+        let result = tokio::task::spawn_blocking(move || clear_recovery(&path, &id))
+            .await
+            .unwrap_or_else(|e| Err(format!("remove task: {e}")));
+        if let Err(message) = result {
+            lock(&self.state).recovery_error = Some(format!("recovery entry: {message}"));
+        }
+    }
+
+    fn identity(&self) -> RunIdentity<'_> {
+        RunIdentity {
+            channel: &self.config.channel,
+            owner: &self.owner,
+            topic: &self.topic,
+            topic_text: &self.topic_text,
+            format: self.config.format,
+            segment_ms: self.config.segment_ms,
+        }
     }
 
     /// The wall clock ladder markers are timed and dated by, Unix ms.
@@ -2943,10 +3327,33 @@ const FEED_HEAD_RETRY: Duration = Duration::from_secs(2);
 /// media in that time.
 async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
     loop {
-        if lock(&ctx.state).feed_settled {
-            return true;
-        }
-        match settle_feed_position(ctx).await {
+        let resume_index = {
+            let state = lock(&ctx.state);
+            if state.feed_settled {
+                return true;
+            }
+            state.resume_index
+        };
+        let result = match resume_index {
+            None => settle_feed_position(ctx).await,
+            Some(saved) => match resume_feed_position(ctx, saved).await {
+                Ok(Resumed::Settled) => Ok(()),
+                Ok(Resumed::Refused(message)) => {
+                    lock(&ctx.state).record_error(format!(
+                        "resume: {message}; nothing was written, and the recovery entry \
+                         is left as it was"
+                    ));
+                    // Ended like a reap, so the host sees the run finish
+                    // and reads the reason; the pump drains what it has.
+                    ctx.cancel.store(true, Ordering::SeqCst);
+                    ctx.push_notify.notify_one();
+                    ctx.reap_notify.notify_one();
+                    return false;
+                }
+                Err(message) => Err(message),
+            },
+        };
+        match result {
             Ok(()) => return true,
             Err(message) => {
                 let mut state = lock(&ctx.state);
@@ -3067,6 +3474,63 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
     Ok(())
 }
 
+/// What the head said about a resumed broadcast's place in its feed.
+enum Resumed {
+    /// The head is the update the entry was written ahead of, or the one
+    /// before it: the run writes after it.
+    Settled,
+    /// The head is anywhere else: the channel moved on since the entry
+    /// was written. Never retried.
+    Refused(String),
+}
+
+/// Settle a resumed broadcast's place in its feed (issue #175): read the
+/// head once with `GET /feeds/{owner}/{topic}?exact=true`, as
+/// [`settle_feed_position`] does, but for its index only. The entry
+/// was written ahead of the update at `saved`, so the head is either
+/// that update (it landed before the kill) or the one before it (it
+/// didn't); the run writes after whichever it is. The head playlist is
+/// not read: it is this broadcast's own, and continuing from it would
+/// number the broadcast on from itself and glue its window in front of
+/// its own recording (what Solar Punk's recovered sessions avoid by
+/// keeping their offset and inherited timeline).
+///
+/// `Err` is a read that didn't answer, retried as for a new broadcast.
+async fn resume_feed_position(ctx: &RunCtx, saved: u64) -> Result<Resumed, String> {
+    let path = format!(
+        "{}/feeds/{}/{}?exact=true",
+        ctx.target.prefix,
+        hex::encode(ctx.owner),
+        hex::encode(ctx.topic),
+    );
+    let response = http_get_timed(&ctx.target, &path).await?;
+    let next_index = match response.status {
+        404 if is_no_update_found(&response.body) => 0,
+        200 => feed_index_of(&response)?
+            .checked_add(1)
+            .ok_or("the feed is full")?,
+        status => {
+            return Err(format!(
+                "gateway returned {status} {}",
+                String::from_utf8_lossy(&response.body).trim(),
+            ))
+        }
+    };
+    if next_index != saved && next_index != saved + 1 {
+        let head = next_index
+            .checked_sub(1)
+            .map_or_else(|| "empty".to_string(), |h| format!("at index {h}"));
+        return Ok(Resumed::Refused(format!(
+            "the feed's head is {head}, but the broadcast stopped writing at index {saved}: \
+             the channel moved on since, so continuing would overwrite it"
+        )));
+    }
+    let mut state = lock(&ctx.state);
+    state.feed_index = next_index;
+    state.feed_settled = true;
+    Ok(Resumed::Settled)
+}
+
 /// A head body read to EOF is only whole if it declared its length
 /// ([`parse_response`] has already checked the two agree): a playlist
 /// cut short by a later chunk that did not retrieve still parses, as a
@@ -3158,7 +3622,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
     // Take the index and mark it in flight in one lock, against
     // `LiveRun::seal_feed`: once the stop call has handed `feed_index`
     // out, nothing may land there.
-    let index = {
+    let (index, recovery) = {
         let mut state = lock(&ctx.state);
         if state.feed_sealed {
             let index = state.feed_index;
@@ -3169,9 +3633,20 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
             return;
         }
         state.feed_update_in_flight = true;
-        state.feed_index
+        let index = state.feed_index;
+        // Taken with the index, from the state the playlist was rendered
+        // from (only this task folds entries in), so it lists everything
+        // the update can make visible.
+        let recovery = (!ctx.config.recovery_path.is_empty())
+            .then(|| state.recovery_entry(&ctx.identity(), index));
+        (index, recovery)
     };
+    // On disk before the update can land (issue #175): a kill after it
+    // went out leaves an entry holding every entry a viewer could have
+    // seen, and naming the index it took.
+    ctx.save_recovery_entry(recovery).await;
     let result = publish_feed_update(ctx, index, &root).await;
+    let landed = result.is_ok();
     {
         let mut state = lock(&ctx.state);
         state.feed_update_in_flight = false;
@@ -3187,6 +3662,12 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
                 state.record_error(format!("feed update {index}: {message}"));
             }
         }
+    }
+    // The recording is the head: the broadcast is over on the feed, and
+    // nothing is left to resume or finalize. Kept on any failure before
+    // this point, so a relaunch can still finalize it.
+    if landed && shape == PlaylistShape::Recording {
+        ctx.clear_recovery_entry().await;
     }
     // A channel manifest that could not be created at start is retried
     // here, so a broadcast that began before the peer set was warm still
@@ -3932,6 +4413,8 @@ mod tests {
             ladder: false,
             width: 0,
             height: 0,
+            recovery_path: String::new(),
+            resume: false,
         }
     }
 
@@ -8110,5 +8593,529 @@ mod tests {
         run.cancel();
         settle(&run).await;
         assert!(!run.report().reaped);
+    }
+
+    // -----------------------------------------------------------------
+    // Recovery entry (issue #175)
+    // -----------------------------------------------------------------
+
+    fn test_identity() -> ([u8; 20], [u8; 32]) {
+        (test_owner(), [0x11; 32])
+    }
+
+    /// A media segment dated `n` segments after go-live.
+    fn media_at(uri: &str, n: u64) -> Committed {
+        let mut m = media(uri, false);
+        if let Committed::Media { program_ms, .. } = &mut m {
+            *program_ms = GO_LIVE_MS + 2000 * n;
+        }
+        m
+    }
+
+    /// A broadcast that continued [`PRIOR_RECORDING`], listed six
+    /// entries (a gap among them) through a window of three, and has a
+    /// lost segment still waiting for media behind it.
+    fn broadcast_to_save() -> PublisherState {
+        let mut state = live_state();
+        state.continue_from(Predecessor::parse(PRIOR_RECORDING).unwrap());
+        for seq in 1..=6 {
+            let outcome = if seq == 4 {
+                lost(false, GO_LIVE_MS + 2000 * seq)
+            } else {
+                media_at(&format!("/bzz/s{seq}/seg.m4s"), seq)
+            };
+            state.done.insert(seq, outcome);
+            state.advance(3, 2000);
+        }
+        state.done.insert(7, lost(false, GO_LIVE_MS + 2000 * 7));
+        state.advance(3, 2000);
+        state
+    }
+
+    /// Issue #175: what a recovery entry holds comes back as the same
+    /// broadcast. The resumed state renders the very live window and
+    /// recording the saved one did, then carries on as one broadcast:
+    /// a new writer's first segment takes the next number (the lost
+    /// segment no viewer saw gives its number back), sits behind one
+    /// `#EXT-X-DISCONTINUITY` under its own map, and the recording holds
+    /// the predecessor, everything saved and everything new.
+    #[test]
+    fn a_recovery_entry_resumes_the_same_broadcast() {
+        let saved = broadcast_to_save();
+        let (owner, topic) = test_identity();
+        let identity = RunIdentity {
+            channel: "test channel",
+            owner: &owner,
+            topic: &topic,
+            topic_text: "",
+            format: StreamFormat::Bzz,
+            segment_ms: 2000,
+        };
+        let entry = saved.recovery_entry(&identity, 9);
+        assert_eq!(entry.feed_index, 9);
+        assert_eq!(entry.owner, hex::encode(owner));
+        assert_eq!(
+            entry.next_number, 21,
+            "the waiting gap's number is free again"
+        );
+        let json = serde_json::to_vec(&entry).unwrap();
+        let entry: RecoveryEntry = serde_json::from_slice(&json).unwrap();
+
+        let mut resumed = PublisherState::resumed(entry);
+        assert_eq!(resumed.resume_index, Some(9));
+        assert!(!resumed.feed_settled, "the head still decides the index");
+        assert_eq!(
+            resumed.render_playlist(2000, false),
+            saved.render_playlist(2000, false)
+        );
+        assert_eq!(resumed.render_recording(2000), saved.render_recording(2000));
+
+        // The relaunched app's writer: a fresh init, then media.
+        resumed.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/new/init.mp4".into(),
+            },
+        );
+        resumed.done.insert(1, media_at("/bzz/n1/seg.m4s", 40));
+        resumed.done.insert(2, media_at("/bzz/n2/seg.m4s", 41));
+        assert!(resumed.advance(3, 2000).is_some());
+        assert_eq!(resumed.segments_listed, 2, "this run's own count");
+
+        let live = resumed.render_playlist(2000, false);
+        assert!(live.contains("\n#EXT-X-MEDIA-SEQUENCE:20\n"), "{live}");
+        assert_eq!(
+            live.matches("\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"/bzz/new/init.mp4\"\n")
+                .count(),
+            1,
+            "{live}"
+        );
+        assert!(live.contains(&format!(
+            "#ANTSTREAM-BROADCAST:{:x}\n",
+            1_760_000_000_000_u64
+        )));
+
+        let recording = resumed.render_recording(2000);
+        assert_eq!(
+            entry_uris(&recording),
+            [
+                "seg-12",
+                "gap-13",
+                "seg-14",
+                "/bzz/s1/seg.m4s",
+                "/bzz/s2/seg.m4s",
+                "/bzz/s3/seg.m4s",
+                "gap-18",
+                "/bzz/s5/seg.m4s",
+                "/bzz/s6/seg.m4s",
+                "/bzz/n1/seg.m4s",
+                "/bzz/n2/seg.m4s",
+            ],
+        );
+        // The predecessor's own break, the go-live seam, the resume.
+        assert_eq!(
+            recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+            3,
+            "{recording}"
+        );
+        // A resume configured with shorter segments keeps the target.
+        let mut short = saved.recovery_entry(&identity, 9);
+        short.segment_ms = 6000;
+        let short = PublisherState::resumed(short);
+        assert!(short
+            .render_playlist(1000, false)
+            .contains("\n#EXT-X-TARGETDURATION:6\n"));
+        // Numbering reads straight through: 12 + 11 entries.
+        assert_eq!(Predecessor::parse(&recording).unwrap().next_number, 23);
+        assert_eq!(resumed.next_number, 23);
+    }
+
+    /// A clock resurrected from disk floors at the last saved segment's
+    /// end, whatever the entry's own clock says (missing here) and
+    /// however far behind the wall clock reads: a resumed broadcast's
+    /// first date never moves back (hls.js reads that as a parsing
+    /// error). A wall clock ahead of it is taken as is.
+    #[test]
+    fn a_resumed_clock_never_dates_before_the_saved_segments() {
+        let saved = broadcast_to_save();
+        let (owner, topic) = test_identity();
+        let identity = RunIdentity {
+            channel: "c",
+            owner: &owner,
+            topic: &topic,
+            topic_text: "",
+            format: StreamFormat::Bzz,
+            segment_ms: 2000,
+        };
+        let mut entry = saved.recovery_entry(&identity, 0);
+        // The last listed segment, seq 6, ended at go-live + 14 s.
+        let last_end = GO_LIVE_MS + 2000 * 7;
+        entry.next_program_ms = None;
+        let mut clock = PublisherState::resumed(entry.clone()).program_clock;
+        let _ = clock.place(SegmentKind::Init, 0, false, GO_LIVE_MS);
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS),
+            last_end
+        );
+        // A saved clock behind the last entry (as a zero would be).
+        entry.next_program_ms = Some(0);
+        let mut clock = PublisherState::resumed(entry.clone()).program_clock;
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 5000),
+            last_end,
+            "no init first: a media segment alone re-anchors too"
+        );
+        // A clock past it (media after the last entry was dropped) wins.
+        entry.next_program_ms = Some(last_end + 4000);
+        let mut clock = PublisherState::resumed(entry.clone()).program_clock;
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS),
+            last_end + 4000
+        );
+        // The relaunch, a minute later: dated from the wall clock.
+        let mut clock = PublisherState::resumed(entry).program_clock;
+        let relaunch = last_end + 60_000;
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, relaunch),
+            relaunch - 2000
+        );
+    }
+
+    #[test]
+    fn resume_needs_a_recovery_path_and_no_start_index() {
+        let mut c = config();
+        c.resume = true;
+        assert!(c.validate().is_err());
+        c.recovery_path = "/x/broadcast.json".into();
+        assert!(c.validate().is_ok());
+        c.start_index = Some(3);
+        assert!(c.validate().is_err());
+        // Serde defaults: a host that never heard of #175 keeps none.
+        let c: PublisherConfig =
+            serde_json::from_str(r#"{"channel":"c","batch_id":"ab"}"#).unwrap();
+        assert!(c.recovery_path.is_empty() && !c.resume);
+    }
+
+    /// A fresh recovery path in the test's temp dir.
+    fn recovery_path(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "ant-publisher-recovery-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("broadcast.json").to_string_lossy().into_owned()
+    }
+
+    /// A broadcast that keeps a recovery entry at `path`, listed three
+    /// segments, and was then "killed": never stopped, nothing more
+    /// pushed. Returns its entry as it stands and its playlists.
+    async fn killed_broadcast(
+        log: &Arc<Mutex<StubLog>>,
+        addr: &str,
+        path: &str,
+    ) -> (RecoveryEntry, Vec<String>) {
+        let mut c = config();
+        c.gateway = format!("http://{addr}");
+        c.format = StreamFormat::Bzz;
+        c.max_backlog = 16;
+        c.recovery_path = path.to_string();
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            c,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3 {
+            let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+        }
+        for _ in 0..400 {
+            let s = run.snapshot();
+            if s.segments_listed == 3
+                && !run.feed_update_in_flight()
+                && s.feed_index == Some(run.report().feed_updates)
+                && load_recovery(path).is_ok_and(|e| e.recording.len() == 3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entry = load_recovery(path).expect("an entry ahead of every update");
+        assert_eq!(entry.recording.len(), 3);
+        assert_eq!(
+            Some(entry.feed_index + 1),
+            run.snapshot().feed_index,
+            "written ahead of the last update, naming its index"
+        );
+        assert_eq!(run.report().recovery_error, "");
+        (entry, uploaded_playlists(log))
+    }
+
+    /// The broadcast id a playlist names.
+    fn playlist_broadcast(playlist: &str) -> &str {
+        playlist
+            .lines()
+            .find_map(|l| l.strip_prefix("#ANTSTREAM-BROADCAST:"))
+            .unwrap()
+    }
+
+    /// Start a run resuming the entry at `path` on `addr`.
+    fn resumed_run(addr: &str, path: &str) -> Result<Arc<LiveRun>, PublisherError> {
+        let mut c = config();
+        c.gateway = format!("http://{addr}");
+        c.format = StreamFormat::Bzz;
+        c.max_backlog = 16;
+        c.recovery_path = path.to_string();
+        c.resume = true;
+        start(
+            &tokio::runtime::Handle::current(),
+            c,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+    }
+
+    /// The stub's feed head at `index`, as a v1 update.
+    fn head_at(index: u64) -> StubHead {
+        StubHead {
+            index,
+            version: "v1",
+            reference: "cd".repeat(32),
+            body: Vec::new(),
+        }
+    }
+
+    /// Issue #175's acceptance on the stub: the app is killed mid-
+    /// broadcast with its last update landed, and the relaunch resumes.
+    /// The feed continues right after that update (no slot rewritten),
+    /// without reading its own head playlist as a predecessor; the media
+    /// sequence numbers on, behind one seam; and the head ends as one
+    /// recording, of the same broadcast, holding every segment from
+    /// before the kill and after it. The entry goes once that lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_killed_broadcast_resumes_on_its_feed_and_records_it_whole() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("resume");
+        let (entry, before) = killed_broadcast(&log, &addr, &path).await;
+        let id = playlist_broadcast(&before[0]).to_string();
+        // The kill came after the last update landed: the head is it.
+        lock(&log).head = Some(head_at(entry.feed_index));
+        let socs_before = soc_ids(&log).len();
+        let reads_before = lock(&log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.starts_with("GET "))
+            .count();
+
+        let run = resumed_run(&addr, &path).unwrap();
+        let _ = run.push(SegmentKind::Init, vec![9u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![0x20; 1000], 2000, false);
+        let _ = run.push(SegmentKind::Media, vec![0x21; 1000], 2000, false);
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.error_count, 0, "{:?}", report.errors);
+        assert_eq!(report.segments_listed, 2);
+
+        let socs = soc_ids(&log);
+        assert_eq!(
+            socs[socs_before],
+            slot(entry.feed_index + 1),
+            "the resumed run writes after the head"
+        );
+        assert_eq!(
+            report.feed_index,
+            Some(entry.feed_index + 1 + report.feed_updates)
+        );
+        // One head read (the index), no head playlist fetched.
+        let reads: Vec<String> = lock(&log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.starts_with("GET "))
+            .skip(reads_before)
+            .map(|r| r.method_path.clone())
+            .collect();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(reads[0].contains("/feeds/") && reads[0].ends_with("?exact=true"));
+
+        let after = &uploaded_playlists(&log)[before.len()..];
+        assert!(
+            after.iter().all(|p| playlist_broadcast(p) == id),
+            "{after:?}"
+        );
+        let first_live = &after[0];
+        assert!(!first_live.contains("#EXT-X-ENDLIST"));
+        assert!(
+            first_live.contains("\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:"),
+            "{first_live}"
+        );
+        let recording = after.last().unwrap();
+        assert!(
+            recording.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "{recording}"
+        );
+        assert_eq!(media_sequence(recording), 0, "{recording}");
+        assert_eq!(entry_uris(recording).len(), 5, "{recording}");
+        let old: Vec<&str> = entry_uris(&before[before.len() - 1]);
+        assert_eq!(&entry_uris(recording)[..3], &old[..], "{recording}");
+        assert_eq!(
+            recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{recording}"
+        );
+        assert_eq!(recording.matches("#EXT-X-MAP:").count(), 2, "{recording}");
+        // Dates never move back across the kill.
+        let dates: Vec<&str> = recording
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:"))
+            .collect();
+        assert!(dates.windows(2).all(|w| w[0] <= w[1]), "{recording}");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the recording is the head: nothing left to resume"
+        );
+    }
+
+    /// The kill came with the update the entry was written ahead of
+    /// still on the wire, and it never landed: the head is the one
+    /// before it, so the resumed run writes that index, leaving no hole
+    /// a feed reader would stop at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_writes_the_update_that_never_landed() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("unlanded");
+        let (entry, _) = killed_broadcast(&log, &addr, &path).await;
+        lock(&log).head = entry.feed_index.checked_sub(1).map(head_at);
+        let socs_before = soc_ids(&log).len();
+        let run = resumed_run(&addr, &path).unwrap();
+        let _ = run.push(SegmentKind::Init, vec![9u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![0x20; 1000], 2000, false);
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(run.report().error_count, 0, "{:?}", run.report().errors);
+        assert_eq!(soc_ids(&log)[socs_before], slot(entry.feed_index));
+    }
+
+    /// The head moved past the entry (another broadcast went out on the
+    /// channel since): resuming would overwrite it, so the run is
+    /// refused, ends by itself and writes nothing, and the entry stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_over_a_channel_that_moved_on_is_refused() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("moved-on");
+        let (entry, before) = killed_broadcast(&log, &addr, &path).await;
+        let saved = std::fs::read(&path).unwrap();
+        lock(&log).head = Some(head_at(entry.feed_index + 3));
+        let socs_before = soc_ids(&log).len();
+        let run = resumed_run(&addr, &path).unwrap();
+        let _ = run.push(SegmentKind::Init, vec![9u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![0x20; 1000], 2000, false);
+        // No stop call: it ends on its own.
+        settle(&run).await;
+        let report = run.report();
+        assert!(
+            report.errors.iter().any(|e| e.contains("moved on")),
+            "{report:?}"
+        );
+        assert_eq!(report.feed_index, None);
+        assert_eq!(soc_ids(&log).len(), socs_before);
+        assert_eq!(uploaded_playlists(&log).len(), before.len());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+    }
+
+    /// Refused at start, entry untouched: another account's broadcast,
+    /// another topic, another format, no entry, an entry that won't
+    /// parse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_is_refused_at_start_unless_the_entry_is_this_feeds() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("refused");
+        let _ = killed_broadcast(&log, &addr, &path).await;
+        let saved = std::fs::read(&path).unwrap();
+        let mut c = config();
+        c.gateway = format!("http://{addr}");
+        c.format = StreamFormat::Bzz;
+        c.recovery_path = path.clone();
+        c.resume = true;
+        let handle = tokio::runtime::Handle::current();
+        let refused =
+            |c: PublisherConfig, owner: [u8; 20]| match start(&handle, c, TEST_SECRET, owner, None)
+            {
+                Err(PublisherError::Config(message)) => message,
+                Ok(_) => panic!("resumed"),
+            };
+        assert!(refused(c.clone(), [9; 20]).contains("not this account"));
+        let mut other = c.clone();
+        other.topic = format!("0x{}", "22".repeat(32));
+        assert!(refused(other, test_owner()).contains("topic"));
+        let mut other = c.clone();
+        other.format = StreamFormat::SolarPunk;
+        assert!(refused(other, test_owner()).contains("format"));
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+        let mut missing = c.clone();
+        missing.recovery_path = format!("{path}.missing");
+        assert!(refused(missing, test_owner()).contains("does not exist"));
+        std::fs::write(&path, b"{\"version\":1,").unwrap();
+        assert!(refused(c, test_owner()).contains("not a recovery entry"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"version\":1,");
+    }
+
+    /// Finalizing a killed broadcast: resume and stop straight away. The
+    /// closing window and the recording go up with every saved segment.
+    /// If the recording fails, the entry stays for another go; once it
+    /// lands, the entry is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_killed_broadcast_finalizes_into_its_recording() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("finalize");
+        let (entry, before) = killed_broadcast(&log, &addr, &path).await;
+        lock(&log).head = Some(head_at(entry.feed_index));
+        lock(&log).fail_recording = true;
+
+        let run = resumed_run(&addr, &path).unwrap();
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(run.report().recording_reference, "");
+        let kept = load_recovery(&path).expect("kept for another go");
+        // The closing window, saved ahead of its update right after the
+        // head; the recording's upload failed, so nothing was saved for
+        // it.
+        assert_eq!(kept.feed_index, entry.feed_index + 1);
+        assert_eq!(kept.recording, entry.recording);
+        let closing = uploaded_playlists(&log)[before.len()].clone();
+        assert!(closing.contains("#EXT-X-ENDLIST"), "{closing}");
+        assert!(!closing.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{closing}");
+
+        // Again, with the recording landing this time (the closing
+        // window is the head now).
+        lock(&log).fail_recording = false;
+        lock(&log).head = Some(head_at(kept.feed_index));
+        let run = resumed_run(&addr, &path).unwrap();
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        let recording = uploaded_playlists(&log).last().unwrap().clone();
+        assert!(
+            recording.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "{recording}"
+        );
+        assert_eq!(
+            entry_uris(&recording),
+            entry_uris(&before[before.len() - 1]),
+            "{recording}"
+        );
+        // The closing window again, then the recording.
+        assert_eq!(soc_ids(&log).last().unwrap(), &slot(kept.feed_index + 2));
+        assert!(!std::path::Path::new(&path).exists());
     }
 }

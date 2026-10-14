@@ -92,7 +92,16 @@ final class LiveBroadcast: ObservableObject {
 
     // MARK: - Lifecycle
 
-    func start(node: AntNode, channel: String, source: CaptureEngine.Source? = nil) async {
+    /// `resume` carries on the broadcast the app was killed in the middle
+    /// of (#175, ``AntNode/unfinishedBroadcast``) instead of starting a
+    /// new one: same feed, same recording, the camera's first segment
+    /// behind one seam.
+    func start(
+        node: AntNode,
+        channel: String,
+        source: CaptureEngine.Source? = nil,
+        resume: Bool = false
+    ) async {
         guard !state.isActive else { return }
         report = nil
         progress = nil
@@ -122,10 +131,12 @@ final class LiveBroadcast: ObservableObject {
                 channel: channel,
                 topic: permanent.topic,
                 topicText: permanent.topicText,
+                owner: permanent.owner,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),
                 segmentMs: UInt32(settings.segmentSeconds * 1000),
-                notes: Self.deviceNotes(network: node.networkLabel, source: source)
+                notes: Self.deviceNotes(network: node.networkLabel, source: source),
+                resume: resume
             )
         } catch {
             state = .failed(error.localizedDescription)
