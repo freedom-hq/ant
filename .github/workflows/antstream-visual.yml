@@ -182,10 +182,11 @@ jobs:
           # The screen waits for `ant_init` before starting (~20 s cold).
           sleep 40
           xcrun simctl io booted screenshot shots/11-live-broadcast.png
-          # Inside the first minute: a broadcast with nothing listed for
-          # 60 s ends by itself (reap_ms, #172), and this one never lists
-          # anything (the sample batch is rejected).
-          sleep 25
+          # This run passes a 10-minute reap_ms (see
+          # `AntNode.reapMsForThisLaunch`): nothing is ever listed here
+          # (the sample batch is rejected), so the real 60 s window (#172)
+          # would end the broadcast before these shots.
+          sleep 30
           xcrun simctl io booted screenshot shots/12-live-publish-lag.png
           # 18/19 — a dropped connection (#172): `-antstream-shot-live-
           # paused` pauses the broadcast 5 s in, as the path monitor does

@@ -712,7 +712,7 @@ final class AntNode: ObservableObject {
             // (#172); anything shorter is a pause with one seam.
             // `LiveBroadcast` notices the `reaped` flag and finishes the
             // stop.
-            "reap_ms": Self.broadcastReapMs,
+            "reap_ms": Self.reapMsForThisLaunch,
         ]
         // One or the other: the publisher refuses both at once.
         if let topicText {
@@ -742,6 +742,20 @@ final class AntNode: ObservableObject {
     /// How long a broadcast outlives its media before it ends by itself
     /// (`reap_ms`, issue #172): Solar Punk's `ORPHAN_REAP_MS`.
     static let broadcastReapMs: UInt64 = 60_000
+
+    /// ``broadcastReapMs``, except under `antstream-visual`'s plain
+    /// `-antstream-shot-live`: the runner's sample batch is rejected, so
+    /// nothing is ever listed, and a minute's reap would end the
+    /// broadcast before shots 11/12 capture it live. The paused run
+    /// (`-antstream-shot-live-paused`) keeps the real window so shot 19
+    /// shows the reap.
+    static var reapMsForThisLaunch: UInt64 {
+        let args = RootView.shotArgs
+        if args.contains("-antstream-shot-live"), !args.contains("-antstream-shot-live-paused") {
+            return 600_000
+        }
+        return broadcastReapMs
+    }
 
     /// The network went: pause the running broadcast (`ant_publisher_pause`)
     /// so it goes silent instead of filling with failed uploads. A no-op
