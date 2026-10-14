@@ -524,7 +524,7 @@ pub const ORPHAN_REAP_MS: u64 = 60_000;
 /// default would leave every broadcast from a host that doesn't ask
 /// unplayable there. A host opts into `"solar-punk"` to be playable in
 /// the Solar Punk viewers (issue #167).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StreamFormat {
     /// Segments and the playlist go up with `POST /bzz` (one manifest
@@ -2258,6 +2258,33 @@ pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
     }
 }
 
+/// [`broadcast_cost`], remembered per cost-relevant config: working it
+/// out builds every segment's erasure-coded tree, while a host asks for
+/// an estimate whenever its plan's room changes (on every redraw that
+/// follows a plan refresh, mid-broadcast too). The cost depends only on
+/// the format, bitrate, segment duration and ladder, so the memo stays a
+/// handful of entries.
+fn broadcast_cost_memoized(config: &PublisherConfig) -> BroadcastCost {
+    static MEMO: Mutex<BTreeMap<(StreamFormat, u32, u32, bool), BroadcastCost>> =
+        Mutex::new(BTreeMap::new());
+    let key = (
+        config.format,
+        config.bitrate_kbps,
+        config.segment_ms,
+        config.ladder,
+    );
+    if let Some(cost) = MEMO.lock().ok().and_then(|m| m.get(&key).copied()) {
+        return cost;
+    }
+    // Worked out outside the lock: two callers racing on a new key both
+    // compute the same value.
+    let cost = broadcast_cost(config);
+    if let Ok(mut memo) = MEMO.lock() {
+        memo.insert(key, cost);
+    }
+    cost
+}
+
 /// How long a broadcast fits on a batch, checked before going live
 /// (issue #176): [`broadcast_cost`] against the batch's room, as
 /// [`estimate_capacity`] works it out.
@@ -2318,7 +2345,7 @@ pub fn estimate_capacity(
             hex::encode(want),
         )));
     }
-    let cost = broadcast_cost(config);
+    let cost = broadcast_cost_memoized(config);
     let chunks_left = plan.worst_case_remaining_chunks;
     let minutes_left =
         chunks_left.saturating_sub(cost.fixed_chunks) / cost.chunks_per_minute.max(1);
@@ -8587,6 +8614,60 @@ mod tests {
             estimate_capacity(&config, &refused).unwrap().usable,
             "a just-bought batch waits"
         );
+    }
+
+    /// The plan JSON the iOS app hands `ant_publisher_capacity`: its
+    /// `StoragePlan` re-encoded, so only the keys it keeps. `usable`
+    /// defaults to `true` when absent, so a host that drops it would
+    /// make every batch look stampable; the app carries it (and
+    /// `propagating`) through, and this is what that JSON estimates to.
+    #[test]
+    fn the_capacity_estimate_reads_usable_from_the_hosts_plan_json() {
+        let config = config();
+        let host_plan = |usable: bool, propagating: bool| {
+            serde_json::json!({
+                "enabled": true,
+                "usable": usable,
+                "propagating": propagating,
+                "batch_id": format!("0x{}", "ab".repeat(32)),
+                "batch_depth": 22,
+                "immutable": true,
+                "total_capacity_chunks": 1u64 << 22,
+                "issued_chunks": 1_000,
+                "worst_case_remaining_chunks": 1_000_000,
+            })
+            .to_string()
+        };
+        let estimate = |json: String| {
+            let plan: ant_control::PostageStatusView = serde_json::from_str(&json).unwrap();
+            estimate_capacity(&config, &plan).unwrap().usable
+        };
+        assert!(estimate(host_plan(true, false)));
+        assert!(!estimate(host_plan(false, false)), "an expired batch");
+        assert!(
+            estimate(host_plan(false, true)),
+            "a just-bought batch waits"
+        );
+    }
+
+    /// The memo the estimate reads its cost from answers what
+    /// [`broadcast_cost`] does, per config, without mixing them up.
+    #[test]
+    fn the_memoized_broadcast_cost_matches_the_cost() {
+        let mut config = config();
+        for format in [StreamFormat::Bzz, StreamFormat::SolarPunk] {
+            for ladder in [false, true] {
+                for (bitrate_kbps, segment_ms) in [(900, 2000), (900, 4000)] {
+                    config.format = format;
+                    config.ladder = ladder;
+                    config.bitrate_kbps = bitrate_kbps;
+                    config.segment_ms = segment_ms;
+                    // Twice: once filling the memo, once reading it.
+                    assert_eq!(broadcast_cost_memoized(&config), broadcast_cost(&config));
+                    assert_eq!(broadcast_cost_memoized(&config), broadcast_cost(&config));
+                }
+            }
+        }
     }
 
     #[test]

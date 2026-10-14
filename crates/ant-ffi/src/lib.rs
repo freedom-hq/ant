@@ -3748,8 +3748,10 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
 /// counts everything a segment carries, so a host adds its audio rate);
 /// `plan_json` is the plan as [`ant_storage_status`] reports it (its
-/// `enabled`, `batch_id`, `immutable` and `worst_case_remaining_chunks`
-/// are read).
+/// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
+/// `usable` and `propagating` are read; pass `usable` through, since a
+/// missing one reads as `true` and the estimate's `usable` would then
+/// always be `true`).
 ///
 /// Returns a [`publisher::CapacityEstimate`] JSON object,
 /// `{"batch_id","immutable","usable","chunks_per_minute","chunks_left",

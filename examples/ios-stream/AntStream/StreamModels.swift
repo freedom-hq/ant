@@ -17,9 +17,18 @@ struct StoragePlan: Codable, Equatable {
     let totalCapacityChunks: UInt64
     let issuedChunks: UInt64
     let worstCaseRemainingChunks: UInt64
+    /// The node will stamp with this batch at all (an expired or unknown
+    /// one it won't). Carried through because ``AntNode/capacity(for:)``
+    /// re-encodes this plan for `ant_publisher_capacity`, where a missing
+    /// field reads as `true`: dropping it would make every batch look
+    /// usable (#176).
+    var usable: Bool = true
+    /// `usable` is `false` only because a just-bought batch is still
+    /// propagating to the storers: it will be usable shortly.
+    var propagating: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case enabled
+        case enabled, usable, propagating
         case batchId = "batch_id"
         case batchDepth = "batch_depth"
         case immutable
@@ -50,6 +59,24 @@ struct StoragePlan: Codable, Equatable {
     var isLow: Bool {
         guard totalCapacityChunks > 0 else { return false }
         return Double(issuedChunks) / Double(totalCapacityChunks) > 0.90
+    }
+}
+
+extension StoragePlan {
+    /// The node leaves `propagating` out when `false` (and older nodes
+    /// sent no `usable`); default both the way the node's own
+    /// `PostageStatusView` does, so a plan decodes either way.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        batchId = try c.decode(String.self, forKey: .batchId)
+        batchDepth = try c.decode(UInt8.self, forKey: .batchDepth)
+        immutable = try c.decode(Bool.self, forKey: .immutable)
+        totalCapacityChunks = try c.decode(UInt64.self, forKey: .totalCapacityChunks)
+        issuedChunks = try c.decode(UInt64.self, forKey: .issuedChunks)
+        worstCaseRemainingChunks = try c.decode(UInt64.self, forKey: .worstCaseRemainingChunks)
+        usable = try c.decodeIfPresent(Bool.self, forKey: .usable) ?? true
+        propagating = try c.decodeIfPresent(Bool.self, forKey: .propagating) ?? false
     }
 }
 

@@ -799,9 +799,14 @@ final class AntNode: ObservableObject {
 
     // MARK: - Storage room for a broadcast (#176)
 
-    /// Estimates already worked out, by plan state and quality: the
-    /// views ask on every redraw, and the plan changes rarely.
-    private var capacityCache: [String: CapacityEstimate] = [:]
+    /// Estimates already worked out for ``capacityCachePlan``, by
+    /// quality: the views ask on every redraw. Emptied whenever the plan
+    /// changes (mid-broadcast its room shrinks with every refresh), so it
+    /// never holds more than one plan's few qualities. Recomputing after
+    /// a change is cheap: the library remembers the broadcast's cost per
+    /// config, so only the room changes.
+    private var capacityCache: [CaptureEngine.Quality: CapacityEstimate] = [:]
+    private var capacityCachePlan: StoragePlan?
 
     /// How long a broadcast at `quality` fits on the connected plan
     /// (#176), from the library's `ant_publisher_capacity`: what a minute
@@ -812,8 +817,11 @@ final class AntNode: ObservableObject {
     /// ``startPublisher`` sends.
     func capacity(for quality: CaptureEngine.Quality) -> CapacityEstimate? {
         guard let plan, plan.enabled, !plan.batchId.isEmpty else { return nil }
-        let key = "\(plan.batchId)|\(plan.worstCaseRemainingChunks)|\(plan.immutable)|\(quality.rawValue)"
-        if let cached = capacityCache[key] { return cached }
+        if capacityCachePlan != plan {
+            capacityCache = [:]
+            capacityCachePlan = plan
+        }
+        if let cached = capacityCache[quality] { return cached }
         let settings = CaptureEngine.Settings(quality: quality)
         let config: [String: Any] = [
             "channel": "",
@@ -838,7 +846,7 @@ final class AntNode: ObservableObject {
         guard let raw else { return nil }
         defer { ant_free_string(raw) }
         guard let estimate = StreamDecoder.capacity(from: String(cString: raw)) else { return nil }
-        capacityCache[key] = estimate
+        capacityCache[quality] = estimate
         return estimate
     }
 
