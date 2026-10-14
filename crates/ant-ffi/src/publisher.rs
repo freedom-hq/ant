@@ -1041,9 +1041,10 @@ impl PublisherState {
                     // return is no longer due: an upload that was still
                     // in flight when the window ran out landed after
                     // all. Left set, it would deny every later return
-                    // its fresh window (see `LiveRun::resume`); if the
-                    // new window runs out paused too, the reaper marks
-                    // it due again.
+                    // its fresh window (see `LiveRun::resume`). The
+                    // committer wakes the parked reaper when this clears
+                    // the flag, so if the new window runs out paused
+                    // too, the reaper marks it due again.
                     self.reap_due = false;
                     self.slide(window, target_ms);
                     newest = Some(captured_at);
@@ -1950,8 +1951,11 @@ impl RunCtx {
 /// runs out during an outage marks the reap due and waits for
 /// [`LiveRun::resume`]; that return ends the run (it buys no fresh
 /// window), with the uploads going out over the connection that just
-/// came back. An outage that never ends leaves the run paused until the
-/// host's stop.
+/// came back. Media that lands while it waits (an upload in flight when
+/// the window ran out) clears the due reap and wakes the reaper too,
+/// which then sleeps out the window that media restarted and, if that
+/// one also runs out paused, marks the reap due again. An outage that
+/// never ends leaves the run paused until the host's stop.
 async fn reaper(ctx: Arc<RunCtx>, reap: Duration) {
     loop {
         // Registered before the state is read, so a return between the
@@ -2219,10 +2223,19 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         let notified = ctx.commit_notify.notified();
         tokio::pin!(notified);
 
-        let newest = {
+        let (newest, held_reap_cleared) = {
             let mut state = lock(&ctx.state);
-            state.advance(ctx.config.playlist_window, ctx.config.segment_ms)
+            let held = state.reap_due;
+            let newest = state.advance(ctx.config.playlist_window, ctx.config.segment_ms);
+            (newest, held && !state.reap_due)
         };
+        if held_reap_cleared {
+            // The reaper is parked on the return for a reap that is no
+            // longer due: wake it to re-read the deadline the media just
+            // moved on, so a window that runs out paused again is marked
+            // due again (see `reaper`).
+            ctx.reap_notify.notify_one();
+        }
         if let Some(captured_at) = newest {
             publish_playlist(&ctx, PlaylistShape::Live, Some(captured_at)).await;
             continue;
@@ -5421,6 +5434,50 @@ mod tests {
         }
         run.cancel();
         settle(&run).await;
+    }
+
+    /// A held reap cleared by media that landed while still paused must
+    /// not leave the reaper parked on the return: when the window that
+    /// media restarted runs out paused too, the reap is due again, and
+    /// the return ends the run rather than buying yet another window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleared_reap_falls_due_again_if_the_new_window_runs_out_paused() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 300);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(lock(&run.state).reap_due, "the first window ran out paused");
+        // An upload that was in flight when the window ran out lands,
+        // folded in by the real committer.
+        {
+            let mut state = lock(&run.state);
+            let seq = state.next_commit;
+            state.done.insert(seq, media("/bzz/cc/seg-late.m4s", false));
+        }
+        run.commit_notify.notify_one();
+        wait_until(&run, "the late segment", |s| s.segments_listed == 2).await;
+        assert!(!lock(&run.state).reap_due, "media cleared the held reap");
+        // The outage outlasts the window that media restarted.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let snapshot = run.snapshot();
+        assert!(snapshot.running && !snapshot.reaped, "{snapshot:?}");
+        assert!(
+            lock(&run.state).reap_due,
+            "the second window ran out paused: due again"
+        );
+        let back = Instant::now();
+        run.resume();
+        settle(&run).await;
+        assert!(
+            back.elapsed() < Duration::from_millis(300),
+            "the return ends it, it buys no window: {:?}",
+            back.elapsed()
+        );
+        assert!(run.report().reaped);
     }
 
     fn quiet_run(log: &Arc<Mutex<StubLog>>, addr: &str, reap_ms: u64) -> Arc<LiveRun> {
