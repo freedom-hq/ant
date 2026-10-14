@@ -71,6 +71,14 @@ struct LiveView: View {
             // fail honestly at the gateway's batch check.
             node.installBroadcastSample()
             await broadcast.start(node: node, channel: "CI test pattern")
+            // `-antstream-shot-live-paused` then drops the "network" the
+            // way `AntNode`'s path monitor does when the device goes
+            // offline (#172), so CI captures the paused state and, a
+            // minute on with nothing listed, the broadcast ending itself.
+            if RootView.shotArgs.contains("-antstream-shot-live-paused") {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await node.pausePublisher()
+            }
         }
     }
 
@@ -180,6 +188,18 @@ struct LiveView: View {
                         .font(.footnote)
                         .foregroundStyle(.yellow)
                 }
+                if let progress = broadcast.progress, progress.paused == true,
+                   broadcast.state.isActive {
+                    // Paused, not over (#172): viewers stay on the
+                    // broadcast and it carries on when the network does.
+                    Label("No connection — paused. Viewers stay on the broadcast; "
+                          + "it carries on when the network is back, or ends "
+                          + "after a minute without it.",
+                          systemImage: "wifi.slash")
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let progress = broadcast.progress {
                     metrics(progress)
                 } else if broadcast.state.isActive {
@@ -256,6 +276,12 @@ struct LiveView: View {
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.75))
+                if let withheld = report.segmentsWithheld, withheld > 0 {
+                    Text("\(withheld) segments shot without a connection were left out; "
+                         + "the broadcast carried on after it.")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                }
                 if report.segmentsDropped > 0 || report.segmentsFailed > 0 {
                     Text("\(report.segmentsDropped) dropped at the live edge, "
                          + "\(report.segmentsFailed) failed to publish.")

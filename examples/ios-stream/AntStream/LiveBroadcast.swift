@@ -182,6 +182,11 @@ final class LiveBroadcast: ObservableObject {
     /// is finished and published, then the publisher closes the playlist
     /// with `#EXT-X-ENDLIST` and publishes the whole broadcast as the
     /// recording.
+    ///
+    /// The only other end is the node's own (#172): a broadcast whose
+    /// network is gone is paused, not stopped (``AntNode`` pauses and
+    /// resumes it with the network), and only a minute with nothing
+    /// reaching the playlist ends it; the progress poll then calls this.
     func stop(node: AntNode, failure: String? = nil) async {
         guard state.isActive else { return }
         state = .stopping
@@ -241,6 +246,14 @@ final class LiveBroadcast: ObservableObject {
                     // continues the feed even if this one is killed
                     // mid-stream.
                     channel.advance(to: snapshot.feedIndex)
+                    // A minute with nothing reaching the playlist (the
+                    // network, or the app, gone that long) ends the
+                    // broadcast node-side (#172): finish the stop here
+                    // so the camera goes off and the report shows.
+                    if snapshot.reaped == true || !snapshot.running {
+                        Task { await self.stop(node: node) }
+                        return
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }

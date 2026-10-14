@@ -510,9 +510,18 @@ struct PublisherSnapshot: Codable, Equatable {
     let peers: UInt32
     let lastError: String
     let errorCount: UInt64
+    /// The network is gone and the broadcast is paused, not over
+    /// (#172). Optional so a snapshot from a node without it decodes.
+    let paused: Bool?
+    /// Segments the camera shot while paused, never uploaded.
+    let segmentsWithheld: UInt64?
+    /// The broadcast is ending by itself: a minute passed with nothing
+    /// reaching the playlist (`reap_ms`).
+    let reaped: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case running, channel, topic, owner, peers
+        case running, channel, topic, owner, peers, paused, reaped
+        case segmentsWithheld = "segments_withheld"
         case elapsedS = "elapsed_s"
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
@@ -589,9 +598,15 @@ struct PublisherReport: Codable, Equatable {
     let keptUp: Bool
     let errors: [String]
     let errorCount: UInt64
+    /// Segments shot while the network was gone, never uploaded (#172).
+    let segmentsWithheld: UInt64?
+    /// It ended by itself after a minute with nothing reaching the
+    /// playlist, not on the stop button.
+    let reaped: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case channel, topic, owner, notes, errors
+        case channel, topic, owner, notes, errors, reaped
+        case segmentsWithheld = "segments_withheld"
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
         case recordingReference = "recording_reference"
@@ -639,6 +654,7 @@ struct PublisherReport: Codable, Equatable {
     var hasVerdict: Bool { segmentsListed > 0 }
 
     var verdictLabel: String {
+        if reaped == true { return "Broadcast ended: nothing reached viewers for a minute" }
         guard hasVerdict else { return "Broadcast ended without publishing" }
         return keptUp ? "Broadcast kept up" : "Broadcast fell behind"
     }

@@ -35,6 +35,10 @@ struct AntStreamApp: App {
             case .active:
                 Task {
                     await node.wake()
+                    // A broadcast left running is carried on, and this
+                    // return buys it a fresh reap window (#172) to get
+                    // its first segment back up.
+                    if !node.isOffline { await node.resumePublisher() }
                     await node.refreshAll()
                 }
             default:

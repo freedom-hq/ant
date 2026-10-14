@@ -558,7 +558,9 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherStart<
 
 /// `AntNative.nativePublisherPushSegment(handle, isInit, data,
 /// durationMs, discontinuity): Int` — `ant_publisher_push_segment`.
-/// Returns its 0 / 1 / 2 disposition; -1 throws.
+/// Returns its 0 / 1 / 2 / 3 disposition (3, withheld, only after
+/// `ant_publisher_pause`, which this binding does not expose yet); -1
+/// throws.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherPushSegment<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
