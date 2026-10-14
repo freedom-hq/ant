@@ -479,7 +479,8 @@ struct PublisherSnapshot: Codable, Equatable {
     /// reference worth sharing.
     let channelReference: String
     let playlistReference: String
-    let feedIndex: UInt64
+    /// `nil` until the node has read the channel's feed head.
+    let feedIndex: UInt64?
     let segmentsPushed: UInt64
     let segmentsPublished: UInt64
     /// Of those, the ones that reached a published playlist — what a
@@ -582,7 +583,8 @@ struct PublisherReport: Codable, Equatable {
     let feedUpdates: UInt64
     /// The next feed update's index: where the permanent channel's next
     /// broadcast starts (the node finds it by reading the feed head).
-    /// Optional so a report from a node without it still decodes.
+    /// `nil` when the broadcast ended before it read the head, and so a
+    /// report from a node without it still decodes.
     let feedIndex: UInt64?
     let sustainedMbitS: Double
     let sustainedChunksS: Double

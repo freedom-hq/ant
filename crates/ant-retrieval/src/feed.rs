@@ -123,8 +123,18 @@ pub enum FeedError {
     /// Walked the entire allowed range without finding a single update.
     /// Either the feed has never been published or the chunks aren't
     /// reachable from this antd's neighbourhood right now.
+    ///
+    /// `corroborated` says whether the anchor miss is the network's
+    /// answer (more than a couple of peers said "not found", see
+    /// [`FetchExhausted::corroborated_missing`]) rather than one or two
+    /// cold peers' `no peer found` for an index that may well exist.
+    /// Only a corroborated miss is a confirmed-empty feed; callers that
+    /// act on "empty" (drop a hint, start writing at index 0) must check
+    /// it.
+    ///
+    /// [`FetchExhausted::corroborated_missing`]: crate::fetcher::FetchExhausted::corroborated_missing
     #[error("feed has no updates (probed {probed} indices)")]
-    NoUpdates { probed: u64 },
+    NoUpdates { probed: u64, corroborated: bool },
     /// Underlying chunk-fetch failed — we surface the source so a
     /// `RetrievalError::Remote` shows up here verbatim. The lookup
     /// silently swallows individual misses, this only fires for hard
@@ -652,22 +662,14 @@ pub async fn resolve_sequence_feed_full(
 /// absent — even if earlier updates exist; when present, the search for
 /// the latest update proceeds from there. `after = 0` is the plain
 /// "latest" lookup.
+///
+/// An anchor miss fails with [`FeedError::NoUpdates`], whose
+/// `corroborated` records whether the network corroborated it
+/// ([`anchor_miss_corroborated`]).
 pub async fn resolve_sequence_feed_after(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
     after: u64,
-) -> Result<FeedResolution, FeedError> {
-    resolve_after_inner(fetcher, feed, after, &mut false).await
-}
-
-/// [`resolve_sequence_feed_after`], also setting `*anchor_corroborated`
-/// when it fails with [`FeedError::NoUpdates`] on an anchor miss the
-/// network corroborated ([`anchor_miss_corroborated`]).
-async fn resolve_after_inner(
-    fetcher: &dyn ChunkFetcher,
-    feed: &Feed,
-    after: u64,
-    anchor_corroborated: &mut bool,
 ) -> Result<FeedResolution, FeedError> {
     let mut probed: u64 = 0;
 
@@ -678,8 +680,10 @@ async fn resolve_after_inner(
         match probe(fetcher, feed, after, &mut probed, None).await? {
             ProbeOutcome::Present(u) => (after, u),
             ProbeOutcome::Absent { corroborated } => {
-                *anchor_corroborated = corroborated;
-                return Err(FeedError::NoUpdates { probed });
+                return Err(FeedError::NoUpdates {
+                    probed,
+                    corroborated,
+                });
             }
             ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
         };
@@ -979,8 +983,7 @@ pub async fn resolve_sequence_feed_hinted(
     };
     let hint = hints.get(&feed.owner, &feed.topic);
     let anchor = after.max(hint);
-    let mut corroborated = false;
-    let mut result = resolve_after_inner(fetcher, feed, anchor, &mut corroborated).await;
+    let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
     if let Err(e) = &result {
         if anchor > after {
             // Only an anchor miss the network corroborated proves the
@@ -988,7 +991,13 @@ pub async fn resolve_sequence_feed_hinted(
             // unretrievable). One cold peer's "not found", a starved
             // pool or a fetch hiccup says nothing about the hint, which
             // stays for the next read.
-            let stale = corroborated && matches!(e, FeedError::NoUpdates { .. });
+            let stale = matches!(
+                e,
+                FeedError::NoUpdates {
+                    corroborated: true,
+                    ..
+                }
+            );
             debug!(
                 target: "ant_retrieval::feed",
                 feed_owner = %hex::encode(feed.owner),
@@ -1801,7 +1810,13 @@ mod tests {
         };
         let fetcher = MapFetcher::new();
         match resolve_sequence_feed(&fetcher, &feed).await {
-            Err(FeedError::NoUpdates { probed }) => {
+            Err(FeedError::NoUpdates {
+                probed,
+                corroborated,
+            }) => {
+                // A local map's miss carries no peer count and is taken
+                // at its word.
+                assert!(corroborated);
                 // Index 0 is absent, so we probe exactly one address
                 // before declaring the feed empty.
                 assert_eq!(probed, 1);
@@ -2666,7 +2681,16 @@ mod tests {
                 answers,
             };
             let r = resolve_sequence_feed_hinted(&typed, &feed, 0, Some(&hints)).await;
-            assert!(matches!(r, Err(FeedError::NoUpdates { .. })), "{r:?}");
+            // The miss says whether it is the network's answer, so the
+            // node answers a cold one with a 503, not "no update found"
+            // (R1-F1 on PR #183).
+            assert!(
+                matches!(
+                    r,
+                    Err(FeedError::NoUpdates { corroborated, .. }) if corroborated != kept
+                ),
+                "{answers} not-found answers: {r:?}"
+            );
             assert_eq!(
                 hints.get(&owner, &topic),
                 if kept { 37 } else { 0 },

@@ -288,7 +288,10 @@ pub struct PublisherConfig {
     ///
     /// The shape Solar Punk's uploader writes over a topic that outlives
     /// a session. Only a `404 "no update found"` (a feed nothing was ever
-    /// written to) starts the feed at 0. Any other failed read is no
+    /// written to; ant's node answers it only for an anchor miss more
+    /// than a couple of peers agree on, and a 503 for a cold node's one
+    /// or two) starts the feed at 0. Any other failed read, a v1 head's
+    /// playlist that does not retrieve included, is no
     /// answer: segments keep uploading, but no playlist or feed update
     /// is written until a retry reads the head, so a flaky read can never
     /// overwrite index 0 and up.
@@ -297,7 +300,9 @@ pub struct PublisherConfig {
     /// numbering starts at 0 with no seam and the recording holds this
     /// broadcast alone, as before #173. A host passing the previous
     /// broadcast's `feed_index` here must get it right, or it rewrites
-    /// the indices that hold earlier playlists.
+    /// the indices that hold earlier playlists. A report's `feed_index`
+    /// is `null` when its run never read the head; passed on as is, it
+    /// leaves this unset and the next broadcast reads the head.
     #[serde(default)]
     pub start_index: Option<u64>,
     /// Gateway base URL, `http://host:port` (loopback: the in-process
@@ -1498,9 +1503,11 @@ pub struct PublisherSnapshot {
     pub format: StreamFormat,
     /// Reference of the most recently published playlist.
     pub playlist_reference: String,
-    /// Sequence-feed index of the next update (i.e. how many updates
-    /// have landed).
-    pub feed_index: u64,
+    /// Sequence-feed index of the next update. `None` (JSON `null`)
+    /// until the broadcast knows where it stands in its feed: with no
+    /// [`PublisherConfig::start_index`], until its read of the feed head
+    /// answers ([`settle_feed_position`]).
+    pub feed_index: Option<u64>,
     pub segments_pushed: u64,
     pub segments_published: u64,
     /// Of those, the ones that reached a published playlist — what a
@@ -1599,7 +1606,14 @@ pub struct PublisherReport {
     /// [`PublisherConfig::start_index`]. Final in the report the stop
     /// call returns, even when its grace ran out first: the run is then
     /// sealed ([`LiveRun::seal_feed`]) and writes no further update.
-    pub feed_index: u64,
+    ///
+    /// `None` (JSON `null`) when the run ended (stopped or reaped)
+    /// before its read of the feed head ever answered: it wrote no
+    /// update and doesn't know where the feed stands, so there is no
+    /// index to hand on. A host must not substitute 0 (that rewrites
+    /// the channel from its first update); passing the `null` on as
+    /// `start_index` makes the next broadcast read the head itself.
+    pub feed_index: Option<u64>,
     pub sustained_mbit_s: f64,
     pub sustained_chunks_s: f64,
     pub publish_ms_p50: u64,
@@ -1861,7 +1875,7 @@ impl LiveRun {
             channel_reference: state.channel_reference.clone().unwrap_or_default(),
             format: self.config.format,
             playlist_reference: state.playlist_reference.clone().unwrap_or_default(),
-            feed_index: state.feed_index,
+            feed_index: state.feed_settled.then_some(state.feed_index),
             segments_pushed: state.segments_pushed,
             segments_published: state.segments_published,
             segments_listed: state.segments_listed,
@@ -1968,7 +1982,7 @@ impl LiveRun {
             chunks_published: state.chunks_published,
             playlists_published: state.playlists_published,
             feed_updates: state.feed_updates,
-            feed_index: state.feed_index,
+            feed_index: state.feed_settled.then_some(state.feed_index),
             sustained_mbit_s: throughput_mbit_s(state.bytes_published, elapsed),
             sustained_chunks_s: if elapsed > 0.0 {
                 state.chunks_published as f64 / elapsed
@@ -2565,8 +2579,10 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
 ///   at the playlist's manifest, whose reference is the response's
 ///   `ETag`, so the playlist is `GET /bzz/<it>/stream.m3u8`. A head that
 ///   isn't a playlist (foreign content on the topic, or a v1 manifest
-///   with no `stream.m3u8`) still moves the index on, with nothing to
-///   continue numbering from.
+///   with no `stream.m3u8`: `404 "path address not found"`) still moves
+///   the index on, with nothing to continue numbering from. A v1
+///   playlist that does not retrieve (any other 404, a 5xx) is an error
+///   like the head's own.
 /// - Anything else, including any other 404 (bee's `"wrapped chunk
 ///   cannot be retrieved"` is a head that exists and did not retrieve):
 ///   an error. Never read as an empty feed, which would write index 0
@@ -2598,8 +2614,15 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
                 let playlist = http_get_timed(&ctx.target, &path).await?;
                 match playlist.status {
                     200 => playlist.body,
-                    // The manifest has no playlist: not a broadcast.
-                    404 => Vec::new(),
+                    // The manifest has no playlist, or the head is no
+                    // manifest at all: not a broadcast.
+                    _ if is_not_a_broadcast_manifest(&playlist.body) => Vec::new(),
+                    // Any other answer, a 404 for a playlist chunk that
+                    // did not retrieve included (the v1 twin of bee's
+                    // `"wrapped chunk cannot be retrieved"` above), is no
+                    // answer: numbering from 0 would move the channel's
+                    // media sequence back and drop every earlier
+                    // broadcast from the recording.
                     status => {
                         return Err(format!(
                             "head playlist {reference}: gateway returned {status} {}",
@@ -2633,12 +2656,32 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
 
 /// Bee's (and ant's) answer for a feed nothing was ever written to:
 /// `404 {"message":"no update found"}`. Every other 404 on `GET /feeds`
-/// is a head that exists but would not retrieve.
+/// is a head that exists but would not retrieve. Ant's node only gives
+/// it for an anchor miss the network corroborated; one or two cold
+/// peers' miss is a 503 (`ant_p2p::feed_lookup_ack`), retried like any
+/// other failed read.
 fn is_no_update_found(body: &[u8]) -> bool {
+    gateway_message(body).is_some_and(|m| m == "no update found")
+}
+
+/// A `/bzz/<v1 head>/stream.m3u8` answer that says the head is not a
+/// broadcast, as opposed to one that did not retrieve: the manifest has
+/// no such path (bee's and ant's `404 "path address not found"`), or the
+/// reference is not a manifest at all. A plain `404 "Not Found"` is a
+/// chunk the network didn't serve, not one of these.
+fn is_not_a_broadcast_manifest(body: &[u8]) -> bool {
+    gateway_message(body).is_some_and(|m| {
+        m == "path address not found" || m.contains("reference is not a mantaray manifest")
+    })
+}
+
+/// The `message` of a gateway's JSON error body.
+fn gateway_message(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("message")?.as_str().map(|m| m == "no update found"))
-        .unwrap_or(false)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// [`http_get`] under the same deadline as an upload.
@@ -4599,11 +4642,18 @@ mod tests {
         head: Option<StubHead>,
         /// Answer this many `GET /feeds` with a 502 first.
         fail_head: u32,
+        /// Then this many with the node's 503 for an anchor miss only
+        /// one or two cold peers answered (`ant_p2p::feed_lookup_ack`).
+        cold_head: u32,
         /// Then this many with bee's other 404, a head that exists but
         /// did not retrieve.
         unretrievable_head: u32,
         /// `GET /bzz/<ref>/stream.m3u8` bodies, by manifest reference.
+        /// Any other reference is a manifest with no such path.
         bzz_playlists: HashMap<String, String>,
+        /// Answer this many `GET /bzz/<ref>/stream.m3u8` first with the
+        /// gateway's plain 404 for a chunk the network didn't serve.
+        unretrievable_playlist: u32,
     }
 
     /// The feed head `GET /feeds` resolves to.
@@ -4643,6 +4693,14 @@ mod tests {
                     br#"{"message":"feed lookup failed"}"#,
                 );
             }
+            if slot.cold_head > 0 {
+                slot.cold_head -= 1;
+                return stub_response(
+                    "503 Service Unavailable",
+                    &[],
+                    br#"{"code":503,"message":"feed lookup: feed has no updates (probed 1 indices); too few peers answered to tell an empty feed from one this node can't reach yet"}"#,
+                );
+            }
             if slot.unretrievable_head > 0 {
                 slot.unretrievable_head -= 1;
                 return stub_response(
@@ -4676,9 +4734,21 @@ mod tests {
             .strip_prefix("/bzz/")
             .and_then(|rest| rest.strip_suffix("/stream.m3u8"))
             .unwrap_or_default();
+        if slot.unretrievable_playlist > 0 {
+            slot.unretrievable_playlist -= 1;
+            return stub_response(
+                "404 Not Found",
+                &[],
+                br#"{"code":404,"message":"Not Found"}"#,
+            );
+        }
         match slot.bzz_playlists.get(reference) {
             Some(body) => stub_response("200 OK", &[], body.as_bytes()),
-            None => stub_response("404 Not Found", &[], br#"{"message":"not found"}"#),
+            None => stub_response(
+                "404 Not Found",
+                &[],
+                br#"{"code":404,"message":"path address not found"}"#,
+            ),
         }
     }
 
@@ -4881,7 +4951,11 @@ mod tests {
         );
         let report = run.report();
         assert!(report.feed_updates > 0);
-        assert_eq!(report.feed_index, 41 + report.feed_updates, "{report:?}");
+        assert_eq!(
+            report.feed_index,
+            Some(41 + report.feed_updates),
+            "{report:?}"
+        );
         let playlist = lock(&log)
             .seen
             .iter()
@@ -5007,7 +5081,11 @@ mod tests {
             !(0..=9).any(|i| ids.contains(&slot(i))),
             "an earlier slot was rewritten"
         );
-        assert_eq!(report.feed_index, 10 + report.feed_updates, "{report:?}");
+        assert_eq!(
+            report.feed_index,
+            Some(10 + report.feed_updates),
+            "{report:?}"
+        );
 
         // Numbered on from 12 + 3 entries, with the seam on the first.
         let playlists = uploaded_playlists(&log);
@@ -5055,13 +5133,23 @@ mod tests {
                 body: b"not the playlist: the manifest's root node".to_vec(),
             }),
             bzz_playlists: HashMap::from([(manifest.clone(), PRIOR_RECORDING.to_string())]),
+            // The playlist's chunk misses once: a read to retry, not a
+            // manifest with no playlist (R1-M1 on PR #183).
+            unretrievable_playlist: 1,
             ..StubLog::default()
         }));
         let run = continued_run(&log, StreamFormat::Bzz, 2).await;
+        wait_until(&run, "the head to answer", |s| s.feed_index.is_some()).await;
         run.cancel();
         settle(&run).await;
         let report = run.report();
-        assert_eq!(report.error_count, 0, "{:?}", report.errors);
+        assert_eq!(report.error_count, 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].starts_with("feed head: head playlist")
+                && report.errors[0].contains("404"),
+            "{:?}",
+            report.errors
+        );
         assert!(lock(&log)
             .seen
             .iter()
@@ -5107,10 +5195,11 @@ mod tests {
         assert!(!first.contains("DISCONTINUITY"), "{first}");
     }
 
-    /// A head read that fails (a 502, or bee's other 404, a head that
-    /// exists and did not retrieve) is no answer: nothing is written,
-    /// in particular not index 0, until a retry reads the head. The
-    /// segments upload meanwhile and are listed once it answers.
+    /// A head read that fails (a 502, the node's 503 for a cold anchor
+    /// miss, or bee's other 404, a head that exists and did not
+    /// retrieve) is no answer: nothing is written, in particular not
+    /// index 0, until a retry reads the head. The segments upload
+    /// meanwhile and are listed once it answers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_head_read_is_retried_never_read_as_an_empty_feed() {
         let log = Arc::new(Mutex::new(StubLog {
@@ -5121,17 +5210,18 @@ mod tests {
                 body: PRIOR_RECORDING.as_bytes().to_vec(),
             }),
             fail_head: 1,
+            cold_head: 1,
             unretrievable_head: 1,
             ..StubLog::default()
         }));
         let run = continued_run(&log, StreamFormat::SolarPunk, 3).await;
-        wait_until(&run, "the head to answer", |s| s.feed_index > 0).await;
+        wait_until(&run, "the head to answer", |s| s.feed_index > Some(0)).await;
         let reads = lock(&log)
             .seen
             .iter()
             .filter(|r| r.method_path.starts_with("GET /feeds/"))
             .count();
-        assert_eq!(reads, 3, "two failed reads, then the answer");
+        assert_eq!(reads, 4, "three failed reads, then the answer");
         run.cancel();
         settle(&run).await;
         let report = run.report();
@@ -5140,14 +5230,15 @@ mod tests {
         assert_eq!(ids[0], slot(4));
         assert!(!ids.iter().any(|id| (0..=3).any(|i| *id == slot(i))));
         assert_eq!(media_sequence(&uploaded_playlists(&log)[0]), 15);
-        assert_eq!(report.error_count, 2, "{:?}", report.errors);
+        assert_eq!(report.error_count, 3, "{:?}", report.errors);
         assert!(
             report.errors.iter().all(|e| e.starts_with("feed head: ")),
             "{:?}",
             report.errors
         );
+        assert!(report.errors[1].contains("503"), "{:?}", report.errors);
         assert!(
-            report.errors[1].contains("wrapped chunk cannot be retrieved"),
+            report.errors[2].contains("wrapped chunk cannot be retrieved"),
             "{:?}",
             report.errors
         );
@@ -5169,6 +5260,12 @@ mod tests {
         assert_eq!(report.segments_published, 3, "segments upload: {report:?}");
         assert_eq!(report.feed_updates, 0, "{report:?}");
         assert_eq!(report.playlists_published, 0, "{report:?}");
+        // No position to hand on: `null`, never 0, which a host passing
+        // it on as `start_index` would rewrite the channel from
+        // (R1-M2 on PR #183).
+        assert_eq!(report.feed_index, None, "{report:?}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["feed_index"].is_null(), "{json}");
         assert_eq!(soc_ids(&log), Vec::<String>::new());
         assert_eq!(uploaded_playlists(&log), Vec::<String>::new());
         assert!(
@@ -5521,10 +5618,10 @@ mod tests {
         // The closing window's update landed before the recording's
         // upload began; nothing is on the wire at the feed.
         assert!(!run.seal_feed(), "no feed update should be in flight");
-        let handed_out = run.report().feed_index;
+        let handed_out = run.report().feed_index.expect("the position is known");
         settle(&run).await;
         let report = run.report();
-        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        assert_eq!(report.feed_index, Some(handed_out), "{report:?}");
         let taken = hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], handed_out));
         assert!(
             !soc_ids(&log).contains(&taken),
@@ -5559,10 +5656,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(!run.feed_update_in_flight());
-        let handed_out = run.report().feed_index;
+        let handed_out = run.report().feed_index.expect("the position is known");
         settle(&run).await;
         let report = run.report();
-        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        assert_eq!(report.feed_index, Some(handed_out), "{report:?}");
         let ids = soc_ids(&log);
         let last = hex::encode(ant_retrieval::sequence_update_id(
             &[0x11; 32],
@@ -6058,7 +6155,7 @@ mod tests {
         let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
         let _ = run.push(SegmentKind::Media, vec![0u8; 64], 300, false);
         for _ in 0..100 {
-            if run.snapshot().feed_index > 0 {
+            if run.snapshot().feed_index > Some(0) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6473,8 +6570,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Polls for up to 10 s: long enough for three failed head reads
+    /// and their [`FEED_HEAD_RETRY`] pauses.
     async fn wait_until(run: &Arc<LiveRun>, what: &str, done: impl Fn(&PublisherSnapshot) -> bool) {
-        for _ in 0..400 {
+        for _ in 0..1000 {
             if done(&run.snapshot()) {
                 return;
             }
@@ -6535,7 +6634,7 @@ mod tests {
             );
         }
         wait_until(&run, "the first three", |s| {
-            s.segments_listed == 3 && s.feed_index > 0
+            s.segments_listed == 3 && s.feed_index > Some(0)
         })
         .await;
         tokio::time::sleep(Duration::from_millis(50)).await;

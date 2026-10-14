@@ -611,6 +611,12 @@ pub enum ControlCommand {
     /// supported variant: the gateway short-circuits `?type=epoch` with
     /// `501 Not Implemented` before sending the command, so the wire
     /// here is sequence-only.
+    ///
+    /// Ends in [`ControlAck::FeedResolved`], [`ControlAck::FeedNotFound`]
+    /// (an anchor miss more than a couple of peers agree on: a feed
+    /// nothing was written to), [`ControlAck::NotReady`] (an anchor miss
+    /// only one or two cold peers answered, which can't tell an empty
+    /// feed from one the node can't reach yet) or [`ControlAck::Error`].
     GetFeed {
         owner: [u8; 20],
         topic: [u8; 32],
@@ -868,7 +874,10 @@ pub enum ControlAck {
         /// decrypting joiner. `None` for unencrypted content.
         decrypt_key: Option<[u8; 32]>,
     },
-    /// Empty-feed signal from `GetFeed`. Distinct from
+    /// Empty-feed signal from `GetFeed`: the anchor miss was
+    /// corroborated by more than a couple of peers
+    /// (`FeedError::NoUpdates { corroborated: true, .. }`); an
+    /// uncorroborated one is [`Self::NotReady`] instead. Distinct from
     /// [`Self::Error`] so the gateway can map it to `404 Not Found`
     /// without substring-matching an error message.
     FeedNotFound,
@@ -886,6 +895,10 @@ pub enum ControlAck {
     /// pressure the content may still be reachable through its replicas
     /// and the answer is a 503, not a 404 (R4-M1 on PR #155). So a
     /// corroborated miss does not by itself rule out `NotReady`.
+    /// `GetFeed` sends it for an anchor miss only one or two peers
+    /// answered (`FeedError::NoUpdates { corroborated: false, .. }`):
+    /// not proof the feed is empty, so a 503 rather than bee's
+    /// `404 "no update found"` (issue #173).
     /// Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for

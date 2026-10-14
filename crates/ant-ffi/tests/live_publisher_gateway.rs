@@ -133,22 +133,11 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                     topic,
                     kind: ant_retrieval::FeedType::Sequence,
                 };
-                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
-                    .await
-                {
-                    Ok(r) => ControlAck::FeedResolved {
-                        reference: r.reference,
-                        index: r.index,
-                        signature: r.signature,
-                        v2: r.v2,
-                        decrypt_key: r.decrypt_key,
-                    },
-                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
-                    Err(e) => ControlAck::Error {
-                        message: e.to_string(),
-                    },
-                };
-                let _ = ack.send(reply);
+                // The node's own mapping, so the stub answers the
+                // publisher's head read exactly as the node does.
+                let result =
+                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await;
+                let _ = ack.send(ant_p2p::feed_lookup_ack(result));
             }
             ControlCommand::StreamBytes {
                 reference,
@@ -1014,7 +1003,7 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
     let segment = |fill: u8| vec![fill; 4000];
     let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
     let _ = run.push(SegmentKind::Media, segment(0), 2000, false);
-    wait_for(&run, |s| s.feed_index >= 1).await;
+    wait_for(&run, |s| s.feed_index >= Some(1)).await;
 
     // The uplink stalls while 1-6 are captured: the backlog of 2 sheds.
     log.lock().unwrap().paused = true;
@@ -1537,9 +1526,13 @@ async fn two_broadcasts_are_one_channel(format: StreamFormat) {
     .await;
     assert_eq!(second.topic, first.topic);
     assert_eq!(second.channel_reference, first.channel_reference);
+    let first_index = first.feed_index.expect("the first broadcast read its head");
+    let second_index = second
+        .feed_index
+        .expect("the second broadcast read its head");
     assert_eq!(
-        second.feed_index,
-        first.feed_index + second.feed_updates,
+        second_index,
+        first_index + second.feed_updates,
         "the second broadcast's updates follow the first's: {second:?}"
     );
 
@@ -1547,10 +1540,10 @@ async fn two_broadcasts_are_one_channel(format: StreamFormat) {
     // second's, none overwritten (each slot names the broadcast that
     // wrote it, in order).
     let mut updates = Vec::new();
-    for index in 0..second.feed_index {
+    for index in 0..second_index {
         updates.push(update_playlist(&addr, format, &topic, index).await);
     }
-    let split = usize::try_from(first.feed_index).unwrap();
+    let split = usize::try_from(first_index).unwrap();
     let first_id = broadcast_id(&updates[0]).to_string();
     let second_id = broadcast_id(&updates[split]).to_string();
     assert_ne!(first_id, second_id);
@@ -1605,7 +1598,7 @@ async fn two_broadcasts_are_one_channel(format: StreamFormat) {
     }
     assert_eq!(
         channel_head(&addr, format, &topic, &first.channel_reference).await,
-        update_playlist(&addr, format, &topic, second.feed_index - 1).await,
+        update_playlist(&addr, format, &topic, second_index - 1).await,
     );
     assert_eq!(log.lock().unwrap().invalid_socs, 0);
 }

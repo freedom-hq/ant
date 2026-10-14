@@ -3956,20 +3956,7 @@ fn handle_control_command(
                     Some(&hints),
                 )
                 .await;
-                let reply = match result {
-                    Ok(resolution) => ControlAck::FeedResolved {
-                        reference: resolution.reference,
-                        index: resolution.index,
-                        signature: resolution.signature,
-                        v2: resolution.v2,
-                        decrypt_key: resolution.decrypt_key,
-                    },
-                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
-                    Err(e) => ControlAck::Error {
-                        message: format!("feed lookup: {e}"),
-                    },
-                };
-                let _ = ack.send(reply);
+                let _ = ack.send(feed_lookup_ack(result));
             });
         }
         ControlCommand::AccountingSnapshot { ack } => {
@@ -6388,6 +6375,42 @@ enum AttemptError {
 /// retry, so we mark them permanent.
 const fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
     matches!(e, ant_retrieval::JoinError::FetchChunk { .. })
+}
+
+/// The terminal ack for a `GetFeed` lookup's result.
+///
+/// Only a miss the network corroborated is an empty feed
+/// ([`ControlAck::FeedNotFound`], bee's `404 "no update found"`). A cold
+/// node's one or two peers answer `no peer found` for an index that may
+/// well exist, so an uncorroborated anchor miss is
+/// [`ControlAck::NotReady`], a 503 to retry: a host that reads the 404
+/// as "empty" starts writing at index 0 over the feed (the live
+/// publisher's head read, issue #173).
+#[must_use]
+pub fn feed_lookup_ack(
+    result: Result<ant_retrieval::FeedResolution, ant_retrieval::FeedError>,
+) -> ControlAck {
+    match result {
+        Ok(resolution) => ControlAck::FeedResolved {
+            reference: resolution.reference,
+            index: resolution.index,
+            signature: resolution.signature,
+            v2: resolution.v2,
+            decrypt_key: resolution.decrypt_key,
+        },
+        Err(ant_retrieval::FeedError::NoUpdates {
+            corroborated: true, ..
+        }) => ControlAck::FeedNotFound,
+        Err(e @ ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::NotReady {
+            message: format!(
+                "feed lookup: {e}; too few peers answered to tell an empty feed \
+                 from one this node can't reach yet"
+            ),
+        },
+        Err(e) => ControlAck::Error {
+            message: format!("feed lookup: {e}"),
+        },
+    }
 }
 
 /// Did this `ManifestError` ultimately come from a chunk-fetch failure
@@ -11146,6 +11169,27 @@ mod tests {
     /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
     /// — even though the very next attempt could have a fresh peer
     /// snapshot that resolves the feed cleanly.
+    /// Issue #173 / R1-F1 on PR #183: only an anchor miss the network
+    /// corroborated is bee's `404 "no update found"`. One or two cold
+    /// peers' miss is a `NotReady` (503), so a publisher reading its
+    /// feed head never takes a cold node's miss for an empty feed and
+    /// rewrites the channel from index 0.
+    #[test]
+    fn feed_lookup_ack_needs_a_corroborated_miss_for_not_found() {
+        let ack = feed_lookup_ack(Err(ant_retrieval::FeedError::NoUpdates {
+            probed: 1,
+            corroborated: true,
+        }));
+        assert!(matches!(ack, ControlAck::FeedNotFound), "{ack:?}");
+        let ack = feed_lookup_ack(Err(ant_retrieval::FeedError::NoUpdates {
+            probed: 1,
+            corroborated: false,
+        }));
+        assert!(matches!(ack, ControlAck::NotReady { .. }), "{ack:?}");
+        let ack = feed_lookup_ack(Err(ant_retrieval::FeedError::OwnerMismatch));
+        assert!(matches!(ack, ControlAck::Error { .. }), "{ack:?}");
+    }
+
     #[test]
     fn is_manifest_transient_classifies_feed_fetch_as_transient() {
         let inner: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
@@ -11162,6 +11206,7 @@ mod tests {
         let terminal = [
             ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::NoUpdates {
                 probed: 4096,
+                corroborated: true,
             }),
             ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::OwnerMismatch),
             ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::InvalidMetadata(

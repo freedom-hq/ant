@@ -3652,7 +3652,8 @@ pub unsafe extern "C" fn ant_bench_stop(
 ///
 /// The report's `feed_index` is where the next broadcast on the channel
 /// starts (it reads the feed head there, or a host passes it as
-/// `start_index`), so a closing window or recording landing in the
+/// `start_index`; `null` if the run never read its head, see
+/// [`publisher::PublisherReport::feed_index`]), so a closing window or recording landing in the
 /// background must not take it: an early return seals the run's
 /// feed ([`publisher::LiveRun::seal_feed`]) first, waits out an update
 /// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
@@ -4045,8 +4046,9 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
 /// wire then — a worst-case drain, closing window and recording can
 /// still be finishing in the background past that (see the constant) —
-/// so call it off the UI thread. The report's `feed_index` is final
-/// either way: a run that outlives the grace writes no further feed
+/// so call it off the UI thread. The report's `feed_index` (`null` when
+/// the run ended before its feed head ever answered: no position to hand
+/// on) is final either way: a run that outlives the grace writes no further feed
 /// update, so the next broadcast, which starts there (reading the feed
 /// head, or given it as `start_index`), never collides with a late
 /// closing window or recording.

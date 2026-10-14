@@ -1416,7 +1416,10 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * channel sees the media sequence only ever increase; and its recording
  * opens with the head playlist's entries, so the head plays every
  * broadcast of the channel. Only a 404 "no update found" (a feed nothing
- * was written to) starts at index 0. Any other failed read holds every
+ * was written to; the node answers it only for a miss more than a couple
+ * of peers agree on, and a 503 for one a cold node's one or two peers
+ * gave) starts at index 0. A v1 head's playlist that does not retrieve
+ * counts as a failed read too. Any other failed read holds every
  * playlist and feed update (segments still upload) until a retry reads
  * the head, so a flaky read never overwrites earlier broadcasts; a
  * broadcast stopped before it ever does writes none.
@@ -1567,7 +1570,10 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * object (free with ant_free_string): the progress fields above plus
  * recording_reference (see below), duration_s, chunks_published,
  * feed_updates, feed_index (the next update's index: where the next
- * broadcast on the channel starts), sustained_chunks_s,
+ * broadcast on the channel starts; null, here and in the progress, until
+ * the broadcast has read its feed head, so a broadcast stopped or reaped
+ * before that reports null, never 0: pass it on as "start_index" and the
+ * next broadcast reads the head itself), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, "reaped" (it ended by itself, see "reap_ms"), and a
  * "kept_up" verdict (at least one feed update landed AND
