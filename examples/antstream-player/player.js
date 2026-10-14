@@ -589,7 +589,7 @@
     enableWorker: true,
     lowLatencyMode: false,
     // The publisher keeps as many segments as fit in one 4096-byte chunk
-    // in its live playlist (about 40 of 2 s): sit four behind the newest
+    // in its live playlist (about 26 of 2 s): sit four behind the newest
     // one, which leaves room to buffer through a slow read. A playhead more
     // than ten target durations (~20 s) behind the live edge jumps forward,
     // long before it would fall out of that window, so the longer playlist

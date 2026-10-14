@@ -1432,8 +1432,14 @@ bool ant_publisher_start(const AntHandle *handle,
  * whenever the writer restarts (camera flip, interruption recovery,
  * thermal downshift) and set `discontinuity` on the first media segment
  * after it. `duration_ms` is the segment's real duration (ignored for
- * the initialization segment). The bytes are copied; the caller may
- * free `data` as soon as this returns.
+ * the initialization segment): it is the EXTINF, and the step from
+ * this segment's EXT-X-PROGRAM-DATE-TIME to the next one's. Every media
+ * segment is dated once, at this call, from one anchor taken off the
+ * wall clock at the first media segment (less its duration) and
+ * re-taken at each writer restart, never moving backwards, so a host
+ * that rounds or nominalises `duration_ms` drifts the broadcast's
+ * dates by that error every segment. The bytes are copied; the caller
+ * may free `data` as soon as this returns.
  *
  * CALL ORDER IS THE BROADCAST ORDER — segments are numbered as these
  * calls arrive, and that number fixes both the playlist order and which

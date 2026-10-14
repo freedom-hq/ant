@@ -24,7 +24,10 @@
 //!    gateway-root paths (`/bzz/<ref>/seg-N.m4s`); `"solar-punk"` lists
 //!    their **bare 64-hex reference**, as Solar Punk's uploader does, and
 //!    a viewer resolves each against `/bytes/` on whichever gateway it
-//!    reads from.
+//!    reads from. Either way each segment carries an
+//!    `#EXT-X-PROGRAM-DATE-TIME` (issue #170), UTC to the millisecond,
+//!    dated once at push from one go-live anchor stepped by the
+//!    segments' real durations ([`ProgramClock`]).
 //! 3. Upload the playlist and publish it as the next **sequence-feed
 //!    update** with `POST /soc/{owner}/{id}`
 //!    (`id = keccak256(topic ‖ index_be8)`). Under `"bzz"` the playlist
@@ -185,8 +188,9 @@ pub const LIVE_WINDOW_MAX_BYTES: usize = CHUNK_SIZE as usize;
 /// Upper bound on the segments listed in the rolling media playlist.
 /// The window is sized by bytes ([`LIVE_WINDOW_MAX_BYTES`]): it holds
 /// the newest segments that fit in one chunk, which at the default 2 s
-/// segments is about 40 (`"bzz"` paths) to 48 (bare references), 80 to
-/// 96 s a joining or slow viewer can buffer from with no extra request.
+/// segments is about 26 (`"bzz"` paths) to 29 (bare references), each
+/// with its `#EXT-X-PROGRAM-DATE-TIME` (issue #170): 52 to 58 s a
+/// joining or slow viewer can buffer from with no extra request.
 /// This cap is set above both so the byte budget is what binds; a host
 /// can still lower it. Apple recommends a live playlist hold at least 3
 /// target durations.
@@ -477,6 +481,9 @@ struct Pending {
     /// media segment does not continue the previous one's timeline.
     discontinuity: bool,
     captured_at: Instant,
+    /// `#EXT-X-PROGRAM-DATE-TIME` of a media segment, Unix ms, decided
+    /// once at push by [`ProgramClock::place`]. 0 for an init segment.
+    program_ms: u64,
 }
 
 /// A segment that landed, in playlist terms.
@@ -490,6 +497,9 @@ struct MediaEntry {
     discontinuity: bool,
     /// The `#EXT-X-MAP` in force for this entry.
     init_uri: String,
+    /// `#EXT-X-PROGRAM-DATE-TIME`, Unix ms: stored on the segment when
+    /// it was placed, never recomputed at render time.
+    program_ms: u64,
 }
 
 /// Per-sequence outcome, collected out of order by the concurrent
@@ -503,6 +513,7 @@ enum Committed {
         duration_ms: u32,
         discontinuity: bool,
         captured_at: Instant,
+        program_ms: u64,
     },
     /// Dropped before it was ever uploaded (backlog full). Only media
     /// segments are ever dropped.
@@ -512,6 +523,107 @@ enum Committed {
     /// writer that emitted it has already been replaced and its map does
     /// not describe what follows.
     Failed(SegmentKind),
+}
+
+// ---------------------------------------------------------------------------
+// Wall-clock dating (#EXT-X-PROGRAM-DATE-TIME, issue #170)
+// ---------------------------------------------------------------------------
+
+/// Dates every media segment from **one anchor taken at go-live**,
+/// stepped by each segment's real media duration — the Solar Punk
+/// uploader's manifest contract, with the capture side's own measured
+/// durations as the step.
+///
+/// The anchor is the wall clock at the first media segment, less that
+/// segment's duration: a segment is pushed once it has closed, so
+/// `now − duration` is when its first frame was captured, which is what
+/// `#EXT-X-PROGRAM-DATE-TIME` names. Every later segment is dated where
+/// the previous one ended. Never the arrival time: arrival jitters by
+/// however long the encoder took to hand the segment over, and dating
+/// by it would make neighbouring stamps disagree with their own
+/// `#EXTINF`.
+///
+/// A dropped or failed segment still advances the clock (it is placed
+/// at push, before the uplink decides its fate), so the segment after a
+/// gap carries the time it was really captured at.
+///
+/// **Writer restarts re-anchor.** An initialization segment after the
+/// first, or a media segment flagged discontinuous, means the encoder's
+/// timeline broke — an interruption, backgrounding, a camera flip — and
+/// the media after it did not follow on from the media before. The next
+/// media segment re-anchors on the wall clock, floored at where the
+/// previous segment ended so a date **never moves backwards** (hls.js
+/// reports a backwards stamp as a parsing error).
+#[derive(Debug, Default)]
+struct ProgramClock {
+    /// Where the next media segment starts, Unix ms. `None` until the
+    /// first media segment anchors the broadcast.
+    next_ms: Option<u64>,
+    /// The writer restarted since the last placed segment.
+    reanchor: bool,
+}
+
+impl ProgramClock {
+    /// Date one pushed segment. `now_ms` is the wall clock at push.
+    /// Returns the media segment's `#EXT-X-PROGRAM-DATE-TIME`, or 0 for
+    /// an initialization segment (which only arms a re-anchor).
+    fn place(
+        &mut self,
+        kind: SegmentKind,
+        duration_ms: u32,
+        discontinuity: bool,
+        now_ms: u64,
+    ) -> u64 {
+        if kind == SegmentKind::Init || discontinuity {
+            self.reanchor = self.next_ms.is_some();
+            if kind == SegmentKind::Init {
+                return 0;
+            }
+        }
+        let duration = u64::from(duration_ms);
+        let wall = now_ms.saturating_sub(duration);
+        let at = match self.next_ms {
+            None => wall,
+            Some(next) if self.reanchor => wall.max(next),
+            Some(next) => next,
+        };
+        self.reanchor = false;
+        self.next_ms = Some(at + duration);
+        at
+    }
+}
+
+/// Wall clock, Unix ms.
+fn unix_ms_now() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Unix ms as RFC 8216 / ISO 8601 UTC to the millisecond,
+/// `2026-09-01T12:00:00.000Z` — byte-for-byte what JavaScript's
+/// `Date.prototype.toISOString` writes, which is what Solar Punk's
+/// uploader stamps and its clients parse.
+fn iso8601_utc_ms(unix_ms: u64) -> String {
+    let millis = unix_ms % 1000;
+    let secs = unix_ms / 1000;
+    let (hour, minute, second) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's
+    // `civil_from_days`), so no date crate is needed for one format.
+    let z = secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +677,8 @@ struct PublisherState {
     discontinuity_sequence: u64,
     /// `#EXT-X-MAP` currently in force.
     init_uri: Option<String>,
+    /// Dates each media segment as it is pushed.
+    program_clock: ProgramClock,
     /// A gap (drop or failure) since the last listed segment, so the
     /// next one that lands starts a new continuous run.
     gap_since_last_listed: bool,
@@ -713,6 +827,7 @@ impl PublisherState {
                     duration_ms,
                     discontinuity,
                     captured_at,
+                    program_ms,
                 } => {
                     let Some(init_uri) = self.init_uri.clone() else {
                         // A media segment whose initialization segment
@@ -736,6 +851,7 @@ impl PublisherState {
                         duration_ms,
                         discontinuity: discontinuous && self.next_number > 0,
                         init_uri,
+                        program_ms,
                     });
                     self.next_number += 1;
                     // Start the live-edge clock at the first segment
@@ -805,6 +921,11 @@ impl PublisherState {
                 let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", entry.init_uri);
                 current_map = Some(entry.init_uri.as_str());
             }
+            let _ = writeln!(
+                out,
+                "#EXT-X-PROGRAM-DATE-TIME:{}",
+                iso8601_utc_ms(entry.program_ms),
+            );
             let _ = writeln!(
                 out,
                 "#EXTINF:{:.3},\n{}",
@@ -982,17 +1103,19 @@ impl LiveRun {
         if self.cancel.load(Ordering::SeqCst) {
             return PushOutcome::Closed;
         }
-        self.enqueue(kind, data, duration_ms, discontinuity)
+        self.enqueue(kind, data, duration_ms, discontinuity, unix_ms_now())
     }
 
     /// [`Self::push`] past its cancel check. Split out so tests can
-    /// drive the push that raced `cancel()` deterministically.
+    /// drive the push that raced `cancel()` deterministically, and on a
+    /// wall clock of their choosing (`now_ms`, Unix ms).
     fn enqueue(
         &self,
         kind: SegmentKind,
         data: Vec<u8>,
         duration_ms: u32,
         discontinuity: bool,
+        now_ms: u64,
     ) -> PushOutcome {
         let mut dropped_oldest = false;
         {
@@ -1011,6 +1134,12 @@ impl LiveRun {
             let seq = state.next_seq;
             state.next_seq += 1;
             state.segments_pushed += 1;
+            // Dated here, in push (= capture) order and before the
+            // backlog can drop it, so a dropped segment still moves the
+            // clock on by the media it held.
+            let program_ms = state
+                .program_clock
+                .place(kind, duration_ms, discontinuity, now_ms);
             state.pending.push_back(Pending {
                 seq,
                 kind,
@@ -1018,6 +1147,7 @@ impl LiveRun {
                 duration_ms,
                 discontinuity,
                 captured_at: Instant::now(),
+                program_ms,
             });
             // Drop-oldest: the backlog is bounded, and when it overflows
             // the *oldest* pending segment is the one least worth
@@ -1458,6 +1588,7 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                                 duration_ms: pending.duration_ms,
                                 discontinuity: pending.discontinuity,
                                 captured_at: pending.captured_at,
+                                program_ms: pending.program_ms,
                             },
                         );
                     }
@@ -2039,6 +2170,7 @@ mod tests {
             duration_ms: 2000,
             discontinuity,
             captured_at: Instant::now(),
+            program_ms: 1_788_264_000_000,
         }
     }
 
@@ -2136,6 +2268,192 @@ mod tests {
         assert!(old_segment < new_map, "{playlist}");
     }
 
+    // -----------------------------------------------------------------
+    // #EXT-X-PROGRAM-DATE-TIME from one go-live anchor (#170)
+    // -----------------------------------------------------------------
+
+    /// 2026-09-01T12:00:00.000Z, the instant in Solar Punk's README
+    /// example.
+    const GO_LIVE_MS: u64 = 1_788_264_000_000;
+
+    #[test]
+    fn program_date_time_is_iso_8601_utc_to_the_millisecond() {
+        // Byte-for-byte what JavaScript's `toISOString` writes (checked
+        // against it for each), which is what Solar Punk stamps.
+        for (ms, text) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (GO_LIVE_MS, "2026-09-01T12:00:00.000Z"),
+            (GO_LIVE_MS + 1_001, "2026-09-01T12:00:01.001Z"),
+            (1_709_251_199_999, "2024-02-29T23:59:59.999Z"),
+            (951_868_800_000, "2000-03-01T00:00:00.000Z"),
+            (4_102_444_800_123, "2100-01-01T00:00:00.123Z"),
+        ] {
+            assert_eq!(iso8601_utc_ms(ms), text, "{ms}");
+        }
+    }
+
+    #[test]
+    fn segments_are_dated_from_one_anchor_stepped_by_their_media() {
+        let mut clock = ProgramClock::default();
+        assert_eq!(clock.place(SegmentKind::Init, 0, false, GO_LIVE_MS), 0);
+        // The first segment closes 2.033 s after go-live and reaches the
+        // publisher 150 ms later: it is dated at its first frame, not at
+        // its arrival.
+        let first = clock.place(SegmentKind::Media, 2033, false, GO_LIVE_MS + 2033 + 150);
+        assert_eq!(first, GO_LIVE_MS + 150);
+        // Later arrivals jitter by hundreds of ms either way; the dates
+        // step by exactly the media each segment held.
+        let mut expected = first + 2033;
+        for (duration, jitter) in [(2000, 900), (2067, 0), (1967, 450), (4033, 20)] {
+            let at = clock.place(SegmentKind::Media, duration, false, expected + jitter);
+            assert_eq!(at, expected);
+            expected += u64::from(duration);
+        }
+    }
+
+    #[test]
+    fn a_writer_restart_re_anchors_on_the_wall_clock_and_never_goes_back() {
+        let mut clock = ProgramClock::default();
+        let _ = clock.place(SegmentKind::Init, 0, false, GO_LIVE_MS);
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 2000),
+            GO_LIVE_MS,
+        );
+        // Backgrounded for 40 s: a fresh writer, a fresh init, and the
+        // first segment after it carries the time it was really shot.
+        let back = GO_LIVE_MS + 2000 + 40_000;
+        let _ = clock.place(SegmentKind::Init, 0, false, back);
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, true, back + 2000),
+            back
+        );
+        // Steps on from the new anchor.
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, back + 4000),
+            back + 2000,
+        );
+        // A camera flip right away, on a wall clock that reads earlier
+        // than where the dates have got to (it stepped back, or the
+        // previous writer's media ran ahead of it): the re-anchor is
+        // floored at the previous segment's end, never behind it.
+        let _ = clock.place(SegmentKind::Init, 0, false, back + 3000);
+        assert_eq!(
+            clock.place(SegmentKind::Media, 1000, true, back + 3000),
+            back + 4000,
+        );
+        // A discontinuity flagged on a media segment alone re-anchors too.
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, true, back + 70_000),
+            back + 68_000,
+        );
+    }
+
+    #[test]
+    fn an_hour_long_broadcast_ends_within_one_segment_of_the_wall_clock() {
+        // Issue #170's acceptance: one hour of keyframe-cut segments that
+        // overrun the configured 2 s by up to 67 ms (the shape Solar Punk
+        // measured), each reaching the publisher 0-400 ms after it
+        // closed, with a 30 s interruption in the middle.
+        let durations = [2000_u32, 2033, 2067, 2000, 1967, 2033];
+        let mut clock = ProgramClock::default();
+        let mut shot_at = GO_LIVE_MS; // true wall clock at a segment's first frame
+        let mut last_stamp = 0;
+        let mut last_duration = 0;
+        let mut nominal = None; // what stepping by `segment_ms` would say
+        let mut i = 0_u64;
+        let _ = clock.place(SegmentKind::Init, 0, false, shot_at);
+        while shot_at < GO_LIVE_MS + 3_600_000 {
+            if i == 900 {
+                shot_at += 30_000;
+                let _ = clock.place(SegmentKind::Init, 0, false, shot_at);
+            }
+            let duration = durations[(i % 6) as usize];
+            let arrival = shot_at + u64::from(duration) + (i * 7919) % 400;
+            let stamp = clock.place(SegmentKind::Media, duration, i == 900, arrival);
+            assert!(
+                stamp >= last_stamp + u64::from(last_duration),
+                "segment {i}"
+            );
+            let n = nominal.get_or_insert(stamp);
+            if i == 900 {
+                *n = stamp;
+            }
+            let nominal_stamp = *n;
+            *n += 2000;
+            last_stamp = stamp;
+            last_duration = duration;
+            if shot_at + u64::from(duration) >= GO_LIVE_MS + 3_600_000 {
+                assert!(
+                    stamp.abs_diff(shot_at) <= u64::from(duration),
+                    "last segment dated {} ms off its capture",
+                    stamp.abs_diff(shot_at),
+                );
+                // Stepping by the nominal length instead, what Solar
+                // Punk found drifting by minutes an hour, misses it even
+                // with the drift reset half way by the interruption.
+                assert!(
+                    nominal_stamp.abs_diff(shot_at) > u64::from(duration),
+                    "nominal stepping drifted only {} ms",
+                    nominal_stamp.abs_diff(shot_at),
+                );
+            }
+            shot_at += u64::from(duration);
+            i += 1;
+        }
+        assert!(i > 1700, "{i} segments");
+    }
+
+    #[test]
+    fn every_listed_segment_carries_its_stored_date_in_front_of_extinf() {
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        let dated = |uri: &str, discontinuity: bool, program_ms: u64| Committed::Media {
+            uri: uri.into(),
+            duration_ms: 2000,
+            discontinuity,
+            captured_at: Instant::now(),
+            program_ms,
+        };
+        state
+            .done
+            .insert(1, dated("/bzz/bb/seg-1.m4s", false, GO_LIVE_MS));
+        state.done.insert(2, Committed::Dropped);
+        state.done.insert(
+            3,
+            Committed::Init {
+                uri: "/bzz/cc/init-3.mp4".into(),
+            },
+        );
+        state
+            .done
+            .insert(4, dated("/bzz/dd/seg-4.m4s", true, GO_LIVE_MS + 41_500));
+        state.advance(5, 2000);
+        let playlist = state.render_playlist(2000, false);
+        assert!(
+            playlist.contains(concat!(
+                "#EXT-X-MAP:URI=\"/bzz/aa/init-0.mp4\"\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n",
+                "#EXTINF:2.000,\n",
+                "/bzz/bb/seg-1.m4s\n",
+                "#EXT-X-DISCONTINUITY\n",
+                "#EXT-X-MAP:URI=\"/bzz/cc/init-3.mp4\"\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:41.500Z\n",
+                "#EXTINF:2.000,\n",
+                "/bzz/dd/seg-4.m4s\n",
+            )),
+            "{playlist}",
+        );
+        assert_eq!(
+            playlist.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
+            playlist.matches("#EXTINF:").count(),
+        );
+    }
+
     #[test]
     fn the_window_slides_and_carries_the_discontinuity_sequence() {
         let mut state = PublisherState::default();
@@ -2191,6 +2509,7 @@ mod tests {
                 duration_ms: 3400,
                 discontinuity: false,
                 captured_at: Instant::now(),
+                program_ms: 1_788_264_000_000,
             },
         );
         state.advance(2, 2000);
@@ -2269,7 +2588,11 @@ mod tests {
     /// budget after every one.
     fn commit_media(state: &mut PublisherState, from: u64, count: u64, window: usize) {
         for seq in from..from + count {
-            state.done.insert(seq, media(&bare_ref(seq), false));
+            let mut entry = media(&bare_ref(seq), false);
+            if let Committed::Media { program_ms, .. } = &mut entry {
+                *program_ms += seq * 2000;
+            }
+            state.done.insert(seq, entry);
             state.advance(window, 2000);
             for endlist in [false, true] {
                 let body = state.render_playlist(2000, endlist);
@@ -2284,7 +2607,10 @@ mod tests {
 
     /// The bytes one more bare-reference segment would add.
     fn entry_bytes() -> usize {
-        "#EXTINF:2.000,\n".len() + 64 + 1
+        "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n".len()
+            + "#EXTINF:2.000,\n".len()
+            + 64
+            + 1
     }
 
     #[test]
@@ -2293,9 +2619,9 @@ mod tests {
         commit_media(&mut state, 1, 300, DEFAULT_PLAYLIST_WINDOW);
         let body = state.render_playlist(2000, false);
         let listed = state.playlist.len();
-        // About 30 segments is what Solar Punk's uploader fits with a
-        // date-time per segment; without one, bare references fit more.
-        assert!(listed >= 30, "only {listed} segments listed:\n{body}");
+        // About 30 segments is what Solar Punk's uploader fits, a
+        // date-time on each; this playlist also carries an `#EXT-X-MAP`.
+        assert!(listed >= 29, "only {listed} segments listed:\n{body}");
         assert!(listed < 300);
         // Full: one more segment (and room for the closing line) would
         // not fit.
@@ -3214,6 +3540,117 @@ mod tests {
         assert!(body.contains("#EXT-X-DISCONTINUITY"), "{body}");
     }
 
+    /// `(date, uri)` of every segment a playlist lists, in order.
+    fn dated_uris(playlist: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = playlist.lines().collect();
+        lines
+            .windows(3)
+            .filter_map(|w| {
+                let date = w[0].strip_prefix("#EXT-X-PROGRAM-DATE-TIME:")?;
+                assert!(w[1].starts_with("#EXTINF:"), "{playlist}");
+                Some((date.to_string(), w[2].to_string()))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn segments_keep_their_capture_date_across_drops_and_a_restart() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        // As in the backlog test: one 200 ms upload at a time and a
+        // backlog of 2, so a burst sheds segments.
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(200)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.max_in_flight = 1;
+        config.max_backlog = 2;
+        config.playlist_window = 64;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+
+        // Segment i of the first writer was shot at GO_LIVE + 2 s·i and
+        // pushed 2 s later plus jitter. After the first lands, a burst
+        // piles the rest up so some are dropped, but every one is dated
+        // when it is pushed.
+        let push = |kind, byte: u8, duration, discontinuity, now_ms| {
+            run.enqueue(kind, vec![byte; 64], duration, discontinuity, now_ms)
+        };
+        let settled = |published: u64| {
+            let run = Arc::clone(&run);
+            async move {
+                for _ in 0..80 {
+                    let s = run.snapshot();
+                    if s.segments_published + s.segments_dropped >= published {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("segments never landed");
+            }
+        };
+        let _ = push(SegmentKind::Init, 0xee, 0, false, GO_LIVE_MS);
+        let _ = push(SegmentKind::Media, 0, 2000, false, GO_LIVE_MS + 2000);
+        settled(1).await;
+        let mut outcomes = Vec::new();
+        for i in 1..8u8 {
+            let shot = GO_LIVE_MS + 2000 * u64::from(i);
+            let jitter = u64::from(i) * 97 % 500;
+            outcomes.push(push(
+                SegmentKind::Media,
+                i,
+                2000,
+                false,
+                shot + 2000 + jitter,
+            ));
+        }
+        assert!(
+            outcomes.contains(&PushOutcome::QueuedDroppingOldest),
+            "{outcomes:?}",
+        );
+        settled(8).await;
+        // The writer restarts after a minute away.
+        let back = GO_LIVE_MS + 16_000 + 60_000;
+        let _ = push(SegmentKind::Init, 0xef, 0, false, back);
+        let _ = push(SegmentKind::Media, 100, 2000, true, back + 2000 + 300);
+        settled(9).await;
+        let _ = push(SegmentKind::Media, 101, 2000, false, back + 4000 + 10);
+        run.cancel();
+        settle(&run).await;
+        assert!(run.report().segments_dropped > 0);
+
+        let seen = lock(&log).seen.clone();
+        // Segment bytes → the date its upload should be listed under.
+        let mut expected = std::collections::HashMap::new();
+        for i in 0..8u8 {
+            expected.insert(i, iso8601_utc_ms(GO_LIVE_MS + 2000 * u64::from(i)));
+        }
+        expected.insert(100, iso8601_utc_ms(back + 300));
+        expected.insert(101, iso8601_utc_ms(back + 2300));
+        let by_reference: std::collections::HashMap<String, u8> = seen
+            .iter()
+            .filter(|r| is_segment(r) && r.body.len() == 64)
+            .map(|r| (bytes_reference(r), r.body[0]))
+            .collect();
+        let playlist = seen.iter().rev().find(|r| is_playlist(r)).unwrap();
+        let body = String::from_utf8(playlist.body.clone()).unwrap();
+        let listed = dated_uris(&body);
+        assert_eq!(listed.len() as u64, run.report().segments_listed, "{body}");
+        for (date, uri) in &listed {
+            let byte = by_reference[uri];
+            assert_eq!(date, &expected[&byte], "segment {byte}:\n{body}");
+        }
+        // Strictly increasing: a gap leaves a hole in the dates, never a
+        // step backwards.
+        assert!(listed.windows(2).all(|w| w[0].0 < w[1].0), "{body}");
+        assert_eq!(by_reference[&listed[0].1], 0, "{body}");
+        assert_eq!(listed.last().unwrap().0, expected[&101]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rejecting_gateway_is_reported_rather_than_counted_as_published() {
         let log = Arc::new(Mutex::new(StubLog {
@@ -3385,7 +3822,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         // The push that passed its cancel check just before `cancel()`
         // and takes the lock only now, while uploads still drain.
-        let outcome = run.enqueue(SegmentKind::Media, vec![2u8; 4096], 2000, false);
+        let outcome = run.enqueue(
+            SegmentKind::Media,
+            vec![2u8; 4096],
+            2000,
+            false,
+            unix_ms_now(),
+        );
         settle(&run).await;
         let report = run.report();
         assert_eq!(report.segments_dropped, 0, "{outcome:?} {report:?}");
