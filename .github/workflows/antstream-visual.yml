@@ -270,6 +270,20 @@ jobs:
             -antstream-shot-live-idle -antstream-shot-low-capacity
           sleep 25
           xcrun simctl io booted screenshot shots/22-live-low-capacity.png
+          # 23/24 — a plan Swarm won't stamp with at all (#176): the
+          # sample batch reads `usable: false` (and is not propagating),
+          # so the same two surfaces say "Swarm won't accept this plan's
+          # stamps" in orange instead of a time estimate.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-channel -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/23-broadcast-unusable-plan.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/24-live-unusable-plan.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

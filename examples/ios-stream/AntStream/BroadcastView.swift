@@ -69,11 +69,14 @@ struct BroadcastView: View {
                 .scrollIndicators(.hidden)
                 .refreshable { await node.refreshAll() }
                 .task {
-                    // antstream-visual: `-antstream-shot-low-capacity` (#176)
-                    // is about the checklist's "Room for a broadcast" row,
-                    // which sits below the fold: bring it into the shot once
-                    // the sample plan is in.
-                    guard RootView.shotArgs.contains("-antstream-shot-low-capacity") else { return }
+                    // antstream-visual: `-antstream-shot-low-capacity` and
+                    // `-antstream-shot-unusable-plan` (#176) are about the
+                    // checklist's "Room for a broadcast" row, which sits
+                    // below the fold: bring it into the shot once the
+                    // sample plan is in.
+                    guard RootView.shotArgs.contains("-antstream-shot-low-capacity")
+                        || RootView.shotArgs.contains("-antstream-shot-unusable-plan")
+                    else { return }
                     for _ in 0..<60 where node.plan == nil {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }

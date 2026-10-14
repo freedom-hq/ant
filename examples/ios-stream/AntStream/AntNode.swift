@@ -1152,6 +1152,23 @@ final class AntNode: ObservableObject {
         // `-antstream-shot-low-capacity`: an immutable plan whose fullest
         // bucket leaves about twenty minutes of 360p (#176), so the
         // checklist and the going-live screen show their warning.
+        // `-antstream-shot-unusable-plan`: a roomy immutable plan the
+        // node won't stamp with at all (expired or unknown to it, and not
+        // merely propagating), so the checklist and the going-live screen
+        // show "Swarm won't accept this plan's stamps" (#176, R1-F1).
+        if RootView.shotArgs.contains("-antstream-shot-unusable-plan") {
+            return StoragePlan(
+                enabled: true,
+                batchId: batchId,
+                batchDepth: 22,
+                immutable: true,
+                totalCapacityChunks: 4_194_304,
+                issuedChunks: 40_000,
+                worstCaseRemainingChunks: 4_000_000,
+                usable: false,
+                propagating: false
+            )
+        }
         if RootView.shotArgs.contains("-antstream-shot-low-capacity") {
             return StoragePlan(
                 enabled: true,
