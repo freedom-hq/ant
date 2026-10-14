@@ -416,10 +416,24 @@ final class AntNode: ObservableObject {
                 if self.networkLabel != label { self.networkLabel = label }
                 guard self.isOffline != offline else { return }
                 self.isOffline = offline
+                // A broadcast in progress pauses rather than ends (#172):
+                // silent while the network is gone, and carried on in
+                // the same feed and recording behind one seam when it
+                // returns. Resumed after `wake`, so the swarm is warm
+                // again before the reap window restarts, or before a
+                // reap that fell due offline uploads the closing
+                // playlist and the recording.
                 if offline {
+                    await self.pausePublisher()
                     await self.suspend()
                 } else {
                     await self.wake()
+                    // `wake` suspends: the path may have dropped again
+                    // meanwhile, and that offline pass has already
+                    // paused the run. Resuming now would unpause it
+                    // against a dead uplink (and reap there, if a reap
+                    // fell due) — leave it for the next return.
+                    if !self.isOffline { await self.resumePublisher() }
                 }
             }
         }
@@ -700,6 +714,12 @@ final class AntNode: ObservableObject {
             // `/bzz/<channel>/stream.m3u8`, so a "solar-punk" broadcast
             // would be unplayable there. The Watch tab here reads both.
             "format": "bzz",
+            // A broadcast whose network (or the app) is gone for a whole
+            // minute ends by itself, as Solar Punk's uploader does
+            // (#172); anything shorter is a pause with one seam.
+            // `LiveBroadcast` notices the `reaped` flag and finishes the
+            // stop.
+            "reap_ms": Self.reapMsForThisLaunch,
         ]
         // One or the other: the publisher refuses both at once.
         if let topicText {
@@ -726,9 +746,53 @@ final class AntNode: ObservableObject {
         if let message = started { throw AntError.op(message) }
     }
 
+    /// How long a broadcast outlives its media before it ends by itself
+    /// (`reap_ms`, issue #172): Solar Punk's `ORPHAN_REAP_MS`.
+    static let broadcastReapMs: UInt64 = 60_000
+
+    /// ``broadcastReapMs``, except under `antstream-visual`'s plain
+    /// `-antstream-shot-live`: the runner's sample batch is rejected, so
+    /// nothing is ever listed, and a minute's reap would end the
+    /// broadcast before shots 11/12 capture it live. The paused run
+    /// (`-antstream-shot-live-paused`) keeps the real window so shot 19
+    /// shows the reap.
+    static var reapMsForThisLaunch: UInt64 {
+        let args = RootView.shotArgs
+        if args.contains("-antstream-shot-live"), !args.contains("-antstream-shot-live-paused") {
+            return 600_000
+        }
+        return broadcastReapMs
+    }
+
+    /// The network went: pause the running broadcast (`ant_publisher_pause`)
+    /// so it goes silent instead of filling with failed uploads. A no-op
+    /// when nothing is broadcasting.
+    func pausePublisher() async {
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_publisher_pause(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            }.value
+        }
+    }
+
+    /// The network (or the app) is back: carry the paused broadcast on
+    /// (`ant_publisher_resume`). Also called on every return to the
+    /// foreground, which restarts the reap window once. A no-op when
+    /// nothing is broadcasting.
+    func resumePublisher() async {
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_publisher_resume(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            }.value
+        }
+    }
+
     /// Hand one captured segment to the publisher. Returns the FFI's
     /// disposition: `0` queued, `1` queued after dropping the oldest
-    /// pending segment, `2` refused (stopping), `-1` error.
+    /// pending segment, `2` refused (stopping, or ended by itself),
+    /// `3` withheld (paused: the network is gone), `-1` error.
     ///
     /// Non-blocking node-side, so the capture pipeline is never stalled
     /// by the uplink — which is the whole point of the drop-oldest

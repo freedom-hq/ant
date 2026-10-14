@@ -3715,6 +3715,15 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
 /// (`topic`); see [`publisher::PublisherConfig`].
 ///
+/// An interruption pauses the broadcast rather than ending it (issue
+/// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on
+/// [`ant_publisher_stop`] or, with `reap_ms` set, by itself once that
+/// long passes with no media reaching the playlist; progress then
+/// reports `reaped` and the host calls the stop for the report. Not
+/// while paused: a window that runs out during an outage ends the
+/// broadcast at [`ant_publisher_resume`] instead, so the closing
+/// playlist and the recording go up over the returned connection.
+///
 /// Returns immediately — the loop drives itself on the node's runtime.
 /// Poll it with [`ant_publisher_progress`] and finish it with
 /// [`ant_publisher_stop`]. Only one broadcast at a time per handle.
@@ -3817,7 +3826,12 @@ pub unsafe extern "C" fn ant_publisher_start(
 /// * `0` — queued.
 /// * `1` — queued, and the oldest pending segment was dropped to stay at
 ///   the live edge (the playlist lists it as an `#EXT-X-GAP` entry).
-/// * `2` — refused: the broadcast is stopping.
+/// * `2` — refused: the broadcast is stopping (by the host's
+///   [`ant_publisher_stop`], or by itself once `reap_ms` passed with no
+///   media).
+/// * `3` — withheld, not uploaded: the broadcast is paused
+///   ([`ant_publisher_pause`]). Media only; an initialization segment is
+///   queued until [`ant_publisher_resume`].
 /// * `-1` — error, with an allocated message in `out_err` (free with
 ///   [`ant_free_string`]).
 ///
@@ -3869,6 +3883,102 @@ pub unsafe extern "C" fn ant_publisher_push_segment(
             publisher::PushOutcome::Queued => 0,
             publisher::PushOutcome::QueuedDroppingOldest => 1,
             publisher::PushOutcome::Closed => 2,
+            publisher::PushOutcome::Withheld => 3,
+        }
+    }
+}
+
+/// The device lost its connection mid-broadcast (issue #172): pause the
+/// running broadcast instead of letting it end or fill with failures.
+/// Call it alongside [`ant_suspend`] when the network goes. The
+/// broadcast goes silent: media segments pushed while paused are
+/// withheld (`ant_publisher_push_segment` returns `3`), initialization
+/// segments wait for [`ant_publisher_resume`], and the live playlist
+/// simply stops advancing — nothing is closed and no `#EXT-X-ENDLIST`
+/// is written. Non-blocking and idempotent.
+///
+/// Returns `0`, or `-1` with an allocated message in `out_err` (free
+/// with [`ant_free_string`]) when no broadcast is running.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_pause(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        publisher_call(
+            handle,
+            out_err,
+            "ant_publisher_pause",
+            publisher::LiveRun::pause,
+        )
+    }
+}
+
+/// The connection is back: the paused broadcast carries on in the same
+/// feed and the same recording, its next media segment behind one
+/// `#EXT-X-DISCONTINUITY` and dated from the wall clock again. The first
+/// return after the last listed segment also restarts the reap window
+/// (`reap_ms` in the start config), so a return late in an outage still
+/// gets the whole window to deliver its first segment; a return after
+/// the window already ran out during the outage ends the broadcast
+/// instead (progress then reports `reaped`). Call it after
+/// [`ant_resume`] / [`ant_wake`] when the network returns, and on a
+/// return to the foreground; harmless without a prior pause.
+/// Non-blocking and idempotent.
+///
+/// Return values and safety: as [`ant_publisher_pause`].
+///
+/// # Safety
+///
+/// See [`ant_publisher_pause`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_resume(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        publisher_call(
+            handle,
+            out_err,
+            "ant_publisher_resume",
+            publisher::LiveRun::resume,
+        )
+    }
+}
+
+/// Run `f` on the running broadcast: `0`, or `-1` with an error.
+unsafe fn publisher_call(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+    name: &str,
+    f: impl FnOnce(&publisher::LiveRun),
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, &format!("{name}: null handle"));
+            return -1;
+        };
+        let run = handle
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(run) = run else {
+            write_out_err(out_err, &format!("{name}: this node is not broadcasting"));
+            return -1;
+        };
+        if catch_unwind(AssertUnwindSafe(|| f(&run))).is_ok() {
+            0
+        } else {
+            write_out_err(out_err, &format!("panic in {name}"));
+            -1
         }
     }
 }
@@ -3926,8 +4036,8 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// update, so passing it as the next broadcast's `start_index` never
 /// collides with a late closing window or recording.
 ///
-/// Calling it on a broadcast that already finished on its own returns
-/// that broadcast's report. Once a stop call has *returned* and
+/// Calling it on a broadcast that already finished on its own (reaped
+/// after `reap_ms` with no media) returns that broadcast's report. Once a stop call has *returned* and
 /// released the slot, a second call fails with "not broadcasting" —
 /// keep the report from the first call rather than re-fetching it.
 ///

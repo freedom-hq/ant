@@ -408,6 +408,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         playlist_window: 6,
         notes: String::new(),
         start_index: 0,
+        reap_ms: 0,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -998,6 +999,7 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         playlist_window: 3,
         notes: String::new(),
         start_index: 0,
+        reap_ms: 0,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -1147,4 +1149,238 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         lost,
         "{recording}"
     );
+}
+
+/// Read every feed update of `topic` the way a viewer polls it.
+async fn feed_updates(addr: &str, topic: &[u8; 32], count: u64) -> Vec<String> {
+    let owner_hex = hex::encode(owner());
+    let mut updates = Vec::new();
+    for index in 0..count {
+        let id = ant_retrieval::sequence_update_id(topic, index);
+        let (status, _, body) =
+            http_get(addr, &format!("/soc/{owner_hex}/{}", hex::encode(id))).await;
+        assert_eq!(status, 200, "update {index}");
+        updates.push(String::from_utf8(body).unwrap());
+    }
+    updates
+}
+
+/// Issue #172, the acceptance case through the real gateway: the
+/// network goes mid-broadcast while the camera keeps running, and comes
+/// back. That is one feed (every update at the next index of the one
+/// topic, none closed before the stop), and one recording at its head
+/// that plays straight through: every segment that was sent, in order,
+/// with a single `#EXT-X-DISCONTINUITY` at the seam, no gap entries for
+/// the silence, and the dating re-anchored on the clock it came back at.
+/// The outage here is 1.5 s of 100 ms segments rather than 30 s of 2 s
+/// ones; the publisher treats both the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outage_is_one_feed_and_one_recording_with_a_single_seam() {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic_text": "antstream-integration-outage",
+        "format": "solar-punk",
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "segment_ms": 100,
+        "reap_ms": 60_000,
+    }))
+    .unwrap();
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let media = |fill: u8| vec![fill; 4000];
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    for i in 0..3u8 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = run.push(SegmentKind::Media, media(i), 100, false);
+    }
+    wait_for(&run, |s| s.segments_listed == 3).await;
+    let before = run.snapshot();
+
+    // The network goes; the node is told, and the stub node stops
+    // answering as well, as a dead uplink would.
+    run.pause();
+    log.lock().unwrap().paused = true;
+    let went = now_ms();
+    for i in 3..18u8 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            run.push(SegmentKind::Media, media(i), 100, false),
+            publisher::PushOutcome::Withheld,
+        );
+    }
+    let during = run.snapshot();
+    assert!(
+        during.paused && during.running && !during.reaped,
+        "{during:?}"
+    );
+    assert_eq!(during.feed_index, before.feed_index, "silence: no update");
+    assert_eq!(during.segments_withheld, 15);
+
+    // Back.
+    log.lock().unwrap().paused = false;
+    run.resume();
+    let back = now_ms();
+    for i in 18..21u8 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = run.push(SegmentKind::Media, media(i), 100, false);
+    }
+    wait_for(&run, |s| s.segments_listed == 6).await;
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.segments_failed, 0, "{:?}", report.errors);
+    assert_eq!(report.segments_listed, 6, "{report:?}");
+    assert_eq!(report.segments_withheld, 15, "{report:?}");
+    assert!(!report.reaped, "{report:?}");
+
+    // One feed, closed only at the stop.
+    let topic = publisher::topic_from_string("antstream-integration-outage");
+    let updates = feed_updates(&addr, &topic, report.feed_updates).await;
+    let (live, finals) = updates.split_at(updates.len() - 2);
+    for playlist in live {
+        assert!(!playlist.contains("#EXT-X-ENDLIST"), "{playlist}");
+    }
+    assert!(finals[0].ends_with("#EXT-X-ENDLIST\n"), "{}", finals[0]);
+    let broadcast = |p: &str| {
+        p.lines()
+            .find(|l| l.starts_with("#ANTSTREAM-BROADCAST:"))
+            .map(str::to_string)
+    };
+    for playlist in &updates {
+        assert_eq!(broadcast(playlist), broadcast(&updates[0]), "one broadcast");
+    }
+
+    // One recording at the head, read the way a viewer reads it.
+    let (status, _, head) = http_get(
+        &addr,
+        &format!("/feeds/{}/{}", hex::encode(owner()), hex::encode(topic)),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let recording = String::from_utf8(head).unwrap();
+    assert_eq!(recording, *updates.last().unwrap());
+    assert!(
+        recording.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"),
+        "{recording}"
+    );
+    assert_eq!(
+        recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+        1,
+        "{recording}"
+    );
+    assert!(!recording.contains("#EXT-X-GAP"), "{recording}");
+    assert_eq!(recording.matches("#EXT-X-MAP:").count(), 1, "{recording}");
+    let lines: Vec<&str> = recording.lines().collect();
+    let uris: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert_eq!(uris.len(), 6, "{recording}");
+    for (uri, fill) in uris.iter().zip([0u8, 1, 2, 18, 19, 20]) {
+        let (status, _, data) = http_get(&addr, &format!("/bytes/{uri}")).await;
+        assert_eq!((status, data), (200, media(fill)), "{recording}");
+    }
+    // The seam sits right in front of the first segment back, numbered
+    // straight on from the last one before the silence.
+    let seam = lines
+        .iter()
+        .position(|l| *l == "#EXT-X-DISCONTINUITY")
+        .unwrap();
+    assert_eq!(lines[seam + 3], uris[3], "{recording}");
+    // Dated straight through, re-anchored at the return: the first
+    // segment back starts after the silence, not 100 ms after the last
+    // segment before it.
+    let dates: Vec<u64> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:"))
+        .map(parse_program_date_time)
+        .collect();
+    assert_eq!(dates.len(), 6);
+    for pair in dates.windows(2) {
+        assert!(pair[1] >= pair[0], "never backwards: {dates:?}");
+    }
+    assert_eq!(dates[1] - dates[0], 100);
+    assert_eq!(dates[5] - dates[4], 100);
+    assert!(
+        dates[3] >= dates[2] + (back - went) && dates[3] <= back + 400,
+        "the seam is dated at the return: {dates:?}, went {went}, back {back}"
+    );
+}
+
+/// Issue #172: with a reap window set, a broadcast whose host went quiet
+/// ends by itself one window after its last segment, without the stop
+/// call, exactly as a stop ends it: the closing window, then the
+/// recording at the feed's head. Not while it is paused, though: with
+/// the uplink gone those two uploads would be lost, so a window that
+/// runs out during the outage ends the run at the return instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broadcast_silent_past_its_reap_window_ends_itself() {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic_text": "antstream-integration-reap",
+        "format": "solar-punk",
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "reap_ms": 500,
+    }))
+    .unwrap();
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    let _ = run.push(SegmentKind::Media, vec![1; 4000], 2000, false);
+    let _ = run.push(SegmentKind::Media, vec![2; 4000], 2000, false);
+    wait_for(&run, |s| s.segments_listed == 2).await;
+    run.pause();
+    log.lock().unwrap().paused = true;
+    // Past the window, still offline: nothing ends against the dead
+    // uplink.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let during = run.snapshot();
+    assert!(
+        during.running && during.paused && !during.reaped,
+        "{during:?}"
+    );
+    // The network is back. No stop call: the reaper ends it.
+    log.lock().unwrap().paused = false;
+    run.resume();
+    for _ in 0..200 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "never reaped: {:?}", run.snapshot());
+    let report = run.report();
+    assert!(report.reaped, "{report:?}");
+    assert!(!report.recording_reference.is_empty(), "{report:?}");
+    let topic = publisher::topic_from_string("antstream-integration-reap");
+    let updates = feed_updates(&addr, &topic, report.feed_updates).await;
+    let head = updates.last().unwrap();
+    assert!(head.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), "{head}");
+    assert_eq!(head.matches("#EXTINF").count(), 2, "{head}");
+    assert!(updates[updates.len() - 2].ends_with("#EXT-X-ENDLIST\n"));
 }

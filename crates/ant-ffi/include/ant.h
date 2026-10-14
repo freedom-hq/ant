@@ -1393,7 +1393,8 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *     "max_in_flight":   4,                       // measured stable window
  *     "max_backlog":     4,                       // drop-oldest past this
  *     "playlist_window": 64,                      // most segments listed; 4096 bytes binds first
- *     "notes":           "iPhone 15 Pro / LTE"
+ *     "notes":           "iPhone 15 Pro / LTE",
+ *     "reap_ms":         60000                       // end by itself after 60 s with no media; 0 = never (default)
  *   }
  *
  * "topic_text" is the topic as a Solar Punk catalog entry names it: the
@@ -1410,6 +1411,21 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * must pass the previous broadcast's final "feed_index" as
  * "start_index": the new broadcast then continues the feed rather than
  * rewriting the indices that hold the old one's playlists.
+ *
+ * An interruption pauses a broadcast, it never ends it (issue #172):
+ * see ant_publisher_pause / ant_publisher_resume. It ends on
+ * ant_publisher_stop, or, with "reap_ms" set, by itself once that long
+ * passes with no media reaching the playlist (counted from the latest of
+ * go-live, the last listed segment and the first resume after it). Not
+ * while paused: a window that runs out during an outage ends the
+ * broadcast at ant_publisher_resume instead, so the closing playlist and
+ * the recording go up over the returned connection rather than failing
+ * against a dead one (an outage that never ends stays paused until
+ * ant_publisher_stop). A
+ * reaped broadcast closes and writes its recording exactly as a stop
+ * does, and progress reports "reaped":true; the host then calls
+ * ant_publisher_stop for the report. Leave "reap_ms" at 0 unless the
+ * host handles a broadcast that ended without its stop call.
  *
  * Do NOT raise max_in_flight without re-measuring: stage 1 found
  * window 4 stable (899/899 segments) and window 8 a connection-layer
@@ -1456,7 +1472,11 @@ bool ant_publisher_start(const AntHandle *handle,
  *    0  queued
  *    1  queued, and the oldest pending segment was dropped to stay at
  *       the live edge (the playlist lists it as an EXT-X-GAP entry)
- *    2  refused: the broadcast is stopping
+ *    2  refused: the broadcast is stopping (ant_publisher_stop, or
+ *       reaped after "reap_ms" with no media)
+ *    3  withheld, not uploaded: the broadcast is paused
+ *       (ant_publisher_pause). Media only; an initialization segment is
+ *       queued until ant_publisher_resume.
  *   -1  error, with an allocated message in *out_err
  */
 int32_t ant_publisher_push_segment(const AntHandle *handle,
@@ -1466,6 +1486,34 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
                                    uint32_t duration_ms,
                                    bool discontinuity,
                                    char **out_err);
+
+/*
+ * The device lost its connection mid-broadcast (issue #172): pause the
+ * running broadcast instead of letting it end or fill with failures.
+ * Call it alongside ant_suspend when the network goes. The broadcast
+ * goes silent: media segments pushed while paused are withheld
+ * (ant_publisher_push_segment returns 3), initialization segments wait
+ * for ant_publisher_resume, and the live playlist simply stops
+ * advancing. Nothing is closed and no EXT-X-ENDLIST is written.
+ * Non-blocking and idempotent. Returns 0, or -1 with an allocated
+ * message in *out_err when no broadcast is running.
+ */
+int ant_publisher_pause(const AntHandle *handle, char **out_err);
+
+/*
+ * The connection is back: the paused broadcast carries on in the same
+ * feed and the same recording, its next media segment behind one
+ * EXT-X-DISCONTINUITY and dated from the wall clock again. The first
+ * return after the last listed segment also restarts the "reap_ms"
+ * window, so a return late in an outage still gets the whole window to
+ * deliver its first segment; a return after the window already ran out
+ * during the outage ends the broadcast instead (progress then reports
+ * "reaped"). Call it after ant_resume / ant_wake when
+ * the network returns, and on a return to the foreground; harmless
+ * without a prior pause. Non-blocking and idempotent. Return values as
+ * ant_publisher_pause.
+ */
+int ant_publisher_resume(const AntHandle *handle, char **out_err);
 
 /*
  * Live progress of the broadcast, as an allocated JSON object (free
@@ -1479,7 +1527,13 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
  *    "bytes_published":4725000,
  *    "playlists_published":21,"publish_ms_p50":900,"publish_ms_p95":2100,
  *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
- *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0}
+ *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0,
+ *    "paused":false,"segments_withheld":0,"reaped":false}
+ *
+ * "paused" is ant_publisher_pause in force; "segments_withheld" counts
+ * the media segments outages withheld (never uploaded, never listed);
+ * "reaped" means the broadcast is ending by itself ("reap_ms" passed
+ * with no media) and the host should call ant_publisher_stop.
  *
  * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
  * behind live a viewer is right now, i.e. the age of the newest segment
@@ -1500,7 +1554,8 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * feed_updates, feed_index (the next update's index: a reused channel's
  * next "start_index"), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
- * strings, and a "kept_up" verdict (at least one feed update landed AND
+ * strings, "reaped" (it ended by itself, see "reap_ms"), and a
+ * "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the
  * live edge ended inside 3 x segment_ms). "lag_ms_final" is that live
  * edge — the age of the newest playable segment at stop, frozen there
@@ -1536,8 +1591,8 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * recording still plays by its own reference, which this report does
  * not carry).
  *
- * Calling it on a broadcast that already finished on its own returns
- * that broadcast's report. Once a stop call has returned and released
+ * Calling it on a broadcast that already finished on its own (reaped)
+ * returns that broadcast's report. Once a stop call has returned and released
  * the slot, a second call fails with "not broadcasting" — keep the
  * report from the first call rather than re-fetching it.
  */

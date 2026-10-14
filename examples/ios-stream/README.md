@@ -257,12 +257,30 @@ writer; the first segment after one is marked `#EXT-X-DISCONTINUITY` in
 the playlist. The idle timer is held off and the audio session is
 configured for recording for the broadcast's duration.
 
+A dropped connection pauses a broadcast; it never ends it (#172). When
+the device goes offline the app calls `ant_publisher_pause` with
+`ant_suspend`: the camera keeps going, but its segments are withheld
+rather than uploaded, and the live playlist just stops advancing (no
+`#EXT-X-ENDLIST`), so viewers stay on the broadcast. Back online (and on
+every return to the foreground) `ant_publisher_resume` carries it on in
+the same feed and the same recording, behind one `#EXT-X-DISCONTINUITY`,
+dated from the wall clock again. The broadcast ends only on Stop, or by
+itself once a minute passes with nothing reaching the playlist
+(`reap_ms` 60000, Solar Punk's `ORPHAN_REAP_MS`; counted from the last
+listed segment or the first return after it, whichever is later); the
+live screen then shows the report. A minute that runs out while offline
+ends the broadcast when the network comes back rather than at once, so
+the closing playlist and the recording go up over a live connection
+instead of failing against a dead one.
+
 Camera and broadcast paths are device-only — the simulator has no
 capture device. `antstream-visual` covers the screen by running the same
 encoder and publisher from a generated test pattern
 (`-antstream-shot-live`), which is labelled as such on screen. Its other
 launch arguments open the app straight onto one surface each:
-`-antstream-shot-live-idle` (quality picker), `-antstream-shot-channel`
+`-antstream-shot-live-idle` (quality picker), `-antstream-shot-live-paused`
+(with `-antstream-shot-live`: the broadcast paused as if offline, then
+ending itself a minute on), `-antstream-shot-channel`
 (the channel card, with sample state), `-antstream-shot-watch` (the
 Watch tab on a sample channel), `-antstream-shot-getstarted-help` (the
 payment ⓘ sheet), plus the Storage and Get Started hooks in

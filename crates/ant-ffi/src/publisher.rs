@@ -50,6 +50,25 @@
 //! plays from the first segment to the last. Its reference is the stop
 //! report's `recording_reference`.
 //!
+//! **An interruption pauses a broadcast; it never ends it** (issue
+//! #172). Phones lose their uplink all the time (an LTE handover, a
+//! call, a minute in a lift), so the host reports the connection going
+//! with [`LiveRun::pause`] and coming back with [`LiveRun::resume`].
+//! While paused the broadcast is silent: media segments the camera keeps
+//! handing over are withheld (never uploaded, never listed, not even as
+//! `#EXT-X-GAP` entries, since there is no uplink to lose them on),
+//! initialization segments wait for the return, and the live playlist
+//! simply stops advancing, with no `#EXT-X-ENDLIST`. The first segment
+//! after the return continues the same feed and the same recording
+//! behind one `#EXT-X-DISCONTINUITY`, dated afresh from the wall clock.
+//! Only [`LiveRun::cancel`] (the host's stop) or the opt-in reap timeout
+//! ([`PublisherConfig::reap_ms`]: that long with no media reaching the
+//! playlist) closes the window and writes the recording. Solar Punk's
+//! uploader treats an encoder that disconnects the same way. A reap
+//! that falls due while paused waits for the return, since the closing
+//! window and the recording can't go up without an uplink: that return
+//! ends the run instead of continuing it.
+//!
 //! The topic is either text, hashed the way Solar Punk catalog entries
 //! and bee-js `Topic.fromString` name a feed ([`topic_from_string`]), or
 //! raw bytes from the host. A `"solar-punk"` broadcast with a text topic
@@ -278,7 +297,31 @@ pub struct PublisherConfig {
     /// final report.
     #[serde(default)]
     pub notes: String,
+    /// End the broadcast by itself after this many milliseconds with no
+    /// media reaching the playlist (issue #172): the closing window and
+    /// the recording go up exactly as on a stop, and the run reports
+    /// `reaped`. The window runs from the latest of go-live, the last
+    /// media segment listed and the first [`LiveRun::resume`] after it,
+    /// so a return late in an outage still gets a whole window to
+    /// deliver its first segment; later resumes with no media in between
+    /// buy nothing more. [`ORPHAN_REAP_MS`] is Solar Punk's figure.
+    ///
+    /// Never while paused: a window that runs out during an outage ends
+    /// the run at the [`LiveRun::resume`] instead (that return buys no
+    /// fresh window), so the closing window and the recording go up over
+    /// a live uplink rather than failing once against a dead one. An
+    /// outage that never ends leaves the run paused until the stop.
+    ///
+    /// 0, the default, never reaps: a host only opts in once it handles
+    /// a broadcast that ended without its stop call (the iOS app does;
+    /// the Android app does not yet).
+    #[serde(default)]
+    pub reap_ms: u64,
 }
+
+/// The reap window Solar Punk's uploader runs with (`ORPHAN_REAP_MS`, 60
+/// s), and the one the iOS app passes as [`PublisherConfig::reap_ms`].
+pub const ORPHAN_REAP_MS: u64 = 60_000;
 
 /// The shape a broadcast takes on Swarm. The two are not
 /// interchangeable for a viewer: each reads only its own.
@@ -483,6 +526,11 @@ pub enum PushOutcome {
     QueuedDroppingOldest,
     /// The run is stopping and no longer accepts segments.
     Closed,
+    /// Not uploaded: the run is paused ([`LiveRun::pause`]), so a media
+    /// segment is withheld rather than sent to an uplink that is not
+    /// there. The next segment after [`LiveRun::resume`] starts a new
+    /// run of the timeline.
+    Withheld,
 }
 
 struct Pending {
@@ -497,6 +545,9 @@ struct Pending {
     /// `#EXT-X-PROGRAM-DATE-TIME` of a media segment, Unix ms, decided
     /// once at push by [`ProgramClock::place`]. 0 for an init segment.
     program_ms: u64,
+    /// [`PublisherState::outages`] when it was pushed: a media segment
+    /// whose upload fails across an outage is withheld, not a gap.
+    outage: u64,
 }
 
 /// One playlist entry: a segment that landed, or the gap a lost one
@@ -550,6 +601,13 @@ enum Committed {
     /// it has already been replaced and its map does not describe what
     /// follows.
     InitFailed,
+    /// A media segment the outage swallowed (issue #172): captured while
+    /// the run was paused, so never uploaded, or uploaded across the
+    /// outage and failed. Unlike [`Committed::Lost`] it is not listed at
+    /// all, not even as a gap: the broadcast went silent there, and the
+    /// media after it is a new run of the timeline behind one
+    /// `#EXT-X-DISCONTINUITY`.
+    Withheld,
 }
 
 impl Committed {
@@ -609,6 +667,13 @@ impl ProgramClock {
     /// Date one pushed segment. `now_ms` is the wall clock at push.
     /// Returns the media segment's `#EXT-X-PROGRAM-DATE-TIME`, or 0 for
     /// an initialization segment (which only arms a re-anchor).
+    /// The timeline broke without a segment saying so (an outage
+    /// withheld some, issue #172): the next media segment re-anchors on
+    /// the wall clock, as after a writer restart.
+    fn break_timeline(&mut self) {
+        self.reanchor = self.next_ms.is_some();
+    }
+
     fn place(
         &mut self,
         kind: SegmentKind,
@@ -807,6 +872,29 @@ struct PublisherState {
     /// out of the window.
     longest_listed_ms: u32,
 
+    /// The host reported the connection gone ([`LiveRun::pause`]) and
+    /// not yet back.
+    paused: bool,
+    /// How many times the run was paused; see [`Pending::outage`].
+    outages: u64,
+    /// Media segments the outages withheld: captured while paused, never
+    /// uploaded. (One sent across an outage that failed is committed as
+    /// [`Committed::Withheld`] too, but counted in `segments_failed`.)
+    segments_withheld: u64,
+    /// The last time a media segment was listed: the reap window runs
+    /// from here, or from `returned_at`.
+    last_media_at: Option<Instant>,
+    /// The first [`LiveRun::resume`] since `last_media_at`.
+    returned_at: Option<Instant>,
+    /// The reap window ran out while paused: the reaper is holding the
+    /// end for the return, so the closing window and the recording go up
+    /// over a live uplink. The return then ends the run instead of
+    /// buying a fresh window.
+    reap_due: bool,
+    /// The run ended itself: [`PublisherConfig::reap_ms`] passed with no
+    /// media.
+    reaped: bool,
+
     errors: Vec<String>,
     last_error: Option<String>,
     error_count: u64,
@@ -879,6 +967,14 @@ impl PublisherState {
                         self.break_since_last_entry = true;
                     }
                 }
+                Committed::Withheld => {
+                    // The broadcast went silent here: whatever is listed
+                    // next is a new run of the timeline. Only a break
+                    // once something was listed, as for a fresh init.
+                    if self.segments_listed > 0 || !self.pending_gaps.is_empty() {
+                        self.break_since_last_entry = true;
+                    }
+                }
                 Committed::InitFailed => {
                     // Listing later segments under the *previous*
                     // writer's map would hand a player an initialization
@@ -940,6 +1036,16 @@ impl PublisherState {
                     // `note_lag` — because a segment nobody can resolve
                     // yet is not the live edge.
                     self.live_edge.get_or_insert(captured_at);
+                    self.last_media_at = Some(Instant::now());
+                    // Media moved the deadline on, so a reap held for the
+                    // return is no longer due: an upload that was still
+                    // in flight when the window ran out landed after
+                    // all. Left set, it would deny every later return
+                    // its fresh window (see `LiveRun::resume`). The
+                    // committer wakes the parked reaper when this clears
+                    // the flag, so if the new window runs out paused
+                    // too, the reaper marks it due again.
+                    self.reap_due = false;
                     self.slide(window, target_ms);
                     newest = Some(captured_at);
                 }
@@ -1063,6 +1169,17 @@ impl PublisherState {
             self.recording.iter(),
             PlaylistShape::Recording,
         )
+    }
+
+    /// When the reap timeout (`reap`) runs out: that long after the
+    /// latest of go-live (`started`), the last media segment listed, and
+    /// the first return after it.
+    fn reap_deadline(&self, started: Instant, reap: Duration) -> Instant {
+        let since = [self.last_media_at, self.returned_at]
+            .into_iter()
+            .flatten()
+            .fold(started, Instant::max);
+        since + reap
     }
 
     /// `#EXT-X-TARGETDURATION`, whole seconds. Run-max, not window-max:
@@ -1208,6 +1325,17 @@ pub struct PublisherSnapshot {
     pub peers: u32,
     pub last_error: String,
     pub error_count: u64,
+    /// The host reported the connection gone ([`LiveRun::pause`]): the
+    /// broadcast is silent, not over, until it comes back.
+    pub paused: bool,
+    /// Media segments withheld by an outage instead of uploaded (see
+    /// [`PublisherReport::segments_withheld`]).
+    pub segments_withheld: u64,
+    /// The run is ending by itself: [`PublisherConfig::reap_ms`] passed
+    /// with no media. It finishes like a stop (closing window, then the
+    /// recording); a host that sees this calls the stop call for the
+    /// report.
+    pub reaped: bool,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -1281,6 +1409,16 @@ pub struct PublisherReport {
     pub kept_up: bool,
     pub errors: Vec<String>,
     pub error_count: u64,
+    /// Media segments an outage withheld (issue #172): captured while
+    /// the run was paused, so never uploaded. Never listed, not even as
+    /// gaps; the media after them follows one `#EXT-X-DISCONTINUITY`. (A
+    /// segment already on the wire when the outage began whose upload
+    /// then failed is not listed either, but counts in
+    /// `segments_failed`.)
+    pub segments_withheld: u64,
+    /// The run ended itself after [`PublisherConfig::reap_ms`] with no
+    /// media, rather than on the host's stop call.
+    pub reaped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,6 +1438,8 @@ pub struct LiveRun {
     cancel: Arc<AtomicBool>,
     push_notify: Arc<Notify>,
     commit_notify: Arc<Notify>,
+    /// Wakes a reaper holding a due reap for the return.
+    reap_notify: Arc<Notify>,
     started_at: Instant,
 }
 
@@ -1354,12 +1494,27 @@ impl LiveRun {
             let seq = state.next_seq;
             state.next_seq += 1;
             state.segments_pushed += 1;
+            // Paused: there is no uplink for this media, and queueing it
+            // for the return would put the broadcast that far behind
+            // live. It takes its place in the commit order only to say
+            // the timeline broke there. An initialization segment is
+            // queued all the same (the pump holds it until the return):
+            // every segment after it needs its map.
+            if state.paused && kind == SegmentKind::Media {
+                state.segments_withheld += 1;
+                state.program_clock.break_timeline();
+                state.done.insert(seq, Committed::Withheld);
+                drop(state);
+                self.commit_notify.notify_one();
+                return PushOutcome::Withheld;
+            }
             // Dated here, in push (= capture) order and before the
             // backlog can drop it, so a dropped segment still moves the
             // clock on by the media it held.
             let program_ms = state
                 .program_clock
                 .place(kind, duration_ms, discontinuity, now_ms);
+            let outage = state.outages;
             state.pending.push_back(Pending {
                 seq,
                 kind,
@@ -1368,6 +1523,7 @@ impl LiveRun {
                 discontinuity,
                 captured_at: Instant::now(),
                 program_ms,
+                outage,
             });
             // Drop-oldest: the backlog is bounded, and when it overflows
             // the *oldest* pending segment is the one least worth
@@ -1397,6 +1553,76 @@ impl LiveRun {
         } else {
             PushOutcome::Queued
         }
+    }
+
+    /// The connection is gone (issue #172): the device went offline, or
+    /// the app is about to lose its network. The broadcast goes silent
+    /// rather than ending: media segments pushed from now on are
+    /// withheld ([`PushOutcome::Withheld`]), and so is any still waiting
+    /// in the backlog; initialization segments wait for
+    /// [`LiveRun::resume`]; uploads already on the wire finish either
+    /// way. Nothing is closed and no `#EXT-X-ENDLIST` is written: a
+    /// viewer just sees the live playlist stop advancing. Idempotent.
+    pub fn pause(&self) {
+        let mut state = lock(&self.state);
+        // A run already stopping drains what it has rather than
+        // withholding it.
+        if state.paused || state.intake_closed || self.cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        state.paused = true;
+        state.outages += 1;
+        let mut kept = VecDeque::with_capacity(state.pending.len());
+        let mut withheld = false;
+        for pending in std::mem::take(&mut state.pending) {
+            if pending.kind == SegmentKind::Media {
+                state.segments_withheld += 1;
+                state.done.insert(pending.seq, Committed::Withheld);
+                withheld = true;
+            } else {
+                kept.push_back(pending);
+            }
+        }
+        state.pending = kept;
+        if withheld {
+            state.program_clock.break_timeline();
+        }
+        drop(state);
+        self.commit_notify.notify_one();
+    }
+
+    /// The connection is back. The broadcast carries on in the same feed
+    /// and the same recording: the next media segment is listed behind
+    /// one `#EXT-X-DISCONTINUITY` (if the outage withheld any) and dated
+    /// from the wall clock again. The first return after the last listed
+    /// segment also restarts the reap window
+    /// ([`PublisherConfig::reap_ms`]), so a return late in an outage
+    /// still has a whole window to deliver its first segment. A return
+    /// after the window already ran out during the outage ends the run
+    /// instead (see [`reaper`]). Idempotent,
+    /// and harmless without a prior [`LiveRun::pause`] (a host can call
+    /// it on every return to the foreground).
+    pub fn resume(&self) {
+        {
+            let mut state = lock(&self.state);
+            state.paused = false;
+            // The window already ran out during the outage: the reaper
+            // ends the run now that the closing uploads can land, rather
+            // than this return buying a fresh window.
+            let first_return = !state.reap_due
+                && match (state.returned_at, state.last_media_at) {
+                    (None, _) => true,
+                    (Some(returned), Some(media)) => media >= returned,
+                    (Some(_), None) => false,
+                };
+            if first_return {
+                state.returned_at = Some(Instant::now());
+            }
+        }
+        // The pump may be holding an initialization segment for this,
+        // and the reaper a due reap.
+        self.push_notify.notify_one();
+        self.reap_notify.notify_one();
     }
 
     /// Elapsed broadcast time: still ticking while the run is live,
@@ -1444,6 +1670,9 @@ impl LiveRun {
             peers: state.peers,
             last_error: state.last_error.clone().unwrap_or_default(),
             error_count: state.error_count,
+            paused: state.paused,
+            segments_withheld: state.segments_withheld,
+            reaped: state.reaped,
         }
     }
 
@@ -1505,7 +1734,8 @@ impl LiveRun {
         let media_pushed = state
             .segments_published
             .saturating_add(state.segments_failed)
-            .saturating_add(state.segments_dropped);
+            .saturating_add(state.segments_dropped)
+            .saturating_add(state.segments_withheld);
         PublisherReport {
             channel: self.config.channel.clone(),
             topic: hex::encode(self.topic),
@@ -1563,6 +1793,8 @@ impl LiveRun {
                 && state.live_edge_lag_ms() <= lag_budget_ms(self.config.segment_ms),
             errors: state.errors.clone(),
             error_count: state.error_count,
+            segments_withheld: state.segments_withheld,
+            reaped: state.reaped,
         }
     }
 }
@@ -1606,6 +1838,8 @@ pub fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let push_notify = Arc::new(Notify::new());
     let commit_notify = Arc::new(Notify::new());
+    let reap_notify = Arc::new(Notify::new());
+    let started_at = Instant::now();
     let run = Arc::new(LiveRun {
         config: config.clone(),
         topic,
@@ -1615,7 +1849,8 @@ pub fn start(
         cancel: Arc::clone(&cancel),
         push_notify: Arc::clone(&push_notify),
         commit_notify: Arc::clone(&commit_notify),
-        started_at: Instant::now(),
+        reap_notify: Arc::clone(&reap_notify),
+        started_at,
     });
 
     let ctx = Arc::new(RunCtx {
@@ -1629,8 +1864,10 @@ pub fn start(
         cancel,
         push_notify,
         commit_notify,
+        reap_notify,
         status_rx,
         manifest_task: Mutex::new(None),
+        started_at,
     });
     runtime.spawn(async move { drive(ctx).await });
     Ok(run)
@@ -1654,6 +1891,10 @@ struct RunCtx {
     /// reference that lands after the final report would be lost to
     /// the host, and it is the only shareable one.
     manifest_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Wakes the reaper on [`LiveRun::resume`]; see [`reaper`].
+    reap_notify: Arc<Notify>,
+    /// Go-live, where the reap window first runs from.
+    started_at: Instant,
 }
 
 impl RunCtx {
@@ -1671,6 +1912,83 @@ impl RunCtx {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// End the run the way the host's stop does, as `reaped`. Refused
+    /// (false) while paused: see [`reaper`].
+    fn reap(&self) -> bool {
+        {
+            let mut state = lock(&self.state);
+            if state.intake_closed || self.cancelled() {
+                return true;
+            }
+            if state.paused {
+                return false;
+            }
+            state.reaped = true;
+            // Under the lock, so a pause can't land between the check
+            // above and the cancel and withhold what the stop drains.
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        // See `LiveRun::cancel` for why `notify_one`.
+        self.push_notify.notify_one();
+        self.commit_notify.notify_one();
+        true
+    }
+}
+
+/// End the broadcast once [`PublisherConfig::reap_ms`] passes with no
+/// media reaching the playlist (issue #172): the host is gone (the app
+/// was backgrounded and never came back, the connection never
+/// returned), and a viewer must not be left on a live playlist that
+/// will never advance again. Re-reads the deadline every time it wakes,
+/// since media and returns only ever push it later.
+///
+/// Never while paused: ending the run uploads the closing window and the
+/// recording, and with the uplink gone both would fail once and never be
+/// tried again, leaving the feed's head a live playlist with no
+/// `#EXT-X-ENDLIST` and the channel with no recording. A window that
+/// runs out during an outage marks the reap due and waits for
+/// [`LiveRun::resume`]; that return ends the run (it buys no fresh
+/// window), with the uploads going out over the connection that just
+/// came back. Media that lands while it waits (an upload in flight when
+/// the window ran out) clears the due reap and wakes the reaper too,
+/// which then sleeps out the window that media restarted and, if that
+/// one also runs out paused, marks the reap due again. An outage that
+/// never ends leaves the run paused until the host's stop.
+async fn reaper(ctx: Arc<RunCtx>, reap: Duration) {
+    loop {
+        // Registered before the state is read, so a return between the
+        // read and the await still wakes us.
+        let returned = ctx.reap_notify.notified();
+        tokio::pin!(returned);
+        let deadline = {
+            let mut state = lock(&ctx.state);
+            if state.intake_closed || ctx.cancelled() {
+                return;
+            }
+            let deadline = state.reap_deadline(ctx.started_at, reap);
+            if state.paused && Instant::now() >= deadline {
+                state.reap_due = true;
+                None
+            } else {
+                Some(deadline)
+            }
+        };
+        let Some(deadline) = deadline else {
+            returned.await;
+            continue;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            // A pause that slipped in since the read: go round again,
+            // which marks the reap due and waits for the return.
+            if ctx.reap() {
+                return;
+            }
+            continue;
+        }
+        tokio::time::sleep(deadline - now).await;
     }
 }
 
@@ -1696,9 +2014,18 @@ async fn drive(ctx: Arc<RunCtx>) {
     // the stream — and the committer retries it until it lands.
     ctx.spawn_channel_manifest();
 
+    let reaper = (ctx.config.reap_ms > 0).then(|| {
+        tokio::spawn(reaper(
+            Arc::clone(&ctx),
+            Duration::from_millis(ctx.config.reap_ms),
+        ))
+    });
     let pump = tokio::spawn(pump(Arc::clone(&ctx)));
     let committer = tokio::spawn(commit_loop(Arc::clone(&ctx)));
     let _ = pump.await;
+    if let Some(reaper) = reaper {
+        reaper.abort();
+    }
     let _ = committer.await;
     // Join, don't abort, the manifest attempt still on the wire: it ran
     // alongside the drain, so this rarely waits, and a reference that
@@ -1758,7 +2085,16 @@ async fn pump(ctx: Arc<RunCtx>) {
 
         let next = {
             let mut state = lock(&ctx.state);
-            let next = state.pending.pop_front();
+            // Paused, only initialization segments are pending (media is
+            // withheld), and they wait for the return rather than fail
+            // against an uplink that is not there. A stop overrides the
+            // hold: it drains whatever is left.
+            let held = state.paused && !ctx.cancelled();
+            let next = if held {
+                None
+            } else {
+                state.pending.pop_front()
+            };
             if next.is_none() && ctx.cancelled() {
                 // Close intake atomically with seeing the backlog
                 // empty: every push accepted before this point is in
@@ -1844,15 +2180,35 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                 }
             }
             Err(message) => {
-                if pending.kind == SegmentKind::Media {
-                    state.segments_failed += 1;
-                }
                 state.record_error(format!(
                     "{} segment {}: {message}",
                     pending.kind.as_str(),
                     pending.seq,
                 ));
-                state.done.insert(pending.seq, Committed::lost(&pending));
+                // An initialization segment that fails while the run is
+                // paused waits for the return and is tried again then:
+                // without it every later segment of its writer is
+                // unplayable, and the outage is why it failed.
+                if pending.kind == SegmentKind::Init && state.paused && !ctx.cancelled() {
+                    state.pending.push_front(pending);
+                    drop(state);
+                    ctx.push_notify.notify_one();
+                    return;
+                }
+                if pending.kind == SegmentKind::Media {
+                    state.segments_failed += 1;
+                }
+                // A media segment that was on the wire across an outage
+                // is the outage's, not a hole in a running broadcast:
+                // not listed as a gap, and the media after it starts a
+                // new run of the timeline.
+                let across_outage = state.paused || state.outages != pending.outage;
+                let outcome = if pending.kind == SegmentKind::Media && across_outage {
+                    Committed::Withheld
+                } else {
+                    Committed::lost(&pending)
+                };
+                state.done.insert(pending.seq, outcome);
             }
         }
     }
@@ -1867,10 +2223,19 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         let notified = ctx.commit_notify.notified();
         tokio::pin!(notified);
 
-        let newest = {
+        let (newest, held_reap_cleared) = {
             let mut state = lock(&ctx.state);
-            state.advance(ctx.config.playlist_window, ctx.config.segment_ms)
+            let held = state.reap_due;
+            let newest = state.advance(ctx.config.playlist_window, ctx.config.segment_ms);
+            (newest, held && !state.reap_due)
         };
+        if held_reap_cleared {
+            // The reaper is parked on the return for a reap that is no
+            // longer due: wake it to re-read the deadline the media just
+            // moved on, so a window that runs out paused again is marked
+            // due again (see `reaper`).
+            ctx.reap_notify.notify_one();
+        }
         if let Some(captured_at) = newest {
             publish_playlist(&ctx, PlaylistShape::Live, Some(captured_at)).await;
             continue;
@@ -2452,6 +2817,7 @@ mod tests {
             playlist_window: 3,
             notes: String::new(),
             start_index: 0,
+            reap_ms: 0,
         }
     }
 
@@ -2578,6 +2944,7 @@ mod tests {
             discontinuity: false,
             captured_at: Instant::now(),
             program_ms: 1_788_264_000_000,
+            outage: 0,
         };
         assert!(matches!(
             Committed::lost(&pending(SegmentKind::Media)),
@@ -4835,7 +5202,9 @@ mod tests {
         match outcome {
             PushOutcome::Closed => assert_eq!(report.segments_published, 1, "{report:?}"),
             PushOutcome::Queued => assert_eq!(report.segments_published, 2, "{report:?}"),
-            PushOutcome::QueuedDroppingOldest => panic!("unexpected {outcome:?}"),
+            PushOutcome::QueuedDroppingOldest | PushOutcome::Withheld => {
+                panic!("unexpected {outcome:?}")
+            }
         }
     }
 
@@ -4902,5 +5271,604 @@ mod tests {
             .count();
         assert!(feeds >= 2, "retry never fired ({feeds} POST /feeds)");
         assert!(!report.channel_reference.is_empty(), "{report:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Interruptions pause, they never end (issue #172)
+    // -----------------------------------------------------------------
+
+    /// Folded by the committer, an outage is one seam: the withheld
+    /// segments take no number and no line (not even `#EXT-X-GAP`), the
+    /// first segment after them is behind one `#EXT-X-DISCONTINUITY`,
+    /// and nothing closes the live window.
+    #[test]
+    fn an_outage_is_one_seam_not_a_run_of_gaps() {
+        let mut state = live_state();
+        commit_media(&mut state, 1, 3, 64);
+        // 30 s of 2 s segments the outage withheld.
+        for seq in 4..19 {
+            state.done.insert(seq, Committed::Withheld);
+            assert_eq!(state.advance(64, 2000), None, "silence publishes nothing");
+        }
+        commit_media(&mut state, 19, 3, 64);
+
+        for body in [
+            state.render_playlist(2000, false),
+            state.render_recording(2000),
+        ] {
+            assert_eq!(body.matches("#EXT-X-DISCONTINUITY\n").count(), 1, "{body}");
+            assert!(!body.contains("#EXT-X-GAP"), "{body}");
+            assert_eq!(body.matches("#EXT-X-MAP:").count(), 1, "{body}");
+            let uris = entry_uris(&body);
+            assert_eq!(
+                uris,
+                [1, 2, 3, 19, 20, 21].map(bare_ref).to_vec(),
+                "every segment that landed, in order:\n{body}"
+            );
+            // The seam sits right in front of the first segment back.
+            let seam = body.find("#EXT-X-DISCONTINUITY\n").unwrap();
+            assert!(body[seam..].find(&bare_ref(3)).is_none(), "{body}");
+            assert!(body[seam..].contains(&bare_ref(19)), "{body}");
+        }
+        assert!(!state
+            .render_playlist(2000, false)
+            .contains("#EXT-X-ENDLIST"));
+        // The numbers run on: the silence took none.
+        let numbers: Vec<u64> = state.recording.iter().map(|e| e.number).collect();
+        assert_eq!(numbers, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Silence before anything was listed is no seam: there is nothing
+    /// in front of the first segment to break from.
+    #[test]
+    fn an_outage_before_the_first_segment_is_not_a_seam() {
+        let mut state = live_state();
+        state.done.insert(1, Committed::Withheld);
+        state.done.insert(2, Committed::Withheld);
+        commit_media(&mut state, 3, 2, 64);
+        let body = state.render_playlist(2000, false);
+        assert!(!body.contains("#EXT-X-DISCONTINUITY"), "{body}");
+    }
+
+    /// The return re-anchors the dating on the wall clock it came back
+    /// at, never moving backwards: the segments the outage swallowed
+    /// were never placed, so the first one back is dated when it was
+    /// really shot, not where the last one before the outage ended.
+    #[test]
+    fn the_return_re_anchors_the_dating() {
+        let mut clock = ProgramClock::default();
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 2000),
+            GO_LIVE_MS
+        );
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 4000),
+            GO_LIVE_MS + 2000
+        );
+        clock.break_timeline();
+        // Back 30 s later.
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 36_000),
+            GO_LIVE_MS + 34_000,
+        );
+        // A clock that ran slow cannot date it before the last segment
+        // ended.
+        let mut clock = ProgramClock::default();
+        let _ = clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS + 2000);
+        clock.break_timeline();
+        assert_eq!(
+            clock.place(SegmentKind::Media, 2000, false, GO_LIVE_MS),
+            GO_LIVE_MS + 2000
+        );
+    }
+
+    /// The reap window runs from the latest of go-live, the last listed
+    /// segment and the first return after it.
+    #[test]
+    fn the_reap_window_runs_from_the_later_of_the_last_segment_and_the_return() {
+        let reap = Duration::from_secs(60);
+        let started = Instant::now();
+        let mut state = PublisherState::default();
+        assert_eq!(state.reap_deadline(started, reap), started + reap);
+        let media = started + Duration::from_secs(10);
+        state.last_media_at = Some(media);
+        assert_eq!(state.reap_deadline(started, reap), media + reap);
+        // Back 26 s into the outage: the whole window again, not 34 s.
+        let back = media + Duration::from_secs(26);
+        state.returned_at = Some(back);
+        assert_eq!(state.reap_deadline(started, reap), back + reap);
+        // A later segment moves it on again.
+        let later = back + Duration::from_secs(5);
+        state.last_media_at = Some(later);
+        assert_eq!(state.reap_deadline(started, reap), later + reap);
+    }
+
+    /// A reap held for the return stops being due once media is listed
+    /// (an upload in flight when the window ran out landed after all):
+    /// the run carries on, and a later outage's return must still buy a
+    /// whole window rather than inherit the stale verdict.
+    #[test]
+    fn listed_media_clears_a_held_reap() {
+        let mut state = PublisherState {
+            reap_due: true,
+            ..PublisherState::default()
+        };
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        assert!(state.advance(3, 2000).is_none());
+        assert!(state.reap_due, "an init is not media");
+        state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
+        assert!(state.advance(3, 2000).is_some());
+        assert!(!state.reap_due);
+    }
+
+    /// End to end: a held reap cleared by media that landed leaves the
+    /// next return its fresh window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_after_a_cleared_reap_gets_a_whole_window() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 0);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        // As the reaper would have, then an in-flight upload landing.
+        lock(&run.state).reap_due = true;
+        {
+            let mut state = lock(&run.state);
+            let seq = state.next_commit;
+            state.done.insert(seq, media("/bzz/cc/seg-late.m4s", false));
+            assert!(state.advance(64, 2000).is_some());
+        }
+        run.resume();
+        {
+            let state = lock(&run.state);
+            assert!(!state.reap_due);
+            let returned = state.returned_at.expect("the return restarts the window");
+            assert!(returned >= state.last_media_at.unwrap());
+        }
+        run.cancel();
+        settle(&run).await;
+    }
+
+    /// A held reap cleared by media that landed while still paused must
+    /// not leave the reaper parked on the return: when the window that
+    /// media restarted runs out paused too, the reap is due again, and
+    /// the return ends the run rather than buying yet another window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleared_reap_falls_due_again_if_the_new_window_runs_out_paused() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 300);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(lock(&run.state).reap_due, "the first window ran out paused");
+        // An upload that was in flight when the window ran out lands,
+        // folded in by the real committer.
+        {
+            let mut state = lock(&run.state);
+            let seq = state.next_commit;
+            state.done.insert(seq, media("/bzz/cc/seg-late.m4s", false));
+        }
+        run.commit_notify.notify_one();
+        wait_until(&run, "the late segment", |s| s.segments_listed == 2).await;
+        assert!(!lock(&run.state).reap_due, "media cleared the held reap");
+        // The outage outlasts the window that media restarted.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let snapshot = run.snapshot();
+        assert!(snapshot.running && !snapshot.reaped, "{snapshot:?}");
+        assert!(
+            lock(&run.state).reap_due,
+            "the second window ran out paused: due again"
+        );
+        let back = Instant::now();
+        run.resume();
+        settle(&run).await;
+        assert!(
+            back.elapsed() < Duration::from_millis(300),
+            "the return ends it, it buys no window: {:?}",
+            back.elapsed()
+        );
+        assert!(run.report().reaped);
+    }
+
+    fn quiet_run(log: &Arc<Mutex<StubLog>>, addr: &str, reap_ms: u64) -> Arc<LiveRun> {
+        let _ = log;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.reap_ms = reap_ms;
+        config.playlist_window = 64;
+        config.max_backlog = 64;
+        start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn wait_until(run: &Arc<LiveRun>, what: &str, done: impl Fn(&PublisherSnapshot) -> bool) {
+        for _ in 0..400 {
+            if done(&run.snapshot()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}: {:?}", run.snapshot());
+    }
+
+    /// Only the first return after the last listed segment buys a fresh
+    /// window: a host that resumes again and again with nothing to show
+    /// for it does not hold a dead broadcast open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_first_return_after_the_last_segment_restarts_the_window() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 0);
+        run.resume();
+        let first = lock(&run.state).returned_at.expect("a return");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        run.pause();
+        run.resume();
+        assert_eq!(
+            lock(&run.state).returned_at,
+            Some(first),
+            "a second return buys nothing"
+        );
+        // Media lands: the next return counts again.
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.resume();
+        let again = lock(&run.state).returned_at.unwrap();
+        assert!(again > first);
+        assert!(again >= lock(&run.state).last_media_at.unwrap());
+        run.cancel();
+        settle(&run).await;
+    }
+
+    /// The acceptance case at the publisher: 30 s without a network
+    /// (dated, not slept) and back is one feed, one recording, every
+    /// segment that was sent in it, and one seam. While paused the
+    /// camera's segments are withheld rather than uploaded, no playlist
+    /// goes out and none is closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_connection_pauses_the_broadcast_and_the_return_continues_it() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 0);
+        let push =
+            |kind, byte: u8, at_ms: u64| run.enqueue(kind, vec![byte; 64], 2000, false, at_ms);
+
+        let _ = push(SegmentKind::Init, 0xee, GO_LIVE_MS);
+        for i in 0..3u8 {
+            let _ = push(
+                SegmentKind::Media,
+                i,
+                GO_LIVE_MS + 2000 * (u64::from(i) + 1),
+            );
+        }
+        wait_until(&run, "the first three", |s| {
+            s.segments_listed == 3 && s.feed_index > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = run.snapshot();
+        let uploads_before = lock(&log).seen.len();
+
+        // The network goes. The camera keeps going for 30 s.
+        run.pause();
+        assert!(run.snapshot().paused);
+        for i in 3..18u8 {
+            assert_eq!(
+                push(
+                    SegmentKind::Media,
+                    i,
+                    GO_LIVE_MS + 2000 * (u64::from(i) + 1)
+                ),
+                PushOutcome::Withheld,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let paused = run.snapshot();
+        assert_eq!(paused.segments_withheld, 15, "{paused:?}");
+        assert!(paused.running && !paused.reaped, "{paused:?}");
+        assert_eq!(
+            (paused.feed_index, paused.playlists_published),
+            (before.feed_index, before.playlists_published),
+            "silence: the live playlist just stops advancing",
+        );
+        assert_eq!(
+            lock(&log).seen.len(),
+            uploads_before,
+            "nothing goes up while paused"
+        );
+
+        // Back.
+        run.resume();
+        assert!(!run.snapshot().paused);
+        // Segment 18, the first back, was pushed as it closed.
+        let back_at = GO_LIVE_MS + 2000 * 18;
+        for i in 18..21u8 {
+            let _ = push(
+                SegmentKind::Media,
+                i,
+                GO_LIVE_MS + 2000 * (u64::from(i) + 1),
+            );
+        }
+        wait_until(&run, "the return", |s| s.segments_listed == 6).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.segments_withheld, 15, "{report:?}");
+        assert_eq!(
+            report.segments_failed + report.segments_dropped,
+            0,
+            "{report:?}"
+        );
+        assert!(!report.reaped, "{report:?}");
+        assert!(!report.kept_up, "an outage is not keeping up: {report:?}");
+
+        // One feed: every update at the next index of the one topic, and
+        // no live playlist before the closing one carries ENDLIST.
+        let seen = lock(&log).seen.clone();
+        let ids = soc_ids(&log);
+        assert_eq!(ids.len() as u64, report.feed_updates);
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(
+                *id,
+                hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], index as u64)),
+            );
+        }
+        let playlists: Vec<String> = seen
+            .iter()
+            .filter(|r| is_playlist(r))
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .collect();
+        let (live, finals) = playlists.split_at(playlists.len() - 2);
+        assert!(finals[0].ends_with("#EXT-X-ENDLIST\n") && !finals[0].contains("VOD"));
+        for body in live {
+            assert!(!body.contains("#EXT-X-ENDLIST"), "{body}");
+        }
+        // One recording, every segment that was sent, one seam.
+        let recording = playlists.last().unwrap();
+        assert!(
+            recording.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "{recording}"
+        );
+        assert_eq!(
+            recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{recording}"
+        );
+        assert!(!recording.contains("#EXT-X-GAP"), "{recording}");
+        let dated = dated_uris(recording);
+        assert_eq!(dated.len(), 6, "{recording}");
+        // Segment i is 64 bytes of i; the withheld 3-17 never went up.
+        let segment_refs: Vec<String> = [0u8, 1, 2, 18, 19, 20]
+            .iter()
+            .map(|i| hex::encode(ant_retrieval::split_bytes_with_redundancy(&[*i; 64], 1).root))
+            .collect();
+        assert_eq!(seen.iter().filter(|r| is_segment(r)).count(), 7, "init + 6");
+        assert_eq!(
+            dated.iter().map(|(_, uri)| uri.clone()).collect::<Vec<_>>(),
+            segment_refs,
+            "{recording}"
+        );
+        // Dated afresh where it came back, the rest stepped by media.
+        assert_eq!(dated[2].0, iso8601_utc_ms(GO_LIVE_MS + 4000));
+        assert_eq!(dated[3].0, iso8601_utc_ms(back_at));
+        assert_eq!(dated[5].0, iso8601_utc_ms(back_at + 4000));
+        // Same broadcast: the recording is the same broadcast id as the
+        // live window before the outage.
+        let id_line = |body: &str| {
+            body.lines()
+                .find(|l| l.starts_with("#ANTSTREAM-BROADCAST:"))
+                .map(str::to_string)
+        };
+        assert_eq!(id_line(recording), id_line(&live[0]));
+    }
+
+    /// An initialization segment never fails against the missing uplink:
+    /// pushed while paused it waits for the return, and one that fails
+    /// while paused is tried again then, so the writer that restarted
+    /// during the outage is still playable after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_init_segment_waits_out_the_outage() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(150)).await;
+        let run = quiet_run(&log, &addr, 0);
+        let _ = run.push(SegmentKind::Init, vec![0xe1; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the first segment", |s| s.segments_listed == 1).await;
+
+        // A writer restart on the wire as the network goes: its upload
+        // fails while paused.
+        let held = |byte: u8| {
+            lock(&log)
+                .seen
+                .iter()
+                .filter(|r| is_segment(r) && r.body.first() == Some(&byte))
+                .count()
+        };
+        lock(&log).fail_uploads = true;
+        let _ = run.push(SegmentKind::Init, vec![0xe2; 64], 0, false);
+        for _ in 0..100 {
+            if held(0xe2) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        run.pause();
+        // Another restart while paused: it is held, not sent.
+        let _ = run.push(SegmentKind::Init, vec![0xe3; 64], 0, false);
+        assert_eq!(
+            run.push(SegmentKind::Media, vec![2u8; 64], 2000, true),
+            PushOutcome::Withheld
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(held(0xe2), 1, "the in-flight init went out once and failed");
+        assert_eq!(held(0xe3), 0, "an init pushed while paused waits");
+
+        lock(&log).fail_uploads = false;
+        run.resume();
+        let _ = run.push(SegmentKind::Media, vec![3u8; 64], 2000, false);
+        wait_until(&run, "the return", |s| s.segments_listed == 2).await;
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(held(0xe2), 2, "the failed init is retried on the return");
+        assert_eq!(held(0xe3), 1);
+        let recording = lock(&log)
+            .seen
+            .iter()
+            .rev()
+            .find(|r| is_recording(r))
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .expect("recording");
+        assert_eq!(recording.matches("#EXTINF").count(), 2, "{recording}");
+        assert_eq!(
+            recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{recording}"
+        );
+        // The segment after the outage is listed under the newest map.
+        let e3 = lock(&log)
+            .seen
+            .iter()
+            .find(|r| is_segment(r) && r.body.first() == Some(&0xe3))
+            .map(bytes_reference)
+            .unwrap();
+        assert!(
+            recording.contains(&format!("#EXT-X-MAP:URI=\"{e3}\"")),
+            "{recording}"
+        );
+    }
+
+    /// Nothing ends a broadcast but the stop call — unless the host asked
+    /// for a reap window, and that long passes with no media: then it
+    /// ends by itself exactly as a stop would, closing window and
+    /// recording, and says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broadcast_with_no_media_for_the_reap_window_ends_itself() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 400);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        // The camera stops handing segments over, the uplink is fine.
+        settle(&run).await;
+        let report = run.report();
+        assert!(report.reaped, "{report:?}");
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        assert_eq!(
+            run.push(SegmentKind::Media, vec![2u8; 64], 2000, false),
+            PushOutcome::Closed
+        );
+        let playlists = lock(&log).seen.iter().filter(|r| is_playlist(r)).count();
+        assert!(playlists >= 3, "live window, closing window, recording");
+        assert!(lock(&log).seen.iter().any(is_recording));
+
+        // Without a reap window the same silence goes on.
+        let run = quiet_run(&log, &addr, 0);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let snapshot = run.snapshot();
+        assert!(snapshot.running && !snapshot.reaped, "{snapshot:?}");
+        run.cancel();
+        settle(&run).await;
+        assert!(!run.report().reaped);
+    }
+
+    /// A window that runs out while paused does not end the run against
+    /// the dead uplink, where the closing window and the recording would
+    /// each fail once and never go up: the reap waits for the return,
+    /// and the return ends the run (no fresh window), with both uploads
+    /// going out over the connection that came back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reap_due_while_paused_waits_for_the_return() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 300);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        {
+            let mut log = lock(&log);
+            log.fail_uploads = true;
+            log.fail_soc = true;
+        }
+        // Well past the window, still offline.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let snapshot = run.snapshot();
+        assert!(
+            snapshot.running && snapshot.paused && !snapshot.reaped,
+            "{snapshot:?}"
+        );
+        assert!(lock(&run.state).reap_due);
+        let closing = |r: &SeenRequest| r.body.windows(14).any(|w| w == b"#EXT-X-ENDLIST");
+        assert!(
+            !lock(&log)
+                .seen
+                .iter()
+                .any(|r| closing(r) || is_recording(r)),
+            "nothing is closed against the dead uplink"
+        );
+
+        // The network is back: the run ends at once, not a window later.
+        {
+            let mut log = lock(&log);
+            log.fail_uploads = false;
+            log.fail_soc = false;
+        }
+        let back = Instant::now();
+        run.resume();
+        settle(&run).await;
+        assert!(
+            back.elapsed() < Duration::from_millis(300),
+            "the return ends it, it buys no window: {:?}",
+            back.elapsed()
+        );
+        let report = run.report();
+        assert!(report.reaped, "{report:?}");
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        assert!(lock(&log).seen.iter().any(is_recording));
+        assert!(lock(&log).seen.iter().any(closing));
+    }
+
+    /// A return late in the window buys a whole window from the return,
+    /// so the first segment back is not reaped seconds before it lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_late_in_the_window_gets_a_whole_window() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 600);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        run.resume();
+        // Past the first segment's window, inside the return's.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let snapshot = run.snapshot();
+        assert!(!snapshot.reaped, "{snapshot:?}");
+        let _ = run.push(SegmentKind::Media, vec![2u8; 64], 2000, true);
+        wait_until(&run, "the return", |s| s.segments_listed == 2).await;
+        run.cancel();
+        settle(&run).await;
+        assert!(!run.report().reaped);
     }
 }

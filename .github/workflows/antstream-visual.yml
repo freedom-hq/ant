@@ -182,8 +182,29 @@ jobs:
           # The screen waits for `ant_init` before starting (~20 s cold).
           sleep 40
           xcrun simctl io booted screenshot shots/11-live-broadcast.png
+          # This run passes a 10-minute reap_ms (see
+          # `AntNode.reapMsForThisLaunch`): nothing is ever listed here
+          # (the sample batch is rejected), so the real 60 s window (#172)
+          # would end the broadcast before these shots.
           sleep 30
           xcrun simctl io booted screenshot shots/12-live-publish-lag.png
+          # 18/19 — a dropped connection (#172): `-antstream-shot-live-
+          # paused` pauses the broadcast 5 s in, as the path monitor does
+          # when the device goes offline. 18 is the paused state (still
+          # LIVE, "No connection — paused"); the "network" returns 65 s
+          # after the pause, past the reap window, and 19 is after that
+          # return, when the reap held for it ended the broadcast
+          # (summary: "nothing reached viewers for a minute"). A reap
+          # never fires while offline: its closing uploads need the
+          # uplink. A real return inside the window needs a device: this
+          # runner can't land a segment at all.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-live-paused
+          sleep 45
+          xcrun simctl io booted screenshot shots/18-live-paused.png
+          sleep 90
+          xcrun simctl io booted screenshot shots/19-live-reaped.png
           # --- Android parity (permanent channel, Watch tab, quality,
           # payment help) ---
           # 13 — the Broadcast tab's "Your channel" card: the permanent

@@ -71,6 +71,19 @@ struct LiveView: View {
             // fail honestly at the gateway's batch check.
             node.installBroadcastSample()
             await broadcast.start(node: node, channel: "CI test pattern")
+            // `-antstream-shot-live-paused` then drops the "network" the
+            // way `AntNode`'s path monitor does when the device goes
+            // offline (#172), so CI captures the paused state. The
+            // "network" comes back 65 s later, past the minute's reap
+            // window: the reap held for the return then ends the
+            // broadcast (it never ends one while offline, since its
+            // closing uploads need the uplink).
+            if RootView.shotArgs.contains("-antstream-shot-live-paused") {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await node.pausePublisher()
+                try? await Task.sleep(nanoseconds: 65_000_000_000)
+                await node.resumePublisher()
+            }
         }
     }
 
@@ -180,6 +193,18 @@ struct LiveView: View {
                         .font(.footnote)
                         .foregroundStyle(.yellow)
                 }
+                if let progress = broadcast.progress, progress.paused == true,
+                   broadcast.state.isActive {
+                    // Paused, not over (#172): viewers stay on the
+                    // broadcast and it carries on when the network does.
+                    Label("No connection — paused. Viewers stay on the broadcast; "
+                          + "it carries on if the network is back within a "
+                          + "minute, and ends when it comes back after that.",
+                          systemImage: "wifi.slash")
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let progress = broadcast.progress {
                     metrics(progress)
                 } else if broadcast.state.isActive {
@@ -251,11 +276,20 @@ struct LiveView: View {
                 Text(report.verdictLabel)
                     .font(.headline)
                     .foregroundStyle(verdictTint(report))
+                    // Wraps rather than ellipsising: the reaped verdict
+                    // is longer than one line on a phone.
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("\(report.durationLabel) · \(report.segmentsListed) playable segments · "
                      + "\(report.feedUpdates) feed updates · "
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.75))
+                if let withheld = report.segmentsWithheld, withheld > 0 {
+                    Text("\(withheld) segments shot while the connection was down "
+                         + "were never sent.")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                }
                 if report.segmentsDropped > 0 || report.segmentsFailed > 0 {
                     Text("\(report.segmentsDropped) dropped at the live edge, "
                          + "\(report.segmentsFailed) failed to publish.")
