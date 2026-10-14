@@ -271,14 +271,17 @@ struct LiveView: View {
                 Text(report.verdictLabel)
                     .font(.headline)
                     .foregroundStyle(verdictTint(report))
+                    // Wraps rather than ellipsising: the reaped verdict
+                    // is longer than one line on a phone.
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("\(report.durationLabel) · \(report.segmentsListed) playable segments · "
                      + "\(report.feedUpdates) feed updates · "
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.75))
                 if let withheld = report.segmentsWithheld, withheld > 0 {
-                    Text("\(withheld) segments shot without a connection were left out; "
-                         + "the broadcast carried on after it.")
+                    Text("\(withheld) segments shot while the connection was down "
+                         + "were never sent.")
                         .font(.caption)
                         .foregroundStyle(.yellow.opacity(0.9))
                 }
