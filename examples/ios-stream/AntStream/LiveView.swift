@@ -27,6 +27,11 @@ struct LiveView: View {
     /// in the middle of (#175) rather than starting a new one. Cleared
     /// once used: a later go-live from this screen is a new broadcast.
     @State private var resumePending: Bool
+    /// The run started from here last was a resume: once it ends with the
+    /// unfinished broadcast's entry still on disk (the node refused it,
+    /// or it failed), the button stays a resume, so the next tap never
+    /// starts a new broadcast that would replace that entry.
+    @State private var lastRunWasResume = false
 
     init(resume: Bool = false) {
         _resumePending = State(initialValue: resume)
@@ -52,6 +57,15 @@ struct LiveView: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .onChange(of: broadcast.state) { _, state in
+            // A resumed run that ended with its entry still on disk (the
+            // node refused it at the feed head, or it failed): the next
+            // tap resumes again rather than replacing the entry with a
+            // new broadcast. Going back offers Discard on the card.
+            guard !state.isActive, lastRunWasResume else { return }
+            // One a stop had begun closing can only be ended (its card does).
+            if node.unfinishedBroadcast?.ended == false { resumePending = true }
+        }
         .task {
             if resumePending, let unfinished = node.unfinishedBroadcast {
                 channel = unfinished.channel
@@ -418,14 +432,17 @@ struct LiveView: View {
                 } else {
                     let resume = resumePending
                     resumePending = false
+                    lastRunWasResume = resume
                     await broadcast.start(
                         node: node,
                         channel: channel.isEmpty ? "AntStream" : channel,
                         resume: resume
                     )
-                    // Refused (no plan, the camera, an entry the node
-                    // won't resume): still a resume, not a new broadcast
-                    // that would replace the unfinished one's entry.
+                    // Refused at start (no plan, the camera, an entry the
+                    // node won't resume): still a resume, not a new
+                    // broadcast that would replace the unfinished one's
+                    // entry. A refusal at the feed head comes later, when
+                    // the run ends: see `.onChange(of: broadcast.state)`.
                     if case .failed = broadcast.state, resume { resumePending = true }
                 }
             }

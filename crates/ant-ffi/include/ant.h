@@ -1489,8 +1489,9 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * uploaded. It holds "saved_at_ms", "channel", "owner", "topic",
  * "topic_text", "format", "broadcast_id", "feed_index" (the index of
  * the update it was written ahead of), the media and discontinuity
- * sequence, the dating clock and "recording" (every entry listed so
- * far; gap entries have "gap": true). It is removed once the recording
+ * sequence, the dating clock, "recording" (every entry listed so
+ * far; gap entries have "gap": true) and "shape" ("live", or "closing" /
+ * "recording" once a stop began closing the broadcast). It is removed once the recording
  * is the feed's head, and kept when the recording or its update fails.
  * A fresh broadcast with the same path replaces it at its first feed
  * update. The whole list is rewritten each time, about 250 bytes an
@@ -1505,15 +1506,21 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * holds every saved entry plus the new ones. The topic and "format" must
  * be the entry's and the node's owner its "owner"; a mismatch, a
  * missing or an unreadable entry fails the start and leaves the file
- * as it was. The feed head is read once (retried as for a new broadcast)
+ * as it was. The feed head is read once (retried until it answers)
  * only to learn whether the update the entry was written ahead of
  * landed; the run writes after it, and its playlist is not read as a
  * predecessor. A head anywhere else means the channel moved on since:
  * the run then ends by itself with nothing written and the reason in
  * "errors", the entry left in place. To finalize instead, start with
  * "resume" and call ant_publisher_stop straight away: the closing window
- * and the recording go up as on any stop. "resume" with "start_index"
- * is an error.
+ * and the recording go up as on any stop. Such a stopping run keeps
+ * retrying a head read that fails for up to a minute, rather than giving
+ * up at the first as a new broadcast does. An entry whose "shape" is past
+ * "live" (a stop had begun closing it, so a live viewer may already have
+ * stopped) is only finalized: the run starts stopped, refuses segments,
+ * and writes the closing window and the recording, or, if the recording
+ * is already the head, only removes the entry. "resume" with
+ * "start_index" is an error.
  *
  * An interruption pauses a broadcast, it never ends it (issue #172):
  * see ant_publisher_pause / ant_publisher_resume. It ends on

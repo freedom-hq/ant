@@ -175,7 +175,8 @@ struct BroadcastView: View {
     private func unfinishedCard(_ unfinished: UnfinishedBroadcast, now: Date) -> some View {
         let resumable = unfinished.canResume(now: now, reapMs: AntNode.broadcastReapMs)
         let since: String = Self.ago(unfinished.savedAt, now: now)
-        let what: String = "\"\(unfinished.channel)\" stopped \(since) when the app closed, "
+        let stopped: String = unfinished.ended ? "was ending" : "stopped"
+        let what: String = "\"\(unfinished.channel)\" \(stopped) \(since) when the app closed, "
             + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
         let next: String = resumable
             ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."

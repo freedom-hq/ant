@@ -572,6 +572,10 @@ struct UnfinishedBroadcast: Equatable {
     /// Playable segments it holds (gaps left out), and their media.
     let segments: Int
     let seconds: Double
+    /// A stop had begun closing it (the entry's `shape` is past "live"):
+    /// its `#EXT-X-ENDLIST` window or recording may already be the head,
+    /// and live viewers have stopped there, so it can only be ended.
+    let ended: Bool
 
     /// Decode a recovery entry, or `nil` for one this build can't read
     /// (left on disk all the same: it is the only record of the
@@ -593,16 +597,18 @@ struct UnfinishedBroadcast: Equatable {
             broadcastId: id,
             savedAt: Date(timeIntervalSince1970: savedMs / 1000),
             segments: media.count,
-            seconds: ms / 1000
+            seconds: ms / 1000,
+            ended: (obj["shape"] as? String ?? "live") != "live"
         )
     }
 
     /// Recent enough to carry on as the same broadcast: the app came back
     /// inside the reap window (a minute), the time a viewer would have
     /// waited for it anyway. Older, it can only be ended into its
-    /// recording.
+    /// recording. An entry a stop had begun closing is never resumed
+    /// (the node only finalizes it).
     func canResume(now: Date = Date(), reapMs: UInt64) -> Bool {
-        now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
+        !ended && now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
     }
 
     var durationLabel: String {

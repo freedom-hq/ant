@@ -471,18 +471,28 @@ pub struct PublisherConfig {
     /// is never read as a predecessor: that would glue the broadcast in
     /// front of itself.
     ///
-    /// The feed head is still read once (as for a new broadcast, retried
-    /// until it answers) to settle the one thing the entry can't know:
-    /// whether the update it was written ahead of landed. The run writes
-    /// after the head if the head is that update or the one before it; any
-    /// other head means the channel moved on since (another broadcast
-    /// wrote to it), and the run is refused there and ends with nothing
-    /// written, the error in its `errors`.
+    /// The feed head is still read once (retried until it answers) to
+    /// settle the one thing the entry can't know: whether the update it
+    /// was written ahead of landed. The run writes after the head if the
+    /// head is that update or the one before it; any other head means the
+    /// channel moved on since (another broadcast wrote to it), and the run
+    /// is refused there and ends with nothing written, the error in its
+    /// `errors`.
     ///
     /// To finalize instead of continuing (the entry is older than the reap
     /// window, or the host chose to end it), start with `resume` and stop
     /// straight away: the closing window and the recording go up as on any
-    /// stop.
+    /// stop. Unlike a new broadcast's, a stopping resumed run keeps
+    /// retrying a head read that fails (a cold peer's `503`, a `502`) for
+    /// up to a minute rather than giving up at the first one.
+    ///
+    /// An entry a stop had already begun closing (written ahead of the
+    /// closing window or the recording: its `shape` is past `"live"`) is
+    /// only ever finalized: a live viewer may already have stopped at its
+    /// `#EXT-X-ENDLIST`, so the run starts stopped, refuses every segment
+    /// (`Closed`), and ends with the closing window and the recording. If
+    /// the recording is already the head, the run writes nothing and only
+    /// removes the entry.
     #[serde(default)]
     pub resume: bool,
 }
@@ -1177,6 +1187,10 @@ struct PublisherState {
     /// index (issue #175): [`resume_feed_position`] reads the head to
     /// settle where the run writes instead of [`settle_feed_position`].
     resume_index: Option<u64>,
+    /// The shape of the update the resumed entry was written ahead of:
+    /// past [`PlaylistShape::Live`] the run only finalizes, and a
+    /// recording that landed means the broadcast is already finished.
+    resume_shape: PlaylistShape,
     /// The newest failure to write or remove the recovery entry. Kept out
     /// of `errors`: it costs a viewer nothing, and a full disk would
     /// otherwise fill the eight kept errors every segment.
@@ -1647,10 +1661,14 @@ impl PublisherState {
     }
 }
 
-/// Which playlist [`render_entries`] writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which playlist [`render_entries`] writes. A [`RecoveryEntry`] keeps
+/// the shape of the update it was written ahead of (`"live"`,
+/// `"closing"`, `"recording"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum PlaylistShape {
     /// The rolling live window.
+    #[default]
     Live,
     /// The live window closed with `#EXT-X-ENDLIST`, published at stop
     /// before the recording.
@@ -1879,6 +1897,21 @@ pub(crate) struct RecoveryEntry {
     /// The playlist the broadcast continued at go-live (issue #173),
     /// glued in front of its recording.
     predecessor: Option<Predecessor>,
+    /// The playlist the update at `feed_index` carries. Past `"live"` a
+    /// stop had begun closing the broadcast: its `#EXT-X-ENDLIST` window
+    /// (or its recording) may already be the head, and a live viewer has
+    /// stopped there, so a resumed run only finalizes it (see
+    /// [`PublisherConfig::resume`]). Missing reads as `"live"`.
+    #[serde(default)]
+    shape: PlaylistShape,
+}
+
+impl RecoveryEntry {
+    /// A stop had begun closing the broadcast this entry saved: it can be
+    /// finalized, never carried on live.
+    fn ended(&self) -> bool {
+        self.shape != PlaylistShape::Live
+    }
 }
 
 /// Read the entry at `path`. A missing file and an unreadable one are
@@ -1948,7 +1981,12 @@ fn clear_recovery(path: &str, broadcast_id: &str) -> Result<(), String> {
 impl PublisherState {
     /// The recovery entry for the state as it stands, written ahead of
     /// the feed update at `feed_index`.
-    fn recovery_entry(&self, run: &RunIdentity<'_>, feed_index: u64) -> RecoveryEntry {
+    fn recovery_entry(
+        &self,
+        run: &RunIdentity<'_>,
+        feed_index: u64,
+        shape: PlaylistShape,
+    ) -> RecoveryEntry {
         // Gaps still waiting for media took numbers nobody saw; a resumed
         // run hands them out again, so the recording's numbering (its
         // media sequence plus the position) matches the live windows'.
@@ -1974,6 +2012,7 @@ impl PublisherState {
             segment_ms: run.segment_ms,
             recording: self.recording.clone(),
             predecessor: self.predecessor.clone(),
+            shape,
         }
     }
 
@@ -2010,6 +2049,7 @@ impl PublisherState {
             },
             feed_index: entry.feed_index,
             resume_index: Some(entry.feed_index),
+            resume_shape: entry.shape,
             ..Self::default()
         }
     }
@@ -2679,9 +2719,13 @@ pub fn start_with_wall_offset(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    // An entry a stop had begun closing is only finalized: the run starts
+    // stopped, as if stopped straight away (see `PublisherConfig::resume`).
+    let mut finalize_only = false;
     let state = if config.resume {
         let entry = load_recovery(&config.recovery_path).map_err(PublisherError::Config)?;
         check_resumable(&entry, &config, &owner, &topic)?;
+        finalize_only = entry.ended();
         PublisherState::resumed(entry)
     } else {
         PublisherState {
@@ -2694,7 +2738,7 @@ pub fn start_with_wall_offset(
         }
     };
     let state = Arc::new(Mutex::new(state));
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(finalize_only));
     let push_notify = Arc::new(Notify::new());
     let commit_notify = Arc::new(Notify::new());
     let reap_notify = Arc::new(Notify::new());
@@ -3313,19 +3357,34 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
 /// did not answer (issue #173).
 const FEED_HEAD_RETRY: Duration = Duration::from_secs(2);
 
-/// Read the feed head until it answers, so the committer can start. Gives
-/// up at the first read that fails once the run is stopping or the stop
-/// call sealed the feed ([`LiveRun::seal_feed`]), so a stop waits on at
-/// most the read in flight (or the one after the retry pause), each under
-/// the [`PUBLISH_TIMEOUT`] deadline. The broadcast then writes no
-/// playlist and no feed update at all, because without the head every
-/// index and every number it could pick might be one an earlier
-/// broadcast already holds. Returns whether the position is known.
+/// How long a resumed run that is stopping (finalizing, or reaped) keeps
+/// retrying a feed head that does not answer before it gives up
+/// ([`settle_until_known`]). Inside `ant_publisher_stop`'s 130 s grace
+/// with room left for the closing window and the recording.
+const RESUME_HEAD_STOP_BUDGET: Duration = Duration::from_secs(60);
+
+/// Read the feed head until it answers, so the committer can start. A
+/// new broadcast gives up at the first read that fails once the run is
+/// stopping or the stop call sealed the feed ([`LiveRun::seal_feed`]), so
+/// a stop waits on at most the read in flight (or the one after the
+/// retry pause), each under the [`PUBLISH_TIMEOUT`] deadline. The
+/// broadcast then writes no playlist and no feed update at all, because
+/// without the head every index and every number it could pick might be
+/// one an earlier broadcast already holds. Returns whether the position
+/// is known.
+///
+/// A resumed run keeps retrying through a stop, for up to
+/// [`RESUME_HEAD_STOP_BUDGET`] after it began stopping (or until the stop
+/// call seals the feed): finalizing (resume and stop straight away) is
+/// the whole point of such a run, and the broadcast it carries already
+/// holds everything a viewer saw, so one cold or `503` head answer must
+/// not leave it unrecorded.
 ///
 /// A broadcast that can't read its head for its whole reap window
 /// ([`PublisherConfig::reap_ms`]) is reaped like any other that listed no
 /// media in that time.
 async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
+    let mut stopping_since: Option<Instant> = None;
     loop {
         let resume_index = {
             let state = lock(&ctx.state);
@@ -3338,6 +3397,15 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
             None => settle_feed_position(ctx).await,
             Some(saved) => match resume_feed_position(ctx, saved).await {
                 Ok(Resumed::Settled) => Ok(()),
+                Ok(Resumed::Finished) => {
+                    // Its recording is already the head: nothing to write.
+                    // Only the entry a failed removal left is cleared.
+                    ctx.clear_recovery_entry().await;
+                    ctx.cancel.store(true, Ordering::SeqCst);
+                    ctx.push_notify.notify_one();
+                    ctx.reap_notify.notify_one();
+                    return false;
+                }
                 Ok(Resumed::Refused(message)) => {
                     lock(&ctx.state).record_error(format!(
                         "resume: {message}; nothing was written, and the recovery entry \
@@ -3357,7 +3425,11 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
             Ok(()) => return true,
             Err(message) => {
                 let mut state = lock(&ctx.state);
-                let gave_up = ctx.cancelled() || state.feed_sealed;
+                let stopping = ctx.cancelled()
+                    && (resume_index.is_none()
+                        || stopping_since.get_or_insert_with(Instant::now).elapsed()
+                            >= RESUME_HEAD_STOP_BUDGET);
+                let gave_up = stopping || state.feed_sealed;
                 state.record_error(if gave_up {
                     format!(
                         "feed head: {message}; no playlist or feed update was written, \
@@ -3482,6 +3554,9 @@ enum Resumed {
     /// The head is anywhere else: the channel moved on since the entry
     /// was written. Never retried.
     Refused(String),
+    /// The entry was written ahead of the recording, and the head is it:
+    /// the broadcast is finished, only its entry was left behind.
+    Finished,
 }
 
 /// Settle a resumed broadcast's place in its feed (issue #175): read the
@@ -3526,6 +3601,9 @@ async fn resume_feed_position(ctx: &RunCtx, saved: u64) -> Result<Resumed, Strin
         )));
     }
     let mut state = lock(&ctx.state);
+    if state.resume_shape == PlaylistShape::Recording && next_index == saved + 1 {
+        return Ok(Resumed::Finished);
+    }
     state.feed_index = next_index;
     state.feed_settled = true;
     Ok(Resumed::Settled)
@@ -3638,7 +3716,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
         // from (only this task folds entries in), so it lists everything
         // the update can make visible.
         let recovery = (!ctx.config.recovery_path.is_empty())
-            .then(|| state.recovery_entry(&ctx.identity(), index));
+            .then(|| state.recovery_entry(&ctx.identity(), index, shape));
         (index, recovery)
     };
     // On disk before the update can land (issue #175): a kill after it
@@ -8651,7 +8729,7 @@ mod tests {
             format: StreamFormat::Bzz,
             segment_ms: 2000,
         };
-        let entry = saved.recovery_entry(&identity, 9);
+        let entry = saved.recovery_entry(&identity, 9, PlaylistShape::Live);
         assert_eq!(entry.feed_index, 9);
         assert_eq!(entry.owner, hex::encode(owner));
         assert_eq!(
@@ -8719,7 +8797,7 @@ mod tests {
             "{recording}"
         );
         // A resume configured with shorter segments keeps the target.
-        let mut short = saved.recovery_entry(&identity, 9);
+        let mut short = saved.recovery_entry(&identity, 9, PlaylistShape::Live);
         short.segment_ms = 6000;
         let short = PublisherState::resumed(short);
         assert!(short
@@ -8747,7 +8825,7 @@ mod tests {
             format: StreamFormat::Bzz,
             segment_ms: 2000,
         };
-        let mut entry = saved.recovery_entry(&identity, 0);
+        let mut entry = saved.recovery_entry(&identity, 0, PlaylistShape::Live);
         // The last listed segment, seq 6, ended at go-live + 14 s.
         let last_end = GO_LIVE_MS + 2000 * 7;
         entry.next_program_ms = None;
@@ -9116,6 +9194,111 @@ mod tests {
         );
         // The closing window again, then the recording.
         assert_eq!(soc_ids(&log).last().unwrap(), &slot(kept.feed_index + 2));
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// Finalizing right after a relaunch: the stop lands before the first
+    /// head read answers, and the node answers it with a 502 and its
+    /// cold-peer 503. The run keeps reading instead of giving up at the
+    /// first failure, and the recording still goes up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalizing_retries_a_head_that_did_not_answer() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("finalize-cold");
+        let (entry, _) = killed_broadcast(&log, &addr, &path).await;
+        lock(&log).head = Some(head_at(entry.feed_index));
+        lock(&log).fail_head = 1;
+        lock(&log).cold_head = 1;
+
+        let run = resumed_run(&addr, &path).unwrap();
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        assert!(
+            report.errors.iter().any(|e| e.contains("retrying")),
+            "{report:?}"
+        );
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// Rewrite the entry at `path` as one written ahead of a `shape`
+    /// update.
+    fn reshape_entry(path: &str, shape: PlaylistShape) -> RecoveryEntry {
+        let mut entry = load_recovery(path).unwrap();
+        entry.shape = shape;
+        save_recovery(path, &entry).unwrap();
+        entry
+    }
+
+    /// An entry written ahead of the closing window: a stop had begun,
+    /// and a live viewer may already have stopped at its
+    /// `#EXT-X-ENDLIST`. Resuming it only finalizes: the run starts
+    /// stopped, takes no segments, writes no live window, and ends with
+    /// the closing window and the recording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entry_a_stop_began_closing_is_only_finalized() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("ended");
+        let (_, before) = killed_broadcast(&log, &addr, &path).await;
+        let entry = reshape_entry(&path, PlaylistShape::Closing);
+        assert!(entry.ended());
+        // The closing window landed before the kill.
+        lock(&log).head = Some(head_at(entry.feed_index));
+
+        let run = resumed_run(&addr, &path).unwrap();
+        assert_eq!(
+            run.push(SegmentKind::Media, vec![9; 1000], 2000, false),
+            PushOutcome::Closed
+        );
+        settle(&run).await;
+        let report = run.report();
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        let after = &uploaded_playlists(&log)[before.len()..];
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(after[0].contains("#EXT-X-ENDLIST"), "{}", after[0]);
+        assert!(
+            after[1].contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "{}",
+            after[1]
+        );
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// An entry written ahead of the recording whose update landed (only
+    /// its removal failed): the broadcast is finished, so the run writes
+    /// nothing and clears the entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entry_whose_recording_landed_is_only_cleared() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("recorded");
+        let (_, before) = killed_broadcast(&log, &addr, &path).await;
+        let entry = reshape_entry(&path, PlaylistShape::Recording);
+        lock(&log).head = Some(head_at(entry.feed_index));
+        let socs = soc_ids(&log).len();
+
+        let run = resumed_run(&addr, &path).unwrap();
+        settle(&run).await;
+        assert_eq!(uploaded_playlists(&log).len(), before.len());
+        assert_eq!(soc_ids(&log).len(), socs, "no feed update");
+        assert!(!std::path::Path::new(&path).exists());
+
+        // Its update did not land: the head is the closing window before
+        // it, so the run finalizes again.
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("recorded-unlanded");
+        let _ = killed_broadcast(&log, &addr, &path).await;
+        let entry = reshape_entry(&path, PlaylistShape::Recording);
+        // (No head at all if the first update listed every segment.)
+        lock(&log).head = entry.feed_index.checked_sub(1).map(head_at);
+        let run = resumed_run(&addr, &path).unwrap();
+        settle(&run).await;
+        assert_ne!(run.report().recording_reference, "");
+        assert_eq!(soc_ids(&log).last().unwrap(), &slot(entry.feed_index + 1));
         assert!(!std::path::Path::new(&path).exists());
     }
 }

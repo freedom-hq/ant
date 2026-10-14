@@ -3643,7 +3643,8 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// backlog (capped at `max_backlog`, so at most one further round) —
 /// a feed-head read that had not answered yet (issue #173) can hold the
 /// playlists behind it for one more (a stop gives up on the head after
-/// that one read), and the closing window and recording add up to four
+/// that one read; a resumed run, finalizing, keeps retrying it for up to
+/// a minute, so a cold head doesn't leave the broadcast unrecorded), and the closing window and recording add up to four
 /// more (an upload and a feed update each), so a slow or wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an

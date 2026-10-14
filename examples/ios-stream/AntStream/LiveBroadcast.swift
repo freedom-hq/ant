@@ -60,6 +60,11 @@ final class LiveBroadcast: ObservableObject {
     /// knows the last segment has reached the publisher.
     private var pumpDrained = true
     private var idleTimerHeld = false
+    /// The running broadcast carries on an unfinished one (#175): the
+    /// node can still refuse it once it reads the feed head (the channel
+    /// moved on), which ends the run by itself with the reason in its
+    /// errors, and ``stop`` shows that reason as the failure.
+    private var resumedRun = false
 
     /// The quality preset the next broadcast encodes, picked on the live
     /// screen before going live and remembered across launches. 360p by
@@ -106,6 +111,7 @@ final class LiveBroadcast: ObservableObject {
         report = nil
         progress = nil
         capturedSegments = 0
+        resumedRun = resume
         state = .starting
 
         guard let batchId = node.plan?.batchId, node.plan?.enabled == true else {
@@ -231,6 +237,8 @@ final class LiveBroadcast: ObservableObject {
         pumpTask = nil
         releaseIdleTimer()
         deactivateAudioSession()
+        let wasResume = resumedRun
+        resumedRun = false
         do {
             report = try await node.stopPublisher()
         } catch {
@@ -238,6 +246,13 @@ final class LiveBroadcast: ObservableObject {
                 state = .failed(error.localizedDescription)
                 return
             }
+        }
+        // A resume the node refused at the feed head ended the run with
+        // nothing written: say why rather than read as a clean stop.
+        if failure == nil, wasResume,
+           let refusal = report?.errors.first(where: { $0.hasPrefix("resume:") }) {
+            state = .failed(refusal)
+            return
         }
         state = failure.map(State.failed) ?? .idle
     }

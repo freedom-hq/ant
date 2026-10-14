@@ -91,6 +91,11 @@ final class AntNode: ObservableObject {
     /// A broadcast started on this node and its stop has not returned:
     /// the recovery entry on disk is its own, not an unfinished one.
     private var publisherActive = false
+    /// ``finishUnfinishedBroadcast()`` is running: the publisher is that
+    /// broadcast, so ``unfinishedBroadcast`` stays up (its card shows the
+    /// finalize in progress, and Go live stays held) until the stop
+    /// returns and the entry on disk says how it went.
+    private var finalizingUnfinished = false
 
     /// The preferred gateway address and the start of the fallback range
     /// (the same range Freedom desktop uses).
@@ -783,7 +788,7 @@ final class AntNode: ObservableObject {
         guard let started = failure else { throw AntError.notReady }
         if let message = started { throw AntError.op(message) }
         publisherActive = true
-        unfinishedBroadcast = nil
+        if !finalizingUnfinished { unfinishedBroadcast = nil }
     }
 
     // MARK: - Unfinished broadcast (#175)
@@ -801,7 +806,7 @@ final class AntNode: ObservableObject {
     /// account is not known yet. An entry that can't be read is left on
     /// disk and not offered: the node could not resume it either.
     func refreshUnfinishedBroadcast() {
-        if unfinishedSampleActive { return }
+        if unfinishedSampleActive || finalizingUnfinished { return }
         guard !publisherActive, let owner = channel?.owner else {
             if unfinishedBroadcast != nil { unfinishedBroadcast = nil }
             return
@@ -825,6 +830,13 @@ final class AntNode: ObservableObject {
             throw AntError.op("Connect a storage plan to end the broadcast: its recording is an upload.")
         }
         let settings = CaptureEngine.Settings(quality: .low)
+        finalizingUnfinished = true
+        defer {
+            // Once the stop returned (or the start failed), the entry on
+            // disk decides: gone once the recording landed, kept to retry.
+            finalizingUnfinished = false
+            refreshUnfinishedBroadcast()
+        }
         try await startPublisher(
             channel: unfinished.channel,
             topic: channel.topic,
@@ -1149,15 +1161,6 @@ final class AntNode: ObservableObject {
         )
     }
 
-    /// Drive the Broadcast tab to its ready state with a channel link,
-    /// for the "Your channel" card's CI screenshot
-    /// (`-antstream-shot-channel`). The link exists only once a plan has
-    /// stamped the channel's feed manifest, and a fresh runner account
-    /// has no plan, so a sample plan, a deployed chequebook and a sample
-    /// reference are published. Nothing is persisted: the account's real
-    /// channel (topic, index, reference) is left untouched.
-    ///
-    /// Sample only, and only ever called behind `-antstream-shot-channel`.
     /// Set while ``installUnfinishedSample()``'s entry is showing, so a
     /// periodic refresh can't replace it with the runner's real (empty)
     /// state before the shot fires.
@@ -1177,10 +1180,20 @@ final class AntNode: ObservableObject {
             broadcastId: "19a3c5e2f10",
             savedAt: Date().addingTimeInterval(-20),
             segments: 214,
-            seconds: 428
+            seconds: 428,
+            ended: false
         )
     }
 
+    /// Drive the Broadcast tab to its ready state with a channel link,
+    /// for the "Your channel" card's CI screenshot
+    /// (`-antstream-shot-channel`). The link exists only once a plan has
+    /// stamped the channel's feed manifest, and a fresh runner account
+    /// has no plan, so a sample plan, a deployed chequebook and a sample
+    /// reference are published. Nothing is persisted: the account's real
+    /// channel (topic, index, reference) is left untouched.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-channel`.
     func installChannelSample() {
         screenshotSampleActive = true
         plan = Self.sampleConnectedPlan(
