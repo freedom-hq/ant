@@ -1514,7 +1514,8 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * "errors", the entry left in place. To finalize instead, start with
  * "resume" and call ant_publisher_stop straight away: the closing window
  * and the recording go up as on any stop. Such a stopping run keeps
- * retrying a head read that fails for up to a minute, rather than giving
+ * reading a head that fails or does not answer for up to a minute after
+ * the stop (a read still in flight then is dropped), rather than giving
  * up at the first as a new broadcast does. An entry whose "shape" is past
  * "live" (a stop had begun closing it, so a live viewer may already have
  * stopped) is only finalized: the run starts stopped, refuses segments,
@@ -1707,7 +1708,8 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * had already popped behind it, then the backlog — up to three rounds
  * of the 60 s per-request publish deadline), one more round for a
  * feed-head read that had not answered yet (see "start_index" at
- * ant_publisher_start; a stop gives up on it after that one), then the
+ * ant_publisher_start; a stop gives up on it after that one, a
+ * finalizing resumed run a minute after the stop), then the
  * closing window and the recording (an upload and a feed update each,
  * four more rounds) can still be finishing in the background past that,
  * with the report returned honestly either way. Call it off the main

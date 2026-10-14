@@ -61,10 +61,15 @@ struct LiveView: View {
             // A resumed run that ended with its entry still on disk (the
             // node refused it at the feed head, or it failed): the next
             // tap resumes again rather than replacing the entry with a
-            // new broadcast. Going back offers Discard on the card.
+            // new broadcast, as long as the entry can still be resumed
+            // (the same `canResume` the Broadcast tab's card offers
+            // Resume on). One a stop had begun closing, or older than the
+            // reap window, can only be ended: the button is then held
+            // (see `blockedByUnfinished`) and the card ends it. Any run,
+            // not only a resume, can leave such an entry behind (a stop
+            // whose recording upload failed).
             guard !state.isActive, lastRunWasResume else { return }
-            // One a stop had begun closing can only be ended (its card does).
-            if node.unfinishedBroadcast?.ended == false { resumePending = true }
+            resumePending = resumable(now: Date())
         }
         .task {
             if resumePending, let unfinished = node.unfinishedBroadcast {
@@ -424,12 +429,54 @@ struct LiveView: View {
 
     // MARK: controls
 
+    /// The unfinished broadcast (#175) can be carried on from here: the
+    /// Broadcast tab's own test for offering Resume on its card.
+    private func resumable(now: Date) -> Bool {
+        node.unfinishedBroadcast?.canResume(now: now, reapMs: AntNode.broadcastReapMs) == true
+    }
+
+    /// An unfinished broadcast's entry is on disk that this screen can't
+    /// carry on (it was ending, it is past the reap window, or this
+    /// screen was opened to go live, not to resume it). A new broadcast
+    /// would replace that entry with its first feed update and leave it
+    /// without its recording, so nothing starts from here: the Broadcast
+    /// tab's card ends it (or discards it, with confirmation).
+    private func blockedByUnfinished(now: Date) -> Bool {
+        guard !broadcast.state.isActive, node.unfinishedBroadcast != nil else { return false }
+        return !(resumePending && resumable(now: now))
+    }
+
     private var controls: some View {
+        // Re-read every few seconds, as the Broadcast tab's card does:
+        // Resume goes once the reap window has passed.
+        TimelineView(.periodic(from: .now, by: 5)) { context in
+            controlStack(now: context.date)
+        }
+    }
+
+    private func controlStack(now: Date) -> some View {
+        let blocked = blockedByUnfinished(now: now)
+        return VStack(spacing: 8) {
+            if blocked {
+                Text("End your unfinished broadcast on the Broadcast tab first: a new one would leave it without its recording.")
+                    .font(.caption)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            controlButton(blocked: blocked)
+        }
+    }
+
+    private func controlButton(blocked: Bool) -> some View {
         Button {
             Task {
                 if broadcast.state.isActive {
                     await broadcast.stop(node: node)
                 } else {
+                    // Checked again at the tap: the entry may have aged
+                    // past the reap window since the last redraw.
+                    guard !blockedByUnfinished(now: Date()) else { return }
                     let resume = resumePending
                     resumePending = false
                     lastRunWasResume = resume
@@ -447,7 +494,7 @@ struct LiveView: View {
                 }
             }
         } label: {
-            Text(controlTitle)
+            Text(controlTitle(blocked: blocked))
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -458,15 +505,18 @@ struct LiveView: View {
                 .foregroundStyle(.white)
         }
         .buttonStyle(.plain)
-        .disabled(broadcast.state == .starting || broadcast.state == .stopping)
+        .disabled(broadcast.state == .starting || broadcast.state == .stopping || blocked)
+        .opacity(blocked ? 0.5 : 1)
     }
 
-    private var controlTitle: String {
+    private func controlTitle(blocked: Bool) -> String {
         switch broadcast.state {
         case .starting: return "Starting…"
         case .stopping: return "Publishing the last segments…"
         case .live: return "Stop broadcast"
-        case .idle, .failed: return resumePending ? "Resume broadcast" : "Go live"
+        case .idle, .failed:
+            if blocked { return "Go live" }
+            return resumePending ? "Resume broadcast" : "Go live"
         }
     }
 }

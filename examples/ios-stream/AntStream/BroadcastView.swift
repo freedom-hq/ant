@@ -243,9 +243,16 @@ struct BroadcastView: View {
         defer { endingUnfinished = false }
         do {
             let report = try await node.finishUnfinishedBroadcast()
-            if let recording = report.recordingReference, !recording.isEmpty,
-               node.unfinishedBroadcast == nil {
-                banner.flash("Broadcast ended: its recording is on the channel")
+            // The entry is gone only once the recording is the channel's
+            // head: landed just now, or already before (the update had
+            // landed ahead of the kill, so the node only cleared the
+            // entry and the report carries no new recording). Either way
+            // the card is gone, so the outcome goes in the banner.
+            if node.unfinishedBroadcast == nil {
+                let landedNow = !(report.recordingReference ?? "").isEmpty
+                banner.flash(landedNow
+                    ? "Broadcast ended: its recording is on the channel"
+                    : "Broadcast ended: its recording was already on the channel")
             } else {
                 unfinishedOutcome = report.errors.first
                     ?? "Its recording did not go up; try again in a moment."

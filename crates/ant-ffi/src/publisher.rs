@@ -483,8 +483,9 @@ pub struct PublisherConfig {
     /// window, or the host chose to end it), start with `resume` and stop
     /// straight away: the closing window and the recording go up as on any
     /// stop. Unlike a new broadcast's, a stopping resumed run keeps
-    /// retrying a head read that fails (a cold peer's `503`, a `502`) for
-    /// up to a minute rather than giving up at the first one.
+    /// retrying a head read that fails (a cold peer's `503`, a `502`) or
+    /// does not answer for up to a minute after the stop (a read still in
+    /// flight then is dropped) rather than giving up at the first one.
     ///
     /// An entry a stop had already begun closing (written ahead of the
     /// closing window or the recording: its `shape` is past `"live"`) is
@@ -3358,10 +3359,45 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
 const FEED_HEAD_RETRY: Duration = Duration::from_secs(2);
 
 /// How long a resumed run that is stopping (finalizing, or reaped) keeps
-/// retrying a feed head that does not answer before it gives up
-/// ([`settle_until_known`]). Inside `ant_publisher_stop`'s 130 s grace
-/// with room left for the closing window and the recording.
+/// reading a feed head that does not answer before it gives up
+/// ([`settle_until_known`]). Measured from the stop itself (to within
+/// [`STOP_POLL`]), not from the first read that failed after it: a read
+/// still in flight at the budget's end is dropped rather than waited out
+/// under its own [`PUBLISH_TIMEOUT`]. So the head is given up at most
+/// ~60 s into `ant_publisher_stop`'s 130 s grace, leaving ~70 s for the
+/// closing window and the recording: seconds on a working uplink. A
+/// wedged one can't fit their four requests (each under
+/// [`PUBLISH_TIMEOUT`]) in any grace; the stop then seals the feed and
+/// the recovery entry is kept for another go, so nothing is lost.
 const RESUME_HEAD_STOP_BUDGET: Duration = Duration::from_secs(60);
+
+/// How often a resumed run's head read in flight checks whether a stop
+/// arrived and its [`RESUME_HEAD_STOP_BUDGET`] ran out.
+const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// Run `read` until it answers, or, once `cancelled` reports a stop,
+/// until [`RESUME_HEAD_STOP_BUDGET`] has passed since the stop was first
+/// seen (`stopping_since`, carried across reads so retries share one
+/// budget). `None` when the budget ran out; the read is dropped then.
+async fn read_within_stop_budget<T>(
+    read: impl std::future::Future<Output = T>,
+    cancelled: impl Fn() -> bool,
+    stopping_since: &mut Option<tokio::time::Instant>,
+) -> Option<T> {
+    tokio::pin!(read);
+    loop {
+        if cancelled() {
+            let since = *stopping_since.get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() >= RESUME_HEAD_STOP_BUDGET {
+                return None;
+            }
+        }
+        tokio::select! {
+            out = &mut read => return Some(out),
+            () = tokio::time::sleep(STOP_POLL) => {}
+        }
+    }
+}
 
 /// Read the feed head until it answers, so the committer can start. A
 /// new broadcast gives up at the first read that fails once the run is
@@ -3374,8 +3410,8 @@ const RESUME_HEAD_STOP_BUDGET: Duration = Duration::from_secs(60);
 /// is known.
 ///
 /// A resumed run keeps retrying through a stop, for up to
-/// [`RESUME_HEAD_STOP_BUDGET`] after it began stopping (or until the stop
-/// call seals the feed): finalizing (resume and stop straight away) is
+/// [`RESUME_HEAD_STOP_BUDGET`] after the stop, a read in flight then
+/// included (or until the stop call seals the feed): finalizing (resume and stop straight away) is
 /// the whole point of such a run, and the broadcast it carries already
 /// holds everything a viewer saw, so one cold or `503` head answer must
 /// not leave it unrecorded.
@@ -3384,7 +3420,9 @@ const RESUME_HEAD_STOP_BUDGET: Duration = Duration::from_secs(60);
 /// ([`PublisherConfig::reap_ms`]) is reaped like any other that listed no
 /// media in that time.
 async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
-    let mut stopping_since: Option<Instant> = None;
+    // Tokio's clock (the same as std's outside a paused test runtime),
+    // shared with `read_within_stop_budget`.
+    let mut stopping_since: Option<tokio::time::Instant> = None;
     loop {
         let resume_index = {
             let state = lock(&ctx.state);
@@ -3395,9 +3433,19 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
         };
         let result = match resume_index {
             None => settle_feed_position(ctx).await,
-            Some(saved) => match resume_feed_position(ctx, saved).await {
-                Ok(Resumed::Settled) => Ok(()),
-                Ok(Resumed::Finished) => {
+            Some(saved) => match read_within_stop_budget(
+                resume_feed_position(ctx, saved),
+                || ctx.cancelled(),
+                &mut stopping_since,
+            )
+            .await
+            {
+                None => Err(format!(
+                    "no answer within {}s of the stop",
+                    RESUME_HEAD_STOP_BUDGET.as_secs()
+                )),
+                Some(Ok(Resumed::Settled)) => Ok(()),
+                Some(Ok(Resumed::Finished)) => {
                     // Its recording is already the head: nothing to write.
                     // Only the entry a failed removal left is cleared.
                     ctx.clear_recovery_entry().await;
@@ -3406,7 +3454,7 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
                     ctx.reap_notify.notify_one();
                     return false;
                 }
-                Ok(Resumed::Refused(message)) => {
+                Some(Ok(Resumed::Refused(message))) => {
                     lock(&ctx.state).record_error(format!(
                         "resume: {message}; nothing was written, and the recovery entry \
                          is left as it was"
@@ -3418,7 +3466,7 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
                     ctx.reap_notify.notify_one();
                     return false;
                 }
-                Err(message) => Err(message),
+                Some(Err(message)) => Err(message),
             },
         };
         match result {
@@ -3427,8 +3475,12 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
                 let mut state = lock(&ctx.state);
                 let stopping = ctx.cancelled()
                     && (resume_index.is_none()
-                        || stopping_since.get_or_insert_with(Instant::now).elapsed()
+                        || stopping_since
+                            .get_or_insert_with(tokio::time::Instant::now)
+                            .elapsed()
                             >= RESUME_HEAD_STOP_BUDGET);
+                // A resumed run's retry pause counts against its budget
+                // too: the next read starts by checking it.
                 let gave_up = stopping || state.feed_sealed;
                 state.record_error(if gave_up {
                     format!(
@@ -9221,6 +9273,63 @@ mod tests {
             "{report:?}"
         );
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// R2-M1: a finalizing run's head budget runs from the stop, not from
+    /// the first read that failed after it. A read hanging on a wedged
+    /// uplink when the stop lands is dropped once the budget has passed
+    /// since the stop, instead of being waited out under its own
+    /// `PUBLISH_TIMEOUT` and only then starting the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_head_read_gives_up_a_budget_after_the_stop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop_after = Duration::from_secs(10);
+        tokio::spawn({
+            let cancel = Arc::clone(&cancel);
+            async move {
+                tokio::time::sleep(stop_after).await;
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        let began = tokio::time::Instant::now();
+        let mut since = None;
+        let out = read_within_stop_budget(
+            std::future::pending::<()>(),
+            || cancel.load(Ordering::SeqCst),
+            &mut since,
+        )
+        .await;
+        assert!(out.is_none());
+        let took = began.elapsed();
+        assert!(took >= stop_after + RESUME_HEAD_STOP_BUDGET, "{took:?}");
+        assert!(
+            took <= stop_after + RESUME_HEAD_STOP_BUDGET + 2 * STOP_POLL,
+            "{took:?}"
+        );
+
+        // A later read shares the spent budget: it gives up at once.
+        let again = tokio::time::Instant::now();
+        let out = read_within_stop_budget(
+            std::future::pending::<()>(),
+            || cancel.load(Ordering::SeqCst),
+            &mut since,
+        )
+        .await;
+        assert!(out.is_none());
+        assert_eq!(again.elapsed(), Duration::ZERO);
+
+        // A read that answers inside the budget is returned.
+        let mut since = None;
+        let out = read_within_stop_budget(
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                7
+            },
+            || true,
+            &mut since,
+        )
+        .await;
+        assert_eq!(out, Some(7));
     }
 
     /// Rewrite the entry at `path` as one written ahead of a `shape`

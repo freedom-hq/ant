@@ -3644,7 +3644,10 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// a feed-head read that had not answered yet (issue #173) can hold the
 /// playlists behind it for one more (a stop gives up on the head after
 /// that one read; a resumed run, finalizing, keeps retrying it for up to
-/// a minute, so a cold head doesn't leave the broadcast unrecorded), and the closing window and recording add up to four
+/// a minute after the stop, a read in flight then included, so a cold
+/// head doesn't leave the broadcast unrecorded and the closing window
+/// and recording still get ~70 s of the grace), and the closing window
+/// and recording add up to four
 /// more (an upload and a feed update each), so a slow or wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an
