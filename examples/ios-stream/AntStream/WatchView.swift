@@ -442,7 +442,10 @@ struct FeedAddress: Equatable {
 /// Segments themselves are plain `http://` URLs, fetched by `AVPlayer`
 /// directly. A custom URL scheme is what routes the playlist through a
 /// resource-loader delegate at all; `AVPlayer` never asks one for
-/// `http` URLs.
+/// `http` URLs. The one relative URI a playlist carries is a lost
+/// segment's `#EXT-X-GAP` placeholder (`gap-<sequence>`, #169), which
+/// resolves against ``playlistURL`` and so would come here: see
+/// ``isGapPlaceholder(_:)``.
 ///
 /// Requests are tracked so a cancelled one (the item replaced on retry
 /// or stop) cancels its read and is never answered. All state is touched
@@ -495,9 +498,26 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
-        guard loadingRequest.request.url?.scheme == Self.scheme else { return false }
+        guard let url = loadingRequest.request.url, url.scheme == Self.scheme else { return false }
+        if Self.isGapPlaceholder(url) {
+            // RFC 8216bis has a client skip a gap entry rather than load
+            // it. Should `AVPlayer` ask anyway, the answer is "no such
+            // resource", never the playlist text a feed read returns.
+            loadingRequest.finishLoading(with: NSError(
+                domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
+            return true
+        }
         read(bzzFormat ? bzzPlaylistURL : feedURL, for: loadingRequest)
         return true
+    }
+
+    /// `url` is an `#EXT-X-GAP` entry's placeholder, `gap-<sequence>`,
+    /// resolved against ``playlistURL``. Names no media: the segment was
+    /// dropped or its upload failed.
+    static func isGapPlaceholder(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return name.count > 4 && name.hasPrefix("gap-")
+            && name.dropFirst(4).allSatisfy(\.isNumber)
     }
 
     func resourceLoader(
@@ -571,7 +591,8 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// absolute on `gateway`: a bare reference (`"solar-punk"`) becomes
     /// `<gateway>/bytes/<ref>`, a gateway-root path (`"bzz"`,
     /// `/bzz/<ref>/<name>`) becomes `<gateway>/bzz/<ref>/<name>`.
-    /// Everything else, absolute URLs included, passes through.
+    /// Everything else, absolute URLs and `#EXT-X-GAP` placeholders
+    /// (`gap-<sequence>`) included, passes through.
     static func rewrite(_ playlist: String, gateway: URL) -> String {
         let map = "#EXT-X-MAP:URI=\""
         return playlist.split(separator: "\n", omittingEmptySubsequences: false)

@@ -3797,7 +3797,7 @@ pub unsafe extern "C" fn ant_publisher_start(
 ///
 /// * `0` — queued.
 /// * `1` — queued, and the oldest pending segment was dropped to stay at
-///   the live edge (the playlist marks the gap `#EXT-X-DISCONTINUITY`).
+///   the live edge (the playlist lists it as an `#EXT-X-GAP` entry).
 /// * `2` — refused: the broadcast is stopping.
 /// * `-1` — error, with an allocated message in `out_err` (free with
 ///   [`ant_free_string`]).

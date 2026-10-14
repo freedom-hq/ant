@@ -272,4 +272,4 @@ The stage-1 findings that became stage-2 constants:
 | window 4 sustains, window 8 collapses the connection layer | `DEFAULT_MAX_IN_FLIGHT = 4` |
 | 360p @ 900 kbit/s, 2 s segments is the reachable rendition | `DEFAULT_BITRATE_KBPS = 900`, `DEFAULT_SEGMENT_MS = 2000` |
 | lag budget = 3 × segment duration | `PublisherReport::kept_up` |
-| a publisher that quietly drifts behind is not a pass | drop-oldest backlog + `#EXT-X-DISCONTINUITY` |
+| a publisher that quietly drifts behind is not a pass | drop-oldest backlog + `#EXT-X-GAP` entries (#169) |

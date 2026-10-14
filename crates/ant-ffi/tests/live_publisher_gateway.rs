@@ -39,6 +39,12 @@ struct NodeLog {
     store: HashMap<[u8; 32], Vec<u8>>,
     /// Chunk reads served from `store`: what one viewer request costs.
     reads: usize,
+    /// Hold every command until cleared: an uplink that stalls, so the
+    /// publisher's backlog overflows and sheds segments.
+    paused: bool,
+    /// Refuse a chunk whose payload is this byte throughout: an upload
+    /// that fails.
+    reject_fill: Option<u8>,
 }
 
 /// A local chunk store over [`NodeLog::store`], so the stub node can run
@@ -63,8 +69,19 @@ impl ant_retrieval::ChunkFetcher for MemFetcher {
 async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLog>>) {
     let fetcher = MemFetcher(Arc::clone(&log));
     while let Some(cmd) = rx.recv().await {
+        while log.lock().unwrap().paused {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         match cmd {
             ControlCommand::PushChunk { wire, ack, .. } => {
+                let reject = log.lock().unwrap().reject_fill;
+                if reject.is_some_and(|fill| wire.len() > 8 && wire[8..].iter().all(|b| *b == fill))
+                {
+                    let _ = ack.send(ControlAck::Error {
+                        message: "refused".into(),
+                    });
+                    continue;
+                }
                 let Some(address) = bmt_address(&wire) else {
                     let _ = ack.send(ControlAck::Error {
                         message: "unsplittable chunk".into(),
@@ -768,4 +785,166 @@ async fn the_default_format_plays_through_the_channel_bzz_path() {
         assert_eq!(status, 200, "segment {i}");
         assert_eq!(segment, vec![i as u8; 40_000], "segment {i}");
     }
+}
+
+/// Wait until `done` holds for the run's snapshot.
+async fn wait_for(run: &publisher::LiveRun, done: impl Fn(&publisher::PublisherSnapshot) -> bool) {
+    for _ in 0..400 {
+        if done(&run.snapshot()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out: {:?}", run.snapshot());
+}
+
+/// Issue #169: a lost segment, whether the backlog dropped it or its
+/// upload failed, is listed as an `#EXT-X-GAP` entry at its own media
+/// sequence number, and arms no discontinuity. Read back through the
+/// real gateway, every feed update a viewer could have polled agrees on
+/// every segment's number while a 3-segment window slides past the
+/// holes, no update starts or ends on a gap, and the dates run on
+/// without a reset across them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
+    const FAIL: u8 = 0xf0;
+    let log = Arc::new(Mutex::new(NodeLog {
+        reject_fill: Some(FAIL),
+        ..NodeLog::default()
+    }));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config = PublisherConfig {
+        channel: "integration".into(),
+        topic: String::new(),
+        topic_text: "antstream-integration-gaps".into(),
+        format: StreamFormat::SolarPunk,
+        gateway: format!("http://{addr}"),
+        batch_id: "ab".repeat(32),
+        segment_ms: 2000,
+        bitrate_kbps: 900,
+        max_in_flight: 1,
+        max_backlog: 2,
+        playlist_window: 3,
+        notes: String::new(),
+        start_index: 0,
+    };
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    // Media segment `i` is filled with byte `i` (one chunk each), so a
+    // listed reference reads back as its own number.
+    let segment = |fill: u8| vec![fill; 4000];
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    let _ = run.push(SegmentKind::Media, segment(0), 2000, false);
+    wait_for(&run, |s| s.feed_index >= 1).await;
+
+    // The uplink stalls while 1-6 are captured: the backlog of 2 sheds.
+    log.lock().unwrap().paused = true;
+    let mut dropped_any = false;
+    for i in 1..=6u8 {
+        dropped_any |= run.push(SegmentKind::Media, segment(i), 2000, false)
+            == publisher::PushOutcome::QueuedDroppingOldest;
+    }
+    assert!(dropped_any, "the burst must overflow the backlog");
+    log.lock().unwrap().paused = false;
+    wait_for(&run, |s| s.segments_published + s.segments_dropped >= 7).await;
+    // 7's upload fails; 8-11 land one by one, so the window slides past
+    // both holes an update at a time.
+    let _ = run.push(SegmentKind::Media, vec![FAIL; 4000], 2000, false);
+    wait_for(&run, |s| s.segments_failed == 1).await;
+    for i in 8..=11u8 {
+        let before = run.snapshot().feed_index;
+        let _ = run.push(SegmentKind::Media, segment(i), 2000, false);
+        wait_for(&run, |s| s.feed_index > before).await;
+    }
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.segments_failed, 1, "{report:?}");
+    assert!(report.segments_dropped > 0, "{report:?}");
+    let lost = report.segments_dropped + report.segments_failed;
+    assert_eq!(report.segments_listed + lost, 12, "{report:?}");
+
+    // Every update, read the way a viewer polls it.
+    let topic = publisher::topic_from_string("antstream-integration-gaps");
+    let owner_hex = hex::encode(owner());
+    let mut numbers: HashMap<String, u64> = HashMap::new();
+    let mut gaps_seen = std::collections::BTreeSet::new();
+    for index in 0..report.feed_updates {
+        let id = ant_retrieval::sequence_update_id(&topic, index);
+        let (status, _, body) =
+            http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(id))).await;
+        assert_eq!(status, 200, "update {index}");
+        let playlist = String::from_utf8(body).unwrap();
+        assert!(
+            !playlist.contains("#EXT-X-DISCONTINUITY"),
+            "a hole is not a break:\n{playlist}"
+        );
+        let first: u64 = playlist
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let lines: Vec<&str> = playlist.lines().collect();
+        let uris: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| !l.starts_with('#'))
+            .collect();
+        assert!(!uris[0].starts_with("gap-"), "starts on a gap:\n{playlist}");
+        assert!(
+            !uris.last().unwrap().starts_with("gap-"),
+            "ends on a gap:\n{playlist}"
+        );
+        for (i, uri) in uris.iter().enumerate() {
+            let number = first + i as u64;
+            let at = lines.iter().position(|l| l == uri).unwrap();
+            if let Some(gap) = uri.strip_prefix("gap-") {
+                // Solar Punk's shape: the tag, the date, the duration, a
+                // placeholder named after its own sequence.
+                assert_eq!(gap.parse::<u64>().unwrap(), number, "{playlist}");
+                assert_eq!(lines[at - 3], "#EXT-X-GAP", "{playlist}");
+                assert!(lines[at - 2].starts_with("#EXT-X-PROGRAM-DATE-TIME:"));
+                assert_eq!(lines[at - 1], "#EXTINF:2.000,", "{playlist}");
+                gaps_seen.insert(number);
+            } else {
+                let (status, _, data) = http_get(&addr, &format!("/bytes/{uri}")).await;
+                assert_eq!(status, 200);
+                assert_eq!(
+                    u64::from(data[0]),
+                    number,
+                    "segment listed at the wrong number:\n{playlist}"
+                );
+            }
+            let seen = *numbers.entry((*uri).to_string()).or_insert(number);
+            assert_eq!(seen, number, "{uri} renumbered:\n{playlist}");
+        }
+        // The dates run straight through the gaps: one 2 s step per
+        // entry, no reset.
+        let dates: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:"))
+            .map(parse_program_date_time)
+            .collect();
+        assert_eq!(dates.len(), uris.len(), "{playlist}");
+        for pair in dates.windows(2) {
+            assert_eq!(pair[1] - pair[0], 2000, "{playlist}");
+        }
+    }
+    // Every lost segment was listed as a gap somewhere, the failed one
+    // (number 7) among them.
+    assert!(gaps_seen.contains(&7), "{gaps_seen:?}");
+    assert_eq!(gaps_seen.len() as u64, lost, "{gaps_seen:?}");
 }
