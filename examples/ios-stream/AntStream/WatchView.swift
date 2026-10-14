@@ -439,6 +439,19 @@ struct FeedAddress: Equatable {
 ///   `/bzz/<ref>/<name>` paths are made absolute on `gateway`. Once seen,
 ///   later reloads go straight there.
 ///
+/// **Joining from a ladder marker** (#174). A broadcast started with
+/// `"ladder": true` (this app's are) writes a small marker every ten
+/// seconds at an address computed from the clock, naming the feed's
+/// newest index. So the very first read of a load is preceded by one
+/// marker read (``markerIndex(_:period:topic:)``, the previous period's
+/// marker, then the one before it) and, when a marker names the
+/// channel, made as `GET <gateway>/feeds/<owner>/<topic>?after=<index>`:
+/// one round of slot reads from there instead of a walk from index 0,
+/// which a viewer an hour into a broadcast pays in many rounds. The node
+/// remembers where the feed stood, so later reloads (and a `"bzz"`
+/// channel's `/bzz` read) start there too. No marker, or one that
+/// doesn't parse, means the read goes out as before.
+///
 /// Segments themselves are plain `http://` URLs, fetched by `AVPlayer`
 /// directly. A custom URL scheme is what routes the playlist through a
 /// resource-loader delegate at all; `AVPlayer` never asks one for
@@ -467,6 +480,9 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// Called (on ``queue``) when a feed read finds the `"bzz"` format,
     /// so the watcher can skip the feed lookup on its next retry.
     private let onBzzFormat: (() -> Void)?
+    /// The first playlist request has been answered or is being: only it
+    /// looks for a ladder marker.
+    private var joined = false
 
     init(
         gateway: URL, address: FeedAddress, channel: String,
@@ -507,8 +523,98 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
                 domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
             return true
         }
-        read(bzzFormat ? bzzPlaylistURL : feedURL, for: loadingRequest)
+        if joined {
+            read(bzzFormat ? bzzPlaylistURL : feedURL, for: loadingRequest)
+        } else {
+            joined = true
+            join(loadingRequest)
+        }
         return true
+    }
+
+    /// The first read: from the newest ladder marker's index when there
+    /// is one (see the type's doc). Even a `"bzz"` channel reads the feed
+    /// once there, since that read is what moves the node's position for
+    /// the feed on to the marker's index; ``finished`` then goes on to
+    /// its `/bzz` path. On ``queue``.
+    private func join(_ loadingRequest: AVAssetResourceLoadingRequest, older: Bool = false) {
+        let now = UInt64(max(0, Date().timeIntervalSince1970) * 1000) / 10_000
+        // The current period's marker may not be written yet, so the one
+        // before it, then the one before that, as Solar Punk's player does.
+        let period = now - (older ? 2 : 1)
+        guard now >= 2, let id = Self.markerID(topic: address.topic, period: period) else {
+            read(bzzFormat ? bzzPlaylistURL : feedURL, for: loadingRequest)
+            return
+        }
+        let url = gateway.appending(path: "soc/\(address.owner)/\(id)")
+        let request = URLRequest(
+            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            self.queue.async {
+                // Cancelled meanwhile: nobody is waiting.
+                guard self.tasks.removeValue(forKey: ObjectIdentifier(loadingRequest)) != nil,
+                      !loadingRequest.isCancelled, !loadingRequest.isFinished
+                else { return }
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                let index = error == nil && code == 200
+                    ? data.flatMap { Self.markerIndex($0, period: period, topic: self.address.topic) }
+                    : nil
+                if let index {
+                    var feed = self.feedURL
+                    feed.append(queryItems: [URLQueryItem(name: "after", value: String(index))])
+                    self.read(feed, for: loadingRequest)
+                } else if !older, error == nil, code == 404 {
+                    // Missing, not a fault: the period before may have one.
+                    self.join(loadingRequest, older: true)
+                } else {
+                    self.read(self.bzzFormat ? self.bzzPlaylistURL : self.feedURL, for: loadingRequest)
+                }
+            }
+        }
+        tasks[ObjectIdentifier(loadingRequest)] = task
+        task.resume()
+    }
+
+    /// The marker's identifier for the channel with feed topic `topic`
+    /// in `period`, from the library (the publisher computes the same).
+    static func markerID(topic: String, period: UInt64) -> String? {
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        guard let raw = topic.withCString({ ant_ladder_marker_id($0, period, &errPtr) }) else {
+            if let errPtr { ant_free_string(errPtr) }
+            return nil
+        }
+        defer { ant_free_string(raw) }
+        return String(cString: raw)
+    }
+
+    /// The feed index a marker read for `period` names for `topic`, or
+    /// `nil` for anything that is not exactly a version 2 marker of that
+    /// period: the checks Solar Punk's `parseLadderMarker` makes, since
+    /// the index is jumped to without a second look.
+    static func markerIndex(_ data: Data, period: UInt64, topic: String) -> UInt64? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == ["v", "period", "writtenAt", "rungs", "segmentMs"],
+              let v = whole(object["v"]), v == 2,
+              whole(object["period"]) == period,
+              let writtenAt = whole(object["writtenAt"]), writtenAt / 10_000 == period,
+              let segmentMs = whole(object["segmentMs"]), segmentMs > 0,
+              let rungs = object["rungs"] as? [String: Any], !rungs.isEmpty
+        else { return nil }
+        return whole(rungs[topic.lowercased()])
+    }
+
+    /// A JSON number that is a whole, non-negative, exactly representable
+    /// integer (not a Boolean, which `JSONSerialization` also reads as an
+    /// `NSNumber`).
+    private static func whole(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let double = number.doubleValue
+        guard double >= 0, double <= 9_007_199_254_740_991, double.rounded() == double
+        else { return nil }
+        return UInt64(double)
     }
 
     /// `url` is an `#EXT-X-GAP` entry's placeholder, `gap-<sequence>`,
@@ -563,7 +669,8 @@ final class FeedPlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
         guard data.starts(with: Data("#EXTM3U".utf8)),
               let playlist = String(data: data, encoding: .utf8)
         else {
-            if url == feedURL {
+            // The feed read, with or without the marker's `?after=`.
+            if url.path == feedURL.path {
                 // A v1 update: the feed's content is the playlist's
                 // manifest. Read the channel's `/bzz` path instead.
                 if !bzzFormat {

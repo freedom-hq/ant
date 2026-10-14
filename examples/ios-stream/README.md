@@ -238,6 +238,14 @@ device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM
    New channels get a text topic (`antstream-<uuid>`, passed as
    `topic_text`), which a Solar Punk catalog entry can name; a channel
    made before keeps its random topic bytes, and with them its link.
+   Every broadcast also passes `"ladder": true` (#174): every ten
+   seconds the node writes a small ladder time marker at an address
+   computed from the clock (`ant_ladder_marker_id`), naming the feed's
+   newest index, so a viewer joining hours in reads one marker and then
+   one round of feed slots instead of walking the feed from 0. 360
+   chunks an hour on the plan. (Under `"solar-punk"` the node would also
+   write a one-rung master playlist for Solar Punk's players; not under
+   `"bzz"`.)
 3. The screen shows the **publish lag** (capture → the feed update that
    makes the segment playable) the whole time, plus how many segments
    the live-edge discipline dropped to hold it there.
@@ -329,7 +337,13 @@ app publishes) it is not, so the delegate reads `/bzz/<ref>/stream.m3u8`
 instead and makes its `/bzz/...` segment paths absolute on the gateway.
 Once a channel is known to be `"bzz"`, the tab's automatic reloads go
 straight to `/bzz` without the feed lookup; playing it again by hand
-checks the format afresh. The player follows the live edge. A channel that is not live
+checks the format afresh. The first read of every load joins from the newest
+ladder marker when the channel has one (#174): the previous ten-second
+period's marker, then the one before, read with `GET /soc`, and the feed
+read anchored at the index it names (`GET /feeds/...?after=<index>`),
+which the node then remembers for the `/bzz` read and every reload. No
+marker (a channel published before markers, a device clock off by more
+than a period) just means the feed is walked as before. The player follows the live edge. A channel that is not live
 yet, an item that fails to load, and a live playlist that stops moving
 (a broadcast that ended without closing its playlist) all reload the
 channel after a short pause, with a plain message saying so; a closed

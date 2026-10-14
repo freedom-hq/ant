@@ -733,6 +733,13 @@ final class AntNode: ObservableObject {
             // `LiveBroadcast` notices the `reaped` flag and finishes the
             // stop.
             "reap_ms": Self.reapMsForThisLaunch,
+            // A ladder time marker every ten seconds (#174), so a viewer
+            // joining hours in reads one marker and then one round of
+            // feed slots from the index it names instead of walking the
+            // feed from 0 (the Watch tab here does). 360 chunks an hour
+            // on the plan. Under "bzz" there is no master playlist: that
+            // is for Solar Punk's players, which read "solar-punk" only.
+            "ladder": true,
         ]
         // One or the other: the publisher refuses both at once.
         if let topicText {
