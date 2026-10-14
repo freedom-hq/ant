@@ -5350,7 +5350,7 @@ mod tests {
         // 1. the channel's feed manifest.
         let manifest = seen
             .iter()
-            .find(|r| r.method_path.contains("/feeds/"))
+            .find(|r| r.method_path.starts_with("POST /feeds/"))
             .expect("feed manifest created");
         assert!(
             manifest.method_path.contains(&format!(
@@ -5885,7 +5885,7 @@ mod tests {
         );
         let manifest = seen
             .iter()
-            .find(|r| r.method_path.contains("/feeds/"))
+            .find(|r| r.method_path.starts_with("POST /feeds/"))
             .expect("feed manifest created");
         assert!(
             manifest
@@ -6358,7 +6358,7 @@ mod tests {
         let feeds = lock(&log)
             .seen
             .iter()
-            .filter(|r| r.method_path.contains("/feeds/"))
+            .filter(|r| r.method_path.starts_with("POST /feeds/"))
             .count();
         assert!(feeds >= 2, "retry never fired ({feeds} POST /feeds)");
         assert!(!report.channel_reference.is_empty(), "{report:?}");
