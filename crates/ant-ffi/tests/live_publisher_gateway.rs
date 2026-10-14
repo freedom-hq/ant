@@ -402,6 +402,9 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         notes: String::new(),
         start_index: None,
         reap_ms: 0,
+        ladder: false,
+        width: 0,
+        height: 0,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -993,6 +996,9 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         notes: String::new(),
         start_index: None,
         reap_ms: 0,
+        ladder: false,
+        width: 0,
+        height: 0,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -1615,4 +1621,137 @@ async fn two_broadcasts_are_one_channel_in_the_solar_punk_format() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_broadcasts_are_one_channel_in_the_default_format() {
     two_broadcasts_are_one_channel(StreamFormat::Bzz).await;
+}
+
+/// Issue #174, the acceptance case through the real gateway: a viewer
+/// joining a broadcast two hours in (feed index 3600 at 2 s segments)
+/// reaches the live playlist in two round trips, the ladder marker and
+/// then one round of slot reads from the index it names, never walking
+/// the feed up from 0. Before that, a Solar Punk catalog entry naming
+/// only the group text finds the one-rung master on the group's feed,
+/// and its URI names the channel's feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_two_hours_in_joins_from_the_marker_in_two_round_trips() {
+    const TEXT: &str = "antstream-ladder-integration";
+    const TWO_HOURS_IN: u64 = 3600;
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic_text": TEXT,
+        "format": "solar-punk",
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "start_index": TWO_HOURS_IN,
+        "ladder": true,
+        "width": 640,
+        "height": 360,
+    }))
+    .unwrap();
+    // The wall clock moved on so the next marker period starts in 1.5 s.
+    let to_boundary = 10_000 - now_ms() % 10_000;
+    let offset = i64::try_from(to_boundary).unwrap() - 1500;
+    let wall = || now_ms().saturating_add_signed(offset);
+    let run = publisher::start_with_wall_offset(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+        offset,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    for i in 0..3u8 {
+        let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+    }
+    wait_for(&run, |s| {
+        !s.master_reference.is_empty()
+            && s.markers_written > 0
+            && s.segments_listed == 3
+            // Every playlist's feed update landed.
+            && s.feed_index == Some(TWO_HOURS_IN + s.playlists_published)
+    })
+    .await;
+    // The newest live update, which a joining viewer should land on.
+    let newest = run.snapshot().feed_index.unwrap() - 1;
+    assert!(newest >= TWO_HOURS_IN);
+
+    let owner_hex = hex::encode(owner());
+    let topic = publisher::topic_from_string(TEXT);
+    let group_text = publisher::ladder_group_text(&topic);
+    assert_eq!(run.snapshot().ladder_group, group_text);
+    let group = publisher::topic_from_string(&group_text);
+
+    // The master, from the group feed, as a catalog entry's source URL
+    // (`swarm://<owner>/<group text>`) is read.
+    let (status, _, master) =
+        http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(group))).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&master));
+    assert_eq!(
+        String::from_utf8(master).unwrap(),
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+         #EXT-X-STREAM-INF:BANDWIDTH=160000,AVERAGE-BANDWIDTH=160000,RESOLUTION=640x360\n\
+         swarm://"
+            .to_string()
+            + &owner_hex
+            + "/"
+            + TEXT
+            + "\n",
+    );
+
+    // Round trip 1: the marker. A viewer computes its address from the
+    // clock alone, reading the period before its own, as Solar Punk's
+    // `MarkerFinder` does (here a viewer arriving one period later).
+    let viewer_period = publisher::marker_period_at(wall()) + 1;
+    let id = publisher::ladder_marker_identifier(&group, viewer_period - 1);
+    let reads = log.lock().unwrap().reads;
+    let (status, _, marker) =
+        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(id))).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&marker));
+    assert_eq!(log.lock().unwrap().reads - reads, 1, "one chunk");
+    let marker: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+    assert_eq!(marker["v"], 2);
+    assert_eq!(marker["period"], viewer_period - 1);
+    assert_eq!(marker["segmentMs"], 2000);
+    let index = marker["rungs"][hex::encode(topic)].as_u64().unwrap();
+    assert!((TWO_HOURS_IN..=newest).contains(&index), "{marker}");
+
+    // Round trip 2: the feed read anchored at that index, one round of
+    // parallel slot reads (the finder's look-ahead window), to the head.
+    let reads = log.lock().unwrap().reads;
+    let (status, head, playlist) = http_get(
+        &addr,
+        &format!("/feeds/{owner_hex}/{}?after={index}", hex::encode(topic)),
+    )
+    .await;
+    let reads = log.lock().unwrap().reads - reads;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&playlist));
+    assert!(
+        head.contains(&format!(
+            "swarm-feed-index: {}",
+            hex::encode(newest.to_be_bytes())
+        )),
+        "{head}"
+    );
+    let playlist = String::from_utf8(playlist).unwrap();
+    assert!(playlist.starts_with("#EXTM3U\n") && !playlist.contains("#EXT-X-ENDLIST"));
+    assert_eq!(playlist.matches("#EXTINF").count(), 3, "{playlist}");
+    // The anchor plus one window of look-ahead probes (offsets up to 2^8
+    // past it), nowhere near the 3600 slots under it.
+    eprintln!("head read from the marker's index: {reads} chunk reads");
+    assert!(reads <= 32, "{reads} chunk reads for the head");
+
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let report = run.report();
+    assert_eq!(report.error_count, 0, "{:?}", report.errors);
+    assert!(report.markers_written >= 1, "{report:?}");
+    assert!(!report.master_reference.is_empty(), "{report:?}");
+    assert_eq!(log.lock().unwrap().invalid_socs, 0);
 }

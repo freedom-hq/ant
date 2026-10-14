@@ -86,6 +86,17 @@
 //! over a topic that outlives a session. See
 //! [`PublisherConfig::start_index`].
 //!
+//! **A channel can be a one-rung ladder** (issue #174,
+//! [`PublisherConfig::ladder`]), so a viewer joining hours in doesn't
+//! walk thousands of feed updates from index 0: every ten seconds a
+//! small **ladder time marker** at an address computed from the clock
+//! names the feed's newest index (a viewer reads it, then one round of
+//! slots from there), and under `"solar-punk"` a **master playlist**
+//! with a measured `BANDWIDTH` names the channel's feed on the ladder's
+//! own group feed, the way a Solar Punk catalog entry points at a ladder.
+//! Both in Solar Punk's version-2 encoding, so their players join the
+//! same way.
+//!
 //! Live-edge discipline, straight from the stage-1 findings:
 //!
 //! * The in-flight window defaults to **4**. Stage 1 measured window 4
@@ -368,6 +379,49 @@ pub struct PublisherConfig {
     /// the Android app does not yet).
     #[serde(default)]
     pub reap_ms: u64,
+    /// Publish the channel as a one-rung ladder too (issue #174): a
+    /// **ladder time marker** every ten seconds, and under
+    /// `"solar-punk"` a **master playlist**, so a viewer joining hours
+    /// into a broadcast reaches the live playlist in two round trips
+    /// instead of walking the feed from index 0.
+    ///
+    /// - The ladder's group is the text [`ladder_group_text`] of the
+    ///   topic, `antstream-ladder-<topic hex>`, its master feed topic
+    ///   [`topic_from_string`] of that. A viewer holding only the
+    ///   channel (owner and topic) computes both; a catalog entry points
+    ///   at the ladder by the group text, the way it points at a Solar
+    ///   Punk ladder.
+    /// - Markers: one single-owner chunk per 10 s period of global time,
+    ///   at [`ladder_marker_identifier`], naming the newest feed index
+    ///   this broadcast has published and [`PublisherConfig::segment_ms`]
+    ///   ([`encode_ladder_marker`], version 2, Solar Punk's
+    ///   `ladderMarker.ts`). In either format, from the first landed
+    ///   feed update until the stop, none while paused. 360 chunks an
+    ///   hour. A marker that fails is skipped: a viewer that finds none
+    ///   searches the feed as before. Marker and master failures go to
+    ///   `ladder_failures`/`ladder_error`, not `errors`.
+    /// - Master (`"solar-punk"` with a text topic that fits a URI only:
+    ///   the rung's URI is `swarm://<owner>/<topic_text>`, and readers
+    ///   hash the text in it, so a raw topic can't be named there, nor a
+    ///   text with a `/` in it such as the default `antstream/<channel>`
+    ///   ([`fits_swarm_uri`]); a `"bzz"` feed is not one a Solar Punk
+    ///   player reads): one `#EXT-X-STREAM-INF` whose
+    ///   `BANDWIDTH` is measured from the segments listed so far
+    ///   ([`render_master_playlist`]), written to the group's feed once
+    ///   three segments are measured and again whenever the measured peak
+    ///   outgrows the one it advertises by a quarter. Continues the
+    ///   group feed's head like the channel's own feed.
+    ///
+    /// Off by default: it costs chunks on the batch, and only viewers
+    /// that read markers gain from it.
+    #[serde(default)]
+    pub ladder: bool,
+    /// Rendition size, for the master playlist's `RESOLUTION`. Left out
+    /// of it unless both are set.
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 /// The reap window Solar Punk's uploader runs with (`ORPHAN_REAP_MS`, 60
@@ -502,12 +556,11 @@ pub const LADDER_MARKER_PERIOD_SECONDS: u64 = 10;
 /// `keccak256("ladder-marker" ‖ group topic ‖ period as u64 big-endian)`,
 /// `group` being the ladder's master feed topic
 /// ([`topic_from_string`] of the group id) and `period`
-/// `unix_ms / (LADDER_MARKER_PERIOD_SECONDS × 1000)`.
+/// [`marker_period_at`].
 ///
-/// A marker names the newest index of every rung of an ABR ladder. This
-/// publisher writes a single rendition, which Solar Punk players find by
-/// searching the feed, so it writes no markers; this is the address it
-/// would write them at.
+/// A marker names the newest index of every rung of an ABR ladder. With
+/// [`PublisherConfig::ladder`] this publisher writes one for its single
+/// rung every period, under the group [`ladder_group_text`].
 #[must_use]
 pub fn ladder_marker_identifier(group: &[u8; 32], period: u64) -> [u8; 32] {
     const PREFIX: &[u8] = b"ladder-marker";
@@ -516,6 +569,167 @@ pub fn ladder_marker_identifier(group: &[u8; 32], period: u64) -> [u8; 32] {
     input.extend_from_slice(group);
     input.extend_from_slice(&period.to_be_bytes());
     ant_crypto::keccak256(&input)
+}
+
+/// Marker period length in ms.
+const LADDER_MARKER_PERIOD_MS: u64 = LADDER_MARKER_PERIOD_SECONDS * 1000;
+
+/// The marker format written: `LADDER_MARKER_VERSION` in
+/// `ladderMarker.ts`. Readers treat any other version as absent.
+pub const LADDER_MARKER_VERSION: u32 = 2;
+
+/// The period a wall-clock instant (Unix ms) falls in:
+/// `floor(unix_ms / 10 000)`, `markerPeriodAt`. Global time, so a reader
+/// needs nothing but its clock.
+#[must_use]
+pub const fn marker_period_at(unix_ms: u64) -> u64 {
+    unix_ms / LADDER_MARKER_PERIOD_MS
+}
+
+/// The group id of a channel's one-rung ladder (issue #174):
+/// `antstream-ladder-<topic as 64 lowercase hex>`. Text, because readers
+/// name a ladder by a string they hash ([`topic_from_string`] gives the
+/// master feed topic, and the marker identifier is keyed by that), and
+/// derived from the topic *bytes*, so a viewer that has only the
+/// channel's owner and topic (all a channel reference's feed manifest
+/// carries) computes it too. No `/`: a Solar Punk player names a feed
+/// as `swarm://<owner>/<topic text>` and keeps only what comes before
+/// the next `/` of it (see [`fits_swarm_uri`]).
+#[must_use]
+pub fn ladder_group_text(topic: &[u8; 32]) -> String {
+    format!("antstream-ladder-{}", hex::encode(topic))
+}
+
+/// Whether `text` reads back whole from a `swarm://<owner>/<text>` URI
+/// in a playlist: Solar Punk's `parseSwarmUri` splits the URI on `/`
+/// and keeps the second piece, so a `/` would cut it short, and a
+/// playlist line can't carry whitespace, `#`, `?` or `%` unescaped
+/// without a player reading something else. The default topic text
+/// `antstream/<channel>` doesn't fit, so its channel gets markers but
+/// no master.
+#[must_use]
+pub fn fits_swarm_uri(text: &str) -> bool {
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '%') || c.is_whitespace() || c.is_control())
+}
+
+/// One marker's chunk payload: the JSON Solar Punk's `encodeLadderMarker`
+/// writes for a single rung, byte for byte (`JSON.stringify`'s key order,
+/// no whitespace):
+/// `{"v":2,"period":P,"writtenAt":W,"rungs":{"<rung topic hex>":I},"segmentMs":S}`.
+///
+/// Refused, like there, when `parseLadderMarker` would reject it (a write
+/// time outside its own period, a zero segment length, a number past
+/// JavaScript's safe integers) or it would not fit one chunk.
+pub fn encode_ladder_marker(
+    period: u64,
+    written_at_ms: u64,
+    rung: &[u8; 32],
+    index: u64,
+    segment_ms: u32,
+) -> Result<Vec<u8>, String> {
+    /// `Number.MAX_SAFE_INTEGER`: `isWholeNumber` refuses anything past it.
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    if marker_period_at(written_at_ms) != period {
+        return Err(format!(
+            "written at {written_at_ms}, outside its period {period}"
+        ));
+    }
+    if segment_ms == 0 {
+        return Err("a marker must name a segment length".into());
+    }
+    if written_at_ms > MAX_SAFE_INTEGER || index > MAX_SAFE_INTEGER {
+        return Err("past JavaScript's safe integers".into());
+    }
+    let text = format!(
+        "{{\"v\":{LADDER_MARKER_VERSION},\"period\":{period},\"writtenAt\":{written_at_ms},\
+         \"rungs\":{{\"{}\":{index}}},\"segmentMs\":{segment_ms}}}",
+        hex::encode(rung),
+    );
+    if text.len() > CHUNK_SIZE as usize {
+        return Err(format!("{} bytes do not fit one chunk", text.len()));
+    }
+    Ok(text.into_bytes())
+}
+
+/// A one-rung master playlist, the text Solar Punk's
+/// `buildMasterPlaylist` writes for a ladder of one: no `CODECS` (the
+/// player takes them from the first fragment), the rung named by
+/// `swarm://<owner hex>/<rung topic text>`, which a reader resolves by
+/// hashing the text ([`topic_from_string`]). `RESOLUTION` only when
+/// known (`width`/`height` both non-zero).
+#[must_use]
+pub fn render_master_playlist(
+    owner: &[u8; 20],
+    rung_text: &str,
+    bandwidth: u64,
+    average_bandwidth: u64,
+    width: u32,
+    height: u32,
+) -> String {
+    let resolution = if width > 0 && height > 0 {
+        format!(",RESOLUTION={width}x{height}")
+    } else {
+        String::new()
+    };
+    let attributes =
+        format!("BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average_bandwidth}{resolution}");
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+         #EXT-X-STREAM-INF:{attributes}\nswarm://{}/{rung_text}\n",
+        hex::encode(owner),
+    )
+}
+
+/// How many consecutive listed segments a peak bitrate is measured
+/// across, `PEAK_WINDOW_SEGMENTS` in Solar Punk's `BitrateMeter.ts`: a
+/// segment cut short on a keyframe can't dominate a window of three,
+/// which still reports the rate a burst costs.
+const PEAK_WINDOW_SEGMENTS: usize = 3;
+
+/// The rendition's real bitrate, measured from the segments listed, for
+/// the master's `BANDWIDTH` and `AVERAGE-BANDWIDTH` rather than the
+/// encoder's target.
+#[derive(Debug, Default)]
+struct BitrateMeter {
+    total_bytes: u64,
+    total_ms: u64,
+    window: VecDeque<(u64, u32)>,
+    /// Highest bits/s over any full window. 0 until one filled.
+    peak_bps: f64,
+}
+
+impl BitrateMeter {
+    fn record(&mut self, bytes: u64, duration_ms: u32) {
+        if bytes == 0 || duration_ms == 0 {
+            return;
+        }
+        self.total_bytes += bytes;
+        self.total_ms += u64::from(duration_ms);
+        self.window.push_back((bytes, duration_ms));
+        if self.window.len() > PEAK_WINDOW_SEGMENTS {
+            self.window.pop_front();
+        }
+        if self.window.len() == PEAK_WINDOW_SEGMENTS {
+            let (bytes, ms) = self.window.iter().fold((0u64, 0u64), |(b, m), &(sb, sm)| {
+                (b + sb, m + u64::from(sm))
+            });
+            self.peak_bps = self.peak_bps.max(bytes as f64 * 8000.0 / ms as f64);
+        }
+    }
+
+    /// `(BANDWIDTH, AVERAGE-BANDWIDTH)` in bits/s, `None` until a full
+    /// window was measured. The average never exceeds the peak (RFC 8216).
+    fn measured(&self) -> Option<(u64, u64)> {
+        if self.peak_bps <= 0.0 {
+            return None;
+        }
+        let peak = self.peak_bps.round() as u64;
+        let average = (self.total_bytes as f64 * 8000.0 / self.total_ms as f64).round() as u64;
+        Some((peak, average.min(peak)))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -625,6 +839,8 @@ enum Committed {
         discontinuity: bool,
         captured_at: Instant,
         program_ms: u64,
+        /// Segment size, for the master's measured bitrate.
+        bytes: u64,
     },
     /// A media segment that never landed: dropped before it was ever
     /// uploaded (backlog full) or its upload failed. Listed as an
@@ -948,6 +1164,27 @@ struct PublisherState {
     /// media.
     reaped: bool,
 
+    /// The listed segments' measured bitrate, for the master playlist.
+    bitrate: BitrateMeter,
+    /// `BANDWIDTH` of the last master that landed this run.
+    master_advertised_bps: Option<u64>,
+    /// The group feed's next index, once its head was read.
+    master_next_index: Option<u64>,
+    /// No master write is started before this: the last one failed.
+    master_retry_at: Option<Instant>,
+    /// Reference of the last master playlist that landed.
+    master_reference: Option<String>,
+    /// Ladder markers that landed.
+    markers_written: u64,
+    /// Marker and master writes that failed, and the newest failure.
+    /// Kept apart from `errors`: a ladder write is a shortcut a viewer
+    /// can do without, retried every period or [`MASTER_RETRY`], and
+    /// would otherwise fill the eight kept errors and become the
+    /// broadcast's headline error over the segment and feed failures
+    /// that actually cost viewers media.
+    ladder_failures: u64,
+    ladder_error: Option<String>,
+
     errors: Vec<String>,
     last_error: Option<String>,
     error_count: u64,
@@ -962,6 +1199,13 @@ impl PublisherState {
             self.errors.push(message.clone());
         }
         self.last_error = Some(message);
+    }
+
+    /// A marker or master write failed: counted in `ladder_failures`
+    /// and shown as `ladder_error`, never in `errors`/`last_error`.
+    fn record_ladder_failure(&mut self, message: String) {
+        self.ladder_failures += 1;
+        self.ladder_error = Some(message);
     }
 
     fn record_latency(queue: &mut VecDeque<u64>, value: u64) {
@@ -1059,6 +1303,7 @@ impl PublisherState {
                     discontinuity,
                     captured_at,
                     program_ms,
+                    bytes,
                 } => {
                     if self.segments_listed == 0
                         && self.predecessor.is_some()
@@ -1098,6 +1343,7 @@ impl PublisherState {
                         self.playlist.push_back(gap);
                     }
                     self.segments_listed += 1;
+                    self.bitrate.record(bytes, duration_ms);
                     self.longest_listed_ms = self.longest_listed_ms.max(duration_ms);
                     self.recording.push(entry.clone());
                     self.playlist.push_back(entry);
@@ -1572,6 +1818,21 @@ pub struct PublisherSnapshot {
     /// recording); a host that sees this calls the stop call for the
     /// report.
     pub reaped: bool,
+    /// The one-rung ladder's group id ([`ladder_group_text`]), what a
+    /// catalog entry names the ladder by. Empty unless
+    /// [`PublisherConfig::ladder`].
+    pub ladder_group: String,
+    /// Reference of the last master playlist that landed, empty while
+    /// none has.
+    pub master_reference: String,
+    /// Ladder time markers that landed.
+    pub markers_written: u64,
+    /// Marker and master writes that failed. Not in `error_count`: a
+    /// ladder write is a shortcut a viewer can do without.
+    pub ladder_failures: u64,
+    /// The newest marker or master failure, empty while none has
+    /// failed. Not in `last_error`/`errors`, for the same reason.
+    pub ladder_error: String,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -1663,6 +1924,16 @@ pub struct PublisherReport {
     /// The run ended itself after [`PublisherConfig::reap_ms`] with no
     /// media, rather than on the host's stop call.
     pub reaped: bool,
+    /// See [`PublisherSnapshot::ladder_group`].
+    pub ladder_group: String,
+    /// See [`PublisherSnapshot::master_reference`].
+    pub master_reference: String,
+    /// See [`PublisherSnapshot::markers_written`].
+    pub markers_written: u64,
+    /// See [`PublisherSnapshot::ladder_failures`].
+    pub ladder_failures: u64,
+    /// See [`PublisherSnapshot::ladder_error`].
+    pub ladder_error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,6 +2188,19 @@ impl LiveRun {
             paused: state.paused,
             segments_withheld: state.segments_withheld,
             reaped: state.reaped,
+            ladder_group: self.ladder_group(),
+            master_reference: state.master_reference.clone().unwrap_or_default(),
+            markers_written: state.markers_written,
+            ladder_failures: state.ladder_failures,
+            ladder_error: state.ladder_error.clone().unwrap_or_default(),
+        }
+    }
+
+    fn ladder_group(&self) -> String {
+        if self.config.ladder {
+            ladder_group_text(&self.topic)
+        } else {
+            String::new()
         }
     }
 
@@ -2039,6 +2323,11 @@ impl LiveRun {
             error_count: state.error_count,
             segments_withheld: state.segments_withheld,
             reaped: state.reaped,
+            ladder_group: self.ladder_group(),
+            master_reference: state.master_reference.clone().unwrap_or_default(),
+            markers_written: state.markers_written,
+            ladder_failures: state.ladder_failures,
+            ladder_error: state.ladder_error.clone().unwrap_or_default(),
         }
     }
 }
@@ -2063,6 +2352,21 @@ pub fn start(
     signing_secret: [u8; 32],
     owner: [u8; 20],
     status_rx: Option<watch::Receiver<StatusSnapshot>>,
+) -> Result<Arc<LiveRun>, PublisherError> {
+    start_with_wall_offset(runtime, config, signing_secret, owner, status_rx, 0)
+}
+
+/// [`start`] with the wall clock the ladder markers are timed and dated
+/// by moved `wall_offset_ms` on, so a test can put a marker period
+/// boundary a moment away instead of waiting up to ten seconds for one.
+#[doc(hidden)]
+pub fn start_with_wall_offset(
+    runtime: &tokio::runtime::Handle,
+    config: PublisherConfig,
+    signing_secret: [u8; 32],
+    owner: [u8; 20],
+    status_rx: Option<watch::Receiver<StatusSnapshot>>,
+    wall_offset_ms: i64,
 ) -> Result<Arc<LiveRun>, PublisherError> {
     config.validate()?;
     let (topic, topic_text) = config.resolve_topic()?;
@@ -2114,7 +2418,10 @@ pub fn start(
         reap_notify,
         status_rx,
         manifest_task: Mutex::new(None),
+        master_task: Mutex::new(None),
         started_at,
+        topic_text: run.topic_text.clone(),
+        wall_offset_ms,
     });
     runtime.spawn(async move { drive(ctx).await });
     Ok(run)
@@ -2140,8 +2447,15 @@ struct RunCtx {
     manifest_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Wakes the reaper on [`LiveRun::resume`]; see [`reaper`].
     reap_notify: Arc<Notify>,
+    /// The master playlist write that may be running; see
+    /// [`RunCtx::spawn_master_if_due`].
+    master_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Go-live, where the reap window first runs from.
     started_at: Instant,
+    /// The topic's text name, empty for a raw topic: the master's rung URI.
+    topic_text: String,
+    /// See [`start_with_wall_offset`].
+    wall_offset_ms: i64,
 }
 
 impl RunCtx {
@@ -2159,6 +2473,61 @@ impl RunCtx {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// The wall clock ladder markers are timed and dated by, Unix ms.
+    fn wall_ms(&self) -> u64 {
+        unix_ms_now().saturating_add_signed(self.wall_offset_ms)
+    }
+
+    /// The ladder's master feed topic: [`topic_from_string`] of
+    /// [`ladder_group_text`].
+    fn group_topic(&self) -> [u8; 32] {
+        topic_from_string(&ladder_group_text(&self.topic))
+    }
+
+    /// Whether this run writes a master playlist at all: see
+    /// [`PublisherConfig::ladder`].
+    fn writes_master(&self) -> bool {
+        self.config.ladder
+            && self.config.format == StreamFormat::SolarPunk
+            && fits_swarm_uri(&self.topic_text)
+    }
+
+    /// Start a master playlist write when one is due and none is
+    /// running: the bitrate has been measured, and either no master
+    /// landed yet this run or the measured peak outgrew the advertised
+    /// one by more than a quarter (`BANDWIDTH` only rises, so this
+    /// rewrites a handful of times at most). A failed write holds off
+    /// [`MASTER_RETRY`]. Spawned, never awaited, so the committer's
+    /// playlist and feed updates never wait on it.
+    fn spawn_master_if_due(self: &Arc<Self>) {
+        if !self.writes_master() {
+            return;
+        }
+        let mut slot = lock(&self.master_task);
+        if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        {
+            let state = lock(&self.state);
+            let Some((peak, _)) = state.bitrate.measured() else {
+                return;
+            };
+            if state
+                .master_advertised_bps
+                .is_some_and(|ad| peak * 4 <= ad * 5)
+            {
+                return;
+            }
+            if state.master_retry_at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+        }
+        let ctx = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            publish_master(&ctx).await;
+        }));
     }
 
     /// End the run the way the host's stop does, as `reaped`. Refused
@@ -2267,6 +2636,10 @@ async fn drive(ctx: Arc<RunCtx>) {
             Duration::from_millis(ctx.config.reap_ms),
         ))
     });
+    let markers = ctx
+        .config
+        .ladder
+        .then(|| tokio::spawn(marker_loop(Arc::clone(&ctx))));
     let pump = tokio::spawn(pump(Arc::clone(&ctx)));
     let committer = tokio::spawn(commit_loop(Arc::clone(&ctx)));
     let _ = pump.await;
@@ -2274,6 +2647,17 @@ async fn drive(ctx: Arc<RunCtx>) {
         reaper.abort();
     }
     let _ = committer.await;
+    // The ladder's extras are shortcuts for joining viewers, never what
+    // a stop waits on: a marker (bounded by its own ten-second period)
+    // or a master still on the wire is dropped, not joined. The next
+    // broadcast reads the group feed's head before it writes a master.
+    if let Some(markers) = markers {
+        markers.abort();
+    }
+    let master = lock(&ctx.master_task).take();
+    if let Some(master) = master {
+        master.abort();
+    }
     // Join, don't abort, the manifest attempt still on the wire: it ran
     // alongside the drain, so this rarely waits, and a reference that
     // lands after `finished` would be missing from the final report. The
@@ -2421,6 +2805,7 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                                 discontinuity: pending.discontinuity,
                                 captured_at: pending.captured_at,
                                 program_ms: pending.program_ms,
+                                bytes,
                             },
                         );
                     }
@@ -2494,6 +2879,7 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         }
         if let Some(captured_at) = newest {
             publish_playlist(&ctx, PlaylistShape::Live, Some(captured_at)).await;
+            ctx.spawn_master_if_due();
             continue;
         }
         // Nothing new. If the pump has finished (backlog drained *and*
@@ -2627,12 +3013,7 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
         404 if is_no_update_found(&response.body) => (0, None),
         200 => {
             require_declared_length(&response, "the head")?;
-            let index = response
-                .header("swarm-feed-index")
-                .and_then(|v| hex::decode(v).ok())
-                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-                .map(u64::from_be_bytes)
-                .ok_or_else(|| "the head carries no swarm-feed-index".to_string())?;
+            let index = feed_index_of(&response)?;
             let playlist = if response.header("swarm-feed-resolved-version") == Some("v1") {
                 let reference = response
                     .header("etag")
@@ -2862,20 +3243,26 @@ async fn upload_playlist(
             let wrapped = v1_update_chunk(&reference)?;
             Ok((playlist_ref, wrapped))
         }
-        StreamFormat::SolarPunk => {
-            // The level is sent rather than left to the gateway's default
-            // so the root chunk rebuilt below is the one the gateway
-            // stored. It is that default (bee's MEDIUM), which is also
-            // what bee-js `uploadPayload` gets for a playlist too big for
-            // one chunk.
-            let level = PLAYLIST_REDUNDANCY_LEVEL.to_string();
-            let headers = [("swarm-redundancy-level".to_string(), level)];
-            let playlist_ref =
-                publish_bytes(&ctx.target, ctx.batch, body.as_bytes(), &headers).await?;
-            let root = playlist_root_chunk(body.as_bytes(), &playlist_ref)?;
-            Ok((playlist_ref, root))
-        }
+        StreamFormat::SolarPunk => upload_v2_payload(ctx, body).await,
     }
+}
+
+/// `POST /bytes` `body` and rebuild its root chunk, for a v2 feed update
+/// wrapping it (bee-js `FeedWriter.uploadPayload`): the
+/// [`StreamFormat::SolarPunk`] playlists and the master playlist.
+async fn upload_v2_payload(
+    ctx: &RunCtx,
+    body: &str,
+) -> Result<(String, ([u8; 32], Vec<u8>)), String> {
+    // The level is sent rather than left to the gateway's default so the
+    // root chunk rebuilt below is the one the gateway stored. It is that
+    // default (bee's MEDIUM), which is also what bee-js `uploadPayload`
+    // gets for a playlist too big for one chunk.
+    let level = PLAYLIST_REDUNDANCY_LEVEL.to_string();
+    let headers = [("swarm-redundancy-level".to_string(), level)];
+    let reference = publish_bytes(&ctx.target, ctx.batch, body.as_bytes(), &headers).await?;
+    let root = playlist_root_chunk(body.as_bytes(), &reference)?;
+    Ok((reference, root))
 }
 
 /// Bee's v1 feed-update chunk for `reference`: the content-addressed
@@ -2971,7 +3358,23 @@ async fn publish_feed_update(
     index: u64,
     wrapped: &([u8; 32], Vec<u8>),
 ) -> Result<(), String> {
-    let id = ant_retrieval::sequence_update_id(&ctx.topic, index);
+    publish_soc(
+        ctx,
+        ant_retrieval::sequence_update_id(&ctx.topic, index),
+        wrapped,
+    )
+    .await
+}
+
+/// Write one single-owner chunk, owned by the broadcast's signer, at
+/// identifier `id`, wrapping the content-addressed chunk `wrapped`
+/// (`(address, span ‖ payload)`): bee-js `SOCWriter.upload`'s shape,
+/// which every feed update, master and ladder marker here takes.
+async fn publish_soc(
+    ctx: &RunCtx,
+    id: [u8; 32],
+    wrapped: &([u8; 32], Vec<u8>),
+) -> Result<(), String> {
     // `wrapped` is `span(8 LE) ‖ payload`, which is both what the SOC
     // signature covers (through its address) and what `POST /soc` takes
     // as its body.
@@ -3002,6 +3405,177 @@ async fn publish_feed_update(
     ];
     post_reference(&ctx.target, &path, &headers, cac_wire).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// One-rung ladder: master playlist and time markers (issue #174)
+// ---------------------------------------------------------------------------
+
+/// How long after a period boundary its marker is written, Solar Punk's
+/// `MARKER_WRITE_DELAY_MS`: a timer firing a little early still lands in
+/// the new period, and a viewer early in a period usually finds the
+/// marker already there.
+const MARKER_WRITE_DELAY_MS: u64 = 250;
+
+/// How long a master write that failed holds off the next attempt
+/// (Solar Punk's `MASTER_REWRITE_RETRY_MS`).
+const MASTER_RETRY: Duration = Duration::from_secs(30);
+
+/// Write the ladder's time marker once per period (issue #174), from the
+/// first landed feed update until the run is cancelled; [`drive`] aborts
+/// it after the committer. Shortly after each period boundary of the
+/// global ten-second clock ([`marker_period_at`]) it writes one
+/// single-owner chunk at [`ladder_marker_identifier`] naming the newest
+/// feed index this broadcast has published ([`encode_ladder_marker`]).
+///
+/// A marker is a shortcut, never a dependency, so everything gives way:
+/// none while paused (there is no uplink), none before this run's first
+/// update landed (a viewer would be sent to an earlier broadcast's head),
+/// a write is abandoned when its own period ends, and a period is never
+/// written twice, not even when the wall clock steps back, since a reader
+/// that already read an address keeps its answer. A failure is counted
+/// in `ladder_failures` and shown as `ladder_error`, never in `errors`.
+async fn marker_loop(ctx: Arc<RunCtx>) {
+    let group = ctx.group_topic();
+    let mut last_period: Option<u64> = None;
+    loop {
+        let now = ctx.wall_ms();
+        let boundary = (marker_period_at(now) + 1) * LADDER_MARKER_PERIOD_MS;
+        tokio::time::sleep(Duration::from_millis(
+            boundary + MARKER_WRITE_DELAY_MS - now,
+        ))
+        .await;
+        if ctx.cancelled() {
+            return;
+        }
+        let written_at = ctx.wall_ms();
+        let period = marker_period_at(written_at);
+        if last_period.is_some_and(|last| period <= last) {
+            continue;
+        }
+        let index = {
+            let state = lock(&ctx.state);
+            if state.paused || state.feed_updates == 0 {
+                continue;
+            }
+            state.feed_index - 1
+        };
+        last_period = Some(period);
+        let deadline = (period + 1) * LADDER_MARKER_PERIOD_MS;
+        let outcome = write_marker(&ctx, &group, period, written_at, index, deadline).await;
+        let mut state = lock(&ctx.state);
+        match outcome {
+            Ok(()) => state.markers_written += 1,
+            Err(message) => state.record_ladder_failure(format!(
+                "ladder marker for period {period}: {message}; viewers search \
+                 the feed instead until one lands"
+            )),
+        }
+    }
+}
+
+/// One marker, abandoned at `deadline` (Unix ms, the end of its period).
+async fn write_marker(
+    ctx: &RunCtx,
+    group: &[u8; 32],
+    period: u64,
+    written_at: u64,
+    index: u64,
+    deadline: u64,
+) -> Result<(), String> {
+    let payload =
+        encode_ladder_marker(period, written_at, &ctx.topic, index, ctx.config.segment_ms)?;
+    let wrapped = ant_crypto::cac_new(&payload).ok_or("marker payload too large")?;
+    let id = ladder_marker_identifier(group, period);
+    let remaining = Duration::from_millis(deadline.saturating_sub(ctx.wall_ms()));
+    tokio::time::timeout(remaining, publish_soc(ctx, id, &wrapped))
+        .await
+        .map_err(|_| "its period ended before the write finished".to_string())?
+}
+
+/// Write the one-rung master playlist ([`render_master_playlist`], the
+/// bitrate measured so far) as the group feed's next v2 update, the way
+/// Solar Punk's `MasterFeedWriter` publishes a ladder's master on the
+/// feed whose topic is the group. The first write of a run reads the
+/// group feed's head (`?exact=true`, as [`settle_feed_position`] reads
+/// the channel's) and writes after it: an earlier broadcast's master is
+/// never overwritten, and a failed read writes nothing.
+async fn publish_master(ctx: &RunCtx) {
+    let outcome = async {
+        let (body, peak) = {
+            let state = lock(&ctx.state);
+            let (peak, average) = state
+                .bitrate
+                .measured()
+                .ok_or("the bitrate is not measured yet")?;
+            let body = render_master_playlist(
+                &ctx.owner,
+                &ctx.topic_text,
+                peak,
+                average,
+                ctx.config.width,
+                ctx.config.height,
+            );
+            (body, peak)
+        };
+        let group = ctx.group_topic();
+        let known = lock(&ctx.state).master_next_index;
+        let index = match known {
+            Some(index) => index,
+            None => feed_next_index(ctx, &group).await?,
+        };
+        let (reference, root) = upload_v2_payload(ctx, &body).await?;
+        publish_soc(ctx, ant_retrieval::sequence_update_id(&group, index), &root).await?;
+        Ok::<_, String>((index, peak, reference))
+    }
+    .await;
+    let mut state = lock(&ctx.state);
+    match outcome {
+        Ok((index, peak, reference)) => {
+            state.master_next_index = Some(index + 1);
+            state.master_advertised_bps = Some(peak);
+            state.master_reference = Some(reference);
+            state.master_retry_at = None;
+        }
+        Err(message) => {
+            state.master_retry_at = Some(Instant::now() + MASTER_RETRY);
+            state.record_ladder_failure(format!("master playlist: {message}"));
+        }
+    }
+}
+
+/// The index after the head of the feed `topic` (this broadcast's owner),
+/// read with `GET /feeds/{owner}/{topic}?exact=true`: 0 for a feed
+/// nothing was written to (`404 "no update found"`), an error for any
+/// answer that isn't a head or that confirmed miss.
+async fn feed_next_index(ctx: &RunCtx, topic: &[u8; 32]) -> Result<u64, String> {
+    let path = format!(
+        "{}/feeds/{}/{}?exact=true",
+        ctx.target.prefix,
+        hex::encode(ctx.owner),
+        hex::encode(topic),
+    );
+    let response = http_get_timed(&ctx.target, &path).await?;
+    match response.status {
+        404 if is_no_update_found(&response.body) => Ok(0),
+        200 => feed_index_of(&response)?
+            .checked_add(1)
+            .ok_or_else(|| "the feed is full".to_string()),
+        status => Err(format!(
+            "gateway returned {status} {}",
+            String::from_utf8_lossy(&response.body).trim(),
+        )),
+    }
+}
+
+/// A feed read's `swarm-feed-index`: 16 hex digits, big-endian.
+fn feed_index_of(response: &HttpResponse) -> Result<u64, String> {
+    response
+        .header("swarm-feed-index")
+        .and_then(|v| hex::decode(v).ok())
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_be_bytes)
+        .ok_or_else(|| "the head carries no swarm-feed-index".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3355,6 +3929,9 @@ mod tests {
             notes: String::new(),
             start_index: None,
             reap_ms: 0,
+            ladder: false,
+            width: 0,
+            height: 0,
         }
     }
 
@@ -3371,6 +3948,7 @@ mod tests {
             discontinuity,
             captured_at: Instant::now(),
             program_ms: 1_788_264_000_000,
+            bytes: 1000,
         }
     }
 
@@ -3434,6 +4012,7 @@ mod tests {
             discontinuity: false,
             captured_at: Instant::now(),
             program_ms: at(n),
+            bytes: 1000,
         };
         state.done.insert(1, dated("/bzz/bb/seg-1.m4s", 0));
         state.done.insert(2, lost(false, at(1)));
@@ -3835,6 +4414,7 @@ mod tests {
             discontinuity,
             captured_at: Instant::now(),
             program_ms,
+            bytes: 1000,
         };
         state
             .done
@@ -3938,6 +4518,7 @@ mod tests {
                 discontinuity: false,
                 captured_at: Instant::now(),
                 program_ms: 1_788_264_000_000,
+                bytes: 1000,
             },
         );
         state.advance(2, 2000);
@@ -4021,6 +4602,7 @@ mod tests {
                 discontinuity: false,
                 captured_at: Instant::now(),
                 program_ms: 1_788_264_004_000,
+                bytes: 1000,
             },
         );
         state.done.insert(
@@ -4719,6 +5301,9 @@ mod tests {
         fail_soc: bool,
         /// Refuse this many `POST /feeds` before accepting one.
         fail_feeds: u32,
+        /// Refuse the ladder's writes only: a marker's `POST /soc` and
+        /// the master playlist's `POST /bytes`.
+        fail_ladder: bool,
         /// Extra latency on `POST /feeds` only.
         feeds_delay: Duration,
         /// Refuse the recording's upload (a playlist marked VOD) only.
@@ -4729,6 +5314,10 @@ mod tests {
         /// What `GET /feeds` answers: `None` is bee's
         /// `404 "no update found"`, an empty feed.
         head: Option<StubHead>,
+        /// Heads of other feeds, by topic hex, answered instead of
+        /// `head` for a `GET /feeds` naming that topic (the ladder's
+        /// group feed).
+        feed_heads: HashMap<String, StubHead>,
         /// Answer this many `GET /feeds` with a 502 first.
         fail_head: u32,
         /// Then this many with the node's 503 for an anchor miss only
@@ -4821,7 +5410,13 @@ mod tests {
                     br#"{"code":404,"message":"wrapped chunk cannot be retrieved"}"#,
                 );
             }
-            return match &slot.head {
+            let head = slot
+                .feed_heads
+                .iter()
+                .find(|(topic, _)| path.contains(topic.as_str()))
+                .map(|(_, head)| head)
+                .or(slot.head.as_ref());
+            return match head {
                 None => stub_response(
                     "404 Not Found",
                     &[],
@@ -4950,7 +5545,16 @@ mod tests {
                                             && (request.method_path.ends_with("/bytes")
                                                 || request.method_path.contains("/bzz?")))
                                         || (slot.fail_soc && request.method_path.contains("/soc/"))
-                                        || (slot.fail_recording && is_recording);
+                                        || (slot.fail_recording && is_recording)
+                                        || (slot.fail_ladder
+                                            && [&b"\"rungs\":"[..], b"#EXT-X-STREAM-INF"]
+                                                .iter()
+                                                .any(|needle| {
+                                                    request
+                                                        .body
+                                                        .windows(needle.len())
+                                                        .any(|w| w == *needle)
+                                                }));
                                     (
                                         fail,
                                         if is_feeds {
@@ -6045,6 +6649,397 @@ mod tests {
                 .ends_with("/e0324f32e2edd73e3cd532076d203c397b9764eac2395fc3baab5738ad1b29bf"),
             "{}",
             manifest.method_path,
+        );
+    }
+
+    /// The bytes Solar Punk's `encodeLadderMarker`
+    /// (stream-event-client `src/shared/ladderMarker.ts`, v2) writes for
+    /// this marker, taken from running it under bee-js 13.1.0, the
+    /// version both pin; its `parseLadderMarker` accepts them. The write
+    /// time is the last millisecond of its period, which a reader still
+    /// takes.
+    #[test]
+    fn a_ladder_marker_is_the_json_solar_punk_writes() {
+        let rung = topic_from_string("antstream-3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b");
+        assert_eq!(
+            hex::encode(rung),
+            "b0050c33bf70c99caa3fac075622bc8d699462306c1f3baff35dae253d650416",
+        );
+        let payload =
+            encode_ladder_marker(176_044_800, 1_760_448_009_999, &rung, 1800, 2000).unwrap();
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            r#"{"v":2,"period":176044800,"writtenAt":1760448009999,"rungs":{"b0050c33bf70c99caa3fac075622bc8d699462306c1f3baff35dae253d650416":1800},"segmentMs":2000}"#,
+        );
+        assert_eq!(marker_period_at(1_760_448_009_999), 176_044_800);
+        assert_eq!(marker_period_at(1_760_448_010_000), 176_044_801);
+        // What `parseLadderMarker` would read as absent is never written.
+        for (period, written_at, segment_ms) in [
+            // A write time in the next period, or the one before.
+            (176_044_800, 1_760_448_010_000, 2000),
+            (176_044_800, 1_760_447_999_999, 2000),
+            // No segment length.
+            (176_044_800, 1_760_448_000_250, 0),
+        ] {
+            assert!(
+                encode_ladder_marker(period, written_at, &rung, 1, segment_ms).is_err(),
+                "{period} {written_at} {segment_ms}",
+            );
+        }
+        assert!(encode_ladder_marker(0, 0, &rung, 1 << 53, 2000).is_err());
+    }
+
+    /// The group a channel's ladder hangs off, and where its markers go:
+    /// the topic and identifiers here are bee-js 13.1.0's
+    /// `Topic.fromString` and stream-event-client's
+    /// `ladderMarkerIdentifier`, run on the group text this publisher
+    /// derives. The group text survives the `parseSwarmUri` a catalog
+    /// entry's source URL goes through (no `/`).
+    #[test]
+    fn the_ladder_group_and_its_marker_addresses_match_solar_punk() {
+        let rung = topic_from_string("antstream-3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b");
+        let group_text = ladder_group_text(&rung);
+        assert_eq!(
+            group_text,
+            "antstream-ladder-b0050c33bf70c99caa3fac075622bc8d699462306c1f3baff35dae253d650416",
+        );
+        assert!(fits_swarm_uri(&group_text));
+        let group = topic_from_string(&group_text);
+        assert_eq!(
+            hex::encode(group),
+            "d76e2fab1498998b0b639b0bc757cfe6868fdc4f27dc96985f2ea2f084f86dc9",
+        );
+        for (period, expected) in [
+            (
+                176_044_800,
+                "bd5b1732eb10afec844d023e950a8979cd05c550146c103cc637622b2666b1c8",
+            ),
+            (
+                0,
+                "4f92d4af9ce9f296668c4fff9ae1f007bfa21b831497a973fe41d1e5c3a6a8a0",
+            ),
+        ] {
+            assert_eq!(
+                hex::encode(ladder_marker_identifier(&group, period)),
+                expected,
+                "period {period}",
+            );
+        }
+    }
+
+    /// Solar Punk's `buildMasterPlaylist` (streaming-monorepo
+    /// `packages/shared/src/masterPlaylist.ts`) for a ladder of one,
+    /// byte for byte, and the URI's topic reads back whole through its
+    /// `parseSwarmUri`.
+    #[test]
+    fn the_master_playlist_is_the_one_solar_punk_writes() {
+        let owner: [u8; 20] = hex::decode("d5572300e441b77b72bdd318bbfa7b97a1f03096")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let text = "antstream-3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b";
+        assert_eq!(
+            render_master_playlist(&owner, text, 1_723_077, 1_578_947, 640, 360),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1723077,AVERAGE-BANDWIDTH=1578947,RESOLUTION=640x360\n\
+             swarm://d5572300e441b77b72bdd318bbfa7b97a1f03096/antstream-3f2b8c4e-1d2a-4b6f-9e0a-7c5d4e3f2a1b\n",
+        );
+        // An unknown size is left out rather than guessed.
+        assert!(!render_master_playlist(&owner, text, 2, 1, 0, 360).contains("RESOLUTION"));
+        assert!(fits_swarm_uri(text));
+        for text in ["", "antstream/Kitchen", "my channel", "a#b", "a?b", "50%"] {
+            assert!(!fits_swarm_uri(text), "{text:?}");
+        }
+    }
+
+    /// `BANDWIDTH` is the peak over three consecutive segments and
+    /// `AVERAGE-BANDWIDTH` the whole mean, clamped to the peak: the
+    /// figures Solar Punk's `BitrateMeter.ts` reports for the same
+    /// segments (sizes in bytes, durations in ms), from the run that
+    /// fills its window on.
+    #[test]
+    fn the_bitrate_is_measured_the_way_solar_punk_measures_it() {
+        let mut meter = BitrateMeter::default();
+        let mut measured = Vec::new();
+        for (bytes, ms) in [
+            (250_000, 2000),
+            (500_000, 1000),
+            (260_000, 2000),
+            (240_000, 2000),
+            (900_000, 2500),
+            (100_000, 1900),
+        ] {
+            meter.record(bytes, ms);
+            measured.push(meter.measured());
+        }
+        assert_eq!(
+            measured,
+            [
+                None,
+                None,
+                Some((1_616_000, 1_616_000)),
+                Some((1_616_000, 1_428_571)),
+                Some((1_723_077, 1_723_077)),
+                Some((1_723_077, 1_578_947)),
+            ],
+        );
+    }
+
+    /// The wall-clock offset that puts the next marker period boundary
+    /// `ms_ahead` from now, for [`start_with_wall_offset`].
+    fn boundary_in(ms_ahead: u64) -> i64 {
+        let now = unix_ms_now();
+        let to_boundary = LADDER_MARKER_PERIOD_MS - now % LADDER_MARKER_PERIOD_MS;
+        i64::try_from(to_boundary).unwrap() - i64::try_from(ms_ahead).unwrap()
+    }
+
+    /// The SOC requests at identifier `id`.
+    fn socs_at<'a>(
+        seen: &'a [SeenRequest],
+        owner: &[u8; 20],
+        id: &[u8; 32],
+    ) -> Vec<&'a SeenRequest> {
+        let prefix = format!("POST /soc/{}/{}?sig=", hex::encode(owner), hex::encode(id));
+        seen.iter()
+            .filter(|r| r.method_path.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Issue #174 under `"solar-punk"`: the master goes up once the
+    /// bitrate is measured, as the group feed's update after its head,
+    /// and a marker every period names the newest feed update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ladder_writes_its_master_after_the_group_head_and_a_marker_each_period() {
+        const TEXT: &str = "antstream-ladder-unit";
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let topic = topic_from_string(TEXT);
+        let group = topic_from_string(&ladder_group_text(&topic));
+        // An earlier broadcast's master at index 4 of the group feed.
+        lock(&log).feed_heads.insert(
+            hex::encode(group),
+            StubHead {
+                index: 4,
+                version: "v2",
+                reference: "00".repeat(32),
+                body: b"#EXTM3U\n".to_vec(),
+            },
+        );
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.topic_text = TEXT.into();
+        config.ladder = true;
+        config.width = 640;
+        config.height = 360;
+        let owner = test_owner();
+        let offset = boundary_in(1500);
+        let run = start_with_wall_offset(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            owner,
+            None,
+            offset,
+        )
+        .unwrap();
+        assert_eq!(run.snapshot().ladder_group, ladder_group_text(&topic));
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        }
+        for _ in 0..200 {
+            let snapshot = run.snapshot();
+            if !snapshot.master_reference.is_empty() && snapshot.markers_written > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot = run.snapshot();
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(snapshot.markers_written, 1, "{snapshot:?}");
+        assert!(!snapshot.master_reference.is_empty(), "{snapshot:?}");
+        assert_eq!(snapshot.error_count, 0, "{snapshot:?}");
+
+        let seen = lock(&log).seen.clone();
+        // The group head was read the way the channel's is, then the
+        // master went up after it: 3 × 40 000 bytes over 6 s is 160 kbit/s.
+        assert!(seen.iter().any(|r| r.method_path
+            == format!(
+                "GET /feeds/{}/{}?exact=true",
+                hex::encode(owner),
+                hex::encode(group)
+            )));
+        let master = render_master_playlist(&owner, TEXT, 160_000, 160_000, 640, 360);
+        let uploaded = seen
+            .iter()
+            .find(|r| r.method_path.ends_with("/bytes") && r.body == master.as_bytes())
+            .expect("master uploaded");
+        assert_eq!(bytes_reference(uploaded), snapshot.master_reference);
+        let slot = socs_at(&seen, &owner, &ant_retrieval::sequence_update_id(&group, 5));
+        assert_eq!(slot.len(), 1, "the master is the group feed's index 5");
+        assert_eq!(
+            &slot[0].body[8..],
+            master.as_bytes(),
+            "a v2 update of the text"
+        );
+        assert!(socs_at(&seen, &owner, &ant_retrieval::sequence_update_id(&group, 4)).is_empty());
+
+        // The marker of the period the boundary opened, naming the newest
+        // update this broadcast had written.
+        let period = marker_period_at(unix_ms_now().saturating_add_signed(offset));
+        let markers: Vec<_> = (period.saturating_sub(2)..=period)
+            .flat_map(|p| socs_at(&seen, &owner, &ladder_marker_identifier(&group, p)))
+            .collect();
+        assert_eq!(markers.len(), 1);
+        let text = String::from_utf8(markers[0].body[8..].to_vec()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let p = value["period"].as_u64().unwrap();
+        assert_eq!(
+            socs_at(&seen, &owner, &ladder_marker_identifier(&group, p)).len(),
+            1
+        );
+        assert_eq!(marker_period_at(value["writtenAt"].as_u64().unwrap()), p);
+        assert_eq!(value["segmentMs"], 2000);
+        let index = value["rungs"][hex::encode(topic)].as_u64().unwrap();
+        assert!(index < snapshot.feed_index.unwrap(), "{text}");
+        assert_eq!(
+            text.into_bytes(),
+            encode_ladder_marker(p, value["writtenAt"].as_u64().unwrap(), &topic, index, 2000)
+                .unwrap(),
+        );
+    }
+
+    /// A ladder write that fails is a shortcut lost, not a broadcast
+    /// failure: it counts in `ladder_failures`/`ladder_error` and never
+    /// in `errors`/`last_error`/`error_count`, which a host shows as the
+    /// broadcast's headline error and which hold only eight entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_ladder_write_stays_out_of_the_broadcast_errors() {
+        const TEXT: &str = "antstream-ladder-failing";
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        lock(&log).fail_ladder = true;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.topic_text = TEXT.into();
+        config.ladder = true;
+        let run = start_with_wall_offset(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+            boundary_in(1500),
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        }
+        // One master and one marker have failed.
+        for _ in 0..200 {
+            if run.snapshot().ladder_failures >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot = run.snapshot();
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(snapshot.ladder_failures, 2, "{snapshot:?}");
+        assert!(
+            snapshot.ladder_error.starts_with("ladder marker")
+                || snapshot.ladder_error.starts_with("master playlist"),
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.markers_written, 0, "{snapshot:?}");
+        assert_eq!(snapshot.master_reference, "", "{snapshot:?}");
+        assert_eq!(snapshot.error_count, 0, "{snapshot:?}");
+        assert_eq!(snapshot.last_error, "", "{snapshot:?}");
+        assert!(report.ladder_failures >= 2, "{report:?}");
+        assert!(!report.ladder_error.is_empty(), "{report:?}");
+        assert_eq!(report.error_count, 0, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.kept_up, "{report:?}");
+    }
+
+    /// Under `"bzz"`, or with a topic text no `swarm://` URI can carry
+    /// (the default `antstream/<channel>`), the ladder is markers only:
+    /// no group head read, no master. And none at all before the first
+    /// feed update landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ladder_a_master_cant_name_writes_markers_only() {
+        // Concurrently: each waits out a whole marker period.
+        tokio::join!(
+            markers_only(StreamFormat::Bzz),
+            markers_only(StreamFormat::SolarPunk),
+        );
+    }
+
+    async fn markers_only(format: StreamFormat) {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.format = format;
+        config.ladder = true;
+        let owner = test_owner();
+        let topic = topic_from_string(&format!("antstream/{}", config.channel));
+        let group = topic_from_string(&ladder_group_text(&topic));
+        // The feed head won't answer until the first boundary has
+        // passed, so that period has nothing to name yet.
+        lock(&log).fail_head = 1;
+        let offset = boundary_in(300);
+        let run = start_with_wall_offset(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            owner,
+            None,
+            offset,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..4u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        }
+        // Past the first boundary (the head read is retried after 2 s)
+        // and the second.
+        for _ in 0..600 {
+            if run.snapshot().markers_written > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.markers_written, 1, "{format:?}: {report:?}");
+        assert_eq!(report.master_reference, "", "{format:?}");
+        let seen = lock(&log).seen.clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.method_path.contains(&hex::encode(group))
+                    || r.body
+                        .starts_with(b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT")),
+            "{format:?}: a master was written",
+        );
+        let now = marker_period_at(unix_ms_now().saturating_add_signed(offset));
+        let first = now - 1;
+        assert!(
+            socs_at(&seen, &owner, &ladder_marker_identifier(&group, first)).is_empty(),
+            "{format:?}: a marker before the first update",
+        );
+        assert_eq!(
+            socs_at(&seen, &owner, &ladder_marker_identifier(&group, now)).len(),
+            1,
+            "{format:?}",
         );
     }
 

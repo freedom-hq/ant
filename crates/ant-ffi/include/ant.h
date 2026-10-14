@@ -1348,6 +1348,23 @@ char *ant_bench_stop(const AntHandle *handle, char **out_err);
 char *ant_topic_from_string(const char *text, char **out_err);
 
 /*
+ * The single-owner-chunk identifier, as 64 lowercase hex, of the ladder
+ * time marker (issue #174) for the channel whose feed topic is
+ * `topic_hex` (64 hex, "0x" optional) and the marker period `period`
+ * (unix_ms / 10000): keccak256("ladder-marker" || group topic ||
+ * period_be8), the group topic being keccak256 of the text
+ * "antstream-ladder-<topic hex>", where a broadcast started with
+ * "ladder": true writes it every ten seconds. A viewer reads
+ * GET /soc/{owner}/{id} (JSON {"v":2,"period":..,"writtenAt":..,
+ * "rungs":{"<topic hex>":<newest feed index>},"segmentMs":..}) and starts
+ * its feed read at that index (GET /feeds/{owner}/{topic}?after=<index>)
+ * instead of walking the feed from 0. Needs no node. Returns an
+ * allocated string (free with ant_free_string), or NULL with a message
+ * in *out_err when `topic_hex` is NULL or not 32 bytes of hex.
+ */
+char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_err);
+
+/*
  * Start a live broadcast from this node.
  *
  * This is the bench loop above with the synthetic generator replaced by
@@ -1394,7 +1411,10 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *     "max_backlog":     4,                       // drop-oldest past this
  *     "playlist_window": 64,                      // most segments listed; 4096 bytes binds first
  *     "notes":           "iPhone 15 Pro / LTE",
- *     "reap_ms":         60000                       // end by itself after 60 s with no media; 0 = never (default)
+ *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default)
+ *     "ladder":          true,                       // master playlist + ladder time markers; false (default)
+ *     "width":           640,                        // the master's RESOLUTION, left out unless both set
+ *     "height":          360
  *   }
  *
  * "topic_text" is the topic as a Solar Punk catalog entry names it: the
@@ -1430,6 +1450,30 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * peers' "not found": on a node with at most two peers the head read
  * keeps answering 503, so the broadcast publishes no playlist until
  * the node reaches three or more (a brand-new channel included).
+ *
+ * "ladder": true also publishes the channel as a one-rung ladder (issue
+ * #174), so a viewer joining hours in reaches the live playlist in two
+ * round trips (one marker read, then one round of feed-slot reads from
+ * the index it names) instead of walking the feed from index 0. The
+ * ladder's group is the text "antstream-ladder-<topic hex>" (progress
+ * and the report carry it as "ladder_group"); its feed topic is
+ * keccak256 of that text. Every ten seconds of global time (period =
+ * unix_ms / 10000) a ladder time marker goes up: one single-owner chunk
+ * at ant_ladder_marker_id(topic, period) holding Solar Punk's v2 marker
+ * JSON, naming the newest feed index this broadcast published and
+ * "segment_ms". From the first landed feed update until the stop, none
+ * while paused; 360 chunks an hour; a marker that fails is skipped
+ * ("markers_written" doesn't rise). Under "solar-punk" with a
+ * topic_text a URI can carry (no '/', whitespace, '#', '?' or '%', so
+ * not the default "antstream/<channel>"), a one-rung master playlist
+ * also goes up as the group feed's next v2 update (after its head, read
+ * like the channel's): #EXT-X-STREAM-INF with BANDWIDTH and
+ * AVERAGE-BANDWIDTH measured from the segments listed (peak over three
+ * in a row, and the mean), then swarm://<owner>/<topic_text>. Written
+ * once three segments are measured and again when the measured peak
+ * outgrows the advertised one by a quarter; "master_reference" is the
+ * last that landed. Markers and the master are never waited on by a
+ * stop: one still on the wire then is dropped.
  *
  * "start_index", when present, overrides all of that: the first update
  * goes exactly there, nothing is read, the numbering starts at 0 and the
@@ -1553,12 +1597,22 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  *    "playlists_published":21,"publish_ms_p50":900,"publish_ms_p95":2100,
  *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0,
- *    "paused":false,"segments_withheld":0,"reaped":false}
+ *    "paused":false,"segments_withheld":0,"reaped":false,
+ *    "ladder_group":"","master_reference":"","markers_written":0,
+ *    "ladder_failures":0,"ladder_error":""}
  *
  * "paused" is ant_publisher_pause in force; "segments_withheld" counts
  * the media segments outages withheld (never uploaded, never listed);
  * "reaped" means the broadcast is ending by itself ("reap_ms" passed
  * with no media) and the host should call ant_publisher_stop.
+ * "ladder_group", "master_reference", "markers_written",
+ * "ladder_failures" and "ladder_error" describe the one-rung ladder
+ * ("ladder": true at start; empty and 0 otherwise). A marker or master
+ * write that fails counts in "ladder_failures" and shows as
+ * "ladder_error" (the newest), never in "errors", "last_error" or
+ * "error_count": a ladder write is a shortcut a viewer can do without,
+ * retried every period, so it would otherwise crowd out the segment and
+ * feed failures those fields are for.
  *
  * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
  * behind live a viewer is right now, i.e. the age of the newest segment

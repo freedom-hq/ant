@@ -3699,6 +3699,45 @@ pub unsafe extern "C" fn ant_topic_from_string(
     }
 }
 
+/// The single-owner-chunk identifier, 64 lowercase hex, of the ladder
+/// time marker for the channel whose feed topic is `topic_hex` (64 hex,
+/// `0x` optional) and the marker period `period`
+/// (`unix_ms / 10 000`), as a broadcast started with `"ladder": true`
+/// writes it (issue #174): `keccak256("ladder-marker" ‖ group topic ‖
+/// period_be8)`, the group being [`publisher::ladder_group_text`] of the
+/// topic. A viewer reads `GET /soc/{owner}/{it}`, a small JSON naming the
+/// feed's newest index, and starts its feed read there
+/// (`GET /feeds/{owner}/{topic}?after=<index>`). Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when `topic_hex` is null or not 32 bytes of hex.
+///
+/// # Safety
+///
+/// * `topic_hex` must be a valid NUL-terminated string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_ladder_marker_id(
+    topic_hex: *const c_char,
+    period: u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_ladder_marker_id", || {
+            let text = cstr_to_str(topic_hex).map_err(|e| e.to_string())?;
+            let raw = text.trim().trim_start_matches("0x");
+            let topic = hex::decode(raw)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(|| format!("topic must be 32 bytes of hex, got {raw:?}"))?;
+            let group = publisher::topic_from_string(&publisher::ladder_group_text(&topic));
+            Ok(hex::encode(publisher::ladder_marker_identifier(
+                &group, period,
+            )))
+        })
+    }
+}
+
 /// Start a live broadcast from this node.
 ///
 /// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
@@ -3719,6 +3758,13 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
 /// (`topic`), and with neither it is the channel's stable text topic
 /// `antstream/<channel>`; see [`publisher::PublisherConfig`].
+///
+/// `ladder: true` also publishes the channel as a one-rung ladder (issue
+/// #174): a ladder time marker every ten seconds (at
+/// [`ant_ladder_marker_id`], naming the newest feed index) and, under
+/// `"solar-punk"` with a topic text a URI can carry, a master playlist
+/// with a measured `BANDWIDTH` on the group's feed, so a viewer joins in
+/// two round trips; see [`publisher::PublisherConfig::ladder`].
 ///
 /// A broadcast continues the feed its topic already holds (issue #173):
 /// before its first update it reads the feed head once and writes after
@@ -4411,6 +4457,30 @@ mod tests {
             hex,
             "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5"
         );
+    }
+
+    /// The viewer's marker address is the publisher's: the vector
+    /// computed with bee-js 13.1.0 and stream-event-client's
+    /// `ladderMarkerIdentifier` on the derived group (see
+    /// `publisher::tests::the_ladder_group_and_its_marker_addresses_match_solar_punk`).
+    #[test]
+    fn ladder_marker_id_ffi_matches_the_publisher() {
+        let topic =
+            CString::new("0xb0050c33bf70c99caa3fac075622bc8d699462306c1f3baff35dae253d650416")
+                .unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let raw = unsafe { ant_ladder_marker_id(topic.as_ptr(), 176_044_800, &raw mut err) };
+        assert!(!raw.is_null() && err.is_null());
+        let hex = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        unsafe { ant_free_string(raw) };
+        assert_eq!(
+            hex,
+            "bd5b1732eb10afec844d023e950a8979cd05c550146c103cc637622b2666b1c8"
+        );
+        let short = CString::new("abcd").unwrap();
+        let raw = unsafe { ant_ladder_marker_id(short.as_ptr(), 1, &raw mut err) };
+        assert!(raw.is_null() && !err.is_null());
+        unsafe { ant_free_string(err) };
     }
 
     /// `log_layer`'s filter must stay scoped to itself: a host composing
