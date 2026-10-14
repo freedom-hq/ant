@@ -45,6 +45,21 @@ struct NodeLog {
     /// Refuse a chunk whose payload is this byte throughout: an upload
     /// that fails.
     reject_fill: Option<u8>,
+    /// The batch is full: refuse every chunk and SOC push from now on
+    /// with the node's own saturation error (`ant_p2p`'s `PushChunk` /
+    /// `PushSoc` on an immutable batch whose bucket is full).
+    saturated: bool,
+}
+
+/// What the node answers a push that would overflow a full bucket of an
+/// immutable batch, word for word (`ant_p2p::behaviour`).
+fn saturation_error() -> ControlAck {
+    ControlAck::Error {
+        message: format!(
+            "batch 0x{} saturated: collision bucket full at depth 20 on an immutable batch — stamping would evict an existing chunk; buy or dilute to a larger batch",
+            "ab".repeat(32),
+        ),
+    }
 }
 
 /// A local chunk store over [`NodeLog::store`], so the stub node can run
@@ -74,6 +89,10 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
         }
         match cmd {
             ControlCommand::PushChunk { wire, ack, .. } => {
+                if log.lock().unwrap().saturated {
+                    let _ = ack.send(saturation_error());
+                    continue;
+                }
                 let reject = log.lock().unwrap().reject_fill;
                 if reject.is_some_and(|fill| wire.len() > 8 && wire[8..].iter().all(|b| *b == fill))
                 {
@@ -100,6 +119,10 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
             ControlCommand::PushSoc {
                 address, wire, ack, ..
             } => {
+                if log.lock().unwrap().saturated {
+                    let _ = ack.send(saturation_error());
+                    continue;
+                }
                 {
                     let mut log = log.lock().unwrap();
                     if !ant_crypto::soc_valid(&address, &wire) {
@@ -1049,6 +1072,11 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
     let report = run.report();
     assert_eq!(report.segments_failed, 1, "{report:?}");
     assert!(report.segments_dropped > 0, "{report:?}");
+    // The node's plain refusal is a 502 from the gateway, the network's
+    // failure, not the batch's (issue #176).
+    assert_eq!(report.batch_full_refusals, 0, "{report:?}");
+    assert_eq!(report.batch_unusable_refusals, 0, "{report:?}");
+    assert_eq!(report.batch_error, "");
     let lost = report.segments_dropped + report.segments_failed;
     assert_eq!(report.segments_listed + lost, 12, "{report:?}");
 
@@ -1946,4 +1974,167 @@ async fn a_killed_broadcast_resumes_in_the_default_format() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_killed_broadcast_finalizes_into_a_recording() {
     a_killed_broadcast_comes_back(StreamFormat::Bzz, 0).await;
+}
+
+fn capacity_config(addr: &str, format: StreamFormat, topic_text: &str) -> PublisherConfig {
+    PublisherConfig {
+        channel: "integration".into(),
+        topic: String::new(),
+        topic_text: topic_text.into(),
+        format,
+        gateway: format!("http://{addr}"),
+        batch_id: "ab".repeat(32),
+        segment_ms: 2000,
+        bitrate_kbps: 160,
+        max_in_flight: 1,
+        max_backlog: 4,
+        playlist_window: 64,
+        notes: String::new(),
+        start_index: None,
+        reap_ms: 0,
+        ladder: false,
+        width: 0,
+        height: 0,
+        recovery_path: String::new(),
+        resume: false,
+    }
+}
+
+/// A segment of `len` bytes no two of which repeat a chunk: real video
+/// doesn't, and a stamp is per distinct chunk.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// Issue #176: the pre-flight estimate counts what a broadcast really
+/// stamps through ant's own gateway. A minute of segments at the
+/// config's bitrate, each with its playlist and feed update, then the
+/// stop's closing window and recording: every chunk and SOC the gateway
+/// pushes takes a stamp, and the estimate for one minute must land
+/// within a few percent of them (it is within one percent: the
+/// recording's first minute steps up a chunk tree earlier than its
+/// hour-long average).
+async fn a_minute_costs_what_the_estimate_says(format: StreamFormat, topic_text: &str) {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config = capacity_config(&addr, format, topic_text);
+    let cost = publisher::broadcast_cost(&config);
+    // The segment size the estimate assumes: the bitrate's bytes plus
+    // its headroom.
+    let segment_bytes = (u64::from(config.bitrate_kbps) * u64::from(config.segment_ms) / 8
+        * (100 + publisher::BITRATE_HEADROOM_PERCENT)
+        / 100) as usize;
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, noise(900, 999), 0, false);
+    // 30 two-second segments, a minute, each landing in its own update.
+    for i in 0..30u64 {
+        let _ = run.push(SegmentKind::Media, noise(segment_bytes, i), 2000, false);
+        wait_for(&run, |s| s.segments_listed > i).await;
+    }
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let report = run.report();
+    assert_eq!(report.segments_listed, 30, "{report:?}");
+    assert!(!report.recording_reference.is_empty(), "{report:?}");
+    let stamped = {
+        let log = log.lock().unwrap();
+        (log.chunks + log.socs.len()) as u64
+    };
+    let estimate = cost.chunks_per_minute + cost.fixed_chunks;
+    let ratio = stamped as f64 / estimate as f64;
+    assert!(
+        (0.95..=1.03).contains(&ratio),
+        "{format:?}: stamped {stamped}, estimated {estimate} ({} a minute + {} once)",
+        cost.chunks_per_minute,
+        cost.fixed_chunks,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_minute_costs_what_the_estimate_says_in_the_default_format() {
+    a_minute_costs_what_the_estimate_says(StreamFormat::Bzz, "antstream-capacity-bzz").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_minute_costs_what_the_estimate_says_in_the_solar_punk_format() {
+    a_minute_costs_what_the_estimate_says(StreamFormat::SolarPunk, "antstream-capacity-sp").await;
+}
+
+/// Issue #176: a batch that fills mid-broadcast. The node refuses the
+/// push with its saturation error, ant's gateway turns that into bee's
+/// `402`, and the publisher names it as the batch being full, not as the
+/// network failing: the live progress counts it apart from the dropped
+/// and failed segments it also causes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_that_fills_mid_broadcast_is_named_as_full() {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config = capacity_config(&addr, StreamFormat::Bzz, "antstream-capacity-full");
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, noise(900, 999), 0, false);
+    for i in 0..3u64 {
+        let _ = run.push(SegmentKind::Media, noise(40_000, i), 2000, false);
+        wait_for(&run, |s| s.segments_listed > i).await;
+    }
+    let healthy = run.snapshot();
+    assert_eq!(healthy.batch_full_refusals, 0, "{healthy:?}");
+    assert_eq!(healthy.batch_error, "");
+
+    // The batch fills.
+    log.lock().unwrap().saturated = true;
+    for i in 3..6u64 {
+        let _ = run.push(SegmentKind::Media, noise(40_000, i), 2000, false);
+    }
+    wait_for(&run, |s| s.segments_failed == 3).await;
+    let full = run.snapshot();
+    assert!(full.batch_full_refusals >= 3, "{full:?}");
+    assert_eq!(full.batch_unusable_refusals, 0, "{full:?}");
+    assert!(
+        full.batch_error.contains("402") && full.batch_error.contains("saturated"),
+        "the refusal is named as the batch's: {}",
+        full.batch_error,
+    );
+    assert_eq!(full.segments_listed, 3, "{full:?}");
+
+    run.cancel();
+    for _ in 0..400 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The closing window and the recording are refused the same way.
+    let report = run.report();
+    assert!(report.recording_reference.is_empty(), "{report:?}");
+    assert!(
+        report.batch_full_refusals > full.batch_full_refusals,
+        "{report:?}"
+    );
 }

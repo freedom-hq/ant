@@ -17,9 +17,18 @@ struct StoragePlan: Codable, Equatable {
     let totalCapacityChunks: UInt64
     let issuedChunks: UInt64
     let worstCaseRemainingChunks: UInt64
+    /// The node will stamp with this batch at all (an expired or unknown
+    /// one it won't). Carried through because ``AntNode/capacity(for:)``
+    /// re-encodes this plan for `ant_publisher_capacity`, where a missing
+    /// field reads as `true`: dropping it would make every batch look
+    /// usable (#176).
+    var usable: Bool = true
+    /// `usable` is `false` only because a just-bought batch is still
+    /// propagating to the storers: it will be usable shortly.
+    var propagating: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case enabled
+        case enabled, usable, propagating
         case batchId = "batch_id"
         case batchDepth = "batch_depth"
         case immutable
@@ -50,6 +59,92 @@ struct StoragePlan: Codable, Equatable {
     var isLow: Bool {
         guard totalCapacityChunks > 0 else { return false }
         return Double(issuedChunks) / Double(totalCapacityChunks) > 0.90
+    }
+}
+
+extension StoragePlan {
+    /// The node leaves `propagating` out when `false` (and older nodes
+    /// sent no `usable`); default both the way the node's own
+    /// `PostageStatusView` does, so a plan decodes either way.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        batchId = try c.decode(String.self, forKey: .batchId)
+        batchDepth = try c.decode(UInt8.self, forKey: .batchDepth)
+        immutable = try c.decode(Bool.self, forKey: .immutable)
+        totalCapacityChunks = try c.decode(UInt64.self, forKey: .totalCapacityChunks)
+        issuedChunks = try c.decode(UInt64.self, forKey: .issuedChunks)
+        worstCaseRemainingChunks = try c.decode(UInt64.self, forKey: .worstCaseRemainingChunks)
+        usable = try c.decodeIfPresent(Bool.self, forKey: .usable) ?? true
+        propagating = try c.decodeIfPresent(Bool.self, forKey: .propagating) ?? false
+    }
+}
+
+/// How long a broadcast fits on the storage plan, from
+/// `ant_publisher_capacity` (#176): what a minute of the broadcast
+/// stamps against the room left in the plan's **fullest** bucket.
+struct CapacityEstimate: Codable, Equatable {
+    let batchId: String
+    /// An immutable plan refuses uploads once full; a mutable one
+    /// overwrites the oldest video instead, with no error at all.
+    let immutable: Bool
+    /// The node will stamp with the plan at all.
+    let usable: Bool
+    let chunksPerMinute: UInt64
+    let chunksLeft: UInt64
+    let minutesLeft: UInt64
+    /// Under an hour left at this quality: warn before going live.
+    let low: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case immutable, usable, low
+        case batchId = "batch_id"
+        case chunksPerMinute = "chunks_per_minute"
+        case chunksLeft = "chunks_left"
+        case minutesLeft = "minutes_left"
+    }
+
+    /// Anything a broadcaster should hear about before going live. The
+    /// one test both the Broadcast checklist and the going-live screen
+    /// use, so they never disagree.
+    var needsWarning: Bool { low || !immutable || !usable }
+
+    /// "About 3 h 20 min", "About 12 min", "No room".
+    var timeLabel: String {
+        if minutesLeft == 0 { return "No room" }
+        if minutesLeft < 60 { return "About \(minutesLeft) min" }
+        let hours = minutesLeft / 60
+        if hours >= 48 { return "About \(hours / 24) days" }
+        let minutes = minutesLeft % 60
+        return minutes == 0 ? "About \(hours) h" : "About \(hours) h \(minutes) min"
+    }
+
+    /// The "about N minutes left on this plan" line, for `quality`. A
+    /// plan Swarm won't stamp with has no room whatever its buckets say,
+    /// so it never reports hours next to ``warning``'s refusal.
+    func summary(quality: String) -> String {
+        if !usable { return "No \(quality) video fits on this plan right now" }
+        return minutesLeft == 0
+            ? "No room left on this plan for \(quality) video"
+            : "\(timeLabel) of \(quality) left on this plan"
+    }
+
+    /// Why ``needsWarning``, in a sentence, or `nil`.
+    var warning: String? {
+        if !usable {
+            return "Swarm won't accept this plan's stamps: every upload would be refused."
+        }
+        if !immutable {
+            return low
+                ? "This plan overwrites its oldest video once full: past that point "
+                    + "a broadcast eats its own beginning, with no error."
+                : "This plan overwrites its oldest video once full instead of refusing, "
+                    + "so a broadcast longer than this would eat its own beginning."
+        }
+        if low {
+            return "Past that, Swarm refuses the broadcast's uploads and its recording."
+        }
+        return nil
     }
 }
 
@@ -522,10 +617,21 @@ struct PublisherSnapshot: Codable, Equatable {
     /// Why the crash-recovery entry (#175) could not be saved, empty
     /// while it saves fine. Optional so a node without it decodes.
     let recoveryError: String?
+    /// Uploads the gateway refused because the storage plan's batch is
+    /// full (bee's 402), and because the batch itself is unusable (#176).
+    /// Not network failures: counted apart so the live screen can name
+    /// the plan as the problem. Optional so a node without them decodes.
+    let batchFullRefusals: UInt64?
+    let batchUnusableRefusals: UInt64?
+    /// The newest of those refusals, empty while there has been none.
+    let batchError: String?
 
     enum CodingKeys: String, CodingKey {
         case running, channel, topic, owner, peers, paused, reaped
         case recoveryError = "recovery_error"
+        case batchFullRefusals = "batch_full_refusals"
+        case batchUnusableRefusals = "batch_unusable_refusals"
+        case batchError = "batch_error"
         case segmentsWithheld = "segments_withheld"
         case elapsedS = "elapsed_s"
         case channelReference = "channel_reference"
@@ -554,6 +660,46 @@ struct PublisherSnapshot: Codable, Equatable {
     var lagLabel: String {
         guard playlistsPublished > 0 else { return "Connecting…" }
         return String(format: "%.1f s behind", Double(lagMs) / 1000.0)
+    }
+
+    /// What the storage plan is doing to this broadcast, if anything.
+    var batchProblem: BatchProblem? {
+        BatchProblem(full: batchFullRefusals ?? 0, unusable: batchUnusableRefusals ?? 0)
+    }
+}
+
+/// A broadcast's uploads refused because of its storage plan rather
+/// than the network (#176). One type for the live screen and the
+/// summary, so both say the same thing about the same counts.
+struct BatchProblem: Equatable {
+    /// Refused because the plan is full (bee's 402).
+    let full: UInt64
+    /// Refused because the plan's batch is unusable (unknown, expired,
+    /// not on chain).
+    let unusable: UInt64
+
+    init?(full: UInt64, unusable: UInt64) {
+        guard full > 0 || unusable > 0 else { return nil }
+        self.full = full
+        self.unusable = unusable
+    }
+
+    /// Full outranks unusable: it is the one a long broadcast walks into.
+    var title: String {
+        full > 0 ? "Storage plan full" : "Storage plan refused"
+    }
+
+    var detail: String {
+        let count = full > 0 ? full : unusable
+        let uploads = count == 1 ? "1 upload" : "\(count) uploads"
+        if full > 0 {
+            return "Swarm refused \(uploads) because the plan has no room left. "
+                + "Viewers miss what is refused, and the recording may not be "
+                + "kept. Extend or buy a bigger plan before the next broadcast."
+        }
+        return "Swarm won't accept this plan's stamps (\(uploads) refused): "
+            + "it is unknown to the network or has expired. Check the plan "
+            + "on the Storage tab."
     }
 }
 
@@ -669,9 +815,16 @@ struct PublisherReport: Codable, Equatable {
     /// It ended by itself after a minute with nothing reaching the
     /// playlist, not on the stop button.
     let reaped: Bool?
+    /// See ``PublisherSnapshot/batchFullRefusals`` (#176).
+    let batchFullRefusals: UInt64?
+    let batchUnusableRefusals: UInt64?
+    let batchError: String?
 
     enum CodingKeys: String, CodingKey {
         case channel, topic, owner, notes, errors, reaped
+        case batchFullRefusals = "batch_full_refusals"
+        case batchUnusableRefusals = "batch_unusable_refusals"
+        case batchError = "batch_error"
         case segmentsWithheld = "segments_withheld"
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
@@ -719,6 +872,10 @@ struct PublisherReport: Codable, Equatable {
     /// throughput verdict.
     var hasVerdict: Bool { segmentsListed > 0 }
 
+    var batchProblem: BatchProblem? {
+        BatchProblem(full: batchFullRefusals ?? 0, unusable: batchUnusableRefusals ?? 0)
+    }
+
     var verdictLabel: String {
         if reaped == true { return "Broadcast ended: nothing reached viewers for a minute" }
         guard hasVerdict else { return "Broadcast ended without publishing" }
@@ -730,6 +887,11 @@ enum StreamDecoder {
     static func publisherSnapshot(from json: String) -> PublisherSnapshot? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(PublisherSnapshot.self, from: data)
+    }
+
+    static func capacity(from json: String) -> CapacityEstimate? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(CapacityEstimate.self, from: data)
     }
 
     static func publisherReport(from json: String) -> PublisherReport? {

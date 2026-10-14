@@ -251,6 +251,39 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live-idle
           sleep 25
           xcrun simctl io booted screenshot shots/17-live-quality-picker.png
+          # 21/22 — a nearly full storage plan (#176). A runner account
+          # has no plan, so `-antstream-shot-low-capacity` makes the
+          # sample one immutable with about twenty minutes of 360p left in
+          # its fullest bucket: the Broadcast checklist's "Room for a
+          # broadcast" row (scrolled into view) and the going-live
+          # screen's line under the quality picker both warn. (Shots 11/12
+          # show the other half: the sample batch is not a real one, so
+          # every upload is refused and the live screen names the plan,
+          # not the network.)
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-channel -antstream-shot-low-capacity
+          sleep 25
+          xcrun simctl io booted screenshot shots/21-broadcast-low-capacity.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-low-capacity
+          sleep 25
+          xcrun simctl io booted screenshot shots/22-live-low-capacity.png
+          # 23/24 — a plan Swarm won't stamp with at all (#176): the
+          # sample batch reads `usable: false` (and is not propagating),
+          # so the same two surfaces say "Swarm won't accept this plan's
+          # stamps" in orange instead of a time estimate.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-channel -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/23-broadcast-unusable-plan.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/24-live-unusable-plan.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

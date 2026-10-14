@@ -495,9 +495,13 @@ struct GetStartedView: View {
         withAnimation { step = .activating }
         Task {
             do {
+                // Immutable (#176): once a bucket fills, a broadcast's
+                // uploads are refused (and the live screen says so)
+                // instead of silently overwriting the oldest video, so a
+                // long broadcast can't eat its own beginning.
                 try await node.buyStorage(rpc: activeRpc, depth: tier.depth,
                                           amountPerChunk: quote.amountPerChunk,
-                                          immutable: false)
+                                          immutable: true)
                 if node.hasStorage {
                     dismiss()
                 } else {

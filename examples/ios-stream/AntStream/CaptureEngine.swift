@@ -36,6 +36,10 @@ import UniformTypeIdentifiers
 final class CaptureEngine: NSObject {
     // MARK: configuration
 
+    /// The camera's AAC track, on top of the video bitrate in every
+    /// segment. The storage estimate (#176) counts it too.
+    static let audioBitrateKbps = 64
+
     /// The rendition. Defaults are the stage-1 go/no-go row: 360p at
     /// ~900 kbit/s with 2 s segments (`crates/ant-ffi/ANTSTREAM_BENCH.md`).
     struct Settings: Equatable {
@@ -472,7 +476,7 @@ final class CaptureEngine: NSObject {
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVNumberOfChannelsKey: 1,
                     AVSampleRateKey: 44_100,
-                    AVEncoderBitRateKey: 64_000,
+                    AVEncoderBitRateKey: CaptureEngine.audioBitrateKbps * 1000,
                 ]
             )
             aInput.expectsMediaDataInRealTime = true

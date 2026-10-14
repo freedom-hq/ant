@@ -2306,19 +2306,13 @@ async fn push_replica_socs(
             }
             match tokio::time::timeout(timeout, ack_rx).await {
                 Ok(Ok(ControlAck::ChunkUploaded { .. })) => Ok(()),
-                Ok(Ok(ControlAck::Error { message })) => {
-                    let status = if message.starts_with("uploads not configured") {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else if message.contains("not usable") {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    };
-                    Err(json_error(
-                        status,
-                        format!("push replica failed: {message}"),
-                    ))
-                }
+                // The same mapping as the upload's own chunks: a replica
+                // refused because the batch is full is the `402` its
+                // data chunks get, not a retryable `502`.
+                Ok(Ok(ControlAck::Error { message })) => Err(json_error(
+                    upload_error_status(&message),
+                    format!("push replica failed: {message}"),
+                )),
                 Ok(Ok(other)) => {
                     warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
                     Err(json_error(

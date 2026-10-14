@@ -3742,6 +3742,57 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
     }
 }
 
+/// How long a broadcast fits on the storage plan, checked before going
+/// live (issue #176). `config_json` is the [`publisher::PublisherConfig`]
+/// the broadcast would start with (only its `batch_id`, `format`,
+/// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
+/// counts everything a segment carries, so a host adds its audio rate);
+/// `plan_json` is the plan as [`ant_storage_status`] reports it (its
+/// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
+/// `usable` and `propagating` are read; pass `usable` through, since a
+/// missing one reads as `true` and the estimate's `usable` would then
+/// always be `true`).
+///
+/// Returns a [`publisher::CapacityEstimate`] JSON object,
+/// `{"batch_id","immutable","usable","chunks_per_minute","chunks_left",
+/// "minutes_left","low"}`: the chunks a minute of the broadcast stamps
+/// (segments, the playlist and feed update after each, ladder markers,
+/// the recording's share), the room left counting the batch's **fullest
+/// bucket**, the whole minutes that fit, and `low` under
+/// [`publisher::LOW_CAPACITY_MINUTES`]. An immutable batch refuses the
+/// broadcast's uploads once `minutes_left` runs out; a mutable one
+/// (`immutable: false`) overwrites its oldest chunks instead, so a host
+/// warns about it whatever its room. Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when either document doesn't parse, the plan
+/// is not connected, or the plan's batch is not the config's.
+///
+/// # Safety
+///
+/// * `config_json` and `plan_json` must be valid NUL-terminated strings.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_capacity(
+    config_json: *const c_char,
+    plan_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_publisher_capacity", || {
+            let config = cstr_to_str(config_json).map_err(|e| e.to_string())?;
+            let plan = cstr_to_str(plan_json).map_err(|e| e.to_string())?;
+            let config: publisher::PublisherConfig =
+                serde_json::from_str(config).map_err(|e| format!("config_json: {e}"))?;
+            let plan: ant_control::PostageStatusView =
+                serde_json::from_str(plan).map_err(|e| format!("plan_json: {e}"))?;
+            let estimate =
+                publisher::estimate_capacity(&config, &plan).map_err(|e| e.to_string())?;
+            serde_json::to_string(&estimate).map_err(|e| e.to_string())
+        })
+    }
+}
+
 /// Start a live broadcast from this node.
 ///
 /// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
