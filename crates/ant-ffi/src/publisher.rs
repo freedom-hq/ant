@@ -42,6 +42,14 @@
 //!    channel (owner and topic) but does not resolve to the playlist
 //!    through `/bzz`, because the feed's content is not a manifest.
 //!
+//! At stop the live window is closed with `#EXT-X-ENDLIST` (so a viewer
+//! following the live edge stops there) and then the **whole broadcast**
+//! goes up the same way as one `#EXT-X-PLAYLIST-TYPE:VOD` playlist and
+//! becomes the feed's final update (issue #168): every segment ever
+//! listed, gaps and discontinuities included, so the channel's head
+//! plays from the first segment to the last. Its reference is the stop
+//! report's `recording_reference`.
+//!
 //! The topic is either text, hashed the way Solar Punk catalog entries
 //! and bee-js `Topic.fromString` name a feed ([`topic_from_string`]), or
 //! raw bytes from the host. A `"solar-punk"` broadcast with a text topic
@@ -704,6 +712,12 @@ struct PublisherState {
 
     /// The rolling media playlist.
     playlist: VecDeque<MediaEntry>,
+    /// Every entry the live window ever listed, in order, never evicted:
+    /// the whole broadcast, written at stop as the recording
+    /// ([`PublisherState::render_recording`], issue #168). A few hundred
+    /// bytes an entry, so about 400 KB of memory for an hour at 2 s
+    /// segments.
+    recording: Vec<MediaEntry>,
     /// Media sequence number for the next listed segment.
     next_number: u64,
     /// `#EXT-X-DISCONTINUITY-SEQUENCE`: discontinuities that have
@@ -748,6 +762,8 @@ struct PublisherState {
     /// content-addressed) but a wasted upload on the live path.
     channel_manifest_in_flight: bool,
     playlist_reference: Option<String>,
+    /// Reference of the uploaded recording, set once it landed at stop.
+    recording_reference: Option<String>,
 
     publish_ms: VecDeque<u64>,
     lag_ms: VecDeque<u64>,
@@ -894,10 +910,17 @@ impl PublisherState {
                     // now, so they are listed with it.
                     for gap in std::mem::take(&mut self.pending_gaps) {
                         self.longest_listed_ms = self.longest_listed_ms.max(gap.duration_ms);
+                        // The recording never starts on a gap either: a
+                        // hole in front of its first segment is not
+                        // worth a line, as in the live window.
+                        if !self.recording.is_empty() {
+                            self.recording.push(gap.clone());
+                        }
                         self.playlist.push_back(gap);
                     }
                     self.segments_listed += 1;
                     self.longest_listed_ms = self.longest_listed_ms.max(duration_ms);
+                    self.recording.push(entry.clone());
                     self.playlist.push_back(entry);
                     // Start the live-edge clock at the first segment
                     // that could have been seen. Later segments do not
@@ -992,57 +1015,121 @@ impl PublisherState {
 
     /// Render the current playlist. `endlist` closes the broadcast.
     fn render_playlist(&self, target_ms: u32, endlist: bool) -> String {
-        // Run-max, not window-max: see `longest_listed_ms`.
-        let target_s = self.longest_listed_ms.max(target_ms).div_ceil(1000).max(1);
-        use std::fmt::Write as _;
-        let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
-        if !self.broadcast_id.is_empty() {
-            let _ = writeln!(out, "#ANTSTREAM-BROADCAST:{}", self.broadcast_id);
-        }
-        // Writing into a `String` is infallible, so the `write!` results
-        // are deliberately dropped rather than unwrapped.
-        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target_s}");
+        render_entries(
+            &self.broadcast_id,
+            self.target_duration_s(target_ms),
+            self.playlist.front().map_or(self.next_number, |e| e.number),
+            self.discontinuity_sequence,
+            self.playlist.iter(),
+            if endlist {
+                PlaylistShape::Closing
+            } else {
+                PlaylistShape::Live
+            },
+        )
+    }
+
+    /// Render the whole broadcast as a recording (issue #168): every
+    /// entry the live window ever listed, in order, gaps and
+    /// discontinuities where they were, as an
+    /// `#EXT-X-PLAYLIST-TYPE:VOD` playlist closed with `#EXT-X-ENDLIST`.
+    /// The shape Solar Punk's uploader writes as its recording
+    /// (`buildVODManifest`): the media sequence is the number the live
+    /// window gave the first segment, so a segment keeps its number from
+    /// the live playlists into the recording, and there is no
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE`, since nothing came before the
+    /// first entry. Not budgeted: past one chunk it uploads as a chunk
+    /// tree.
+    fn render_recording(&self, target_ms: u32) -> String {
+        render_entries(
+            &self.broadcast_id,
+            self.target_duration_s(target_ms),
+            self.recording
+                .first()
+                .map_or(self.next_number, |e| e.number),
+            0,
+            self.recording.iter(),
+            PlaylistShape::Recording,
+        )
+    }
+
+    /// `#EXT-X-TARGETDURATION`, whole seconds. Run-max, not window-max:
+    /// see `longest_listed_ms`. The same value in every playlist of the
+    /// broadcast, the recording included.
+    fn target_duration_s(&self, target_ms: u32) -> u32 {
+        self.longest_listed_ms.max(target_ms).div_ceil(1000).max(1)
+    }
+}
+
+/// Which playlist [`render_entries`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistShape {
+    /// The rolling live window.
+    Live,
+    /// The live window closed with `#EXT-X-ENDLIST`, published at stop
+    /// before the recording.
+    Closing,
+    /// The whole broadcast: `#EXT-X-PLAYLIST-TYPE:VOD` and
+    /// `#EXT-X-ENDLIST`.
+    Recording,
+}
+
+/// Write an HLS media playlist over `entries`, every playlist of a
+/// broadcast (live window, closing window, recording) in one shape.
+fn render_entries<'a>(
+    broadcast_id: &str,
+    target_s: u32,
+    media_sequence: u64,
+    discontinuity_sequence: u64,
+    entries: impl Iterator<Item = &'a MediaEntry>,
+    shape: PlaylistShape,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    if !broadcast_id.is_empty() {
+        let _ = writeln!(out, "#ANTSTREAM-BROADCAST:{broadcast_id}");
+    }
+    // Writing into a `String` is infallible, so the `write!` results
+    // are deliberately dropped rather than unwrapped.
+    let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target_s}");
+    if shape == PlaylistShape::Recording {
+        out.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    }
+    let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{media_sequence}");
+    if discontinuity_sequence > 0 {
         let _ = writeln!(
             out,
-            "#EXT-X-MEDIA-SEQUENCE:{}",
-            self.playlist.front().map_or(self.next_number, |e| e.number),
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
         );
-        if self.discontinuity_sequence > 0 {
-            let _ = writeln!(
-                out,
-                "#EXT-X-DISCONTINUITY-SEQUENCE:{}",
-                self.discontinuity_sequence,
-            );
-        }
-        let mut current_map: Option<&str> = None;
-        for entry in &self.playlist {
-            if entry.discontinuity {
-                out.push_str("#EXT-X-DISCONTINUITY\n");
-            }
-            if current_map != Some(entry.init_uri.as_str()) {
-                let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", entry.init_uri);
-                current_map = Some(entry.init_uri.as_str());
-            }
-            if entry.gap {
-                out.push_str("#EXT-X-GAP\n");
-            }
-            let _ = writeln!(
-                out,
-                "#EXT-X-PROGRAM-DATE-TIME:{}",
-                iso8601_utc_ms(entry.program_ms),
-            );
-            let _ = writeln!(
-                out,
-                "#EXTINF:{:.3},\n{}",
-                f64::from(entry.duration_ms) / 1000.0,
-                entry.uri,
-            );
-        }
-        if endlist {
-            out.push_str("#EXT-X-ENDLIST\n");
-        }
-        out
     }
+    let mut current_map: Option<&str> = None;
+    for entry in entries {
+        if entry.discontinuity {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+        }
+        if current_map != Some(entry.init_uri.as_str()) {
+            let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", entry.init_uri);
+            current_map = Some(entry.init_uri.as_str());
+        }
+        if entry.gap {
+            out.push_str("#EXT-X-GAP\n");
+        }
+        let _ = writeln!(
+            out,
+            "#EXT-X-PROGRAM-DATE-TIME:{}",
+            iso8601_utc_ms(entry.program_ms),
+        );
+        let _ = writeln!(
+            out,
+            "#EXTINF:{:.3},\n{}",
+            f64::from(entry.duration_ms) / 1000.0,
+            entry.uri,
+        );
+    }
+    if shape != PlaylistShape::Live {
+        out.push_str("#EXT-X-ENDLIST\n");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1210,16 @@ pub struct PublisherReport {
     /// See [`PublisherSnapshot::format`].
     pub format: StreamFormat,
     pub playlist_reference: String,
+    /// Reference of the **recording** (issue #168): the whole broadcast
+    /// as one `#EXT-X-PLAYLIST-TYPE:VOD` playlist, uploaded at stop and
+    /// published as the feed's final update, so the channel's head
+    /// plays from the first segment to the last. Kept by a host that
+    /// lists past broadcasts: under `"bzz"` it plays as
+    /// `/bzz/<it>/stream.m3u8`, under `"solar-punk"` as `/bytes/<it>`,
+    /// with no feed lookup. Empty when nothing was listed or its upload
+    /// failed (see `errors`). Set as soon as the upload lands, even if
+    /// the feed update after it fails.
+    pub recording_reference: String,
     pub notes: String,
     pub target_bitrate_kbps: u32,
     pub segment_ms: u32,
@@ -1333,8 +1430,9 @@ impl LiveRun {
     }
 
     /// Ask the loop to stop. Cooperative: already-captured segments are
-    /// drained (the last seconds of a broadcast are worth publishing)
-    /// and the playlist is closed with `#EXT-X-ENDLIST`.
+    /// drained (the last seconds of a broadcast are worth publishing),
+    /// the live playlist is closed with `#EXT-X-ENDLIST`, and the whole
+    /// broadcast is published as the recording, the feed's final update.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
         // `notify_one` rather than `notify_waiters`: the pump and the
@@ -1372,6 +1470,7 @@ impl LiveRun {
             channel_reference: state.channel_reference.clone().unwrap_or_default(),
             format: self.config.format,
             playlist_reference: state.playlist_reference.clone().unwrap_or_default(),
+            recording_reference: state.recording_reference.clone().unwrap_or_default(),
             notes: self.config.notes.clone(),
             target_bitrate_kbps: self.config.bitrate_kbps,
             segment_ms: self.config.segment_ms,
@@ -1728,7 +1827,7 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
             state.advance(ctx.config.playlist_window, ctx.config.segment_ms)
         };
         if let Some(captured_at) = newest {
-            publish_playlist(&ctx, false, Some(captured_at)).await;
+            publish_playlist(&ctx, PlaylistShape::Live, Some(captured_at)).await;
             continue;
         }
         // Nothing new. If the pump has finished (backlog drained *and*
@@ -1751,33 +1850,58 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         let lag = state.live_edge_lag_ms();
         state.lag_frozen_ms = Some(lag);
     }
-    // Final playlist: `#EXT-X-ENDLIST` turns the live channel into a
-    // finished recording for anyone still resolving the feed.
-    if !lock(&ctx.state).playlist.is_empty() {
-        publish_playlist(&ctx, true, None).await;
+    if lock(&ctx.state).recording.is_empty() {
+        return;
     }
+    // First the live window closed with `#EXT-X-ENDLIST`: a viewer
+    // following the live edge stops reloading there, the way it always
+    // has. It must reach that before the recording, which it could not
+    // take in place of a live playlist: the recording's
+    // `#EXT-X-MEDIA-SEQUENCE` is the broadcast's first segment, behind
+    // the window's, and a live client (the web player's stale-read guard,
+    // Solar Punk's feed poller) reads a media sequence that moves back as
+    // an older playlist, not as the end. Solar Punk's uploader closes its
+    // window and then writes the recording in the same order.
+    publish_playlist(&ctx, PlaylistShape::Closing, None).await;
+    // Then the whole broadcast as the final update (issue #168), so the
+    // feed's head plays from the first segment to the last rather than
+    // the closing window's last minute.
+    publish_playlist(&ctx, PlaylistShape::Recording, None).await;
 }
 
-/// Upload the current playlist and publish it as the next feed update.
+/// Upload a playlist (`shape`: the live window, the closing window or
+/// the recording) and publish it as the next feed update.
 /// `captured_at`, when present, is the newest committed segment — its
 /// live-edge lag is only known once the feed update lands. How the
 /// playlist goes up and what the update wraps depends on the
 /// [`StreamFormat`]; see [`upload_playlist`].
-async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<Instant>) {
+async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: Option<Instant>) {
     let body = {
         let state = lock(&ctx.state);
-        state.render_playlist(ctx.config.segment_ms, endlist)
+        match shape {
+            PlaylistShape::Live => state.render_playlist(ctx.config.segment_ms, false),
+            PlaylistShape::Closing => state.render_playlist(ctx.config.segment_ms, true),
+            PlaylistShape::Recording => state.render_recording(ctx.config.segment_ms),
+        }
     };
     let (playlist_ref, root) = match upload_playlist(ctx, &body).await {
         Ok(uploaded) => uploaded,
         Err(message) => {
-            lock(&ctx.state).record_error(format!("playlist: {message}"));
+            let what = if shape == PlaylistShape::Recording {
+                "recording"
+            } else {
+                "playlist"
+            };
+            lock(&ctx.state).record_error(format!("{what}: {message}"));
             return;
         }
     };
     {
         let mut state = lock(&ctx.state);
         state.playlists_published += 1;
+        if shape == PlaylistShape::Recording {
+            state.recording_reference = Some(playlist_ref.clone());
+        }
         state.playlist_reference = Some(playlist_ref);
     }
 
@@ -1805,7 +1929,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
     // in the final report. Not after the closing playlist: a fresh
     // attempt there would add a whole publish deadline to stop's drain
     // (an attempt already in flight is still joined).
-    if !endlist && lock(&ctx.state).channel_reference.is_none() {
+    if shape == PlaylistShape::Live && lock(&ctx.state).channel_reference.is_none() {
         ctx.spawn_channel_manifest();
     }
 }
@@ -1823,9 +1947,11 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<
 ///   what Solar Punk's uploader publishes). The SOC payload *is* the
 ///   playlist: the live window is budgeted to fit in one chunk
 ///   ([`LIVE_WINDOW_MAX_BYTES`]), so a viewer's poll is a single chunk
-///   read. (Only a lone segment whose own lines are past the budget,
-///   which no real reference is, would make it the root of a chunk tree
-///   instead: still readable, at the cost of extra reads.) Both
+///   read. The recording written at stop is not budgeted (it lists the
+///   whole broadcast), so past one chunk the update wraps the root of
+///   its chunk tree, span = the whole playlist's length, and a reader
+///   joins the leaves under it (as does a lone live segment whose own
+///   lines are past the budget, which no real reference is). Both
 ///   `GET /soc/{owner}/{id}` and `GET /feeds/{owner}/{topic}` answer
 ///   with the playlist text, on bee and on ant. (Readers tell a v1
 ///   update by its 40- or 72-byte payload; the playlist's fixed header
@@ -2887,6 +3013,149 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The recording (#168)
+    // -----------------------------------------------------------------
+
+    /// The lines of a playlist that name an entry (segment or gap).
+    fn entry_uris(playlist: &str) -> Vec<&str> {
+        playlist.lines().filter(|l| !l.starts_with('#')).collect()
+    }
+
+    /// Long after the window slid past them, the recording still lists
+    /// every entry the broadcast ever listed: gaps, a writer restart's
+    /// discontinuity and fresh map where they were, the run-max target
+    /// duration, closed as VOD and numbered from the first segment with
+    /// no discontinuity sequence. A gap still waiting for media when the
+    /// broadcast ends is not listed, as in the closing window.
+    #[test]
+    fn the_recording_lists_every_entry_the_window_slid_past() {
+        let mut state = PublisherState {
+            broadcast_id: "b1".into(),
+            ..PublisherState::default()
+        };
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
+        state.done.insert(2, lost(false, 1_788_264_002_000));
+        state.done.insert(
+            3,
+            Committed::Media {
+                uri: "/bzz/b3/seg-3.m4s".into(),
+                duration_ms: 3400,
+                discontinuity: false,
+                captured_at: Instant::now(),
+                program_ms: 1_788_264_004_000,
+            },
+        );
+        state.done.insert(
+            4,
+            Committed::Init {
+                uri: "/bzz/cc/init-4.mp4".into(),
+            },
+        );
+        state.done.insert(5, media("/bzz/b5/seg-5.m4s", true));
+        state.done.insert(6, media("/bzz/b6/seg-6.m4s", false));
+        state.done.insert(7, media("/bzz/b7/seg-7.m4s", false));
+        state.done.insert(8, lost(false, 1_788_264_020_000));
+        assert!(state.advance(2, 2000).is_some());
+
+        let window = state.render_playlist(2000, true);
+        assert_eq!(
+            entry_uris(&window),
+            ["/bzz/b6/seg-6.m4s", "/bzz/b7/seg-7.m4s"],
+            "{window}"
+        );
+        assert!(window.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
+
+        let recording = state.render_recording(2000);
+        assert_eq!(
+            recording,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #ANTSTREAM-BROADCAST:b1\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-MAP:URI=\"/bzz/aa/init-0.mp4\"\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n\
+             #EXTINF:2.000,\n/bzz/b1/seg-1.m4s\n\
+             #EXT-X-GAP\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n\
+             #EXTINF:2.000,\ngap-1\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:04.000Z\n\
+             #EXTINF:3.400,\n/bzz/b3/seg-3.m4s\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXT-X-MAP:URI=\"/bzz/cc/init-4.mp4\"\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n\
+             #EXTINF:2.000,\n/bzz/b5/seg-5.m4s\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n\
+             #EXTINF:2.000,\n/bzz/b6/seg-6.m4s\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n\
+             #EXTINF:2.000,\n/bzz/b7/seg-7.m4s\n\
+             #EXT-X-ENDLIST\n",
+        );
+    }
+
+    /// A segment lost in front of the broadcast's first listed one is
+    /// not worth a line in the recording either: it starts on media, at
+    /// that media's number.
+    #[test]
+    fn the_recording_never_starts_on_a_gap() {
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        state.done.insert(1, lost(false, 1_788_264_000_000));
+        state.done.insert(2, media("/bzz/b2/seg-2.m4s", false));
+        state.advance(3, 2000);
+        let recording = state.render_recording(2000);
+        assert!(!recording.contains("#EXT-X-GAP"), "{recording}");
+        assert!(
+            recording.contains("#EXT-X-MEDIA-SEQUENCE:1\n"),
+            "{recording}"
+        );
+        assert_eq!(entry_uris(&recording), ["/bzz/b2/seg-2.m4s"]);
+        // …and agrees with the live window on where it starts.
+        assert!(state
+            .render_playlist(2000, false)
+            .contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+    }
+
+    /// A broadcast hundreds of segments long: the live window stays one
+    /// chunk while the recording keeps all of them, the window's
+    /// segments being its tail at the same numbers.
+    #[test]
+    fn the_recording_outgrows_the_chunk_the_window_fits_in() {
+        let mut state = live_state();
+        commit_media(&mut state, 1, 300, DEFAULT_PLAYLIST_WINDOW);
+        let window = state.render_playlist(2000, true);
+        let recording = state.render_recording(2000);
+        assert!(window.len() <= LIVE_WINDOW_MAX_BYTES);
+        assert!(
+            recording.len() > 8 * LIVE_WINDOW_MAX_BYTES,
+            "{}",
+            recording.len()
+        );
+        let all = entry_uris(&recording);
+        assert_eq!(all, (1..=300).map(bare_ref).collect::<Vec<_>>());
+        let tail = entry_uris(&window);
+        assert_eq!(tail, all[all.len() - tail.len()..]);
+        assert!(recording.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
+        assert_eq!(
+            recording.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
+            300,
+            "every segment keeps its date"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Live window sized to one chunk (#171)
     // -----------------------------------------------------------------
 
@@ -3289,6 +3558,8 @@ mod tests {
         fail_feeds: u32,
         /// Extra latency on `POST /feeds` only.
         feeds_delay: Duration,
+        /// Refuse the recording's upload (a playlist marked VOD) only.
+        fail_recording: bool,
     }
 
     /// The reference bee and ant answer a `POST /bytes` with: the root of
@@ -3364,7 +3635,12 @@ mod tests {
                                         || (slot.fail_uploads
                                             && (request.method_path.ends_with("/bytes")
                                                 || request.method_path.contains("/bzz?")))
-                                        || (slot.fail_soc && request.method_path.contains("/soc/"));
+                                        || (slot.fail_soc && request.method_path.contains("/soc/"))
+                                        || (slot.fail_recording
+                                            && request
+                                                .body
+                                                .windows(24)
+                                                .any(|w| w == b"#EXT-X-PLAYLIST-TYPE:VOD"));
                                     (
                                         fail,
                                         if is_feeds {
@@ -3643,6 +3919,151 @@ mod tests {
         for (soc, playlist) in socs.iter().zip(&playlists) {
             assert_eq!(&soc.body[8..], playlist.body.as_slice());
         }
+    }
+
+    /// Issue #168: stop closes the live window, then publishes the whole
+    /// broadcast as the recording, the final feed update, and reports
+    /// its reference. With a 3-segment window and 10 segments the
+    /// closing window holds the last 3 and the recording all 10.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_publishes_the_closing_window_then_the_whole_recording() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.max_backlog = 16;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..10u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+        }
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.segments_listed, 10, "{report:?}");
+        assert_eq!(report.error_count, 0, "{:?}", report.errors);
+
+        let seen = lock(&log).seen.clone();
+        let playlists: Vec<String> = seen
+            .iter()
+            .filter(|r| is_playlist(r))
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .collect();
+        let [.., live, closing, recording] = playlists.as_slice() else {
+            panic!("{playlists:?}");
+        };
+        assert!(!live.contains("#EXT-X-ENDLIST"), "{live}");
+        assert!(closing.ends_with("#EXT-X-ENDLIST\n"), "{closing}");
+        assert!(!closing.contains("#EXT-X-PLAYLIST-TYPE"), "{closing}");
+        assert_eq!(entry_uris(closing).len(), 3, "{closing}");
+        assert!(closing.contains("#EXT-X-MEDIA-SEQUENCE:7\n"), "{closing}");
+        assert!(recording.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"));
+        assert!(recording.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"));
+        assert!(recording.ends_with("#EXT-X-ENDLIST\n"));
+        let segment_ref = |i: u8| {
+            bytes_reference(
+                seen.iter()
+                    .find(|r| is_segment(r) && r.body == vec![i; 1000])
+                    .expect("segment uploaded"),
+            )
+        };
+        assert_eq!(
+            entry_uris(recording),
+            (0..10).map(segment_ref).collect::<Vec<_>>(),
+            "every segment, in capture order:\n{recording}"
+        );
+        assert_eq!(entry_uris(closing), entry_uris(recording)[7..]);
+        // Both were dated in the same broadcast id, which is what tells a
+        // viewer the recording is this broadcast's, not a new one.
+        let id_line = |p: &str| {
+            p.lines()
+                .find(|l| l.starts_with("#ANTSTREAM-BROADCAST:"))
+                .map(str::to_string)
+        };
+        assert!(id_line(recording).is_some());
+        assert_eq!(id_line(closing), id_line(recording));
+
+        // The final update wraps the recording, at the last index.
+        let last_soc = seen
+            .iter()
+            .rev()
+            .find(|r| r.method_path.contains("/soc/"))
+            .unwrap();
+        assert_eq!(&last_soc.body[8..], recording.as_bytes());
+        let id_hex = last_soc
+            .method_path
+            .split_once("?sig=")
+            .unwrap()
+            .0
+            .rsplit('/')
+            .next()
+            .unwrap();
+        assert_eq!(
+            id_hex,
+            hex::encode(ant_retrieval::sequence_update_id(
+                &[0x11; 32],
+                report.feed_updates - 1
+            ))
+        );
+        let recording_request = seen.iter().rev().find(|r| is_playlist(r)).unwrap();
+        assert_eq!(
+            report.recording_reference,
+            bytes_reference(recording_request)
+        );
+        assert_eq!(report.playlist_reference, report.recording_reference);
+    }
+
+    /// A recording that will not upload leaves the closing window at the
+    /// head (the broadcast's last minute, still closed), no recording
+    /// reference, and says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_recording_upload_is_reported_and_leaves_the_closing_window() {
+        let log = Arc::new(Mutex::new(StubLog {
+            fail_recording: true,
+            ..StubLog::default()
+        }));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 1000], 2000, false);
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.recording_reference, "", "{report:?}");
+        assert!(
+            report.errors.iter().any(|e| e.starts_with("recording: ")),
+            "{:?}",
+            report.errors
+        );
+        let seen = lock(&log).seen.clone();
+        let last_soc = seen
+            .iter()
+            .rev()
+            .find(|r| r.method_path.contains("/soc/"))
+            .unwrap();
+        let head = String::from_utf8(last_soc.body[8..].to_vec()).unwrap();
+        assert!(head.ends_with("#EXT-X-ENDLIST\n"), "{head}");
+        assert!(!head.contains("#EXT-X-PLAYLIST-TYPE"), "{head}");
+        assert!(
+            report.kept_up,
+            "the live broadcast itself kept up: {report:?}"
+        );
     }
 
     /// A host that names no `format` (the Android app, and any host that

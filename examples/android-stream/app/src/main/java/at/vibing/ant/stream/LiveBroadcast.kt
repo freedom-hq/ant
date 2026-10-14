@@ -207,8 +207,9 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
 
     /**
      * End the broadcast: capture stops first so the segment in flight is
-     * finished and pushed, then the publisher drains and closes the
-     * playlist with `#EXT-X-ENDLIST`.
+     * finished and pushed, then the publisher drains, closes the
+     * playlist with `#EXT-X-ENDLIST` and publishes the whole broadcast
+     * as the recording.
      */
     suspend fun stop(failure: String? = null) {
         if (!isBusy) {

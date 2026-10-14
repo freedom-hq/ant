@@ -220,10 +220,15 @@
     const seq = Number((/#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(text) || [])[1] || 0);
     const segments = (text.match(/#EXTINF/g) || []).length;
     const ended = text.includes('#EXT-X-ENDLIST');
+    const recording = ended && text.includes('#EXT-X-PLAYLIST-TYPE:VOD');
     const id = (/^#ANTSTREAM-BROADCAST:(\S+)/m.exec(text) || [])[1] || null;
-    // Order within one broadcast: later window start, then more segments,
-    // then closed.
-    return { key: [seq, segments, ended ? 1 : 0], id, ended };
+    // Order within one broadcast: the recording first (the publisher's
+    // final update, the whole broadcast from its first segment, so its
+    // window start is *behind* every live playlist's, yet nothing comes
+    // after it; a viewer whose reload skipped the brief closing window
+    // must still take it as the end), then later window start, then more
+    // segments, then closed.
+    return { key: [recording ? 1 : 0, seq, segments, ended ? 1 : 0], id, ended };
   }
 
   const newer = (a, b) => {
@@ -783,7 +788,13 @@
       prefetchAfter(cursorSn);
       if (ended && !wasEnded) log.marker('the broadcast ended');
       if (ended) {
-        setStatus('The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
+        // A viewer who was following the live edge stops at the closing
+        // window (its last minutes); one who opens a finished channel gets
+        // the recording the publisher leaves at the head, the whole
+        // broadcast as VOD.
+        setStatus(details.type === 'VOD'
+          ? 'The broadcast has ended: playing its recording from the start. You will switch to the next one when it starts.'
+          : 'The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
         watchForNextBroadcast();
       }
     });

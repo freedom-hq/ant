@@ -501,9 +501,10 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
     let playlist = String::from_utf8(feeds_body).expect("GET /feeds returns the playlist text");
     assert!(playlist.starts_with("#EXTM3U\n"), "{playlist}");
     assert!(
-        playlist.contains("#EXT-X-ENDLIST"),
-        "the head is the closing playlist:\n{playlist}"
+        playlist.contains("#EXT-X-ENDLIST") && playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+        "the head is the recording:\n{playlist}"
     );
+    assert_eq!(report.recording_reference, report.playlist_reference);
     assert_eq!(playlist.matches("#EXTINF").count(), 3, "{playlist}");
     assert_eq!(assert_dated(&playlist, pushed_from, pushed_until).len(), 3);
 
@@ -577,12 +578,18 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
 }
 
 /// Issue #171: the live window is sized to one chunk, not a segment
-/// count. A broadcast far longer than fits keeps every feed update a
+/// count. A broadcast far longer than fits keeps every live feed update a
 /// single chunk (the SOC payload *is* the whole playlist), still lists
-/// as many of the newest segments as fit, and a viewer's poll of the
-/// head slot is one chunk read.
+/// as many of the newest segments as fit, and a viewer's poll of a live
+/// slot is one chunk read.
+///
+/// Issue #168: at stop, after the closing window, the whole broadcast
+/// goes up as the recording and is the final update: a v2 update
+/// wrapping the root of a chunk tree, which `GET /feeds` and
+/// `GET /soc` both answer with the full playlist, every segment from
+/// the first to the last as VOD.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_live_feed_update_is_a_single_chunk() {
+async fn live_updates_are_single_chunks_and_the_head_is_the_whole_recording() {
     const SEGMENTS: u8 = 80;
     let log = Arc::new(Mutex::new(NodeLog::default()));
     let addr = serve_gateway(Arc::clone(&log)).await;
@@ -607,10 +614,12 @@ async fn every_live_feed_update_is_a_single_chunk() {
         None,
     )
     .unwrap();
+    let pushed_from = now_ms();
     let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
     for i in 0..SEGMENTS {
         let _ = run.push(SegmentKind::Media, vec![i; 300], 2000, false);
     }
+    let pushed_until = now_ms();
     run.cancel();
     for _ in 0..800 {
         if run.is_finished() {
@@ -621,8 +630,11 @@ async fn every_live_feed_update_is_a_single_chunk() {
     assert!(run.is_finished(), "publisher never finished");
     let report = run.report();
     assert_eq!(report.segments_failed, 0, "{:?}", report.errors);
+    assert_eq!(report.error_count, 0, "{:?}", report.errors);
     assert_eq!(report.segments_listed, u64::from(SEGMENTS), "{report:?}");
-    assert!(report.feed_updates > 0, "{report:?}");
+    // At least one live update, the closing window and the recording.
+    assert!(report.feed_updates >= 3, "{report:?}");
+    let head = report.feed_updates - 1;
 
     let topic = publisher::topic_from_string("antstream-integration-long");
     let feed = ant_retrieval::Feed {
@@ -630,27 +642,29 @@ async fn every_live_feed_update_is_a_single_chunk() {
         topic,
         kind: ant_retrieval::FeedType::Sequence,
     };
-    // Every update the node received, at every index: the SOC wraps a
-    // leaf chunk (span = payload length, at most 4096) whose payload is
-    // a whole playlist.
+    // id(32) ‖ signature(65) ‖ span(8) ‖ payload. The span's top byte
+    // carries the redundancy level on an intermediate chunk; the rest is
+    // the length it covers.
+    let update = |log: &NodeLog, index: u64| -> (u64, Vec<u8>) {
+        let address = ant_retrieval::sequence_update_address(&feed, index);
+        let (_, wire) = log
+            .socs
+            .iter()
+            .find(|(a, _)| *a == address)
+            .unwrap_or_else(|| panic!("feed update {index} never reached the node"));
+        let mut span = [0u8; 8];
+        span.copy_from_slice(&wire[97..105]);
+        span[7] = 0;
+        (u64::from_le_bytes(span), wire[105..].to_vec())
+    };
     {
         let log = log.lock().unwrap();
         assert_eq!(log.invalid_socs, 0);
-        for index in 0..report.feed_updates {
-            let address = ant_retrieval::sequence_update_address(&feed, index);
-            let (_, wire) = log
-                .socs
-                .iter()
-                .find(|(a, _)| *a == address)
-                .unwrap_or_else(|| panic!("feed update {index} never reached the node"));
-            // id(32) ‖ signature(65) ‖ span(8) ‖ payload
-            // The span's top byte carries the redundancy level on an
-            // intermediate chunk; the rest is the length it covers.
-            let mut span = [0u8; 8];
-            span.copy_from_slice(&wire[97..105]);
-            span[7] = 0;
-            let span = u64::from_le_bytes(span);
-            let payload = &wire[105..];
+        // Every live update, the closing one included: the SOC wraps a
+        // leaf chunk (span = payload length, at most 4096) whose payload
+        // is a whole playlist.
+        for index in 0..head {
+            let (span, payload) = update(&log, index);
             assert!(
                 span <= publisher::LIVE_WINDOW_MAX_BYTES as u64,
                 "feed update {index} wraps a {span}-byte tree, not one chunk",
@@ -658,55 +672,118 @@ async fn every_live_feed_update_is_a_single_chunk() {
             assert_eq!(payload.len() as u64, span, "feed update {index} is a leaf");
             assert!(payload.starts_with(b"#EXTM3U\n"), "feed update {index}");
         }
+        // The recording: far past one chunk, so the update wraps the
+        // root of its tree (a payload of child references, not text).
+        let (span, payload) = update(&log, head);
+        assert!(
+            span > publisher::LIVE_WINDOW_MAX_BYTES as u64,
+            "the recording is {span} bytes"
+        );
+        assert!(
+            !payload.starts_with(b"#EXTM3U"),
+            "the head wraps a tree root"
+        );
     }
 
-    // The head, read the way a viewer polls it: one HTTP round trip
-    // answered from one chunk.
+    // The closing window, read the way a live viewer polls it: one HTTP
+    // round trip answered from one chunk.
     let owner_hex = hex::encode(owner());
-    let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
+    let closing_id = ant_retrieval::sequence_update_id(&topic, head - 1);
     log.lock().unwrap().reads = 0;
-    let (status, _, soc_body) =
-        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
+    let (status, _, soc_body) = http_get(
+        &addr,
+        &format!("/soc/{owner_hex}/{}", hex::encode(closing_id)),
+    )
+    .await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&soc_body));
     assert_eq!(log.lock().unwrap().reads, 1, "GET /soc is one chunk read");
-    let playlist = String::from_utf8(soc_body).unwrap();
+    let closing = String::from_utf8(soc_body).unwrap();
     assert!(
-        playlist.len() <= publisher::LIVE_WINDOW_MAX_BYTES,
+        closing.len() <= publisher::LIVE_WINDOW_MAX_BYTES,
         "{} bytes",
-        playlist.len()
+        closing.len()
     );
-    assert!(playlist.starts_with("#EXTM3U\n"));
-    assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+    assert!(closing.starts_with("#EXTM3U\n"));
+    assert!(closing.ends_with("#EXT-X-ENDLIST\n"));
+    assert!(!closing.contains("#EXT-X-PLAYLIST-TYPE"), "{closing}");
     // Far more than the old 6-segment window, fewer than the broadcast:
     // the newest segments that fit, each with its date-time (#170).
-    let listed = playlist.matches("#EXTINF").count();
+    let listed = closing.matches("#EXTINF").count();
     assert_eq!(
-        playlist.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
+        closing.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
         listed,
-        "{playlist}"
+        "{closing}"
     );
     assert!(
         (29..usize::from(SEGMENTS)).contains(&listed),
-        "{listed} segments listed:\n{playlist}"
+        "{listed} segments listed:\n{closing}"
     );
     assert!(
-        playlist.contains(&format!(
+        closing.contains(&format!(
             "#EXT-X-MEDIA-SEQUENCE:{}\n",
             usize::from(SEGMENTS) - listed
         )),
-        "{playlist}"
+        "{closing}"
     );
-    // The newest segment is the last one listed, and plays from `/bytes/`.
-    let newest = playlist.lines().rfind(|l| !l.starts_with('#')).unwrap();
-    let (status, _, segment) = http_get(&addr, &format!("/bytes/{newest}")).await;
-    assert_eq!((status, segment), (200, vec![SEGMENTS - 1; 300]));
 
-    // `GET /feeds` finds the same head and answers with the same text.
-    let (status, head, feeds_body) =
+    // The head, the way a Solar Punk viewer finds it from the owner and
+    // topic alone: the whole broadcast, joined from the tree.
+    let (status, head_hdr, feeds_body) =
         http_get(&addr, &format!("/feeds/{owner_hex}/{}", hex::encode(topic))).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&feeds_body));
-    assert!(head.contains("swarm-feed-resolved-version: v2"), "{head}");
-    assert_eq!(String::from_utf8(feeds_body).unwrap(), playlist);
+    assert!(
+        head_hdr.contains("swarm-feed-resolved-version: v2"),
+        "{head_hdr}"
+    );
+    assert!(
+        head_hdr.contains(&format!(
+            "swarm-feed-index: {}",
+            hex::encode(head.to_be_bytes())
+        )),
+        "{head_hdr}"
+    );
+    let recording = String::from_utf8(feeds_body).unwrap();
+    assert!(recording.len() > publisher::LIVE_WINDOW_MAX_BYTES);
+    assert!(recording.starts_with("#EXTM3U\n"), "{recording}");
+    assert!(
+        recording.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"),
+        "{recording}"
+    );
+    assert!(
+        recording.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"),
+        "{recording}"
+    );
+    assert!(recording.ends_with("#EXT-X-ENDLIST\n"), "{recording}");
+    assert_eq!(recording.matches("#EXT-X-MAP:").count(), 1, "{recording}");
+    // Every segment, first to last, dated straight through, and each one
+    // the segment that was pushed at that place.
+    assert_eq!(
+        assert_dated(&recording, pushed_from, pushed_until).len(),
+        usize::from(SEGMENTS)
+    );
+    let uris: Vec<&str> = recording.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(uris.len(), usize::from(SEGMENTS), "{recording}");
+    for (i, uri) in uris.iter().enumerate() {
+        let (status, _, segment) = http_get(&addr, &format!("/bytes/{uri}")).await;
+        assert_eq!((status, segment), (200, vec![i as u8; 300]), "segment {i}");
+    }
+    // The closing window's segments are the recording's tail, at the
+    // same numbers.
+    let closing_uris: Vec<&str> = closing.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(closing_uris, uris[uris.len() - listed..]);
+
+    // `GET /soc` of the head slot is the same text, and so is the
+    // reference the stop report hands the host, read with no feed at all.
+    let head_id = ant_retrieval::sequence_update_id(&topic, head);
+    let (status, _, soc_body) =
+        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(soc_body).unwrap(), recording);
+    assert_eq!(report.playlist_reference, report.recording_reference);
+    let (status, _, by_ref) =
+        http_get(&addr, &format!("/bytes/{}", report.recording_reference)).await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(by_ref).unwrap(), recording);
 }
 
 /// The default format, `"bzz"`: what the Android Watch tab and the web
@@ -785,6 +862,100 @@ async fn the_default_format_plays_through_the_channel_bzz_path() {
         assert_eq!(status, 200, "segment {i}");
         assert_eq!(segment, vec![i as u8; 40_000], "segment {i}");
     }
+    // The channel's head is the recording (issue #168), and the stop
+    // report's reference plays it without the feed.
+    assert!(
+        playlist.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"),
+        "{playlist}"
+    );
+    let (status, _, by_ref) = http_get(
+        &addr,
+        &format!("/bzz/{}/stream.m3u8", report.recording_reference),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&by_ref));
+    assert_eq!(String::from_utf8(by_ref).unwrap(), playlist);
+}
+
+/// Issue #168 in the default format, what the web player and the
+/// Android Watch tab read: a broadcast far longer than the live window
+/// ends with `/bzz/<channel>/stream.m3u8` resolving to the recording,
+/// every segment from the first to the last (a playlist file of
+/// several chunks behind its manifest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_format_channel_ends_on_the_whole_recording() {
+    const SEGMENTS: u8 = 80;
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "integration",
+        "topic": "ce".repeat(32),
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "max_backlog": usize::from(SEGMENTS) + 1,
+    }))
+    .unwrap();
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let pushed_from = now_ms();
+    let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
+    for i in 0..SEGMENTS {
+        let _ = run.push(SegmentKind::Media, vec![i; 300], 2000, false);
+    }
+    let pushed_until = now_ms();
+    run.cancel();
+    for _ in 0..800 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.error_count, 0, "{:?}", report.errors);
+    assert_eq!(report.segments_listed, u64::from(SEGMENTS), "{report:?}");
+    assert!(!report.channel_reference.is_empty(), "{report:?}");
+    assert!(!report.recording_reference.is_empty(), "{report:?}");
+
+    let (status, _, body) = http_get(
+        &addr,
+        &format!("/bzz/{}/stream.m3u8", report.channel_reference),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let recording = String::from_utf8(body).unwrap();
+    assert!(recording.len() > publisher::LIVE_WINDOW_MAX_BYTES);
+    assert!(
+        recording.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"),
+        "{recording}"
+    );
+    assert!(
+        recording.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"),
+        "{recording}"
+    );
+    assert!(recording.ends_with("#EXT-X-ENDLIST\n"), "{recording}");
+    assert_eq!(
+        assert_dated(&recording, pushed_from, pushed_until).len(),
+        usize::from(SEGMENTS)
+    );
+    let uris: Vec<&str> = recording.lines().filter(|l| !l.starts_with('#')).collect();
+    for (i, uri) in uris.iter().enumerate() {
+        let (status, _, segment) = http_get(&addr, uri).await;
+        assert_eq!((status, segment), (200, vec![i as u8; 300]), "segment {i}");
+    }
+    let (status, _, by_ref) = http_get(
+        &addr,
+        &format!("/bzz/{}/stream.m3u8", report.recording_reference),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(by_ref).unwrap(), recording);
 }
 
 /// Wait until `done` holds for the run's snapshot.
@@ -947,4 +1118,33 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
     // (number 7) among them.
     assert!(gaps_seen.contains(&7), "{gaps_seen:?}");
     assert_eq!(gaps_seen.len() as u64, lost, "{gaps_seen:?}");
+
+    // Issue #168: the head is the recording, every entry of the
+    // broadcast in one playlist although the window was 3 — segment 0 to
+    // 11, each at the number the live updates gave it (checked above),
+    // the holes as gap entries where they were.
+    let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
+    let (status, _, body) =
+        http_get(&addr, &format!("/soc/{owner_hex}/{}", hex::encode(head_id))).await;
+    assert_eq!(status, 200);
+    let recording = String::from_utf8(body).unwrap();
+    assert!(
+        recording.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"),
+        "{recording}"
+    );
+    assert!(
+        recording.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"),
+        "{recording}"
+    );
+    assert!(recording.ends_with("#EXT-X-ENDLIST\n"), "{recording}");
+    let entries: Vec<&str> = recording.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(entries.len(), 12, "{recording}");
+    for (number, entry) in entries.iter().enumerate() {
+        assert_eq!(numbers[*entry], number as u64, "{recording}");
+    }
+    assert_eq!(
+        recording.matches("#EXT-X-GAP\n").count() as u64,
+        lost,
+        "{recording}"
+    );
 }

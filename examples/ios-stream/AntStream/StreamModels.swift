@@ -550,6 +550,11 @@ struct PublisherReport: Codable, Equatable {
     let owner: String
     let channelReference: String
     let playlistReference: String
+    /// The whole broadcast as one VOD playlist, the channel's final feed
+    /// update (issue #168), playable by itself without the feed. Empty
+    /// when its upload failed; optional so a report from a node without
+    /// it still decodes.
+    let recordingReference: String?
     let notes: String
     let targetBitrateKbps: UInt32
     let segmentMs: UInt32
@@ -589,6 +594,7 @@ struct PublisherReport: Codable, Equatable {
         case channel, topic, owner, notes, errors
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
+        case recordingReference = "recording_reference"
         case targetBitrateKbps = "target_bitrate_kbps"
         case segmentMs = "segment_ms"
         case maxInFlight = "max_in_flight"

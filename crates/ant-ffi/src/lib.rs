@@ -3891,9 +3891,13 @@ pub unsafe extern "C" fn ant_publisher_progress(
 ///
 /// **Blocking**: stopping is cooperative. Segments already captured are
 /// published (the last seconds of a broadcast are real content, not a
-/// truncated measurement) and the playlist is closed with
-/// `#EXT-X-ENDLIST` so viewers see a finished recording rather than a
-/// stream that just stopped updating. Returns after
+/// truncated measurement), the live playlist is closed with
+/// `#EXT-X-ENDLIST` (a viewer following the live edge stops there), and
+/// the whole broadcast is published as the recording, one
+/// `#EXT-X-PLAYLIST-TYPE:VOD` playlist that is the feed's final update
+/// (issue #168). The report's `recording_reference` names it; it is
+/// empty if its upload failed or had not landed when the grace ran out.
+/// Returns after
 /// [`PUBLISHER_STOP_GRACE`] (~130 s) at the latest — a worst-case
 /// drain can still be finishing in the background past that (see the
 /// constant) — so call it off the UI thread.
