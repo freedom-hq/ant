@@ -2616,6 +2616,7 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
     let (next_index, prior) = match response.status {
         404 if is_no_update_found(&response.body) => (0, None),
         200 => {
+            require_declared_length(&response, "the head")?;
             let index = response
                 .header("swarm-feed-index")
                 .and_then(|v| hex::decode(v).ok())
@@ -2631,7 +2632,10 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
                 let path = format!("{}/bzz/{reference}/{PLAYLIST_NAME}", ctx.target.prefix);
                 let playlist = http_get_timed(&ctx.target, &path).await?;
                 match playlist.status {
-                    200 => playlist.body,
+                    200 => {
+                        require_declared_length(&playlist, "the head playlist")?;
+                        playlist.body
+                    }
                     // The manifest has no playlist, or the head is no
                     // manifest at all: not a broadcast.
                     _ if is_not_a_broadcast_manifest(&playlist.body) => Vec::new(),
@@ -2670,6 +2674,21 @@ async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
     }
     state.feed_settled = true;
     Ok(())
+}
+
+/// A head body read to EOF is only whole if it declared its length
+/// ([`parse_response`] has already checked the two agree): a playlist
+/// cut short by a later chunk that did not retrieve still parses, as a
+/// shorter one, and numbering after it would reuse the cut entries'
+/// media sequence numbers and drop them from the recording. Bee and
+/// ant's gateway both declare one on every `/feeds` and `/bzz` body.
+fn require_declared_length(response: &HttpResponse, what: &str) -> Result<(), String> {
+    match response.header("content-length") {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "{what} declares no content-length; a partial body can't be told from a whole one",
+        )),
+    }
 }
 
 /// Bee's (and ant's) answer for a feed nothing was ever written to:
@@ -3115,8 +3134,11 @@ impl HttpResponse {
 }
 
 /// `GET` one resource. HTTP/1.0, so the gateway answers with the body to
-/// EOF rather than chunked (which [`parse_response`] doesn't decode): a
-/// streamed read such as `GET /feeds` has no `Content-Length` to give.
+/// EOF rather than chunked (which [`parse_response`] doesn't decode).
+/// A body cut short by a mid-stream failure also ends at EOF;
+/// [`parse_response`] rejects it against its `Content-Length`, and a
+/// caller that must not act on a partial body ([`settle_feed_position`])
+/// also refuses one that declares no length.
 pub(crate) async fn http_get(target: &Target, path: &str) -> Result<HttpResponse, String> {
     let mut stream = TcpStream::connect(&target.authority)
         .await
@@ -3184,7 +3206,9 @@ pub(crate) async fn http_post(
 /// Parse a `connection: close` response: status line, headers, body to
 /// EOF. Chunked transfer-encoding is not handled — the gateway answers
 /// uploads with a small `Content-Length` JSON object, and a body we
-/// can't parse would show up as a non-201 status anyway.
+/// can't parse would show up as a non-201 status anyway. A body shorter
+/// (or longer) than its `Content-Length` is an error, not a response:
+/// the gateway sent the head and then failed mid-stream.
 pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
     let split = raw
         .windows(4)
@@ -3200,16 +3224,36 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| format!("malformed status line: `{status_line}`"))?;
-    let headers = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
             Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
         })
         .collect();
+    let body = &raw[split + 4..];
+    // The body runs to EOF, and EOF is also what a gateway that fails
+    // mid-stream (a later chunk of a multi-chunk body not retrieving
+    // after the first was sent) leaves behind: only the declared length
+    // tells a whole body from a cut one.
+    if let Some(declared) = headers
+        .iter()
+        .find(|(n, _)| n == "content-length")
+        .map(|(_, v)| v)
+    {
+        let declared: usize = declared
+            .parse()
+            .map_err(|_| format!("malformed content-length: `{declared}`"))?;
+        if body.len() != declared {
+            return Err(format!(
+                "truncated response: content-length {declared}, got {} bytes",
+                body.len(),
+            ));
+        }
+    }
     Ok(HttpResponse {
         status,
         headers,
-        body: raw[split + 4..].to_vec(),
+        body: body.to_vec(),
     })
 }
 
@@ -3262,6 +3306,23 @@ mod tests {
         assert_eq!(r.status, 201);
         assert_eq!(r.body, b"{}");
         assert!(parse_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn response_parser_rejects_a_body_cut_short() {
+        // A 200 whose body stream failed after the head went out: the
+        // first leaf arrived, the rest never did.
+        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 8192\r\n\r\n#EXTM3U\n";
+        let err = parse_response(raw)
+            .err()
+            .expect("a truncated body is no response");
+        assert!(err.contains("truncated"), "{err}");
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: x\r\n\r\n").is_err());
+        // No declared length: parsed, but the head read refuses it.
+        let r = parse_response(b"HTTP/1.0 200 OK\r\n\r\n#EXTM3U\n").unwrap();
+        assert!(require_declared_length(&r, "the head").is_err());
+        let r = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\n#EXTM3U\n").unwrap();
+        assert!(require_declared_length(&r, "the head").is_ok());
     }
 
     // -----------------------------------------------------------------
@@ -4672,6 +4733,13 @@ mod tests {
         /// Answer this many `GET /bzz/<ref>/stream.m3u8` first with the
         /// gateway's plain 404 for a chunk the network didn't serve.
         unretrievable_playlist: u32,
+        /// Answer this many `200` `GET /feeds` bodies cut off
+        /// mid-stream: the full `content-length`, then only the first
+        /// half of the body (a later leaf that did not retrieve after
+        /// the first was sent).
+        truncated_head: u32,
+        /// The same for `200` `GET /bzz/<ref>/stream.m3u8` bodies.
+        truncated_playlist: u32,
     }
 
     /// The feed head `GET /feeds` resolves to.
@@ -4701,6 +4769,22 @@ mod tests {
 
     /// Answer the reads a publisher makes (`GET /feeds`, `GET /bzz`).
     fn stub_read(log: &Arc<Mutex<StubLog>>, path: &str) -> Vec<u8> {
+        let mut response = stub_read_whole(log, path);
+        let mut slot = lock(log);
+        let cuts = if path.contains("/feeds/") {
+            &mut slot.truncated_head
+        } else {
+            &mut slot.truncated_playlist
+        };
+        if *cuts > 0 && response.starts_with(b"HTTP/1.1 200") {
+            *cuts -= 1;
+            let body_at = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            response.truncate(body_at + (response.len() - body_at) / 2);
+        }
+        response
+    }
+
+    fn stub_read_whole(log: &Arc<Mutex<StubLog>>, path: &str) -> Vec<u8> {
         let mut slot = lock(log);
         if path.contains("/feeds/") {
             if slot.fail_head > 0 {
@@ -5135,6 +5219,64 @@ mod tests {
         assert_eq!(uris[..3], ["seg-12", "gap-13", "seg-14"], "{recording}");
         assert_eq!(uris.len(), 6, "{recording}");
         assert_eq!(Predecessor::parse(recording).unwrap().next_number, 18);
+    }
+
+    /// A head playlist whose body stream failed after the response head
+    /// went out (a multi-chunk recording, a later leaf not retrieved) is
+    /// a failed read, not a shorter predecessor: numbering after the
+    /// half that arrived would reuse the rest's media sequence numbers
+    /// and drop them from the recording (R4-F1 on PR #183). Same for a
+    /// v1 head's `/bzz` playlist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_playlist_cut_short_is_retried_not_continued() {
+        let manifest = "ef".repeat(32);
+        for (format, head) in [
+            (
+                StreamFormat::SolarPunk,
+                StubHead {
+                    index: 9,
+                    version: "v2",
+                    reference: "cd".repeat(32),
+                    body: PRIOR_RECORDING.as_bytes().to_vec(),
+                },
+            ),
+            (
+                StreamFormat::Bzz,
+                StubHead {
+                    index: 9,
+                    version: "v1",
+                    reference: manifest.clone(),
+                    body: b"the manifest's root node".to_vec(),
+                },
+            ),
+        ] {
+            let v1 = head.version == "v1";
+            let log = Arc::new(Mutex::new(StubLog {
+                head: Some(head),
+                bzz_playlists: HashMap::from([(manifest.clone(), PRIOR_RECORDING.to_string())]),
+                // v1: the head itself arrives whole, its playlist cut.
+                truncated_head: u32::from(!v1),
+                truncated_playlist: u32::from(v1),
+                ..StubLog::default()
+            }));
+            let run = continued_run(&log, format, 2).await;
+            wait_until(&run, "the head to answer", |s| s.feed_index.is_some()).await;
+            run.cancel();
+            settle(&run).await;
+            let report = run.report();
+            assert_eq!(report.error_count, 1, "{:?}", report.errors);
+            assert!(
+                report.errors[0].starts_with("feed head:")
+                    && report.errors[0].contains("truncated"),
+                "{:?}",
+                report.errors
+            );
+            assert_eq!(soc_ids(&log)[0], slot(10));
+            let playlists = uploaded_playlists(&log);
+            assert_eq!(media_sequence(&playlists[0]), 15, "{}", playlists[0]);
+            let recording = playlists.last().unwrap();
+            assert_eq!(entry_uris(recording)[..3], ["seg-12", "gap-13", "seg-14"]);
+        }
     }
 
     /// Under `"bzz"` the head is a v1 update pointing at the playlist's
