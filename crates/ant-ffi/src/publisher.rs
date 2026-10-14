@@ -1248,6 +1248,16 @@ impl PublisherState {
     /// durations. The predecessor is itself the recording of every
     /// broadcast before it, so the head recording plays the whole
     /// channel. Solar Punk's `buildVODManifest` glues the same way.
+    ///
+    /// That glued history survives only while every stop's recording
+    /// lands. The recording is published once, with no retry. If its
+    /// upload or feed update fails (a 5xx, or `PUBLISH_TIMEOUT` on a
+    /// long channel's growing recording), the head stays at the
+    /// closing window. The next broadcast then continues from that
+    /// window alone, so the head recording drops every earlier
+    /// broadcast's entries that fell outside it. The older recordings
+    /// are still at earlier feed indices, but nothing points a viewer
+    /// at them.
     fn render_recording(&self, target_ms: u32) -> String {
         let own_sequence = self
             .recording

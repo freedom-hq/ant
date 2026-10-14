@@ -11185,14 +11185,6 @@ mod tests {
         assert!(!is_final_miss(&ManifestError::NotAManifest));
     }
 
-    /// Pin the contract that `is_manifest_transient` treats a feed
-    /// dereference whose underlying chunk fetch failed as transient.
-    /// This is the read-path equivalent of marking a normal manifest
-    /// node fetch failure transient: without it, "no BZZ peers
-    /// available" raised inside `resolve_sequence_feed` escapes the
-    /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
-    /// — even though the very next attempt could have a fresh peer
-    /// snapshot that resolves the feed cleanly.
     /// Issue #173 / R1-F1 on PR #183: only an anchor miss the network
     /// corroborated is bee's `404 "no update found"`. One or two cold
     /// peers' miss is a `NotReady` (503), so a publisher reading its
@@ -11221,6 +11213,14 @@ mod tests {
         assert!(matches!(ack, ControlAck::Error { .. }), "{ack:?}");
     }
 
+    /// Pin the contract that `is_manifest_transient` treats a feed
+    /// dereference whose underlying chunk fetch failed as transient.
+    /// This is the read-path equivalent of marking a normal manifest
+    /// node fetch failure transient: without it, "no BZZ peers
+    /// available" raised inside `resolve_sequence_feed` escapes the
+    /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
+    /// — even though the very next attempt could have a fresh peer
+    /// snapshot that resolves the feed cleanly.
     #[test]
     fn is_manifest_transient_classifies_feed_fetch_as_transient() {
         let inner: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
