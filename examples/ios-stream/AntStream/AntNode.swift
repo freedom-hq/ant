@@ -428,7 +428,12 @@ final class AntNode: ObservableObject {
                     await self.suspend()
                 } else {
                     await self.wake()
-                    await self.resumePublisher()
+                    // `wake` suspends: the path may have dropped again
+                    // meanwhile, and that offline pass has already
+                    // paused the run. Resuming now would unpause it
+                    // against a dead uplink (and reap there, if a reap
+                    // fell due) — leave it for the next return.
+                    if !self.isOffline { await self.resumePublisher() }
                 }
             }
         }

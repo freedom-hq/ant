@@ -1037,6 +1037,14 @@ impl PublisherState {
                     // yet is not the live edge.
                     self.live_edge.get_or_insert(captured_at);
                     self.last_media_at = Some(Instant::now());
+                    // Media moved the deadline on, so a reap held for the
+                    // return is no longer due: an upload that was still
+                    // in flight when the window ran out landed after
+                    // all. Left set, it would deny every later return
+                    // its fresh window (see `LiveRun::resume`); if the
+                    // new window runs out paused too, the reaper marks
+                    // it due again.
+                    self.reap_due = false;
                     self.slide(window, target_ms);
                     newest = Some(captured_at);
                 }
@@ -5360,6 +5368,59 @@ mod tests {
         let later = back + Duration::from_secs(5);
         state.last_media_at = Some(later);
         assert_eq!(state.reap_deadline(started, reap), later + reap);
+    }
+
+    /// A reap held for the return stops being due once media is listed
+    /// (an upload in flight when the window ran out landed after all):
+    /// the run carries on, and a later outage's return must still buy a
+    /// whole window rather than inherit the stale verdict.
+    #[test]
+    fn listed_media_clears_a_held_reap() {
+        let mut state = PublisherState {
+            reap_due: true,
+            ..PublisherState::default()
+        };
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        assert!(state.advance(3, 2000).is_none());
+        assert!(state.reap_due, "an init is not media");
+        state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
+        assert!(state.advance(3, 2000).is_some());
+        assert!(!state.reap_due);
+    }
+
+    /// End to end: a held reap cleared by media that landed leaves the
+    /// next return its fresh window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_after_a_cleared_reap_gets_a_whole_window() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 0);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        // As the reaper would have, then an in-flight upload landing.
+        lock(&run.state).reap_due = true;
+        {
+            let mut state = lock(&run.state);
+            let seq = state.next_commit;
+            state.done.insert(seq, media("/bzz/cc/seg-late.m4s", false));
+            assert!(state.advance(64, 2000).is_some());
+        }
+        run.resume();
+        {
+            let state = lock(&run.state);
+            assert!(!state.reap_due);
+            let returned = state.returned_at.expect("the return restarts the window");
+            assert!(returned >= state.last_media_at.unwrap());
+        }
+        run.cancel();
+        settle(&run).await;
     }
 
     fn quiet_run(log: &Arc<Mutex<StubLog>>, addr: &str, reap_ms: u64) -> Arc<LiveRun> {
