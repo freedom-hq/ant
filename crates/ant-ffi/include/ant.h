@@ -1352,9 +1352,12 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *
  * This is the bench loop above with the synthetic generator replaced by
  * the host's camera pipeline. Per segment it uploads the segment,
- * rebuilds the HLS media playlist over a sliding window, uploads the
- * playlist, and publishes it as a sequence-feed update with POST /soc
- * (id = keccak256(topic || index_be8)), in one of two formats ("format"):
+ * rebuilds the HLS media playlist over a sliding window (the newest
+ * segments whose rendered playlist fits in one 4096-byte chunk, so a
+ * viewer's poll is one chunk read; "playlist_window" caps the count),
+ * uploads the playlist, and publishes it as a sequence-feed update
+ * with POST /soc (id = keccak256(topic || index_be8)), in one of two
+ * formats ("format"):
  *
  *   "bzz" (the default): POST /bzz for segments and the playlist
  *     (stream.m3u8), segments listed as gateway-root /bzz/<ref>/<name>
@@ -1389,7 +1392,7 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition
  *     "max_in_flight":   4,                       // measured stable window
  *     "max_backlog":     4,                       // drop-oldest past this
- *     "playlist_window": 6,                       // segments in the live playlist
+ *     "playlist_window": 64,                      // most segments listed; 4096 bytes binds first
  *     "notes":           "iPhone 15 Pro / LTE"
  *   }
  *
