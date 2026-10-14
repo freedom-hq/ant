@@ -180,7 +180,8 @@ final class LiveBroadcast: ObservableObject {
 
     /// End the broadcast. Capture stops first so the segment in flight
     /// is finished and published, then the publisher closes the playlist
-    /// with `#EXT-X-ENDLIST`.
+    /// with `#EXT-X-ENDLIST` and publishes the whole broadcast as the
+    /// recording.
     func stop(node: AntNode, failure: String? = nil) async {
         guard state.isActive else { return }
         state = .stopping

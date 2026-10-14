@@ -16,7 +16,7 @@
 //! C function produced; handles cross as `jlong`.
 //!
 //! Every call blocks the calling thread for as long as the C function
-//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s),
+//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s, ~195 s worst case),
 //! so the Kotlin side runs them on `Dispatchers.IO`.
 
 use std::ffi::{c_char, CStr, CString};

@@ -271,8 +271,26 @@ struct LiveView: View {
                 if !report.channelReference.isEmpty {
                     channelLinkRow(report.channelReference)
                 }
+                if let recording = report.recordingReference, !recording.isEmpty {
+                    recordingRow(recording)
+                }
             }
         }
+    }
+
+    /// The recording's own reference (the whole broadcast, issue #168),
+    /// for keeping a past broadcast. The channel link above plays it too
+    /// until the channel's next broadcast starts.
+    private func recordingRow(_ reference: String) -> some View {
+        Button {
+            UIPasteboard.general.string = reference
+            banner.flash("Recording reference copied")
+        } label: {
+            Label("Copy recording reference", systemImage: "film")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: quality

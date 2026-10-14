@@ -220,10 +220,15 @@
     const seq = Number((/#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(text) || [])[1] || 0);
     const segments = (text.match(/#EXTINF/g) || []).length;
     const ended = text.includes('#EXT-X-ENDLIST');
+    const recording = ended && text.includes('#EXT-X-PLAYLIST-TYPE:VOD');
     const id = (/^#ANTSTREAM-BROADCAST:(\S+)/m.exec(text) || [])[1] || null;
-    // Order within one broadcast: later window start, then more segments,
-    // then closed.
-    return { key: [seq, segments, ended ? 1 : 0], id, ended };
+    // Order within one broadcast: the recording first (the publisher's
+    // final update, the whole broadcast from its first segment, so its
+    // window start is *behind* every live playlist's, yet nothing comes
+    // after it; a viewer whose reload skipped the brief closing window
+    // must still take it as the end), then later window start, then more
+    // segments, then closed.
+    return { key: [recording ? 1 : 0, seq, segments, ended ? 1 : 0], id, ended };
   }
 
   const newer = (a, b) => {
@@ -690,6 +695,11 @@
   let hls = null;
   let channel = null;
   let ended = false;
+  // Whether this channel's first loaded playlist was live: a viewer who
+  // joined live plays on from where they were when the broadcast ends,
+  // even when the reload lands on the recording; only one who opened an
+  // already-finished channel starts the recording from its first segment.
+  let joinedLive = null;
   let everPlayed = false;
   let segmentsLoaded = 0;
   let lastFetchMs = null;
@@ -731,6 +741,7 @@
     stop();
     channel = ch;
     ended = false;
+    joinedLive = null;
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
@@ -779,11 +790,24 @@
       }
       const wasEnded = ended;
       ended = !details.live;
+      if (joinedLive === null) joinedLive = details.live;
       // New segments may have come into the prefetch window.
       prefetchAfter(cursorSn);
       if (ended && !wasEnded) log.marker('the broadcast ended');
       if (ended) {
-        setStatus('The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
+        // A viewer who was following the live edge plays on from where
+        // they were, to the end of the closing window (its last minutes) or
+        // of the recording if the reload went straight to it; one who opens
+        // a finished channel gets the recording the publisher leaves at the
+        // head, the whole broadcast as VOD, from its first segment.
+        const next = 'You will switch to the next one when it starts.';
+        if (joinedLive) {
+          setStatus(`The broadcast has ended: playing on to its end. ${next}`);
+        } else {
+          setStatus(details.type === 'VOD'
+            ? `The broadcast has ended: playing its recording from the start. ${next}`
+            : `The broadcast has ended: playing its last minutes. ${next}`);
+        }
         watchForNextBroadcast();
       }
     });

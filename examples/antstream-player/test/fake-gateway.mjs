@@ -18,6 +18,10 @@
 // n segments *without* ENDLIST, like a broadcaster that dropped off.
 // STALE_PCT=<p> answers p% of playlist reads with an older playlist of the
 // same broadcast, like a feed lookup that missed the newest updates.
+// RECORDING=1 answers every read of an ended broadcast with its recording,
+// every segment as one #EXT-X-PLAYLIST-TYPE:VOD playlist (the publisher's
+// `render_recording`), like a viewer whose reload skipped the closing
+// window.
 // PLAYLIST_MS=<min>-<max> answers every playlist read after a random delay
 // in that range, with the playlist as it was when the read started, like a
 // feed lookup that probes Swarm for seconds.
@@ -45,6 +49,7 @@ const slowMs = Number(process.env.SLOW_MS || 0);
 const restartMs = Number(process.env.RESTART_MS || 0);
 const stallAfter = Number(process.env.STALL || 0);
 const stalePct = Number(process.env.STALE_PCT || 0);
+const recording = process.env.RECORDING === '1';
 const [playlistMin, playlistMax] = (process.env.PLAYLIST_MS || '0').split('-').map(Number);
 if (!dir) {
   console.error('usage: fake-gateway.mjs <segments-dir> [port]');
@@ -97,6 +102,17 @@ function publishNext() {
 }
 
 function playlist() {
+  if (ended && recording) {
+    const target = Math.max(...published.map((p) => Math.ceil(p.ms / 1000)), 2);
+    let out = `#EXTM3U\n#EXT-X-VERSION:7\n#ANTSTREAM-BROADCAST:b${broadcast}\n`;
+    out += `#EXT-X-TARGETDURATION:${target}\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n`;
+    published.forEach((p, i) => {
+      if (p.discontinuity) out += '#EXT-X-DISCONTINUITY\n';
+      if (i === 0 || p.discontinuity) out += `#EXT-X-MAP:URI="/bzz/${initRef}/init-1.mp4"\n`;
+      out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
+    });
+    return `${out}#EXT-X-ENDLIST\n`;
+  }
   // A stale read: the playlist as it was a few updates ago.
   const lag = Math.random() * 100 < stalePct ? 1 + Math.floor(Math.random() * 5) : 0;
   const upto = Math.max(1, published.length - lag);

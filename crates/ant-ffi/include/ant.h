@@ -1496,8 +1496,9 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
 /*
  * End the broadcast and return its final report as an allocated JSON
  * object (free with ant_free_string): the progress fields above plus
- * duration_s, chunks_published, feed_updates, feed_index (the next
- * update's index: a reused channel's next "start_index"), sustained_chunks_s,
+ * recording_reference (see below), duration_s, chunks_published,
+ * feed_updates, feed_index (the next update's index: a reused channel's
+ * next "start_index"), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, and a "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the
@@ -1511,14 +1512,29 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * verdict at all?" off segments_listed too.
  *
  * BLOCKING: stopping is cooperative. Segments already captured are
- * published — the last seconds of a broadcast are real content — and
- * the playlist is closed with EXT-X-ENDLIST so viewers see a finished
- * recording rather than a stream that stopped updating. Returns after
- * ~130 s at the latest; a worst-case drain (the in-flight window, a
- * segment the pump had already popped behind it, then the backlog —
- * up to three rounds of the 60 s per-segment publish deadline) can
- * still be finishing in the background past that, with the report
- * returned honestly either way. Call it off the main thread.
+ * published — the last seconds of a broadcast are real content — the
+ * live playlist is closed with EXT-X-ENDLIST (a viewer following the
+ * live edge stops there), and then the whole broadcast goes up as one
+ * EXT-X-PLAYLIST-TYPE:VOD playlist, the feed's final update, so the
+ * channel plays from its first segment to its last afterwards.
+ * "recording_reference" is that recording, playable with no feed lookup
+ * (format "bzz": /bzz/<it>/stream.m3u8; "solar-punk": /bytes/<it>):
+ * keep it to list past broadcasts. It is "" when nothing was listed or
+ * its upload failed (the reason is in "errors"); it is also "" when the
+ * stop grace below ran out before it landed. Returns after
+ * ~130 s, plus up to ~65 s more for a feed update already on the wire
+ * then; a worst-case drain (the in-flight window, a segment the pump
+ * had already popped behind it, then the backlog — up to three rounds
+ * of the 60 s per-request publish deadline) followed by the closing
+ * window and the recording (an upload and a feed update each, four
+ * more rounds) can still be finishing in the background past that,
+ * with the report returned honestly either way. Call it off the main
+ * thread. "feed_index" is final either way: a broadcast still going
+ * when the call returns writes no further feed update, so a closing
+ * window or recording landing late never takes the index handed out
+ * as the next "start_index" (it then stays off the feed; a late
+ * recording still plays by its own reference, which this report does
+ * not carry).
  *
  * Calling it on a broadcast that already finished on its own returns
  * that broadcast's report. Once a stop call has returned and released

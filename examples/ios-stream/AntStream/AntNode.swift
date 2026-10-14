@@ -768,8 +768,8 @@ final class AntNode: ObservableObject {
     /// End the broadcast and take its final report.
     ///
     /// `ant_publisher_stop` blocks while the already-captured segments
-    /// are published and the playlist is closed with `#EXT-X-ENDLIST`
-    /// (up to ~130 s, its stop grace), so this must not run on the main
+    /// are published, the playlist is closed with `#EXT-X-ENDLIST` and
+    /// the whole broadcast goes up as the recording (up to ~130 s, its stop grace, ~195 s worst case), so this must not run on the main
     /// actor's thread — ``ffiString`` already hops onto a detached task
     /// for that reason.
     func stopPublisher() async throws -> PublisherReport {

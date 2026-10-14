@@ -6,7 +6,7 @@ package at.vibing.ant.stream
  * app runs exactly the code path the iOS AntStream app calls directly.
  *
  * Every call blocks for as long as the C function does (chain calls take
- * seconds, [nativePublisherStop] up to ~130 s): call them off the main
+ * seconds, [nativePublisherStop] up to ~130 s, ~195 s worst case): call them off the main
  * thread. Failures throw [AntException].
  */
 object AntNative {
