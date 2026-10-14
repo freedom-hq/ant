@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ant_control::{ControlAck, ControlCommand, StatusSnapshot};
 use ant_ffi::publisher::{self, PublisherConfig, SegmentKind, StreamFormat};
@@ -232,6 +232,68 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
     }
 }
 
+/// Wall clock, Unix ms.
+fn now_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// `2026-09-01T12:00:00.000Z` → Unix ms. Only the exact shape the
+/// publisher writes (JavaScript's `toISOString`) parses.
+fn parse_program_date_time(text: &str) -> u64 {
+    let b = text.as_bytes();
+    assert!(
+        b.len() == 24 && b[4] == b'-' && b[10] == b'T' && b[19] == b'.' && b[23] == b'Z',
+        "not ISO 8601 UTC to the ms: {text}"
+    );
+    let num = |r: std::ops::Range<usize>| text[r].parse::<u64>().unwrap();
+    let (year, month, day) = (num(0..4), num(5..7), num(8..10));
+    // Days from civil (Howard Hinnant), the inverse of the publisher's.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    ((days * 24 + num(11..13)) * 60 + num(14..16)) * 60_000 + num(17..19) * 1000 + num(20..23)
+}
+
+/// Issue #170: every listed segment carries `#EXT-X-PROGRAM-DATE-TIME`
+/// right in front of its `#EXTINF`, dated from one anchor taken from the
+/// wall clock at go-live and stepped by each segment's media (here 2 s,
+/// although the test pushes them 50 ms apart: the step is the media,
+/// never the arrival). Returns the dates.
+fn assert_dated(playlist: &str, pushed_from_ms: u64, pushed_until_ms: u64) -> Vec<u64> {
+    let lines: Vec<&str> = playlist.lines().collect();
+    let mut dates = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("#EXTINF:") {
+            let date = lines[i - 1]
+                .strip_prefix("#EXT-X-PROGRAM-DATE-TIME:")
+                .unwrap_or_else(|| panic!("segment without a date:\n{playlist}"));
+            dates.push(parse_program_date_time(date));
+        }
+    }
+    assert!(!dates.is_empty(), "{playlist}");
+    // The first segment is dated at its first frame: when it was pushed,
+    // less the 2 s it holds.
+    assert!(
+        dates[0] + 2000 >= pushed_from_ms && dates[0] + 2000 <= pushed_until_ms,
+        "first date {} outside the push window {pushed_from_ms}..{pushed_until_ms}",
+        dates[0],
+    );
+    for pair in dates.windows(2) {
+        assert_eq!(pair[1] - pair[0], 2000, "{playlist}");
+    }
+    dates
+}
+
 /// One plain `GET` against the gateway: status, lower-cased head and
 /// body. HTTP/1.0, so the body arrives unchunked and ends at EOF.
 async fn http_get(addr: &str, path: &str) -> (u16, String, Vec<u8>) {
@@ -339,11 +401,13 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
     )
     .unwrap();
 
+    let pushed_from = now_ms();
     let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
     for i in 0..3u8 {
         let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let pushed_until = now_ms();
     run.cancel();
     for _ in 0..400 {
         if run.is_finished() {
@@ -424,6 +488,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         "the head is the closing playlist:\n{playlist}"
     );
     assert_eq!(playlist.matches("#EXTINF").count(), 3, "{playlist}");
+    assert_eq!(assert_dated(&playlist, pushed_from, pushed_until).len(), 3);
 
     // The head's own slot, by address: the same text, not a pointer.
     let head_id = ant_retrieval::sequence_update_id(&topic, report.feed_updates - 1);
@@ -596,10 +661,15 @@ async fn every_live_feed_update_is_a_single_chunk() {
     assert!(playlist.starts_with("#EXTM3U\n"));
     assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
     // Far more than the old 6-segment window, fewer than the broadcast:
-    // the newest segments that fit.
+    // the newest segments that fit, each with its date-time (#170).
     let listed = playlist.matches("#EXTINF").count();
+    assert_eq!(
+        playlist.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
+        listed,
+        "{playlist}"
+    );
     assert!(
-        (30..usize::from(SEGMENTS)).contains(&listed),
+        (29..usize::from(SEGMENTS)).contains(&listed),
         "{listed} segments listed:\n{playlist}"
     );
     assert!(
@@ -648,11 +718,13 @@ async fn the_default_format_plays_through_the_channel_bzz_path() {
         None,
     )
     .unwrap();
+    let pushed_from = now_ms();
     let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
     for i in 0..3u8 {
         let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let pushed_until = now_ms();
     run.cancel();
     for _ in 0..400 {
         if run.is_finished() {
@@ -677,6 +749,7 @@ async fn the_default_format_plays_through_the_channel_bzz_path() {
     let playlist = String::from_utf8(body).unwrap();
     assert!(playlist.starts_with("#EXTM3U\n"), "{playlist}");
     assert!(playlist.contains("#EXT-X-ENDLIST"), "{playlist}");
+    assert_eq!(assert_dated(&playlist, pushed_from, pushed_until).len(), 3);
     let map = playlist
         .lines()
         .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"")?.strip_suffix('"'))

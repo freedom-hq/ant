@@ -3682,7 +3682,8 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// and `batch_id` are required (a broadcast needs a name and a storage
 /// plan). Segments come from the host's capture pipeline through
 /// [`ant_publisher_push_segment`]; per segment the publisher uploads the
-/// segment, rebuilds the HLS playlist, uploads it, and publishes it as a
+/// segment, rebuilds the HLS playlist (each segment carrying its
+/// `#EXT-X-PROGRAM-DATE-TIME`), uploads it, and publishes it as a
 /// sequence-feed update with `POST /soc` — all against `gateway`, which
 /// must already be listening (see [`ant_start_gateway`]). The `format`
 /// field picks the shape ([`publisher::StreamFormat`]): `"bzz"`, the
@@ -3772,7 +3773,13 @@ pub unsafe extern "C" fn ant_publisher_start(
 /// fresh one whenever the writer restarts (camera flip, interruption
 /// recovery, bitrate downshift) and set `discontinuity` on the first
 /// media segment after it. `duration_ms` is the segment's real duration
-/// (ignored for the initialization segment).
+/// (ignored for the initialization segment): it is the `#EXTINF`, and
+/// the step from this segment's `#EXT-X-PROGRAM-DATE-TIME` to the next
+/// one's. Every media segment is dated once, at this call, from one
+/// anchor taken off the wall clock at the first media segment (less its
+/// duration) and re-taken at each writer restart, never moving
+/// backwards — so a host that rounds or nominalises `duration_ms`
+/// drifts the broadcast's dates by that error every segment.
 ///
 /// **Call order is the broadcast order.** Segments are numbered as these
 /// calls arrive, and that number fixes both the playlist order and which
