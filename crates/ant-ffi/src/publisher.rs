@@ -58,8 +58,11 @@
 //! * When the uplink cannot keep up, the backlog **drops its oldest
 //!   pending segment** rather than growing without bound: a live
 //!   broadcast that falls minutes behind is worse than one with a gap.
-//!   Dropped and failed segments leave a hole, and the next segment that
-//!   does land is tagged `#EXT-X-DISCONTINUITY`.
+//!   A dropped or failed media segment keeps its place in the playlist
+//!   as an `#EXT-X-GAP` entry (issue #169): the encoder kept running, so
+//!   the media either side of the hole is one timeline, and
+//!   `#EXT-X-DISCONTINUITY` stays reserved for a real break (a writer
+//!   restart).
 //!
 //! Uploads go straight to the in-process gateway (`ant_start_gateway`)
 //! rather than through `UploadManager` jobs on purpose: that machinery is
@@ -259,6 +262,8 @@ pub struct PublisherConfig {
     /// Most segments the live playlist lists. An upper bound, not the
     /// size: the playlist holds the newest segments that fit in
     /// [`LIVE_WINDOW_MAX_BYTES`], and at most this many of them.
+    /// `#EXT-X-GAP` entries for lost segments count against the bytes,
+    /// not against this.
     #[serde(default = "default_playlist_window")]
     pub playlist_window: usize,
     /// Free-form host context (device, network, rendition) echoed in the
@@ -486,12 +491,19 @@ struct Pending {
     program_ms: u64,
 }
 
-/// A segment that landed, in playlist terms.
+/// One playlist entry: a segment that landed, or the gap a lost one
+/// left.
 #[derive(Debug, Clone)]
 struct MediaEntry {
-    /// HLS media sequence number (counts only listed segments).
+    /// HLS media sequence number. Every media segment the capture side
+    /// pushed under a landed `#EXT-X-MAP` takes one, lost ones included,
+    /// so a segment keeps its number as the window slides past a hole.
     number: u64,
+    /// The uploaded segment, or `gap-<number>` for a gap entry.
     uri: String,
+    /// `#EXT-X-GAP`: the segment was dropped or its upload failed. RFC
+    /// 8216bis §4.4.4.7: the entry names no media and a client skips it.
+    gap: bool,
     duration_ms: u32,
     /// `#EXT-X-DISCONTINUITY` precedes this entry.
     discontinuity: bool,
@@ -515,14 +527,35 @@ enum Committed {
         captured_at: Instant,
         program_ms: u64,
     },
-    /// Dropped before it was ever uploaded (backlog full). Only media
-    /// segments are ever dropped.
-    Dropped,
-    /// Upload failed. The kind matters: a failed *initialization*
-    /// segment retires the `#EXT-X-MAP` currently in force, because the
-    /// writer that emitted it has already been replaced and its map does
-    /// not describe what follows.
-    Failed(SegmentKind),
+    /// A media segment that never landed: dropped before it was ever
+    /// uploaded (backlog full) or its upload failed. Listed as an
+    /// `#EXT-X-GAP` entry carrying the date and duration it was placed
+    /// with, so the media after it keeps both its number and its date.
+    Lost {
+        duration_ms: u32,
+        /// The capture side flagged it as the first of a new writer.
+        discontinuity: bool,
+        program_ms: u64,
+    },
+    /// An *initialization* segment's upload failed. It retires the
+    /// `#EXT-X-MAP` currently in force, because the writer that emitted
+    /// it has already been replaced and its map does not describe what
+    /// follows.
+    InitFailed,
+}
+
+impl Committed {
+    /// What a pending segment that never landed becomes.
+    fn lost(pending: &Pending) -> Self {
+        match pending.kind {
+            SegmentKind::Init => Self::InitFailed,
+            SegmentKind::Media => Self::Lost {
+                duration_ms: pending.duration_ms,
+                discontinuity: pending.discontinuity,
+                program_ms: pending.program_ms,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,8 +577,9 @@ enum Committed {
 /// `#EXTINF`.
 ///
 /// A dropped or failed segment still advances the clock (it is placed
-/// at push, before the uplink decides its fate), so the segment after a
-/// gap carries the time it was really captured at.
+/// at push, before the uplink decides its fate), so its `#EXT-X-GAP`
+/// entry carries the time it covered and the segment after the gap the
+/// time it was really captured at.
 ///
 /// **Writer restarts re-anchor.** An initialization segment after the
 /// first, or a media segment flagged discontinuous, means the encoder's
@@ -679,9 +713,16 @@ struct PublisherState {
     init_uri: Option<String>,
     /// Dates each media segment as it is pushed.
     program_clock: ProgramClock,
-    /// A gap (drop or failure) since the last listed segment, so the
-    /// next one that lands starts a new continuous run.
-    gap_since_last_listed: bool,
+    /// A real timeline break (a writer restart, or media the playlist
+    /// could not list under any map) since the last entry, so the next
+    /// one starts a new continuous run with `#EXT-X-DISCONTINUITY`. A
+    /// lost segment is not one: see [`Committed::Lost`].
+    break_since_last_entry: bool,
+    /// Gap entries waiting for the next listed segment. A gap never
+    /// ends a playlist, so a lost segment is only listed once media
+    /// behind it lands; one still waiting when the broadcast ends is
+    /// never listed.
+    pending_gaps: Vec<MediaEntry>,
 
     segments_pushed: u64,
     segments_published: u64,
@@ -806,21 +847,34 @@ impl PublisherState {
                     // encoder timeline: whatever follows is discontinuous
                     // with what came before.
                     self.init_uri = Some(uri);
-                    if !self.playlist.is_empty() {
-                        self.gap_since_last_listed = true;
+                    if self.segments_listed > 0 || !self.pending_gaps.is_empty() {
+                        self.break_since_last_entry = true;
                     }
                 }
-                Committed::Dropped | Committed::Failed(SegmentKind::Media) => {
-                    self.gap_since_last_listed = true;
-                }
-                Committed::Failed(SegmentKind::Init) => {
+                Committed::InitFailed => {
                     // Listing later segments under the *previous*
                     // writer's map would hand a player an initialization
                     // segment that does not describe them. Better a
                     // shorter playlist than an unplayable one: nothing
                     // is listed again until a fresh init lands.
                     self.init_uri = None;
-                    self.gap_since_last_listed = true;
+                    self.break_since_last_entry = true;
+                }
+                Committed::Lost {
+                    duration_ms,
+                    discontinuity,
+                    program_ms,
+                } => {
+                    // Not a break: the encoder kept running, so the
+                    // media behind the hole continues the media in
+                    // front of it. The hole keeps its own number as an
+                    // `#EXT-X-GAP` entry, listed once media behind it
+                    // lands.
+                    let Some(entry) = self.next_entry(None, duration_ms, discontinuity, program_ms)
+                    else {
+                        continue;
+                    };
+                    self.pending_gaps.push(entry);
                 }
                 Committed::Media {
                     uri,
@@ -829,46 +883,29 @@ impl PublisherState {
                     captured_at,
                     program_ms,
                 } => {
-                    let Some(init_uri) = self.init_uri.clone() else {
+                    let Some(entry) =
+                        self.next_entry(Some(uri), duration_ms, discontinuity, program_ms)
+                    else {
                         // A media segment whose initialization segment
-                        // never landed is unplayable; list nothing and
-                        // leave the gap flag set.
-                        self.gap_since_last_listed = true;
+                        // never landed is unplayable; list nothing.
                         continue;
                     };
-                    let discontinuous = discontinuity
-                        || self.gap_since_last_listed
-                        || self
-                            .playlist
-                            .back()
-                            .is_some_and(|prev| prev.init_uri != init_uri);
-                    self.gap_since_last_listed = false;
+                    // The gaps in front of it are between two entries
+                    // now, so they are listed with it.
+                    for gap in std::mem::take(&mut self.pending_gaps) {
+                        self.longest_listed_ms = self.longest_listed_ms.max(gap.duration_ms);
+                        self.playlist.push_back(gap);
+                    }
                     self.segments_listed += 1;
                     self.longest_listed_ms = self.longest_listed_ms.max(duration_ms);
-                    self.playlist.push_back(MediaEntry {
-                        number: self.next_number,
-                        uri,
-                        duration_ms,
-                        discontinuity: discontinuous && self.next_number > 0,
-                        init_uri,
-                        program_ms,
-                    });
-                    self.next_number += 1;
+                    self.playlist.push_back(entry);
                     // Start the live-edge clock at the first segment
                     // that could have been seen. Later segments do not
                     // move it — only a landed feed update does, in
                     // `note_lag` — because a segment nobody can resolve
                     // yet is not the live edge.
                     self.live_edge.get_or_insert(captured_at);
-                    while self.playlist.len() > window
-                        || (self.playlist.len() > 1 && self.over_budget(target_ms))
-                    {
-                        if let Some(evicted) = self.playlist.pop_front() {
-                            if evicted.discontinuity {
-                                self.discontinuity_sequence += 1;
-                            }
-                        }
-                    }
+                    self.slide(window, target_ms);
                     newest = Some(captured_at);
                 }
             }
@@ -876,11 +913,76 @@ impl PublisherState {
         newest
     }
 
+    /// The next entry, numbered and flagged: a segment that landed
+    /// (`uri`), or a gap entry (`None`). `None` when no `#EXT-X-MAP` is
+    /// in force, which makes the segment unlistable: it takes no number
+    /// and is a break for whatever is listed next.
+    fn next_entry(
+        &mut self,
+        uri: Option<String>,
+        duration_ms: u32,
+        discontinuity: bool,
+        program_ms: u64,
+    ) -> Option<MediaEntry> {
+        let Some(init_uri) = self.init_uri.clone() else {
+            self.break_since_last_entry = true;
+            return None;
+        };
+        let previous = self.pending_gaps.last().or(self.playlist.back());
+        let discontinuous = discontinuity
+            || self.break_since_last_entry
+            || previous.is_some_and(|prev| prev.init_uri != init_uri);
+        self.break_since_last_entry = false;
+        let number = self.next_number;
+        self.next_number += 1;
+        Some(MediaEntry {
+            number,
+            gap: uri.is_none(),
+            uri: uri.unwrap_or_else(|| format!("gap-{number}")),
+            duration_ms,
+            // The broadcast's first listed segment starts the timeline;
+            // there is nothing before it to be discontinuous with.
+            discontinuity: discontinuous && self.segments_listed > 0,
+            init_uri,
+            program_ms,
+        })
+    }
+
+    /// Slide the window: at most `window` listed segments, within
+    /// [`LIVE_WINDOW_MAX_BYTES`], and never starting on a gap entry
+    /// (`#EXT-X-MEDIA-SEQUENCE` is always a segment that landed, and a
+    /// hole behind the window's first segment is not worth a line).
+    /// Gap entries count against the byte budget but not against
+    /// `window`, which counts media.
+    fn slide(&mut self, window: usize, target_ms: u32) {
+        let mut listed = self.playlist.iter().filter(|e| !e.gap).count();
+        loop {
+            while self.playlist.front().is_some_and(|e| e.gap) {
+                self.evict_front();
+            }
+            if listed > window || (listed > 1 && self.over_budget(target_ms)) {
+                self.evict_front();
+                listed -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn evict_front(&mut self) {
+        if let Some(evicted) = self.playlist.pop_front() {
+            if evicted.discontinuity {
+                self.discontinuity_sequence += 1;
+            }
+        }
+    }
+
     /// The playlist, as it would render now, is past
     /// [`LIVE_WINDOW_MAX_BYTES`]. Measured on the real rendering, so
     /// everything a segment brings with it counts (its `#EXTINF` and URI,
-    /// a `#EXT-X-DISCONTINUITY` for a gap or restart in front of it, a
-    /// fresh `#EXT-X-MAP`), as do header values that move with the
+    /// the `#EXT-X-GAP` entries for a hole in front of it, a
+    /// `#EXT-X-DISCONTINUITY` for a restart, a fresh `#EXT-X-MAP`), as do
+    /// header values that move with the
     /// window (`#EXT-X-MEDIA-SEQUENCE`, `#EXT-X-DISCONTINUITY-SEQUENCE`).
     /// Measured *with* `#EXT-X-ENDLIST`, so the closing playlist, which
     /// is this same window plus that line, fits too.
@@ -920,6 +1022,9 @@ impl PublisherState {
             if current_map != Some(entry.init_uri.as_str()) {
                 let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", entry.init_uri);
                 current_map = Some(entry.init_uri.as_str());
+            }
+            if entry.gap {
+                out.push_str("#EXT-X-GAP\n");
             }
             let _ = writeln!(
                 out,
@@ -1166,7 +1271,7 @@ impl LiveRun {
                     break;
                 };
                 state.segments_dropped += 1;
-                state.done.insert(victim.seq, Committed::Dropped);
+                state.done.insert(victim.seq, Committed::lost(&victim));
                 dropped_oldest = true;
             }
         }
@@ -1603,9 +1708,7 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                     pending.kind.as_str(),
                     pending.seq,
                 ));
-                state
-                    .done
-                    .insert(pending.seq, Committed::Failed(pending.kind));
+                state.done.insert(pending.seq, Committed::lost(&pending));
             }
         }
     }
@@ -2203,8 +2306,23 @@ mod tests {
         assert!(!playlist.contains("#EXT-X-ENDLIST"));
     }
 
+    /// A media segment that never landed (dropped or failed), placed
+    /// at `program_ms` with 2 s of media.
+    fn lost(discontinuity: bool, program_ms: u64) -> Committed {
+        Committed::Lost {
+            duration_ms: 2000,
+            discontinuity,
+            program_ms,
+        }
+    }
+
+    /// Issue #169: a dropped segment keeps its place as an `#EXT-X-GAP`
+    /// entry, in Solar Punk's shape (gap tag, its date, its `#EXTINF`,
+    /// `gap-<sequence>`), and arms no discontinuity: the encoder kept
+    /// running, so the media behind the hole continues the media in
+    /// front of it.
     #[test]
-    fn a_dropped_segment_becomes_a_discontinuity_not_a_silent_gap() {
+    fn a_dropped_segment_is_a_gap_entry_not_a_discontinuity() {
         let mut state = PublisherState::default();
         state.done.insert(
             0,
@@ -2212,24 +2330,225 @@ mod tests {
                 uri: "/bzz/aa/init-0.mp4".into(),
             },
         );
-        state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
-        state.done.insert(2, Committed::Dropped);
-        state.done.insert(3, media("/bzz/dd/seg-3.m4s", false));
+        let at = |n: u64| 1_788_264_000_000 + 2000 * n;
+        let dated = |uri: &str, n: u64| Committed::Media {
+            uri: uri.into(),
+            duration_ms: 2000,
+            discontinuity: false,
+            captured_at: Instant::now(),
+            program_ms: at(n),
+        };
+        state.done.insert(1, dated("/bzz/bb/seg-1.m4s", 0));
+        state.done.insert(2, lost(false, at(1)));
+        state.done.insert(3, lost(false, at(2)));
+        state.done.insert(4, dated("/bzz/ee/seg-4.m4s", 3));
         assert!(state.advance(5, 2000).is_some());
 
-        let playlist = state.render_playlist(2000, false);
         assert_eq!(
-            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
-            1,
-            "{playlist}"
+            state.render_playlist(2000, false),
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-VERSION:7\n",
+                "#EXT-X-TARGETDURATION:2\n",
+                "#EXT-X-MEDIA-SEQUENCE:0\n",
+                "#EXT-X-MAP:URI=\"/bzz/aa/init-0.mp4\"\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n",
+                "#EXTINF:2.000,\n",
+                "/bzz/bb/seg-1.m4s\n",
+                "#EXT-X-GAP\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n",
+                "#EXTINF:2.000,\n",
+                "gap-1\n",
+                "#EXT-X-GAP\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:04.000Z\n",
+                "#EXTINF:2.000,\n",
+                "gap-2\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:06.000Z\n",
+                "#EXTINF:2.000,\n",
+                "/bzz/ee/seg-4.m4s\n",
+            ),
         );
-        // The tag belongs to the segment *after* the gap.
-        let tag = playlist.find("#EXT-X-DISCONTINUITY\n").unwrap();
-        let after = playlist.find("/bzz/dd/seg-3.m4s").unwrap();
-        let before = playlist.find("/bzz/bb/seg-1.m4s").unwrap();
-        assert!(before < tag && tag < after, "{playlist}");
-        // Media sequence numbering counts only listed segments.
-        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
+        // A gap is not something a viewer can play.
+        assert_eq!(state.segments_listed, 2);
+    }
+
+    /// A failed media upload is the same hole as a drop: `Committed::lost`
+    /// is what both the backlog and a failed upload record.
+    #[test]
+    fn a_failed_media_upload_is_a_gap_and_a_failed_init_is_a_break() {
+        let pending = |kind| Pending {
+            seq: 0,
+            kind,
+            data: Vec::new(),
+            duration_ms: 1980,
+            discontinuity: false,
+            captured_at: Instant::now(),
+            program_ms: 1_788_264_000_000,
+        };
+        assert!(matches!(
+            Committed::lost(&pending(SegmentKind::Media)),
+            Committed::Lost {
+                duration_ms: 1980,
+                discontinuity: false,
+                program_ms: 1_788_264_000_000,
+            }
+        ));
+        assert!(matches!(
+            Committed::lost(&pending(SegmentKind::Init)),
+            Committed::InitFailed
+        ));
+    }
+
+    /// The point of numbering the holes: a segment's media sequence
+    /// number never changes while it is listed, however the window
+    /// slides past the gaps around it. Each playlist numbers its entries
+    /// consecutively from `#EXT-X-MEDIA-SEQUENCE`, so read every URI's
+    /// number off every playlist and check they agree.
+    #[test]
+    fn segment_numbers_stay_put_as_the_window_slides_past_a_gap() {
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init.mp4".into(),
+            },
+        );
+        let mut numbers = std::collections::HashMap::<String, u64>::new();
+        for seq in 1..=40u64 {
+            // Drops at 5, 6, 13 and every seventh from 20.
+            let outcome = if [5, 6, 13].contains(&seq) || (seq >= 20 && seq % 7 == 0) {
+                lost(false, 1_788_264_000_000 + 2000 * seq)
+            } else {
+                let mut m = media(&format!("/bzz/{seq:02x}/seg-{seq}.m4s"), false);
+                if let Committed::Media { program_ms, .. } = &mut m {
+                    *program_ms += 2000 * seq;
+                }
+                m
+            };
+            state.done.insert(seq, outcome);
+            state.advance(4, 2000);
+            let body = state.render_playlist(2000, false);
+            if state.playlist.is_empty() {
+                continue;
+            }
+            assert!(!body.contains("#EXT-X-DISCONTINUITY"), "{body}");
+            let first: u64 = body
+                .lines()
+                .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let uris: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+            // Never starts or ends on a gap.
+            assert!(!uris[0].starts_with("gap-"), "{body}");
+            assert!(!uris.last().unwrap().starts_with("gap-"), "{body}");
+            for (i, uri) in uris.iter().enumerate() {
+                let number = first + i as u64;
+                // The number is the segment's own place in the
+                // broadcast (sequence 0 is the init segment).
+                if let Some(gap) = uri.strip_prefix("gap-") {
+                    assert_eq!(gap.parse::<u64>().unwrap(), number, "{body}");
+                }
+                let seen = *numbers.entry((*uri).to_string()).or_insert(number);
+                assert_eq!(seen, number, "{uri} renumbered:\n{body}");
+            }
+        }
+        // Every media segment took a number, lost ones included.
+        assert_eq!(state.next_number, 40);
+        assert_eq!(numbers["/bzz/28/seg-40.m4s"], 39);
+        assert_eq!(numbers["gap-34"], 34);
+    }
+
+    /// A gap entry never starts a window: once the segment in front of a
+    /// hole slides out, the hole goes with it, so
+    /// `#EXT-X-MEDIA-SEQUENCE` is always a segment that landed. Nor does
+    /// one end a playlist: a lost segment with nothing behind it yet is
+    /// held back, and one still held back when the broadcast closes is
+    /// never listed.
+    #[test]
+    fn a_gap_never_starts_or_ends_a_playlist() {
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init.mp4".into(),
+            },
+        );
+        state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
+        state.done.insert(2, lost(false, 1));
+        state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
+        state.advance(2, 2000);
+        assert!(state.render_playlist(2000, false).contains("gap-1\n"));
+        // seg-1 slides out, and the gap behind it with it.
+        state.done.insert(4, media("/bzz/b4/seg-4.m4s", false));
+        state.done.insert(5, lost(false, 1));
+        assert!(state.advance(2, 2000).is_some());
+        let closing = state.render_playlist(2000, true);
+        assert!(closing.contains("#EXT-X-MEDIA-SEQUENCE:2\n"), "{closing}");
+        assert!(!closing.contains("#EXT-X-GAP"), "{closing}");
+        assert!(
+            closing.ends_with("/bzz/b4/seg-4.m4s\n#EXT-X-ENDLIST\n"),
+            "{closing}"
+        );
+        // The trailing loss waits for the next segment, and is listed
+        // with it at its own number.
+        state.done.insert(6, media("/bzz/b6/seg-6.m4s", false));
+        state.advance(2, 2000);
+        let body = state.render_playlist(2000, false);
+        assert!(body.contains("#EXT-X-GAP\n"), "{body}");
+        assert!(
+            body.contains("\ngap-4\n#EXT-X-PROGRAM-DATE-TIME:"),
+            "{body}"
+        );
+        assert!(body.ends_with("/bzz/b6/seg-6.m4s\n"), "{body}");
+        assert!(body.contains("#EXT-X-MEDIA-SEQUENCE:3\n"), "{body}");
+    }
+
+    /// Discontinuity stays for real breaks: a lost segment the capture
+    /// side flagged as a new writer's first carries the break on its gap
+    /// entry, where the new timeline starts, and a writer restart behind
+    /// a hole still marks the restart.
+    #[test]
+    fn a_writer_restart_next_to_a_gap_is_still_a_discontinuity() {
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init-0.mp4".into(),
+            },
+        );
+        state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
+        state.done.insert(2, lost(false, 1_788_264_002_000));
+        state.done.insert(
+            3,
+            Committed::Init {
+                uri: "/bzz/cc/init-3.mp4".into(),
+            },
+        );
+        // The new writer's first segment is lost too.
+        state.done.insert(4, lost(true, 1_788_264_064_000));
+        state.done.insert(5, media("/bzz/b5/seg-5.m4s", false));
+        state.advance(8, 2000);
+        let body = state.render_playlist(2000, false);
+        assert_eq!(body.matches("#EXT-X-DISCONTINUITY\n").count(), 1, "{body}");
+        assert!(
+            body.contains(concat!(
+                "/bzz/b1/seg-1.m4s\n",
+                "#EXT-X-GAP\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n",
+                "#EXTINF:2.000,\n",
+                "gap-1\n",
+                "#EXT-X-DISCONTINUITY\n",
+                "#EXT-X-MAP:URI=\"/bzz/cc/init-3.mp4\"\n",
+                "#EXT-X-GAP\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:01:04.000Z\n",
+                "#EXTINF:2.000,\n",
+                "gap-2\n",
+                "#EXT-X-PROGRAM-DATE-TIME:",
+            )),
+            "{body}"
+        );
+        assert!(body.ends_with("/bzz/b5/seg-5.m4s\n"), "{body}");
     }
 
     #[test]
@@ -2422,7 +2741,7 @@ mod tests {
         state
             .done
             .insert(1, dated("/bzz/bb/seg-1.m4s", false, GO_LIVE_MS));
-        state.done.insert(2, Committed::Dropped);
+        state.done.insert(2, lost(false, GO_LIVE_MS + 2000));
         state.done.insert(
             3,
             Committed::Init {
@@ -2440,6 +2759,10 @@ mod tests {
                 "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n",
                 "#EXTINF:2.000,\n",
                 "/bzz/bb/seg-1.m4s\n",
+                "#EXT-X-GAP\n",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n",
+                "#EXTINF:2.000,\n",
+                "gap-1\n",
                 "#EXT-X-DISCONTINUITY\n",
                 "#EXT-X-MAP:URI=\"/bzz/cc/init-3.mp4\"\n",
                 "#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:41.500Z\n",
@@ -2464,26 +2787,33 @@ mod tests {
             },
         );
         state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
-        state.done.insert(2, Committed::Dropped);
+        state.done.insert(2, lost(false, 0));
         state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
-        state.done.insert(4, media("/bzz/b4/seg-4.m4s", false));
-        state.done.insert(5, media("/bzz/b5/seg-5.m4s", false));
+        // A writer restart: the one real break here.
+        state.done.insert(
+            4,
+            Committed::Init {
+                uri: "/bzz/cc/init-4.mp4".into(),
+            },
+        );
+        state.done.insert(5, media("/bzz/b5/seg-5.m4s", true));
         state.done.insert(6, media("/bzz/b6/seg-6.m4s", false));
-        // Window of 2: the first two listed segments (including the one
-        // carrying the discontinuity) fall out.
+        state.done.insert(7, media("/bzz/b7/seg-7.m4s", false));
+        // Window of 2: everything up to and including the segment
+        // carrying the discontinuity falls out.
         assert!(state.advance(2, 2000).is_some());
 
         let playlist = state.render_playlist(2000, false);
         assert!(!playlist.contains("/bzz/b1/seg-1.m4s"), "{playlist}");
-        // Five segments were listed (numbers 0-4); the window holds the
-        // last two, so the playlist starts at number 3.
-        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:3\n"), "{playlist}");
+        // Six media segments were pushed (numbers 0-5, the lost one at
+        // 1); the window holds the last two, so it starts at number 4.
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:4\n"), "{playlist}");
         assert!(
             playlist.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"),
             "{playlist}"
         );
         // Every listed segment still carries a map.
-        assert!(playlist.contains("#EXT-X-MAP:URI=\"/bzz/aa/init.mp4\""));
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"/bzz/cc/init-4.mp4\""));
     }
 
     #[test]
@@ -2534,7 +2864,7 @@ mod tests {
         // The initialization segment failed to upload: listing the media
         // segments anyway would produce a playlist no player can start.
         let mut state = PublisherState::default();
-        state.done.insert(0, Committed::Failed(SegmentKind::Init));
+        state.done.insert(0, Committed::InitFailed);
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
         assert!(state.advance(3, 2000).is_none());
         assert!(state.playlist.is_empty());
@@ -2672,16 +3002,16 @@ mod tests {
 
     #[test]
     fn gap_lines_count_against_the_budget() {
-        // Every other segment dropped: each listed one carries an
-        // `#EXT-X-DISCONTINUITY` line, which has to come out of the same
-        // 4096 bytes.
+        // Every other segment dropped: each listed one has an
+        // `#EXT-X-GAP` entry in front of it, which has to come out of
+        // the same 4096 bytes.
         let mut clean = live_state();
         commit_media(&mut clean, 1, 200, DEFAULT_PLAYLIST_WINDOW);
 
         let mut gappy = live_state();
         for seq in 1..=400u64 {
             let outcome = if seq % 2 == 0 {
-                Committed::Dropped
+                lost(false, GO_LIVE_MS + 2000 * seq)
             } else {
                 media(&bare_ref(seq), false)
             };
@@ -2690,22 +3020,19 @@ mod tests {
             assert!(gappy.render_playlist(2000, true).len() <= LIVE_WINDOW_MAX_BYTES);
         }
         let body = gappy.render_playlist(2000, false);
+        let gaps = body.matches("#EXT-X-GAP\n").count();
+        assert!(gaps > 10, "{body}");
+        let listed = gappy.playlist.iter().filter(|e| !e.gap).count();
+        // Between every two listed segments, one gap.
+        assert_eq!(gaps + 1, listed, "{body}");
         assert!(
-            body.matches("#EXT-X-DISCONTINUITY\n").count() > 20,
-            "{body}"
-        );
-        assert!(
-            gappy.playlist.len() < clean.playlist.len(),
-            "gaps cost bytes: {} vs {}",
-            gappy.playlist.len(),
+            listed < clean.playlist.len(),
+            "gaps cost bytes: {listed} vs {}",
             clean.playlist.len(),
         );
-        // The discontinuities that slid out are carried in the header.
-        assert!(gappy.discontinuity_sequence > 0);
-        assert!(body.contains(&format!(
-            "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
-            gappy.discontinuity_sequence
-        )));
+        // A hole is not a break.
+        assert!(!body.contains("#EXT-X-DISCONTINUITY"), "{body}");
+        assert_eq!(gappy.discontinuity_sequence, 0);
     }
 
     #[test]
@@ -3496,8 +3823,7 @@ mod tests {
         .unwrap();
 
         // Get one segment safely published first, so the gap the drops
-        // create sits *between* listed segments — which is where a
-        // player needs the discontinuity marker.
+        // create sits *between* listed segments, where it is listed.
         let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
         let _ = run.push(SegmentKind::Media, vec![0u8; 64], 2000, false);
         for _ in 0..40 {
@@ -3528,8 +3854,9 @@ mod tests {
         );
         // Falling behind is not a pass, even though nothing errored.
         assert!(!report.kept_up, "{report:?}");
-        // The dropped segments left a discontinuity rather than a silent
-        // gap in the published playlist.
+        // The dropped segments are `#EXT-X-GAP` entries in the
+        // published playlist, not a discontinuity: the encoder never
+        // stopped (#169).
         let seen = lock(&log).seen.clone();
         let playlist = seen
             .iter()
@@ -3537,7 +3864,8 @@ mod tests {
             .find(|r| is_playlist(r))
             .expect("playlist uploaded");
         let body = String::from_utf8(playlist.body.clone()).unwrap();
-        assert!(body.contains("#EXT-X-DISCONTINUITY"), "{body}");
+        assert!(body.contains("#EXT-X-GAP\n"), "{body}");
+        assert!(!body.contains("#EXT-X-DISCONTINUITY"), "{body}");
     }
 
     /// `(date, uri)` of every segment a playlist lists, in order.
@@ -3636,19 +3964,55 @@ mod tests {
             .filter(|r| is_segment(r) && r.body.len() == 64)
             .map(|r| (bytes_reference(r), r.body[0]))
             .collect();
+        // Media sequence number of each pushed media segment: its place
+        // in the broadcast, lost ones counted.
+        let number = |byte: u8| {
+            if byte < 100 {
+                u64::from(byte)
+            } else {
+                u64::from(byte) - 92
+            }
+        };
         let playlist = seen.iter().rev().find(|r| is_playlist(r)).unwrap();
         let body = String::from_utf8(playlist.body.clone()).unwrap();
+        let first: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .unwrap()
+            .parse()
+            .unwrap();
         let listed = dated_uris(&body);
-        assert_eq!(listed.len() as u64, run.report().segments_listed, "{body}");
-        for (date, uri) in &listed {
-            let byte = by_reference[uri];
+        let gaps = listed
+            .iter()
+            .filter(|(_, uri)| uri.starts_with("gap-"))
+            .count();
+        assert_eq!(gaps as u64, run.report().segments_dropped, "{body}");
+        assert_eq!(
+            (listed.len() - gaps) as u64,
+            run.report().segments_listed,
+            "{body}"
+        );
+        for (i, (date, uri)) in listed.iter().enumerate() {
+            let at = first + i as u64;
+            let byte = match uri.strip_prefix("gap-") {
+                // A dropped segment's gap entry carries the date it was
+                // placed with, at its own number.
+                Some(n) => {
+                    assert_eq!(n.parse::<u64>().unwrap(), at, "{body}");
+                    u8::try_from(at).unwrap()
+                }
+                None => by_reference[uri],
+            };
+            assert_eq!(number(byte), at, "segment {byte} numbered {at}:\n{body}");
             assert_eq!(date, &expected[&byte], "segment {byte}:\n{body}");
         }
-        // Strictly increasing: a gap leaves a hole in the dates, never a
-        // step backwards.
+        // Strictly increasing: a gap keeps its own date, never a step
+        // backwards.
         assert!(listed.windows(2).all(|w| w[0].0 < w[1].0), "{body}");
         assert_eq!(by_reference[&listed[0].1], 0, "{body}");
         assert_eq!(listed.last().unwrap().0, expected[&101]);
+        // The one discontinuity is the writer restart.
+        assert_eq!(body.matches("#EXT-X-DISCONTINUITY\n").count(), 1, "{body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3767,7 +4131,7 @@ mod tests {
         state.advance(6, 2000);
         assert_eq!(state.segments_listed, 1);
         // Writer restart whose initialization segment fails to upload.
-        state.done.insert(2, Committed::Failed(SegmentKind::Init));
+        state.done.insert(2, Committed::InitFailed);
         state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
         state.advance(6, 2000);
         // Listed count did not move even though the upload succeeded,
