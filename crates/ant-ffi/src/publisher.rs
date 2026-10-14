@@ -106,6 +106,18 @@
 //! Both in Solar Punk's version-2 encoding, so their players join the
 //! same way.
 //!
+//! **The postage batch is checked before going live and named when it
+//! refuses** (issue #176). [`broadcast_cost`] estimates what a minute of
+//! a broadcast stamps (its segments at the configured bitrate, the
+//! playlist and feed update after each, the markers, the recording) and
+//! [`estimate_capacity`] sets that against the room left in the batch's
+//! fullest bucket, so a host can say "about N minutes left on this
+//! batch" and warn about a nearly full or mutable one. During the
+//! broadcast an upload the gateway refuses for the batch (a full bucket,
+//! bee's `402`; an unusable batch) is counted apart from network
+//! failures ([`PublisherSnapshot::batch_full_refusals`]), the way Solar
+//! Punk's uploader reports a postage refusal in its health.
+//!
 //! Live-edge discipline, straight from the stage-1 findings:
 //!
 //! * The in-flight window defaults to **4**. Stage 1 measured window 4
@@ -350,7 +362,8 @@ pub struct PublisherConfig {
     #[serde(default = "default_segment_ms")]
     pub segment_ms: u32,
     /// Encoder target bitrate. Echoed in the report; the publisher does
-    /// not enforce it (the capture pipeline does).
+    /// not enforce it (the capture pipeline does). [`broadcast_cost`]
+    /// sizes segments from it.
     #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
     #[serde(default = "default_max_in_flight")]
@@ -1283,6 +1296,18 @@ struct PublisherState {
     ladder_failures: u64,
     ladder_error: Option<String>,
 
+    /// The broadcast's own uploads (segments, playlists, feed updates,
+    /// the channel manifest, the recording) the gateway refused because
+    /// the postage batch is full ([`BatchRefusal::Full`]) or unusable
+    /// ([`BatchRefusal::Unusable`]), counted apart from network failures
+    /// (issue #176): no retry and no better uplink brings those back, so
+    /// a host names them as the batch's. Each is in `errors` too, and a
+    /// refused segment still counts in `segments_failed`.
+    batch_full_refusals: u64,
+    batch_unusable_refusals: u64,
+    /// The newest of those refusals.
+    batch_error: Option<String>,
+
     errors: Vec<String>,
     last_error: Option<String>,
     error_count: u64,
@@ -1297,6 +1322,20 @@ impl PublisherState {
             self.errors.push(message.clone());
         }
         self.last_error = Some(message);
+    }
+
+    /// One of the broadcast's own uploads failed: in `errors`, and
+    /// counted as the batch's when the gateway refused it for the batch.
+    fn record_upload_error(&mut self, error: &UploadError, message: String) {
+        match error.batch {
+            Some(BatchRefusal::Full) => self.batch_full_refusals += 1,
+            Some(BatchRefusal::Unusable) => self.batch_unusable_refusals += 1,
+            None => {}
+        }
+        if error.batch.is_some() {
+            self.batch_error = Some(message.clone());
+        }
+        self.record_error(message);
     }
 
     /// A marker or master write failed: counted in `ladder_failures`
@@ -2073,6 +2112,228 @@ struct RunIdentity<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Postage capacity before going live (issue #176)
+// ---------------------------------------------------------------------------
+
+/// Below this many minutes of room a batch is **nearly full** for a
+/// broadcast at the rate it was estimated for: [`CapacityEstimate::low`],
+/// which the iOS app warns about before going live. An hour, so a typical
+/// broadcast that starts inside the warning is told before it begins, not
+/// by a refused segment halfway through.
+pub const LOW_CAPACITY_MINUTES: u64 = 60;
+
+/// Headroom on [`PublisherConfig::bitrate_kbps`] when estimating segment
+/// sizes, in percent: an average-bitrate encoder overshoots within a
+/// segment, and fMP4 boxing adds bytes on top of the media. Erring high
+/// makes the estimate warn early rather than late.
+pub const BITRATE_HEADROOM_PERCENT: u64 = 10;
+
+/// Redundancy level every upload of a broadcast is stamped at: segments
+/// name none, so the gateway applies bee's default (MEDIUM, `1`), and
+/// playlists send [`PLAYLIST_REDUNDANCY_LEVEL`], the same level.
+const UPLOAD_REDUNDANCY_LEVEL: u8 = PLAYLIST_REDUNDANCY_LEVEL;
+
+/// Bytes one recording entry takes at most, for the recording's share of
+/// the estimate: an `#EXT-X-PROGRAM-DATE-TIME` line, an `#EXTINF` line
+/// and a `"bzz"` URI (`/bzz/<64 hex>/seg-<n>.m4s`), the longer of the
+/// two formats' URIs.
+const RECORDING_ENTRY_BYTES: usize = 160;
+
+/// Bytes an fMP4 initialization segment takes, about: the iOS writer's
+/// are under a kilobyte. One per writer start.
+const INIT_SEGMENT_BYTES: usize = 1024;
+
+/// How many chunks the gateway stamps for one upload of `bytes` under
+/// `format`, counted with the same builders it assembles the upload with
+/// (`ant_gateway`'s `assemble_bzz`, `upload_bytes`): the erasure-coded
+/// chunk tree at [`UPLOAD_REDUNDANCY_LEVEL`], [`ant_retrieval::REPLICA_COUNTS`]
+/// dispersed replica SOCs of its root, and under [`StreamFormat::Bzz`]
+/// the single-file manifest's nodes with their replicas too. Every one
+/// takes a stamp from the batch. Counted on a zero buffer of the right
+/// size: the shape of the tree depends only on the length.
+fn stamped_upload_chunks(
+    format: StreamFormat,
+    bytes: usize,
+    name: &str,
+    content_type: &str,
+) -> u64 {
+    let level = UPLOAD_REDUNDANCY_LEVEL;
+    let replicas = ant_retrieval::REPLICA_COUNTS[usize::from(level)] as u64;
+    let split = ant_retrieval::split_bytes_with_redundancy(&vec![0u8; bytes], level);
+    let mut chunks = split.chunks.len() as u64 + replicas;
+    if format == StreamFormat::Bzz {
+        // A file name the manifest builder refuses would fail the upload
+        // itself; the publisher's names never are.
+        if let Ok(manifest) =
+            ant_retrieval::build_single_file_manifest(name, Some(content_type), split.root)
+        {
+            chunks += manifest.chunks.len() as u64 * (1 + replicas);
+        }
+    }
+    chunks
+}
+
+/// What a broadcast stamps on its batch, estimated from its config
+/// before it starts (issue #176): see [`broadcast_cost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BroadcastCost {
+    /// Chunks one minute of broadcast stamps: every media segment
+    /// (bitrate × segment duration, plus [`BITRATE_HEADROOM_PERCENT`]),
+    /// the live playlist rewritten after each (a full one-chunk window,
+    /// [`LIVE_WINDOW_MAX_BYTES`]) and the feed update naming it, the
+    /// ladder markers when [`PublisherConfig::ladder`] is on, and the
+    /// minute's share of the recording written at stop.
+    pub chunks_per_minute: u64,
+    /// Chunks a broadcast stamps once whatever its length: the channel
+    /// manifest, the initialization segment, the closing window and its
+    /// feed update, and the recording's first chunk, manifest and
+    /// update.
+    pub fixed_chunks: u64,
+}
+
+/// Estimate what a broadcast configured as `config` stamps on its
+/// batch, from its bitrate and segment duration, plus the playlist,
+/// feed and marker overhead each segment brings (issue #176).
+///
+/// `bitrate_kbps` is taken as everything a segment carries: a host
+/// whose segments also carry audio adds its rate (the iOS app does).
+/// One initialization segment is counted, in the fixed part; a writer
+/// restart adds another, a few chunks.
+#[must_use]
+pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
+    let format = config.format;
+    let segment_ms = u64::from(config.segment_ms.max(1));
+    let segment_bytes =
+        u64::from(config.bitrate_kbps) * segment_ms / 8 * (100 + BITRATE_HEADROOM_PERCENT) / 100;
+    let media = stamped_upload_chunks(
+        format,
+        usize::try_from(segment_bytes).unwrap_or(usize::MAX / 2),
+        "seg-0.m4s",
+        "video/iso.segment",
+    );
+    let playlist_upload = stamped_upload_chunks(
+        format,
+        LIVE_WINDOW_MAX_BYTES,
+        PLAYLIST_NAME,
+        "application/vnd.apple.mpegurl",
+    );
+    // The playlist, then the single-owner chunk of its feed update.
+    let playlist = playlist_upload + 1;
+    let per_segment = media + playlist;
+    let segments_per_hour = 3_600_000 / segment_ms;
+    let markers_per_hour = if config.ladder {
+        3_600 / LADDER_MARKER_PERIOD_SECONDS
+    } else {
+        0
+    };
+    // The recording: one playlist upload at the stop, its manifest and
+    // replicas once, its entries growing with the broadcast. The growth
+    // of an hour's recording is spread over the hour, a few chunks a
+    // minute.
+    let recording = |entries: u64| {
+        stamped_upload_chunks(
+            format,
+            usize::try_from(entries).unwrap_or(0) * RECORDING_ENTRY_BYTES,
+            PLAYLIST_NAME,
+            "application/vnd.apple.mpegurl",
+        )
+    };
+    let recording_base = recording(1);
+    let recording_growth = recording(segments_per_hour).saturating_sub(recording_base);
+    let per_hour = per_segment * segments_per_hour + markers_per_hour + recording_growth;
+    let replicas = ant_retrieval::REPLICA_COUNTS[usize::from(UPLOAD_REDUNDANCY_LEVEL)] as u64;
+    // Its shape doesn't depend on the owner or topic it names.
+    let feed_manifest_nodes = ant_retrieval::build_feed_manifest(&[0; 20], &[0; 32])
+        .map_or(1, |manifest| manifest.chunks.len() as u64);
+    BroadcastCost {
+        chunks_per_minute: per_hour.div_ceil(60),
+        // The channel manifest (`POST /feeds`, its mantaray nodes and
+        // their replicas), the initialization segment, the closing window with
+        // its update, and the recording's base with its update.
+        fixed_chunks: feed_manifest_nodes * (1 + replicas)
+            + stamped_upload_chunks(format, INIT_SEGMENT_BYTES, "init-0.mp4", "video/mp4")
+            + playlist
+            + recording_base
+            + 1,
+    }
+}
+
+/// How long a broadcast fits on a batch, checked before going live
+/// (issue #176): [`broadcast_cost`] against the batch's room, as
+/// [`estimate_capacity`] works it out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CapacityEstimate {
+    /// The batch checked, `0x`-prefixed hex as the node reports it.
+    pub batch_id: String,
+    /// The batch refuses a stamp once a bucket is full. A mutable one
+    /// overwrites the bucket's oldest chunk instead, so a broadcast
+    /// longer than [`CapacityEstimate::minutes_left`] **eats its own
+    /// beginning** with no error at all: a host warns about a mutable
+    /// batch whatever its room.
+    pub immutable: bool,
+    /// The node will stamp with the batch at all (see the node's
+    /// `PostageStatusView::usable`). A host does not offer going live on
+    /// one that isn't: every upload would be refused.
+    pub usable: bool,
+    /// See [`BroadcastCost::chunks_per_minute`].
+    pub chunks_per_minute: u64,
+    /// Chunks the batch can still stamp counting its **fullest bucket**,
+    /// not the average: `(bucket capacity − fullest bucket's fill) ×
+    /// buckets` (the node's `worst_case_remaining_chunks`). Chunk
+    /// addresses spread evenly over the buckets, so the fullest one
+    /// fills first, and on an immutable batch that is when refusals
+    /// begin.
+    pub chunks_left: u64,
+    /// Whole minutes of this broadcast that fit in `chunks_left`, after
+    /// [`BroadcastCost::fixed_chunks`]. The "about N minutes left on
+    /// this batch" a host shows.
+    pub minutes_left: u64,
+    /// `minutes_left` under [`LOW_CAPACITY_MINUTES`]: the batch is
+    /// nearly full for this broadcast, and a host warns before going
+    /// live.
+    pub low: bool,
+}
+
+/// Check `plan` (the node's postage status, `ant_storage_status`) against
+/// a broadcast configured as `config` (issue #176). Refuses a plan that
+/// is not connected or is not the config's batch: an estimate for a
+/// different batch than the broadcast stamps with would be a guess.
+pub fn estimate_capacity(
+    config: &PublisherConfig,
+    plan: &ant_control::PostageStatusView,
+) -> Result<CapacityEstimate, PublisherError> {
+    if !plan.enabled {
+        return Err(PublisherError::Config(
+            "no storage plan is connected".to_string(),
+        ));
+    }
+    let want = parse_hex32(&config.batch_id)
+        .map_err(|e| PublisherError::Config(format!("batch_id {e}")))?;
+    let have = parse_hex32(&plan.batch_id)
+        .map_err(|e| PublisherError::Config(format!("plan batch_id {e}")))?;
+    if want != have {
+        return Err(PublisherError::Config(format!(
+            "the plan's batch is 0x{}, the broadcast's 0x{}",
+            hex::encode(have),
+            hex::encode(want),
+        )));
+    }
+    let cost = broadcast_cost(config);
+    let chunks_left = plan.worst_case_remaining_chunks;
+    let minutes_left =
+        chunks_left.saturating_sub(cost.fixed_chunks) / cost.chunks_per_minute.max(1);
+    Ok(CapacityEstimate {
+        batch_id: format!("0x{}", hex::encode(have)),
+        immutable: plan.immutable,
+        usable: plan.usable || plan.propagating,
+        chunks_per_minute: cost.chunks_per_minute,
+        chunks_left,
+        minutes_left,
+        low: minutes_left < LOW_CAPACITY_MINUTES,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot / report
 // ---------------------------------------------------------------------------
 
@@ -2170,6 +2431,25 @@ pub struct PublisherSnapshot {
     /// `last_error`/`errors`: it costs a viewer nothing.
     #[serde(default)]
     pub recovery_error: String,
+    /// Uploads of this broadcast (segments, playlists, feed updates, the
+    /// channel manifest, the recording) the gateway refused because the
+    /// postage batch is **full**: bee's `402 "batch is overissued"`, a
+    /// full collision bucket on an immutable batch (issue #176). Not a
+    /// network failure, and no retry fixes it: the host names it as the
+    /// storage plan running out. A batch fills unevenly, so these begin
+    /// as the odd refused segment and soon refuse nearly every one. Each
+    /// is also in `errors`/`error_count`, and a refused media segment in
+    /// `segments_failed`.
+    #[serde(default)]
+    pub batch_full_refusals: u64,
+    /// The same, for uploads refused because the batch itself is
+    /// **unusable**: a `400` naming it (unknown to the node, expired) or
+    /// a `422` (storer peers attest it is not on chain).
+    #[serde(default)]
+    pub batch_unusable_refusals: u64,
+    /// The newest of those refusals, empty while there has been none.
+    #[serde(default)]
+    pub batch_error: String,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -2274,6 +2554,15 @@ pub struct PublisherReport {
     /// See [`PublisherSnapshot::recovery_error`].
     #[serde(default)]
     pub recovery_error: String,
+    /// See [`PublisherSnapshot::batch_full_refusals`].
+    #[serde(default)]
+    pub batch_full_refusals: u64,
+    /// See [`PublisherSnapshot::batch_unusable_refusals`].
+    #[serde(default)]
+    pub batch_unusable_refusals: u64,
+    /// See [`PublisherSnapshot::batch_error`].
+    #[serde(default)]
+    pub batch_error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2534,6 +2823,9 @@ impl LiveRun {
             ladder_failures: state.ladder_failures,
             ladder_error: state.ladder_error.clone().unwrap_or_default(),
             recovery_error: state.recovery_error.clone().unwrap_or_default(),
+            batch_full_refusals: state.batch_full_refusals,
+            batch_unusable_refusals: state.batch_unusable_refusals,
+            batch_error: state.batch_error.clone().unwrap_or_default(),
         }
     }
 
@@ -2670,6 +2962,9 @@ impl LiveRun {
             ladder_failures: state.ladder_failures,
             ladder_error: state.ladder_error.clone().unwrap_or_default(),
             recovery_error: state.recovery_error.clone().unwrap_or_default(),
+            batch_full_refusals: state.batch_full_refusals,
+            batch_unusable_refusals: state.batch_unusable_refusals,
+            batch_error: state.batch_error.clone().unwrap_or_default(),
         }
     }
 }
@@ -3240,12 +3535,11 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                     }
                 }
             }
-            Err(message) => {
-                state.record_error(format!(
-                    "{} segment {}: {message}",
-                    pending.kind.as_str(),
-                    pending.seq,
-                ));
+            Err(error) => {
+                state.record_upload_error(
+                    &error,
+                    format!("{} segment {}: {error}", pending.kind.as_str(), pending.seq),
+                );
                 // An initialization segment that fails while the run is
                 // paused waits for the return and is tried again then:
                 // without it every later segment of its writer is
@@ -3730,13 +4024,13 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
     };
     let (playlist_ref, root) = match upload_playlist(ctx, &body).await {
         Ok(uploaded) => uploaded,
-        Err(message) => {
+        Err(error) => {
             let what = if shape == PlaylistShape::Recording {
                 "recording"
             } else {
                 "playlist"
             };
-            lock(&ctx.state).record_error(format!("{what}: {message}"));
+            lock(&ctx.state).record_upload_error(&error, format!("{what}: {error}"));
             return;
         }
     };
@@ -3788,8 +4082,8 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
                     state.note_lag(captured_at);
                 }
             }
-            Err(message) => {
-                state.record_error(format!("feed update {index}: {message}"));
+            Err(error) => {
+                state.record_upload_error(&error, format!("feed update {index}: {error}"));
             }
         }
     }
@@ -3839,7 +4133,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
 async fn upload_playlist(
     ctx: &RunCtx,
     body: &str,
-) -> Result<(String, ([u8; 32], Vec<u8>)), String> {
+) -> Result<(String, ([u8; 32], Vec<u8>)), UploadError> {
     match ctx.config.format {
         StreamFormat::Bzz => {
             let playlist_ref = publish_bzz(
@@ -3864,7 +4158,7 @@ async fn upload_playlist(
 async fn upload_v2_payload(
     ctx: &RunCtx,
     body: &str,
-) -> Result<(String, ([u8; 32], Vec<u8>)), String> {
+) -> Result<(String, ([u8; 32], Vec<u8>)), UploadError> {
     // The level is sent rather than left to the gateway's default so the
     // root chunk rebuilt below is the one the gateway stored. It is that
     // default (bee's MEDIUM), which is also what bee-js `uploadPayload`
@@ -3949,7 +4243,7 @@ async fn ensure_channel_manifest(ctx: &RunCtx) {
     state.channel_manifest_in_flight = false;
     match outcome {
         Ok(reference) => state.channel_reference = Some(reference),
-        Err(message) => state.record_error(format!("channel manifest: {message}")),
+        Err(error) => state.record_upload_error(&error, format!("channel manifest: {error}")),
     }
 }
 
@@ -3968,7 +4262,7 @@ async fn publish_feed_update(
     ctx: &RunCtx,
     index: u64,
     wrapped: &([u8; 32], Vec<u8>),
-) -> Result<(), String> {
+) -> Result<(), UploadError> {
     publish_soc(
         ctx,
         ant_retrieval::sequence_update_id(&ctx.topic, index),
@@ -3985,7 +4279,7 @@ async fn publish_soc(
     ctx: &RunCtx,
     id: [u8; 32],
     wrapped: &([u8; 32], Vec<u8>),
-) -> Result<(), String> {
+) -> Result<(), UploadError> {
     // `wrapped` is `span(8 LE) ‖ payload`, which is both what the SOC
     // signature covers (through its address) and what `POST /soc` takes
     // as its body.
@@ -4102,6 +4396,7 @@ async fn write_marker(
     tokio::time::timeout(remaining, publish_soc(ctx, id, &wrapped))
         .await
         .map_err(|_| "its period ended before the write finished".to_string())?
+        .map_err(String::from)
 }
 
 /// Write the one-rung master playlist ([`render_master_playlist`], the
@@ -4206,7 +4501,7 @@ async fn publish_bytes(
     batch: [u8; 32],
     payload: &[u8],
     extra_headers: &[(String, String)],
-) -> Result<String, String> {
+) -> Result<String, UploadError> {
     let path = format!("{}/bytes", target.prefix);
     let mut headers = vec![
         (
@@ -4229,13 +4524,85 @@ pub(crate) async fn publish_bzz(
     name: &str,
     content_type: &str,
     payload: &[u8],
-) -> Result<String, String> {
+) -> Result<String, UploadError> {
     let path = format!("{}/bzz?name={name}", target.prefix);
     let headers = [
         ("content-type".to_string(), content_type.to_string()),
         ("swarm-postage-batch-id".to_string(), hex::encode(batch)),
     ];
     post_reference(target, &path, &headers, payload).await
+}
+
+/// Why the gateway refused an upload, when the refusal is the postage
+/// batch's and not the network's (issue #176). Retrying does not help
+/// with either: a host has to buy or extend storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchRefusal {
+    /// `402`, bee's `"batch is overissued"`: the collision bucket the
+    /// chunk falls in is full on an immutable batch, so the stamp is
+    /// refused. A batch fills unevenly, so these start as the odd
+    /// refused segment and become every segment within minutes.
+    Full,
+    /// The batch itself is refused: `400` naming it (not usable here:
+    /// unknown to the node, expired, or not bought), or `422` (storer
+    /// peers attest it is not on chain).
+    Unusable,
+}
+
+impl BatchRefusal {
+    /// Read the refusal off a gateway's answer to an upload. Keyed on the
+    /// status, the one thing every bee-shaped gateway agrees on
+    /// (`ant_gateway::upload_error_status` maps every write endpoint the
+    /// same way): `402` is a full bucket, `422` a batch the network says
+    /// is not on chain. A `400`/`404` only counts when its message names
+    /// the batch, since those statuses also mean a malformed request;
+    /// bee and ant both answer an unusable batch with a message that
+    /// does (`"batch not usable"`, `"batch 0x… not usable"`). Any other
+    /// status (a `502` pushsync failure, a `503`, a timeout) is the
+    /// network's.
+    fn of_response(status: u16, body: &[u8]) -> Option<Self> {
+        match status {
+            402 => Some(Self::Full),
+            422 => Some(Self::Unusable),
+            400 | 404
+                if gateway_message(body)
+                    .is_some_and(|m| m.to_ascii_lowercase().contains("batch")) =>
+            {
+                Some(Self::Unusable)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A failed upload: what to report, and whether the batch refused it
+/// (see [`BatchRefusal`]). Converts to and from a plain message so the
+/// helpers that only report it keep their `Result<_, String>`.
+#[derive(Debug, Clone)]
+pub(crate) struct UploadError {
+    message: String,
+    batch: Option<BatchRefusal>,
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for UploadError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            batch: None,
+        }
+    }
+}
+
+impl From<UploadError> for String {
+    fn from(error: UploadError) -> Self {
+        error.message
+    }
 }
 
 /// `POST` something the gateway answers with bee's
@@ -4245,24 +4612,27 @@ async fn post_reference(
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<String, String> {
+) -> Result<String, UploadError> {
     let response = tokio::time::timeout(PUBLISH_TIMEOUT, http_post(target, path, headers, body))
         .await
         .map_err(|_| format!("timed out after {}s", PUBLISH_TIMEOUT.as_secs()))??;
     if response.status != 201 {
-        return Err(format!(
-            "gateway returned {} {}",
-            response.status,
-            String::from_utf8_lossy(&response.body).trim(),
-        ));
+        return Err(UploadError {
+            message: format!(
+                "gateway returned {} {}",
+                response.status,
+                String::from_utf8_lossy(&response.body).trim(),
+            ),
+            batch: BatchRefusal::of_response(response.status, &response.body),
+        });
     }
     let parsed: serde_json::Value = serde_json::from_slice(&response.body)
         .map_err(|e| format!("gateway response is not JSON: {e}"))?;
-    parsed
+    Ok(parsed
         .get("reference")
         .and_then(serde_json::Value::as_str)
         .map(|r| r.trim_start_matches("0x").to_ascii_lowercase())
-        .ok_or_else(|| "gateway response carries no reference".to_string())
+        .ok_or_else(|| "gateway response carries no reference".to_string())?)
 }
 
 // ---------------------------------------------------------------------------
@@ -5909,6 +6279,9 @@ mod tests {
         /// Refuse every `POST /bytes` and `POST /bzz` (segments and
         /// playlists alike, in either format).
         fail_uploads: bool,
+        /// What a refused `POST` answers, `(status line, body)`. `None`
+        /// is `400 {"message":"batch not usable"}`, an unusable batch.
+        fail_answer: Option<(&'static str, &'static str)>,
         /// Refuse every feed update from now on, the segments
         /// themselves still uploading fine.
         fail_soc: bool,
@@ -6181,14 +6554,11 @@ mod tests {
                                 };
                                 tokio::time::sleep(delay + feeds_delay).await;
                                 let response = if fail {
-                                    let body = br#"{"message":"batch not usable"}"#;
-                                    let mut r = format!(
-                                        "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                                        body.len(),
-                                    )
-                                    .into_bytes();
-                                    r.extend_from_slice(body);
-                                    r
+                                    let (status, body) = lock(&log).fail_answer.unwrap_or((
+                                        "400 Bad Request",
+                                        r#"{"message":"batch not usable"}"#,
+                                    ));
+                                    stub_response(status, &[], body.as_bytes())
                                 } else {
                                     let reference = if request.method_path.ends_with("/bytes") {
                                         bytes_reference(&request)
@@ -7906,6 +8276,338 @@ mod tests {
         // No playlist can be built without an initialization segment, so
         // nothing bogus was published either.
         assert_eq!(report.playlists_published, 0);
+        // A batch the gateway won't stamp with is named as the batch's
+        // problem (issue #176): both segments, the init included.
+        assert_eq!(report.batch_unusable_refusals, 2);
+        assert_eq!(report.batch_full_refusals, 0);
+        assert!(
+            report.batch_error.contains("batch not usable"),
+            "{}",
+            report.batch_error
+        );
+    }
+
+    /// The answers the gateway gives a refused upload, read for whose
+    /// problem it is (issue #176): the status first, the message only
+    /// where the status alone is ambiguous.
+    #[test]
+    fn a_refusal_is_the_batchs_by_its_status_not_by_a_failed_upload() {
+        let of = |status, body: &str| BatchRefusal::of_response(status, body.as_bytes());
+        // bee's and ant's full bucket on an immutable batch.
+        assert_eq!(
+            of(402, r#"{"message":"batch is overissued"}"#),
+            Some(BatchRefusal::Full)
+        );
+        assert_eq!(
+            of(
+                402,
+                r#"{"message":"batch 0xab… saturated: collision bucket full at depth 20 on an immutable batch"}"#
+            ),
+            Some(BatchRefusal::Full),
+        );
+        // A status alone says it, whatever the words.
+        assert_eq!(of(402, ""), Some(BatchRefusal::Full));
+        assert_eq!(
+            of(
+                422,
+                r#"{"message":"rejected by 0xpeer: batch 0xab not found on-chain"}"#
+            ),
+            Some(BatchRefusal::Unusable),
+        );
+        // A 400 or 404 only when it names the batch.
+        assert_eq!(
+            of(400, r#"{"message":"batch 0xab not usable"}"#),
+            Some(BatchRefusal::Unusable)
+        );
+        assert_eq!(
+            of(
+                400,
+                r#"{"message":"batch not usable yet or does not exist"}"#
+            ),
+            Some(BatchRefusal::Unusable),
+        );
+        assert_eq!(
+            of(404, r#"{"message":"batch with id not found"}"#),
+            Some(BatchRefusal::Unusable)
+        );
+        assert_eq!(of(400, r#"{"message":"chunk wire size too large"}"#), None);
+        assert_eq!(of(404, "Not Found"), None);
+        // The network's: a pushsync failure, a node not ready, a gateway
+        // that is down.
+        assert_eq!(
+            of(502, r#"{"message":"pushsync: exhausted pushsync peers"}"#),
+            None
+        );
+        assert_eq!(of(503, r#"{"message":"batch is still propagating"}"#), None);
+        assert_eq!(of(500, ""), None);
+    }
+
+    /// Run a broadcast whose every upload the stub refuses with `answer`,
+    /// pushing an init and three media segments, and return its report.
+    async fn refused_broadcast(answer: (&'static str, &'static str)) -> PublisherReport {
+        let log = Arc::new(Mutex::new(StubLog {
+            fail_uploads: true,
+            fail_answer: Some(answer),
+            ..StubLog::default()
+        }));
+        let addr = stub_gateway(Arc::clone(&log), Duration::ZERO).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        for i in 0..3 {
+            let _ = run.push(SegmentKind::Media, vec![i; 64], 2000, false);
+        }
+        wait_until(&run, "every upload answered", |s| {
+            s.segments_failed == 3 && s.error_count >= 4
+        })
+        .await;
+        let snapshot = run.snapshot();
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        // The live view reads the same counts the report ends with.
+        assert_eq!(snapshot.batch_full_refusals, report.batch_full_refusals);
+        assert_eq!(
+            snapshot.batch_unusable_refusals,
+            report.batch_unusable_refusals
+        );
+        assert_eq!(snapshot.batch_error, report.batch_error);
+        report
+    }
+
+    /// A batch that fills mid-broadcast is counted and named as full
+    /// (issue #176), apart from a network that refuses the same uploads:
+    /// both drop the same segments, but only one is the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_batch_is_counted_apart_from_a_failing_network() {
+        let full = refused_broadcast((
+            "402 Payment Required",
+            r#"{"message":"batch is overissued"}"#,
+        ))
+        .await;
+        assert_eq!(full.segments_failed, 3);
+        assert_eq!(
+            full.batch_full_refusals, 4,
+            "the init and three media segments"
+        );
+        assert_eq!(full.batch_unusable_refusals, 0);
+        assert!(full.batch_error.contains("402"), "{}", full.batch_error);
+        assert!(
+            full.batch_error.contains("overissued"),
+            "{}",
+            full.batch_error
+        );
+        // Still a failure like any other in the broadcast's errors.
+        assert!(full.error_count >= 4);
+
+        let network = refused_broadcast((
+            "502 Bad Gateway",
+            r#"{"message":"pushsync: exhausted pushsync peers"}"#,
+        ))
+        .await;
+        assert_eq!(network.segments_failed, 3, "the same segments are lost");
+        assert_eq!(network.batch_full_refusals, 0);
+        assert_eq!(network.batch_unusable_refusals, 0);
+        assert_eq!(network.batch_error, "");
+        assert!(network.error_count >= 4);
+    }
+
+    /// A refused feed update is the batch's too: the playlist uploads
+    /// and the segments land, but the update naming them is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_feed_update_counts_against_the_batch() {
+        let log = Arc::new(Mutex::new(StubLog {
+            fail_soc: true,
+            fail_answer: Some((
+                "402 Payment Required",
+                r#"{"message":"batch is overissued"}"#,
+            )),
+            ..StubLog::default()
+        }));
+        let addr = stub_gateway(Arc::clone(&log), Duration::ZERO).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "a refused feed update", |s| s.batch_full_refusals > 0).await;
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.segments_failed, 0);
+        assert!(
+            snapshot.batch_error.starts_with("feed update 0:"),
+            "{}",
+            snapshot.batch_error
+        );
+        run.cancel();
+        settle(&run).await;
+    }
+
+    fn plan(worst_case_remaining_chunks: u64, immutable: bool) -> ant_control::PostageStatusView {
+        ant_control::PostageStatusView {
+            enabled: true,
+            usable: true,
+            batch_id: format!("0x{}", "ab".repeat(32)),
+            batch_depth: 22,
+            bucket_depth: 16,
+            immutable,
+            bucket_count: 1 << 16,
+            bucket_capacity: 64,
+            total_capacity_chunks: 1 << 22,
+            worst_case_remaining_chunks,
+            ..ant_control::PostageStatusView::default()
+        }
+    }
+
+    /// What a minute of broadcast stamps, counted the way the gateway
+    /// assembles each upload (issue #176): the bitrate's segments with
+    /// their erasure coding and replicas, plus the playlist and feed
+    /// update each one brings.
+    #[test]
+    fn a_broadcast_costs_its_segments_plus_their_playlist_and_feed_overhead() {
+        let mut config = config();
+        config.format = StreamFormat::SolarPunk;
+        config.bitrate_kbps = 900;
+        config.segment_ms = 2000;
+        // One segment: 900 kbit/s × 2 s = 225 000 bytes, 247 500 with the
+        // headroom. 61 data leaves under one intermediate chunk, its
+        // MEDIUM parities, and two replicas of the root.
+        let segment_bytes = 247_500usize;
+        let split = ant_retrieval::split_bytes_with_redundancy(&vec![0u8; segment_bytes], 1);
+        let media = split.chunks.len() as u64 + 2;
+        assert!(
+            media > data_chunk_count(segment_bytes as u64),
+            "parities and replicas cost stamps"
+        );
+        // The one-chunk playlist and its two replicas, then the update.
+        let playlist = 1 + 2 + 1;
+        let cost = broadcast_cost(&config);
+        let per_minute_without_recording = 30 * (media + playlist);
+        assert!(
+            cost.chunks_per_minute > per_minute_without_recording
+                && cost.chunks_per_minute < per_minute_without_recording + 10,
+            "{} vs {per_minute_without_recording}",
+            cost.chunks_per_minute,
+        );
+
+        // The ladder's markers are one a period, six a minute.
+        config.ladder = true;
+        assert_eq!(
+            broadcast_cost(&config).chunks_per_minute,
+            cost.chunks_per_minute + 6
+        );
+        config.ladder = false;
+
+        // Twice the bitrate is about twice the segments' chunks (their
+        // trees grow parities and intermediate chunks with them), while
+        // the playlist and feed overhead stays put.
+        config.bitrate_kbps = 1800;
+        let double = broadcast_cost(&config).chunks_per_minute;
+        let media_minute = cost.chunks_per_minute - 30 * playlist;
+        let doubled = (double - 30 * playlist) as f64 / (2 * media_minute) as f64;
+        assert!(
+            (0.95..1.05).contains(&doubled),
+            "{double} vs {} per minute at 900 kbit/s",
+            cost.chunks_per_minute,
+        );
+
+        // Under "bzz" every upload also carries its manifest.
+        config.bitrate_kbps = 900;
+        config.format = StreamFormat::Bzz;
+        assert!(broadcast_cost(&config).chunks_per_minute > cost.chunks_per_minute);
+    }
+
+    /// The pre-flight check (issue #176): minutes left counted from the
+    /// fullest bucket, low under an hour, and the batch's mutability
+    /// carried through for the host's warning.
+    #[test]
+    fn the_capacity_estimate_counts_the_fullest_bucket_and_flags_a_nearly_full_batch() {
+        let config = config();
+        let per_minute = broadcast_cost(&config).chunks_per_minute;
+        let fixed = broadcast_cost(&config).fixed_chunks;
+
+        // Plenty of room: a day and more.
+        let roomy = estimate_capacity(&config, &plan(per_minute * 2_000, true)).unwrap();
+        assert!(!roomy.low);
+        assert!(roomy.immutable && roomy.usable);
+        assert_eq!(roomy.chunks_per_minute, per_minute);
+        assert_eq!(
+            roomy.minutes_left,
+            (per_minute * 2_000 - fixed) / per_minute
+        );
+
+        // A batch whose average bucket is roomy but whose fullest has
+        // twenty minutes left: the fullest is what counts.
+        let mut lopsided = plan(fixed + per_minute * 20, true);
+        lopsided.remaining_total_chunks = per_minute * 2_000;
+        let nearly_full = estimate_capacity(&config, &lopsided).unwrap();
+        assert_eq!(nearly_full.minutes_left, 20);
+        assert!(nearly_full.low);
+
+        // Right at the line.
+        let hour = estimate_capacity(
+            &config,
+            &plan(fixed + per_minute * LOW_CAPACITY_MINUTES, true),
+        )
+        .unwrap();
+        assert_eq!(hour.minutes_left, LOW_CAPACITY_MINUTES);
+        assert!(!hour.low);
+
+        // Full, and no room at all for the fixed overhead.
+        let full = estimate_capacity(&config, &plan(0, true)).unwrap();
+        assert_eq!(full.minutes_left, 0);
+        assert!(full.low);
+
+        // A mutable batch is estimated the same way and reported mutable:
+        // past its minutes it overwrites rather than refuses.
+        let mutable = estimate_capacity(&config, &plan(per_minute * 2_000, false)).unwrap();
+        assert!(!mutable.immutable);
+        assert_eq!(mutable.minutes_left, roomy.minutes_left);
+
+        // A batch the node won't stamp with.
+        let mut refused = plan(per_minute * 2_000, true);
+        refused.usable = false;
+        assert!(!estimate_capacity(&config, &refused).unwrap().usable);
+        refused.propagating = true;
+        assert!(
+            estimate_capacity(&config, &refused).unwrap().usable,
+            "a just-bought batch waits"
+        );
+    }
+
+    #[test]
+    fn the_capacity_estimate_refuses_a_plan_it_cannot_speak_for() {
+        let config = config();
+        let mut other = plan(1_000_000, true);
+        other.batch_id = format!("0x{}", "cd".repeat(32));
+        assert!(estimate_capacity(&config, &other)
+            .unwrap_err()
+            .to_string()
+            .contains("the plan's batch is 0xcdcd"));
+        let none = ant_control::PostageStatusView::default();
+        assert!(estimate_capacity(&config, &none)
+            .unwrap_err()
+            .to_string()
+            .contains("no storage plan"));
+        // The host's plan JSON names its batch with or without `0x`, in
+        // any case.
+        let mut upper = plan(1_000_000, true);
+        upper.batch_id = "AB".repeat(32);
+        assert!(estimate_capacity(&config, &upper).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

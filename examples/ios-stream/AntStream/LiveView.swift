@@ -32,6 +32,9 @@ struct LiveView: View {
     /// or it failed), the button stays a resume, so the next tap never
     /// starts a new broadcast that would replace that entry.
     @State private var lastRunWasResume = false
+    /// Going live was tapped on a plan with under an hour of room at the
+    /// picked quality, or one Swarm won't stamp with (#176): ask first.
+    @State private var confirmLowCapacity = false
 
     init(resume: Bool = false) {
         _resumePending = State(initialValue: resume)
@@ -57,6 +60,14 @@ struct LiveView: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .alert(lowCapacityTitle, isPresented: $confirmLowCapacity) {
+            Button("Go live anyway", role: .destructive) {
+                Task { await goLive() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(capacity?.warning ?? "")
+        }
         .onChange(of: broadcast.state) { _, state in
             // A resumed run that ended with its entry still on disk (the
             // node refused it at the feed head, or it failed): the next
@@ -235,6 +246,11 @@ struct LiveView: View {
                         .foregroundStyle(.yellow)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let problem = broadcast.progress?.batchProblem, broadcast.state.isActive {
+                    // The plan, not the network, is refusing the uploads
+                    // (#176): no retry or better signal brings them back.
+                    batchProblemNote(problem)
+                }
                 if let progress = broadcast.progress {
                     metrics(progress)
                 } else if broadcast.state.isActive {
@@ -294,6 +310,18 @@ struct LiveView: View {
         }
     }
 
+    private func batchProblemNote(_ problem: BatchProblem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(problem.title, systemImage: "externaldrive.badge.xmark")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(problem.detail)
+                .font(.caption)
+                .foregroundStyle(.orange.opacity(0.9))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private func metric(_ label: String, _ value: String, tint: Color? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
@@ -327,6 +355,9 @@ struct LiveView: View {
                          + "were never sent.")
                         .font(.caption)
                         .foregroundStyle(.yellow.opacity(0.9))
+                }
+                if let problem = report.batchProblem {
+                    batchProblemNote(problem)
                 }
                 if report.segmentsDropped > 0 || report.segmentsFailed > 0 {
                     Text("\(report.segmentsDropped) dropped at the live edge, "
@@ -385,7 +416,44 @@ struct LiveView: View {
                  + "segments. Lower is more reliable on mobile data.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
+            if let estimate = capacity {
+                // The plan's room at this quality (#176), counted from
+                // its fullest bucket: the same estimate and the same
+                // warning test as the Broadcast tab's checklist.
+                Label {
+                    Text([estimate.summary(quality: quality.label), estimate.warning]
+                        .compactMap { $0 }
+                        .joined(separator: ". "))
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: estimate.needsWarning
+                          ? "exclamationmark.triangle.fill" : "externaldrive")
+                }
+                .font(.caption)
+                .foregroundStyle(estimate.needsWarning ? Color.orange : Color.white.opacity(0.7))
+            }
         }
+    }
+
+    /// The plan's room for a broadcast at the picked quality (#176).
+    private var capacity: CapacityEstimate? {
+        node.capacity(for: broadcast.quality)
+    }
+
+    /// Going live needs a yes first: the plan runs out within the hour at
+    /// this quality, or won't be stamped at all. A mutable plan with room
+    /// is only warned about on screen.
+    private var needsCapacityConfirmation: Bool {
+        guard let estimate = capacity else { return false }
+        return estimate.low || !estimate.usable
+    }
+
+    private var lowCapacityTitle: String {
+        guard let estimate = capacity else { return "Storage plan" }
+        if !estimate.usable { return "Storage plan refused" }
+        return estimate.minutesLeft == 0
+            ? "No room left on your storage plan"
+            : "\(estimate.timeLabel) left on your storage plan"
     }
 
     // MARK: channel link
@@ -473,24 +541,10 @@ struct LiveView: View {
             Task {
                 if broadcast.state.isActive {
                     await broadcast.stop(node: node)
+                } else if needsCapacityConfirmation {
+                    confirmLowCapacity = true
                 } else {
-                    // Checked again at the tap: the entry may have aged
-                    // past the reap window since the last redraw.
-                    guard !blockedByUnfinished(now: Date()) else { return }
-                    let resume = resumePending
-                    resumePending = false
-                    lastRunWasResume = resume
-                    await broadcast.start(
-                        node: node,
-                        channel: channel.isEmpty ? "AntStream" : channel,
-                        resume: resume
-                    )
-                    // Refused at start (no plan, the camera, an entry the
-                    // node won't resume): still a resume, not a new
-                    // broadcast that would replace the unfinished one's
-                    // entry. A refusal at the feed head comes later, when
-                    // the run ends: see `.onChange(of: broadcast.state)`.
-                    if case .failed = broadcast.state, resume { resumePending = true }
+                    await goLive()
                 }
             }
         } label: {
@@ -507,6 +561,26 @@ struct LiveView: View {
         .buttonStyle(.plain)
         .disabled(broadcast.state == .starting || broadcast.state == .stopping || blocked)
         .opacity(blocked ? 0.5 : 1)
+    }
+
+    private func goLive() async {
+        guard !broadcast.state.isActive else { return }
+        // Checked again at the tap (and after the capacity question): the
+        // entry may have aged past the reap window since the last redraw.
+        guard !blockedByUnfinished(now: Date()) else { return }
+        let resume = resumePending
+        resumePending = false
+        lastRunWasResume = resume
+        await broadcast.start(
+            node: node,
+            channel: channel.isEmpty ? "AntStream" : channel,
+            resume: resume
+        )
+        // Refused at start (no plan, the camera, an entry the node won't
+        // resume): still a resume, not a new broadcast that would replace
+        // the unfinished one's entry. A refusal at the feed head comes
+        // later, when the run ends: see `.onChange(of: broadcast.state)`.
+        if case .failed = broadcast.state, resume { resumePending = true }
     }
 
     private func controlTitle(blocked: Bool) -> String {

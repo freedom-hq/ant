@@ -44,28 +44,43 @@ struct BroadcastView: View {
         ZStack {
             LiquidGlassBackground(palette: .broadcast)
 
-            ScrollView {
-                VStack(spacing: 18) {
-                    header
-                    if let unfinished = node.unfinishedBroadcast {
-                        // Re-read every few seconds: "Resume" goes once
-                        // the reap window has passed.
-                        TimelineView(.periodic(from: .now, by: 5)) { context in
-                            unfinishedCard(unfinished, now: context.date)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 18) {
+                        header
+                        if let unfinished = node.unfinishedBroadcast {
+                            // Re-read every few seconds: "Resume" goes once
+                            // the reap window has passed.
+                            TimelineView(.periodic(from: .now, by: 5)) { context in
+                                unfinishedCard(unfinished, now: context.date)
+                            }
                         }
+                        liveCard
+                        if node.hasStorage { channelCard }
+                        checklistCard
+                            .id(Self.checklistID)
+                        benchCard
+                        if !node.hasStorage { setUpCard }
                     }
-                    liveCard
-                    if node.hasStorage { channelCard }
-                    checklistCard
-                    benchCard
-                    if !node.hasStorage { setUpCard }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 130)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 130)
+                .scrollIndicators(.hidden)
+                .refreshable { await node.refreshAll() }
+                .task {
+                    // antstream-visual: `-antstream-shot-low-capacity` (#176)
+                    // is about the checklist's "Room for a broadcast" row,
+                    // which sits below the fold: bring it into the shot once
+                    // the sample plan is in.
+                    guard RootView.shotArgs.contains("-antstream-shot-low-capacity") else { return }
+                    for _ in 0..<60 where node.plan == nil {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    withAnimation { proxy.scrollTo(Self.checklistID, anchor: .top) }
+                }
             }
-            .scrollIndicators(.hidden)
-            .refreshable { await node.refreshAll() }
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
@@ -330,6 +345,8 @@ struct BroadcastView: View {
 
     // MARK: readiness checklist
 
+    private static let checklistID = "checklist"
+
     private var checklistCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
@@ -360,6 +377,9 @@ struct BroadcastView: View {
                     detail: node.plan.map { formatBytes($0.freeBytes) + " free" }
                         ?? "No plan yet"
                 )
+                if node.hasStorage {
+                    capacityRow
+                }
                 checkRow(
                     done: node.settlement?.enabled == true,
                     title: "Network settlement ready",
@@ -375,6 +395,25 @@ struct BroadcastView: View {
         }
     }
 
+    /// How long a broadcast at the last-picked quality fits on the plan
+    /// (#176), counting the plan's fullest bucket. A warning, not a gate:
+    /// a nearly full plan can still carry a short broadcast, so going
+    /// live stays open and the going-live screen asks first.
+    @ViewBuilder
+    private var capacityRow: some View {
+        let quality = LiveBroadcast.storedQuality
+        if let estimate = node.capacity(for: quality) {
+            checkRow(
+                done: !estimate.needsWarning,
+                warn: estimate.needsWarning,
+                title: "Room for a broadcast",
+                detail: [estimate.summary(quality: quality.label), estimate.warning]
+                    .compactMap { $0 }
+                    .joined(separator: ". ")
+            )
+        }
+    }
+
     /// Where the gateway listens, or why it doesn't: the bind error stays
     /// on screen while the node retries every 10 s.
     private var gatewayDetail: String {
@@ -383,20 +422,25 @@ struct BroadcastView: View {
         return "Starting…"
     }
 
-    private func checkRow(done: Bool, title: String, detail: String) -> some View {
+    /// `warn` marks a row that is usable but needs reading: an orange
+    /// triangle, and the detail wraps instead of being cut to one line.
+    private func checkRow(done: Bool, warn: Bool = false, title: String, detail: String) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+            Image(systemName: warn
+                  ? "exclamationmark.triangle.fill"
+                  : (done ? "checkmark.circle.fill" : "circle"))
                 .font(.title3)
-                .foregroundStyle(done ? .green : .white.opacity(0.4))
+                .foregroundStyle(warn ? Color.orange : (done ? Color.green : Color.white.opacity(0.4)))
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                 Text(detail)
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.6))
-                    .lineLimit(1)
+                    .foregroundStyle(warn ? Color.orange.opacity(0.9) : Color.white.opacity(0.6))
+                    .lineLimit(warn ? nil : 1)
                     .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: warn)
             }
             Spacer()
         }

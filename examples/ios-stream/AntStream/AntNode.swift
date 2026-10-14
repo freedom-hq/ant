@@ -745,11 +745,9 @@ final class AntNode: ObservableObject {
             "bitrate_kbps": bitrateKbps,
             "segment_ms": segmentMs,
             "notes": notes,
-            // The `/bzz` format, not Solar Punk's (#167): the web player
-            // the Share links open and the Android Watch tab read only
-            // `/bzz/<channel>/stream.m3u8`, so a "solar-punk" broadcast
-            // would be unplayable there. The Watch tab here reads both.
-            "format": "bzz",
+            // The `/bzz` format, not Solar Punk's (#167): see
+            // `broadcastFormat`.
+            "format": Self.broadcastFormat,
             // A broadcast whose network (or the app) is gone for a whole
             // minute ends by itself, as Solar Punk's uploader does
             // (#172); anything shorter is a pause with one seam.
@@ -762,7 +760,7 @@ final class AntNode: ObservableObject {
             // feed from 0 (the Watch tab here does). 360 chunks an hour
             // on the plan. Under "bzz" there is no master playlist: that
             // is for Solar Punk's players, which read "solar-punk" only.
-            "ladder": true,
+            "ladder": Self.broadcastLadder,
         ]
         // One or the other: the publisher refuses both at once.
         if let topicText {
@@ -789,6 +787,59 @@ final class AntNode: ObservableObject {
         if let message = started { throw AntError.op(message) }
         publisherActive = true
         if !finalizingUnfinished { unfinishedBroadcast = nil }
+    }
+
+    /// The format every broadcast goes out in: `/bzz`, not Solar Punk's
+    /// (#167). The web player the Share links open and the Android Watch
+    /// tab read only `/bzz/<channel>/stream.m3u8`, so a "solar-punk"
+    /// broadcast would be unplayable there. The Watch tab here reads both.
+    static let broadcastFormat = "bzz"
+    /// Every broadcast writes ladder time markers (#174).
+    static let broadcastLadder = true
+
+    // MARK: - Storage room for a broadcast (#176)
+
+    /// Estimates already worked out, by plan state and quality: the
+    /// views ask on every redraw, and the plan changes rarely.
+    private var capacityCache: [String: CapacityEstimate] = [:]
+
+    /// How long a broadcast at `quality` fits on the connected plan
+    /// (#176), from the library's `ant_publisher_capacity`: what a minute
+    /// of it stamps (segments at the video and audio rate, the playlist
+    /// and feed update after each, the ladder markers, the recording)
+    /// against the room left in the plan's fullest bucket. `nil` with no
+    /// plan. Needs no node; the same format and ladder setting
+    /// ``startPublisher`` sends.
+    func capacity(for quality: CaptureEngine.Quality) -> CapacityEstimate? {
+        guard let plan, plan.enabled, !plan.batchId.isEmpty else { return nil }
+        let key = "\(plan.batchId)|\(plan.worstCaseRemainingChunks)|\(plan.immutable)|\(quality.rawValue)"
+        if let cached = capacityCache[key] { return cached }
+        let settings = CaptureEngine.Settings(quality: quality)
+        let config: [String: Any] = [
+            "channel": "",
+            "batch_id": plan.batchId,
+            "bitrate_kbps": settings.bitrateKbps + CaptureEngine.audioBitrateKbps,
+            "segment_ms": Int(settings.segmentSeconds * 1000),
+            "format": Self.broadcastFormat,
+            "ladder": Self.broadcastLadder,
+        ]
+        guard let configData = try? JSONSerialization.data(withJSONObject: config),
+              let configJSON = String(data: configData, encoding: .utf8),
+              let planData = try? JSONEncoder().encode(plan),
+              let planJSON = String(data: planData, encoding: .utf8)
+        else { return nil }
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        let raw = configJSON.withCString { configPtr in
+            planJSON.withCString { planPtr in
+                ant_publisher_capacity(configPtr, planPtr, &errPtr)
+            }
+        }
+        if let errPtr { ant_free_string(errPtr) }
+        guard let raw else { return nil }
+        defer { ant_free_string(raw) }
+        guard let estimate = StreamDecoder.capacity(from: String(cString: raw)) else { return nil }
+        capacityCache[key] = estimate
+        return estimate
     }
 
     // MARK: - Unfinished broadcast (#175)
@@ -1090,7 +1141,21 @@ final class AntNode: ObservableObject {
     /// deposit card and the going-live screen, and the storage meter
     /// shows a populated bar rather than "no plan".
     private static func sampleConnectedPlan(batchId: String) -> StoragePlan {
-        StoragePlan(
+        // `-antstream-shot-low-capacity`: an immutable plan whose fullest
+        // bucket leaves about twenty minutes of 360p (#176), so the
+        // checklist and the going-live screen show their warning.
+        if RootView.shotArgs.contains("-antstream-shot-low-capacity") {
+            return StoragePlan(
+                enabled: true,
+                batchId: batchId,
+                batchDepth: 22,
+                immutable: true,
+                totalCapacityChunks: 4_194_304,
+                issuedChunks: 3_900_000,
+                worstCaseRemainingChunks: 46_000
+            )
+        }
+        return StoragePlan(
             enabled: true,
             batchId: batchId,
             batchDepth: 22,

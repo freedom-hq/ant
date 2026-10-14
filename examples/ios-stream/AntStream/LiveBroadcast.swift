@@ -75,9 +75,15 @@ final class LiveBroadcast: ObservableObject {
 
     private static let qualityKey = "antstream.quality"
 
+    /// The quality the next broadcast will use, as last picked. The
+    /// Broadcast tab's checklist estimates the plan's room at it (#176).
+    static var storedQuality: CaptureEngine.Quality {
+        let stored = UserDefaults.standard.string(forKey: qualityKey) ?? ""
+        return CaptureEngine.Quality(rawValue: stored) ?? .low
+    }
+
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.qualityKey) ?? ""
-        quality = CaptureEngine.Quality(rawValue: stored) ?? .low
+        quality = Self.storedQuality
     }
 
     /// The rendition for ``quality``, with 2 s segments. The same values

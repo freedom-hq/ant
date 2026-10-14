@@ -1365,6 +1365,32 @@ char *ant_topic_from_string(const char *text, char **out_err);
 char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_err);
 
 /*
+ * How long a broadcast fits on the storage plan, checked before going
+ * live (issue #176). `config_json` is the publisher config the broadcast
+ * would start with (its "batch_id", "format", "bitrate_kbps",
+ * "segment_ms" and "ladder" are read; "bitrate_kbps" counts everything a
+ * segment carries, so a host adds its audio rate); `plan_json` is the
+ * plan as ant_storage_status reports it (its "enabled", "batch_id",
+ * "immutable" and "worst_case_remaining_chunks" are read).
+ * Returns a JSON object:
+ *   {"batch_id","immutable","usable","chunks_per_minute","chunks_left",
+ *    "minutes_left","low"}
+ * the chunks a minute of the broadcast stamps (segments, the playlist
+ * and feed update after each, ladder markers, the recording's share),
+ * the room left counting the batch's fullest bucket, the whole minutes
+ * that fit, and "low" under 60 minutes. An immutable batch refuses the
+ * broadcast's uploads once "minutes_left" runs out; a mutable one
+ * ("immutable": false) overwrites its oldest chunks instead, so a host
+ * warns about it whatever its room. Needs no node.
+ * Returns an allocated string (free with ant_free_string), or NULL with
+ * a message in *out_err when either document doesn't parse, the plan is
+ * not connected, or the plan's batch is not the config's.
+ */
+char *ant_publisher_capacity(const char *config_json,
+                             const char *plan_json,
+                             char **out_err);
+
+/*
  * Start a live broadcast from this node.
  *
  * This is the bench loop above with the synthetic generator replaced by
@@ -1641,7 +1667,8 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0,
  *    "paused":false,"segments_withheld":0,"reaped":false,
  *    "ladder_group":"","master_reference":"","markers_written":0,
- *    "ladder_failures":0,"ladder_error":"","recovery_error":""}
+ *    "ladder_failures":0,"ladder_error":"","recovery_error":"",
+ *    "batch_full_refusals":0,"batch_unusable_refusals":0,"batch_error":""}
  *
  * "paused" is ant_publisher_pause in force; "segments_withheld" counts
  * the media segments outages withheld (never uploaded, never listed);
@@ -1657,6 +1684,16 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  * feed failures those fields are for. "recovery_error" is the newest
  * failure to write or remove the "recovery_path" entry, "" while none
  * has failed: a kill now may lose what the entry missed.
+ * "batch_full_refusals" counts the broadcast's uploads (segments,
+ * playlists, feed updates, the channel manifest, the recording) the
+ * gateway refused because the postage batch is full (402 "batch is
+ * overissued": a full bucket on an immutable batch), and
+ * "batch_unusable_refusals" those refused because the batch itself is
+ * unusable (a 400 naming it, or a 422: not on chain); "batch_error" is
+ * the newest of either, "" while there has been none (issue #176).
+ * Neither is a network failure and no retry fixes them, so a host names
+ * them as the storage plan's problem. Each is also in "errors" and
+ * "error_count", and a refused media segment in "segments_failed".
  *
  * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
  * behind live a viewer is right now, i.e. the age of the newest segment
