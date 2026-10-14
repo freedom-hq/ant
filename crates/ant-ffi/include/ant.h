@@ -1462,8 +1462,8 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * at ant_ladder_marker_id(topic, period) holding Solar Punk's v2 marker
  * JSON, naming the newest feed index this broadcast published and
  * "segment_ms". From the first landed feed update until the stop, none
- * while paused; 360 chunks an hour; a marker that fails is skipped and
- * counted by "markers_written" not rising. Under "solar-punk" with a
+ * while paused; 360 chunks an hour; a marker that fails is skipped
+ * ("markers_written" doesn't rise). Under "solar-punk" with a
  * topic_text a URI can carry (no '/', whitespace, '#', '?' or '%', so
  * not the default "antstream/<channel>"), a one-rung master playlist
  * also goes up as the group feed's next v2 update (after its head, read
@@ -1598,14 +1598,21 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0,
  *    "paused":false,"segments_withheld":0,"reaped":false,
- *    "ladder_group":"","master_reference":"","markers_written":0}
+ *    "ladder_group":"","master_reference":"","markers_written":0,
+ *    "ladder_failures":0,"ladder_error":""}
  *
  * "paused" is ant_publisher_pause in force; "segments_withheld" counts
  * the media segments outages withheld (never uploaded, never listed);
  * "reaped" means the broadcast is ending by itself ("reap_ms" passed
  * with no media) and the host should call ant_publisher_stop.
- * "ladder_group", "master_reference" and "markers_written" describe the
- * one-rung ladder ("ladder": true at start; empty and 0 otherwise).
+ * "ladder_group", "master_reference", "markers_written",
+ * "ladder_failures" and "ladder_error" describe the one-rung ladder
+ * ("ladder": true at start; empty and 0 otherwise). A marker or master
+ * write that fails counts in "ladder_failures" and shows as
+ * "ladder_error" (the newest), never in "errors", "last_error" or
+ * "error_count": a ladder write is a shortcut a viewer can do without,
+ * retried every period, so it would otherwise crowd out the segment and
+ * feed failures those fields are for.
  *
  * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
  * behind live a viewer is right now, i.e. the age of the newest segment

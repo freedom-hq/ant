@@ -398,7 +398,8 @@ pub struct PublisherConfig {
     ///   `ladderMarker.ts`). In either format, from the first landed
     ///   feed update until the stop, none while paused. 360 chunks an
     ///   hour. A marker that fails is skipped: a viewer that finds none
-    ///   searches the feed as before.
+    ///   searches the feed as before. Marker and master failures go to
+    ///   `ladder_failures`/`ladder_error`, not `errors`.
     /// - Master (`"solar-punk"` with a text topic that fits a URI only:
     ///   the rung's URI is `swarm://<owner>/<topic_text>`, and readers
     ///   hash the text in it, so a raw topic can't be named there, nor a
@@ -1175,6 +1176,14 @@ struct PublisherState {
     master_reference: Option<String>,
     /// Ladder markers that landed.
     markers_written: u64,
+    /// Marker and master writes that failed, and the newest failure.
+    /// Kept apart from `errors`: a ladder write is a shortcut a viewer
+    /// can do without, retried every period or [`MASTER_RETRY`], and
+    /// would otherwise fill the eight kept errors and become the
+    /// broadcast's headline error over the segment and feed failures
+    /// that actually cost viewers media.
+    ladder_failures: u64,
+    ladder_error: Option<String>,
 
     errors: Vec<String>,
     last_error: Option<String>,
@@ -1190,6 +1199,13 @@ impl PublisherState {
             self.errors.push(message.clone());
         }
         self.last_error = Some(message);
+    }
+
+    /// A marker or master write failed: counted in `ladder_failures`
+    /// and shown as `ladder_error`, never in `errors`/`last_error`.
+    fn record_ladder_failure(&mut self, message: String) {
+        self.ladder_failures += 1;
+        self.ladder_error = Some(message);
     }
 
     fn record_latency(queue: &mut VecDeque<u64>, value: u64) {
@@ -1811,6 +1827,12 @@ pub struct PublisherSnapshot {
     pub master_reference: String,
     /// Ladder time markers that landed.
     pub markers_written: u64,
+    /// Marker and master writes that failed. Not in `error_count`: a
+    /// ladder write is a shortcut a viewer can do without.
+    pub ladder_failures: u64,
+    /// The newest marker or master failure, empty while none has
+    /// failed. Not in `last_error`/`errors`, for the same reason.
+    pub ladder_error: String,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -1908,6 +1930,10 @@ pub struct PublisherReport {
     pub master_reference: String,
     /// See [`PublisherSnapshot::markers_written`].
     pub markers_written: u64,
+    /// See [`PublisherSnapshot::ladder_failures`].
+    pub ladder_failures: u64,
+    /// See [`PublisherSnapshot::ladder_error`].
+    pub ladder_error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,6 +2191,8 @@ impl LiveRun {
             ladder_group: self.ladder_group(),
             master_reference: state.master_reference.clone().unwrap_or_default(),
             markers_written: state.markers_written,
+            ladder_failures: state.ladder_failures,
+            ladder_error: state.ladder_error.clone().unwrap_or_default(),
         }
     }
 
@@ -2298,6 +2326,8 @@ impl LiveRun {
             ladder_group: self.ladder_group(),
             master_reference: state.master_reference.clone().unwrap_or_default(),
             markers_written: state.markers_written,
+            ladder_failures: state.ladder_failures,
+            ladder_error: state.ladder_error.clone().unwrap_or_default(),
         }
     }
 }
@@ -3403,13 +3433,11 @@ const MASTER_RETRY: Duration = Duration::from_secs(30);
 /// update landed (a viewer would be sent to an earlier broadcast's head),
 /// a write is abandoned when its own period ends, and a period is never
 /// written twice, not even when the wall clock steps back, since a reader
-/// that already read an address keeps its answer. The first failure of
-/// a run of them is recorded in `errors`; the rest show only as
-/// `markers_written` not rising.
+/// that already read an address keeps its answer. A failure is counted
+/// in `ladder_failures` and shown as `ladder_error`, never in `errors`.
 async fn marker_loop(ctx: Arc<RunCtx>) {
     let group = ctx.group_topic();
     let mut last_period: Option<u64> = None;
-    let mut failing = false;
     loop {
         let now = ctx.wall_ms();
         let boundary = (marker_period_at(now) + 1) * LADDER_MARKER_PERIOD_MS;
@@ -3437,19 +3465,11 @@ async fn marker_loop(ctx: Arc<RunCtx>) {
         let outcome = write_marker(&ctx, &group, period, written_at, index, deadline).await;
         let mut state = lock(&ctx.state);
         match outcome {
-            Ok(()) => {
-                state.markers_written += 1;
-                failing = false;
-            }
-            Err(message) => {
-                if !failing {
-                    state.record_error(format!(
-                        "ladder marker for period {period}: {message}; viewers search \
-                         the feed instead until one lands"
-                    ));
-                }
-                failing = true;
-            }
+            Ok(()) => state.markers_written += 1,
+            Err(message) => state.record_ladder_failure(format!(
+                "ladder marker for period {period}: {message}; viewers search \
+                 the feed instead until one lands"
+            )),
         }
     }
 }
@@ -3519,7 +3539,7 @@ async fn publish_master(ctx: &RunCtx) {
         }
         Err(message) => {
             state.master_retry_at = Some(Instant::now() + MASTER_RETRY);
-            state.record_error(format!("master playlist: {message}"));
+            state.record_ladder_failure(format!("master playlist: {message}"));
         }
     }
 }
@@ -5281,6 +5301,9 @@ mod tests {
         fail_soc: bool,
         /// Refuse this many `POST /feeds` before accepting one.
         fail_feeds: u32,
+        /// Refuse the ladder's writes only: a marker's `POST /soc` and
+        /// the master playlist's `POST /bytes`.
+        fail_ladder: bool,
         /// Extra latency on `POST /feeds` only.
         feeds_delay: Duration,
         /// Refuse the recording's upload (a playlist marked VOD) only.
@@ -5522,7 +5545,16 @@ mod tests {
                                             && (request.method_path.ends_with("/bytes")
                                                 || request.method_path.contains("/bzz?")))
                                         || (slot.fail_soc && request.method_path.contains("/soc/"))
-                                        || (slot.fail_recording && is_recording);
+                                        || (slot.fail_recording && is_recording)
+                                        || (slot.fail_ladder
+                                            && [&b"\"rungs\":"[..], b"#EXT-X-STREAM-INF"]
+                                                .iter()
+                                                .any(|needle| {
+                                                    request
+                                                        .body
+                                                        .windows(needle.len())
+                                                        .any(|w| w == *needle)
+                                                }));
                                     (
                                         fail,
                                         if is_feeds {
@@ -6877,6 +6909,62 @@ mod tests {
             encode_ladder_marker(p, value["writtenAt"].as_u64().unwrap(), &topic, index, 2000)
                 .unwrap(),
         );
+    }
+
+    /// A ladder write that fails is a shortcut lost, not a broadcast
+    /// failure: it counts in `ladder_failures`/`ladder_error` and never
+    /// in `errors`/`last_error`/`error_count`, which a host shows as the
+    /// broadcast's headline error and which hold only eight entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_ladder_write_stays_out_of_the_broadcast_errors() {
+        const TEXT: &str = "antstream-ladder-failing";
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        lock(&log).fail_ladder = true;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.topic_text = TEXT.into();
+        config.ladder = true;
+        let run = start_with_wall_offset(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+            boundary_in(1500),
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        }
+        // One master and one marker have failed.
+        for _ in 0..200 {
+            if run.snapshot().ladder_failures >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot = run.snapshot();
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(snapshot.ladder_failures, 2, "{snapshot:?}");
+        assert!(
+            snapshot.ladder_error.starts_with("ladder marker")
+                || snapshot.ladder_error.starts_with("master playlist"),
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.markers_written, 0, "{snapshot:?}");
+        assert_eq!(snapshot.master_reference, "", "{snapshot:?}");
+        assert_eq!(snapshot.error_count, 0, "{snapshot:?}");
+        assert_eq!(snapshot.last_error, "", "{snapshot:?}");
+        assert!(report.ladder_failures >= 2, "{report:?}");
+        assert!(!report.ladder_error.is_empty(), "{report:?}");
+        assert_eq!(report.error_count, 0, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.kept_up, "{report:?}");
     }
 
     /// Under `"bzz"`, or with a topic text no `swarm://` URI can carry
