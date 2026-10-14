@@ -73,11 +73,16 @@ struct LiveView: View {
             await broadcast.start(node: node, channel: "CI test pattern")
             // `-antstream-shot-live-paused` then drops the "network" the
             // way `AntNode`'s path monitor does when the device goes
-            // offline (#172), so CI captures the paused state and, a
-            // minute on with nothing listed, the broadcast ending itself.
+            // offline (#172), so CI captures the paused state. The
+            // "network" comes back 65 s later, past the minute's reap
+            // window: the reap held for the return then ends the
+            // broadcast (it never ends one while offline, since its
+            // closing uploads need the uplink).
             if RootView.shotArgs.contains("-antstream-shot-live-paused") {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 await node.pausePublisher()
+                try? await Task.sleep(nanoseconds: 65_000_000_000)
+                await node.resumePublisher()
             }
         }
     }
@@ -193,8 +198,8 @@ struct LiveView: View {
                     // Paused, not over (#172): viewers stay on the
                     // broadcast and it carries on when the network does.
                     Label("No connection — paused. Viewers stay on the broadcast; "
-                          + "it carries on when the network is back, or ends "
-                          + "after a minute without it.",
+                          + "it carries on if the network is back within a "
+                          + "minute, and ends when it comes back after that.",
                           systemImage: "wifi.slash")
                         .font(.footnote)
                         .foregroundStyle(.yellow)

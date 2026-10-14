@@ -1324,9 +1324,11 @@ async fn an_outage_is_one_feed_and_one_recording_with_a_single_seam() {
 }
 
 /// Issue #172: with a reap window set, a broadcast whose host went quiet
-/// (paused and never back) ends by itself one window after its last
-/// segment, without the stop call, exactly as a stop ends it: the
-/// closing window, then the recording at the feed's head.
+/// ends by itself one window after its last segment, without the stop
+/// call, exactly as a stop ends it: the closing window, then the
+/// recording at the feed's head. Not while it is paused, though: with
+/// the uplink gone those two uploads would be lost, so a window that
+/// runs out during the outage ends the run at the return instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_broadcast_silent_past_its_reap_window_ends_itself() {
     let log = Arc::new(Mutex::new(NodeLog::default()));
@@ -1353,7 +1355,18 @@ async fn a_broadcast_silent_past_its_reap_window_ends_itself() {
     let _ = run.push(SegmentKind::Media, vec![2; 4000], 2000, false);
     wait_for(&run, |s| s.segments_listed == 2).await;
     run.pause();
-    // No stop call: the reaper ends it.
+    log.lock().unwrap().paused = true;
+    // Past the window, still offline: nothing ends against the dead
+    // uplink.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let during = run.snapshot();
+    assert!(
+        during.running && during.paused && !during.reaped,
+        "{during:?}"
+    );
+    // The network is back. No stop call: the reaper ends it.
+    log.lock().unwrap().paused = false;
+    run.resume();
     for _ in 0..200 {
         if run.is_finished() {
             break;

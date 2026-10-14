@@ -186,7 +186,8 @@ final class LiveBroadcast: ObservableObject {
     /// The only other end is the node's own (#172): a broadcast whose
     /// network is gone is paused, not stopped (``AntNode`` pauses and
     /// resumes it with the network), and only a minute with nothing
-    /// reaching the playlist ends it; the progress poll then calls this.
+    /// reaching the playlist ends it (a minute that ran out offline, at
+    /// the network's return); the progress poll then calls this.
     func stop(node: AntNode, failure: String? = nil) async {
         guard state.isActive else { return }
         state = .stopping

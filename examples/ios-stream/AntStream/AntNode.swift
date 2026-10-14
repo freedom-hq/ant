@@ -420,7 +420,9 @@ final class AntNode: ObservableObject {
                 // silent while the network is gone, and carried on in
                 // the same feed and recording behind one seam when it
                 // returns. Resumed after `wake`, so the swarm is warm
-                // again before the reap window restarts.
+                // again before the reap window restarts, or before a
+                // reap that fell due offline uploads the closing
+                // playlist and the recording.
                 if offline {
                     await self.pausePublisher()
                     await self.suspend()

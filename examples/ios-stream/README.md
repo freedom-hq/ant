@@ -268,7 +268,10 @@ dated from the wall clock again. The broadcast ends only on Stop, or by
 itself once a minute passes with nothing reaching the playlist
 (`reap_ms` 60000, Solar Punk's `ORPHAN_REAP_MS`; counted from the last
 listed segment or the first return after it, whichever is later); the
-live screen then shows the report.
+live screen then shows the report. A minute that runs out while offline
+ends the broadcast when the network comes back rather than at once, so
+the closing playlist and the recording go up over a live connection
+instead of failing against a dead one.
 
 Camera and broadcast paths are device-only — the simulator has no
 capture device. `antstream-visual` covers the screen by running the same

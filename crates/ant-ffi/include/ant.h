@@ -1416,7 +1416,12 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * see ant_publisher_pause / ant_publisher_resume. It ends on
  * ant_publisher_stop, or, with "reap_ms" set, by itself once that long
  * passes with no media reaching the playlist (counted from the latest of
- * go-live, the last listed segment and the first resume after it). A
+ * go-live, the last listed segment and the first resume after it). Not
+ * while paused: a window that runs out during an outage ends the
+ * broadcast at ant_publisher_resume instead, so the closing playlist and
+ * the recording go up over the returned connection rather than failing
+ * against a dead one (an outage that never ends stays paused until
+ * ant_publisher_stop). A
  * reaped broadcast closes and writes its recording exactly as a stop
  * does, and progress reports "reaped":true; the host then calls
  * ant_publisher_stop for the report. Leave "reap_ms" at 0 unless the
@@ -1501,7 +1506,9 @@ int ant_publisher_pause(const AntHandle *handle, char **out_err);
  * EXT-X-DISCONTINUITY and dated from the wall clock again. The first
  * return after the last listed segment also restarts the "reap_ms"
  * window, so a return late in an outage still gets the whole window to
- * deliver its first segment. Call it after ant_resume / ant_wake when
+ * deliver its first segment; a return after the window already ran out
+ * during the outage ends the broadcast instead (progress then reports
+ * "reaped"). Call it after ant_resume / ant_wake when
  * the network returns, and on a return to the foreground; harmless
  * without a prior pause. Non-blocking and idempotent. Return values as
  * ant_publisher_pause.

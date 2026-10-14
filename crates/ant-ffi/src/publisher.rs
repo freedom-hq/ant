@@ -64,7 +64,10 @@
 //! Only [`LiveRun::cancel`] (the host's stop) or the opt-in reap timeout
 //! ([`PublisherConfig::reap_ms`]: that long with no media reaching the
 //! playlist) closes the window and writes the recording. Solar Punk's
-//! uploader treats an encoder that disconnects the same way.
+//! uploader treats an encoder that disconnects the same way. A reap
+//! that falls due while paused waits for the return, since the closing
+//! window and the recording can't go up without an uplink: that return
+//! ends the run instead of continuing it.
 //!
 //! The topic is either text, hashed the way Solar Punk catalog entries
 //! and bee-js `Topic.fromString` name a feed ([`topic_from_string`]), or
@@ -302,6 +305,12 @@ pub struct PublisherConfig {
     /// so a return late in an outage still gets a whole window to
     /// deliver its first segment; later resumes with no media in between
     /// buy nothing more. [`ORPHAN_REAP_MS`] is Solar Punk's figure.
+    ///
+    /// Never while paused: a window that runs out during an outage ends
+    /// the run at the [`LiveRun::resume`] instead (that return buys no
+    /// fresh window), so the closing window and the recording go up over
+    /// a live uplink rather than failing once against a dead one. An
+    /// outage that never ends leaves the run paused until the stop.
     ///
     /// 0, the default, never reaps: a host only opts in once it handles
     /// a broadcast that ended without its stop call (the iOS app does;
@@ -877,6 +886,11 @@ struct PublisherState {
     last_media_at: Option<Instant>,
     /// The first [`LiveRun::resume`] since `last_media_at`.
     returned_at: Option<Instant>,
+    /// The reap window ran out while paused: the reaper is holding the
+    /// end for the return, so the closing window and the recording go up
+    /// over a live uplink. The return then ends the run instead of
+    /// buying a fresh window.
+    reap_due: bool,
     /// The run ended itself: [`PublisherConfig::reap_ms`] passed with no
     /// media.
     reaped: bool,
@@ -1415,6 +1429,8 @@ pub struct LiveRun {
     cancel: Arc<AtomicBool>,
     push_notify: Arc<Notify>,
     commit_notify: Arc<Notify>,
+    /// Wakes a reaper holding a due reap for the return.
+    reap_notify: Arc<Notify>,
     started_at: Instant,
 }
 
@@ -1572,24 +1588,32 @@ impl LiveRun {
     /// from the wall clock again. The first return after the last listed
     /// segment also restarts the reap window
     /// ([`PublisherConfig::reap_ms`]), so a return late in an outage
-    /// still has a whole window to deliver its first segment. Idempotent,
+    /// still has a whole window to deliver its first segment. A return
+    /// after the window already ran out during the outage ends the run
+    /// instead (see [`reaper`]). Idempotent,
     /// and harmless without a prior [`LiveRun::pause`] (a host can call
     /// it on every return to the foreground).
     pub fn resume(&self) {
         {
             let mut state = lock(&self.state);
             state.paused = false;
-            let first_return = match (state.returned_at, state.last_media_at) {
-                (None, _) => true,
-                (Some(returned), Some(media)) => media >= returned,
-                (Some(_), None) => false,
-            };
+            // The window already ran out during the outage: the reaper
+            // ends the run now that the closing uploads can land, rather
+            // than this return buying a fresh window.
+            let first_return = !state.reap_due
+                && match (state.returned_at, state.last_media_at) {
+                    (None, _) => true,
+                    (Some(returned), Some(media)) => media >= returned,
+                    (Some(_), None) => false,
+                };
             if first_return {
                 state.returned_at = Some(Instant::now());
             }
         }
-        // The pump may be holding an initialization segment for this.
+        // The pump may be holding an initialization segment for this,
+        // and the reaper a due reap.
         self.push_notify.notify_one();
+        self.reap_notify.notify_one();
     }
 
     /// Elapsed broadcast time: still ticking while the run is live,
@@ -1805,6 +1829,7 @@ pub fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let push_notify = Arc::new(Notify::new());
     let commit_notify = Arc::new(Notify::new());
+    let reap_notify = Arc::new(Notify::new());
     let started_at = Instant::now();
     let run = Arc::new(LiveRun {
         config: config.clone(),
@@ -1815,6 +1840,7 @@ pub fn start(
         cancel: Arc::clone(&cancel),
         push_notify: Arc::clone(&push_notify),
         commit_notify: Arc::clone(&commit_notify),
+        reap_notify: Arc::clone(&reap_notify),
         started_at,
     });
 
@@ -1829,6 +1855,7 @@ pub fn start(
         cancel,
         push_notify,
         commit_notify,
+        reap_notify,
         status_rx,
         manifest_task: Mutex::new(None),
         started_at,
@@ -1855,6 +1882,8 @@ struct RunCtx {
     /// reference that lands after the final report would be lost to
     /// the host, and it is the only shareable one.
     manifest_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Wakes the reaper on [`LiveRun::resume`]; see [`reaper`].
+    reap_notify: Arc<Notify>,
     /// Go-live, where the reap window first runs from.
     started_at: Instant,
 }
@@ -1876,19 +1905,26 @@ impl RunCtx {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    /// End the run the way the host's stop does, as `reaped`.
-    fn reap(&self) {
+    /// End the run the way the host's stop does, as `reaped`. Refused
+    /// (false) while paused: see [`reaper`].
+    fn reap(&self) -> bool {
         {
             let mut state = lock(&self.state);
             if state.intake_closed || self.cancelled() {
-                return;
+                return true;
+            }
+            if state.paused {
+                return false;
             }
             state.reaped = true;
+            // Under the lock, so a pause can't land between the check
+            // above and the cancel and withhold what the stop drains.
+            self.cancel.store(true, Ordering::SeqCst);
         }
-        self.cancel.store(true, Ordering::SeqCst);
         // See `LiveRun::cancel` for why `notify_one`.
         self.push_notify.notify_one();
         self.commit_notify.notify_one();
+        true
     }
 }
 
@@ -1898,19 +1934,47 @@ impl RunCtx {
 /// returned), and a viewer must not be left on a live playlist that
 /// will never advance again. Re-reads the deadline every time it wakes,
 /// since media and returns only ever push it later.
+///
+/// Never while paused: ending the run uploads the closing window and the
+/// recording, and with the uplink gone both would fail once and never be
+/// tried again, leaving the feed's head a live playlist with no
+/// `#EXT-X-ENDLIST` and the channel with no recording. A window that
+/// runs out during an outage marks the reap due and waits for
+/// [`LiveRun::resume`]; that return ends the run (it buys no fresh
+/// window), with the uploads going out over the connection that just
+/// came back. An outage that never ends leaves the run paused until the
+/// host's stop.
 async fn reaper(ctx: Arc<RunCtx>, reap: Duration) {
     loop {
+        // Registered before the state is read, so a return between the
+        // read and the await still wakes us.
+        let returned = ctx.reap_notify.notified();
+        tokio::pin!(returned);
         let deadline = {
-            let state = lock(&ctx.state);
+            let mut state = lock(&ctx.state);
             if state.intake_closed || ctx.cancelled() {
                 return;
             }
-            state.reap_deadline(ctx.started_at, reap)
+            let deadline = state.reap_deadline(ctx.started_at, reap);
+            if state.paused && Instant::now() >= deadline {
+                state.reap_due = true;
+                None
+            } else {
+                Some(deadline)
+            }
+        };
+        let Some(deadline) = deadline else {
+            returned.await;
+            continue;
         };
         let now = Instant::now();
         if now >= deadline {
-            ctx.reap();
-            return;
+            // A pause that slipped in since the read: go round again,
+            // which marks the reap due and waits for the return.
+            if ctx.reap() {
+                return;
+            }
+            continue;
         }
         tokio::time::sleep(deadline - now).await;
     }
@@ -5584,7 +5648,7 @@ mod tests {
         let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
         let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
         wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
-        run.pause();
+        // The camera stops handing segments over, the uplink is fine.
         settle(&run).await;
         let report = run.report();
         assert!(report.reaped, "{report:?}");
@@ -5601,13 +5665,69 @@ mod tests {
         let run = quiet_run(&log, &addr, 0);
         let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
         let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
-        run.pause();
         tokio::time::sleep(Duration::from_millis(800)).await;
         let snapshot = run.snapshot();
         assert!(snapshot.running && !snapshot.reaped, "{snapshot:?}");
         run.cancel();
         settle(&run).await;
         assert!(!run.report().reaped);
+    }
+
+    /// A window that runs out while paused does not end the run against
+    /// the dead uplink, where the closing window and the recording would
+    /// each fail once and never go up: the reap waits for the return,
+    /// and the return ends the run (no fresh window), with both uploads
+    /// going out over the connection that came back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reap_due_while_paused_waits_for_the_return() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = quiet_run(&log, &addr, 300);
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 64], 2000, false);
+        wait_until(&run, "the segment", |s| s.segments_listed == 1).await;
+        run.pause();
+        {
+            let mut log = lock(&log);
+            log.fail_uploads = true;
+            log.fail_soc = true;
+        }
+        // Well past the window, still offline.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let snapshot = run.snapshot();
+        assert!(
+            snapshot.running && snapshot.paused && !snapshot.reaped,
+            "{snapshot:?}"
+        );
+        assert!(lock(&run.state).reap_due);
+        let closing = |r: &SeenRequest| r.body.windows(14).any(|w| w == b"#EXT-X-ENDLIST");
+        assert!(
+            !lock(&log)
+                .seen
+                .iter()
+                .any(|r| closing(r) || is_recording(r)),
+            "nothing is closed against the dead uplink"
+        );
+
+        // The network is back: the run ends at once, not a window later.
+        {
+            let mut log = lock(&log);
+            log.fail_uploads = false;
+            log.fail_soc = false;
+        }
+        let back = Instant::now();
+        run.resume();
+        settle(&run).await;
+        assert!(
+            back.elapsed() < Duration::from_millis(300),
+            "the return ends it, it buys no window: {:?}",
+            back.elapsed()
+        );
+        let report = run.report();
+        assert!(report.reaped, "{report:?}");
+        assert!(!report.recording_reference.is_empty(), "{report:?}");
+        assert!(lock(&log).seen.iter().any(is_recording));
+        assert!(lock(&log).seen.iter().any(closing));
     }
 
     /// A return late in the window buys a whole window from the return,

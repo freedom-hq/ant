@@ -3719,7 +3719,10 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on
 /// [`ant_publisher_stop`] or, with `reap_ms` set, by itself once that
 /// long passes with no media reaching the playlist; progress then
-/// reports `reaped` and the host calls the stop for the report.
+/// reports `reaped` and the host calls the stop for the report. Not
+/// while paused: a window that runs out during an outage ends the
+/// broadcast at [`ant_publisher_resume`] instead, so the closing
+/// playlist and the recording go up over the returned connection.
 ///
 /// Returns immediately — the loop drives itself on the node's runtime.
 /// Poll it with [`ant_publisher_progress`] and finish it with
@@ -3922,7 +3925,9 @@ pub unsafe extern "C" fn ant_publisher_pause(
 /// `#EXT-X-DISCONTINUITY` and dated from the wall clock again. The first
 /// return after the last listed segment also restarts the reap window
 /// (`reap_ms` in the start config), so a return late in an outage still
-/// gets the whole window to deliver its first segment. Call it after
+/// gets the whole window to deliver its first segment; a return after
+/// the window already ran out during the outage ends the broadcast
+/// instead (progress then reports `reaped`). Call it after
 /// [`ant_resume`] / [`ant_wake`] when the network returns, and on a
 /// return to the foreground; harmless without a prior pause.
 /// Non-blocking and idempotent.
