@@ -755,6 +755,15 @@ struct PublisherState {
     /// that actually landed, so a failed update is retried at the same
     /// index rather than leaving a hole the finder would stop at.
     feed_index: u64,
+    /// A feed update is on the wire at `feed_index`: it may still land
+    /// and take that index. See [`LiveRun::seal_feed`].
+    feed_update_in_flight: bool,
+    /// The stop call returned before the run finished and handed
+    /// `feed_index` to the host as the next broadcast's `start_index`:
+    /// no further update may be written, or a closing window or
+    /// recording landing late would take the index the next broadcast
+    /// starts at. See [`LiveRun::seal_feed`].
+    feed_sealed: bool,
     channel_reference: Option<String>,
     /// A `POST /feeds` is already in flight. The start-time attempt and
     /// the committer's retry would otherwise both fire while the first
@@ -782,10 +791,13 @@ struct PublisherState {
     /// [`PublisherState::live_edge_lag_ms`] frozen when the run
     /// finished, so a report read later does not keep ageing.
     lag_frozen_ms: Option<u64>,
-    /// When the run finished, so the duration (and the throughput
-    /// figures divided by it) freezes with the broadcast — the same
-    /// principle as `lag_frozen_ms`: a report read a minute later must
-    /// describe the broadcast, not how long the host waited to ask.
+    /// When the broadcast's content ended (the committer folded in the
+    /// last segment), so the duration (and the throughput figures divided
+    /// by it) freezes with the broadcast — the same principle as
+    /// `lag_frozen_ms`: a report read a minute later must describe the
+    /// broadcast, not how long the host waited to ask, and the closing
+    /// window and recording uploaded after it are bookkeeping, not
+    /// broadcast time.
     ended_at: Option<Instant>,
     /// Longest media segment ever listed, in ms. Drives
     /// `#EXT-X-TARGETDURATION`, which RFC 8216 §6.2.1 says MUST NOT
@@ -1218,15 +1230,19 @@ pub struct PublisherReport {
     /// `/bzz/<it>/stream.m3u8`, under `"solar-punk"` as `/bytes/<it>`,
     /// with no feed lookup. Empty when nothing was listed or its upload
     /// failed (see `errors`). Set as soon as the upload lands, even if
-    /// the feed update after it fails.
+    /// the feed update after it fails or is skipped (the stop call's
+    /// grace ran out first, see [`LiveRun::seal_feed`]); the recording
+    /// then still plays by this reference but is not the feed's head.
     pub recording_reference: String,
     pub notes: String,
     pub target_bitrate_kbps: u32,
     pub segment_ms: u32,
     pub max_in_flight: usize,
-    /// Broadcast duration. Frozen when the run finished (like
-    /// `lag_ms_final`), so it — and the sustained figures divided by
-    /// it — stays put no matter how much later the report is read.
+    /// Broadcast duration. Frozen with the last content (like
+    /// `lag_ms_final`), before the closing window and the recording go
+    /// up, so it — and the sustained figures divided by it — counts
+    /// only the broadcast and stays put no matter how much later the
+    /// report is read.
     pub duration_s: f64,
     pub segments_pushed: u64,
     pub segments_published: u64,
@@ -1243,7 +1259,9 @@ pub struct PublisherReport {
     pub feed_updates: u64,
     /// Sequence-feed index the *next* update would take: what a host
     /// reusing this channel's topic passes as the next broadcast's
-    /// [`PublisherConfig::start_index`].
+    /// [`PublisherConfig::start_index`]. Final in the report the stop
+    /// call returns, even when its grace ran out first: the run is then
+    /// sealed ([`LiveRun::seal_feed`]) and writes no further update.
     pub feed_index: u64,
     pub sustained_mbit_s: f64,
     pub sustained_chunks_s: f64,
@@ -1447,6 +1465,32 @@ impl LiveRun {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         lock(&self.state).finished
+    }
+
+    /// Write no further feed update: the stop call is about to hand
+    /// `feed_index` to the host before the run finished (its grace ran
+    /// out on a slow uplink), and the host passes it on as the next
+    /// broadcast's `start_index`. Without the seal, a closing window or
+    /// recording still uploading in the background would land at that
+    /// very index, so the next broadcast's first update would collide
+    /// with it. Segments and playlists already on the wire still
+    /// finish; only their feed updates are skipped (and reported).
+    ///
+    /// Returns whether an update is in flight right now: it may still
+    /// land and take `feed_index`, so the caller must wait for
+    /// [`LiveRun::feed_update_in_flight`] to clear (at most
+    /// [`PUBLISH_TIMEOUT`]) before reading the index it hands out.
+    #[must_use]
+    pub fn seal_feed(&self) -> bool {
+        let mut state = lock(&self.state);
+        state.feed_sealed = true;
+        state.feed_update_in_flight
+    }
+
+    /// A feed update is on the wire; see [`LiveRun::seal_feed`].
+    #[must_use]
+    pub fn feed_update_in_flight(&self) -> bool {
+        lock(&self.state).feed_update_in_flight
     }
 
     /// Final report. Safe to call while the run is still going.
@@ -1680,7 +1724,8 @@ async fn drive(ctx: Arc<RunCtx>) {
         // Duration freezes with the run for the same reason the lag
         // does: `duration_s` and the throughput figures divided by it
         // must describe the broadcast, not the wait before the report
-        // was read.
+        // was read. The committer freezes it with the last content; this
+        // too is the fallback.
         state.ended_at.get_or_insert_with(Instant::now);
         state.finished = true;
     }
@@ -1842,13 +1887,17 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         }
         notified.await;
     }
-    // Freeze the live-edge lag *with the last content*, before the
-    // closing playlist: what follows is bookkeeping, and a slow final
-    // upload must not read as a broadcast that fell behind.
+    // Freeze the live-edge lag and the duration *with the last
+    // content*, before the closing playlist: what follows is
+    // bookkeeping, and a slow final upload must not read as a broadcast
+    // that fell behind, nor the recording's chunk tree (hundreds of
+    // chunks after a long broadcast) as broadcast time that dilutes the
+    // sustained figures.
     {
         let mut state = lock(&ctx.state);
         let lag = state.live_edge_lag_ms();
         state.lag_frozen_ms = Some(lag);
+        state.ended_at = Some(Instant::now());
     }
     if lock(&ctx.state).recording.is_empty() {
         return;
@@ -1905,18 +1954,37 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
         state.playlist_reference = Some(playlist_ref);
     }
 
-    let index = lock(&ctx.state).feed_index;
-    match publish_feed_update(ctx, index, &root).await {
-        Ok(()) => {
-            let mut state = lock(&ctx.state);
-            state.feed_index += 1;
-            state.feed_updates += 1;
-            if let Some(captured_at) = captured_at {
-                state.note_lag(captured_at);
-            }
+    // Take the index and mark it in flight in one lock, against
+    // `LiveRun::seal_feed`: once the stop call has handed `feed_index`
+    // out, nothing may land there.
+    let index = {
+        let mut state = lock(&ctx.state);
+        if state.feed_sealed {
+            let index = state.feed_index;
+            state.record_error(format!(
+                "feed update {index} skipped: stop returned before it, and \
+                 its report gave {index} as the next broadcast's start_index"
+            ));
+            return;
         }
-        Err(message) => {
-            lock(&ctx.state).record_error(format!("feed update {index}: {message}"));
+        state.feed_update_in_flight = true;
+        state.feed_index
+    };
+    let result = publish_feed_update(ctx, index, &root).await;
+    {
+        let mut state = lock(&ctx.state);
+        state.feed_update_in_flight = false;
+        match result {
+            Ok(()) => {
+                state.feed_index += 1;
+                state.feed_updates += 1;
+                if let Some(captured_at) = captured_at {
+                    state.note_lag(captured_at);
+                }
+            }
+            Err(message) => {
+                state.record_error(format!("feed update {index}: {message}"));
+            }
         }
     }
     // A channel manifest that could not be created at start is retried
@@ -3560,6 +3628,9 @@ mod tests {
         feeds_delay: Duration,
         /// Refuse the recording's upload (a playlist marked VOD) only.
         fail_recording: bool,
+        /// Extra latency on every request carrying the recording (its
+        /// upload and, under "solar-punk", the feed update wrapping it).
+        recording_delay: Duration,
     }
 
     /// The reference bee and ant answer a `POST /bytes` with: the root of
@@ -3626,6 +3697,10 @@ mod tests {
                                 let is_feeds = request.method_path.contains("/feeds/");
                                 let (fail, feeds_delay) = {
                                     let mut slot = lock(&log);
+                                    let is_recording = request
+                                        .body
+                                        .windows(24)
+                                        .any(|w| w == b"#EXT-X-PLAYLIST-TYPE:VOD");
                                     slot.seen.push(request.clone());
                                     let fail_feeds = is_feeds && slot.fail_feeds > 0;
                                     if fail_feeds {
@@ -3636,15 +3711,13 @@ mod tests {
                                             && (request.method_path.ends_with("/bytes")
                                                 || request.method_path.contains("/bzz?")))
                                         || (slot.fail_soc && request.method_path.contains("/soc/"))
-                                        || (slot.fail_recording
-                                            && request
-                                                .body
-                                                .windows(24)
-                                                .any(|w| w == b"#EXT-X-PLAYLIST-TYPE:VOD"));
+                                        || (slot.fail_recording && is_recording);
                                     (
                                         fail,
                                         if is_feeds {
                                             slot.feeds_delay
+                                        } else if is_recording {
+                                            slot.recording_delay
                                         } else {
                                             Duration::ZERO
                                         },
@@ -4018,6 +4091,148 @@ mod tests {
             bytes_reference(recording_request)
         );
         assert_eq!(report.playlist_reference, report.recording_reference);
+    }
+
+    /// Start a broadcast against `log`'s stub, push ten segments, stop,
+    /// and wait until the stub has seen a request matching `seen`.
+    async fn stop_and_wait_for(
+        log: &Arc<Mutex<StubLog>>,
+        seen: impl Fn(&SeenRequest) -> bool,
+    ) -> Arc<LiveRun> {
+        let addr = stub_gateway(Arc::clone(log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.max_backlog = 16;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..10u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+        }
+        run.cancel();
+        for _ in 0..400 {
+            if lock(log).seen.iter().any(&seen) {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the stub never saw the request");
+    }
+
+    fn is_recording(request: &SeenRequest) -> bool {
+        request
+            .body
+            .windows(24)
+            .any(|w| w == b"#EXT-X-PLAYLIST-TYPE:VOD")
+    }
+
+    /// The SOC ids of every feed update the stub saw.
+    fn soc_ids(log: &Arc<Mutex<StubLog>>) -> Vec<String> {
+        lock(log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.contains("/soc/"))
+            .map(|r| {
+                let path = r.method_path.split_once("?sig=").unwrap().0;
+                path.rsplit('/').next().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// The duration freezes with the last content: the closing window and
+    /// the recording (a chunk tree after a long broadcast) are uploaded
+    /// after it and are not broadcast time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_recording_is_not_counted_as_broadcast_time() {
+        let log = Arc::new(Mutex::new(StubLog {
+            recording_delay: Duration::from_millis(1500),
+            ..StubLog::default()
+        }));
+        let run = stop_and_wait_for(&log, |r| is_playlist(r) && is_recording(r)).await;
+        settle(&run).await;
+        let report = run.report();
+        assert_ne!(report.recording_reference, "", "{report:?}");
+        assert!(
+            report.duration_s < 1.0,
+            "the recording's 1.5 s upload counted as broadcast time: {report:?}"
+        );
+    }
+
+    /// A stop that returns while the recording is still uploading (the
+    /// grace ran out) seals the feed: the report's `feed_index`, which a
+    /// host passes as the next broadcast's `start_index`, is never taken
+    /// by the recording landing afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sealed_feed_leaves_the_reported_index_to_the_next_broadcast() {
+        let log = Arc::new(Mutex::new(StubLog {
+            recording_delay: Duration::from_millis(400),
+            ..StubLog::default()
+        }));
+        let run = stop_and_wait_for(&log, |r| is_playlist(r) && is_recording(r)).await;
+        // The closing window's update landed before the recording's
+        // upload began; nothing is on the wire at the feed.
+        assert!(!run.seal_feed(), "no feed update should be in flight");
+        let handed_out = run.report().feed_index;
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        let taken = hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], handed_out));
+        assert!(
+            !soc_ids(&log).contains(&taken),
+            "a late update took the next broadcast's start_index {handed_out}"
+        );
+        // The recording itself still landed and plays by its reference;
+        // the skipped update is reported.
+        assert_ne!(report.recording_reference, "", "{report:?}");
+        assert!(
+            report.errors.iter().any(|e| e.contains("skipped")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// Sealing while the recording's feed update is already on the wire:
+    /// the seal reports it, and once it clears the index counts it, so
+    /// what the stop call hands out is past it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealing_waits_out_a_feed_update_already_on_the_wire() {
+        let log = Arc::new(Mutex::new(StubLog {
+            recording_delay: Duration::from_millis(400),
+            ..StubLog::default()
+        }));
+        let run =
+            stop_and_wait_for(&log, |r| r.method_path.contains("/soc/") && is_recording(r)).await;
+        assert!(run.seal_feed(), "the recording's update is in flight");
+        for _ in 0..400 {
+            if !run.feed_update_in_flight() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!run.feed_update_in_flight());
+        let handed_out = run.report().feed_index;
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        let ids = soc_ids(&log);
+        let last = hex::encode(ant_retrieval::sequence_update_id(
+            &[0x11; 32],
+            handed_out - 1,
+        ));
+        assert_eq!(
+            ids.last(),
+            Some(&last),
+            "the in-flight update landed below it"
+        );
+        let taken = hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], handed_out));
+        assert!(!ids.contains(&taken));
+        assert_eq!(report.error_count, 0, "{:?}", report.errors);
     }
 
     /// A recording that will not upload leaves the closing window at the

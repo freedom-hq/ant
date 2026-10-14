@@ -3635,16 +3635,35 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// How long [`ant_publisher_stop`] waits for a cancelled broadcast to
 /// settle before returning the report anyway.
 ///
-/// Stopping publishes what is already captured. With every upload
-/// timing out that drain is at worst *three* rounds of the publisher's
-/// 60 s per-segment deadline — the in-flight window, a segment the
-/// pump had already popped behind it, then the backlog (capped at
-/// `max_backlog`, so at most one further round) — so a fully wedged
-/// uplink can outlive this grace. That is deliberate: a drain that
-/// slow means the tail is lost regardless, so the call returns at
-/// ~130 s with an honest report and the loop finishes in the
-/// background and releases its slot.
+/// Stopping publishes what is already captured, then the closing
+/// window and the recording, each an upload plus a feed update. With
+/// every upload timing out the segment drain alone is at worst *three*
+/// rounds of the publisher's 60 s per-request deadline — the in-flight
+/// window, a segment the pump had already popped behind it, then the
+/// backlog (capped at `max_backlog`, so at most one further round) —
+/// and the closing window and recording add up to four more (an upload
+/// and a feed update each), so a slow or wedged uplink can outlive
+/// this grace by minutes. That is deliberate: a drain that slow means
+/// the tail is lost regardless, so the call returns at ~130 s with an
+/// honest report and the loop finishes in the background and releases
+/// its slot.
+///
+/// The report's `feed_index` is what a host passes as the next
+/// broadcast's `start_index`, so a closing window or recording landing
+/// in the background must not take it: an early return seals the run's
+/// feed ([`publisher::LiveRun::seal_feed`]) first, waits out an update
+/// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
+/// the report. Whatever the background loop still uploads after that
+/// gets no feed update (the recording keeps its reference, but the
+/// closing window or the live window before it stays the feed's head).
 const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
+
+/// How long [`ant_publisher_stop`] waits, past [`PUBLISHER_STOP_GRACE`],
+/// for a feed update that was already on the wire when it sealed the
+/// feed: a little over the publisher's per-request deadline, which
+/// bounds that update.
+const PUBLISHER_SEAL_GRACE: Duration =
+    Duration::from_secs(publisher::PUBLISH_TIMEOUT.as_secs() + 5);
 
 /// Poll interval while waiting for a cancelled broadcast to settle.
 const PUBLISHER_STOP_POLL: Duration = Duration::from_millis(50);
@@ -3898,9 +3917,14 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// (issue #168). The report's `recording_reference` names it; it is
 /// empty if its upload failed or had not landed when the grace ran out.
 /// Returns after
-/// [`PUBLISHER_STOP_GRACE`] (~130 s) at the latest — a worst-case
-/// drain can still be finishing in the background past that (see the
-/// constant) — so call it off the UI thread.
+/// [`PUBLISHER_STOP_GRACE`] (~130 s), plus at most
+/// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
+/// wire then — a worst-case drain, closing window and recording can
+/// still be finishing in the background past that (see the constant) —
+/// so call it off the UI thread. The report's `feed_index` is final
+/// either way: a run that outlives the grace writes no further feed
+/// update, so passing it as the next broadcast's `start_index` never
+/// collides with a late closing window or recording.
 ///
 /// Calling it on a broadcast that already finished on its own returns
 /// that broadcast's report. Once a stop call has *returned* and
@@ -3930,6 +3954,15 @@ pub unsafe extern "C" fn ant_publisher_stop(
             let deadline = Instant::now() + PUBLISHER_STOP_GRACE;
             while !run.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(PUBLISHER_STOP_POLL);
+            }
+            // Out of grace with the loop still going: its `feed_index`
+            // must be final before the report hands it out as the next
+            // broadcast's start_index (see `PUBLISHER_STOP_GRACE`).
+            if !run.is_finished() && run.seal_feed() {
+                let deadline = Instant::now() + PUBLISHER_SEAL_GRACE;
+                while run.feed_update_in_flight() && Instant::now() < deadline {
+                    std::thread::sleep(PUBLISHER_STOP_POLL);
+                }
             }
             let report = run.report();
             // Only release the slot once the loop is actually done, and

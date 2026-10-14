@@ -91,10 +91,12 @@ log** and **Download** export everything as JSON for a bug report.
 
 A channel that is not live yet (the feed answers 404) shows "Waiting for
 the broadcast" and keeps retrying; a playlist with `#EXT-X-ENDLIST`
-switches to recording playback. A viewer who was watching live stops at
-the broadcast's closing playlist (its last minutes); one who opens the
-channel after it ended gets the recording the publisher leaves as the
-final feed update, the whole broadcast from its first segment.
+switches to recording playback. A viewer who was watching live plays on
+from where they were to the end, whether the reload lands on the
+broadcast's closing playlist (its last minutes) or straight on the
+recording; one who opens the channel after it ended gets the recording
+the publisher leaves as the final feed update, the whole broadcast from
+its first segment.
 
 ## Testing without a live broadcast
 

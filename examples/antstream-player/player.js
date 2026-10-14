@@ -695,6 +695,11 @@
   let hls = null;
   let channel = null;
   let ended = false;
+  // Whether this channel's first loaded playlist was live: a viewer who
+  // joined live plays on from where they were when the broadcast ends,
+  // even when the reload lands on the recording; only one who opened an
+  // already-finished channel starts the recording from its first segment.
+  let joinedLive = null;
   let everPlayed = false;
   let segmentsLoaded = 0;
   let lastFetchMs = null;
@@ -736,6 +741,7 @@
     stop();
     channel = ch;
     ended = false;
+    joinedLive = null;
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
@@ -784,17 +790,24 @@
       }
       const wasEnded = ended;
       ended = !details.live;
+      if (joinedLive === null) joinedLive = details.live;
       // New segments may have come into the prefetch window.
       prefetchAfter(cursorSn);
       if (ended && !wasEnded) log.marker('the broadcast ended');
       if (ended) {
-        // A viewer who was following the live edge stops at the closing
-        // window (its last minutes); one who opens a finished channel gets
-        // the recording the publisher leaves at the head, the whole
-        // broadcast as VOD.
-        setStatus(details.type === 'VOD'
-          ? 'The broadcast has ended: playing its recording from the start. You will switch to the next one when it starts.'
-          : 'The broadcast has ended: playing its last minutes. You will switch to the next one when it starts.');
+        // A viewer who was following the live edge plays on from where
+        // they were, to the end of the closing window (its last minutes) or
+        // of the recording if the reload went straight to it; one who opens
+        // a finished channel gets the recording the publisher leaves at the
+        // head, the whole broadcast as VOD, from its first segment.
+        const next = 'You will switch to the next one when it starts.';
+        if (joinedLive) {
+          setStatus(`The broadcast has ended: playing on to its end. ${next}`);
+        } else {
+          setStatus(details.type === 'VOD'
+            ? `The broadcast has ended: playing its recording from the start. ${next}`
+            : `The broadcast has ended: playing its last minutes. ${next}`);
+        }
         watchForNextBroadcast();
       }
     });
