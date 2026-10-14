@@ -36,6 +36,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 ant-crypto = { path = "../ant-crypto" }
+# `feed_lookup_ack`: the GetFeed stub answers with the node's own mapping.
+ant-p2p = { path = "../ant-p2p", default-features = false }
 anyhow.workspace = true
 async-trait.workspace = true
 bytes = "1.11.1"

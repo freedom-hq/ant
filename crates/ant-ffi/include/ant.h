@@ -1409,7 +1409,10 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *
  * A broadcast continues the feed its topic already holds (issue #173).
  * Before its first update it reads the feed head once
- * (GET /feeds/{owner}/{topic}) and writes from the index after it; it
+ * (GET /feeds/{owner}/{topic}?exact=true: ant's node answers only once
+ * the slot after the head is confirmed empty, else a 503, so a head
+ * slow to answer is never skipped) and writes from the index after it;
+ * it
  * numbers its media from where the head playlist's numbering ends
  * (EXT-X-MEDIA-SEQUENCE plus its entries, gaps included), with an
  * EXT-X-DISCONTINUITY on its first segment, so a viewer following the
@@ -1422,7 +1425,11 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * counts as a failed read too. Any other failed read holds every
  * playlist and feed update (segments still upload) until a retry reads
  * the head, so a flaky read never overwrites earlier broadcasts; a
- * broadcast stopped before it ever does writes none.
+ * broadcast stopped before it ever does writes none. Confirming either
+ * miss (an empty feed, or the slot after the head) takes more than two
+ * peers' "not found": on a node with at most two peers the head read
+ * keeps answering 503, so the broadcast publishes no playlist until
+ * the node reaches three or more (a brand-new channel included).
  *
  * "start_index", when present, overrides all of that: the first update
  * goes exactly there, nothing is read, the numbering starts at 0 and the

@@ -200,7 +200,10 @@ struct BroadcastView: View {
                     detail: node.isOffline
                         ? "Waiting for network…"
                         : (node.status.isReady
-                            ? "\(node.peerCount) peers" : node.status.label)
+                            ? (node.peerCount >= AntNode.minPeersToBroadcast
+                                ? "\(node.peerCount) peers"
+                                : "\(node.peerCount) of \(AntNode.minPeersToBroadcast) peers…")
+                            : node.status.label)
                 )
                 checkRow(
                     done: node.keyProtection != nil,

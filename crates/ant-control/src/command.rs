@@ -616,7 +616,8 @@ pub enum ControlCommand {
     /// (an anchor miss more than a couple of peers agree on: a feed
     /// nothing was written to), [`ControlAck::NotReady`] (an anchor miss
     /// only one or two cold peers answered, which can't tell an empty
-    /// feed from one the node can't reach yet) or [`ControlAck::Error`].
+    /// feed from one the node can't reach yet, or with `exact` a head
+    /// whose next slot isn't confirmed empty) or [`ControlAck::Error`].
     GetFeed {
         owner: [u8; 20],
         topic: [u8; 32],
@@ -626,6 +627,14 @@ pub enum ControlCommand {
         /// updates exist) and searches for the latest update from
         /// there. `0` is the plain "latest" lookup.
         after: u64,
+        /// The gateway's `?exact=true` (ant only, not bee): resolve
+        /// through `ant_retrieval::resolve_sequence_feed_exact`, which
+        /// answers only once the slot after the head is confirmed empty
+        /// and otherwise ends in [`ControlAck::NotReady`]. For a writer
+        /// about to take the next slot (the live publisher's head read,
+        /// issue #173); a reader leaves it off and gets bee's finder,
+        /// whose bounded look-ahead can land below a slow head.
+        exact: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /pins/{reference}` — pin a content tree into the
@@ -898,7 +907,9 @@ pub enum ControlAck {
     /// `GetFeed` sends it for an anchor miss only one or two peers
     /// answered (`FeedError::NoUpdates { corroborated: false, .. }`):
     /// not proof the feed is empty, so a 503 rather than bee's
-    /// `404 "no update found"` (issue #173).
+    /// `404 "no update found"` (issue #173). An `exact` `GetFeed` also
+    /// sends it for a head whose next slot isn't confirmed empty
+    /// (`FeedError::EndUnconfirmed`).
     /// Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for

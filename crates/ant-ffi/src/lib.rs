@@ -3726,8 +3726,11 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// `#EXT-X-DISCONTINUITY` at the seam, so the media sequence only ever
 /// increases) and opens its recording with the head playlist's entries.
 /// Only a feed nothing was written to starts at index 0; a head read
-/// that fails holds every playlist and feed update until a retry
-/// answers. `start_index` overrides all of that with an exact index; see
+/// that fails, or whose next slot isn't confirmed empty, holds every
+/// playlist and feed update until a retry answers. Confirming a miss
+/// takes more than two peers, so on a node with at most two (a brand-new
+/// channel included) no playlist goes up until it has three or more.
+/// `start_index` overrides all of that with an exact index; see
 /// [`publisher::PublisherConfig::start_index`].
 ///
 /// An interruption pauses the broadcast rather than ending it (issue

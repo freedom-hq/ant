@@ -3908,6 +3908,7 @@ fn handle_control_command(
             owner,
             topic,
             after,
+            exact,
             ack,
         } => {
             // Feed reads share their fetch path with `GetBytes`: spin up a
@@ -3926,8 +3927,13 @@ fn handle_control_command(
             let control = control.clone();
             let hints = state.feed_hints.clone();
             tokio::spawn(async move {
-                let mut builder =
-                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                // An exact read ends on a miss it needs corroborated
+                // (the slot after the head), so it stops at a handful
+                // of peers' "not found" like `/soc` does rather than
+                // walking the whole error budget (issue #146).
+                let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_cache(cache)
+                    .with_fast_miss(exact);
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
@@ -3949,13 +3955,21 @@ fn handle_control_command(
                 // or one cold peer's "not found" keeps it, as before.
                 // The `/bzz` feed-manifest dereference shares the same
                 // map and helper (issue #159).
-                let result = ant_retrieval::resolve_sequence_feed_hinted(
-                    &fetcher,
-                    &feed,
-                    after,
-                    Some(&hints),
-                )
-                .await;
+                // `exact` (a writer's head read) also confirms the slot
+                // after the head is empty, rather than trusting the
+                // look-ahead's bounded probes (issue #173).
+                let result = if exact {
+                    ant_retrieval::resolve_sequence_feed_exact(&fetcher, &feed, after, Some(&hints))
+                        .await
+                } else {
+                    ant_retrieval::resolve_sequence_feed_hinted(
+                        &fetcher,
+                        &feed,
+                        after,
+                        Some(&hints),
+                    )
+                    .await
+                };
                 let _ = ack.send(feed_lookup_ack(result));
             });
         }
@@ -6385,7 +6399,14 @@ const fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
 /// well exist, so an uncorroborated anchor miss is
 /// [`ControlAck::NotReady`], a 503 to retry: a host that reads the 404
 /// as "empty" starts writing at index 0 over the feed (the live
-/// publisher's head read, issue #173).
+/// publisher's head read, issue #173). An exact read's head whose next
+/// slot isn't confirmed empty ([`ant_retrieval::FeedError::EndUnconfirmed`])
+/// is a `NotReady` too: the head may be below the real one.
+///
+/// Corroborating takes more than two peers' "not found", so a node with
+/// at most two peers can't tell a brand-new feed is empty, or that the
+/// slot after a head is: every such read stays a 503 until it has three
+/// or more (the iOS app gates **Go Live** on that).
 #[must_use]
 pub fn feed_lookup_ack(
     result: Result<ant_retrieval::FeedResolution, ant_retrieval::FeedError>,
@@ -6406,6 +6427,9 @@ pub fn feed_lookup_ack(
                 "feed lookup: {e}; too few peers answered to tell an empty feed \
                  from one this node can't reach yet"
             ),
+        },
+        Err(e @ ant_retrieval::FeedError::EndUnconfirmed { .. }) => ControlAck::NotReady {
+            message: format!("feed lookup: {e}"),
         },
         Err(e) => ControlAck::Error {
             message: format!("feed lookup: {e}"),
@@ -11186,6 +11210,13 @@ mod tests {
             corroborated: false,
         }));
         assert!(matches!(ack, ControlAck::NotReady { .. }), "{ack:?}");
+        // R2-F1: an exact read whose next slot isn't confirmed empty
+        // may sit below the real head, so it is a 503 too.
+        let ack = feed_lookup_ack(Err(ant_retrieval::FeedError::EndUnconfirmed {
+            index: 9,
+            reason: "index 10: feed probe for index 10 exceeded 800 ms deadline".into(),
+        }));
+        assert!(matches!(ack, ControlAck::NotReady { .. }), "{ack:?}");
         let ack = feed_lookup_ack(Err(ant_retrieval::FeedError::OwnerMismatch));
         assert!(matches!(ack, ControlAck::Error { .. }), "{ack:?}");
     }
@@ -11488,6 +11519,7 @@ mod tests {
                 owner,
                 topic,
                 after: 0,
+                exact: false,
                 ack: ack_tx,
             },
         );
@@ -11539,6 +11571,7 @@ mod tests {
                 owner,
                 topic,
                 after: 0,
+                exact: false,
                 ack: ack_tx,
             },
         );
@@ -11679,6 +11712,7 @@ mod tests {
                 owner,
                 topic,
                 after: 0,
+                exact: false,
                 ack: ack_tx,
             },
         );

@@ -272,7 +272,10 @@ pub struct PublisherConfig {
     /// Override for the sequence-feed index of this broadcast's first
     /// update. Leave it out: a broadcast then **continues the feed** the
     /// topic already holds (issue #173). Before its first update it
-    /// reads the feed head once (`GET /feeds/{owner}/{topic}`) and
+    /// reads the feed head once (`GET /feeds/{owner}/{topic}?exact=true`,
+    /// which ant's node answers only once the slot after the head is
+    /// confirmed empty, so a head slow to answer is never read as the
+    /// one before it) and
     ///
     /// - writes from the index after the head, so the previous
     ///   broadcast's playlists are never overwritten;
@@ -295,6 +298,14 @@ pub struct PublisherConfig {
     /// answer: segments keep uploading, but no playlist or feed update
     /// is written until a retry reads the head, so a flaky read can never
     /// overwrite index 0 and up.
+    ///
+    /// Confirming a miss (the empty feed's index 0, or the slot after a
+    /// head) takes more than two peers' "not found", so on a node with at
+    /// most two peers every head read is a 503 and the broadcast, a
+    /// brand-new channel's first one included, publishes no playlist or
+    /// feed update until the node reaches three or more. The progress
+    /// `errors` say so; with `reap_ms` set the run is reaped once that
+    /// long passes, as for any broadcast that lists no media.
     ///
     /// Set, the first update goes exactly here and nothing is read: the
     /// numbering starts at 0 with no seam and the recording holds this
@@ -2565,9 +2576,16 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
 }
 
 /// Find where this broadcast stands in its feed (issue #173): read the
-/// head once with `GET /feeds/{owner}/{topic}`, then continue the feed
-/// after its index and the media numbering after its playlist
+/// head once with `GET /feeds/{owner}/{topic}?exact=true`, then continue
+/// the feed after its index and the media numbering after its playlist
 /// ([`PublisherState::continue_from`]).
+///
+/// `exact` makes ant's node answer only once the slot after the head is
+/// confirmed empty (`ant_retrieval::resolve_sequence_feed_exact`), and
+/// `503` otherwise. Without it a head slow to answer (past the finder's
+/// 800 ms look-ahead deadline) or missed by one or two cold peers reads
+/// as absent, so the answer lands one or more updates below the real
+/// head and the first update here would take a slot already written.
 ///
 /// The answers, as Solar Punk's uploader reads them at the start of a
 /// session over a topic that outlives it (`resumeFeedIndex`):
@@ -2589,7 +2607,7 @@ async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
 ///   and up over the previous broadcast.
 async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
     let path = format!(
-        "{}/feeds/{}/{}",
+        "{}/feeds/{}/{}?exact=true",
         ctx.target.prefix,
         hex::encode(ctx.owner),
         hex::encode(ctx.topic),
@@ -5063,7 +5081,7 @@ mod tests {
             .collect();
         assert_eq!(reads.len(), 1, "one head read");
         let feed_path = format!(
-            "GET /feeds/{}/{}",
+            "GET /feeds/{}/{}?exact=true",
             hex::encode(test_owner()),
             "11".repeat(32)
         );

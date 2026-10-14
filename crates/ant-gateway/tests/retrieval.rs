@@ -1896,12 +1896,14 @@ async fn handle_feed_test_command(
             owner,
             topic,
             after,
+            exact,
             ack,
         } => {
-            // Resolve via the real `resolve_sequence_feed_after` against
-            // the staged HashMap. Mirrors how the production node-side
-            // handler runs the resolver, so an end-to-end gateway test
-            // exercises the wiring without a swarm.
+            // Resolve via the real resolver against the staged HashMap,
+            // and answer with the node's own result-to-ack mapping
+            // (`ant_p2p::feed_lookup_ack`), so an end-to-end gateway
+            // test exercises the wiring without a swarm and the stub's
+            // 404-vs-503 split can't drift from the node's.
             assert_eq!(owner, expected_owner);
             assert_eq!(topic, expected_topic);
             let feed = ant_retrieval::Feed {
@@ -1912,21 +1914,12 @@ async fn handle_feed_test_command(
             let fetcher = MapFetcher {
                 chunks: chunks.clone(),
             };
-            let reply =
-                match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await {
-                    Ok(r) => ControlAck::FeedResolved {
-                        reference: r.reference,
-                        index: r.index,
-                        signature: r.signature,
-                        v2: r.v2,
-                        decrypt_key: r.decrypt_key,
-                    },
-                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
-                    Err(e) => ControlAck::Error {
-                        message: format!("feed lookup: {e}"),
-                    },
-                };
-            let _ = ack.send(reply);
+            let result = if exact {
+                ant_retrieval::resolve_sequence_feed_exact(&fetcher, &feed, after, None).await
+            } else {
+                ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await
+            };
+            let _ = ack.send(ant_p2p::feed_lookup_ack(result));
         }
         ControlCommand::StreamBytes {
             reference,
@@ -2233,6 +2226,51 @@ async fn get_feed_type_param_is_ignored_like_bee() {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["message"], "no update found");
     }
+}
+
+/// `?exact=true` (ant only): the node confirms the slot after the head
+/// is empty before answering (issue #173, R2-F1 on PR #183). On a
+/// readable feed it answers like the plain read, an empty feed is still
+/// `404 "no update found"`, and a value that isn't a Go bool is bee's
+/// `400` for a bad query param.
+#[tokio::test]
+async fn get_feed_exact_resolves_and_validates() {
+    let scenario = FeedScenario::new(0x28, 0xb8);
+    let uri = |q: &str| {
+        format!(
+            "/feeds/{}/{}?exact={q}",
+            hex::encode(scenario.owner),
+            hex::encode(scenario.topic),
+        )
+    };
+    let get = |router, uri: String| {
+        send(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let updates = [(0, b"first".as_slice(), 1), (1, b"second".as_slice(), 2)];
+    let resp = get(scenario.router(&updates), uri("true")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("swarm-feed-index").unwrap(),
+        index_hex(1).as_str()
+    );
+    assert_eq!(body_bytes(resp).await.as_slice(), b"second");
+
+    let resp = get(scenario.router(&[]), uri("true")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["message"], "no update found");
+
+    let resp = get(scenario.router(&updates), uri("maybe")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["reasons"][0]["field"], "exact", "{json}");
 }
 
 #[tokio::test]

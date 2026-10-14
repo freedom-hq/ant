@@ -126,6 +126,7 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                 owner,
                 topic,
                 after,
+                exact,
                 ack,
             } => {
                 let feed = ant_retrieval::Feed {
@@ -135,8 +136,11 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                 };
                 // The node's own mapping, so the stub answers the
                 // publisher's head read exactly as the node does.
-                let result =
-                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await;
+                let result = if exact {
+                    ant_retrieval::resolve_sequence_feed_exact(&fetcher, &feed, after, None).await
+                } else {
+                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await
+                };
                 let _ = ack.send(ant_p2p::feed_lookup_ack(result));
             }
             ControlCommand::StreamBytes {

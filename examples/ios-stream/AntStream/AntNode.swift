@@ -461,7 +461,19 @@ final class AntNode: ObservableObject {
     /// it is true one line after launch, offline included — so a
     /// broadcast gate has to look at the live path and the peer count
     /// too, or a device in airplane mode reads as ready.
-    var isOnNetwork: Bool { !isOffline && status.isReady && peerCount > 0 }
+    ///
+    /// The count is `minPeersToBroadcast`, not one: a broadcast reads
+    /// its channel's feed head before its first playlist (#173), and the
+    /// node only confirms a miss there (a new channel's empty feed, or
+    /// the slot after the head) when more than two peers answer it, so
+    /// with one or two peers it would upload segments but publish no
+    /// playlist.
+    var isOnNetwork: Bool {
+        !isOffline && status.isReady && peerCount >= Self.minPeersToBroadcast
+    }
+
+    /// Peers the node needs before going live; see `isOnNetwork`.
+    static let minPeersToBroadcast = 3
 
     /// Everything a first launch has to get through before the device can
     /// go live — the conjunction of the Broadcast tab's readiness

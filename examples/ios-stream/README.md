@@ -309,6 +309,10 @@ manifest of owner + topic, so it is one link for all broadcasts.
   from the last one's (one `#EXT-X-DISCONTINUITY` at the seam, so a
   viewer's media sequence only ever increases), and its recording opens
   with the last one's, so the channel's head plays every broadcast.
+  Reading the head needs the node to confirm a miss (an empty feed, or
+  the slot after the head) with more than two peers, so **Go Live**
+  waits for three connected peers; until the node has them no playlist
+  or feed update would go up.
 
 ## Watch
 
