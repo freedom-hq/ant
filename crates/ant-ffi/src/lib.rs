@@ -3643,7 +3643,11 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// backlog (capped at `max_backlog`, so at most one further round) —
 /// a feed-head read that had not answered yet (issue #173) can hold the
 /// playlists behind it for one more (a stop gives up on the head after
-/// that one read), and the closing window and recording add up to four
+/// that one read; a resumed run, finalizing, keeps retrying it for up to
+/// a minute after the stop, a read in flight then included, so a cold
+/// head doesn't leave the broadcast unrecorded and the closing window
+/// and recording still get ~70 s of the grace), and the closing window
+/// and recording add up to four
 /// more (an upload and a feed update each), so a slow or wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an
@@ -3778,6 +3782,16 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// channel included) no playlist goes up until it has three or more.
 /// `start_index` overrides all of that with an exact index; see
 /// [`publisher::PublisherConfig::start_index`].
+///
+/// `recovery_path` keeps a recovery entry for the broadcast (issue #175),
+/// written ahead of every feed update and removed once the recording is
+/// the feed's head; after a kill or crash, starting with `resume: true`
+/// and the same path carries the same broadcast on in the same feed (or,
+/// stopped straight away, finalizes it into its recording). A resume is
+/// refused at start for another account's, topic's or format's entry,
+/// and ends by itself with nothing written when the feed's head shows the
+/// channel moved on since. See [`publisher::PublisherConfig::recovery_path`]
+/// and [`publisher::PublisherConfig::resume`].
 ///
 /// An interruption pauses the broadcast rather than ending it (issue
 /// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on

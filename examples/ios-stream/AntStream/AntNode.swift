@@ -84,6 +84,18 @@ final class AntNode: ObservableObject {
     @Published private(set) var channel: Channel?
     /// The channel's shareable reference, once its feed manifest exists.
     @Published private(set) var channelReference: String?
+    /// A broadcast this account was in the middle of when the app was
+    /// killed or crashed (#175), read from its recovery entry; `nil` when
+    /// there is none, or while this launch is broadcasting.
+    @Published private(set) var unfinishedBroadcast: UnfinishedBroadcast?
+    /// A broadcast started on this node and its stop has not returned:
+    /// the recovery entry on disk is its own, not an unfinished one.
+    private var publisherActive = false
+    /// ``finishUnfinishedBroadcast()`` is running: the publisher is that
+    /// broadcast, so ``unfinishedBroadcast`` stays up (its card shows the
+    /// finalize in progress, and Go live stays held) until the stop
+    /// returns and the entry on disk says how it went.
+    private var finalizingUnfinished = false
 
     /// The preferred gateway address and the start of the fallback range
     /// (the same range Freedom desktop uses).
@@ -706,16 +718,27 @@ final class AntNode: ObservableObject {
     /// the same account) can't rewrite earlier broadcasts. A channel with
     /// a text topic hands the publisher the text (it hashes it to the
     /// same bytes) so the report names it too.
+    ///
+    /// Every broadcast keeps a recovery entry (`recovery_path`, #175) in
+    /// the account's file under `Application Support/antstream/`, so a
+    /// kill or crash leaves what the next launch needs to carry it on
+    /// (`resume`) or end it into its recording
+    /// (``finishUnfinishedBroadcast()``). The node removes it once the
+    /// recording is the feed's head.
     func startPublisher(
         channel: String,
         topic: String,
         topicText: String?,
+        owner: String,
         batchId: String,
         bitrateKbps: UInt32,
         segmentMs: UInt32,
-        notes: String
+        notes: String,
+        resume: Bool = false
     ) async throws {
         var config: [String: Any] = [
+            "recovery_path": Self.recoveryURL(owner: owner).path,
+            "resume": resume,
             "channel": channel,
             "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId,
@@ -764,6 +787,78 @@ final class AntNode: ObservableObject {
         }
         guard let started = failure else { throw AntError.notReady }
         if let message = started { throw AntError.op(message) }
+        publisherActive = true
+        if !finalizingUnfinished { unfinishedBroadcast = nil }
+    }
+
+    // MARK: - Unfinished broadcast (#175)
+
+    /// Where the publisher keeps `owner`'s recovery entry: one file per
+    /// account, so a restored or switched account never offers another
+    /// account's broadcast (the node refuses to resume one anyway).
+    static func recoveryURL(owner: String) -> URL {
+        let hex = owner.lowercased().replacingOccurrences(of: "0x", with: "")
+        return resolveDataDir().appendingPathComponent("broadcast-recovery-\(hex).json")
+    }
+
+    /// Re-read this account's recovery entry. Nothing while this launch
+    /// is broadcasting (the entry is the running broadcast's own) or the
+    /// account is not known yet. An entry that can't be read is left on
+    /// disk and not offered: the node could not resume it either.
+    func refreshUnfinishedBroadcast() {
+        if unfinishedSampleActive || finalizingUnfinished { return }
+        guard !publisherActive, let owner = channel?.owner else {
+            if unfinishedBroadcast != nil { unfinishedBroadcast = nil }
+            return
+        }
+        let url = Self.recoveryURL(owner: owner)
+        let hex = owner.lowercased().replacingOccurrences(of: "0x", with: "")
+        let entry = (try? Data(contentsOf: url)).flatMap(UnfinishedBroadcast.decode)
+        let found = entry?.owner == hex ? entry : nil
+        if found != unfinishedBroadcast { unfinishedBroadcast = found }
+    }
+
+    /// End the unfinished broadcast without going live again: the node
+    /// resumes it and stops straight away, so its closing window and
+    /// recording go up as on any stop and the channel's head plays every
+    /// segment that landed before the app went. Blocks like a stop.
+    func finishUnfinishedBroadcast() async throws -> PublisherReport {
+        guard let unfinished = unfinishedBroadcast, let channel else {
+            throw AntError.op("There is no unfinished broadcast to end.")
+        }
+        guard let batchId = plan?.batchId, plan?.enabled == true else {
+            throw AntError.op("Connect a storage plan to end the broadcast: its recording is an upload.")
+        }
+        let settings = CaptureEngine.Settings(quality: .low)
+        finalizingUnfinished = true
+        defer {
+            // Once the stop returned (or the start failed), the entry on
+            // disk decides: gone once the recording landed, kept to retry.
+            finalizingUnfinished = false
+            refreshUnfinishedBroadcast()
+        }
+        try await startPublisher(
+            channel: unfinished.channel,
+            topic: channel.topic,
+            topicText: channel.topicText,
+            owner: channel.owner,
+            batchId: batchId,
+            bitrateKbps: UInt32(settings.bitrateKbps),
+            segmentMs: UInt32(settings.segmentSeconds * 1000),
+            notes: "ending an unfinished broadcast",
+            resume: true
+        )
+        return try await stopPublisher()
+    }
+
+    /// Forget the unfinished broadcast: its segments stay on Swarm and
+    /// the channel keeps its last live window, but it is never closed or
+    /// recorded. For an entry the node refuses (the channel moved on).
+    func discardUnfinishedBroadcast() {
+        guard let owner = channel?.owner else { return }
+        try? FileManager.default.removeItem(at: Self.recoveryURL(owner: owner))
+        unfinishedSampleActive = false
+        unfinishedBroadcast = nil
     }
 
     /// How long a broadcast outlives its media before it ends by itself
@@ -857,6 +952,13 @@ final class AntNode: ObservableObject {
     /// actor's thread — ``ffiString`` already hops onto a detached task
     /// for that reason.
     func stopPublisher() async throws -> PublisherReport {
+        defer {
+            // The stop has returned, so whatever entry is left is an
+            // unfinished broadcast (a recording that did not land, or a
+            // resume the node refused): offer it again.
+            publisherActive = false
+            refreshUnfinishedBroadcast()
+        }
         let json = try await ffiString(name: "stop broadcast") { h, errPtr in
             ant_publisher_stop(h, errPtr)
         }
@@ -871,6 +973,7 @@ final class AntNode: ObservableObject {
     func refreshAll() async {
         await refreshPlan()
         await refreshAccount()
+        refreshUnfinishedBroadcast()
         await refreshSettlement()
         await ensureChannelReference()
     }
@@ -1055,6 +1158,30 @@ final class AntNode: ObservableObject {
             needsTopUp: true,
             xdaiToSendDisplay: "0.0150",
             sufficientFunds: false
+        )
+    }
+
+    /// Set while ``installUnfinishedSample()``'s entry is showing, so a
+    /// periodic refresh can't replace it with the runner's real (empty)
+    /// state before the shot fires.
+    private var unfinishedSampleActive = false
+
+    /// The Broadcast tab's "Unfinished broadcast" card for a CI
+    /// screenshot: a runner never has a broadcast killed under it, so
+    /// this shows a sample one saved 20 s ago, recent enough to resume.
+    /// Nothing is written to disk. Sample only, and only ever called
+    /// behind `-antstream-shot-unfinished`.
+    func installUnfinishedSample() {
+        installChannelSample()
+        unfinishedSampleActive = true
+        unfinishedBroadcast = UnfinishedBroadcast(
+            channel: "Kitchen",
+            owner: channel?.owner.lowercased() ?? "",
+            broadcastId: "19a3c5e2f10",
+            savedAt: Date().addingTimeInterval(-20),
+            segments: 214,
+            seconds: 428,
+            ended: false
         )
     }
 

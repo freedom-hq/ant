@@ -23,6 +23,19 @@ struct LiveView: View {
     /// the device's, the first time) so going live needs no typing but
     /// stays editable.
     @State private var channel = ""
+    /// The first go-live here carries on the broadcast the app was killed
+    /// in the middle of (#175) rather than starting a new one. Cleared
+    /// once used: a later go-live from this screen is a new broadcast.
+    @State private var resumePending: Bool
+    /// The run started from here last was a resume: once it ends with the
+    /// unfinished broadcast's entry still on disk (the node refused it,
+    /// or it failed), the button stays a resume, so the next tap never
+    /// starts a new broadcast that would replace that entry.
+    @State private var lastRunWasResume = false
+
+    init(resume: Bool = false) {
+        _resumePending = State(initialValue: resume)
+    }
 
     var body: some View {
         ZStack {
@@ -44,7 +57,24 @@ struct LiveView: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .onChange(of: broadcast.state) { _, state in
+            // A resumed run that ended with its entry still on disk (the
+            // node refused it at the feed head, or it failed): the next
+            // tap resumes again rather than replacing the entry with a
+            // new broadcast, as long as the entry can still be resumed
+            // (the same `canResume` the Broadcast tab's card offers
+            // Resume on). One a stop had begun closing, or older than the
+            // reap window, can only be ended: the button is then held
+            // (see `blockedByUnfinished`) and the card ends it. Any run,
+            // not only a resume, can leave such an entry behind (a stop
+            // whose recording upload failed).
+            guard !state.isActive, lastRunWasResume else { return }
+            resumePending = resumable(now: Date())
+        }
         .task {
+            if resumePending, let unfinished = node.unfinishedBroadcast {
+                channel = unfinished.channel
+            }
             if channel.isEmpty { channel = node.channel?.name ?? UIDevice.current.name }
             // `-antstream-shot-live-idle` shows the screen before going
             // live (the quality picker), with the sample plan installed
@@ -253,6 +283,14 @@ struct LiveView: View {
                     .foregroundStyle(.orange.opacity(0.9))
                     .lineLimit(2)
             }
+            if let recovery = progress.recoveryError, !recovery.isEmpty {
+                // The crash-recovery entry (#175) isn't saving: a kill now
+                // could not be resumed. Viewers are unaffected.
+                Text("Crash recovery off: \(recovery)")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -391,20 +429,72 @@ struct LiveView: View {
 
     // MARK: controls
 
+    /// The unfinished broadcast (#175) can be carried on from here: the
+    /// Broadcast tab's own test for offering Resume on its card.
+    private func resumable(now: Date) -> Bool {
+        node.unfinishedBroadcast?.canResume(now: now, reapMs: AntNode.broadcastReapMs) == true
+    }
+
+    /// An unfinished broadcast's entry is on disk that this screen can't
+    /// carry on (it was ending, it is past the reap window, or this
+    /// screen was opened to go live, not to resume it). A new broadcast
+    /// would replace that entry with its first feed update and leave it
+    /// without its recording, so nothing starts from here: the Broadcast
+    /// tab's card ends it (or discards it, with confirmation).
+    private func blockedByUnfinished(now: Date) -> Bool {
+        guard !broadcast.state.isActive, node.unfinishedBroadcast != nil else { return false }
+        return !(resumePending && resumable(now: now))
+    }
+
     private var controls: some View {
+        // Re-read every few seconds, as the Broadcast tab's card does:
+        // Resume goes once the reap window has passed.
+        TimelineView(.periodic(from: .now, by: 5)) { context in
+            controlStack(now: context.date)
+        }
+    }
+
+    private func controlStack(now: Date) -> some View {
+        let blocked = blockedByUnfinished(now: now)
+        return VStack(spacing: 8) {
+            if blocked {
+                Text("End your unfinished broadcast on the Broadcast tab first: a new one would leave it without its recording.")
+                    .font(.caption)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            controlButton(blocked: blocked)
+        }
+    }
+
+    private func controlButton(blocked: Bool) -> some View {
         Button {
             Task {
                 if broadcast.state.isActive {
                     await broadcast.stop(node: node)
                 } else {
+                    // Checked again at the tap: the entry may have aged
+                    // past the reap window since the last redraw.
+                    guard !blockedByUnfinished(now: Date()) else { return }
+                    let resume = resumePending
+                    resumePending = false
+                    lastRunWasResume = resume
                     await broadcast.start(
                         node: node,
-                        channel: channel.isEmpty ? "AntStream" : channel
+                        channel: channel.isEmpty ? "AntStream" : channel,
+                        resume: resume
                     )
+                    // Refused at start (no plan, the camera, an entry the
+                    // node won't resume): still a resume, not a new
+                    // broadcast that would replace the unfinished one's
+                    // entry. A refusal at the feed head comes later, when
+                    // the run ends: see `.onChange(of: broadcast.state)`.
+                    if case .failed = broadcast.state, resume { resumePending = true }
                 }
             }
         } label: {
-            Text(controlTitle)
+            Text(controlTitle(blocked: blocked))
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -415,15 +505,18 @@ struct LiveView: View {
                 .foregroundStyle(.white)
         }
         .buttonStyle(.plain)
-        .disabled(broadcast.state == .starting || broadcast.state == .stopping)
+        .disabled(broadcast.state == .starting || broadcast.state == .stopping || blocked)
+        .opacity(blocked ? 0.5 : 1)
     }
 
-    private var controlTitle: String {
+    private func controlTitle(blocked: Bool) -> String {
         switch broadcast.state {
         case .starting: return "Starting…"
         case .stopping: return "Publishing the last segments…"
         case .live: return "Stop broadcast"
-        case .idle, .failed: return "Go live"
+        case .idle, .failed:
+            if blocked { return "Go live" }
+            return resumePending ? "Resume broadcast" : "Go live"
         }
     }
 }
