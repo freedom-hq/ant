@@ -122,7 +122,6 @@ final class LiveBroadcast: ObservableObject {
                 channel: channel,
                 topic: permanent.topic,
                 topicText: permanent.topicText,
-                startIndex: permanent.nextIndex,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),
                 segmentMs: UInt32(settings.segmentSeconds * 1000),
@@ -175,7 +174,7 @@ final class LiveBroadcast: ObservableObject {
         self.engine = engine
         engine.start()
         state = .live
-        startPolling(node: node, channel: permanent)
+        startPolling(node: node)
     }
 
     /// End the broadcast. Capture stops first so the segment in flight
@@ -222,9 +221,7 @@ final class LiveBroadcast: ObservableObject {
         releaseIdleTimer()
         deactivateAudioSession()
         do {
-            let finished = try await node.stopPublisher()
-            report = finished
-            if let next = finished.feedIndex { node.channel?.advance(to: next) }
+            report = try await node.stopPublisher()
         } catch {
             if failure == nil {
                 state = .failed(error.localizedDescription)
@@ -236,17 +233,13 @@ final class LiveBroadcast: ObservableObject {
 
     // MARK: - Progress
 
-    private func startPolling(node: AntNode, channel: Channel) {
+    private func startPolling(node: AntNode) {
         pollTask?.cancel()
         pollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self, self.state.isActive else { return }
                 if let snapshot = await node.publisherProgress() {
                     self.progress = snapshot
-                    // Saved as it advances, so the next broadcast
-                    // continues the feed even if this one is killed
-                    // mid-stream.
-                    channel.advance(to: snapshot.feedIndex)
                     // A minute with nothing reaching the playlist (the
                     // network, or the app, gone that long) ends the
                     // broadcast node-side (#172): finish the stop here

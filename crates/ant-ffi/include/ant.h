@@ -1385,7 +1385,7 @@ char *ant_topic_from_string(const char *text, char **out_err);
  *     "topic_text":      "kitchen-cam",           // text topic, see below
  *     "topic":           "0x<64 hex>",            // or raw topic bytes
  *     "format":          "bzz",                   // or "solar-punk"; see above
- *     "start_index":     0,                       // first feed index; see below
+ *     "start_index":     0,                       // override: exact first feed index; see below
  *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
  *     "segment_ms":      2000,                    // nominal segment duration
@@ -1401,16 +1401,41 @@ char *ant_topic_from_string(const char *text, char **out_err);
  * feed topic is keccak256(utf8(topic_text)), bee-js Topic.fromString,
  * hashed exactly as given. "topic" is raw 32-byte hex instead, for a
  * host that already has topic bytes. Set one, not both (an error). With
- * neither, the topic is the text "antstream/<channel>/<unix_ms>/<n>",
- * fresh per broadcast. Progress and the report carry the topic as hex
- * ("topic") and its text ("topic_text", empty for a raw topic), and
- * the "format".
+ * neither, the topic is the text "antstream/<channel>", the same for
+ * every broadcast of the channel, so the channel reference (the feed
+ * manifest of owner + topic) stays one link. Progress and the report
+ * carry the topic as hex ("topic") and its text ("topic_text", empty
+ * for a raw topic), and the "format".
  *
- * A host that keeps one topic across broadcasts, so the channel
- * reference (the feed manifest of owner + topic) stays the same link,
- * must pass the previous broadcast's final "feed_index" as
- * "start_index": the new broadcast then continues the feed rather than
- * rewriting the indices that hold the old one's playlists.
+ * A broadcast continues the feed its topic already holds (issue #173).
+ * Before its first update it reads the feed head once
+ * (GET /feeds/{owner}/{topic}?exact=true: ant's node answers only once
+ * the slot after the head is confirmed empty, else a 503, so a head
+ * slow to answer is never skipped) and writes from the index after it;
+ * it
+ * numbers its media from where the head playlist's numbering ends
+ * (EXT-X-MEDIA-SEQUENCE plus its entries, gaps included), with an
+ * EXT-X-DISCONTINUITY on its first segment, so a viewer following the
+ * channel sees the media sequence only ever increase; and its recording
+ * opens with the head playlist's entries, so the head plays every
+ * broadcast of the channel. Only a 404 "no update found" (a feed nothing
+ * was written to; the node answers it only for a miss more than a couple
+ * of peers agree on, and a 503 for one a cold node's one or two peers
+ * gave) starts at index 0. A v1 head's playlist that does not retrieve
+ * counts as a failed read too. Any other failed read holds every
+ * playlist and feed update (segments still upload) until a retry reads
+ * the head, so a flaky read never overwrites earlier broadcasts; a
+ * broadcast stopped before it ever does writes none. Confirming either
+ * miss (an empty feed, or the slot after the head) takes more than two
+ * peers' "not found": on a node with at most two peers the head read
+ * keeps answering 503, so the broadcast publishes no playlist until
+ * the node reaches three or more (a brand-new channel included).
+ *
+ * "start_index", when present, overrides all of that: the first update
+ * goes exactly there, nothing is read, the numbering starts at 0 and the
+ * recording holds this broadcast alone. A host passing the previous
+ * broadcast's "feed_index" there must get it right, or it rewrites the
+ * indices that hold earlier playlists.
  *
  * An interruption pauses a broadcast, it never ends it (issue #172):
  * see ant_publisher_pause / ant_publisher_resume. It ends on
@@ -1551,8 +1576,11 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * End the broadcast and return its final report as an allocated JSON
  * object (free with ant_free_string): the progress fields above plus
  * recording_reference (see below), duration_s, chunks_published,
- * feed_updates, feed_index (the next update's index: a reused channel's
- * next "start_index"), sustained_chunks_s,
+ * feed_updates, feed_index (the next update's index: where the next
+ * broadcast on the channel starts; null, here and in the progress, until
+ * the broadcast has read its feed head, so a broadcast stopped or reaped
+ * before that reports null, never 0: pass it on as "start_index" and the
+ * next broadcast reads the head itself), sustained_chunks_s,
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, "reaped" (it ended by itself, see "reap_ms"), and a
  * "kept_up" verdict (at least one feed update landed AND
@@ -1580,9 +1608,11 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * ~130 s, plus up to ~65 s more for a feed update already on the wire
  * then; a worst-case drain (the in-flight window, a segment the pump
  * had already popped behind it, then the backlog — up to three rounds
- * of the 60 s per-request publish deadline) followed by the closing
- * window and the recording (an upload and a feed update each, four
- * more rounds) can still be finishing in the background past that,
+ * of the 60 s per-request publish deadline), one more round for a
+ * feed-head read that had not answered yet (see "start_index" at
+ * ant_publisher_start; a stop gives up on it after that one), then the
+ * closing window and the recording (an upload and a feed update each,
+ * four more rounds) can still be finishing in the background past that,
  * with the report returned honestly either way. Call it off the main
  * thread. "feed_index" is final either way: a broadcast still going
  * when the call returns writes no further feed update, so a closing

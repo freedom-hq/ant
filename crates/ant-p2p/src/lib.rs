@@ -21,7 +21,8 @@ pub mod swap;
 mod underlay;
 
 pub use behaviour::{
-    run, LateChainInit, RunConfig, RunError, SwapConfig, UploadRuntime, DEFAULT_TARGET_PEERS,
+    feed_lookup_ack, run, LateChainInit, RunConfig, RunError, SwapConfig, UploadRuntime,
+    DEFAULT_TARGET_PEERS,
 };
 pub use handshake::{
     handshake_outbound, handshake_outbound_with_role, HandshakeError, HandshakeInfo,

@@ -3641,16 +3641,20 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// rounds of the publisher's 60 s per-request deadline — the in-flight
 /// window, a segment the pump had already popped behind it, then the
 /// backlog (capped at `max_backlog`, so at most one further round) —
-/// and the closing window and recording add up to four more (an upload
-/// and a feed update each), so a slow or wedged uplink can outlive
+/// a feed-head read that had not answered yet (issue #173) can hold the
+/// playlists behind it for one more (a stop gives up on the head after
+/// that one read), and the closing window and recording add up to four
+/// more (an upload and a feed update each), so a slow or wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an
 /// honest report and the loop finishes in the background and releases
 /// its slot.
 ///
-/// The report's `feed_index` is what a host passes as the next
-/// broadcast's `start_index`, so a closing window or recording landing
-/// in the background must not take it: an early return seals the run's
+/// The report's `feed_index` is where the next broadcast on the channel
+/// starts (it reads the feed head there, or a host passes it as
+/// `start_index`; `null` if the run never read its head, see
+/// [`publisher::PublisherReport::feed_index`]), so a closing window or recording landing in the
+/// background must not take it: an early return seals the run's
 /// feed ([`publisher::LiveRun::seal_feed`]) first, waits out an update
 /// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
 /// the report. Whatever the background loop still uploads after that
@@ -3713,7 +3717,21 @@ pub unsafe extern "C" fn ant_topic_from_string(
 /// updates wrapping the playlist itself, so `GET /feeds/{owner}/{topic}`
 /// returns the playlist (what Solar Punk's viewers read). The topic is
 /// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
-/// (`topic`); see [`publisher::PublisherConfig`].
+/// (`topic`), and with neither it is the channel's stable text topic
+/// `antstream/<channel>`; see [`publisher::PublisherConfig`].
+///
+/// A broadcast continues the feed its topic already holds (issue #173):
+/// before its first update it reads the feed head once and writes after
+/// it, numbers its media after the head playlist's (one
+/// `#EXT-X-DISCONTINUITY` at the seam, so the media sequence only ever
+/// increases) and opens its recording with the head playlist's entries.
+/// Only a feed nothing was written to starts at index 0; a head read
+/// that fails, or whose next slot isn't confirmed empty, holds every
+/// playlist and feed update until a retry answers. Confirming a miss
+/// takes more than two peers, so on a node with at most two (a brand-new
+/// channel included) no playlist goes up until it has three or more.
+/// `start_index` overrides all of that with an exact index; see
+/// [`publisher::PublisherConfig::start_index`].
 ///
 /// An interruption pauses the broadcast rather than ending it (issue
 /// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on
@@ -4031,10 +4049,12 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
 /// wire then — a worst-case drain, closing window and recording can
 /// still be finishing in the background past that (see the constant) —
-/// so call it off the UI thread. The report's `feed_index` is final
-/// either way: a run that outlives the grace writes no further feed
-/// update, so passing it as the next broadcast's `start_index` never
-/// collides with a late closing window or recording.
+/// so call it off the UI thread. The report's `feed_index` (`null` when
+/// the run ended before its feed head ever answered: no position to hand
+/// on) is final either way: a run that outlives the grace writes no further feed
+/// update, so the next broadcast, which starts there (reading the feed
+/// head, or given it as `start_index`), never collides with a late
+/// closing window or recording.
 ///
 /// Calling it on a broadcast that already finished on its own (reaped
 /// after `reap_ms` with no media) returns that broadcast's report. Once a stop call has *returned* and
@@ -4066,8 +4086,8 @@ pub unsafe extern "C" fn ant_publisher_stop(
                 std::thread::sleep(PUBLISHER_STOP_POLL);
             }
             // Out of grace with the loop still going: its `feed_index`
-            // must be final before the report hands it out as the next
-            // broadcast's start_index (see `PUBLISHER_STOP_GRACE`).
+            // must be final before the report hands it out as where the
+            // next broadcast starts (see `PUBLISHER_STOP_GRACE`).
             if !run.is_finished() && run.seal_feed() {
                 let deadline = Instant::now() + PUBLISHER_SEAL_GRACE;
                 while run.feed_update_in_flight() && Instant::now() < deadline {

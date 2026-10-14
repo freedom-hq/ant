@@ -126,6 +126,7 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                 owner,
                 topic,
                 after,
+                exact,
                 ack,
             } => {
                 let feed = ant_retrieval::Feed {
@@ -133,22 +134,14 @@ async fn stub_node(mut rx: mpsc::Receiver<ControlCommand>, log: Arc<Mutex<NodeLo
                     topic,
                     kind: ant_retrieval::FeedType::Sequence,
                 };
-                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
-                    .await
-                {
-                    Ok(r) => ControlAck::FeedResolved {
-                        reference: r.reference,
-                        index: r.index,
-                        signature: r.signature,
-                        v2: r.v2,
-                        decrypt_key: r.decrypt_key,
-                    },
-                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
-                    Err(e) => ControlAck::Error {
-                        message: e.to_string(),
-                    },
+                // The node's own mapping, so the stub answers the
+                // publisher's head read exactly as the node does.
+                let result = if exact {
+                    ant_retrieval::resolve_sequence_feed_exact(&fetcher, &feed, after, None).await
+                } else {
+                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await
                 };
-                let _ = ack.send(reply);
+                let _ = ack.send(ant_p2p::feed_lookup_ack(result));
             }
             ControlCommand::StreamBytes {
                 reference,
@@ -407,7 +400,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         max_backlog: 4,
         playlist_window: 6,
         notes: String::new(),
-        start_index: 0,
+        start_index: None,
         reap_ms: 0,
     };
     let run = publisher::start(
@@ -998,7 +991,7 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         max_backlog: 2,
         playlist_window: 3,
         notes: String::new(),
-        start_index: 0,
+        start_index: None,
         reap_ms: 0,
     };
     let run = publisher::start(
@@ -1014,7 +1007,7 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
     let segment = |fill: u8| vec![fill; 4000];
     let _ = run.push(SegmentKind::Init, vec![0x11; 900], 0, false);
     let _ = run.push(SegmentKind::Media, segment(0), 2000, false);
-    wait_for(&run, |s| s.feed_index >= 1).await;
+    wait_for(&run, |s| s.feed_index >= Some(1)).await;
 
     // The uplink stalls while 1-6 are captured: the backlog of 2 sheds.
     log.lock().unwrap().paused = true;
@@ -1383,4 +1376,243 @@ async fn a_broadcast_silent_past_its_reap_window_ends_itself() {
     assert!(head.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), "{head}");
     assert_eq!(head.matches("#EXTINF").count(), 2, "{head}");
     assert!(updates[updates.len() - 2].ends_with("#EXT-X-ENDLIST\n"));
+}
+
+/// Feed update `index` of `topic` as the playlist text a viewer reads:
+/// the SOC payload itself under `"solar-punk"` (a v2 update wraps the
+/// playlist), and under `"bzz"` the playlist file behind the manifest
+/// its v1 payload (`timestamp ‖ reference`) points at.
+async fn update_playlist(addr: &str, format: StreamFormat, topic: &[u8; 32], index: u64) -> String {
+    let id = ant_retrieval::sequence_update_id(topic, index);
+    let (status, _, body) = http_get(
+        addr,
+        &format!("/soc/{}/{}", hex::encode(owner()), hex::encode(id)),
+    )
+    .await;
+    assert_eq!(status, 200, "update {index}");
+    if format == StreamFormat::SolarPunk {
+        return String::from_utf8(body).unwrap();
+    }
+    assert_eq!(body.len(), 40, "a v1 update: {body:?}");
+    let reference = hex::encode(&body[8..]);
+    let (status, _, playlist) = http_get(addr, &format!("/bzz/{reference}/stream.m3u8")).await;
+    assert_eq!(status, 200, "update {index}'s playlist");
+    String::from_utf8(playlist).unwrap()
+}
+
+fn media_sequence(playlist: &str) -> u64 {
+    playlist
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .unwrap_or_else(|| panic!("no media sequence:\n{playlist}"))
+        .parse()
+        .unwrap()
+}
+
+fn broadcast_id(playlist: &str) -> &str {
+    playlist
+        .lines()
+        .find_map(|l| l.strip_prefix("#ANTSTREAM-BROADCAST:"))
+        .unwrap_or_else(|| panic!("no broadcast id:\n{playlist}"))
+}
+
+fn entries(playlist: &str) -> Vec<&str> {
+    playlist.lines().filter(|l| !l.starts_with('#')).collect()
+}
+
+/// What a viewer that stays on the channel link reads: `GET /feeds` under
+/// `"solar-punk"`, the channel's feed manifest under `"bzz"`.
+async fn channel_head(
+    addr: &str,
+    format: StreamFormat,
+    topic: &[u8; 32],
+    channel_reference: &str,
+) -> String {
+    let path = match format {
+        StreamFormat::SolarPunk => {
+            format!("/feeds/{}/{}", hex::encode(owner()), hex::encode(topic))
+        }
+        StreamFormat::Bzz => format!("/bzz/{channel_reference}/stream.m3u8"),
+    };
+    let (status, _, body) = http_get(addr, &path).await;
+    assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&body));
+    String::from_utf8(body).unwrap()
+}
+
+/// One broadcast on channel `kitchen` with the host's JSON left at its
+/// defaults (no topic, no start index): an init and `segments` media
+/// segments filled with `fill + i`. `live` runs once the broadcast's
+/// first feed update has landed, before the rest is pushed and the stop.
+async fn broadcast<F, Fut>(
+    addr: &str,
+    format: StreamFormat,
+    fill: u8,
+    segments: u8,
+    live: F,
+) -> publisher::PublisherReport
+where
+    F: FnOnce(publisher::PublisherSnapshot) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let config: PublisherConfig = serde_json::from_value(serde_json::json!({
+        "channel": "kitchen",
+        "format": format.as_str(),
+        "gateway": format!("http://{addr}"),
+        "batch_id": "ab".repeat(32),
+        "max_backlog": usize::from(segments) + 1,
+        "playlist_window": 4,
+    }))
+    .unwrap();
+    let run = publisher::start(
+        &tokio::runtime::Handle::current(),
+        config,
+        SECRET,
+        owner(),
+        None,
+    )
+    .unwrap();
+    let _ = run.push(SegmentKind::Init, vec![fill; 900], 0, false);
+    let _ = run.push(SegmentKind::Media, vec![fill; 300], 2000, false);
+    // Keeping up needs a feed update that landed.
+    wait_for(&run, |s| s.keeping_up).await;
+    live(run.snapshot()).await;
+    for i in 1..segments {
+        let _ = run.push(SegmentKind::Media, vec![fill + i; 300], 2000, false);
+    }
+    run.cancel();
+    for _ in 0..800 {
+        if run.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(run.is_finished(), "publisher never finished");
+    let report = run.report();
+    assert_eq!(report.error_count, 0, "{:?}", report.errors);
+    assert_eq!(report.segments_listed, u64::from(segments), "{report:?}");
+    report
+}
+
+/// Issue #173, the acceptance case through the real gateway: two
+/// broadcasts on one channel, the host naming neither a topic nor a
+/// start index. They share the stable text topic and so the channel
+/// link; the second continues the feed after the first's recording
+/// (no slot rewritten) and its numbering after it, behind one seam, so
+/// across every live and closing window the media sequence only ever
+/// increases; a viewer still on the channel link reads the second
+/// broadcast's live playlist (a new broadcast id, not closed) from the
+/// same link; and the head ends as one recording of both broadcasts.
+async fn two_broadcasts_are_one_channel(format: StreamFormat) {
+    let log = Arc::new(Mutex::new(NodeLog::default()));
+    let addr = serve_gateway(Arc::clone(&log)).await;
+    let first = broadcast(&addr, format, 0x10, 6, |_| async {}).await;
+    assert_eq!(first.topic_text, "antstream/kitchen");
+    let topic = publisher::topic_from_string("antstream/kitchen");
+    assert_eq!(first.topic, hex::encode(topic));
+    let first_head = channel_head(&addr, format, &topic, &first.channel_reference).await;
+    assert!(
+        first_head.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+        "{first_head}"
+    );
+
+    let (addr2, channel, first_id) = (
+        addr.clone(),
+        first.channel_reference.clone(),
+        broadcast_id(&first_head).to_string(),
+    );
+    let second = broadcast(&addr, format, 0x40, 6, move |snapshot| async move {
+        // Live: the same link now reads the second broadcast.
+        assert_eq!(snapshot.channel_reference, channel, "one link for both");
+        let head = channel_head(&addr2, format, &topic, &channel).await;
+        assert_ne!(broadcast_id(&head), first_id, "{head}");
+        assert!(!head.contains("#EXT-X-ENDLIST"), "{head}");
+    })
+    .await;
+    assert_eq!(second.topic, first.topic);
+    assert_eq!(second.channel_reference, first.channel_reference);
+    let first_index = first.feed_index.expect("the first broadcast read its head");
+    let second_index = second
+        .feed_index
+        .expect("the second broadcast read its head");
+    assert_eq!(
+        second_index,
+        first_index + second.feed_updates,
+        "the second broadcast's updates follow the first's: {second:?}"
+    );
+
+    // Every update in feed order: the first broadcast's, then the
+    // second's, none overwritten (each slot names the broadcast that
+    // wrote it, in order).
+    let mut updates = Vec::new();
+    for index in 0..second_index {
+        updates.push(update_playlist(&addr, format, &topic, index).await);
+    }
+    let split = usize::try_from(first_index).unwrap();
+    let first_id = broadcast_id(&updates[0]).to_string();
+    let second_id = broadcast_id(&updates[split]).to_string();
+    assert_ne!(first_id, second_id);
+    assert!(updates[..split].iter().all(|p| broadcast_id(p) == first_id));
+    assert!(updates[split..]
+        .iter()
+        .all(|p| broadcast_id(p) == second_id));
+
+    // The media sequence a live viewer follows never moves back: every
+    // live and closing window, across both broadcasts. (A recording is
+    // the end of the road for a live viewer, so it is left out, as the
+    // web player and Solar Punk's poller leave it.)
+    let windows: Vec<(u64, &String)> = updates
+        .iter()
+        .filter(|p| !p.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
+        .map(|p| (media_sequence(p), p))
+        .collect();
+    for pair in windows.windows(2) {
+        assert!(
+            pair[0].0 <= pair[1].0,
+            "the media sequence moved back:\n{}\n---\n{}",
+            pair[0].1,
+            pair[1].1
+        );
+    }
+    // The second broadcast opens on the number after the first's last
+    // segment, behind one seam.
+    let opening = &updates[split];
+    assert_eq!(media_sequence(opening), 6, "{opening}");
+    assert!(
+        opening.contains("\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:"),
+        "{opening}"
+    );
+
+    // The head: one recording of the whole channel, both broadcasts in
+    // order, from 0, with exactly one seam, every segment readable.
+    let head = channel_head(&addr, format, &topic, &first.channel_reference).await;
+    assert!(head.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"), "{head}");
+    assert_eq!(media_sequence(&head), 0, "{head}");
+    assert_eq!(head.matches("#EXT-X-DISCONTINUITY\n").count(), 1, "{head}");
+    assert_eq!(head.matches("#EXT-X-MAP:").count(), 2, "{head}");
+    let uris = entries(&head);
+    assert_eq!(uris.len(), 12, "{head}");
+    for (i, uri) in uris.iter().enumerate() {
+        let fill = if i < 6 { 0x10 + i } else { 0x40 + i - 6 } as u8;
+        let path = match format {
+            StreamFormat::SolarPunk => format!("/bytes/{uri}"),
+            StreamFormat::Bzz => (*uri).to_string(),
+        };
+        let (status, _, segment) = http_get(&addr, &path).await;
+        assert_eq!((status, segment), (200, vec![fill; 300]), "entry {i}");
+    }
+    assert_eq!(
+        channel_head(&addr, format, &topic, &first.channel_reference).await,
+        update_playlist(&addr, format, &topic, second_index - 1).await,
+    );
+    assert_eq!(log.lock().unwrap().invalid_socs, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_broadcasts_are_one_channel_in_the_solar_punk_format() {
+    two_broadcasts_are_one_channel(StreamFormat::SolarPunk).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_broadcasts_are_one_channel_in_the_default_format() {
+    two_broadcasts_are_one_channel(StreamFormat::Bzz).await;
 }

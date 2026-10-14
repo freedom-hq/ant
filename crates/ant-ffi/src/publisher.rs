@@ -71,8 +71,20 @@
 //!
 //! The topic is either text, hashed the way Solar Punk catalog entries
 //! and bee-js `Topic.fromString` name a feed ([`topic_from_string`]), or
-//! raw bytes from the host. A `"solar-punk"` broadcast with a text topic
-//! plays in a Solar Punk viewer given only the owner and that text.
+//! raw bytes from the host; by default the text `antstream/<channel>`.
+//! A `"solar-punk"` broadcast with a text topic plays in a Solar Punk
+//! viewer given only the owner and that text.
+//!
+//! **A channel is one feed for good** (issue #173): every broadcast on a
+//! topic continues the feed the earlier ones left. Before its first
+//! update a broadcast reads the feed head once, writes after it, numbers
+//! its media on from the head playlist's numbering behind one
+//! `#EXT-X-DISCONTINUITY`, so the media sequence a viewer follows never
+//! moves backwards from one broadcast into the next, and opens its
+//! recording with the head playlist's entries, so the head is always the
+//! recording of the whole channel. The Solar Punk uploader does the same
+//! over a topic that outlives a session. See
+//! [`PublisherConfig::start_index`].
 //!
 //! Live-edge discipline, straight from the stage-1 findings:
 //!
@@ -237,12 +249,12 @@ pub struct PublisherConfig {
     /// [`PublisherConfig::topic_text`] instead for a topic a catalog can
     /// name. Setting both is a configuration error.
     ///
-    /// With neither set, the topic is the text
-    /// `antstream/<channel>/<unix_ms>/<nonce>` (the nonce a process-wide
-    /// counter), unique to this broadcast, so a second broadcast of the
-    /// same channel starts a fresh feed at index 0 instead of having to
-    /// discover the previous head (or, restarted quickly, overwriting
-    /// it). That text is reported as `topic_text`.
+    /// With neither set, the topic is the text `antstream/<channel>`
+    /// (issue #173): the same for every broadcast of the channel, so a
+    /// shared or QR-scanned channel link keeps working from one
+    /// broadcast to the next. That text is reported as `topic_text`.
+    /// Whichever names it, a broadcast continues the feed already on the
+    /// topic; see [`PublisherConfig::start_index`].
     #[serde(default)]
     pub topic: String,
     /// Feed topic as text, the way Solar Punk catalog entries and every
@@ -257,14 +269,53 @@ pub struct PublisherConfig {
     /// this repository reads.
     #[serde(default)]
     pub format: StreamFormat,
-    /// Sequence-feed index of this broadcast's first update. A host that
-    /// reuses one `topic` across broadcasts (a permanent channel link)
-    /// passes the previous broadcast's final `feed_index` here, so the
-    /// new updates continue the feed instead of rewriting index 0 and
-    /// up, which already hold the previous broadcast's playlists. With a
-    /// derived per-broadcast topic it stays 0.
+    /// Override for the sequence-feed index of this broadcast's first
+    /// update. Leave it out: a broadcast then **continues the feed** the
+    /// topic already holds (issue #173). Before its first update it
+    /// reads the feed head once (`GET /feeds/{owner}/{topic}?exact=true`,
+    /// which ant's node answers only once the slot after the head is
+    /// confirmed empty, so a head slow to answer is never read as the
+    /// one before it) and
+    ///
+    /// - writes from the index after the head, so the previous
+    ///   broadcast's playlists are never overwritten;
+    /// - numbers its media from where the head playlist's numbering ends
+    ///   (its `#EXT-X-MEDIA-SEQUENCE` plus the entries it lists, gaps
+    ///   included), with an `#EXT-X-DISCONTINUITY` on its first segment,
+    ///   so a viewer following the channel sees the media sequence only
+    ///   ever increase from one broadcast into the next (hls.js treats a
+    ///   sequence that moves backwards as a fatal parsing error);
+    /// - opens its recording with the head playlist's entries, so the
+    ///   recording it leaves at the head plays every broadcast the
+    ///   channel has carried (see [`PublisherState::render_recording`]).
+    ///
+    /// The shape Solar Punk's uploader writes over a topic that outlives
+    /// a session. Only a `404 "no update found"` (a feed nothing was ever
+    /// written to; ant's node answers it only for an anchor miss more
+    /// than a couple of peers agree on, and a 503 for a cold node's one
+    /// or two) starts the feed at 0. Any other failed read, a v1 head's
+    /// playlist that does not retrieve included, is no
+    /// answer: segments keep uploading, but no playlist or feed update
+    /// is written until a retry reads the head, so a flaky read can never
+    /// overwrite index 0 and up.
+    ///
+    /// Confirming a miss (the empty feed's index 0, or the slot after a
+    /// head) takes more than two peers' "not found", so on a node with at
+    /// most two peers every head read is a 503 and the broadcast, a
+    /// brand-new channel's first one included, publishes no playlist or
+    /// feed update until the node reaches three or more. The progress
+    /// `errors` say so; with `reap_ms` set the run is reaped once that
+    /// long passes, as for any broadcast that lists no media.
+    ///
+    /// Set, the first update goes exactly here and nothing is read: the
+    /// numbering starts at 0 with no seam and the recording holds this
+    /// broadcast alone, as before #173. A host passing the previous
+    /// broadcast's `feed_index` here must get it right, or it rewrites
+    /// the indices that hold earlier playlists. A report's `feed_index`
+    /// is `null` when its run never read the head; passed on as is, it
+    /// leaves this unset and the next broadcast reads the head.
     #[serde(default)]
-    pub start_index: u64,
+    pub start_index: Option<u64>,
     /// Gateway base URL, `http://host:port` (loopback: the in-process
     /// `ant_start_gateway` on iOS, `antd` on desktop).
     #[serde(default = "default_gateway")]
@@ -410,14 +461,8 @@ impl PublisherConfig {
 
     /// The feed topic this broadcast writes to, and its text form when
     /// it has one: the configured raw topic, the configured text topic,
-    /// or a per-broadcast text derived from the channel name.
+    /// or the channel's stable text topic, `antstream/<channel>`.
     fn resolve_topic(&self) -> Result<([u8; 32], String), PublisherError> {
-        // A wall-clock seed alone is not unique enough: stop + restart
-        // of the same channel inside one clock tick would silently reuse
-        // the topic, and the new broadcast's index 0 would overwrite the
-        // old feed's head. The process-wide counter makes every
-        // derivation distinct regardless of clock granularity.
-        static TOPIC_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let raw = self.topic.trim();
         if !raw.is_empty() && !self.topic_text.is_empty() {
             return Err(PublisherError::Config(
@@ -430,12 +475,7 @@ impl PublisherConfig {
             return Ok((topic, String::new()));
         }
         let text = if self.topic_text.is_empty() {
-            let unix_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let nonce = TOPIC_NONCE.fetch_add(1, Ordering::Relaxed);
-            format!("antstream/{}/{unix_ms}/{nonce}", self.channel)
+            format!("antstream/{}", self.channel)
         } else {
             self.topic_text.clone()
         };
@@ -783,8 +823,20 @@ struct PublisherState {
     /// bytes an entry, so about 400 KB of memory for an hour at 2 s
     /// segments.
     recording: Vec<MediaEntry>,
-    /// Media sequence number for the next listed segment.
+    /// Media sequence number for the next listed segment. Starts where
+    /// the predecessor's numbering ended (issue #173), else at 0.
     next_number: u64,
+    /// Where this broadcast stands in its feed is known: the index its
+    /// first update takes and the numbering it continues (issue #173).
+    /// Until then the committer folds nothing in, so no playlist is
+    /// rendered with a guessed `#EXT-X-MEDIA-SEQUENCE` and no update is
+    /// written at a guessed index. Set at start when the host gave a
+    /// [`PublisherConfig::start_index`], else by [`settle_feed_position`].
+    feed_settled: bool,
+    /// The playlist at the feed's head when this broadcast started,
+    /// continued from: its first listed segment carries the seam's
+    /// `#EXT-X-DISCONTINUITY`, and the recording opens with its entries.
+    predecessor: Option<Predecessor>,
     /// `#EXT-X-DISCONTINUITY-SEQUENCE`: discontinuities that have
     /// already slid out of the playlist window.
     discontinuity_sequence: u64,
@@ -823,11 +875,12 @@ struct PublisherState {
     /// A feed update is on the wire at `feed_index`: it may still land
     /// and take that index. See [`LiveRun::seal_feed`].
     feed_update_in_flight: bool,
-    /// The stop call returned before the run finished and handed
-    /// `feed_index` to the host as the next broadcast's `start_index`:
-    /// no further update may be written, or a closing window or
-    /// recording landing late would take the index the next broadcast
-    /// starts at. See [`LiveRun::seal_feed`].
+    /// The stop call returned before the run finished and reported
+    /// `feed_index` as final, where the next broadcast on the channel
+    /// starts (it reads the head there, or a host passes it as
+    /// `start_index`): no further update may be written, or a closing
+    /// window or recording landing late would take the index the next
+    /// broadcast starts at. See [`LiveRun::seal_feed`].
     feed_sealed: bool,
     channel_reference: Option<String>,
     /// A `POST /feeds` is already in flight. The start-time attempt and
@@ -1007,6 +1060,24 @@ impl PublisherState {
                     captured_at,
                     program_ms,
                 } => {
+                    if self.segments_listed == 0
+                        && self.predecessor.is_some()
+                        && self.init_uri.is_some()
+                    {
+                        // Gaps in front of the first segment are never
+                        // listed (no playlist starts on one), so their
+                        // numbers are nobody's. Continuing a predecessor,
+                        // give them back: the recording glues this
+                        // broadcast's entries straight after the
+                        // predecessor's, numbered on from its media
+                        // sequence, so a hole here would shift every
+                        // segment's number between the live window and
+                        // the recording.
+                        if let Some(first) = self.pending_gaps.first() {
+                            self.next_number = first.number;
+                        }
+                        self.pending_gaps.clear();
+                    }
                     let Some(entry) =
                         self.next_entry(Some(uri), duration_ms, discontinuity, program_ms)
                     else {
@@ -1076,14 +1147,22 @@ impl PublisherState {
         self.break_since_last_entry = false;
         let number = self.next_number;
         self.next_number += 1;
+        let seam = self.segments_listed == 0 && self.predecessor.is_some() && uri.is_some();
         Some(MediaEntry {
             number,
             gap: uri.is_none(),
             uri: uri.unwrap_or_else(|| format!("gap-{number}")),
             duration_ms,
             // The broadcast's first listed segment starts the timeline;
-            // there is nothing before it to be discontinuous with.
-            discontinuity: discontinuous && self.segments_listed > 0,
+            // there is nothing before it to be discontinuous with, unless
+            // it continues an earlier broadcast's numbering: that seam
+            // is a break, said once, on the first segment (not on a gap
+            // in front of it, which no playlist starts on).
+            discontinuity: if self.segments_listed == 0 {
+                seam
+            } else {
+                discontinuous
+            },
             init_uri,
             program_ms,
         })
@@ -1138,6 +1217,7 @@ impl PublisherState {
             self.target_duration_s(target_ms),
             self.playlist.front().map_or(self.next_number, |e| e.number),
             self.discontinuity_sequence,
+            &[],
             self.playlist.iter(),
             if endlist {
                 PlaylistShape::Closing
@@ -1158,17 +1238,68 @@ impl PublisherState {
     /// `#EXT-X-DISCONTINUITY-SEQUENCE`, since nothing came before the
     /// first entry. Not budgeted: past one chunk it uploads as a chunk
     /// tree.
+    ///
+    /// A broadcast that continued an earlier one on the channel (issue
+    /// #173) opens its recording with that playlist's entries, verbatim,
+    /// then the seam's one `#EXT-X-DISCONTINUITY` (carried by this
+    /// broadcast's first entry) and its own: the recording takes the
+    /// predecessor's `#EXT-X-MEDIA-SEQUENCE` and
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE`, and the longer of the two target
+    /// durations. The predecessor is itself the recording of every
+    /// broadcast before it, so the head recording plays the whole
+    /// channel. Solar Punk's `buildVODManifest` glues the same way.
+    ///
+    /// That glued history survives only while every stop's recording
+    /// lands. The recording is published once, with no retry. If its
+    /// upload or feed update fails (a 5xx, or `PUBLISH_TIMEOUT` on a
+    /// long channel's growing recording), the head stays at the
+    /// closing window. The next broadcast then continues from that
+    /// window alone, so the head recording drops every earlier
+    /// broadcast's entries that fell outside it. The older recordings
+    /// are still at earlier feed indices, but nothing points a viewer
+    /// at them.
     fn render_recording(&self, target_ms: u32) -> String {
-        render_entries(
-            &self.broadcast_id,
-            self.target_duration_s(target_ms),
-            self.recording
-                .first()
-                .map_or(self.next_number, |e| e.number),
-            0,
-            self.recording.iter(),
-            PlaylistShape::Recording,
-        )
+        let own_sequence = self
+            .recording
+            .first()
+            .map_or(self.next_number, |e| e.number);
+        let target_s = self.target_duration_s(target_ms);
+        match &self.predecessor {
+            Some(prior) => render_entries(
+                &self.broadcast_id,
+                target_s.max(prior.target_duration_s),
+                prior.media_sequence,
+                prior.discontinuity_sequence,
+                &prior.lines,
+                self.recording.iter(),
+                PlaylistShape::Recording,
+            ),
+            None => render_entries(
+                &self.broadcast_id,
+                target_s,
+                own_sequence,
+                0,
+                &[],
+                self.recording.iter(),
+                PlaylistShape::Recording,
+            ),
+        }
+    }
+
+    /// Continue `prior`, the playlist at the feed's head (issue #173):
+    /// number from where it ended, and count the discontinuities in
+    /// front of this broadcast's first entry (those its own header said
+    /// had slid out of its window, plus the ones it lists) as the live
+    /// window's `#EXT-X-DISCONTINUITY-SEQUENCE`.
+    fn continue_from(&mut self, prior: Predecessor) {
+        self.next_number = prior.next_number;
+        self.discontinuity_sequence = prior.discontinuity_sequence
+            + prior
+                .lines
+                .iter()
+                .filter(|l| l.as_str() == "#EXT-X-DISCONTINUITY")
+                .count() as u64;
+        self.predecessor = Some(prior);
     }
 
     /// When the reap timeout (`reap`) runs out: that long after the
@@ -1210,6 +1341,7 @@ fn render_entries<'a>(
     target_s: u32,
     media_sequence: u64,
     discontinuity_sequence: u64,
+    prefix: &[String],
     entries: impl Iterator<Item = &'a MediaEntry>,
     shape: PlaylistShape,
 ) -> String {
@@ -1230,6 +1362,14 @@ fn render_entries<'a>(
             out,
             "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
         );
+    }
+    // An earlier broadcast's entries, verbatim (the recording of a
+    // broadcast that continued one, see `render_recording`). The entry
+    // after them restates its `#EXT-X-MAP`, since `current_map` starts
+    // empty.
+    for line in prefix {
+        out.push_str(line);
+        out.push('\n');
     }
     let mut current_map: Option<&str> = None;
     for entry in entries {
@@ -1262,6 +1402,100 @@ fn render_entries<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Continuing the channel (issue #173)
+// ---------------------------------------------------------------------------
+
+/// The playlist at the head of the channel's feed when a broadcast
+/// started: the previous broadcast's recording, closing window, or (if it
+/// was killed) its last live window. Read off the head by
+/// [`settle_feed_position`] and parsed by [`Predecessor::parse`], which
+/// reads only what Solar Punk's uploader reads (`continuesFrom` and
+/// `inheritedTimeline` in its `ManifestManager.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Predecessor {
+    /// Where its numbering ended: its `#EXT-X-MEDIA-SEQUENCE` plus the
+    /// entries it lists (one `#EXTINF` each, gap entries included). A
+    /// playlist numbered from 12 that lists 30 entries makes this 42.
+    next_number: u64,
+    /// Its `#EXT-X-MEDIA-SEQUENCE`, which the recording that glues it in
+    /// front declares.
+    media_sequence: u64,
+    /// Its `#EXT-X-DISCONTINUITY-SEQUENCE` (0 when absent, as on a
+    /// recording): the breaks already in front of its first entry.
+    discontinuity_sequence: u64,
+    /// Its `#EXT-X-TARGETDURATION`, whole seconds.
+    target_duration_s: u32,
+    /// Its timeline, verbatim: every line from the first entry's first
+    /// tag up to, not including, `#EXT-X-ENDLIST`, blank lines dropped.
+    /// Unlike Solar Punk's MPEG-TS segments, these are fMP4, so the
+    /// `#EXT-X-MAP` lines are part of it.
+    lines: Vec<String>,
+}
+
+impl Predecessor {
+    /// Tags that open (or sit inside) the timeline: everything from the
+    /// first of them on is entries, not header.
+    const TIMELINE_TAGS: [&'static str; 5] = [
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-MAP",
+        "#EXT-X-GAP",
+        "#EXT-X-PROGRAM-DATE-TIME",
+        "#EXTINF",
+    ];
+
+    fn is_timeline(line: &str) -> bool {
+        Self::TIMELINE_TAGS.iter().any(|tag| {
+            line == *tag
+                || line
+                    .strip_prefix(tag)
+                    .is_some_and(|rest| rest.starts_with(':'))
+        })
+    }
+
+    /// `None` for anything that is not a media playlist with a
+    /// `#EXT-X-MEDIA-SEQUENCE` and at least one entry (foreign content on
+    /// the topic, or a playlist naming nothing): a broadcast over such a
+    /// head still writes after it, but has no numbering to continue and
+    /// nothing to glue.
+    fn parse(playlist: &str) -> Option<Self> {
+        let lines: Vec<&str> = playlist.lines().map(str::trim).collect();
+        if lines.first() != Some(&"#EXTM3U") {
+            return None;
+        }
+        let opens_at = lines.iter().position(|l| Self::is_timeline(l))?;
+        let header = &lines[..opens_at];
+        let number = |tag: &str| -> Option<f64> {
+            header
+                .iter()
+                .find_map(|l| l.strip_prefix(tag)?.strip_prefix(':'))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+        };
+        let media_sequence = number("#EXT-X-MEDIA-SEQUENCE")? as u64;
+        let timeline: Vec<String> = lines[opens_at..]
+            .iter()
+            .take_while(|l| **l != "#EXT-X-ENDLIST")
+            .filter(|l| !l.is_empty())
+            .map(|l| (*l).to_string())
+            .collect();
+        let entries = timeline
+            .iter()
+            .filter(|l| l.starts_with("#EXTINF:"))
+            .count() as u64;
+        if entries == 0 {
+            return None;
+        }
+        Some(Self {
+            next_number: media_sequence.saturating_add(entries),
+            media_sequence,
+            discontinuity_sequence: number("#EXT-X-DISCONTINUITY-SEQUENCE").unwrap_or(0.0) as u64,
+            target_duration_s: number("#EXT-X-TARGETDURATION").map_or(0, |v| v.ceil() as u32),
+            lines: timeline,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot / report
 // ---------------------------------------------------------------------------
 
@@ -1290,9 +1524,11 @@ pub struct PublisherSnapshot {
     pub format: StreamFormat,
     /// Reference of the most recently published playlist.
     pub playlist_reference: String,
-    /// Sequence-feed index of the next update (i.e. how many updates
-    /// have landed).
-    pub feed_index: u64,
+    /// Sequence-feed index of the next update. `None` (JSON `null`)
+    /// until the broadcast knows where it stands in its feed: with no
+    /// [`PublisherConfig::start_index`], until its read of the feed head
+    /// answers ([`settle_feed_position`]).
+    pub feed_index: Option<u64>,
     pub segments_pushed: u64,
     pub segments_published: u64,
     /// Of those, the ones that reached a published playlist — what a
@@ -1385,12 +1621,20 @@ pub struct PublisherReport {
     pub chunks_published: u64,
     pub playlists_published: u64,
     pub feed_updates: u64,
-    /// Sequence-feed index the *next* update would take: what a host
-    /// reusing this channel's topic passes as the next broadcast's
+    /// Sequence-feed index the *next* update would take: where the next
+    /// broadcast on this topic starts, whether it finds it by reading the
+    /// feed head (the default) or a host passes it as
     /// [`PublisherConfig::start_index`]. Final in the report the stop
     /// call returns, even when its grace ran out first: the run is then
     /// sealed ([`LiveRun::seal_feed`]) and writes no further update.
-    pub feed_index: u64,
+    ///
+    /// `None` (JSON `null`) when the run ended (stopped or reaped)
+    /// before its read of the feed head ever answered: it wrote no
+    /// update and doesn't know where the feed stands, so there is no
+    /// index to hand on. A host must not substitute 0 (that rewrites
+    /// the channel from its first update); passing the `null` on as
+    /// `start_index` makes the next broadcast read the head itself.
+    pub feed_index: Option<u64>,
     pub sustained_mbit_s: f64,
     pub sustained_chunks_s: f64,
     pub publish_ms_p50: u64,
@@ -1652,7 +1896,7 @@ impl LiveRun {
             channel_reference: state.channel_reference.clone().unwrap_or_default(),
             format: self.config.format,
             playlist_reference: state.playlist_reference.clone().unwrap_or_default(),
-            feed_index: state.feed_index,
+            feed_index: state.feed_settled.then_some(state.feed_index),
             segments_pushed: state.segments_pushed,
             segments_published: state.segments_published,
             segments_listed: state.segments_listed,
@@ -1698,11 +1942,11 @@ impl LiveRun {
 
     /// Write no further feed update: the stop call is about to hand
     /// `feed_index` to the host before the run finished (its grace ran
-    /// out on a slow uplink), and the host passes it on as the next
-    /// broadcast's `start_index`. Without the seal, a closing window or
-    /// recording still uploading in the background would land at that
-    /// very index, so the next broadcast's first update would collide
-    /// with it. Segments and playlists already on the wire still
+    /// out on a slow uplink), and the next broadcast on the channel
+    /// starts there (reading the head, or given it as `start_index`).
+    /// Without the seal, a closing window or recording still uploading
+    /// in the background would land at that very index, so the next
+    /// broadcast's first update would collide with it. Segments and playlists already on the wire still
     /// finish; only their feed updates are skipped (and reported).
     ///
     /// Returns whether an update is in flight right now: it may still
@@ -1759,7 +2003,7 @@ impl LiveRun {
             chunks_published: state.chunks_published,
             playlists_published: state.playlists_published,
             feed_updates: state.feed_updates,
-            feed_index: state.feed_index,
+            feed_index: state.feed_settled.then_some(state.feed_index),
             sustained_mbit_s: throughput_mbit_s(state.bytes_published, elapsed),
             sustained_chunks_s: if elapsed > 0.0 {
                 state.chunks_published as f64 / elapsed
@@ -1832,7 +2076,10 @@ pub fn start(
         .as_millis();
     let state = Arc::new(Mutex::new(PublisherState {
         broadcast_id: format!("{started_ms:x}"),
-        feed_index: config.start_index,
+        // An override is the index, as given: nothing to read. Without
+        // one the committer reads the head first (issue #173).
+        feed_index: config.start_index.unwrap_or(0),
+        feed_settled: config.start_index.is_some(),
         ..PublisherState::default()
     }));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -2218,7 +2465,16 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
 /// Fold finished segments into the playlist **in capture order**, then
 /// republish the playlist and point the feed at it. Single task, so
 /// feed indices are written strictly in order.
+///
+/// Nothing is folded in before the broadcast knows where it stands in
+/// its feed ([`settle_feed_position`]): the head decides both the index
+/// of the first update and the `#EXT-X-MEDIA-SEQUENCE` the first
+/// playlist is rendered with. Segments upload meanwhile and their
+/// outcomes wait in `done`.
 async fn commit_loop(ctx: Arc<RunCtx>) {
+    if !settle_until_known(&ctx).await {
+        return;
+    }
     loop {
         let notified = ctx.commit_notify.notified();
         tokio::pin!(notified);
@@ -2283,6 +2539,205 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
     publish_playlist(&ctx, PlaylistShape::Recording, None).await;
 }
 
+/// How long the committer waits between two reads of the feed head that
+/// did not answer (issue #173).
+const FEED_HEAD_RETRY: Duration = Duration::from_secs(2);
+
+/// Read the feed head until it answers, so the committer can start. Gives
+/// up at the first read that fails once the run is stopping or the stop
+/// call sealed the feed ([`LiveRun::seal_feed`]), so a stop waits on at
+/// most the read in flight (or the one after the retry pause), each under
+/// the [`PUBLISH_TIMEOUT`] deadline. The broadcast then writes no
+/// playlist and no feed update at all, because without the head every
+/// index and every number it could pick might be one an earlier
+/// broadcast already holds. Returns whether the position is known.
+///
+/// A broadcast that can't read its head for its whole reap window
+/// ([`PublisherConfig::reap_ms`]) is reaped like any other that listed no
+/// media in that time.
+async fn settle_until_known(ctx: &Arc<RunCtx>) -> bool {
+    loop {
+        if lock(&ctx.state).feed_settled {
+            return true;
+        }
+        match settle_feed_position(ctx).await {
+            Ok(()) => return true,
+            Err(message) => {
+                let mut state = lock(&ctx.state);
+                let gave_up = ctx.cancelled() || state.feed_sealed;
+                state.record_error(if gave_up {
+                    format!(
+                        "feed head: {message}; no playlist or feed update was written, \
+                         since the index and numbering to continue from are unknown"
+                    )
+                } else {
+                    format!(
+                        "feed head: {message}; retrying before the first feed update, \
+                         so an earlier broadcast on the channel is not overwritten"
+                    )
+                });
+                if gave_up {
+                    return false;
+                }
+            }
+        }
+        tokio::time::sleep(FEED_HEAD_RETRY).await;
+    }
+}
+
+/// Find where this broadcast stands in its feed (issue #173): read the
+/// head once with `GET /feeds/{owner}/{topic}?exact=true`, then continue
+/// the feed after its index and the media numbering after its playlist
+/// ([`PublisherState::continue_from`]).
+///
+/// `exact` makes ant's node answer only once the slot after the head is
+/// confirmed empty (`ant_retrieval::resolve_sequence_feed_exact`), and
+/// `503` otherwise. Without it a head slow to answer (past the finder's
+/// 800 ms look-ahead deadline) or missed by one or two cold peers reads
+/// as absent, so the answer lands one or more updates below the real
+/// head and the first update here would take a slot already written.
+///
+/// The answers, as Solar Punk's uploader reads them at the start of a
+/// session over a topic that outlives it (`resumeFeedIndex`):
+///
+/// - `404 "no update found"`: nothing was ever written to the feed, so
+///   the broadcast starts it at index 0, numbered from 0.
+/// - `200`: the head's index is `swarm-feed-index`. Its playlist is the
+///   body of a v2 update (`"solar-punk"`); a v1 update (`"bzz"`) points
+///   at the playlist's manifest, whose reference is the response's
+///   `ETag`, so the playlist is `GET /bzz/<it>/stream.m3u8`. A head that
+///   isn't a playlist (foreign content on the topic, or a v1 manifest
+///   with no `stream.m3u8`: `404 "path address not found"`) still moves
+///   the index on, with nothing to continue numbering from. A v1
+///   playlist that does not retrieve (any other 404, a 5xx) is an error
+///   like the head's own.
+/// - Anything else, including any other 404 (bee's `"wrapped chunk
+///   cannot be retrieved"` is a head that exists and did not retrieve):
+///   an error. Never read as an empty feed, which would write index 0
+///   and up over the previous broadcast.
+async fn settle_feed_position(ctx: &RunCtx) -> Result<(), String> {
+    let path = format!(
+        "{}/feeds/{}/{}?exact=true",
+        ctx.target.prefix,
+        hex::encode(ctx.owner),
+        hex::encode(ctx.topic),
+    );
+    let response = http_get_timed(&ctx.target, &path).await?;
+    let (next_index, prior) = match response.status {
+        404 if is_no_update_found(&response.body) => (0, None),
+        200 => {
+            require_declared_length(&response, "the head")?;
+            let index = response
+                .header("swarm-feed-index")
+                .and_then(|v| hex::decode(v).ok())
+                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| "the head carries no swarm-feed-index".to_string())?;
+            let playlist = if response.header("swarm-feed-resolved-version") == Some("v1") {
+                let reference = response
+                    .header("etag")
+                    .map(|v| v.trim_matches('"').to_ascii_lowercase())
+                    .filter(|r| r.len() == 64 && hex::decode(r).is_ok())
+                    .ok_or_else(|| "the v1 head carries no reference".to_string())?;
+                let path = format!("{}/bzz/{reference}/{PLAYLIST_NAME}", ctx.target.prefix);
+                let playlist = http_get_timed(&ctx.target, &path).await?;
+                match playlist.status {
+                    200 => {
+                        require_declared_length(&playlist, "the head playlist")?;
+                        playlist.body
+                    }
+                    // The manifest has no playlist, or the head is no
+                    // manifest at all: not a broadcast.
+                    _ if is_not_a_broadcast_manifest(&playlist.body) => Vec::new(),
+                    // Any other answer, a 404 for a playlist chunk that
+                    // did not retrieve included (the v1 twin of bee's
+                    // `"wrapped chunk cannot be retrieved"` above), is no
+                    // answer: numbering from 0 would move the channel's
+                    // media sequence back and drop every earlier
+                    // broadcast from the recording.
+                    status => {
+                        return Err(format!(
+                            "head playlist {reference}: gateway returned {status} {}",
+                            String::from_utf8_lossy(&playlist.body).trim(),
+                        ))
+                    }
+                }
+            } else {
+                response.body
+            };
+            let prior = std::str::from_utf8(&playlist)
+                .ok()
+                .and_then(Predecessor::parse);
+            (index.checked_add(1).ok_or("the feed is full")?, prior)
+        }
+        status => {
+            return Err(format!(
+                "gateway returned {status} {}",
+                String::from_utf8_lossy(&response.body).trim(),
+            ))
+        }
+    };
+    let mut state = lock(&ctx.state);
+    state.feed_index = next_index;
+    if let Some(prior) = prior {
+        state.continue_from(prior);
+    }
+    state.feed_settled = true;
+    Ok(())
+}
+
+/// A head body read to EOF is only whole if it declared its length
+/// ([`parse_response`] has already checked the two agree): a playlist
+/// cut short by a later chunk that did not retrieve still parses, as a
+/// shorter one, and numbering after it would reuse the cut entries'
+/// media sequence numbers and drop them from the recording. Bee and
+/// ant's gateway both declare one on every `/feeds` and `/bzz` body.
+fn require_declared_length(response: &HttpResponse, what: &str) -> Result<(), String> {
+    match response.header("content-length") {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "{what} declares no content-length; a partial body can't be told from a whole one",
+        )),
+    }
+}
+
+/// Bee's (and ant's) answer for a feed nothing was ever written to:
+/// `404 {"message":"no update found"}`. Every other 404 on `GET /feeds`
+/// is a head that exists but would not retrieve. Ant's node only gives
+/// it for an anchor miss the network corroborated; one or two cold
+/// peers' miss is a 503 (`ant_p2p::feed_lookup_ack`), retried like any
+/// other failed read.
+fn is_no_update_found(body: &[u8]) -> bool {
+    gateway_message(body).is_some_and(|m| m == "no update found")
+}
+
+/// A `/bzz/<v1 head>/stream.m3u8` answer that says the head is not a
+/// broadcast, as opposed to one that did not retrieve: the manifest has
+/// no such path (bee's and ant's `404 "path address not found"`), or the
+/// reference is not a manifest at all. A plain `404 "Not Found"` is a
+/// chunk the network didn't serve, not one of these.
+fn is_not_a_broadcast_manifest(body: &[u8]) -> bool {
+    gateway_message(body).is_some_and(|m| {
+        m == "path address not found" || m.contains("reference is not a mantaray manifest")
+    })
+}
+
+/// The `message` of a gateway's JSON error body.
+fn gateway_message(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// [`http_get`] under the same deadline as an upload.
+async fn http_get_timed(target: &Target, path: &str) -> Result<HttpResponse, String> {
+    tokio::time::timeout(PUBLISH_TIMEOUT, http_get(target, path))
+        .await
+        .map_err(|_| format!("timed out after {}s", PUBLISH_TIMEOUT.as_secs()))?
+}
+
 /// Upload a playlist (`shape`: the live window, the closing window or
 /// the recording) and publish it as the next feed update.
 /// `captured_at`, when present, is the newest committed segment — its
@@ -2328,7 +2783,7 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
             let index = state.feed_index;
             state.record_error(format!(
                 "feed update {index} skipped: stop returned before it, and \
-                 its report gave {index} as the next broadcast's start_index"
+                 its report gave {index} as where the next broadcast starts"
             ));
             return;
         }
@@ -2674,7 +3129,42 @@ impl Target {
 
 pub(crate) struct HttpResponse {
     pub(crate) status: u16,
+    /// Header names lower-cased, values trimmed.
+    pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
+}
+
+impl HttpResponse {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// `GET` one resource. HTTP/1.0, so the gateway answers with the body to
+/// EOF rather than chunked (which [`parse_response`] doesn't decode).
+/// A body cut short by a mid-stream failure also ends at EOF;
+/// [`parse_response`] rejects it against its `Content-Length`, and a
+/// caller that must not act on a partial body ([`settle_feed_position`])
+/// also refuses one that declares no length.
+pub(crate) async fn http_get(target: &Target, path: &str) -> Result<HttpResponse, String> {
+    let mut stream = TcpStream::connect(&target.authority)
+        .await
+        .map_err(|e| format!("connect {}: {e}", target.authority))?;
+    let _ = stream.set_nodelay(true);
+    let head = format!("GET {path} HTTP/1.0\r\nhost: {}\r\n\r\n", target.authority);
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("write request head: {e}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read response: {e}"))?;
+    parse_response(&raw)
 }
 
 pub(crate) async fn http_post(
@@ -2726,7 +3216,9 @@ pub(crate) async fn http_post(
 /// Parse a `connection: close` response: status line, headers, body to
 /// EOF. Chunked transfer-encoding is not handled — the gateway answers
 /// uploads with a small `Content-Length` JSON object, and a body we
-/// can't parse would show up as a non-201 status anyway.
+/// can't parse would show up as a non-201 status anyway. A body shorter
+/// (or longer) than its `Content-Length` is an error, not a response:
+/// the gateway sent the head and then failed mid-stream.
 pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
     let split = raw
         .windows(4)
@@ -2742,9 +3234,36 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| format!("malformed status line: `{status_line}`"))?;
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let body = &raw[split + 4..];
+    // The body runs to EOF, and EOF is also what a gateway that fails
+    // mid-stream (a later chunk of a multi-chunk body not retrieving
+    // after the first was sent) leaves behind: only the declared length
+    // tells a whole body from a cut one.
+    if let Some(declared) = headers
+        .iter()
+        .find(|(n, _)| n == "content-length")
+        .map(|(_, v)| v)
+    {
+        let declared: usize = declared
+            .parse()
+            .map_err(|_| format!("malformed content-length: `{declared}`"))?;
+        if body.len() != declared {
+            return Err(format!(
+                "truncated response: content-length {declared}, got {} bytes",
+                body.len(),
+            ));
+        }
+    }
     Ok(HttpResponse {
         status,
-        body: raw[split + 4..].to_vec(),
+        headers,
+        body: body.to_vec(),
     })
 }
 
@@ -2755,6 +3274,7 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // -----------------------------------------------------------------
     // Pure helpers shared with the bench
@@ -2798,6 +3318,23 @@ mod tests {
         assert!(parse_response(b"garbage").is_err());
     }
 
+    #[test]
+    fn response_parser_rejects_a_body_cut_short() {
+        // A 200 whose body stream failed after the head went out: the
+        // first leaf arrived, the rest never did.
+        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 8192\r\n\r\n#EXTM3U\n";
+        let err = parse_response(raw)
+            .err()
+            .expect("a truncated body is no response");
+        assert!(err.contains("truncated"), "{err}");
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: x\r\n\r\n").is_err());
+        // No declared length: parsed, but the head read refuses it.
+        let r = parse_response(b"HTTP/1.0 200 OK\r\n\r\n#EXTM3U\n").unwrap();
+        assert!(require_declared_length(&r, "the head").is_err());
+        let r = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\n#EXTM3U\n").unwrap();
+        assert!(require_declared_length(&r, "the head").is_ok());
+    }
+
     // -----------------------------------------------------------------
     // Playlist assembly
     // -----------------------------------------------------------------
@@ -2816,7 +3353,7 @@ mod tests {
             max_backlog: 4,
             playlist_window: 3,
             notes: String::new(),
-            start_index: 0,
+            start_index: None,
             reap_ms: 0,
         }
     }
@@ -3799,25 +4336,216 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_topic_is_derived_per_broadcast() {
+    fn an_omitted_topic_is_the_channels_stable_text_topic() {
         let mut c = config();
         c.topic = String::new();
         let (a, a_text) = c.resolve_topic().unwrap();
-        assert_ne!(a, [0u8; 32]);
-        // The derived topic is a text topic, so even a broadcast whose
-        // host named none can be put in a catalog entry by its text.
-        assert!(a_text.starts_with("antstream/test channel/"), "{a_text}");
+        // Issue #173: a text topic named after the channel, so a catalog
+        // entry can name it and every broadcast of the channel writes
+        // the same feed: a shared channel link outlives one broadcast.
+        assert_eq!(a_text, "antstream/test channel");
         assert_eq!(a, topic_from_string(&a_text));
-        // Two derivations must differ even inside one clock tick —
-        // otherwise a quick stop + restart of the same channel would
-        // write its fresh index 0 over the old feed's head.
-        let (b, _) = c.resolve_topic().unwrap();
-        assert_ne!(a, b, "derived topics must be per-broadcast");
+        assert_eq!(c.resolve_topic().unwrap(), (a, a_text));
+        // Another channel is another feed.
+        c.channel = "other".into();
+        assert_ne!(c.resolve_topic().unwrap().0, a);
         // An explicit topic is honoured verbatim, with or without `0x`.
         c.topic = "cd".repeat(32);
         assert_eq!(c.resolve_topic().unwrap(), ([0xcd; 32], String::new()));
         c.topic = "0xnothex".into();
         assert!(c.resolve_topic().is_err());
+    }
+
+    #[test]
+    fn start_index_is_an_override_left_out_by_default() {
+        let parse =
+            |json: serde_json::Value| -> PublisherConfig { serde_json::from_value(json).unwrap() };
+        let base = serde_json::json!({ "channel": "c", "batch_id": "ab".repeat(32) });
+        assert_eq!(parse(base.clone()).start_index, None);
+        let mut set = base;
+        set["start_index"] = 0.into();
+        assert_eq!(
+            parse(set).start_index,
+            Some(0),
+            "an explicit 0 is an override too"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Continuing the channel (issue #173)
+    // -----------------------------------------------------------------
+
+    /// A previous broadcast's recording, as this publisher writes one: a
+    /// map, then entries numbered from 12, a gap and a writer restart.
+    const PRIOR_RECORDING: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#ANTSTREAM-BROADCAST:aa\n\
+        #EXT-X-TARGETDURATION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:12\n\
+        #EXT-X-MAP:URI=\"init-a\"\n\
+        #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n#EXTINF:2.000,\nseg-12\n\
+        #EXT-X-GAP\n#EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n#EXTINF:2.000,\ngap-13\n\
+        #EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init-b\"\n\
+        #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:10.000Z\n#EXTINF:2.500,\nseg-14\n\
+        #EXT-X-ENDLIST\n";
+
+    #[test]
+    fn the_head_playlist_is_continued_from_where_its_numbering_ends() {
+        let prior = Predecessor::parse(PRIOR_RECORDING).expect("a playlist");
+        // Solar Punk's `continuesFrom`: the media sequence plus every
+        // entry, the gap included.
+        assert_eq!(prior.next_number, 15);
+        assert_eq!(prior.media_sequence, 12);
+        assert_eq!(prior.discontinuity_sequence, 0);
+        assert_eq!(prior.target_duration_s, 3);
+        // The timeline verbatim from its first tag (the map, since these
+        // are fMP4) to before #EXT-X-ENDLIST; no header lines.
+        assert_eq!(prior.lines.first().unwrap(), "#EXT-X-MAP:URI=\"init-a\"");
+        assert_eq!(prior.lines.last().unwrap(), "seg-14");
+        assert!(!prior
+            .lines
+            .iter()
+            .any(|l| l.starts_with("#EXT-X-MEDIA-SEQUENCE")
+                || l.starts_with("#ANTSTREAM-BROADCAST")
+                || l == "#EXT-X-ENDLIST"));
+        assert_eq!(prior.lines.len(), 13);
+
+        // A killed broadcast's last live window: no #EXT-X-ENDLIST, and
+        // its header says how many breaks had already slid out.
+        let live = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n\
+            #EXT-X-MEDIA-SEQUENCE:500\n#EXT-X-DISCONTINUITY-SEQUENCE:4\n\
+            #EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"i\"\n\
+            #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:00.000Z\n#EXTINF:2.000,\ns500\n\
+            #EXT-X-PROGRAM-DATE-TIME:2026-09-01T12:00:02.000Z\n#EXTINF:2.000,\ns501\n";
+        let prior = Predecessor::parse(live).unwrap();
+        assert_eq!(prior.next_number, 502);
+        assert_eq!(prior.discontinuity_sequence, 4);
+        assert_eq!(
+            prior.lines[0], "#EXT-X-DISCONTINUITY",
+            "the timeline opens at the break"
+        );
+
+        // Nothing to continue from: not a playlist, no numbering, or no
+        // entries.
+        assert_eq!(Predecessor::parse("hello"), None);
+        assert_eq!(Predecessor::parse(""), None);
+        assert_eq!(
+            Predecessor::parse("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\na\n"),
+            None
+        );
+        assert_eq!(
+            Predecessor::parse("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:3\n#EXT-X-ENDLIST\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_continued_broadcast_numbers_on_with_one_seam_and_glues_its_recording() {
+        let mut state = live_state();
+        state.continue_from(Predecessor::parse(PRIOR_RECORDING).unwrap());
+        // A segment lost before anything was listed: numbered, never the
+        // carrier of the seam, and never listed in front of it.
+        state.done.insert(1, lost(false, 1_788_264_100_000));
+        for seq in 2..6 {
+            state
+                .done
+                .insert(seq, media(&format!("/bzz/s{seq}/seg.m4s"), false));
+        }
+        state.advance(3, 2000);
+        let live = state.render_playlist(2000, false);
+        // The lost segment in front gave its number back, so the first
+        // segment is 15. The window slid past it (window 3 of 4
+        // segments), so the seam counts: the predecessor's own break,
+        // plus the seam.
+        assert!(live.contains("\n#EXT-X-MEDIA-SEQUENCE:16\n"), "{live}");
+        assert!(
+            live.contains("\n#EXT-X-DISCONTINUITY-SEQUENCE:2\n"),
+            "{live}"
+        );
+        assert!(!live.contains("\n#EXT-X-DISCONTINUITY\n"), "{live}");
+
+        // Before it slid: the first live window opens on the seam, at the
+        // number after the predecessor's last entry and its gap.
+        let mut fresh = live_state();
+        fresh.continue_from(Predecessor::parse(PRIOR_RECORDING).unwrap());
+        fresh.done.insert(1, media("/bzz/first/seg.m4s", false));
+        fresh.advance(3, 2000);
+        let first = fresh.render_playlist(2000, false);
+        assert!(first.contains("\n#EXT-X-MEDIA-SEQUENCE:15\n"), "{first}");
+        assert!(
+            first.contains("\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n"),
+            "{first}"
+        );
+        assert_eq!(
+            first.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{first}"
+        );
+        let seam = first.find("#EXT-X-DISCONTINUITY\n").unwrap();
+        assert!(
+            seam < first.find("#EXT-X-MAP").unwrap(),
+            "the seam opens the window:\n{first}"
+        );
+
+        // The recording: the predecessor's numbering and entries
+        // verbatim, one seam, this broadcast's own map restated, then its
+        // own entries; the longer target duration of the two.
+        let recording = state.render_recording(2000);
+        assert!(
+            recording.contains("\n#EXT-X-MEDIA-SEQUENCE:12\n"),
+            "{recording}"
+        );
+        assert!(
+            !recording.contains("#EXT-X-DISCONTINUITY-SEQUENCE"),
+            "{recording}"
+        );
+        assert!(
+            recording.contains("\n#EXT-X-TARGETDURATION:3\n"),
+            "{recording}"
+        );
+        let prior_body = &PRIOR_RECORDING[PRIOR_RECORDING.find("#EXT-X-MAP").unwrap()
+            ..PRIOR_RECORDING.find("#EXT-X-ENDLIST").unwrap()];
+        let glued = format!(
+            "{prior_body}#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"{}\"\n",
+            bare_ref(u64::MAX)
+        );
+        assert!(recording.contains(&glued), "{recording}");
+        assert_eq!(
+            recording.matches("#EXT-X-DISCONTINUITY\n").count(),
+            2,
+            "{recording}"
+        );
+        assert_eq!(
+            entry_uris(&recording),
+            [
+                "seg-12",
+                "gap-13",
+                "seg-14",
+                "/bzz/s2/seg.m4s",
+                "/bzz/s3/seg.m4s",
+                "/bzz/s4/seg.m4s",
+                "/bzz/s5/seg.m4s"
+            ],
+        );
+        // …and the numbering reads straight through: a third broadcast
+        // continues after this one's last entry.
+        let next = Predecessor::parse(&recording).unwrap();
+        assert_eq!(next.next_number, 12 + 7, "{recording}");
+        assert_eq!(next.next_number, state.next_number);
+        assert!(recording.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn a_fresh_channel_renders_as_before() {
+        let mut state = live_state();
+        state.done.insert(1, media("/bzz/a/seg.m4s", false));
+        state.advance(3, 2000);
+        let live = state.render_playlist(2000, false);
+        assert!(live.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"), "{live}");
+        assert!(!live.contains("DISCONTINUITY"), "{live}");
+        let recording = state.render_recording(2000);
+        assert!(
+            recording.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"),
+            "{recording}"
+        );
+        assert!(!recording.contains("DISCONTINUITY"), "{recording}");
     }
 
     #[test]
@@ -3998,6 +4726,142 @@ mod tests {
         /// Extra latency on every request carrying the recording (its
         /// upload and, under "solar-punk", the feed update wrapping it).
         recording_delay: Duration,
+        /// What `GET /feeds` answers: `None` is bee's
+        /// `404 "no update found"`, an empty feed.
+        head: Option<StubHead>,
+        /// Answer this many `GET /feeds` with a 502 first.
+        fail_head: u32,
+        /// Then this many with the node's 503 for an anchor miss only
+        /// one or two cold peers answered (`ant_p2p::feed_lookup_ack`).
+        cold_head: u32,
+        /// Then this many with bee's other 404, a head that exists but
+        /// did not retrieve.
+        unretrievable_head: u32,
+        /// `GET /bzz/<ref>/stream.m3u8` bodies, by manifest reference.
+        /// Any other reference is a manifest with no such path.
+        bzz_playlists: HashMap<String, String>,
+        /// Answer this many `GET /bzz/<ref>/stream.m3u8` first with the
+        /// gateway's plain 404 for a chunk the network didn't serve.
+        unretrievable_playlist: u32,
+        /// Answer this many `200` `GET /feeds` bodies cut off
+        /// mid-stream: the full `content-length`, then only the first
+        /// half of the body (a later leaf that did not retrieve after
+        /// the first was sent).
+        truncated_head: u32,
+        /// The same for `200` `GET /bzz/<ref>/stream.m3u8` bodies.
+        truncated_playlist: u32,
+    }
+
+    /// The feed head `GET /feeds` resolves to.
+    #[derive(Clone)]
+    struct StubHead {
+        index: u64,
+        /// `"v1"` or `"v2"`.
+        version: &'static str,
+        /// The `ETag` reference (v1: the playlist's manifest).
+        reference: String,
+        /// The response body (v2: the playlist itself).
+        body: Vec<u8>,
+    }
+
+    /// A gateway answer, as raw HTTP.
+    fn stub_response(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut r = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\n", body.len());
+        for (name, value) in headers {
+            let _ = write!(r, "{name}: {value}\r\n");
+        }
+        r.push_str("connection: close\r\n\r\n");
+        let mut r = r.into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Answer the reads a publisher makes (`GET /feeds`, `GET /bzz`).
+    fn stub_read(log: &Arc<Mutex<StubLog>>, path: &str) -> Vec<u8> {
+        let mut response = stub_read_whole(log, path);
+        let mut slot = lock(log);
+        let cuts = if path.contains("/feeds/") {
+            &mut slot.truncated_head
+        } else {
+            &mut slot.truncated_playlist
+        };
+        if *cuts > 0 && response.starts_with(b"HTTP/1.1 200") {
+            *cuts -= 1;
+            let body_at = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            response.truncate(body_at + (response.len() - body_at) / 2);
+        }
+        response
+    }
+
+    fn stub_read_whole(log: &Arc<Mutex<StubLog>>, path: &str) -> Vec<u8> {
+        let mut slot = lock(log);
+        if path.contains("/feeds/") {
+            if slot.fail_head > 0 {
+                slot.fail_head -= 1;
+                return stub_response(
+                    "502 Bad Gateway",
+                    &[],
+                    br#"{"message":"feed lookup failed"}"#,
+                );
+            }
+            if slot.cold_head > 0 {
+                slot.cold_head -= 1;
+                return stub_response(
+                    "503 Service Unavailable",
+                    &[],
+                    br#"{"code":503,"message":"feed lookup: feed has no updates (probed 1 indices); too few peers answered to tell an empty feed from one this node can't reach yet"}"#,
+                );
+            }
+            if slot.unretrievable_head > 0 {
+                slot.unretrievable_head -= 1;
+                return stub_response(
+                    "404 Not Found",
+                    &[],
+                    br#"{"code":404,"message":"wrapped chunk cannot be retrieved"}"#,
+                );
+            }
+            return match &slot.head {
+                None => stub_response(
+                    "404 Not Found",
+                    &[],
+                    br#"{"code":404,"message":"no update found"}"#,
+                ),
+                Some(head) => stub_response(
+                    "200 OK",
+                    &[
+                        ("swarm-feed-index", hex::encode(head.index.to_be_bytes())),
+                        (
+                            "swarm-feed-index-next",
+                            hex::encode((head.index + 1).to_be_bytes()),
+                        ),
+                        ("swarm-feed-resolved-version", head.version.to_string()),
+                        ("etag", format!("\"{}\"", head.reference)),
+                    ],
+                    &head.body,
+                ),
+            };
+        }
+        let reference = path
+            .strip_prefix("/bzz/")
+            .and_then(|rest| rest.strip_suffix("/stream.m3u8"))
+            .unwrap_or_default();
+        if slot.unretrievable_playlist > 0 {
+            slot.unretrievable_playlist -= 1;
+            return stub_response(
+                "404 Not Found",
+                &[],
+                br#"{"code":404,"message":"Not Found"}"#,
+            );
+        }
+        match slot.bzz_playlists.get(reference) {
+            Some(body) => stub_response("200 OK", &[], body.as_bytes()),
+            None => stub_response(
+                "404 Not Found",
+                &[],
+                br#"{"code":404,"message":"path address not found"}"#,
+            ),
+        }
     }
 
     /// The reference bee and ant answer a `POST /bytes` with: the root of
@@ -4061,6 +4925,14 @@ mod tests {
                                     headers: lines.map(str::to_string).collect(),
                                     body: raw[split + 4..split + 4 + want].to_vec(),
                                 };
+                                if let Some(path) = request.method_path.strip_prefix("GET ") {
+                                    lock(&log).seen.push(request.clone());
+                                    tokio::time::sleep(delay).await;
+                                    let response = stub_read(&log, path);
+                                    let _ = socket.write_all(&response).await;
+                                    let _ = socket.shutdown().await;
+                                    return;
+                                }
                                 let is_feeds = request.method_path.contains("/feeds/");
                                 let (fail, feeds_delay) = {
                                     let mut slot = lock(&log);
@@ -4155,7 +5027,7 @@ mod tests {
         let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
         let mut config = config();
         config.gateway = format!("http://{addr}");
-        config.start_index = 41;
+        config.start_index = Some(41);
         let run = start(
             &tokio::runtime::Handle::current(),
             config,
@@ -4191,7 +5063,11 @@ mod tests {
         );
         let report = run.report();
         assert!(report.feed_updates > 0);
-        assert_eq!(report.feed_index, 41 + report.feed_updates, "{report:?}");
+        assert_eq!(
+            report.feed_index,
+            Some(41 + report.feed_updates),
+            "{report:?}"
+        );
         let playlist = lock(&log)
             .seen
             .iter()
@@ -4202,6 +5078,373 @@ mod tests {
         assert!(
             playlist.contains("\n#ANTSTREAM-BROADCAST:"),
             "playlists name their broadcast:\n{playlist}"
+        );
+        // An override is the index as given: the head is never read, and
+        // the numbering starts at 0 with no seam, as before issue #173.
+        assert!(
+            !lock(&log)
+                .seen
+                .iter()
+                .any(|r| r.method_path.starts_with("GET ")),
+            "an override reads nothing"
+        );
+        assert!(
+            playlist.contains("\n#EXT-X-MEDIA-SEQUENCE:0\n"),
+            "{playlist}"
+        );
+        assert!(!playlist.contains("#EXT-X-DISCONTINUITY"), "{playlist}");
+    }
+
+    /// Start a broadcast on the default test topic against `log`'s stub,
+    /// with `format`, and push an init and `media` segments.
+    async fn continued_run(
+        log: &Arc<Mutex<StubLog>>,
+        format: StreamFormat,
+        media: u8,
+    ) -> Arc<LiveRun> {
+        let addr = stub_gateway(Arc::clone(log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.format = format;
+        config.max_backlog = 16;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..media {
+            let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+        }
+        run
+    }
+
+    /// The feed slot of `index` on the test topic, as [`soc_ids`] lists it.
+    fn slot(index: u64) -> String {
+        hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], index))
+    }
+
+    /// Every playlist the stub saw uploaded, in order (either format).
+    fn uploaded_playlists(log: &Arc<Mutex<StubLog>>) -> Vec<String> {
+        lock(log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.starts_with("POST ") && r.body.starts_with(b"#EXTM3U"))
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .collect()
+    }
+
+    fn media_sequence(playlist: &str) -> u64 {
+        playlist
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// Issue #173: with no `start_index`, a broadcast reads the feed head
+    /// once and continues it: its first update goes after the head, its
+    /// numbering after the head playlist's (one seam), and its recording
+    /// opens with the head playlist's entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_broadcast_continues_the_feed_head() {
+        let log = Arc::new(Mutex::new(StubLog {
+            head: Some(StubHead {
+                index: 9,
+                version: "v2",
+                reference: "cd".repeat(32),
+                body: PRIOR_RECORDING.as_bytes().to_vec(),
+            }),
+            ..StubLog::default()
+        }));
+        let run = continued_run(&log, StreamFormat::SolarPunk, 3).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.error_count, 0, "{:?}", report.errors);
+        assert_eq!(report.segments_listed, 3, "{report:?}");
+
+        // The head was read once, before any update was written.
+        let seen = lock(&log).seen.clone();
+        let reads: Vec<usize> = (0..seen.len())
+            .filter(|&i| seen[i].method_path.starts_with("GET "))
+            .collect();
+        assert_eq!(reads.len(), 1, "one head read");
+        let feed_path = format!(
+            "GET /feeds/{}/{}?exact=true",
+            hex::encode(test_owner()),
+            "11".repeat(32)
+        );
+        assert_eq!(seen[reads[0]].method_path, feed_path);
+        let first_soc = seen
+            .iter()
+            .position(|r| r.method_path.contains("/soc/"))
+            .unwrap();
+        assert!(reads[0] < first_soc);
+
+        // Every update after the head, none over it.
+        let ids = soc_ids(&log);
+        assert_eq!(ids[0], slot(10), "the first update follows the head at 9");
+        assert!(
+            !(0..=9).any(|i| ids.contains(&slot(i))),
+            "an earlier slot was rewritten"
+        );
+        assert_eq!(
+            report.feed_index,
+            Some(10 + report.feed_updates),
+            "{report:?}"
+        );
+
+        // Numbered on from 12 + 3 entries, with the seam on the first.
+        let playlists = uploaded_playlists(&log);
+        let first = &playlists[0];
+        assert!(first.contains("\n#EXT-X-MEDIA-SEQUENCE:15\n"), "{first}");
+        assert!(
+            first.contains("\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n"),
+            "{first}"
+        );
+        assert!(first.contains("\n#EXT-X-DISCONTINUITY\n"), "{first}");
+        // The media sequence only ever moves forward across the live
+        // and closing windows.
+        let windows: Vec<u64> = playlists[..playlists.len() - 1]
+            .iter()
+            .map(|p| media_sequence(p))
+            .collect();
+        assert!(windows.windows(2).all(|w| w[0] <= w[1]), "{windows:?}");
+        assert!(windows.iter().all(|s| *s >= 15), "{windows:?}");
+
+        // The recording is the whole channel: the head's entries, the
+        // seam, then this broadcast's, numbered from the head's 12.
+        let recording = playlists.last().unwrap();
+        assert!(
+            recording.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "{recording}"
+        );
+        assert_eq!(media_sequence(recording), 12, "{recording}");
+        let uris = entry_uris(recording);
+        assert_eq!(uris[..3], ["seg-12", "gap-13", "seg-14"], "{recording}");
+        assert_eq!(uris.len(), 6, "{recording}");
+        assert_eq!(Predecessor::parse(recording).unwrap().next_number, 18);
+    }
+
+    /// A head playlist whose body stream failed after the response head
+    /// went out (a multi-chunk recording, a later leaf not retrieved) is
+    /// a failed read, not a shorter predecessor: numbering after the
+    /// half that arrived would reuse the rest's media sequence numbers
+    /// and drop them from the recording (R4-F1 on PR #183). Same for a
+    /// v1 head's `/bzz` playlist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_playlist_cut_short_is_retried_not_continued() {
+        let manifest = "ef".repeat(32);
+        for (format, head) in [
+            (
+                StreamFormat::SolarPunk,
+                StubHead {
+                    index: 9,
+                    version: "v2",
+                    reference: "cd".repeat(32),
+                    body: PRIOR_RECORDING.as_bytes().to_vec(),
+                },
+            ),
+            (
+                StreamFormat::Bzz,
+                StubHead {
+                    index: 9,
+                    version: "v1",
+                    reference: manifest.clone(),
+                    body: b"the manifest's root node".to_vec(),
+                },
+            ),
+        ] {
+            let v1 = head.version == "v1";
+            let log = Arc::new(Mutex::new(StubLog {
+                head: Some(head),
+                bzz_playlists: HashMap::from([(manifest.clone(), PRIOR_RECORDING.to_string())]),
+                // v1: the head itself arrives whole, its playlist cut.
+                truncated_head: u32::from(!v1),
+                truncated_playlist: u32::from(v1),
+                ..StubLog::default()
+            }));
+            let run = continued_run(&log, format, 2).await;
+            wait_until(&run, "the head to answer", |s| s.feed_index.is_some()).await;
+            run.cancel();
+            settle(&run).await;
+            let report = run.report();
+            assert_eq!(report.error_count, 1, "{:?}", report.errors);
+            assert!(
+                report.errors[0].starts_with("feed head:")
+                    && report.errors[0].contains("truncated"),
+                "{:?}",
+                report.errors
+            );
+            assert_eq!(soc_ids(&log)[0], slot(10));
+            let playlists = uploaded_playlists(&log);
+            assert_eq!(media_sequence(&playlists[0]), 15, "{}", playlists[0]);
+            let recording = playlists.last().unwrap();
+            assert_eq!(entry_uris(recording)[..3], ["seg-12", "gap-13", "seg-14"]);
+        }
+    }
+
+    /// Under `"bzz"` the head is a v1 update pointing at the playlist's
+    /// manifest (the response's `ETag`): its playlist is read through
+    /// `/bzz/<it>/stream.m3u8`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bzz_head_is_read_through_its_playlist_manifest() {
+        let manifest = "ef".repeat(32);
+        let log = Arc::new(Mutex::new(StubLog {
+            head: Some(StubHead {
+                index: 4,
+                version: "v1",
+                reference: manifest.clone(),
+                body: b"not the playlist: the manifest's root node".to_vec(),
+            }),
+            bzz_playlists: HashMap::from([(manifest.clone(), PRIOR_RECORDING.to_string())]),
+            // The playlist's chunk misses once: a read to retry, not a
+            // manifest with no playlist (R1-M1 on PR #183).
+            unretrievable_playlist: 1,
+            ..StubLog::default()
+        }));
+        let run = continued_run(&log, StreamFormat::Bzz, 2).await;
+        wait_until(&run, "the head to answer", |s| s.feed_index.is_some()).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.error_count, 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].starts_with("feed head: head playlist")
+                && report.errors[0].contains("404"),
+            "{:?}",
+            report.errors
+        );
+        assert!(lock(&log)
+            .seen
+            .iter()
+            .any(|r| r.method_path == format!("GET /bzz/{manifest}/stream.m3u8")));
+        assert_eq!(soc_ids(&log)[0], slot(5));
+        let playlists = uploaded_playlists(&log);
+        assert_eq!(media_sequence(&playlists[0]), 15, "{}", playlists[0]);
+        assert!(playlists.last().unwrap().contains("\nseg-14\n"));
+
+        // A v1 head whose manifest holds no playlist (foreign content on
+        // the topic): the feed still continues after it, numbered from 0.
+        let log = Arc::new(Mutex::new(StubLog {
+            head: Some(StubHead {
+                index: 4,
+                version: "v1",
+                reference: manifest,
+                body: Vec::new(),
+            }),
+            ..StubLog::default()
+        }));
+        let run = continued_run(&log, StreamFormat::Bzz, 1).await;
+        run.cancel();
+        settle(&run).await;
+        assert_eq!(soc_ids(&log)[0], slot(5));
+        let first = &uploaded_playlists(&log)[0];
+        assert_eq!(media_sequence(first), 0, "{first}");
+        assert!(!first.contains("DISCONTINUITY"), "{first}");
+    }
+
+    /// A feed nothing was ever written to (`404 "no update found"`)
+    /// starts at index 0, numbered from 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_feed_starts_at_index_zero() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let run = continued_run(&log, StreamFormat::SolarPunk, 2).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.error_count, 0, "{:?}", report.errors);
+        assert_eq!(soc_ids(&log)[0], slot(0));
+        let first = &uploaded_playlists(&log)[0];
+        assert_eq!(media_sequence(first), 0, "{first}");
+        assert!(!first.contains("DISCONTINUITY"), "{first}");
+    }
+
+    /// A head read that fails (a 502, the node's 503 for a cold anchor
+    /// miss, or bee's other 404, a head that exists and did not
+    /// retrieve) is no answer: nothing is written, in particular not
+    /// index 0, until a retry reads the head. The segments upload
+    /// meanwhile and are listed once it answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_head_read_is_retried_never_read_as_an_empty_feed() {
+        let log = Arc::new(Mutex::new(StubLog {
+            head: Some(StubHead {
+                index: 3,
+                version: "v2",
+                reference: "cd".repeat(32),
+                body: PRIOR_RECORDING.as_bytes().to_vec(),
+            }),
+            fail_head: 1,
+            cold_head: 1,
+            unretrievable_head: 1,
+            ..StubLog::default()
+        }));
+        let run = continued_run(&log, StreamFormat::SolarPunk, 3).await;
+        wait_until(&run, "the head to answer", |s| s.feed_index > Some(0)).await;
+        let reads = lock(&log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.starts_with("GET /feeds/"))
+            .count();
+        assert_eq!(reads, 4, "three failed reads, then the answer");
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.segments_listed, 3, "{report:?}");
+        let ids = soc_ids(&log);
+        assert_eq!(ids[0], slot(4));
+        assert!(!ids.iter().any(|id| (0..=3).any(|i| *id == slot(i))));
+        assert_eq!(media_sequence(&uploaded_playlists(&log)[0]), 15);
+        assert_eq!(report.error_count, 3, "{:?}", report.errors);
+        assert!(
+            report.errors.iter().all(|e| e.starts_with("feed head: ")),
+            "{:?}",
+            report.errors
+        );
+        assert!(report.errors[1].contains("503"), "{:?}", report.errors);
+        assert!(
+            report.errors[2].contains("wrapped chunk cannot be retrieved"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// A head that never answers before the stop: the broadcast writes no
+    /// playlist and no feed update at all, rather than guess an index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_that_never_answers_writes_nothing() {
+        let log = Arc::new(Mutex::new(StubLog {
+            fail_head: u32::MAX,
+            ..StubLog::default()
+        }));
+        let run = continued_run(&log, StreamFormat::SolarPunk, 3).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.segments_published, 3, "segments upload: {report:?}");
+        assert_eq!(report.feed_updates, 0, "{report:?}");
+        assert_eq!(report.playlists_published, 0, "{report:?}");
+        // No position to hand on: `null`, never 0, which a host passing
+        // it on as `start_index` would rewrite the channel from
+        // (R1-M2 on PR #183).
+        assert_eq!(report.feed_index, None, "{report:?}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["feed_index"].is_null(), "{json}");
+        assert_eq!(soc_ids(&log), Vec::<String>::new());
+        assert_eq!(uploaded_playlists(&log), Vec::<String>::new());
+        assert!(
+            report
+                .errors
+                .last()
+                .is_some_and(|e| e.contains("no playlist or feed update was written")),
+            "{:?}",
+            report.errors
         );
     }
 
@@ -4259,7 +5502,7 @@ mod tests {
         // 1. the channel's feed manifest.
         let manifest = seen
             .iter()
-            .find(|r| r.method_path.contains("/feeds/"))
+            .find(|r| r.method_path.starts_with("POST /feeds/"))
             .expect("feed manifest created");
         assert!(
             manifest.method_path.contains(&format!(
@@ -4545,10 +5788,10 @@ mod tests {
         // The closing window's update landed before the recording's
         // upload began; nothing is on the wire at the feed.
         assert!(!run.seal_feed(), "no feed update should be in flight");
-        let handed_out = run.report().feed_index;
+        let handed_out = run.report().feed_index.expect("the position is known");
         settle(&run).await;
         let report = run.report();
-        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        assert_eq!(report.feed_index, Some(handed_out), "{report:?}");
         let taken = hex::encode(ant_retrieval::sequence_update_id(&[0x11; 32], handed_out));
         assert!(
             !soc_ids(&log).contains(&taken),
@@ -4583,10 +5826,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(!run.feed_update_in_flight());
-        let handed_out = run.report().feed_index;
+        let handed_out = run.report().feed_index.expect("the position is known");
         settle(&run).await;
         let report = run.report();
-        assert_eq!(report.feed_index, handed_out, "{report:?}");
+        assert_eq!(report.feed_index, Some(handed_out), "{report:?}");
         let ids = soc_ids(&log);
         let last = hex::encode(ant_retrieval::sequence_update_id(
             &[0x11; 32],
@@ -4794,7 +6037,7 @@ mod tests {
         );
         let manifest = seen
             .iter()
-            .find(|r| r.method_path.contains("/feeds/"))
+            .find(|r| r.method_path.starts_with("POST /feeds/"))
             .expect("feed manifest created");
         assert!(
             manifest
@@ -5082,7 +6325,7 @@ mod tests {
         let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
         let _ = run.push(SegmentKind::Media, vec![0u8; 64], 300, false);
         for _ in 0..100 {
-            if run.snapshot().feed_index > 0 {
+            if run.snapshot().feed_index > Some(0) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5267,7 +6510,7 @@ mod tests {
         let feeds = lock(&log)
             .seen
             .iter()
-            .filter(|r| r.method_path.contains("/feeds/"))
+            .filter(|r| r.method_path.starts_with("POST /feeds/"))
             .count();
         assert!(feeds >= 2, "retry never fired ({feeds} POST /feeds)");
         assert!(!report.channel_reference.is_empty(), "{report:?}");
@@ -5497,8 +6740,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Polls for up to 10 s: long enough for three failed head reads
+    /// and their [`FEED_HEAD_RETRY`] pauses.
     async fn wait_until(run: &Arc<LiveRun>, what: &str, done: impl Fn(&PublisherSnapshot) -> bool) {
-        for _ in 0..400 {
+        for _ in 0..1000 {
             if done(&run.snapshot()) {
                 return;
             }
@@ -5559,7 +6804,7 @@ mod tests {
             );
         }
         wait_until(&run, "the first three", |s| {
-            s.segments_listed == 3 && s.feed_index > 0
+            s.segments_listed == 3 && s.feed_index > Some(0)
         })
         .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
