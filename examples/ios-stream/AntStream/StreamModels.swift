@@ -581,8 +581,8 @@ struct PublisherReport: Codable, Equatable {
     let playlistsPublished: UInt64
     let feedUpdates: UInt64
     /// The next feed update's index: where the permanent channel's next
-    /// broadcast starts (its `start_index`). Optional so a report from a
-    /// node without it still decodes.
+    /// broadcast starts (the node finds it by reading the feed head).
+    /// Optional so a report from a node without it still decodes.
     let feedIndex: UInt64?
     let sustainedMbitS: Double
     let sustainedChunksS: Double

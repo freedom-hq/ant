@@ -300,12 +300,15 @@ manifest of owner + topic, so it is one link for all broadcasts.
 * **Broadcast → Your channel** shows it, with **Share** (the web player
   links, for the Freedom browser and for any browser), copy, and
   **Watch**. The live screen's copy/share buttons send the same links.
-* Every broadcast passes the topic and the next feed index as `"topic"`
-  and `"start_index"` to `ant_publisher_start`, so it continues the
-  feed instead of rewriting the indices that hold the last broadcast.
-  The index only moves forward: it is saved from the publisher's
-  progress every second and from the final report, so even an app
-  killed mid-stream resumes at most one update behind.
+* Every broadcast passes the channel's topic (`"topic_text"`, or
+  `"topic"` for a channel older than text topics) to
+  `ant_publisher_start` and no `"start_index"`: the node reads the feed
+  head and continues after it (#173), so it never rewrites the indices
+  that hold the last broadcast, even after a reinstall or from another
+  device on the same account. The new broadcast numbers its segments on
+  from the last one's (one `#EXT-X-DISCONTINUITY` at the seam, so a
+  viewer's media sequence only ever increases), and its recording opens
+  with the last one's, so the channel's head plays every broadcast.
 
 ## Watch
 

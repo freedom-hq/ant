@@ -685,17 +685,19 @@ final class AntNode: ObservableObject {
     /// measured 4 as the stable point and 8 as a connection-layer
     /// collapse, so it is not a knob this screen should offer.
     ///
-    /// `topic`, `topicText` and `startIndex` come from the account's
-    /// permanent ``Channel``: the same topic every time keeps the
-    /// channel link stable, and `startIndex` continues the feed after the
-    /// previous broadcast instead of rewriting the indices that hold it.
-    /// A channel with a text topic hands the publisher the text (it
-    /// hashes it to the same bytes) so the report names it too.
+    /// `topic` and `topicText` come from the account's permanent
+    /// ``Channel``: the same topic every time keeps the channel link
+    /// stable. No `start_index` is passed: the node reads the feed head
+    /// and continues after it (#173), with the media sequence numbered on
+    /// from the previous broadcast and the recording opening with it, so
+    /// an index this app lost track of (a reinstall, another device on
+    /// the same account) can't rewrite earlier broadcasts. A channel with
+    /// a text topic hands the publisher the text (it hashes it to the
+    /// same bytes) so the report names it too.
     func startPublisher(
         channel: String,
         topic: String,
         topicText: String?,
-        startIndex: UInt64,
         batchId: String,
         bitrateKbps: UInt32,
         segmentMs: UInt32,
@@ -703,7 +705,6 @@ final class AntNode: ObservableObject {
     ) async throws {
         var config: [String: Any] = [
             "channel": channel,
-            "start_index": startIndex,
             "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId,
             "bitrate_kbps": bitrateKbps,
@@ -1225,11 +1226,9 @@ final class AntNode: ObservableObject {
 /// topic) is one link a viewer can bookmark, shared before going live.
 /// Ported from the Android app's `Channel.kt`.
 ///
-/// Every broadcast continues the feed where the last one stopped
-/// (``nextIndex`` becomes the publisher's `start_index`): rewriting
-/// indices that already hold an old broadcast's playlists would collide
-/// with them. The index is saved as the broadcast runs, so even an app
-/// killed mid-stream resumes at most one update behind.
+/// Every broadcast continues the feed where the last one stopped: the
+/// node reads the feed head at the start of each broadcast and writes
+/// after it (#173), so nothing here tracks the index.
 ///
 /// Scoped to the account address: a restored account gets its own
 /// channel. Lives in `UserDefaults` — nothing here is secret, the topic
@@ -1299,18 +1298,6 @@ struct Channel: Equatable {
     var name: String? {
         get { defaults.string(forKey: prefix + "name") }
         nonmutating set { defaults.set(newValue, forKey: prefix + "name") }
-    }
-
-    /// The feed index the next broadcast starts at.
-    var nextIndex: UInt64 {
-        UInt64(max(0, defaults.integer(forKey: prefix + "nextIndex")))
-    }
-
-    /// Record the publisher's `feed_index`. Only ever forward: a stale
-    /// report must not rewind the feed.
-    func advance(to index: UInt64) {
-        guard index > nextIndex, index <= UInt64(Int.max) else { return }
-        defaults.set(Int(index), forKey: prefix + "nextIndex")
     }
 
     /// The shareable channel reference, once its feed manifest exists.
