@@ -363,11 +363,14 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// ([`ChunkFetcher::detached`]): the deadline only stops the *wait*, the
 /// fetch runs on for its full retrieval budget and lands the SOC in the
 /// node's chunk cache. The next resolution then reads it locally, or,
-/// if it is still in flight, waits on that same fetch instead of
-/// starting another (one fetch per `(owner, topic, index)`, at most
+/// if it is still in flight, takes its delivery instead of starting
+/// another background fetch (one per `(owner, topic, index)`, at most
 /// [`BACKGROUND_PROBES_CAP`] per node, each dropped from the registry
-/// when it ends). Every other speculative probe is cut off at the
-/// deadline as before.
+/// when it ends). A probe joining an earlier probe's fetch still fetches
+/// afresh alongside it, cut off at the deadline as before, and only a
+/// delivery from the earlier fetch counts: it may have started before
+/// the update was pushed, so its miss is stale ([`fresh_or_landed`]).
+/// Every other speculative probe is cut off at the deadline as before.
 ///
 /// Cost of that: a resolution still waits at most this long per probe
 /// round, but the node keeps up to [`BACKGROUND_PROBE_SPAN`] fetches
@@ -375,11 +378,12 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// hint; a fallback walk from the caller's `after` adds its own), each
 /// until its fetcher gives up: on the live network an absent index
 /// costs the multi-peer walk the deadline otherwise cuts short. A poll
-/// that finds those fetches still running waits on them rather than
-/// adding more, so a feed polled while nothing new exists holds that
-/// many fetches at any time, however often it is polled, and the node
-/// never more than [`BACKGROUND_PROBES_CAP`]. A fetch that lands a
-/// present update is paid and cached like any other retrieval.
+/// that finds those fetches still running adds no background fetch (its
+/// own fresh probes are the ones it made before issue #190, cut off at
+/// the deadline), so a feed polled while nothing new exists holds that
+/// many background fetches at any time, however often it is polled, and
+/// the node never more than [`BACKGROUND_PROBES_CAP`]. A fetch that
+/// lands a present update is paid and cached like any other retrieval.
 ///
 /// Sized below a single absent SOC fetch's natural cost (~2-3 s of
 /// closest-peer walking on the live network): a reachable update in its
@@ -443,19 +447,20 @@ impl std::fmt::Debug for FeedProbes {
 
 impl FeedProbes {
     /// The background fetch of `addr` for `key`: the one already in
-    /// flight, or a new one started in a detached task. `None` when the
-    /// node is at [`BACKGROUND_PROBES_CAP`], the fetcher can't be
-    /// detached, or there is no runtime to run it on; the caller then
-    /// fetches directly, as before.
+    /// flight ([`Joined::Earlier`]), or a new one started in a detached
+    /// task ([`Joined::Started`]). `None` when the node is at
+    /// [`BACKGROUND_PROBES_CAP`], the fetcher can't be detached, or there
+    /// is no runtime to run it on; the caller then fetches directly, as
+    /// before.
     fn landing(
         self: &Arc<Self>,
         fetcher: &dyn ChunkFetcher,
         key: ProbeKey,
         addr: [u8; 32],
-    ) -> Option<Landing> {
+    ) -> Option<Joined> {
         let mut inflight = self.inflight.lock().ok()?;
         if let Some((_, landing)) = inflight.get(&key) {
-            return Some(landing.clone());
+            return Some(Joined::Earlier(landing.clone()));
         }
         if inflight.len() >= BACKGROUND_PROBES_CAP {
             return None;
@@ -498,12 +503,46 @@ impl FeedProbes {
             drop(cleanup);
             let _ = tx.send(landed);
         });
-        Some(landing)
+        Some(Joined::Started(landing))
     }
 
     /// Background fetches in flight.
     fn len(&self) -> usize {
         self.inflight.lock().map_or(0, |m| m.len())
+    }
+}
+
+/// The background fetch a probe waits on, and whether this probe started
+/// it.
+enum Joined {
+    /// Started by this probe, so it began now: as fresh as a direct fetch.
+    Started(Landing),
+    /// Started by an earlier probe, possibly before the update this probe
+    /// is looking for was pushed: its miss may be stale, so only its
+    /// delivery counts (see [`fresh_or_landed`]).
+    Earlier(Landing),
+}
+
+/// A probe that joins a background fetch an earlier probe started
+/// (issue #190's follow-up): that fetch may have begun before the update
+/// was pushed, and its walk then ends in a miss that says nothing about
+/// the network *now*. So the probe also fetches afresh, exactly as it did
+/// without a background fetch, and the earlier fetch can only add a
+/// delivery: whichever delivers first wins, and otherwise the fresh
+/// fetch's outcome is the answer. A probe never sees less than a plain
+/// fetch would have shown it; the fresh fetch is cut off at the probe's
+/// deadline as before, so the background work stays one fetch per index.
+async fn fresh_or_landed(
+    landing: Landing,
+    fresh: impl std::future::Future<Output = Fetched>,
+) -> Fetched {
+    let fresh = std::pin::pin!(fresh);
+    match futures::future::select(landing, fresh).await {
+        futures::future::Either::Left((Landed::Wire(wire), _)) => {
+            Fetched::Wire(Arc::unwrap_or_clone(wire))
+        }
+        futures::future::Either::Left((_stale, fresh)) => fresh.await,
+        futures::future::Either::Right((fetched, _)) => fetched,
     }
 }
 
@@ -769,7 +808,18 @@ async fn probe_once(
                 // to its loser drain, so a late delivery still records its
                 // debit in the accounting mirror.
                 let waited = match landing {
-                    Some(landing) => tokio::time::timeout(d, landing).await.map(Fetched::from),
+                    Some(Joined::Started(landing)) => {
+                        tokio::time::timeout(d, landing).await.map(Fetched::from)
+                    }
+                    Some(Joined::Earlier(landing)) => {
+                        tokio::time::timeout(
+                            d,
+                            fresh_or_landed(landing, async {
+                                Fetched::from(fetcher.fetch(addr).await)
+                            }),
+                        )
+                        .await
+                    }
                     None => tokio::time::timeout(d, fetcher.fetch(addr))
                         .await
                         .map(Fetched::from),
@@ -1250,7 +1300,9 @@ impl FeedHints {
 /// [`FEED_PROBE_TIMEOUT`] (when the fetcher can be
 /// [detached](ChunkFetcher::detached)), so a present update that is slow
 /// to reach is in the node's chunk cache, or still in flight for the next
-/// read to wait on, instead of lost (issue #190). This changes only how
+/// read to take, instead of lost (issue #190). A later read's probe also
+/// fetches afresh, as it would without the background fetch, so an
+/// earlier fetch's stale miss never hides an update pushed since. This changes only how
 /// long a probe's fetch lives, never what the walk does with its outcome,
 /// so the resolved index is the one the plain walk would return for the
 /// same probe outcomes.
@@ -3266,6 +3318,7 @@ mod tests {
         slow: HashMap<[u8; 32], Duration>,
         absent_delay: Duration,
         cached: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+        withheld: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
         started: std::sync::Mutex<HashMap<[u8; 32], usize>>,
         inflight: std::sync::Mutex<HashMap<[u8; 32], usize>>,
         max_inflight: std::sync::Mutex<HashMap<[u8; 32], usize>>,
@@ -3287,10 +3340,20 @@ mod tests {
                 slow,
                 absent_delay,
                 cached: std::sync::Mutex::default(),
+                withheld: std::sync::Mutex::default(),
                 started: std::sync::Mutex::default(),
                 inflight: std::sync::Mutex::default(),
                 max_inflight: std::sync::Mutex::default(),
             }))
+        }
+        /// `addr` is not pushed yet: a fetch that starts now misses it.
+        fn withhold(&self, addr: [u8; 32]) {
+            self.0.withheld.lock().unwrap().insert(addr);
+        }
+        /// The writer pushes `addr`: fetches that start from now find
+        /// it, one already walking still misses.
+        fn push(&self, addr: [u8; 32]) {
+            self.0.withheld.lock().unwrap().remove(&addr);
         }
         fn started(&self, addr: &[u8; 32]) -> usize {
             self.0
@@ -3332,7 +3395,8 @@ mod tests {
                 let m = max.entry(addr).or_default();
                 *m = (*m).max(now);
             }
-            let Some(wire) = st.chunks.get(&addr) else {
+            let withheld = st.withheld.lock().unwrap().contains(&addr);
+            let Some(wire) = st.chunks.get(&addr).filter(|_| !withheld) else {
                 tokio::time::sleep(st.absent_delay).await;
                 return Err(format!("not found: {}", hex::encode(addr)).into());
             };
@@ -3433,8 +3497,16 @@ mod tests {
             .unwrap();
         assert_eq!(second.index, N + 1, "the second read sees N+1");
         assert_eq!(hints.get(&feed.owner, &feed.topic), N + 1);
-        assert_eq!(net.started(&next), 1, "N+1 fetched once across both reads");
-        assert_eq!(net.max_inflight(), 1, "one fetch per index in flight");
+        assert_eq!(
+            net.started(&next),
+            2,
+            "one background fetch of N+1, plus the second read's fresh probe",
+        );
+        assert_eq!(
+            net.max_inflight(),
+            2,
+            "a background fetch per index, plus one read's fresh probe",
+        );
 
         // Every background fetch ends within its own budget and leaves
         // the registry, and a later read finds N+1 locally.
@@ -3444,7 +3516,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.index, N + 1);
-        assert_eq!(net.started(&next), 1);
+        assert_eq!(net.started(&next), 2, "the third read is served from cache");
+    }
+
+    /// A background fetch that started before the update it looks for
+    /// was pushed misses it, however long it runs. A later read that
+    /// finds that fetch still in flight must not take its stale miss (or
+    /// time out waiting on it): it probes afresh, as it would without a
+    /// background fetch, so it sees the update in the same read (one
+    /// probe round) a plain read would.
+    #[tokio::test(start_paused = true)]
+    async fn update_pushed_during_a_background_fetch_is_read_at_once() {
+        const N: u64 = 4;
+        let absent = Duration::from_secs(2);
+        for detachable in [false, true] {
+            let (net, feed) = scripted_feed(
+                &format!("pushed-{detachable}"),
+                N,
+                Some(Duration::ZERO),
+                absent,
+            );
+            let next = sequence_update_address(&feed, N + 1);
+            net.withhold(next);
+            let hints = FeedHints::new();
+            hints.record(&feed.owner, &feed.topic, N);
+            let read = || async {
+                if detachable {
+                    resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints)).await
+                } else {
+                    resolve_sequence_feed_hinted(&Undetachable(&net), &feed, 0, Some(&hints)).await
+                }
+                .unwrap()
+            };
+            assert_eq!(read().await.index, N, "N+1 not pushed yet");
+            if detachable {
+                assert!(hints.probes.len() > 0, "N+1's miss still running");
+            }
+            // The writer pushes N+1 while that fetch is still walking.
+            net.push(next);
+            let start = tokio::time::Instant::now();
+            let second = read().await;
+            assert_eq!(second.index, N + 1, "detachable={detachable}");
+            assert!(
+                start.elapsed() <= FEED_PROBE_TIMEOUT * 3 / 2,
+                "detachable={detachable}: took {:?}",
+                start.elapsed()
+            );
+        }
     }
 
     /// Issue #190: on a feed polled while no new update exists, the
@@ -3487,7 +3605,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        assert_eq!(net.max_inflight(), 1, "one fetch per index in flight");
+        assert!(
+            net.max_inflight() <= 2,
+            "a background fetch per index, plus one read's fresh probe",
+        );
         tokio::time::sleep(absent * 2).await;
         assert_eq!(hints.probes.len(), 0, "every background fetch cleaned up");
     }
