@@ -26,7 +26,7 @@ Bundle id: `baby.freedom.antstream`. Data dir:
 | `CaptureEngine.swift` | #65: `AVCaptureSession` → H.264 → `AVAssetWriter` in `.mpeg4AppleHLS` mode, emitting fMP4 segments; interruption handling and the on-disk segment ring. |
 | `LiveBroadcast.swift` | Joins capture to `ant_publisher_*`, holds the foreground keep-alive, polls publish progress. |
 | `LiveView.swift` | The going-live screen: quality presets, preview, publish-lag indicator, live counters, channel share. |
-| `WatchView.swift` | The Watch tab: `AVPlayer` on a channel's `stream.m3u8` from the in-process gateway, with automatic retry. |
+| `WatchView.swift` | The Watch tab: `AVPlayer` on a channel from the in-process gateway, in either publisher format (`/bzz/<ref>/stream.m3u8`, or `GET /feeds` with segment references rewritten to `/bytes/`), with automatic retry. |
 | `BenchView.swift` | #67 stage 1: the throughput bench sheet. |
 | `GetStartedView.swift` | Ported onboarding: plan tiers → on-chain quote → payment detection → one-shot auto-activation. |
 | `StorageView.swift` | Ported storage tab: plan meter, extend/top-up, settlement warning, account + key backup/restore. |
@@ -227,8 +227,25 @@ device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM
 2. `ant_publisher_push_segment` queues each one. Per segment the node
    does `POST /bzz`, rebuilds the rolling HLS playlist, publishes it,
    and points the channel's sequence feed at it with `POST /soc` — the
-   bee-js update shape, so any bee gateway resolves the channel from the
-   feed manifest `POST /feeds` created at start.
+   publisher's `"bzz"` format, the bee-js update shape, so any bee
+   gateway resolves the channel from the feed manifest `POST /feeds`
+   created at start. The app passes `format: "bzz"` on purpose: the web
+   player the Share links open and the Android Watch tab only read that
+   format. The Solar Punk stream format (#167: `POST /bytes`, bare
+   segment references, v2 updates whose content is the playlist, read
+   with `GET /feeds/{owner}/{topic}`) is a `format: "solar-punk"` away
+   once those viewers read it.
+   New channels get a text topic (`antstream-<uuid>`, passed as
+   `topic_text`), which a Solar Punk catalog entry can name; a channel
+   made before keeps its random topic bytes, and with them its link.
+   Every broadcast also passes `"ladder": true` (#174): every ten
+   seconds the node writes a small ladder time marker at an address
+   computed from the clock (`ant_ladder_marker_id`), naming the feed's
+   newest index, so a viewer joining hours in reads one marker and then
+   one round of feed slots instead of walking the feed from 0. 360
+   chunks an hour on the plan. (Under `"solar-punk"` the node would also
+   write a one-rung master playlist for Solar Punk's players; not under
+   `"bzz"`.)
 3. The screen shows the **publish lag** (capture → the feed update that
    makes the segment playable) the whole time, plus how many segments
    the live-edge discipline dropped to hold it there.
@@ -248,12 +265,30 @@ writer; the first segment after one is marked `#EXT-X-DISCONTINUITY` in
 the playlist. The idle timer is held off and the audio session is
 configured for recording for the broadcast's duration.
 
+A dropped connection pauses a broadcast; it never ends it (#172). When
+the device goes offline the app calls `ant_publisher_pause` with
+`ant_suspend`: the camera keeps going, but its segments are withheld
+rather than uploaded, and the live playlist just stops advancing (no
+`#EXT-X-ENDLIST`), so viewers stay on the broadcast. Back online (and on
+every return to the foreground) `ant_publisher_resume` carries it on in
+the same feed and the same recording, behind one `#EXT-X-DISCONTINUITY`,
+dated from the wall clock again. The broadcast ends only on Stop, or by
+itself once a minute passes with nothing reaching the playlist
+(`reap_ms` 60000, Solar Punk's `ORPHAN_REAP_MS`; counted from the last
+listed segment or the first return after it, whichever is later); the
+live screen then shows the report. A minute that runs out while offline
+ends the broadcast when the network comes back rather than at once, so
+the closing playlist and the recording go up over a live connection
+instead of failing against a dead one.
+
 Camera and broadcast paths are device-only — the simulator has no
 capture device. `antstream-visual` covers the screen by running the same
 encoder and publisher from a generated test pattern
 (`-antstream-shot-live`), which is labelled as such on screen. Its other
 launch arguments open the app straight onto one surface each:
-`-antstream-shot-live-idle` (quality picker), `-antstream-shot-channel`
+`-antstream-shot-live-idle` (quality picker), `-antstream-shot-live-paused`
+(with `-antstream-shot-live`: the broadcast paused as if offline, then
+ending itself a minute on), `-antstream-shot-channel`
 (the channel card, with sample state), `-antstream-shot-watch` (the
 Watch tab on a sample channel), `-antstream-shot-getstarted-help` (the
 payment ⓘ sheet), plus the Storage and Get Started hooks in
@@ -273,20 +308,42 @@ manifest of owner + topic, so it is one link for all broadcasts.
 * **Broadcast → Your channel** shows it, with **Share** (the web player
   links, for the Freedom browser and for any browser), copy, and
   **Watch**. The live screen's copy/share buttons send the same links.
-* Every broadcast passes the topic and the next feed index as `"topic"`
-  and `"start_index"` to `ant_publisher_start`, so it continues the
-  feed instead of rewriting the indices that hold the last broadcast.
-  The index only moves forward: it is saved from the publisher's
-  progress every second and from the final report, so even an app
-  killed mid-stream resumes at most one update behind.
+* Every broadcast passes the channel's topic (`"topic_text"`, or
+  `"topic"` for a channel older than text topics) to
+  `ant_publisher_start` and no `"start_index"`: the node reads the feed
+  head and continues after it (#173), so it never rewrites the indices
+  that hold the last broadcast, even after a reinstall or from another
+  device on the same account. The new broadcast numbers its segments on
+  from the last one's (one `#EXT-X-DISCONTINUITY` at the seam, so a
+  viewer's media sequence only ever increases), and its recording opens
+  with the last one's, so the channel's head plays every broadcast.
+  Reading the head needs the node to confirm a miss (an empty feed, or
+  the slot after the head) with more than two peers, so **Go Live**
+  waits for three connected peers; until the node has them no playlist
+  or feed update would go up.
 
 ## Watch
 
 The **Watch** tab plays a channel reference (pasted, or handed over by
-the channel card's Watch button) with `AVPlayer` from
-`http://<gateway address>/bzz/<ref>/stream.m3u8` on the in-process
-gateway. The feed manifest re-resolves to the newest playlist on every
-refresh, so the player follows the live edge. A channel that is not live
+the channel card's Watch button) with `AVPlayer` through the in-process
+gateway. The reference is the channel's feed manifest; the tab reads the
+feed's owner and topic out of it (`GET /bytes/<ref>`), then every
+playlist load and reload goes through a resource-loader delegate that
+plays either publisher format. It reads `GET /feeds/<owner>/<topic>`:
+for a `"solar-punk"` channel that is the playlist, and each bare segment
+reference is rewritten to `http://<gateway address>/bytes/<ref>`, the
+same rewrite Solar Punk's viewers do; for a `"bzz"` channel (what the
+app publishes) it is not, so the delegate reads `/bzz/<ref>/stream.m3u8`
+instead and makes its `/bzz/...` segment paths absolute on the gateway.
+Once a channel is known to be `"bzz"`, the tab's automatic reloads go
+straight to `/bzz` without the feed lookup; playing it again by hand
+checks the format afresh. The first read of every load joins from the newest
+ladder marker when the channel has one (#174): the previous ten-second
+period's marker, then the one before, read with `GET /soc`, and the feed
+read anchored at the index it names (`GET /feeds/...?after=<index>`),
+which the node then remembers for the `/bzz` read and every reload. No
+marker (a channel published before markers, a device clock off by more
+than a period) just means the feed is walked as before. The player follows the live edge. A channel that is not live
 yet, an item that fails to load, and a live playlist that stops moving
 (a broadcast that ended without closing its playlist) all reload the
 channel after a short pause, with a plain message saying so; a closed

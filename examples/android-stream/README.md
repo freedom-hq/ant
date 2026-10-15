@@ -50,10 +50,15 @@ APK.
    ~900 kbit/s (the stage-1 rendition from #67) with AAC audio, in 2 s
    segments. Each segment is `POST /bzz`'d, the rolling playlist is
    republished and the channel's sequence feed is updated, exactly as on
-   iOS. The screen shows the publish lag and the channel reference.
+   iOS: the publisher's default `"bzz"` format, which the Watch tab below
+   and the web player read. (The Solar Punk format from #167 is an
+   opt-in `format: "solar-punk"` this app does not set.) The screen shows
+   the publish lag and the channel reference.
 3. **Watch**: paste a channel reference. The player loads
    `http://127.0.0.1:1633/bzz/<channel>/stream.m3u8`, which re-resolves
-   the feed on every playlist refresh.
+   the feed on every playlist refresh. A channel published in the
+   `"solar-punk"` format doesn't resolve on this path; the iOS Watch tab
+   reads both.
 
 The broadcast is foreground-only: leaving the app ends it cleanly (the
 playlist gets `#EXT-X-ENDLIST`). Without microphone permission it

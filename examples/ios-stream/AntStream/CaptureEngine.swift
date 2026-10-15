@@ -36,6 +36,10 @@ import UniformTypeIdentifiers
 final class CaptureEngine: NSObject {
     // MARK: configuration
 
+    /// The camera's AAC track, on top of the video bitrate in every
+    /// segment. The storage estimate (#176) counts it too.
+    static let audioBitrateKbps = 64
+
     /// The rendition. Defaults are the stage-1 go/no-go row: 360p at
     /// ~900 kbit/s with 2 s segments (`crates/ant-ffi/ANTSTREAM_BENCH.md`).
     struct Settings: Equatable {
@@ -192,6 +196,17 @@ final class CaptureEngine: NSObject {
     private let delegateLock = NSLock()
     private var pendingDiscontinuityLocked = false
     private var segmentIndexLocked = 0
+    /// Media the current writer has handed over, exactly (a `CMTime`
+    /// keeps the track's own timescale), and the whole milliseconds
+    /// already reported for it. Each segment's `durationMs` is the
+    /// rounded total less what was already reported, so per-segment
+    /// rounding never accumulates: the publisher dates every segment by
+    /// adding these up (`#EXT-X-PROGRAM-DATE-TIME`, #170), and truncating
+    /// each one on its own would let the dates fall behind the media by
+    /// up to a millisecond a segment. Reset by each writer's
+    /// initialization segment.
+    private var writerMediaLocked = CMTime.zero
+    private var writerReportedMsLocked: UInt64 = 0
     private var ringFilesLocked: [URL] = []
     /// Snapshot of the settings the delegate needs, republished under
     /// ``delegateLock`` whenever the rendition changes.
@@ -461,7 +476,7 @@ final class CaptureEngine: NSObject {
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVNumberOfChannelsKey: 1,
                     AVSampleRateKey: 44_100,
-                    AVEncoderBitRateKey: 64_000,
+                    AVEncoderBitRateKey: CaptureEngine.audioBitrateKbps * 1000,
                 ]
             )
             aInput.expectsMediaDataInRealTime = true
@@ -827,16 +842,28 @@ extension CaptureEngine: AVAssetWriterDelegate {
         let url = storeLocked(segmentData, name: name, capacity: ringCapacity)
         let discontinuity = !isInit && pendingDiscontinuityLocked
         if discontinuity { pendingDiscontinuityLocked = false }
+        var durationMs: UInt32 = 0
+        if isInit {
+            writerMediaLocked = .zero
+            writerReportedMsLocked = 0
+        } else {
+            // The video track's: segments are cut on its keyframes.
+            let reports = segmentReport?.trackReports ?? []
+            let reported = (reports.first { $0.mediaType == .video } ?? reports.first)?.duration
+            let media = reported.flatMap { $0.isNumeric && $0 > .zero ? $0 : nil }
+                ?? CMTime(seconds: segmentSeconds, preferredTimescale: 1000)
+            writerMediaLocked = CMTimeAdd(writerMediaLocked, media)
+            let totalMs = UInt64((writerMediaLocked.seconds * 1000).rounded())
+            durationMs = UInt32(clamping: totalMs - min(totalMs, writerReportedMsLocked))
+            writerReportedMsLocked = max(totalMs, writerReportedMsLocked)
+        }
         delegateLock.unlock()
 
-        let reported = segmentReport?.trackReports.first?.duration
-        let durationMs = reported.map { UInt32(max(0, $0.seconds) * 1000) }
-            ?? UInt32(segmentSeconds * 1000)
         onSegment?(
             Segment(
                 data: segmentData,
                 isInitialization: isInit,
-                durationMs: isInit ? 0 : durationMs,
+                durationMs: durationMs,
                 discontinuity: discontinuity,
                 fileURL: url
             )

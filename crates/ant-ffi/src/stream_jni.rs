@@ -16,7 +16,7 @@
 //! C function produced; handles cross as `jlong`.
 //!
 //! Every call blocks the calling thread for as long as the C function
-//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s),
+//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s, ~195 s worst case),
 //! so the Kotlin side runs them on `Dispatchers.IO`.
 
 use std::ffi::{c_char, CStr, CString};
@@ -610,7 +610,9 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherStart<
 
 /// `AntNative.nativePublisherPushSegment(handle, isInit, data,
 /// durationMs, discontinuity): Int` — `ant_publisher_push_segment`.
-/// Returns its 0 / 1 / 2 disposition; -1 throws.
+/// Returns its 0 / 1 / 2 / 3 disposition (3, withheld, only after
+/// `ant_publisher_pause`, which this binding does not expose yet); -1
+/// throws.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherPushSegment<'caller>(
     mut unowned_env: EnvUnowned<'caller>,

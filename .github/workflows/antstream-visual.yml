@@ -182,8 +182,29 @@ jobs:
           # The screen waits for `ant_init` before starting (~20 s cold).
           sleep 40
           xcrun simctl io booted screenshot shots/11-live-broadcast.png
+          # This run passes a 10-minute reap_ms (see
+          # `AntNode.reapMsForThisLaunch`): nothing is ever listed here
+          # (the sample batch is rejected), so the real 60 s window (#172)
+          # would end the broadcast before these shots.
           sleep 30
           xcrun simctl io booted screenshot shots/12-live-publish-lag.png
+          # 18/19 — a dropped connection (#172): `-antstream-shot-live-
+          # paused` pauses the broadcast 5 s in, as the path monitor does
+          # when the device goes offline. 18 is the paused state (still
+          # LIVE, "No connection — paused"); the "network" returns 65 s
+          # after the pause, past the reap window, and 19 is after that
+          # return, when the reap held for it ended the broadcast
+          # (summary: "nothing reached viewers for a minute"). A reap
+          # never fires while offline: its closing uploads need the
+          # uplink. A real return inside the window needs a device: this
+          # runner can't land a segment at all.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-live-paused
+          sleep 45
+          xcrun simctl io booted screenshot shots/18-live-paused.png
+          sleep 90
+          xcrun simctl io booted screenshot shots/19-live-reaped.png
           # --- Android parity (permanent channel, Watch tab, quality,
           # payment help) ---
           # 13 — the Broadcast tab's "Your channel" card: the permanent
@@ -195,6 +216,16 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-channel
           sleep 25
           xcrun simctl io booted screenshot shots/13-broadcast-channel-card.png
+          # 20 — the Broadcast tab after a relaunch that finds a broadcast
+          # the app was killed in the middle of (#175): the "Unfinished
+          # broadcast" card with Resume / End broadcast / Discard, and Go
+          # live held until it is dealt with. A runner never has a
+          # broadcast killed under it, so `-antstream-shot-unfinished`
+          # installs a sample entry (nothing on disk).
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-unfinished
+          sleep 25
+          xcrun simctl io booted screenshot shots/20-broadcast-unfinished.png
           # 14/15 — the Watch tab playing a channel through the in-process
           # gateway. The sample reference points at nothing, so this
           # captures the player loading and then the plain-language retry
@@ -220,6 +251,39 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live-idle
           sleep 25
           xcrun simctl io booted screenshot shots/17-live-quality-picker.png
+          # 21/22 — a nearly full storage plan (#176). A runner account
+          # has no plan, so `-antstream-shot-low-capacity` makes the
+          # sample one immutable with about twenty minutes of 360p left in
+          # its fullest bucket: the Broadcast checklist's "Room for a
+          # broadcast" row (scrolled into view) and the going-live
+          # screen's line under the quality picker both warn. (Shots 11/12
+          # show the other half: the sample batch is not a real one, so
+          # every upload is refused and the live screen names the plan,
+          # not the network.)
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-channel -antstream-shot-low-capacity
+          sleep 25
+          xcrun simctl io booted screenshot shots/21-broadcast-low-capacity.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-low-capacity
+          sleep 25
+          xcrun simctl io booted screenshot shots/22-live-low-capacity.png
+          # 23/24 — a plan Swarm won't stamp with at all (#176): the
+          # sample batch reads `usable: false` (and is not propagating),
+          # so the same two surfaces say "Swarm won't accept this plan's
+          # stamps" in orange instead of a time estimate.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-channel -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/23-broadcast-unusable-plan.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-unusable-plan
+          sleep 25
+          xcrun simctl io booted screenshot shots/24-live-unusable-plan.png
           # --- Credit card: account wallet, add / withdraw (#165) ---
           # A fresh runner account has no chequebook or wallet funds, so
           # `-antstream-shot-credit` publishes the state #165 was filed
@@ -227,31 +291,31 @@ jobs:
           # `-add` / `-withdraw` / `-confirm` variants open the amount
           # sheet and the confirmation. Nothing is sent: the confirm
           # button is never pressed.
-          # 18 — the card: credit figures + the account wallet + actions.
+          # 25 — the card: credit figures + the account wallet + actions.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-storage -antstream-shot-credit
           sleep 22
-          xcrun simctl io booted screenshot shots/18-credit-wallet.png
-          # 19 — "Add to credit": amount field, quick picks, gas note.
+          xcrun simctl io booted screenshot shots/25-credit-wallet.png
+          # 26 — "Add to credit": amount field, quick picks, gas note.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-add
           sleep 22
-          xcrun simctl io booted screenshot shots/19-credit-add-sheet.png
-          # 20 — the confirmation before the real transaction.
+          xcrun simctl io booted screenshot shots/26-credit-add-sheet.png
+          # 27 — the confirmation before the real transaction.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-add \
             -antstream-shot-credit-confirm
           sleep 24
-          xcrun simctl io booted screenshot shots/20-credit-add-confirm.png
-          # 21 — "Withdraw to account", capped at the free credit.
+          xcrun simctl io booted screenshot shots/27-credit-add-confirm.png
+          # 28 — "Withdraw to account", capped at the free credit.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-withdraw
           sleep 22
-          xcrun simctl io booted screenshot shots/21-credit-withdraw-sheet.png
+          xcrun simctl io booted screenshot shots/28-credit-withdraw-sheet.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

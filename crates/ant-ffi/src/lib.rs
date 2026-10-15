@@ -3752,29 +3752,223 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// How long [`ant_publisher_stop`] waits for a cancelled broadcast to
 /// settle before returning the report anyway.
 ///
-/// Stopping publishes what is already captured. With every upload
-/// timing out that drain is at worst *three* rounds of the publisher's
-/// 60 s per-segment deadline — the in-flight window, a segment the
-/// pump had already popped behind it, then the backlog (capped at
-/// `max_backlog`, so at most one further round) — so a fully wedged
-/// uplink can outlive this grace. That is deliberate: a drain that
-/// slow means the tail is lost regardless, so the call returns at
-/// ~130 s with an honest report and the loop finishes in the
-/// background and releases its slot.
+/// Stopping publishes what is already captured, then the closing
+/// window and the recording, each an upload plus a feed update. With
+/// every upload timing out the segment drain alone is at worst *three*
+/// rounds of the publisher's 60 s per-request deadline — the in-flight
+/// window, a segment the pump had already popped behind it, then the
+/// backlog (capped at `max_backlog`, so at most one further round) —
+/// a feed-head read that had not answered yet (issue #173) can hold the
+/// playlists behind it for one more (a stop gives up on the head after
+/// that one read; a resumed run, finalizing, keeps retrying it for up to
+/// a minute after the stop, a read in flight then included, so a cold
+/// head doesn't leave the broadcast unrecorded and the closing window
+/// and recording still get ~70 s of the grace), and the closing window
+/// and recording add up to four
+/// more (an upload and a feed update each), so a slow or wedged uplink can outlive
+/// this grace by minutes. That is deliberate: a drain that slow means
+/// the tail is lost regardless, so the call returns at ~130 s with an
+/// honest report and the loop finishes in the background and releases
+/// its slot.
+///
+/// The report's `feed_index` is where the next broadcast on the channel
+/// starts (it reads the feed head there, or a host passes it as
+/// `start_index`; `null` if the run never read its head, see
+/// [`publisher::PublisherReport::feed_index`]), so a closing window or recording landing in the
+/// background must not take it: an early return seals the run's
+/// feed ([`publisher::LiveRun::seal_feed`]) first, waits out an update
+/// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
+/// the report. Whatever the background loop still uploads after that
+/// gets no feed update (the recording keeps its reference, but the
+/// closing window or the live window before it stays the feed's head).
 const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
+
+/// How long [`ant_publisher_stop`] waits, past [`PUBLISHER_STOP_GRACE`],
+/// for a feed update that was already on the wire when it sealed the
+/// feed: a little over the publisher's per-request deadline, which
+/// bounds that update.
+const PUBLISHER_SEAL_GRACE: Duration =
+    Duration::from_secs(publisher::PUBLISH_TIMEOUT.as_secs() + 5);
 
 /// Poll interval while waiting for a cancelled broadcast to settle.
 const PUBLISHER_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// The 32-byte feed topic a text topic names, as 64 lowercase hex:
+/// `keccak256(utf8(text))`, bee-js `Topic.fromString`, the way a Solar
+/// Punk catalog entry's `topic` is read (see
+/// [`publisher::topic_from_string`]). `text` is hashed exactly as given.
+/// Lets a host that keeps a text topic create the channel's feed manifest
+/// (`POST /feeds/{owner}/{topic}`) before going live. Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when `text` is null or not UTF-8.
+///
+/// # Safety
+///
+/// * `text` must be a valid NUL-terminated string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_topic_from_string(
+    text: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_topic_from_string", || {
+            let text = cstr_to_str(text).map_err(|e| e.to_string())?;
+            Ok(hex::encode(publisher::topic_from_string(text)))
+        })
+    }
+}
+
+/// The single-owner-chunk identifier, 64 lowercase hex, of the ladder
+/// time marker for the channel whose feed topic is `topic_hex` (64 hex,
+/// `0x` optional) and the marker period `period`
+/// (`unix_ms / 10 000`), as a broadcast started with `"ladder": true`
+/// writes it (issue #174): `keccak256("ladder-marker" ‖ group topic ‖
+/// period_be8)`, the group being [`publisher::ladder_group_text`] of the
+/// topic. A viewer reads `GET /soc/{owner}/{it}`, a small JSON naming the
+/// feed's newest index, and starts its feed read there
+/// (`GET /feeds/{owner}/{topic}?after=<index>`). Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when `topic_hex` is null or not 32 bytes of hex.
+///
+/// # Safety
+///
+/// * `topic_hex` must be a valid NUL-terminated string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_ladder_marker_id(
+    topic_hex: *const c_char,
+    period: u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_ladder_marker_id", || {
+            let text = cstr_to_str(topic_hex).map_err(|e| e.to_string())?;
+            let raw = text.trim().trim_start_matches("0x");
+            let topic = hex::decode(raw)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(|| format!("topic must be 32 bytes of hex, got {raw:?}"))?;
+            let group = publisher::topic_from_string(&publisher::ladder_group_text(&topic));
+            Ok(hex::encode(publisher::ladder_marker_identifier(
+                &group, period,
+            )))
+        })
+    }
+}
+
+/// How long a broadcast fits on the storage plan, checked before going
+/// live (issue #176). `config_json` is the [`publisher::PublisherConfig`]
+/// the broadcast would start with (only its `batch_id`, `format`,
+/// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
+/// counts everything a segment carries, so a host adds its audio rate);
+/// `plan_json` is the plan as [`ant_storage_status`] reports it (its
+/// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
+/// `usable` and `propagating` are read; pass `usable` through, since a
+/// missing one reads as `true` and the estimate's `usable` would then
+/// always be `true`).
+///
+/// Returns a [`publisher::CapacityEstimate`] JSON object,
+/// `{"batch_id","immutable","usable","chunks_per_minute","chunks_left",
+/// "minutes_left","low"}`: the chunks a minute of the broadcast stamps
+/// (segments, the playlist and feed update after each, ladder markers,
+/// the recording's share), the room left counting the batch's **fullest
+/// bucket**, the whole minutes that fit, and `low` under
+/// [`publisher::LOW_CAPACITY_MINUTES`]. An immutable batch refuses the
+/// broadcast's uploads once `minutes_left` runs out; a mutable one
+/// (`immutable: false`) overwrites its oldest chunks instead, so a host
+/// warns about it whatever its room. Needs no node.
+///
+/// Returns an allocated string (free with [`ant_free_string`]); null with
+/// a message in `*out_err` when either document doesn't parse, the plan
+/// is not connected, or the plan's batch is not the config's.
+///
+/// # Safety
+///
+/// * `config_json` and `plan_json` must be valid NUL-terminated strings.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_capacity(
+    config_json: *const c_char,
+    plan_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_publisher_capacity", || {
+            let config = cstr_to_str(config_json).map_err(|e| e.to_string())?;
+            let plan = cstr_to_str(plan_json).map_err(|e| e.to_string())?;
+            let config: publisher::PublisherConfig =
+                serde_json::from_str(config).map_err(|e| format!("config_json: {e}"))?;
+            let plan: ant_control::PostageStatusView =
+                serde_json::from_str(plan).map_err(|e| format!("plan_json: {e}"))?;
+            let estimate =
+                publisher::estimate_capacity(&config, &plan).map_err(|e| e.to_string())?;
+            serde_json::to_string(&estimate).map_err(|e| e.to_string())
+        })
+    }
+}
 
 /// Start a live broadcast from this node.
 ///
 /// `config_json` is a [`publisher::PublisherConfig`] document; `channel`
 /// and `batch_id` are required (a broadcast needs a name and a storage
 /// plan). Segments come from the host's capture pipeline through
-/// [`ant_publisher_push_segment`]; per segment the publisher does one
-/// `POST /bzz`, rebuilds the HLS playlist, and publishes it as a
+/// [`ant_publisher_push_segment`]; per segment the publisher uploads the
+/// segment, rebuilds the HLS playlist (each segment carrying its
+/// `#EXT-X-PROGRAM-DATE-TIME`), uploads it, and publishes it as a
 /// sequence-feed update with `POST /soc` — all against `gateway`, which
-/// must already be listening (see [`ant_start_gateway`]).
+/// must already be listening (see [`ant_start_gateway`]). The `format`
+/// field picks the shape ([`publisher::StreamFormat`]): `"bzz"`, the
+/// default, uploads with `POST /bzz`, lists `/bzz/<ref>/<name>` paths and
+/// writes v1 updates, so viewers play `/bzz/<channel>/stream.m3u8` (the
+/// web player and the Android Watch tab read this); `"solar-punk"`
+/// uploads with `POST /bytes`, lists bare references and writes v2
+/// updates wrapping the playlist itself, so `GET /feeds/{owner}/{topic}`
+/// returns the playlist (what Solar Punk's viewers read). The topic is
+/// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
+/// (`topic`), and with neither it is the channel's stable text topic
+/// `antstream/<channel>`; see [`publisher::PublisherConfig`].
+///
+/// `ladder: true` also publishes the channel as a one-rung ladder (issue
+/// #174): a ladder time marker every ten seconds (at
+/// [`ant_ladder_marker_id`], naming the newest feed index) and, under
+/// `"solar-punk"` with a topic text a URI can carry, a master playlist
+/// with a measured `BANDWIDTH` on the group's feed, so a viewer joins in
+/// two round trips; see [`publisher::PublisherConfig::ladder`].
+///
+/// A broadcast continues the feed its topic already holds (issue #173):
+/// before its first update it reads the feed head once and writes after
+/// it, numbers its media after the head playlist's (one
+/// `#EXT-X-DISCONTINUITY` at the seam, so the media sequence only ever
+/// increases) and opens its recording with the head playlist's entries.
+/// Only a feed nothing was written to starts at index 0; a head read
+/// that fails, or whose next slot isn't confirmed empty, holds every
+/// playlist and feed update until a retry answers. Confirming a miss
+/// takes more than two peers, so on a node with at most two (a brand-new
+/// channel included) no playlist goes up until it has three or more.
+/// `start_index` overrides all of that with an exact index; see
+/// [`publisher::PublisherConfig::start_index`].
+///
+/// `recovery_path` keeps a recovery entry for the broadcast (issue #175),
+/// written ahead of every feed update and removed once the recording is
+/// the feed's head; after a kill or crash, starting with `resume: true`
+/// and the same path carries the same broadcast on in the same feed (or,
+/// stopped straight away, finalizes it into its recording). A resume is
+/// refused at start for another account's, topic's or format's entry,
+/// and ends by itself with nothing written when the feed's head shows the
+/// channel moved on since. See [`publisher::PublisherConfig::recovery_path`]
+/// and [`publisher::PublisherConfig::resume`].
+///
+/// An interruption pauses the broadcast rather than ending it (issue
+/// #172; [`ant_publisher_pause`] / [`ant_publisher_resume`]). It ends on
+/// [`ant_publisher_stop`] or, with `reap_ms` set, by itself once that
+/// long passes with no media reaching the playlist; progress then
+/// reports `reaped` and the host calls the stop for the report. Not
+/// while paused: a window that runs out during an outage ends the
+/// broadcast at [`ant_publisher_resume`] instead, so the closing
+/// playlist and the recording go up over the returned connection.
 ///
 /// Returns immediately — the loop drives itself on the node's runtime.
 /// Poll it with [`ant_publisher_progress`] and finish it with
@@ -3853,7 +4047,13 @@ pub unsafe extern "C" fn ant_publisher_start(
 /// fresh one whenever the writer restarts (camera flip, interruption
 /// recovery, bitrate downshift) and set `discontinuity` on the first
 /// media segment after it. `duration_ms` is the segment's real duration
-/// (ignored for the initialization segment).
+/// (ignored for the initialization segment): it is the `#EXTINF`, and
+/// the step from this segment's `#EXT-X-PROGRAM-DATE-TIME` to the next
+/// one's. Every media segment is dated once, at this call, from one
+/// anchor taken off the wall clock at the first media segment (less its
+/// duration) and re-taken at each writer restart, never moving
+/// backwards — so a host that rounds or nominalises `duration_ms`
+/// drifts the broadcast's dates by that error every segment.
 ///
 /// **Call order is the broadcast order.** Segments are numbered as these
 /// calls arrive, and that number fixes both the playlist order and which
@@ -3871,8 +4071,13 @@ pub unsafe extern "C" fn ant_publisher_start(
 ///
 /// * `0` — queued.
 /// * `1` — queued, and the oldest pending segment was dropped to stay at
-///   the live edge (the playlist marks the gap `#EXT-X-DISCONTINUITY`).
-/// * `2` — refused: the broadcast is stopping.
+///   the live edge (the playlist lists it as an `#EXT-X-GAP` entry).
+/// * `2` — refused: the broadcast is stopping (by the host's
+///   [`ant_publisher_stop`], or by itself once `reap_ms` passed with no
+///   media).
+/// * `3` — withheld, not uploaded: the broadcast is paused
+///   ([`ant_publisher_pause`]). Media only; an initialization segment is
+///   queued until [`ant_publisher_resume`].
 /// * `-1` — error, with an allocated message in `out_err` (free with
 ///   [`ant_free_string`]).
 ///
@@ -3924,6 +4129,102 @@ pub unsafe extern "C" fn ant_publisher_push_segment(
             publisher::PushOutcome::Queued => 0,
             publisher::PushOutcome::QueuedDroppingOldest => 1,
             publisher::PushOutcome::Closed => 2,
+            publisher::PushOutcome::Withheld => 3,
+        }
+    }
+}
+
+/// The device lost its connection mid-broadcast (issue #172): pause the
+/// running broadcast instead of letting it end or fill with failures.
+/// Call it alongside [`ant_suspend`] when the network goes. The
+/// broadcast goes silent: media segments pushed while paused are
+/// withheld (`ant_publisher_push_segment` returns `3`), initialization
+/// segments wait for [`ant_publisher_resume`], and the live playlist
+/// simply stops advancing — nothing is closed and no `#EXT-X-ENDLIST`
+/// is written. Non-blocking and idempotent.
+///
+/// Returns `0`, or `-1` with an allocated message in `out_err` (free
+/// with [`ant_free_string`]) when no broadcast is running.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_pause(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        publisher_call(
+            handle,
+            out_err,
+            "ant_publisher_pause",
+            publisher::LiveRun::pause,
+        )
+    }
+}
+
+/// The connection is back: the paused broadcast carries on in the same
+/// feed and the same recording, its next media segment behind one
+/// `#EXT-X-DISCONTINUITY` and dated from the wall clock again. The first
+/// return after the last listed segment also restarts the reap window
+/// (`reap_ms` in the start config), so a return late in an outage still
+/// gets the whole window to deliver its first segment; a return after
+/// the window already ran out during the outage ends the broadcast
+/// instead (progress then reports `reaped`). Call it after
+/// [`ant_resume`] / [`ant_wake`] when the network returns, and on a
+/// return to the foreground; harmless without a prior pause.
+/// Non-blocking and idempotent.
+///
+/// Return values and safety: as [`ant_publisher_pause`].
+///
+/// # Safety
+///
+/// See [`ant_publisher_pause`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_resume(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        publisher_call(
+            handle,
+            out_err,
+            "ant_publisher_resume",
+            publisher::LiveRun::resume,
+        )
+    }
+}
+
+/// Run `f` on the running broadcast: `0`, or `-1` with an error.
+unsafe fn publisher_call(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+    name: &str,
+    f: impl FnOnce(&publisher::LiveRun),
+) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, &format!("{name}: null handle"));
+            return -1;
+        };
+        let run = handle
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(run) = run else {
+            write_out_err(out_err, &format!("{name}: this node is not broadcasting"));
+            return -1;
+        };
+        if catch_unwind(AssertUnwindSafe(|| f(&run))).is_ok() {
+            0
+        } else {
+            write_out_err(out_err, &format!("panic in {name}"));
+            -1
         }
     }
 }
@@ -3965,15 +4266,26 @@ pub unsafe extern "C" fn ant_publisher_progress(
 ///
 /// **Blocking**: stopping is cooperative. Segments already captured are
 /// published (the last seconds of a broadcast are real content, not a
-/// truncated measurement) and the playlist is closed with
-/// `#EXT-X-ENDLIST` so viewers see a finished recording rather than a
-/// stream that just stopped updating. Returns after
-/// [`PUBLISHER_STOP_GRACE`] (~130 s) at the latest — a worst-case
-/// drain can still be finishing in the background past that (see the
-/// constant) — so call it off the UI thread.
+/// truncated measurement), the live playlist is closed with
+/// `#EXT-X-ENDLIST` (a viewer following the live edge stops there), and
+/// the whole broadcast is published as the recording, one
+/// `#EXT-X-PLAYLIST-TYPE:VOD` playlist that is the feed's final update
+/// (issue #168). The report's `recording_reference` names it; it is
+/// empty if its upload failed or had not landed when the grace ran out.
+/// Returns after
+/// [`PUBLISHER_STOP_GRACE`] (~130 s), plus at most
+/// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
+/// wire then — a worst-case drain, closing window and recording can
+/// still be finishing in the background past that (see the constant) —
+/// so call it off the UI thread. The report's `feed_index` (`null` when
+/// the run ended before its feed head ever answered: no position to hand
+/// on) is final either way: a run that outlives the grace writes no further feed
+/// update, so the next broadcast, which starts there (reading the feed
+/// head, or given it as `start_index`), never collides with a late
+/// closing window or recording.
 ///
-/// Calling it on a broadcast that already finished on its own returns
-/// that broadcast's report. Once a stop call has *returned* and
+/// Calling it on a broadcast that already finished on its own (reaped
+/// after `reap_ms` with no media) returns that broadcast's report. Once a stop call has *returned* and
 /// released the slot, a second call fails with "not broadcasting" —
 /// keep the report from the first call rather than re-fetching it.
 ///
@@ -4000,6 +4312,15 @@ pub unsafe extern "C" fn ant_publisher_stop(
             let deadline = Instant::now() + PUBLISHER_STOP_GRACE;
             while !run.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(PUBLISHER_STOP_POLL);
+            }
+            // Out of grace with the loop still going: its `feed_index`
+            // must be final before the report hands it out as where the
+            // next broadcast starts (see `PUBLISHER_STOP_GRACE`).
+            if !run.is_finished() && run.seal_feed() {
+                let deadline = Instant::now() + PUBLISHER_SEAL_GRACE;
+                while run.feed_update_in_flight() && Instant::now() < deadline {
+                    std::thread::sleep(PUBLISHER_STOP_POLL);
+                }
             }
             let report = run.report();
             // Only release the slot once the loop is actually done, and
@@ -4302,6 +4623,47 @@ mod android_log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host-facing topic hash is the publisher's: bee-js
+    /// `Topic.fromString`, checked against the vector Solar Punk's
+    /// `ladderMarker.test.ts` freezes.
+    #[test]
+    fn topic_from_string_ffi_matches_bee_js() {
+        let text = CString::new("ladder-marker-vector-group").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let raw = unsafe { ant_topic_from_string(text.as_ptr(), &raw mut err) };
+        assert!(!raw.is_null() && err.is_null());
+        let hex = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        unsafe { ant_free_string(raw) };
+        assert_eq!(
+            hex,
+            "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5"
+        );
+    }
+
+    /// The viewer's marker address is the publisher's: the vector
+    /// computed with bee-js 13.1.0 and stream-event-client's
+    /// `ladderMarkerIdentifier` on the derived group (see
+    /// `publisher::tests::the_ladder_group_and_its_marker_addresses_match_solar_punk`).
+    #[test]
+    fn ladder_marker_id_ffi_matches_the_publisher() {
+        let topic =
+            CString::new("0xb0050c33bf70c99caa3fac075622bc8d699462306c1f3baff35dae253d650416")
+                .unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let raw = unsafe { ant_ladder_marker_id(topic.as_ptr(), 176_044_800, &raw mut err) };
+        assert!(!raw.is_null() && err.is_null());
+        let hex = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        unsafe { ant_free_string(raw) };
+        assert_eq!(
+            hex,
+            "bd5b1732eb10afec844d023e950a8979cd05c550146c103cc637622b2666b1c8"
+        );
+        let short = CString::new("abcd").unwrap();
+        let raw = unsafe { ant_ladder_marker_id(short.as_ptr(), 1, &raw mut err) };
+        assert!(raw.is_null() && !err.is_null());
+        unsafe { ant_free_string(err) };
+    }
 
     /// `log_layer`'s filter must stay scoped to itself: a host composing
     /// it with another layer (freedom-ipfs's progress recorder) needs

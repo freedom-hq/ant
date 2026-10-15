@@ -89,6 +89,18 @@ final class AntNode: ObservableObject {
     @Published private(set) var channel: Channel?
     /// The channel's shareable reference, once its feed manifest exists.
     @Published private(set) var channelReference: String?
+    /// A broadcast this account was in the middle of when the app was
+    /// killed or crashed (#175), read from its recovery entry; `nil` when
+    /// there is none, or while this launch is broadcasting.
+    @Published private(set) var unfinishedBroadcast: UnfinishedBroadcast?
+    /// A broadcast started on this node and its stop has not returned:
+    /// the recovery entry on disk is its own, not an unfinished one.
+    private var publisherActive = false
+    /// ``finishUnfinishedBroadcast()`` is running: the publisher is that
+    /// broadcast, so ``unfinishedBroadcast`` stays up (its card shows the
+    /// finalize in progress, and Go live stays held) until the stop
+    /// returns and the entry on disk says how it went.
+    private var finalizingUnfinished = false
 
     /// The preferred gateway address and the start of the fallback range
     /// (the same range Freedom desktop uses).
@@ -429,10 +441,24 @@ final class AntNode: ObservableObject {
                 if self.networkLabel != label { self.networkLabel = label }
                 guard self.isOffline != offline else { return }
                 self.isOffline = offline
+                // A broadcast in progress pauses rather than ends (#172):
+                // silent while the network is gone, and carried on in
+                // the same feed and recording behind one seam when it
+                // returns. Resumed after `wake`, so the swarm is warm
+                // again before the reap window restarts, or before a
+                // reap that fell due offline uploads the closing
+                // playlist and the recording.
                 if offline {
+                    await self.pausePublisher()
                     await self.suspend()
                 } else {
                     await self.wake()
+                    // `wake` suspends: the path may have dropped again
+                    // meanwhile, and that offline pass has already
+                    // paused the run. Resuming now would unpause it
+                    // against a dead uplink (and reap there, if a reap
+                    // fell due) — leave it for the next return.
+                    if !self.isOffline { await self.resumePublisher() }
                 }
             }
         }
@@ -460,7 +486,19 @@ final class AntNode: ObservableObject {
     /// it is true one line after launch, offline included — so a
     /// broadcast gate has to look at the live path and the peer count
     /// too, or a device in airplane mode reads as ready.
-    var isOnNetwork: Bool { !isOffline && status.isReady && peerCount > 0 }
+    ///
+    /// The count is `minPeersToBroadcast`, not one: a broadcast reads
+    /// its channel's feed head before its first playlist (#173), and the
+    /// node only confirms a miss there (a new channel's empty feed, or
+    /// the slot after the head) when more than two peers answer it, so
+    /// with one or two peers it would upload segments but publish no
+    /// playlist.
+    var isOnNetwork: Bool {
+        !isOffline && status.isReady && peerCount >= Self.minPeersToBroadcast
+    }
+
+    /// Peers the node needs before going live; see `isOnNetwork`.
+    static let minPeersToBroadcast = 3
 
     /// Everything a first launch has to get through before the device can
     /// go live — the conjunction of the Broadcast tab's readiness
@@ -684,29 +722,65 @@ final class AntNode: ObservableObject {
     /// measured 4 as the stable point and 8 as a connection-layer
     /// collapse, so it is not a knob this screen should offer.
     ///
-    /// `topic` and `startIndex` come from the account's permanent
+    /// `topic` and `topicText` come from the account's permanent
     /// ``Channel``: the same topic every time keeps the channel link
-    /// stable, and `startIndex` continues the feed after the previous
-    /// broadcast instead of rewriting the indices that hold it.
+    /// stable. No `start_index` is passed: the node reads the feed head
+    /// and continues after it (#173), with the media sequence numbered on
+    /// from the previous broadcast and the recording opening with it, so
+    /// an index this app lost track of (a reinstall, another device on
+    /// the same account) can't rewrite earlier broadcasts. A channel with
+    /// a text topic hands the publisher the text (it hashes it to the
+    /// same bytes) so the report names it too.
+    ///
+    /// Every broadcast keeps a recovery entry (`recovery_path`, #175) in
+    /// the account's file under `Application Support/antstream/`, so a
+    /// kill or crash leaves what the next launch needs to carry it on
+    /// (`resume`) or end it into its recording
+    /// (``finishUnfinishedBroadcast()``). The node removes it once the
+    /// recording is the feed's head.
     func startPublisher(
         channel: String,
         topic: String,
-        startIndex: UInt64,
+        topicText: String?,
+        owner: String,
         batchId: String,
         bitrateKbps: UInt32,
         segmentMs: UInt32,
-        notes: String
+        notes: String,
+        resume: Bool = false
     ) async throws {
-        let config: [String: Any] = [
+        var config: [String: Any] = [
+            "recovery_path": Self.recoveryURL(owner: owner).path,
+            "resume": resume,
             "channel": channel,
-            "topic": topic,
-            "start_index": startIndex,
             "gateway": "http://\(gatewayAddress)",
             "batch_id": batchId,
             "bitrate_kbps": bitrateKbps,
             "segment_ms": segmentMs,
             "notes": notes,
+            // The `/bzz` format, not Solar Punk's (#167): see
+            // `broadcastFormat`.
+            "format": Self.broadcastFormat,
+            // A broadcast whose network (or the app) is gone for a whole
+            // minute ends by itself, as Solar Punk's uploader does
+            // (#172); anything shorter is a pause with one seam.
+            // `LiveBroadcast` notices the `reaped` flag and finishes the
+            // stop.
+            "reap_ms": Self.reapMsForThisLaunch,
+            // A ladder time marker every ten seconds (#174), so a viewer
+            // joining hours in reads one marker and then one round of
+            // feed slots from the index it names instead of walking the
+            // feed from 0 (the Watch tab here does). 360 chunks an hour
+            // on the plan. Under "bzz" there is no master playlist: that
+            // is for Solar Punk's players, which read "solar-punk" only.
+            "ladder": Self.broadcastLadder,
         ]
+        // One or the other: the publisher refuses both at once.
+        if let topicText {
+            config["topic_text"] = topicText
+        } else {
+            config["topic"] = topic
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: config),
               let json = String(data: data, encoding: .utf8) else {
             throw AntError.op("could not encode the broadcast configuration")
@@ -724,11 +798,188 @@ final class AntNode: ObservableObject {
         }
         guard let started = failure else { throw AntError.notReady }
         if let message = started { throw AntError.op(message) }
+        publisherActive = true
+        if !finalizingUnfinished { unfinishedBroadcast = nil }
+    }
+
+    /// The format every broadcast goes out in: `/bzz`, not Solar Punk's
+    /// (#167). The web player the Share links open and the Android Watch
+    /// tab read only `/bzz/<channel>/stream.m3u8`, so a "solar-punk"
+    /// broadcast would be unplayable there. The Watch tab here reads both.
+    static let broadcastFormat = "bzz"
+    /// Every broadcast writes ladder time markers (#174).
+    static let broadcastLadder = true
+
+    // MARK: - Storage room for a broadcast (#176)
+
+    /// Estimates already worked out for ``capacityCachePlan``, by
+    /// quality: the views ask on every redraw. Emptied whenever the plan
+    /// changes (mid-broadcast its room shrinks with every refresh), so it
+    /// never holds more than one plan's few qualities. Recomputing after
+    /// a change is cheap: the library remembers the broadcast's cost per
+    /// config, so only the room changes.
+    private var capacityCache: [CaptureEngine.Quality: CapacityEstimate] = [:]
+    private var capacityCachePlan: StoragePlan?
+
+    /// How long a broadcast at `quality` fits on the connected plan
+    /// (#176), from the library's `ant_publisher_capacity`: what a minute
+    /// of it stamps (segments at the video and audio rate, the playlist
+    /// and feed update after each, the ladder markers, the recording)
+    /// against the room left in the plan's fullest bucket. `nil` with no
+    /// plan. Needs no node; the same format and ladder setting
+    /// ``startPublisher`` sends.
+    func capacity(for quality: CaptureEngine.Quality) -> CapacityEstimate? {
+        guard let plan, plan.enabled, !plan.batchId.isEmpty else { return nil }
+        if capacityCachePlan != plan {
+            capacityCache = [:]
+            capacityCachePlan = plan
+        }
+        if let cached = capacityCache[quality] { return cached }
+        let settings = CaptureEngine.Settings(quality: quality)
+        let config: [String: Any] = [
+            "channel": "",
+            "batch_id": plan.batchId,
+            "bitrate_kbps": settings.bitrateKbps + CaptureEngine.audioBitrateKbps,
+            "segment_ms": Int(settings.segmentSeconds * 1000),
+            "format": Self.broadcastFormat,
+            "ladder": Self.broadcastLadder,
+        ]
+        guard let configData = try? JSONSerialization.data(withJSONObject: config),
+              let configJSON = String(data: configData, encoding: .utf8),
+              let planData = try? JSONEncoder().encode(plan),
+              let planJSON = String(data: planData, encoding: .utf8)
+        else { return nil }
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        let raw = configJSON.withCString { configPtr in
+            planJSON.withCString { planPtr in
+                ant_publisher_capacity(configPtr, planPtr, &errPtr)
+            }
+        }
+        if let errPtr { ant_free_string(errPtr) }
+        guard let raw else { return nil }
+        defer { ant_free_string(raw) }
+        guard let estimate = StreamDecoder.capacity(from: String(cString: raw)) else { return nil }
+        capacityCache[quality] = estimate
+        return estimate
+    }
+
+    // MARK: - Unfinished broadcast (#175)
+
+    /// Where the publisher keeps `owner`'s recovery entry: one file per
+    /// account, so a restored or switched account never offers another
+    /// account's broadcast (the node refuses to resume one anyway).
+    static func recoveryURL(owner: String) -> URL {
+        let hex = owner.lowercased().replacingOccurrences(of: "0x", with: "")
+        return resolveDataDir().appendingPathComponent("broadcast-recovery-\(hex).json")
+    }
+
+    /// Re-read this account's recovery entry. Nothing while this launch
+    /// is broadcasting (the entry is the running broadcast's own) or the
+    /// account is not known yet. An entry that can't be read is left on
+    /// disk and not offered: the node could not resume it either.
+    func refreshUnfinishedBroadcast() {
+        if unfinishedSampleActive || finalizingUnfinished { return }
+        guard !publisherActive, let owner = channel?.owner else {
+            if unfinishedBroadcast != nil { unfinishedBroadcast = nil }
+            return
+        }
+        let url = Self.recoveryURL(owner: owner)
+        let hex = owner.lowercased().replacingOccurrences(of: "0x", with: "")
+        let entry = (try? Data(contentsOf: url)).flatMap(UnfinishedBroadcast.decode)
+        let found = entry?.owner == hex ? entry : nil
+        if found != unfinishedBroadcast { unfinishedBroadcast = found }
+    }
+
+    /// End the unfinished broadcast without going live again: the node
+    /// resumes it and stops straight away, so its closing window and
+    /// recording go up as on any stop and the channel's head plays every
+    /// segment that landed before the app went. Blocks like a stop.
+    func finishUnfinishedBroadcast() async throws -> PublisherReport {
+        guard let unfinished = unfinishedBroadcast, let channel else {
+            throw AntError.op("There is no unfinished broadcast to end.")
+        }
+        guard let batchId = plan?.batchId, plan?.enabled == true else {
+            throw AntError.op("Connect a storage plan to end the broadcast: its recording is an upload.")
+        }
+        let settings = CaptureEngine.Settings(quality: .low)
+        finalizingUnfinished = true
+        defer {
+            // Once the stop returned (or the start failed), the entry on
+            // disk decides: gone once the recording landed, kept to retry.
+            finalizingUnfinished = false
+            refreshUnfinishedBroadcast()
+        }
+        try await startPublisher(
+            channel: unfinished.channel,
+            topic: channel.topic,
+            topicText: channel.topicText,
+            owner: channel.owner,
+            batchId: batchId,
+            bitrateKbps: UInt32(settings.bitrateKbps),
+            segmentMs: UInt32(settings.segmentSeconds * 1000),
+            notes: "ending an unfinished broadcast",
+            resume: true
+        )
+        return try await stopPublisher()
+    }
+
+    /// Forget the unfinished broadcast: its segments stay on Swarm and
+    /// the channel keeps its last live window, but it is never closed or
+    /// recorded. For an entry the node refuses (the channel moved on).
+    func discardUnfinishedBroadcast() {
+        guard let owner = channel?.owner else { return }
+        try? FileManager.default.removeItem(at: Self.recoveryURL(owner: owner))
+        unfinishedSampleActive = false
+        unfinishedBroadcast = nil
+    }
+
+    /// How long a broadcast outlives its media before it ends by itself
+    /// (`reap_ms`, issue #172): Solar Punk's `ORPHAN_REAP_MS`.
+    static let broadcastReapMs: UInt64 = 60_000
+
+    /// ``broadcastReapMs``, except under `antstream-visual`'s plain
+    /// `-antstream-shot-live`: the runner's sample batch is rejected, so
+    /// nothing is ever listed, and a minute's reap would end the
+    /// broadcast before shots 11/12 capture it live. The paused run
+    /// (`-antstream-shot-live-paused`) keeps the real window so shot 19
+    /// shows the reap.
+    static var reapMsForThisLaunch: UInt64 {
+        let args = RootView.shotArgs
+        if args.contains("-antstream-shot-live"), !args.contains("-antstream-shot-live-paused") {
+            return 600_000
+        }
+        return broadcastReapMs
+    }
+
+    /// The network went: pause the running broadcast (`ant_publisher_pause`)
+    /// so it goes silent instead of filling with failed uploads. A no-op
+    /// when nothing is broadcasting.
+    func pausePublisher() async {
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_publisher_pause(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            }.value
+        }
+    }
+
+    /// The network (or the app) is back: carry the paused broadcast on
+    /// (`ant_publisher_resume`). Also called on every return to the
+    /// foreground, which restarts the reap window once. A no-op when
+    /// nothing is broadcasting.
+    func resumePublisher() async {
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_publisher_resume(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            }.value
+        }
     }
 
     /// Hand one captured segment to the publisher. Returns the FFI's
     /// disposition: `0` queued, `1` queued after dropping the oldest
-    /// pending segment, `2` refused (stopping), `-1` error.
+    /// pending segment, `2` refused (stopping, or ended by itself),
+    /// `3` withheld (paused: the network is gone), `-1` error.
     ///
     /// Non-blocking node-side, so the capture pipeline is never stalled
     /// by the uplink — which is the whole point of the drop-oldest
@@ -768,11 +1019,18 @@ final class AntNode: ObservableObject {
     /// End the broadcast and take its final report.
     ///
     /// `ant_publisher_stop` blocks while the already-captured segments
-    /// are published and the playlist is closed with `#EXT-X-ENDLIST`
-    /// (up to ~130 s, its stop grace), so this must not run on the main
+    /// are published, the playlist is closed with `#EXT-X-ENDLIST` and
+    /// the whole broadcast goes up as the recording (up to ~130 s, its stop grace, ~195 s worst case), so this must not run on the main
     /// actor's thread — ``ffiString`` already hops onto a detached task
     /// for that reason.
     func stopPublisher() async throws -> PublisherReport {
+        defer {
+            // The stop has returned, so whatever entry is left is an
+            // unfinished broadcast (a recording that did not land, or a
+            // resume the node refused): offer it again.
+            publisherActive = false
+            refreshUnfinishedBroadcast()
+        }
         let json = try await ffiString(name: "stop broadcast") { h, errPtr in
             ant_publisher_stop(h, errPtr)
         }
@@ -787,6 +1045,7 @@ final class AntNode: ObservableObject {
     func refreshAll() async {
         await refreshPlan()
         await refreshAccount()
+        refreshUnfinishedBroadcast()
         await refreshSettlement()
         await ensureChannelReference()
     }
@@ -992,7 +1251,38 @@ final class AntNode: ObservableObject {
     /// deposit card and the going-live screen, and the storage meter
     /// shows a populated bar rather than "no plan".
     private static func sampleConnectedPlan(batchId: String) -> StoragePlan {
-        StoragePlan(
+        // `-antstream-shot-low-capacity`: an immutable plan whose fullest
+        // bucket leaves about twenty minutes of 360p (#176), so the
+        // checklist and the going-live screen show their warning.
+        // `-antstream-shot-unusable-plan`: a roomy immutable plan the
+        // node won't stamp with at all (expired or unknown to it, and not
+        // merely propagating), so the checklist and the going-live screen
+        // show "Swarm won't accept this plan's stamps" (#176, R1-F1).
+        if RootView.shotArgs.contains("-antstream-shot-unusable-plan") {
+            return StoragePlan(
+                enabled: true,
+                batchId: batchId,
+                batchDepth: 22,
+                immutable: true,
+                totalCapacityChunks: 4_194_304,
+                issuedChunks: 40_000,
+                worstCaseRemainingChunks: 4_000_000,
+                usable: false,
+                propagating: false
+            )
+        }
+        if RootView.shotArgs.contains("-antstream-shot-low-capacity") {
+            return StoragePlan(
+                enabled: true,
+                batchId: batchId,
+                batchDepth: 22,
+                immutable: true,
+                totalCapacityChunks: 4_194_304,
+                issuedChunks: 3_900_000,
+                worstCaseRemainingChunks: 46_000
+            )
+        }
+        return StoragePlan(
             enabled: true,
             batchId: batchId,
             batchDepth: 22,
@@ -1060,6 +1350,30 @@ final class AntNode: ObservableObject {
             needsTopUp: true,
             xdaiToSendDisplay: "0.0150",
             sufficientFunds: false
+        )
+    }
+
+    /// Set while ``installUnfinishedSample()``'s entry is showing, so a
+    /// periodic refresh can't replace it with the runner's real (empty)
+    /// state before the shot fires.
+    private var unfinishedSampleActive = false
+
+    /// The Broadcast tab's "Unfinished broadcast" card for a CI
+    /// screenshot: a runner never has a broadcast killed under it, so
+    /// this shows a sample one saved 20 s ago, recent enough to resume.
+    /// Nothing is written to disk. Sample only, and only ever called
+    /// behind `-antstream-shot-unfinished`.
+    func installUnfinishedSample() {
+        installChannelSample()
+        unfinishedSampleActive = true
+        unfinishedBroadcast = UnfinishedBroadcast(
+            channel: "Kitchen",
+            owner: channel?.owner.lowercased() ?? "",
+            broadcastId: "19a3c5e2f10",
+            savedAt: Date().addingTimeInterval(-20),
+            segments: 214,
+            seconds: 428,
+            ended: false
         )
     }
 
@@ -1294,11 +1608,9 @@ final class AntNode: ObservableObject {
 /// topic) is one link a viewer can bookmark, shared before going live.
 /// Ported from the Android app's `Channel.kt`.
 ///
-/// Every broadcast continues the feed where the last one stopped
-/// (``nextIndex`` becomes the publisher's `start_index`): rewriting
-/// indices that already hold an old broadcast's playlists would collide
-/// with them. The index is saved as the broadcast runs, so even an app
-/// killed mid-stream resumes at most one update behind.
+/// Every broadcast continues the feed where the last one stopped: the
+/// node reads the feed head at the start of each broadcast and writes
+/// after it (#173), so nothing here tracks the index.
 ///
 /// Scoped to the account address: a restored account gets its own
 /// channel. Lives in `UserDefaults` — nothing here is secret, the topic
@@ -1307,6 +1619,14 @@ struct Channel: Equatable {
     let owner: String
     /// 32-byte feed topic, hex, created once per account.
     let topic: String
+    /// The topic's text name (`topic` is `keccak256` of it, bee-js
+    /// `Topic.fromString`): what a Solar Punk catalog entry carries, so
+    /// once the app publishes the "solar-punk" format (see
+    /// ``AntNode/startPublisher``) a broadcast on this channel plays in
+    /// their viewers given only the owner and this text. `nil` for a channel created before text
+    /// topics, whose random topic bytes no text names; it keeps them, so
+    /// its link stays the same.
+    let topicText: String?
 
     private let prefix: String
     private var defaults: UserDefaults { .standard }
@@ -1314,37 +1634,52 @@ struct Channel: Equatable {
     init(owner: String) {
         let prefix = "antstream.channel.\(owner.lowercased())."
         let key = prefix + "topic"
+        let textKey = prefix + "topicText"
+        let defaults = UserDefaults.standard
         let topic: String
-        if let stored = UserDefaults.standard.string(forKey: key), stored.count == 64 {
+        var topicText: String? = nil
+        if let stored = defaults.string(forKey: key), stored.count == 64 {
             topic = stored
+            topicText = defaults.string(forKey: textKey)
         } else {
-            // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
-            // platforms.
-            let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
-            topic = bytes.map { String(format: "%02x", $0) }.joined()
-            UserDefaults.standard.set(topic, forKey: key)
+            let text = "antstream-\(UUID().uuidString.lowercased())"
+            if let hex = Self.topicHex(text) {
+                topic = hex
+                topicText = text
+                // Text first: a topic stored without its text would be
+                // read back as a pre-text-topic channel.
+                defaults.set(text, forKey: textKey)
+            } else {
+                // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
+                // platforms.
+                let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+                topic = bytes.map { String(format: "%02x", $0) }.joined()
+            }
+            defaults.set(topic, forKey: key)
         }
         self.owner = owner
         self.prefix = prefix
         self.topic = topic
+        self.topicText = topicText
+    }
+
+    /// `keccak256(utf8(text))` as hex, from the library (the publisher
+    /// hashes `topic_text` the same way).
+    private static func topicHex(_ text: String) -> String? {
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        guard let raw = text.withCString({ ant_topic_from_string($0, &errPtr) }) else {
+            if let errPtr { ant_free_string(errPtr) }
+            return nil
+        }
+        defer { ant_free_string(raw) }
+        let hex = String(cString: raw)
+        return hex.count == 64 ? hex : nil
     }
 
     /// The name the last broadcast used; seeds the live screen's field.
     var name: String? {
         get { defaults.string(forKey: prefix + "name") }
         nonmutating set { defaults.set(newValue, forKey: prefix + "name") }
-    }
-
-    /// The feed index the next broadcast starts at.
-    var nextIndex: UInt64 {
-        UInt64(max(0, defaults.integer(forKey: prefix + "nextIndex")))
-    }
-
-    /// Record the publisher's `feed_index`. Only ever forward: a stale
-    /// report must not rewind the feed.
-    func advance(to index: UInt64) {
-        guard index > nextIndex, index <= UInt64(Int.max) else { return }
-        defaults.set(Int(index), forKey: prefix + "nextIndex")
     }
 
     /// The shareable channel reference, once its feed manifest exists.

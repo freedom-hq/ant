@@ -82,9 +82,9 @@ pub use enc_split::{
 };
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_after,
-    resolve_sequence_feed_full, resolve_sequence_feed_hinted, sequence_update_address,
-    sequence_update_id, Feed, FeedError, FeedHints, FeedResolution, FeedType, FEED_OWNER_KEY,
-    FEED_TOPIC_KEY, FEED_TYPE_KEY,
+    resolve_sequence_feed_exact, resolve_sequence_feed_full, resolve_sequence_feed_hinted,
+    sequence_update_address, sequence_update_id, Feed, FeedError, FeedHints, FeedResolution,
+    FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{

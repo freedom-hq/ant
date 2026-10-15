@@ -60,6 +60,11 @@ final class LiveBroadcast: ObservableObject {
     /// knows the last segment has reached the publisher.
     private var pumpDrained = true
     private var idleTimerHeld = false
+    /// The running broadcast carries on an unfinished one (#175): the
+    /// node can still refuse it once it reads the feed head (the channel
+    /// moved on), which ends the run by itself with the reason in its
+    /// errors, and ``stop`` shows that reason as the failure.
+    private var resumedRun = false
 
     /// The quality preset the next broadcast encodes, picked on the live
     /// screen before going live and remembered across launches. 360p by
@@ -70,9 +75,15 @@ final class LiveBroadcast: ObservableObject {
 
     private static let qualityKey = "antstream.quality"
 
+    /// The quality the next broadcast will use, as last picked. The
+    /// Broadcast tab's checklist estimates the plan's room at it (#176).
+    static var storedQuality: CaptureEngine.Quality {
+        let stored = UserDefaults.standard.string(forKey: qualityKey) ?? ""
+        return CaptureEngine.Quality(rawValue: stored) ?? .low
+    }
+
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.qualityKey) ?? ""
-        quality = CaptureEngine.Quality(rawValue: stored) ?? .low
+        quality = Self.storedQuality
     }
 
     /// The rendition for ``quality``, with 2 s segments. The same values
@@ -92,11 +103,21 @@ final class LiveBroadcast: ObservableObject {
 
     // MARK: - Lifecycle
 
-    func start(node: AntNode, channel: String, source: CaptureEngine.Source? = nil) async {
+    /// `resume` carries on the broadcast the app was killed in the middle
+    /// of (#175, ``AntNode/unfinishedBroadcast``) instead of starting a
+    /// new one: same feed, same recording, the camera's first segment
+    /// behind one seam.
+    func start(
+        node: AntNode,
+        channel: String,
+        source: CaptureEngine.Source? = nil,
+        resume: Bool = false
+    ) async {
         guard !state.isActive else { return }
         report = nil
         progress = nil
         capturedSegments = 0
+        resumedRun = resume
         state = .starting
 
         guard let batchId = node.plan?.batchId, node.plan?.enabled == true else {
@@ -121,11 +142,13 @@ final class LiveBroadcast: ObservableObject {
             try await node.startPublisher(
                 channel: channel,
                 topic: permanent.topic,
-                startIndex: permanent.nextIndex,
+                topicText: permanent.topicText,
+                owner: permanent.owner,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),
                 segmentMs: UInt32(settings.segmentSeconds * 1000),
-                notes: Self.deviceNotes(network: node.networkLabel, source: source)
+                notes: Self.deviceNotes(network: node.networkLabel, source: source),
+                resume: resume
             )
         } catch {
             state = .failed(error.localizedDescription)
@@ -174,12 +197,19 @@ final class LiveBroadcast: ObservableObject {
         self.engine = engine
         engine.start()
         state = .live
-        startPolling(node: node, channel: permanent)
+        startPolling(node: node)
     }
 
     /// End the broadcast. Capture stops first so the segment in flight
     /// is finished and published, then the publisher closes the playlist
-    /// with `#EXT-X-ENDLIST`.
+    /// with `#EXT-X-ENDLIST` and publishes the whole broadcast as the
+    /// recording.
+    ///
+    /// The only other end is the node's own (#172): a broadcast whose
+    /// network is gone is paused, not stopped (``AntNode`` pauses and
+    /// resumes it with the network), and only a minute with nothing
+    /// reaching the playlist ends it (a minute that ran out offline, at
+    /// the network's return); the progress poll then calls this.
     func stop(node: AntNode, failure: String? = nil) async {
         guard state.isActive else { return }
         state = .stopping
@@ -213,32 +243,43 @@ final class LiveBroadcast: ObservableObject {
         pumpTask = nil
         releaseIdleTimer()
         deactivateAudioSession()
+        let wasResume = resumedRun
+        resumedRun = false
         do {
-            let finished = try await node.stopPublisher()
-            report = finished
-            if let next = finished.feedIndex { node.channel?.advance(to: next) }
+            report = try await node.stopPublisher()
         } catch {
             if failure == nil {
                 state = .failed(error.localizedDescription)
                 return
             }
         }
+        // A resume the node refused at the feed head ended the run with
+        // nothing written: say why rather than read as a clean stop.
+        if failure == nil, wasResume,
+           let refusal = report?.errors.first(where: { $0.hasPrefix("resume:") }) {
+            state = .failed(refusal)
+            return
+        }
         state = failure.map(State.failed) ?? .idle
     }
 
     // MARK: - Progress
 
-    private func startPolling(node: AntNode, channel: Channel) {
+    private func startPolling(node: AntNode) {
         pollTask?.cancel()
         pollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self, self.state.isActive else { return }
                 if let snapshot = await node.publisherProgress() {
                     self.progress = snapshot
-                    // Saved as it advances, so the next broadcast
-                    // continues the feed even if this one is killed
-                    // mid-stream.
-                    channel.advance(to: snapshot.feedIndex)
+                    // A minute with nothing reaching the playlist (the
+                    // network, or the app, gone that long) ends the
+                    // broadcast node-side (#172): finish the stop here
+                    // so the camera goes off and the report shows.
+                    if snapshot.reaped == true || !snapshot.running {
+                        Task { await self.stop(node: node) }
+                        return
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }

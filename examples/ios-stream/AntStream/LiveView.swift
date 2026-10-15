@@ -23,6 +23,22 @@ struct LiveView: View {
     /// the device's, the first time) so going live needs no typing but
     /// stays editable.
     @State private var channel = ""
+    /// The first go-live here carries on the broadcast the app was killed
+    /// in the middle of (#175) rather than starting a new one. Cleared
+    /// once used: a later go-live from this screen is a new broadcast.
+    @State private var resumePending: Bool
+    /// The run started from here last was a resume: once it ends with the
+    /// unfinished broadcast's entry still on disk (the node refused it,
+    /// or it failed), the button stays a resume, so the next tap never
+    /// starts a new broadcast that would replace that entry.
+    @State private var lastRunWasResume = false
+    /// Going live was tapped on a plan with under an hour of room at the
+    /// picked quality, or one Swarm won't stamp with (#176): ask first.
+    @State private var confirmLowCapacity = false
+
+    init(resume: Bool = false) {
+        _resumePending = State(initialValue: resume)
+    }
 
     var body: some View {
         ZStack {
@@ -44,7 +60,32 @@ struct LiveView: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .alert(lowCapacityTitle, isPresented: $confirmLowCapacity) {
+            Button("Go live anyway", role: .destructive) {
+                Task { await goLive() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(capacity?.warning ?? "")
+        }
+        .onChange(of: broadcast.state) { _, state in
+            // A resumed run that ended with its entry still on disk (the
+            // node refused it at the feed head, or it failed): the next
+            // tap resumes again rather than replacing the entry with a
+            // new broadcast, as long as the entry can still be resumed
+            // (the same `canResume` the Broadcast tab's card offers
+            // Resume on). One a stop had begun closing, or older than the
+            // reap window, can only be ended: the button is then held
+            // (see `blockedByUnfinished`) and the card ends it. Any run,
+            // not only a resume, can leave such an entry behind (a stop
+            // whose recording upload failed).
+            guard !state.isActive, lastRunWasResume else { return }
+            resumePending = resumable(now: Date())
+        }
         .task {
+            if resumePending, let unfinished = node.unfinishedBroadcast {
+                channel = unfinished.channel
+            }
             if channel.isEmpty { channel = node.channel?.name ?? UIDevice.current.name }
             // `-antstream-shot-live-idle` shows the screen before going
             // live (the quality picker), with the sample plan installed
@@ -71,6 +112,19 @@ struct LiveView: View {
             // fail honestly at the gateway's batch check.
             node.installBroadcastSample()
             await broadcast.start(node: node, channel: "CI test pattern")
+            // `-antstream-shot-live-paused` then drops the "network" the
+            // way `AntNode`'s path monitor does when the device goes
+            // offline (#172), so CI captures the paused state. The
+            // "network" comes back 65 s later, past the minute's reap
+            // window: the reap held for the return then ends the
+            // broadcast (it never ends one while offline, since its
+            // closing uploads need the uplink).
+            if RootView.shotArgs.contains("-antstream-shot-live-paused") {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await node.pausePublisher()
+                try? await Task.sleep(nanoseconds: 65_000_000_000)
+                await node.resumePublisher()
+            }
         }
     }
 
@@ -180,6 +234,23 @@ struct LiveView: View {
                         .font(.footnote)
                         .foregroundStyle(.yellow)
                 }
+                if let progress = broadcast.progress, progress.paused == true,
+                   broadcast.state.isActive {
+                    // Paused, not over (#172): viewers stay on the
+                    // broadcast and it carries on when the network does.
+                    Label("No connection — paused. Viewers stay on the broadcast; "
+                          + "it carries on if the network is back within a "
+                          + "minute, and ends when it comes back after that.",
+                          systemImage: "wifi.slash")
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let problem = broadcast.progress?.batchProblem, broadcast.state.isActive {
+                    // The plan, not the network, is refusing the uploads
+                    // (#176): no retry or better signal brings them back.
+                    batchProblemNote(problem)
+                }
                 if let progress = broadcast.progress {
                     metrics(progress)
                 } else if broadcast.state.isActive {
@@ -228,6 +299,26 @@ struct LiveView: View {
                     .foregroundStyle(.orange.opacity(0.9))
                     .lineLimit(2)
             }
+            if let recovery = progress.recoveryError, !recovery.isEmpty {
+                // The crash-recovery entry (#175) isn't saving: a kill now
+                // could not be resumed. Viewers are unaffected.
+                Text("Crash recovery off: \(recovery)")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func batchProblemNote(_ problem: BatchProblem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(problem.title, systemImage: "externaldrive.badge.xmark")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(problem.detail)
+                .font(.caption)
+                .foregroundStyle(.orange.opacity(0.9))
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -251,11 +342,23 @@ struct LiveView: View {
                 Text(report.verdictLabel)
                     .font(.headline)
                     .foregroundStyle(verdictTint(report))
+                    // Wraps rather than ellipsising: the reaped verdict
+                    // is longer than one line on a phone.
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("\(report.durationLabel) · \(report.segmentsListed) playable segments · "
                      + "\(report.feedUpdates) feed updates · "
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.75))
+                if let withheld = report.segmentsWithheld, withheld > 0 {
+                    Text("\(withheld) segments shot while the connection was down "
+                         + "were never sent.")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                }
+                if let problem = report.batchProblem {
+                    batchProblemNote(problem)
+                }
                 if report.segmentsDropped > 0 || report.segmentsFailed > 0 {
                     Text("\(report.segmentsDropped) dropped at the live edge, "
                          + "\(report.segmentsFailed) failed to publish.")
@@ -271,8 +374,26 @@ struct LiveView: View {
                 if !report.channelReference.isEmpty {
                     channelLinkRow(report.channelReference)
                 }
+                if let recording = report.recordingReference, !recording.isEmpty {
+                    recordingRow(recording)
+                }
             }
         }
+    }
+
+    /// The recording's own reference (the whole broadcast, issue #168),
+    /// for keeping a past broadcast. The channel link above plays it too
+    /// until the channel's next broadcast starts.
+    private func recordingRow(_ reference: String) -> some View {
+        Button {
+            UIPasteboard.general.string = reference
+            banner.flash("Recording reference copied")
+        } label: {
+            Label("Copy recording reference", systemImage: "film")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: quality
@@ -295,7 +416,44 @@ struct LiveView: View {
                  + "segments. Lower is more reliable on mobile data.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
+            if let estimate = capacity {
+                // The plan's room at this quality (#176), counted from
+                // its fullest bucket: the same estimate and the same
+                // warning test as the Broadcast tab's checklist.
+                Label {
+                    Text([estimate.summary(quality: quality.label), estimate.warning]
+                        .compactMap { $0 }
+                        .joined(separator: ". "))
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: estimate.needsWarning
+                          ? "exclamationmark.triangle.fill" : "externaldrive")
+                }
+                .font(.caption)
+                .foregroundStyle(estimate.needsWarning ? Color.orange : Color.white.opacity(0.7))
+            }
         }
+    }
+
+    /// The plan's room for a broadcast at the picked quality (#176).
+    private var capacity: CapacityEstimate? {
+        node.capacity(for: broadcast.quality)
+    }
+
+    /// Going live needs a yes first: the plan runs out within the hour at
+    /// this quality, or won't be stamped at all. A mutable plan with room
+    /// is only warned about on screen.
+    private var needsCapacityConfirmation: Bool {
+        guard let estimate = capacity else { return false }
+        return estimate.low || !estimate.usable
+    }
+
+    private var lowCapacityTitle: String {
+        guard let estimate = capacity else { return "Storage plan" }
+        if !estimate.usable { return "Storage plan refused" }
+        return estimate.minutesLeft == 0
+            ? "No room left on your storage plan"
+            : "\(estimate.timeLabel) left on your storage plan"
     }
 
     // MARK: channel link
@@ -339,20 +497,58 @@ struct LiveView: View {
 
     // MARK: controls
 
+    /// The unfinished broadcast (#175) can be carried on from here: the
+    /// Broadcast tab's own test for offering Resume on its card.
+    private func resumable(now: Date) -> Bool {
+        node.unfinishedBroadcast?.canResume(now: now, reapMs: AntNode.broadcastReapMs) == true
+    }
+
+    /// An unfinished broadcast's entry is on disk that this screen can't
+    /// carry on (it was ending, it is past the reap window, or this
+    /// screen was opened to go live, not to resume it). A new broadcast
+    /// would replace that entry with its first feed update and leave it
+    /// without its recording, so nothing starts from here: the Broadcast
+    /// tab's card ends it (or discards it, with confirmation).
+    private func blockedByUnfinished(now: Date) -> Bool {
+        guard !broadcast.state.isActive, node.unfinishedBroadcast != nil else { return false }
+        return !(resumePending && resumable(now: now))
+    }
+
     private var controls: some View {
+        // Re-read every few seconds, as the Broadcast tab's card does:
+        // Resume goes once the reap window has passed.
+        TimelineView(.periodic(from: .now, by: 5)) { context in
+            controlStack(now: context.date)
+        }
+    }
+
+    private func controlStack(now: Date) -> some View {
+        let blocked = blockedByUnfinished(now: now)
+        return VStack(spacing: 8) {
+            if blocked {
+                Text("End your unfinished broadcast on the Broadcast tab first: a new one would leave it without its recording.")
+                    .font(.caption)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            controlButton(blocked: blocked)
+        }
+    }
+
+    private func controlButton(blocked: Bool) -> some View {
         Button {
             Task {
                 if broadcast.state.isActive {
                     await broadcast.stop(node: node)
+                } else if needsCapacityConfirmation {
+                    confirmLowCapacity = true
                 } else {
-                    await broadcast.start(
-                        node: node,
-                        channel: channel.isEmpty ? "AntStream" : channel
-                    )
+                    await goLive()
                 }
             }
         } label: {
-            Text(controlTitle)
+            Text(controlTitle(blocked: blocked))
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -363,15 +559,38 @@ struct LiveView: View {
                 .foregroundStyle(.white)
         }
         .buttonStyle(.plain)
-        .disabled(broadcast.state == .starting || broadcast.state == .stopping)
+        .disabled(broadcast.state == .starting || broadcast.state == .stopping || blocked)
+        .opacity(blocked ? 0.5 : 1)
     }
 
-    private var controlTitle: String {
+    private func goLive() async {
+        guard !broadcast.state.isActive else { return }
+        // Checked again at the tap (and after the capacity question): the
+        // entry may have aged past the reap window since the last redraw.
+        guard !blockedByUnfinished(now: Date()) else { return }
+        let resume = resumePending
+        resumePending = false
+        lastRunWasResume = resume
+        await broadcast.start(
+            node: node,
+            channel: channel.isEmpty ? "AntStream" : channel,
+            resume: resume
+        )
+        // Refused at start (no plan, the camera, an entry the node won't
+        // resume): still a resume, not a new broadcast that would replace
+        // the unfinished one's entry. A refusal at the feed head comes
+        // later, when the run ends: see `.onChange(of: broadcast.state)`.
+        if case .failed = broadcast.state, resume { resumePending = true }
+    }
+
+    private func controlTitle(blocked: Bool) -> String {
         switch broadcast.state {
         case .starting: return "Starting…"
         case .stopping: return "Publishing the last segments…"
         case .live: return "Stop broadcast"
-        case .idle, .failed: return "Go live"
+        case .idle, .failed:
+            if blocked { return "Go live" }
+            return resumePending ? "Resume broadcast" : "Go live"
         }
     }
 }

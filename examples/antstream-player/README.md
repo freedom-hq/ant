@@ -28,6 +28,14 @@ curl -X POST http://127.0.0.1:1633/bzz -H 'Content-Type: application/x-tar' \
 
 ## How it plays a channel
 
+> This is the publisher's default `"bzz"` format, the one both apps
+> publish. A channel published with the opt-in `format: "solar-punk"`
+> (#167: each feed update *is* the playlist, read with
+> `GET /feeds/{owner}/{topic}`, and segments are bare references read
+> from `/bytes/<ref>`) has no `stream.m3u8` path, so this player can't
+> play it yet; the iOS Watch tab
+> (`examples/ios-stream/AntStream/WatchView.swift`) reads both.
+
 A channel reference is a feed manifest; `<channel>/stream.m3u8` resolves
 the feed to the newest playlist on every reload, so hls.js follows the
 live edge on its own. Two details make it work under `bzz://`:
@@ -83,7 +91,12 @@ log** and **Download** export everything as JSON for a bug report.
 
 A channel that is not live yet (the feed answers 404) shows "Waiting for
 the broadcast" and keeps retrying; a playlist with `#EXT-X-ENDLIST`
-switches to recording playback.
+switches to recording playback. A viewer who was watching live plays on
+from where they were to the end, whether the reload lands on the
+broadcast's closing playlist (its last minutes) or straight on the
+recording; one who opens the channel after it ended gets the recording
+the publisher leaves as the final feed update, the whole broadcast from
+its first segment.
 
 ## Testing without a live broadcast
 

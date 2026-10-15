@@ -17,9 +17,18 @@ struct StoragePlan: Codable, Equatable {
     let totalCapacityChunks: UInt64
     let issuedChunks: UInt64
     let worstCaseRemainingChunks: UInt64
+    /// The node will stamp with this batch at all (an expired or unknown
+    /// one it won't). Carried through because ``AntNode/capacity(for:)``
+    /// re-encodes this plan for `ant_publisher_capacity`, where a missing
+    /// field reads as `true`: dropping it would make every batch look
+    /// usable (#176).
+    var usable: Bool = true
+    /// `usable` is `false` only because a just-bought batch is still
+    /// propagating to the storers: it will be usable shortly.
+    var propagating: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case enabled
+        case enabled, usable, propagating
         case batchId = "batch_id"
         case batchDepth = "batch_depth"
         case immutable
@@ -50,6 +59,92 @@ struct StoragePlan: Codable, Equatable {
     var isLow: Bool {
         guard totalCapacityChunks > 0 else { return false }
         return Double(issuedChunks) / Double(totalCapacityChunks) > 0.90
+    }
+}
+
+extension StoragePlan {
+    /// The node leaves `propagating` out when `false` (and older nodes
+    /// sent no `usable`); default both the way the node's own
+    /// `PostageStatusView` does, so a plan decodes either way.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        batchId = try c.decode(String.self, forKey: .batchId)
+        batchDepth = try c.decode(UInt8.self, forKey: .batchDepth)
+        immutable = try c.decode(Bool.self, forKey: .immutable)
+        totalCapacityChunks = try c.decode(UInt64.self, forKey: .totalCapacityChunks)
+        issuedChunks = try c.decode(UInt64.self, forKey: .issuedChunks)
+        worstCaseRemainingChunks = try c.decode(UInt64.self, forKey: .worstCaseRemainingChunks)
+        usable = try c.decodeIfPresent(Bool.self, forKey: .usable) ?? true
+        propagating = try c.decodeIfPresent(Bool.self, forKey: .propagating) ?? false
+    }
+}
+
+/// How long a broadcast fits on the storage plan, from
+/// `ant_publisher_capacity` (#176): what a minute of the broadcast
+/// stamps against the room left in the plan's **fullest** bucket.
+struct CapacityEstimate: Codable, Equatable {
+    let batchId: String
+    /// An immutable plan refuses uploads once full; a mutable one
+    /// overwrites the oldest video instead, with no error at all.
+    let immutable: Bool
+    /// The node will stamp with the plan at all.
+    let usable: Bool
+    let chunksPerMinute: UInt64
+    let chunksLeft: UInt64
+    let minutesLeft: UInt64
+    /// Under an hour left at this quality: warn before going live.
+    let low: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case immutable, usable, low
+        case batchId = "batch_id"
+        case chunksPerMinute = "chunks_per_minute"
+        case chunksLeft = "chunks_left"
+        case minutesLeft = "minutes_left"
+    }
+
+    /// Anything a broadcaster should hear about before going live. The
+    /// one test both the Broadcast checklist and the going-live screen
+    /// use, so they never disagree.
+    var needsWarning: Bool { low || !immutable || !usable }
+
+    /// "About 3 h 20 min", "About 12 min", "No room".
+    var timeLabel: String {
+        if minutesLeft == 0 { return "No room" }
+        if minutesLeft < 60 { return "About \(minutesLeft) min" }
+        let hours = minutesLeft / 60
+        if hours >= 48 { return "About \(hours / 24) days" }
+        let minutes = minutesLeft % 60
+        return minutes == 0 ? "About \(hours) h" : "About \(hours) h \(minutes) min"
+    }
+
+    /// The "about N minutes left on this plan" line, for `quality`. A
+    /// plan Swarm won't stamp with has no room whatever its buckets say,
+    /// so it never reports hours next to ``warning``'s refusal.
+    func summary(quality: String) -> String {
+        if !usable { return "No \(quality) video fits on this plan right now" }
+        return minutesLeft == 0
+            ? "No room left on this plan for \(quality) video"
+            : "\(timeLabel) of \(quality) left on this plan"
+    }
+
+    /// Why ``needsWarning``, in a sentence, or `nil`.
+    var warning: String? {
+        if !usable {
+            return "Swarm won't accept this plan's stamps: every upload would be refused."
+        }
+        if !immutable {
+            return low
+                ? "This plan overwrites its oldest video once full: past that point "
+                    + "a broadcast eats its own beginning, with no error."
+                : "This plan overwrites its oldest video once full instead of refusing, "
+                    + "so a broadcast longer than this would eat its own beginning."
+        }
+        if low {
+            return "Past that, Swarm refuses the broadcast's uploads and its recording."
+        }
+        return nil
     }
 }
 
@@ -536,7 +631,8 @@ struct PublisherSnapshot: Codable, Equatable {
     /// reference worth sharing.
     let channelReference: String
     let playlistReference: String
-    let feedIndex: UInt64
+    /// `nil` until the node has read the channel's feed head.
+    let feedIndex: UInt64?
     let segmentsPushed: UInt64
     let segmentsPublished: UInt64
     /// Of those, the ones that reached a published playlist — what a
@@ -567,9 +663,33 @@ struct PublisherSnapshot: Codable, Equatable {
     let peers: UInt32
     let lastError: String
     let errorCount: UInt64
+    /// The network is gone and the broadcast is paused, not over
+    /// (#172). Optional so a snapshot from a node without it decodes.
+    let paused: Bool?
+    /// Segments the camera shot while paused, never uploaded.
+    let segmentsWithheld: UInt64?
+    /// The broadcast is ending by itself: a minute passed with nothing
+    /// reaching the playlist (`reap_ms`).
+    let reaped: Bool?
+    /// Why the crash-recovery entry (#175) could not be saved, empty
+    /// while it saves fine. Optional so a node without it decodes.
+    let recoveryError: String?
+    /// Uploads the gateway refused because the storage plan's batch is
+    /// full (bee's 402), and because the batch itself is unusable (#176).
+    /// Not network failures: counted apart so the live screen can name
+    /// the plan as the problem. Optional so a node without them decodes.
+    let batchFullRefusals: UInt64?
+    let batchUnusableRefusals: UInt64?
+    /// The newest of those refusals, empty while there has been none.
+    let batchError: String?
 
     enum CodingKeys: String, CodingKey {
-        case running, channel, topic, owner, peers
+        case running, channel, topic, owner, peers, paused, reaped
+        case recoveryError = "recovery_error"
+        case batchFullRefusals = "batch_full_refusals"
+        case batchUnusableRefusals = "batch_unusable_refusals"
+        case batchError = "batch_error"
+        case segmentsWithheld = "segments_withheld"
         case elapsedS = "elapsed_s"
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
@@ -598,6 +718,106 @@ struct PublisherSnapshot: Codable, Equatable {
         guard playlistsPublished > 0 else { return "Connecting…" }
         return String(format: "%.1f s behind", Double(lagMs) / 1000.0)
     }
+
+    /// What the storage plan is doing to this broadcast, if anything.
+    var batchProblem: BatchProblem? {
+        BatchProblem(full: batchFullRefusals ?? 0, unusable: batchUnusableRefusals ?? 0)
+    }
+}
+
+/// A broadcast's uploads refused because of its storage plan rather
+/// than the network (#176). One type for the live screen and the
+/// summary, so both say the same thing about the same counts.
+struct BatchProblem: Equatable {
+    /// Refused because the plan is full (bee's 402).
+    let full: UInt64
+    /// Refused because the plan's batch is unusable (unknown, expired,
+    /// not on chain).
+    let unusable: UInt64
+
+    init?(full: UInt64, unusable: UInt64) {
+        guard full > 0 || unusable > 0 else { return nil }
+        self.full = full
+        self.unusable = unusable
+    }
+
+    /// Full outranks unusable: it is the one a long broadcast walks into.
+    var title: String {
+        full > 0 ? "Storage plan full" : "Storage plan refused"
+    }
+
+    var detail: String {
+        let count = full > 0 ? full : unusable
+        let uploads = count == 1 ? "1 upload" : "\(count) uploads"
+        if full > 0 {
+            return "Swarm refused \(uploads) because the plan has no room left. "
+                + "Viewers miss what is refused, and the recording may not be "
+                + "kept. Extend or buy a bigger plan before the next broadcast."
+        }
+        return "Swarm won't accept this plan's stamps (\(uploads) refused): "
+            + "it is unknown to the network or has expired. Check the plan "
+            + "on the Storage tab."
+    }
+}
+
+/// A broadcast the app was killed or crashed in the middle of (#175):
+/// the publisher's recovery entry (`recovery_path`), read back at
+/// launch. Only what the Broadcast tab shows; resuming hands the node
+/// the file itself, and the node checks it is this account's feed.
+struct UnfinishedBroadcast: Equatable {
+    let channel: String
+    /// The feed's owner, 40 lowercase hex.
+    let owner: String
+    let broadcastId: String
+    /// When the entry was last written: ahead of the broadcast's last
+    /// feed update before the app went.
+    let savedAt: Date
+    /// Playable segments it holds (gaps left out), and their media.
+    let segments: Int
+    let seconds: Double
+    /// A stop had begun closing it (the entry's `shape` is past "live"):
+    /// its `#EXT-X-ENDLIST` window or recording may already be the head,
+    /// and live viewers have stopped there, so it can only be ended.
+    let ended: Bool
+
+    /// Decode a recovery entry, or `nil` for one this build can't read
+    /// (left on disk all the same: it is the only record of the
+    /// broadcast).
+    static func decode(_ data: Data) -> UnfinishedBroadcast? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["version"] as? Int == 1,
+              let channel = obj["channel"] as? String,
+              let owner = obj["owner"] as? String,
+              let id = obj["broadcast_id"] as? String,
+              let savedMs = (obj["saved_at_ms"] as? NSNumber)?.doubleValue,
+              let recording = obj["recording"] as? [[String: Any]]
+        else { return nil }
+        let media = recording.filter { ($0["gap"] as? Bool) != true }
+        let ms = media.reduce(0.0) { $0 + ((($1["duration_ms"] as? NSNumber)?.doubleValue) ?? 0) }
+        return UnfinishedBroadcast(
+            channel: channel,
+            owner: owner.lowercased(),
+            broadcastId: id,
+            savedAt: Date(timeIntervalSince1970: savedMs / 1000),
+            segments: media.count,
+            seconds: ms / 1000,
+            ended: (obj["shape"] as? String ?? "live") != "live"
+        )
+    }
+
+    /// Recent enough to carry on as the same broadcast: the app came back
+    /// inside the reap window (a minute), the time a viewer would have
+    /// waited for it anyway. Older, it can only be ended into its
+    /// recording. An entry a stop had begun closing is never resumed
+    /// (the node only finalizes it).
+    func canResume(now: Date = Date(), reapMs: UInt64) -> Bool {
+        !ended && now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
+    }
+
+    var durationLabel: String {
+        let total = Int(seconds.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
 }
 
 /// Final result of a broadcast, as returned by `ant_publisher_stop`.
@@ -607,6 +827,11 @@ struct PublisherReport: Codable, Equatable {
     let owner: String
     let channelReference: String
     let playlistReference: String
+    /// The whole broadcast as one VOD playlist, the channel's final feed
+    /// update (issue #168), playable by itself without the feed. Empty
+    /// when its upload failed; optional so a report from a node without
+    /// it still decodes.
+    let recordingReference: String?
     let notes: String
     let targetBitrateKbps: UInt32
     let segmentMs: UInt32
@@ -624,8 +849,9 @@ struct PublisherReport: Codable, Equatable {
     let playlistsPublished: UInt64
     let feedUpdates: UInt64
     /// The next feed update's index: where the permanent channel's next
-    /// broadcast starts (its `start_index`). Optional so a report from a
-    /// node without it still decodes.
+    /// broadcast starts (the node finds it by reading the feed head).
+    /// `nil` when the broadcast ended before it read the head, and so a
+    /// report from a node without it still decodes.
     let feedIndex: UInt64?
     let sustainedMbitS: Double
     let sustainedChunksS: Double
@@ -641,11 +867,25 @@ struct PublisherReport: Codable, Equatable {
     let keptUp: Bool
     let errors: [String]
     let errorCount: UInt64
+    /// Segments shot while the network was gone, never uploaded (#172).
+    let segmentsWithheld: UInt64?
+    /// It ended by itself after a minute with nothing reaching the
+    /// playlist, not on the stop button.
+    let reaped: Bool?
+    /// See ``PublisherSnapshot/batchFullRefusals`` (#176).
+    let batchFullRefusals: UInt64?
+    let batchUnusableRefusals: UInt64?
+    let batchError: String?
 
     enum CodingKeys: String, CodingKey {
-        case channel, topic, owner, notes, errors
+        case channel, topic, owner, notes, errors, reaped
+        case batchFullRefusals = "batch_full_refusals"
+        case batchUnusableRefusals = "batch_unusable_refusals"
+        case batchError = "batch_error"
+        case segmentsWithheld = "segments_withheld"
         case channelReference = "channel_reference"
         case playlistReference = "playlist_reference"
+        case recordingReference = "recording_reference"
         case targetBitrateKbps = "target_bitrate_kbps"
         case segmentMs = "segment_ms"
         case maxInFlight = "max_in_flight"
@@ -689,7 +929,12 @@ struct PublisherReport: Codable, Equatable {
     /// throughput verdict.
     var hasVerdict: Bool { segmentsListed > 0 }
 
+    var batchProblem: BatchProblem? {
+        BatchProblem(full: batchFullRefusals ?? 0, unusable: batchUnusableRefusals ?? 0)
+    }
+
     var verdictLabel: String {
+        if reaped == true { return "Broadcast ended: nothing reached viewers for a minute" }
         guard hasVerdict else { return "Broadcast ended without publishing" }
         return keptUp ? "Broadcast kept up" : "Broadcast fell behind"
     }
@@ -699,6 +944,11 @@ enum StreamDecoder {
     static func publisherSnapshot(from json: String) -> PublisherSnapshot? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(PublisherSnapshot.self, from: data)
+    }
+
+    static func capacity(from json: String) -> CapacityEstimate? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(CapacityEstimate.self, from: data)
     }
 
     static func publisherReport(from json: String) -> PublisherReport? {

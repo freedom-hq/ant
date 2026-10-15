@@ -2306,19 +2306,13 @@ async fn push_replica_socs(
             }
             match tokio::time::timeout(timeout, ack_rx).await {
                 Ok(Ok(ControlAck::ChunkUploaded { .. })) => Ok(()),
-                Ok(Ok(ControlAck::Error { message })) => {
-                    let status = if message.starts_with("uploads not configured") {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else if message.contains("not usable") {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    };
-                    Err(json_error(
-                        status,
-                        format!("push replica failed: {message}"),
-                    ))
-                }
+                // The same mapping as the upload's own chunks: a replica
+                // refused because the batch is full is the `402` its
+                // data chunks get, not a retryable `502`.
+                Ok(Ok(ControlAck::Error { message })) => Err(json_error(
+                    upload_error_status(&message),
+                    format!("push replica failed: {message}"),
+                )),
                 Ok(Ok(other)) => {
                     warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
                     Err(json_error(
@@ -4336,6 +4330,11 @@ pub async fn download_feed(
     //   update found", even when earlier updates exist).
     // - `type` is ignored entirely — bee never parses it here, so even
     //   `?type=epoch` runs the sequence path.
+    // - `exact` (ant only; bee ignores it) is a Go bool: answer only
+    //   once the slot after the head is confirmed empty, else `503`.
+    //   For a writer about to take the next slot (the live publisher's
+    //   head read, issue #173), which can't trust the finder's bounded
+    //   look-ahead the way a polling reader can.
     //
     // Parse failures collect into bee's `reasons` array with Go's
     // strconv error text ("invalid syntax" / "value out of range").
@@ -4350,6 +4349,13 @@ pub async fn download_feed(
         match raw.parse::<u64>() {
             Ok(v) => after = v,
             Err(e) => reasons.push(Reason::new("after", strconv_error_text(&e))),
+        }
+    }
+    let mut exact = false;
+    if let Some(raw) = query.get("exact") {
+        match go_parse_bool(raw) {
+            Some(v) => exact = v,
+            None => reasons.push(Reason::new("exact", "invalid syntax")),
         }
     }
     if !reasons.is_empty() {
@@ -4374,6 +4380,7 @@ pub async fn download_feed(
         owner,
         topic,
         after,
+        exact,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {

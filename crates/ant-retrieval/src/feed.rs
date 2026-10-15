@@ -123,8 +123,18 @@ pub enum FeedError {
     /// Walked the entire allowed range without finding a single update.
     /// Either the feed has never been published or the chunks aren't
     /// reachable from this antd's neighbourhood right now.
+    ///
+    /// `corroborated` says whether the anchor miss is the network's
+    /// answer (more than a couple of peers said "not found", see
+    /// [`FetchExhausted::corroborated_missing`]) rather than one or two
+    /// cold peers' `no peer found` for an index that may well exist.
+    /// Only a corroborated miss is a confirmed-empty feed; callers that
+    /// act on "empty" (drop a hint, start writing at index 0) must check
+    /// it.
+    ///
+    /// [`FetchExhausted::corroborated_missing`]: crate::fetcher::FetchExhausted::corroborated_missing
     #[error("feed has no updates (probed {probed} indices)")]
-    NoUpdates { probed: u64 },
+    NoUpdates { probed: u64, corroborated: bool },
     /// Underlying chunk-fetch failed — we surface the source so a
     /// `RetrievalError::Remote` shows up here verbatim. The lookup
     /// silently swallows individual misses, this only fires for hard
@@ -147,6 +157,18 @@ pub enum FeedError {
     WrappedChunkNotFound {
         /// The v1 reference (address part) that could not be retrieved.
         reference: [u8; 32],
+    },
+    /// [`resolve_sequence_feed_exact`] found an update at `index` but
+    /// could not confirm that `index + 1` is empty: the slot timed out,
+    /// failed, or only one or two peers answered "not found". The walk's
+    /// answer may then be below the real head, which a reader is free to
+    /// accept but a writer about to take the next slot is not.
+    #[error("feed head at index {index} is not confirmed as the last update: {reason}")]
+    EndUnconfirmed {
+        /// The index the walk resolved.
+        index: u64,
+        /// Why the slot after it is not known to be empty.
+        reason: String,
     },
 }
 
@@ -652,22 +674,14 @@ pub async fn resolve_sequence_feed_full(
 /// absent — even if earlier updates exist; when present, the search for
 /// the latest update proceeds from there. `after = 0` is the plain
 /// "latest" lookup.
+///
+/// An anchor miss fails with [`FeedError::NoUpdates`], whose
+/// `corroborated` records whether the network corroborated it
+/// ([`anchor_miss_corroborated`]).
 pub async fn resolve_sequence_feed_after(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
     after: u64,
-) -> Result<FeedResolution, FeedError> {
-    resolve_after_inner(fetcher, feed, after, &mut false).await
-}
-
-/// [`resolve_sequence_feed_after`], also setting `*anchor_corroborated`
-/// when it fails with [`FeedError::NoUpdates`] on an anchor miss the
-/// network corroborated ([`anchor_miss_corroborated`]).
-async fn resolve_after_inner(
-    fetcher: &dyn ChunkFetcher,
-    feed: &Feed,
-    after: u64,
-    anchor_corroborated: &mut bool,
 ) -> Result<FeedResolution, FeedError> {
     let mut probed: u64 = 0;
 
@@ -678,8 +692,10 @@ async fn resolve_after_inner(
         match probe(fetcher, feed, after, &mut probed, None).await? {
             ProbeOutcome::Present(u) => (after, u),
             ProbeOutcome::Absent { corroborated } => {
-                *anchor_corroborated = corroborated;
-                return Err(FeedError::NoUpdates { probed });
+                return Err(FeedError::NoUpdates {
+                    probed,
+                    corroborated,
+                });
             }
             ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
         };
@@ -979,8 +995,7 @@ pub async fn resolve_sequence_feed_hinted(
     };
     let hint = hints.get(&feed.owner, &feed.topic);
     let anchor = after.max(hint);
-    let mut corroborated = false;
-    let mut result = resolve_after_inner(fetcher, feed, anchor, &mut corroborated).await;
+    let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
     if let Err(e) = &result {
         if anchor > after {
             // Only an anchor miss the network corroborated proves the
@@ -988,7 +1003,13 @@ pub async fn resolve_sequence_feed_hinted(
             // unretrievable). One cold peer's "not found", a starved
             // pool or a fetch hiccup says nothing about the hint, which
             // stays for the next read.
-            let stale = corroborated && matches!(e, FeedError::NoUpdates { .. });
+            let stale = matches!(
+                e,
+                FeedError::NoUpdates {
+                    corroborated: true,
+                    ..
+                }
+            );
             debug!(
                 target: "ant_retrieval::feed",
                 feed_owner = %hex::encode(feed.owner),
@@ -1013,6 +1034,74 @@ pub async fn resolve_sequence_feed_hinted(
         hints.record(&feed.owner, &feed.topic, resolution.index);
     }
     result
+}
+
+/// [`resolve_sequence_feed_hinted`] for a writer: the resolved index is
+/// only returned once the slot after it is confirmed empty, so the
+/// caller can write its next update there (the live publisher's head
+/// read, issue #173).
+///
+/// The finder's look-ahead probes run under [`FEED_PROBE_TIMEOUT`] and
+/// fold a timeout, a failure or one or two cold peers' "not found" into
+/// "absent", the way bee's finder does: right for a reader, which gets
+/// the newer update on its next poll, but a writer that trusts such an
+/// answer takes a slot an earlier update already holds. So this probes
+/// `index + 1` once more with no deadline:
+///
+/// - absent, and the miss is the network's answer (more than a couple of
+///   peers said "not found", [`anchor_miss_corroborated`]): the
+///   resolution is exact;
+/// - present: the walk stopped short of it, so walk again from there;
+/// - anything else (a timeout, a failure, an uncorroborated miss):
+///   [`FeedError::EndUnconfirmed`], for the caller to retry.
+///
+/// An empty feed is [`FeedError::NoUpdates`] as from the plain walk.
+pub async fn resolve_sequence_feed_exact(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    after: u64,
+    hints: Option<&FeedHints>,
+) -> Result<FeedResolution, FeedError> {
+    let mut resolution = resolve_sequence_feed_hinted(fetcher, feed, after, hints).await?;
+    loop {
+        let Some(next) = resolution.index.checked_add(1) else {
+            return Ok(resolution);
+        };
+        let mut probed = 0;
+        let reason = match probe(fetcher, feed, next, &mut probed, None).await? {
+            ProbeOutcome::Absent { corroborated: true } => return Ok(resolution),
+            ProbeOutcome::Present(_) => {
+                debug!(
+                    target: "ant_retrieval::feed",
+                    feed_owner = %hex::encode(feed.owner),
+                    feed_topic = %hex::encode(feed.topic),
+                    resolved = resolution.index,
+                    "feed walk stopped below a present update; walking on from it",
+                );
+                // The update at `next` was just fetched, so a miss on it
+                // now says nothing about the feed being empty.
+                resolution = resolve_sequence_feed_hinted(fetcher, feed, next, hints)
+                    .await
+                    .map_err(|e| match e {
+                        FeedError::NoUpdates { .. } => FeedError::EndUnconfirmed {
+                            index: resolution.index,
+                            reason: format!("index {next} was found, then missed ({e})"),
+                        },
+                        e => e,
+                    })?;
+                continue;
+            }
+            ProbeOutcome::Absent {
+                corroborated: false,
+            } => "too few peers answered to tell an empty slot from one this node can't reach yet"
+                .to_string(),
+            ProbeOutcome::Transient(e) => e.to_string(),
+        };
+        return Err(FeedError::EndUnconfirmed {
+            index: resolution.index,
+            reason: format!("index {next}: {reason}"),
+        });
+    }
 }
 
 /// Resolve the reference a verified update points at, distinguishing v1
@@ -1801,7 +1890,13 @@ mod tests {
         };
         let fetcher = MapFetcher::new();
         match resolve_sequence_feed(&fetcher, &feed).await {
-            Err(FeedError::NoUpdates { probed }) => {
+            Err(FeedError::NoUpdates {
+                probed,
+                corroborated,
+            }) => {
+                // A local map's miss carries no peer count and is taken
+                // at its word.
+                assert!(corroborated);
                 // Index 0 is absent, so we probe exactly one address
                 // before declaring the feed empty.
                 assert_eq!(probed, 1);
@@ -2636,6 +2731,115 @@ mod tests {
         }
     }
 
+    /// Delays one address by `delay` before handing it to `inner`: an
+    /// update that exists but answers slower than the finder's
+    /// look-ahead deadline.
+    struct SlowAtFetcher<'a> {
+        inner: &'a dyn ChunkFetcher,
+        slow: [u8; 32],
+        delay: Duration,
+    }
+    #[async_trait]
+    impl ChunkFetcher for SlowAtFetcher<'_> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            if addr == self.slow {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.fetch(addr).await
+        }
+    }
+
+    /// R2-F1 on PR #183: the finder folds a head slower than
+    /// [`FEED_PROBE_TIMEOUT`] (or one or two peers' miss on it) into
+    /// "absent" and lands one below it. A reader gets the newer update on
+    /// its next poll; a writer taking the next slot must not, so the exact
+    /// read re-probes the slot after the head without a deadline and only
+    /// answers once that slot is a corroborated miss.
+    #[tokio::test(start_paused = true)]
+    async fn exact_read_never_lands_below_a_slow_or_thin_head() {
+        let secret: [u8; 32] = [41u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(b"exact/slow-head");
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let indices: Vec<u64> = (0..=10).collect();
+        let (healthy, _root, _) = bzz_feed_fixture(&secret, &topic, &indices, &[]);
+        let corroborated = TypedMissFetcher {
+            inner: &healthy,
+            answers: 3,
+        };
+        let slow = SlowAtFetcher {
+            inner: &corroborated,
+            slow: sequence_update_address(&feed, 10),
+            delay: FEED_PROBE_TIMEOUT * 2,
+        };
+
+        // The plain finder lands below the slow head (what the publisher
+        // used to read as exact).
+        let plain = resolve_sequence_feed_hinted(&slow, &feed, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(plain.index, 9, "the bounded look-ahead skips the slow head");
+
+        // The exact read finds it, with or without a hint at 9.
+        let r = resolve_sequence_feed_exact(&slow, &feed, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(r.index, 10);
+        let hints = FeedHints::new();
+        hints.record(&owner, &topic, 9);
+        let r = resolve_sequence_feed_exact(&slow, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(r.index, 10);
+        assert_eq!(hints.get(&owner, &topic), 10);
+
+        // With only one or two peers answering the slot after the head,
+        // the end isn't confirmed: an error to retry, never an index.
+        for answers in [1, 2] {
+            let thin = TypedMissFetcher {
+                inner: &healthy,
+                answers,
+            };
+            let r = resolve_sequence_feed_exact(&thin, &feed, 0, None).await;
+            assert!(
+                matches!(r, Err(FeedError::EndUnconfirmed { index: 10, .. })),
+                "{answers} not-found answers: {r:?}"
+            );
+        }
+        // A slot after the head that keeps failing transiently is no
+        // answer either.
+        let mut flaky = FlakyFetcher::new();
+        flaky.chunks.clone_from(&healthy.chunks);
+        flaky.mark_transient(sequence_update_address(&feed, 11));
+        let r = resolve_sequence_feed_exact(&flaky, &feed, 0, None).await;
+        assert!(
+            matches!(r, Err(FeedError::EndUnconfirmed { index: 10, .. })),
+            "{r:?}"
+        );
+
+        // A corroborated miss on index 0 is still an empty feed.
+        let empty = FlakyFetcher::new();
+        let typed = TypedMissFetcher {
+            inner: &empty,
+            answers: 3,
+        };
+        let r = resolve_sequence_feed_exact(&typed, &feed, 0, None).await;
+        assert!(
+            matches!(
+                r,
+                Err(FeedError::NoUpdates {
+                    corroborated: true,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+    }
+
     /// R3-M1 on PR #160: a hinted anchor miss only drops the hint when
     /// the network corroborated it. On a cold node whose one or two
     /// peers answer "no peer found" for everything (the hinted anchor
@@ -2666,7 +2870,16 @@ mod tests {
                 answers,
             };
             let r = resolve_sequence_feed_hinted(&typed, &feed, 0, Some(&hints)).await;
-            assert!(matches!(r, Err(FeedError::NoUpdates { .. })), "{r:?}");
+            // The miss says whether it is the network's answer, so the
+            // node answers a cold one with a 503, not "no update found"
+            // (R1-F1 on PR #183).
+            assert!(
+                matches!(
+                    r,
+                    Err(FeedError::NoUpdates { corroborated, .. }) if corroborated != kept
+                ),
+                "{answers} not-found answers: {r:?}"
+            );
             assert_eq!(
                 hints.get(&owner, &topic),
                 if kept { 37 } else { 0 },

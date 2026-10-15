@@ -57,10 +57,12 @@ struct RootView: View {
         }
     }
 
-    /// `-antstream-shot-channel` and `-antstream-shot-watch` land here
-    /// too: the first on the Broadcast tab's channel card (BroadcastView
-    /// installs the sample state), the second on the Watch tab already
-    /// playing a sample channel (see the `@State` seeds above).
+    /// `-antstream-shot-channel`, `-antstream-shot-unfinished` and
+    /// `-antstream-shot-watch` land here too: the first two on the
+    /// Broadcast tab's channel card and unfinished-broadcast card
+    /// (BroadcastView installs the sample state), the last on the Watch
+    /// tab already playing a sample channel (see the `@State` seeds
+    /// above).
     private var tabs: some View {
         TabView(selection: $tab) {
             Tab("Broadcast", systemImage: "dot.radiowaves.left.and.right", value: TabID.broadcast) {
