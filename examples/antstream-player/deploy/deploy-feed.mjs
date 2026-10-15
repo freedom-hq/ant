@@ -58,7 +58,7 @@ const bee = new Bee(opts.gateway, { signer: key })
 // The next feed index: one past the newest update, or 0 for a new feed.
 let next = 0
 try {
-  const latest = await bee.makeFeedReader(topic, owner).downloadReference()
+  const latest = await bee.feed.makeReader(topic, owner).downloadReference()
   next = Number(latest.feedIndexNext ? latest.feedIndexNext.toBigInt() : latest.feedIndex.toBigInt() + 1n)
 } catch {
   next = 0
@@ -85,11 +85,11 @@ try {
     process.exit(0)
   }
 
-  const upload = await bee.uploadFilesFromDirectory(opts.stamp, stage, { indexDocument: 'index.html' })
+  const upload = await bee.collection.uploadFromDirectory(opts.stamp, stage, { indexDocument: 'index.html' })
   console.log(`collection ${upload.reference.toHex()}`)
 
-  await bee.makeFeedWriter(topic, key).uploadReference(opts.stamp, upload.reference, { index: next })
-  const manifest = await bee.createFeedManifest(opts.stamp, topic, owner)
+  await bee.feed.makeWriter(topic, key).uploadReference(opts.stamp, upload.reference, { index: next })
+  const manifest = await bee.feed.createManifest(opts.stamp, topic, owner)
   console.log(`feed owner ${owner.toHex()} topic ${topic.toHex()} index ${next}`)
   console.log(`feed manifest ${manifest.toHex()}`)
 } finally {
