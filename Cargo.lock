@@ -176,6 +176,7 @@ dependencies = [
  "libp2p",
  "percent-encoding",
  "primitive-types",
+ "rlp",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

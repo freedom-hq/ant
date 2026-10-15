@@ -118,6 +118,22 @@ pub trait ChainWriter: Send + Sync {
     /// Fund the chequebook by transferring `amount` xBZZ into it.
     /// Returns the 32-byte transaction hash.
     async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String>;
+    /// Withdraw `amount` xBZZ (PLUR) from the chequebook back to the
+    /// node wallet, never more than issued cheques leave free
+    /// (`ant_chain::chequebook_store::withdraw_from_chequebook`). The
+    /// writer tells the node through `node`: the chequebook's lowered
+    /// funds while the transaction confirms and the chain's afterwards
+    /// (`SetRetrievalFunds`), and it asks the node what it has issued
+    /// (`AccountingSnapshot`). Returns the 32-byte transaction hash.
+    /// Defaulted to [`FundingFailure::Unsupported`] (`501`) so test fakes
+    /// and other embedders needn't implement it.
+    async fn withdraw_chequebook(
+        &self,
+        _amount: u128,
+        _node: tokio::sync::mpsc::Sender<ControlCommand>,
+    ) -> Result<[u8; 32], FundingFailure> {
+        Err(FundingFailure::Unsupported)
+    }
 
     // xDAI-only storage funding (`/v0/storage/*`, `/v0/settlement/deposit`):
     // the node swaps the xBZZ it lacks itself, so a user only ever sends
@@ -196,6 +212,10 @@ pub enum FundingFailure {
     NotFound(String),
     /// A chain read or transaction failed. → `502`.
     Chain(String),
+    /// The node can't vouch for a figure the operation needs right now
+    /// (e.g. a withdrawal while its cheque total is unknown); nothing was
+    /// sent. → `503`.
+    Unavailable(String),
     /// The chain says no to the node's chequebook (the deposit top-up's
     /// checks): nothing was swapped or sent. The route hands it to
     /// [`GatewayHandle::on_chequebook_refused`] before answering.
@@ -1130,6 +1150,61 @@ pub async fn chequebook_deposit(
         .into_response()
 }
 
+/// `POST /chequebook/withdraw?amount=` (bee's
+/// `chequebookWithdrawHandler`). Moves `amount` xBZZ (PLUR) out of the
+/// chequebook back to the node wallet; answers `200
+/// {transactionHash}`. Never takes xBZZ that backs a cheque the node
+/// already issued: an amount above the deposit less every issued cheque
+/// (bee's `availableBalance`), or above the contract's liquid balance,
+/// is a `400` and nothing is sent; while the node's issued total isn't
+/// known (no ledger loaded for this chequebook, or one that lost its
+/// figures) it's a `503`. The node stops signing cheques against the
+/// amount before the transaction goes out, and gets the chequebook's
+/// new funds once it confirms.
+///
+/// Spending-route guards like `POST /v0/settlement/deposit`: the
+/// [`WriteGate`] (`409` while another write runs), the [`WalletTxLock`],
+/// and (in the router) `cors::wallet_spend_guard`, which refuses
+/// requests from web pages.
+pub async fn chequebook_withdraw(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (chain, w) = match writer(&handle) {
+        Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let amount: u128 = match required(&q, "amount") {
+        Ok(0) => {
+            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
+        }
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let Some(_one_write) = chain.writes.try_begin() else {
+        return busy();
+    };
+    let tx = chain.tx_lock.lock().await;
+    let withdrawn = tokio::time::timeout(
+        CHAIN_TX_TIMEOUT,
+        w.withdraw_chequebook(amount, handle.commands.clone()),
+    )
+    .await;
+    drop(tx);
+    match withdrawn {
+        Ok(Ok(hash)) => Json(TxHashBody {
+            transaction_hash: format!("0x{}", hex::encode(hash)),
+        })
+        .into_response(),
+        Ok(Err(FundingFailure::Unsupported)) => json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "this node can't withdraw from its chequebook",
+        ),
+        Ok(Err(f)) => failure_response(f),
+        Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "chain transaction timed out"),
+    }
+}
+
 // --- xDAI storage funding (`/v0/storage/*`, `/v0/settlement/deposit`) ---
 //
 // Ant-specific routes, namespaced under `/v0/` like `/v0/manifest`. They
@@ -1170,6 +1245,7 @@ fn failure_response(f: FundingFailure) -> Response {
         }
         FundingFailure::NotFound(m) => json_error(StatusCode::NOT_FOUND, m),
         FundingFailure::Chain(m) => json_error(StatusCode::BAD_GATEWAY, m),
+        FundingFailure::Unavailable(m) => json_error(StatusCode::SERVICE_UNAVAILABLE, m),
     }
 }
 

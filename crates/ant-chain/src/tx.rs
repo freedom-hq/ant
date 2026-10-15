@@ -71,6 +71,9 @@ pub const FACTORY_DEPLOY_CHEQUEBOOK_GAS: u64 = 1_500_000;
 /// Plain `IERC20.transfer(to, value)` to fund a freshly-deployed
 /// chequebook. Same shape as `approve`, so 100 K is plenty.
 pub const ERC20_TRANSFER_GAS: u64 = 100_000;
+/// `SimpleSwap.withdraw` gas: an issuer check, a liquid-balance read and
+/// one xBZZ transfer back to the issuer.
+pub const CHEQUEBOOK_WITHDRAW_GAS: u64 = 150_000;
 /// One-time CREATE2 deployment of the `BzzSwapHelper` (~1.2 KB of init
 /// code) through the deterministic deployer. Empirically ~250 K; cap at
 /// 600 K for headroom.
@@ -795,6 +798,27 @@ impl Wallet {
             *token,
             erc20_transfer_calldata(to, &value),
             ERC20_TRANSFER_GAS,
+        )
+        .await
+    }
+
+    /// `SimpleSwap.withdraw(amount)` on `chequebook`: the contract sends
+    /// `amount` xBZZ back to its issuer, which must be this wallet (it
+    /// reverts otherwise, and above `liquidBalance()`). Use
+    /// [`crate::chequebook_store::withdraw_from_chequebook`], which caps
+    /// the amount at what issued cheques leave free, rather than this
+    /// directly.
+    pub async fn withdraw_from_chequebook(
+        &self,
+        client: &ChainClient,
+        chequebook: &[u8; 20],
+        amount: U256,
+    ) -> Result<TxReceipt, TxError> {
+        self.send_signed(
+            client,
+            *chequebook,
+            crate::chequebook::chequebook_withdraw_calldata(amount),
+            CHEQUEBOOK_WITHDRAW_GAS,
         )
         .await
     }

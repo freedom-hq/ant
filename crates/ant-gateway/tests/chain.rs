@@ -605,6 +605,8 @@ struct FundingWriter {
     short_of_xdai: bool,
     /// Answer the deposit top-up with the chain refusing the chequebook.
     refuse_deposit: Option<ChequebookRefusal>,
+    /// Answer a withdrawal with this instead of a transaction hash.
+    refuse_withdraw: Option<FundingFailure>,
 }
 
 impl FundingWriter {
@@ -750,6 +752,17 @@ impl ChainWriter for FundingWriter {
             shortfall_plur: 0,
             funding: FundingView::default(),
         })
+    }
+    async fn withdraw_chequebook(
+        &self,
+        amount: u128,
+        _node: tokio::sync::mpsc::Sender<ant_control::ControlCommand>,
+    ) -> Result<[u8; 32], FundingFailure> {
+        self.record(format!("withdraw_chequebook({amount})"));
+        match &self.refuse_withdraw {
+            Some(f) => Err(f.clone()),
+            None => Ok([0xE0; 32]),
+        }
     }
 }
 
@@ -1010,6 +1023,7 @@ async fn v0_writes_are_one_at_a_time() {
         (Method::POST, "/stamps/1000000/20"),
         (Method::POST, "/v0/settlement/deposit"),
         (Method::POST, "/chequebook/deposit?amount=5"),
+        (Method::POST, "/chequebook/withdraw?amount=5"),
     ] {
         let (status, json) = req(router.clone(), method, uri).await;
         assert_eq!(status, StatusCode::CONFLICT, "{uri}");
@@ -1229,10 +1243,11 @@ async fn status_with_headers(
 /// origin only `*` covers. Reads and non-browser callers still work.
 #[tokio::test]
 async fn v0_wallet_spending_routes_refuse_web_pages() {
-    const WRITES: [&str; 3] = [
+    const WRITES: [&str; 4] = [
         "/v0/storage/buy?depth=24&amountPerChunk=1000",
         "/v0/storage/extend?batchId=abababababababababababababababababababababababababababababababab&amountPerChunk=1000",
         "/v0/settlement/deposit",
+        "/chequebook/withdraw?amount=5",
     ];
     let browser_headers: [&[(&str, &str)]; 5] = [
         &[
@@ -1346,4 +1361,97 @@ async fn buys_register_the_batch_with_its_creation_block() {
             ([0xAB; 32], 21, false, None),
         ]
     );
+}
+
+/// `POST /chequebook/withdraw?amount=` answers bee's `200
+/// {transactionHash}`, after holding the wallet tx lock like every
+/// other write.
+#[tokio::test]
+async fn withdraw_returns_tx_hash_under_the_wallet_lock() {
+    let writer = Arc::new(FundingWriter::default());
+    let ctx = funding_ctx(writer.clone());
+    let held = ctx.tx_lock.clone().lock_owned().await;
+    let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+    let mut call = tokio::spawn(req(
+        router,
+        Method::POST,
+        "/chequebook/withdraw?amount=1500000000000000",
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut call)
+            .await
+            .is_err(),
+        "withdrew while another wallet tx held the lock",
+    );
+    drop(held);
+    let (status, json) = call.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["transactionHash"],
+        format!("0x{}", hex::encode([0xE0; 32]))
+    );
+    assert_eq!(writer.calls(), ["withdraw_chequebook(1500000000000000)"]);
+}
+
+/// A missing or zero amount never reaches the writer; the writer's
+/// refusals keep their status: over the available credit `400`, an
+/// unknown cheque total `503`, a failed transaction `502`.
+#[tokio::test]
+async fn withdraw_validates_and_maps_refusals() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    for uri in [
+        "/chequebook/withdraw",
+        "/chequebook/withdraw?amount=0",
+        "/chequebook/withdraw?amount=-1",
+        "/chequebook/withdraw?amount=lots",
+    ] {
+        let (status, _) = req(router.clone(), Method::POST, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert_eq!(
+        writer.calls(),
+        Vec::<String>::new(),
+        "nothing reached the writer"
+    );
+
+    for (refusal, want) in [
+        (
+            FundingFailure::Rejected("can withdraw at most 0.0007 xBZZ now".into()),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            FundingFailure::Unavailable("not withdrawing: ledger unreadable".into()),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            FundingFailure::Chain("withdraw transaction: reverted".into()),
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        let message = match &refusal {
+            FundingFailure::Rejected(m)
+            | FundingFailure::Unavailable(m)
+            | FundingFailure::Chain(m) => m.clone(),
+            _ => unreachable!(),
+        };
+        let writer = Arc::new(FundingWriter {
+            refuse_withdraw: Some(refusal),
+            ..FundingWriter::default()
+        });
+        let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
+        let (status, json) = req(router, Method::POST, "/chequebook/withdraw?amount=7").await;
+        assert_eq!(status, want);
+        assert_eq!(json["message"], message);
+    }
+}
+
+/// No writer, or one that can't withdraw: `501`.
+#[tokio::test]
+async fn withdraw_501_without_support() {
+    for ctx in [chain_ctx(Some([0xCD; 20])), chain_ctx_rw(Some([0xCD; 20]))] {
+        let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+        let (status, _) = req(router, Method::POST, "/chequebook/withdraw?amount=1").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
 }

@@ -727,6 +727,51 @@ char *ant_storage_settlement_topup_amount(const AntHandle *handle,
                                           char **out_err);
 
 /*
+ * Withdraw `amount_plur` (a decimal PLUR string, 1 xBZZ = 10^16 PLUR)
+ * from this account's chequebook back to its wallet (the chequebook's
+ * withdraw(uint256), signed by the node key, its issuer). Never takes
+ * xBZZ that backs a cheque already issued: an amount above the node's
+ * available credit (ant_swap_status available_plur: deposited less
+ * issued, bee's availableBalance) or above the chequebook's liquid
+ * balance is refused with the most it can take now, and nothing is sent
+ * while the node can't say what it has issued (its cheque ledger for
+ * this chequebook isn't loaded, or lost its figures). The node stops
+ * signing cheques against the amount before the transaction goes out
+ * and reads the chequebook's funds again once it confirms, so
+ * ant_swap_status available_plur / paying follow at once. Mirrors bee's
+ * (and the gateway's) POST /chequebook/withdraw?amount=. Errors on an
+ * amount that isn't a positive integer. Returns the refreshed
+ * ant_storage_settlement_deposit JSON, or the JSON literal `null` when
+ * the withdrawal confirmed but re-reading the deposit failed (not an
+ * error: the xBZZ has moved, so retrying would withdraw again; re-read
+ * the deposit later). An error once the transaction may have gone out
+ * (a receipt timeout, an RPC error after sending) does not mean nothing
+ * moved: the transaction may still land, so the node keeps the amount off
+ * ant_swap_status available_plur (and paying) for up to 10 minutes from
+ * the error, as it does on reads that don't show a confirmed one yet.
+ * Re-read ant_storage_settlement_deposit before retrying, or the retry
+ * may withdraw twice. Only a refusal before sending, or a reverted
+ * transaction, hands the amount back at once. SUBMITS A REAL TRANSACTION
+ * (a little xDAI for gas) and BLOCKS until it confirms. Requires the
+ * `chain` cargo feature.
+ */
+char *ant_storage_settlement_withdraw_amount(const AntHandle *handle,
+                                             const char *gnosis_rpc,
+                                             const char *amount_plur,
+                                             char **out_err);
+
+/*
+ * This account's wallet balances as a JSON object:
+ *   {"address":"0x…","bzz_plur","bzz","xdai_wei","xdai"}
+ * (PLUR / wei as decimal strings; bzz / xdai short 4-decimal display
+ * strings): the xBZZ ant_storage_settlement_topup_amount draws on first
+ * and the xDAI that pays for gas and swaps. Two light reads over
+ * `gnosis_rpc`, no gateway needed; a read that fails is an error, never
+ * a zero. Requires the `chain` cargo feature.
+ */
+char *ant_wallet_balance(const AntHandle *handle, const char *gnosis_rpc, char **out_err);
+
+/*
  * Deep read-back propagation check for an uploaded reference. Resolves
  * the manifest to its data root, enumerates the file's chunk tree
  * (fetching every interior node network-only, which proves the skeleton
@@ -1228,7 +1273,10 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a
  * nested event loop). It may be invoked concurrently from several such
- * threads, so `host_ctx` must be safe to use from any thread.
+ * threads, so `host_ctx` must be safe to use from any thread. Return
+ * within a minute: some reads (the chequebook funds refresh) stop
+ * waiting after 60 s, but the thread stays inside the callback until it
+ * returns, and that refresh starts no new read until it does.
  *
  * Lifetime: `transport` must stay callable and `host_ctx` valid until
  * the transport is replaced/cleared or ant_shutdown is called. Both of

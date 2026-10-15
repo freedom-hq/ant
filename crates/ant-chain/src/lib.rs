@@ -114,6 +114,12 @@ pub struct ChainClient {
     /// when this (verified) one can't serve it in a few windows; see
     /// [`Self::with_unverified_logs`].
     unverified_logs: Option<std::sync::Arc<ChainClient>>,
+    /// Host transport calls this client (and its clones) started that
+    /// are still inside the host's `serve`, whether or not anyone still
+    /// awaits them: a timed-out read stops waiting, but its blocking
+    /// thread stays parked until the host returns. See
+    /// [`Self::with_own_host_call_count`].
+    host_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "chain-rpc")]
@@ -127,7 +133,30 @@ impl ChainClient {
                 .expect("reqwest client"),
             transport: None,
             unverified_logs: None,
+            host_calls: std::sync::Arc::default(),
         }
+    }
+
+    /// This client with a count of host transport calls of its own
+    /// ([`Self::host_calls_in_flight`]), separate from the clients it
+    /// was cloned from, so a periodic reader can tell whether *its* last
+    /// call is still parked in the host's `serve` (e.g. after a timeout)
+    /// without other readers' calls counting.
+    #[must_use]
+    pub fn with_own_host_call_count(&self) -> Self {
+        Self {
+            host_calls: std::sync::Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Host transport calls started through this client's count (see
+    /// [`Self::with_own_host_call_count`]) that haven't returned from the
+    /// host yet. A call a caller stopped waiting for still counts until
+    /// the host answers: its blocking-pool thread can't be taken back.
+    #[must_use]
+    pub fn host_calls_in_flight(&self) -> usize {
+        self.host_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Give the wallet's transfer scan an explicitly unverified source
@@ -209,7 +238,7 @@ impl ChainClient {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
         if let Some(t) = self.transport.clone() {
-            match Self::ask_host(t, body.to_string()).await {
+            match Self::ask_host(t, body.to_string(), self.host_calls.clone()).await {
                 Ok(v) => return Ok(v),
                 Err(reason) => tracing::debug!(
                     target: "ant-chain",
@@ -235,8 +264,24 @@ impl ChainClient {
     async fn ask_host(
         transport: SharedChainTransport,
         request: String,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<serde_json::Value, &'static str> {
-        match tokio::task::spawn_blocking(move || transport.serve(&request)).await {
+        /// Counts the call until the blocking closure ends, not until the
+        /// awaiting future does: dropped with the closure.
+        struct InFlight(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = InFlight(in_flight);
+        match tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            transport.serve(&request)
+        })
+        .await
+        {
             // A panicking host must not take the node down with it —
             // treat it like any other can't-serve and use the URL.
             Err(_) => Err("host transport panicked"),

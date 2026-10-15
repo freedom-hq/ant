@@ -284,6 +284,38 @@ jobs:
             -antstream-shot-live-idle -antstream-shot-unusable-plan
           sleep 25
           xcrun simctl io booted screenshot shots/24-live-unusable-plan.png
+          # --- Credit card: account wallet, add / withdraw (#165) ---
+          # A fresh runner account has no chequebook or wallet funds, so
+          # `-antstream-shot-credit` publishes the state #165 was filed
+          # from (5.76 xBZZ in the wallet, a nearly spent chequebook); the
+          # `-add` / `-withdraw` / `-confirm` variants open the amount
+          # sheet and the confirmation. Nothing is sent: the confirm
+          # button is never pressed.
+          # 25 — the card: credit figures + the account wallet + actions.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-storage -antstream-shot-credit
+          sleep 22
+          xcrun simctl io booted screenshot shots/25-credit-wallet.png
+          # 26 — "Add to credit": amount field, quick picks, gas note.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-add
+          sleep 22
+          xcrun simctl io booted screenshot shots/26-credit-add-sheet.png
+          # 27 — the confirmation before the real transaction.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-add \
+            -antstream-shot-credit-confirm
+          sleep 24
+          xcrun simctl io booted screenshot shots/27-credit-add-confirm.png
+          # 28 — "Withdraw to account", capped at the free credit.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-withdraw
+          sleep 22
+          xcrun simctl io booted screenshot shots/28-credit-withdraw-sheet.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

@@ -72,11 +72,17 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
          xDAI, through `extend_with_xdai`, which calls it",
     ),
     (
-        "read_retrieval_funds",
+        "read_and_publish_retrieval_funds",
         Side::Ffi,
         "the C API's deposit top-up re-reads the funds once and starts the funds watch, since \
          `ant_init` reloads a chequebook without an RPC and starts none; `antd` starts its watch \
          (`watch_retrieval_funds`, which reads through this) with settlement at startup",
+    ),
+    (
+        "note_deposit",
+        Side::Antd,
+        "the gateway's `POST /chequebook/deposit` transfers into the chequebook itself; every \
+         C API deposit goes through `top_up_chequebook`, which calls it",
     ),
     (
         "wallet_scan_forget",

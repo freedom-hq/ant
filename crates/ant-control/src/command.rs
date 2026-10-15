@@ -410,7 +410,9 @@ pub enum ControlCommand {
     /// runs on that chequebook (now, or once it starts). Acks `Ok`.
     SetRetrievalFunds {
         chequebook: [u8; 20],
-        /// xBZZ ever deposited and not withdrawn, PLUR.
+        /// xBZZ ever deposited and not withdrawn, PLUR. A chequebook
+        /// withdrawal hands the node this lowered by its amount before
+        /// the transaction goes out, so no cheque is signed against it.
         deposited_plur: u128,
         /// Bee's oracle exchange rate, PLUR per accounting unit.
         exchange_rate_plur: u128,

@@ -189,6 +189,63 @@ struct SwapStatus: Equatable {
     }
 }
 
+/// `ant_wallet_balance`: the account wallet on Gnosis. Its xBZZ is what
+/// "Add to credit" moves into the chequebook; its xDAI pays the gas.
+struct WalletBalance: Equatable {
+    let address: String
+    let bzzPlur: Decimal
+    let xdaiWei: Decimal
+
+    static func parse(_ json: String) -> WalletBalance? {
+        guard let data = json.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let bzz = (o["bzz_plur"] as? String).flatMap({ Decimal(string: $0) }),
+              let xdai = (o["xdai_wei"] as? String).flatMap({ Decimal(string: $0) })
+        else { return nil }
+        return WalletBalance(address: o["address"] as? String ?? "", bzzPlur: bzz, xdaiWei: xdai)
+    }
+}
+
+private let plurPerBzz = Decimal(sign: .plus, exponent: 16, significand: 1)
+
+/// An xBZZ amount as typed ("0.5", "1,25") in PLUR, or nil unless it is a
+/// positive number with at most 16 decimals.
+func parseBzzAmount(_ text: String) -> Decimal? {
+    let t = text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+    guard !t.isEmpty, t.allSatisfy({ $0.isNumber || $0 == "." }),
+          let bzz = Decimal(string: t, locale: Locale(identifier: "en_US_POSIX")), bzz > 0
+    else { return nil }
+    var plur = bzz * plurPerBzz
+    var whole = Decimal()
+    NSDecimalRound(&whole, &plur, 0, .down)
+    return whole == plur ? plur : nil
+}
+
+/// PLUR as a decimal string for the FFI (`amount_plur`).
+func plurString(_ plur: Decimal) -> String {
+    NSDecimalNumber(decimal: plur).stringValue
+}
+
+/// PLUR as a plain xBZZ number for an amount field, rounded down to 6
+/// decimals.
+func bzzInput(_ plur: Decimal) -> String {
+    var micro = plur / Decimal(sign: .plus, exponent: 10, significand: 1)
+    var floored = Decimal()
+    NSDecimalRound(&floored, &micro, 0, .down)
+    let bzz = floored / Decimal(1_000_000)
+    return NSDecimalNumber(decimal: bzz).description(withLocale: Locale(identifier: "en_US_POSIX"))
+}
+
+/// Wei as xDAI with 4 decimals, rounded down.
+func formatXdai(_ wei: Decimal) -> String {
+    var units = wei / Decimal(sign: .plus, exponent: 14, significand: 1)
+    var floored = Decimal()
+    NSDecimalRound(&floored, &units, 0, .down)
+    var digits = NSDecimalNumber(decimal: floored).stringValue
+    while digits.count < 5 { digits = "0" + digits }
+    return "\(digits.dropLast(4)).\(digits.suffix(4)) xDAI"
+}
+
 /// One cheque payment to a peer, as seen between two polls.
 struct Payment: Equatable, Identifiable {
     let id = UUID()

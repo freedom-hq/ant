@@ -268,6 +268,68 @@ fn failure(e: FundingError) -> FundingFailure {
     }
 }
 
+/// The route status for a refused or failed withdrawal.
+fn withdraw_failure(e: ant_chain::chequebook_store::WithdrawError) -> FundingFailure {
+    use ant_chain::chequebook_store::WithdrawError;
+    match e {
+        WithdrawError::Invalid(_)
+        | WithdrawError::ExceedsAvailable { .. }
+        | WithdrawError::NotIssuer { .. } => FundingFailure::Rejected(e.to_string()),
+        WithdrawError::IssuedUnknown(_) => FundingFailure::Unavailable(e.to_string()),
+        WithdrawError::Chain(_) | WithdrawError::Tx(_) => FundingFailure::Chain(e.to_string()),
+    }
+}
+
+/// Hand the node `chequebook`'s `funds` (`ControlCommand::SetRetrievalFunds`).
+/// `false` once the node is gone.
+async fn set_node_funds(
+    node: tokio::sync::mpsc::Sender<ant_control::ControlCommand>,
+    chequebook: [u8; 20],
+    funds: ant_chain::chequebook_store::RetrievalFunds,
+) -> bool {
+    let (ack, ack_rx) = tokio::sync::oneshot::channel();
+    node.send(ant_control::ControlCommand::SetRetrievalFunds {
+        chequebook,
+        deposited_plur: funds.deposited_plur,
+        exchange_rate_plur: funds.exchange_rate_plur,
+        deduction_plur: funds.deduction_plur,
+        ack,
+    })
+    .await
+    .is_ok()
+        && tokio::time::timeout(NODE_ACK_TIMEOUT, ack_rx)
+            .await
+            .is_ok_and(|r| r.is_ok())
+}
+
+/// How long a withdrawal waits for the node loop to answer a command.
+const NODE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Every cheque the node has issued from `chequebook`, in PLUR, asked of
+/// the node (`ControlCommand::AccountingSnapshot`), or why that total
+/// isn't fully known (`ant_control::AccountingSnapshotView::issued_from`).
+/// A chequebook withdrawal must leave it backed. Shared by the gateway's
+/// `POST /chequebook/withdraw` and `ant-ffi`'s C API.
+///
+/// # Errors
+///
+/// The node is gone or didn't answer, or the total isn't known.
+pub async fn node_issued_from(
+    node: tokio::sync::mpsc::Sender<ant_control::ControlCommand>,
+    chequebook: [u8; 20],
+) -> Result<u128, String> {
+    let (ack, ack_rx) = tokio::sync::oneshot::channel();
+    node.send(ant_control::ControlCommand::AccountingSnapshot { ack })
+        .await
+        .map_err(|_| "the node stopped".to_string())?;
+    match tokio::time::timeout(NODE_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(ant_control::ControlAck::Accounting(view))) => view.issued_from(&chequebook),
+        Ok(Ok(other)) => Err(format!("the node's cheque total is unavailable: {other:?}")),
+        Ok(Err(_)) => Err("the node stopped".to_string()),
+        Err(_) => Err("the node didn't report its cheque total in time".to_string()),
+    }
+}
+
 #[async_trait]
 impl ChainWriter for AntChainWriter {
     async fn buy_batch(
@@ -314,7 +376,30 @@ impl ChainWriter for AntChainWriter {
             .erc20_transfer(&self.client, &self.bzz_token, &cb, U256::from(amount))
             .await
             .map_err(|e| format!("deposit transfer: {e}"))?;
+        // A withdrawal from the last minutes mustn't hide this deposit.
+        ant_chain::chequebook_store::note_deposit(&cb, amount);
         Ok(receipt.tx_hash)
+    }
+
+    async fn withdraw_chequebook(
+        &self,
+        amount: u128,
+        node: tokio::sync::mpsc::Sender<ant_control::ControlCommand>,
+    ) -> Result<[u8; 32], FundingFailure> {
+        let cb = self.chequebook.get().ok_or_else(|| {
+            FundingFailure::Rejected("no chequebook configured to withdraw from".into())
+        })?;
+        ant_chain::chequebook_store::withdraw_from_chequebook(
+            &self.client,
+            &self.wallet,
+            &cb,
+            amount,
+            |funds| set_node_funds(node.clone(), cb, funds),
+            || node_issued_from(node.clone(), cb),
+        )
+        .await
+        .map(|w| w.tx)
+        .map_err(withdraw_failure)
     }
 
     async fn quote_plan(&self, depth: u8, days: u64) -> Result<StorageQuoteView, FundingFailure> {

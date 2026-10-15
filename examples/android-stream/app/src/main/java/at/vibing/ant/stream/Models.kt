@@ -73,6 +73,54 @@ data class SwapStatus(
     }
 }
 
+/**
+ * `ant_wallet_balance`: the account wallet on Gnosis. Its xBZZ is what
+ * "Add to credit" moves into the chequebook; its xDAI pays the gas.
+ */
+data class WalletBalance(val address: String, val bzzPlur: BigInteger, val xdaiWei: BigInteger) {
+    companion object {
+        fun parse(json: String): WalletBalance? = runCatching {
+            val o = JSONObject(json)
+            WalletBalance(
+                address = o.optString("address"),
+                bzzPlur = o.getString("bzz_plur").toBigInteger(),
+                xdaiWei = o.getString("xdai_wei").toBigInteger(),
+            )
+        }.getOrNull()
+    }
+}
+
+/**
+ * `ant_storage_settlement_deposit`: whether the chequebook holds the
+ * deposit its plan needs. A deployed chequebook with too little behind it
+ * signs cheques nobody can cash, so broadcasts stall once the peers'
+ * tolerance runs out.
+ */
+data class SettlementDeposit(
+    val enabled: Boolean,
+    val depositBzz: String,
+    val targetBzz: String,
+    val shortfallBzz: String,
+    val needsTopUp: Boolean,
+    val xdaiToSendDisplay: String,
+    val sufficientFunds: Boolean,
+) {
+    companion object {
+        fun parse(json: String): SettlementDeposit? = runCatching {
+            val o = JSONObject(json)
+            SettlementDeposit(
+                enabled = o.optBoolean("enabled"),
+                depositBzz = o.optString("deposit_bzz"),
+                targetBzz = o.optString("target_bzz"),
+                shortfallBzz = o.optString("shortfall_bzz"),
+                needsTopUp = o.optBoolean("needs_top_up"),
+                xdaiToSendDisplay = o.optString("xdai_to_send_display"),
+                sufficientFunds = o.optBoolean("sufficient_funds", true),
+            )
+        }.getOrNull()
+    }
+}
+
 /** One cheque payment to a peer, as seen between two polls. */
 data class Payment(val peer: String, val plur: BigInteger, val atMillis: Long)
 
@@ -97,6 +145,28 @@ fun formatBzz(plur: BigInteger): String {
     if (micro.signum() == 0) return "< 0.000001 xBZZ"
     val s = micro.toString().padStart(7, '0')
     return "${s.dropLast(6)}.${s.takeLast(6)} xBZZ"
+}
+
+/**
+ * An xBZZ amount as typed ("0.5", "1,25") in PLUR, or null unless it is a
+ * positive number with at most 16 decimals.
+ */
+fun parseBzzAmount(text: String): BigInteger? {
+    val d = text.trim().replace(',', '.').toBigDecimalOrNull() ?: return null
+    if (d.signum() <= 0) return null
+    return runCatching { d.movePointRight(16).toBigIntegerExact() }.getOrNull()
+}
+
+/** PLUR as a plain xBZZ number for an amount field, rounded down to 6 decimals. */
+fun bzzInput(plur: BigInteger): String {
+    val micro = plur.multiply(BigInteger.valueOf(1_000_000)).divide(PLUR_PER_BZZ)
+    return java.math.BigDecimal(micro, 6).stripTrailingZeros().toPlainString()
+}
+
+/** Wei as xDAI with 4 decimals, rounded down. */
+fun formatXdai(wei: BigInteger): String {
+    val units = wei.divide(BigInteger.TEN.pow(14))
+    return "${java.math.BigDecimal(units, 4).toPlainString()} xDAI"
 }
 
 data class StorageValidity(val enabled: Boolean, val remainingSeconds: Long, val expiresUnix: Long) {

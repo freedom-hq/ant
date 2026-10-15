@@ -35,6 +35,11 @@ object AntNative {
     @JvmStatic external fun nativeStorageValidity(handle: Long, rpc: String): String
     @JvmStatic external fun nativeSettlementDeposit(handle: Long, rpc: String): String
     @JvmStatic external fun nativeSettlementTopup(handle: Long, rpc: String): String
+    /** Spends real funds: moves `amountPlur` xBZZ from the wallet into the chequebook. */
+    @JvmStatic external fun nativeSettlementTopupAmount(handle: Long, rpc: String, amountPlur: String): String
+    /** Sends a real transaction: moves `amountPlur` xBZZ from the chequebook back to the wallet. */
+    @JvmStatic external fun nativeSettlementWithdrawAmount(handle: Long, rpc: String, amountPlur: String): String
+    @JvmStatic external fun nativeWalletBalance(handle: Long, rpc: String): String
     @JvmStatic external fun nativeStorageQuote(handle: Long, rpc: String, depth: Int, days: Long): String
     @JvmStatic external fun nativeStorageBuyXdai(
         handle: Long,

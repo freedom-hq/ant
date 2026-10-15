@@ -45,7 +45,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 primitive-types = { version = "0.14.0", default-features = false }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 # `chain-rpc` brings in `reqwest` and the `ChainClient` / `Wallet` async
 # methods that drive a JSON-RPC node. Off-by-default for embedders that

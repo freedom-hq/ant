@@ -43,7 +43,7 @@ struct StorageView: View {
                         connectCard
                     }
                     if node.settlement?.enabled == true {
-                        CreditCard(credit: node.credit)
+                        CreditCard(credit: node.credit, rpc: activeRpc) { banner.flash($0) }
                     }
                     accountCard
                     accountKeyCard
@@ -96,6 +96,15 @@ struct StorageView: View {
             if RootView.shotArgs.contains("-antstream-shot-deposit") {
                 node.installDepositTopUpSample()
                 await node.refreshAccount()
+                return
+            }
+            // `-antstream-shot-credit`: the Credit card with the account
+            // wallet beside a nearly spent chequebook (issue #165), same
+            // latching sample approach. The card itself opens its sheets
+            // for the `-antstream-shot-credit-*` variants.
+            if RootView.shotArgs.contains("-antstream-shot-credit") {
+                await node.refreshAccount()
+                node.installCreditSample()
                 return
             }
             await node.refreshAll()

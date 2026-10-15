@@ -299,6 +299,21 @@ pub fn chequebook_liquid_balance_selector() -> [u8; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
+/// `SimpleSwap.withdraw(uint256 amount)` calldata: move `amount` xBZZ
+/// (PLUR) out of the chequebook back to its issuer. The contract only
+/// lets the issuer call it, and reverts above `liquidBalance()`. Nothing
+/// stops it withdrawing funds that back cheques already issued but not
+/// yet cashed (the chain doesn't know about those), so callers cap the
+/// amount themselves; see
+/// [`crate::chequebook_store::withdraw_from_chequebook`].
+#[must_use]
+pub fn chequebook_withdraw_calldata(amount: U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&keccak(b"withdraw(uint256)")[0..4]);
+    data.extend_from_slice(&u256_be_word(&amount));
+    data
+}
+
 /// Encode a `paidOut(beneficiary)` call's full calldata.
 #[must_use]
 pub fn chequebook_paid_out_calldata(beneficiary: &[u8; 20]) -> Vec<u8> {
@@ -573,6 +588,17 @@ mod tests {
             chequebook_paid_out_selector().to_vec(),
             keccak(b"paidOut(address)")[0..4].to_vec()
         );
+    }
+
+    /// `withdraw(uint256)` selector + ABI layout: the amount
+    /// left-padded to one 32-byte word.
+    #[test]
+    fn withdraw_calldata_layout() {
+        let data = chequebook_withdraw_calldata(U256::from(0x1234u64));
+        assert_eq!(hex::encode(&data[..4]), "2e1a7d4d");
+        assert_eq!(data.len(), 36);
+        assert_eq!(&data[34..], &[0x12, 0x34]);
+        assert!(data[4..34].iter().all(|&b| b == 0));
     }
 
     /// `deployedContracts(address)` selector + ABI layout. Used by
