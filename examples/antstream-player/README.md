@@ -10,21 +10,37 @@ and a vendored hls.js 1.7.3 light build (`vendor/`, Apache-2.0).
 ## Published build
 
 ```
-bzz://d36e69f559acbed1bbada8690f3231741bb8975fa7e9e764c43a27d095a088e2/#<channel>
-https://api.gateway.ethswarm.org/bzz/d36e69f559acbed1bbada8690f3231741bb8975fa7e9e764c43a27d095a088e2/#<channel>
+bzz://b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac42857c35/#<channel>
+https://api.gateway.ethswarm.org/bzz/b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac42857c35/#<channel>
 ```
 
-The Android app's Share button sends both links. Changing the player
-means uploading it again (a new reference) and updating it in
-`examples/android-stream/app/src/main/java/at/vibing/ant/stream/Channel.kt`
-(`PLAYER_REF`) and `examples/ios-stream/AntStream/AntNode.swift`:
+This is a **feed manifest**: the address stays the same and always serves
+the newest build. The Android app's Share button sends both links, and
+the apps (`PLAYER_REF` in
+`examples/android-stream/app/src/main/java/at/vibing/ant/stream/Channel.kt`,
+`playerReference` in `examples/ios-stream/AntStream/AntNode.swift`) never
+need a new reference for a player update.
+
+The page footer and the debug panel show which build is being served:
+`Player build <n> · <commit> · <build time>`, where `<n>` is the feed index
+the build was published at.
+
+### Publishing a new build
 
 ```sh
-tar --format=ustar -cf player.tar index.html player.css player.js debug.js vendor/hls.light.min.js vendor/hls.js-LICENSE
-curl -X POST http://127.0.0.1:1633/bzz -H 'Content-Type: application/x-tar' \
-  -H 'swarm-collection: true' -H 'swarm-index-document: index.html' \
-  -H "swarm-postage-batch-id: $BATCH" --data-binary @player.tar
+cd examples/antstream-player/deploy
+npm install
+node deploy-feed.mjs --gateway http://127.0.0.1:1633 --stamp "$BATCH" \
+  --key /path/to/antstream-player-feed.key      # --dry-run to stage only
 ```
+
+`deploy-feed.mjs` uploads the player with a generated `version.js` (build
+number, commit, build time) and writes it as the next update of the feed
+(topic `antstream-player`, owner `0x0b882aea32aa77a804ad6c506a5024ed56c746d1`).
+The key only signs feed updates: it holds no funds and has no rights on any
+chain. The stamp pays for the upload on the gateway's node.
+
+A page loaded from a checkout (no `version.js`) says "development build".
 
 ## How it plays a channel
 

@@ -315,8 +315,9 @@
     let result = { error };
     if (text !== null) {
       const info = playlistInfo(text);
-      row.seq = info.key[0];
-      row.segments = info.key[1];
+      // key is [recording, media sequence, entries, ended].
+      row.seq = info.key[1];
+      row.segments = info.key[2];
       const before = guard.text;
       const kept = guardPlaylist(text);
       row.note = kept !== text ? 'stale: kept the newer one' : kept === before ? 'unchanged' : 'newer';
@@ -1043,7 +1044,30 @@
   fromHash();
 
   // Exposed for the test harness and for debugging from the console.
+  // -- build ------------------------------------------------------------------
+  //
+  // deploy-feed.mjs writes version.js next to the page at deploy time:
+  // the build number (the feed index the build is published at), the
+  // commit and the build time. A page served straight from a checkout
+  // has none and says so.
+
+  const build = window.ANTSTREAM_PLAYER_BUILD || null;
+
+  function buildLabel() {
+    if (!build) return 'Player: development build';
+    const at = new Date(build.builtAt);
+    const when = Number.isNaN(at.getTime())
+      ? build.builtAt
+      : `${at.toLocaleString()} (${at.toISOString().replace('T', ' ').slice(0, 16)} UTC)`;
+    return `Player build ${build.build} · ${build.commit} · ${when}`;
+  }
+
+  const versionEl = document.getElementById('player-version');
+  if (versionEl) versionEl.textContent = buildLabel();
+
   window.antstreamPlayer = {
+    build,
+    buildLabel,
     toContentUrl,
     parseChannel,
     contentUrl,
