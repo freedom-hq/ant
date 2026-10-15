@@ -186,6 +186,25 @@ AntDrive — see the "Driving the iOS Drive app on the simulator" section
 in the repo's `AGENTS.md` (the FFI logs to stderr, which the simulator
 does not forward to the unified log, so relaunch with `--console-pty`).
 
+## TestFlight
+
+[`.github/workflows/antstream-ios-testflight.yml`](../../.github/workflows/antstream-ios-testflight.yml)
+archives the app, signs it with Xcode's cloud-managed signing and
+uploads it to App Store Connect on every release tag (`v*`), or by hand
+from the Actions tab. Builds are numbered `0.1.<run>` / `<run>`.
+
+One-time setup:
+
+1. In App Store Connect, create the app record for
+   `baby.freedom.antstream` (team `46XPHRBLH5`) if it doesn't exist.
+2. Under Users and Access → Integrations → App Store Connect API,
+   create a team key with the **Admin** role (cloud signing creates the
+   distribution certificate) and download its `.p8`.
+3. Add three repository secrets: `ASC_KEY_ID`, `ASC_ISSUER_ID` and
+   `ASC_KEY_P8` (the file's contents).
+
+Until the secrets exist, the workflow skips the upload and succeeds.
+
 ## First run
 
 1. Launch — the Broadcast tab shows the readiness checklist. The account
