@@ -1212,6 +1212,12 @@ impl ChunkFetcher for SniffedFetcher<'_> {
     async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
         self.inner.put_recovered(addr, wire).await;
     }
+
+    /// The inner fetcher's handle: a detached feed-probe fetch only has
+    /// to land in the node's caches, not in this sniff's memo.
+    fn detached(&self) -> Option<std::sync::Arc<dyn ChunkFetcher>> {
+        self.inner.detached()
+    }
 }
 
 /// A copy of a fetch error the sniff can replay later. Boxed errors

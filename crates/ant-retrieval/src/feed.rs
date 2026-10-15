@@ -348,9 +348,38 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Bounding the speculative probes turns "find latest" back into a
 /// sub-second operation for the common feed. A genuinely
 /// present-but-slow update that loses the race against this deadline is
-/// folded into "absent" for this resolution and recovered on the next
-/// one (feeds are polled), exactly as bee's bounded async finder treats
-/// an update it couldn't fetch within its own per-probe budget.
+/// folded into "absent" for this resolution, exactly as bee's bounded
+/// async finder treats an update it couldn't fetch within its own
+/// per-probe budget.
+///
+/// Recovering it on the next resolution (feeds are polled) only works
+/// if the next one doesn't start the same losing fetch from scratch:
+/// right after a push an update's SOC often takes longer than this to
+/// reach, and a reader polling with fresh 800 ms probes stayed on the
+/// old head for ~20 s at a time (issue #190). So on a hinted walk
+/// ([`resolve_sequence_feed_hinted`], where the node keeps
+/// [`FeedHints`]) the probes of the [`BACKGROUND_PROBE_SPAN`] indices
+/// just past the walk's anchor fetch in a detached task
+/// ([`ChunkFetcher::detached`]): the deadline only stops the *wait*, the
+/// fetch runs on for its full retrieval budget and lands the SOC in the
+/// node's chunk cache. The next resolution then reads it locally, or,
+/// if it is still in flight, waits on that same fetch instead of
+/// starting another (one fetch per `(owner, topic, index)`, at most
+/// [`BACKGROUND_PROBES_CAP`] per node, each dropped from the registry
+/// when it ends). Every other speculative probe is cut off at the
+/// deadline as before.
+///
+/// Cost of that: a resolution still waits at most this long per probe
+/// round, but the node keeps up to [`BACKGROUND_PROBE_SPAN`] fetches
+/// running past each anchor a feed is walked from (normally just its
+/// hint; a fallback walk from the caller's `after` adds its own), each
+/// until its fetcher gives up: on the live network an absent index
+/// costs the multi-peer walk the deadline otherwise cuts short. A poll
+/// that finds those fetches still running waits on them rather than
+/// adding more, so a feed polled while nothing new exists holds that
+/// many fetches at any time, however often it is polled, and the node
+/// never more than [`BACKGROUND_PROBES_CAP`]. A fetch that lands a
+/// present update is paid and cached like any other retrieval.
 ///
 /// Sized below a single absent SOC fetch's natural cost (~2-3 s of
 /// closest-peer walking on the live network): a reachable update in its
@@ -360,6 +389,189 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// the whole confirmation window at once), a single-writer feed resolves
 /// in ~1 round-trip instead of one-per-probe.
 const FEED_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// How many indices past a hinted walk's anchor (`anchor + 1 ..= anchor +
+/// span`) fetch in the background, so a probe that hits
+/// [`FEED_PROBE_TIMEOUT`] doesn't throw its fetch away (issue #190).
+/// These are the updates a polled live feed is most likely to have
+/// gained since the last read (a writer a few updates ahead of a
+/// reader); further indices are reached once the head moves up. Bounds
+/// the background work one feed can hold to this many fetches, however
+/// often it is polled.
+const BACKGROUND_PROBE_SPAN: u64 = 4;
+
+/// Most background probe fetches one node keeps in flight across all
+/// feeds ([`FeedHints`]). Past it a probe is cut off at its deadline as
+/// before, so a gateway whose clients poll many feeds can't pile up
+/// fetches for absent indices without bound.
+const BACKGROUND_PROBES_CAP: usize = 64;
+
+/// What a background probe fetch ended with, classified the way
+/// [`probe_once`] classifies a direct fetch (a `Box<dyn Error>` can't be
+/// shared between the probes that wait on the same fetch).
+#[derive(Clone)]
+enum Landed {
+    Wire(Arc<Vec<u8>>),
+    Miss { corroborated: bool },
+    Failed(Arc<str>),
+}
+
+/// A background probe fetch that any number of probes can wait on.
+type Landing = futures::future::Shared<futures::future::BoxFuture<'static, Landed>>;
+
+/// `(owner, topic, index)`: one feed update a background fetch is for.
+type ProbeKey = (FeedKey, u64);
+
+/// The node's background probe fetches in flight, one per
+/// `(owner, topic, index)`, at most [`BACKGROUND_PROBES_CAP`]. A fetch's
+/// entry is removed when its task ends, however it ends (see
+/// [`ProbeCleanup`]); its result goes to the probes waiting on it and,
+/// through the fetcher, to the node's chunk caches.
+#[derive(Default)]
+struct FeedProbes {
+    next_id: std::sync::atomic::AtomicU64,
+    inflight: Mutex<HashMap<ProbeKey, (u64, Landing)>>,
+}
+
+impl std::fmt::Debug for FeedProbes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeedProbes")
+            .field("inflight", &self.len())
+            .finish()
+    }
+}
+
+impl FeedProbes {
+    /// The background fetch of `addr` for `key`: the one already in
+    /// flight, or a new one started in a detached task. `None` when the
+    /// node is at [`BACKGROUND_PROBES_CAP`], the fetcher can't be
+    /// detached, or there is no runtime to run it on; the caller then
+    /// fetches directly, as before.
+    fn landing(
+        self: &Arc<Self>,
+        fetcher: &dyn ChunkFetcher,
+        key: ProbeKey,
+        addr: [u8; 32],
+    ) -> Option<Landing> {
+        let mut inflight = self.inflight.lock().ok()?;
+        if let Some((_, landing)) = inflight.get(&key) {
+            return Some(landing.clone());
+        }
+        if inflight.len() >= BACKGROUND_PROBES_CAP {
+            return None;
+        }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let detached = fetcher.detached()?;
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let landing = futures::FutureExt::shared(futures::FutureExt::boxed(async move {
+            rx.await.unwrap_or_else(|_| {
+                Landed::Failed(Arc::from("background feed probe ended without a result"))
+            })
+        }));
+        inflight.insert(key, (id, landing.clone()));
+        drop(inflight);
+        let cleanup = ProbeCleanup {
+            probes: Arc::clone(self),
+            key,
+            id,
+        };
+        runtime.spawn(async move {
+            let landed = match detached.fetch(addr).await {
+                Ok(wire) => Landed::Wire(Arc::new(wire)),
+                Err(e) if is_chunk_not_found(e.as_ref()) => Landed::Miss {
+                    corroborated: anchor_miss_corroborated(e.as_ref()),
+                },
+                Err(e) => Landed::Failed(Arc::from(e.to_string())),
+            };
+            trace!(
+                target: "ant_retrieval::feed",
+                index = key.1,
+                present = matches!(landed, Landed::Wire(_)),
+                "background feed probe ended",
+            );
+            // Out of the registry before the waiters hear the result, so
+            // a probe that comes later starts afresh (and, for a present
+            // update, reads it from the chunk cache).
+            drop(cleanup);
+            let _ = tx.send(landed);
+        });
+        Some(landing)
+    }
+
+    /// Background fetches in flight.
+    fn len(&self) -> usize {
+        self.inflight.lock().map_or(0, |m| m.len())
+    }
+}
+
+/// Removes a background probe's registry entry when its task ends, also
+/// if the task is cancelled or panics, and only if the entry is still
+/// this task's own.
+struct ProbeCleanup {
+    probes: Arc<FeedProbes>,
+    key: ProbeKey,
+    id: u64,
+}
+
+impl Drop for ProbeCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.probes.inflight.lock() {
+            if inflight
+                .get(&self.key)
+                .is_some_and(|(id, _)| *id == self.id)
+            {
+                inflight.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Which speculative probes of one walk fetch in the background: those
+/// of the [`BACKGROUND_PROBE_SPAN`] indices just past `anchor`, the
+/// index the walk started from.
+#[derive(Clone, Copy)]
+struct Background<'a> {
+    probes: &'a Arc<FeedProbes>,
+    anchor: u64,
+}
+
+impl Background<'_> {
+    fn covers(&self, index: u64) -> bool {
+        index > self.anchor && index - self.anchor <= BACKGROUND_PROBE_SPAN
+    }
+}
+
+/// One fetch's outcome, as [`probe_once`] acts on it.
+enum Fetched {
+    Wire(Vec<u8>),
+    Miss { corroborated: bool },
+    Failed(Box<dyn StdError + Send + Sync>),
+}
+
+impl From<Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> for Fetched {
+    fn from(r: Result<Vec<u8>, Box<dyn StdError + Send + Sync>>) -> Self {
+        match r {
+            Ok(wire) => Self::Wire(wire),
+            Err(e) if is_chunk_not_found(e.as_ref()) => Self::Miss {
+                corroborated: anchor_miss_corroborated(e.as_ref()),
+            },
+            Err(e) => Self::Failed(e),
+        }
+    }
+}
+
+impl From<Landed> for Fetched {
+    fn from(l: Landed) -> Self {
+        match l {
+            Landed::Wire(wire) => Self::Wire(Arc::unwrap_or_clone(wire)),
+            Landed::Miss { corroborated } => Self::Miss { corroborated },
+            Landed::Failed(msg) => Self::Failed(msg.to_string().into()),
+        }
+    }
+}
 
 /// Outcome of probing one sequence index.
 enum ProbeOutcome {
@@ -429,6 +641,7 @@ async fn prefetch_window(
     feed: &Feed,
     anchor: u64,
     probed: &mut u64,
+    background: Option<Background<'_>>,
 ) -> ProbeCache {
     let mut offsets: Vec<u64> = Vec::new();
     for k in 0..=LOOKAHEAD_LEVELS {
@@ -456,7 +669,7 @@ async fn prefetch_window(
     let outcomes = futures::future::join_all(indices.iter().map(|&i| async move {
         (
             i,
-            probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT)).await,
+            probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT), background).await,
         )
     }))
     .await;
@@ -489,6 +702,7 @@ async fn probe_cached(
     probed: &mut u64,
     deadline: Option<Duration>,
     cache: &ProbeCache,
+    background: Option<Background<'_>>,
 ) -> Result<ProbeOutcome, FeedError> {
     if let Some(hit) = cache.get(&index) {
         return Ok(match hit {
@@ -499,7 +713,7 @@ async fn probe_cached(
             CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.clone().into()),
         });
     }
-    probe(fetcher, feed, index, probed, deadline).await
+    probe(fetcher, feed, index, probed, deadline, background).await
 }
 
 /// Probe a single sequence index, retrying transient fetch failures.
@@ -514,9 +728,10 @@ async fn probe(
     index: u64,
     probed: &mut u64,
     deadline: Option<Duration>,
+    background: Option<Background<'_>>,
 ) -> Result<ProbeOutcome, FeedError> {
     *probed += 1;
-    probe_once(fetcher, feed, index, deadline).await
+    probe_once(fetcher, feed, index, deadline, background).await
 }
 
 /// One sequence-index probe without touching the `probed` counter, so
@@ -528,44 +743,63 @@ async fn probe_once(
     feed: &Feed,
     index: u64,
     deadline: Option<Duration>,
+    background: Option<Background<'_>>,
 ) -> Result<ProbeOutcome, FeedError> {
     let addr = sequence_update_address(feed, index);
     let mut attempt: u32 = 0;
     loop {
-        let fetched = match deadline {
+        let fetched: Fetched = match deadline {
             // Speculative probe: cap the wall-clock so an absent index
             // can't burn the fetcher's full multi-peer retrieval budget.
             // A timeout is folded into "transient" — an upper bound for
             // the bracket / not-present for the look-ahead — rather than a
             // definitive "absent", so we never assert the feed ended on a
-            // slow probe; the next resolution re-checks. Dropping the
-            // fetch at the deadline doesn't drop its in-flight requests:
-            // `RoutingFetcher` hands them to its loser drain, so a late
-            // delivery still records its debit in the accounting mirror.
-            Some(d) => match tokio::time::timeout(d, fetcher.fetch(addr)).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    debug!(
-                        target: "ant_retrieval::feed",
-                        index,
-                        deadline_ms = d.as_millis() as u64,
-                        "speculative feed probe timed out; folding into a transient miss",
-                    );
-                    return Ok(ProbeOutcome::Transient(
-                        format!(
-                            "feed probe for index {index} exceeded {} ms deadline",
-                            d.as_millis()
-                        )
-                        .into(),
-                    ));
+            // slow probe; the next resolution re-checks.
+            Some(d) => {
+                // Just past a hinted walk's anchor, the fetch runs in the
+                // background and the deadline only bounds the wait for it
+                // (issue #190, see `FEED_PROBE_TIMEOUT`).
+                let landing = background.filter(|b| b.covers(index)).and_then(|b| {
+                    b.probes
+                        .landing(fetcher, ((feed.owner, feed.topic), index), addr)
+                });
+                let in_background = landing.is_some();
+                // Elsewhere, dropping the fetch at the deadline doesn't
+                // drop its in-flight requests: `RoutingFetcher` hands them
+                // to its loser drain, so a late delivery still records its
+                // debit in the accounting mirror.
+                let waited = match landing {
+                    Some(landing) => tokio::time::timeout(d, landing).await.map(Fetched::from),
+                    None => tokio::time::timeout(d, fetcher.fetch(addr))
+                        .await
+                        .map(Fetched::from),
+                };
+                match waited {
+                    Ok(fetched) => fetched,
+                    Err(_elapsed) => {
+                        debug!(
+                            target: "ant_retrieval::feed",
+                            index,
+                            deadline_ms = d.as_millis() as u64,
+                            in_background,
+                            "speculative feed probe timed out; folding into a transient miss",
+                        );
+                        return Ok(ProbeOutcome::Transient(
+                            format!(
+                                "feed probe for index {index} exceeded {} ms deadline",
+                                d.as_millis()
+                            )
+                            .into(),
+                        ));
+                    }
                 }
-            },
+            }
             // Anchor probe (index 0): unbounded — it must resolve, and on a
             // remote feed it legitimately comes from the network.
-            None => fetcher.fetch(addr).await,
+            None => fetcher.fetch(addr).await.into(),
         };
         match fetched {
-            Ok(wire) => {
+            Fetched::Wire(wire) => {
                 let decoded = decode_sequence_update(&wire, addr, feed)?;
                 // Seed the update's wrapped CAC into the local store,
                 // exactly like a recovered RS shard. Bee's `resolveFeed`
@@ -591,12 +825,10 @@ async fn probe_once(
                 );
                 return Ok(ProbeOutcome::Present(decoded));
             }
-            Err(e) => {
-                if is_chunk_not_found(e.as_ref()) {
-                    return Ok(ProbeOutcome::Absent {
-                        corroborated: anchor_miss_corroborated(e.as_ref()),
-                    });
-                }
+            Fetched::Miss { corroborated } => {
+                return Ok(ProbeOutcome::Absent { corroborated });
+            }
+            Fetched::Failed(e) => {
                 if attempt >= PROBE_RETRIES {
                     debug!(
                         target: "ant_retrieval::feed",
@@ -683,13 +915,31 @@ pub async fn resolve_sequence_feed_after(
     feed: &Feed,
     after: u64,
 ) -> Result<FeedResolution, FeedError> {
+    resolve_walk(fetcher, feed, after, None).await
+}
+
+/// [`resolve_sequence_feed_after`], with the speculative probes just past
+/// `after` fetching in the background through `probes` when given (see
+/// [`FEED_PROBE_TIMEOUT`]). Which update it resolves never depends on
+/// `probes`: a background fetch only changes how long a probe's fetch
+/// lives, not what the walk does with the probe's outcome.
+async fn resolve_walk(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    after: u64,
+    probes: Option<&Arc<FeedProbes>>,
+) -> Result<FeedResolution, FeedError> {
+    let background = probes.map(|probes| Background {
+        probes,
+        anchor: after,
+    });
     let mut probed: u64 = 0;
 
     // Phase 0 — anchor on index `after` (unbounded: it must resolve;
     // bee's anchor fetch is likewise bounded only by the request
     // context).
     let (mut latest_index, mut latest) =
-        match probe(fetcher, feed, after, &mut probed, None).await? {
+        match probe(fetcher, feed, after, &mut probed, None, None).await? {
             ProbeOutcome::Present(u) => (after, u),
             ProbeOutcome::Absent { corroborated } => {
                 return Err(FeedError::NoUpdates {
@@ -706,7 +956,7 @@ pub async fn resolve_sequence_feed_after(
         // (unchanged) sequential logic consume the cached outcomes.
         // See `prefetch_window` for the lattice + the measured cost of
         // the sequential original.
-        let cache = prefetch_window(fetcher, feed, latest_index, &mut probed).await;
+        let cache = prefetch_window(fetcher, feed, latest_index, &mut probed, background).await;
 
         // Phase 1 — exponential bracket. `lo` is known present, `hi` is
         // known absent (a transient that survived retries counts as
@@ -729,6 +979,7 @@ pub async fn resolve_sequence_feed_after(
                 &mut probed,
                 Some(FEED_PROBE_TIMEOUT),
                 &cache,
+                background,
             )
             .await?
             {
@@ -753,6 +1004,7 @@ pub async fn resolve_sequence_feed_after(
                 &mut probed,
                 Some(FEED_PROBE_TIMEOUT),
                 &cache,
+                background,
             )
             .await?
             {
@@ -807,7 +1059,7 @@ pub async fn resolve_sequence_feed_after(
         let mut outcomes = futures::future::join_all(live.iter().map(|&i| async move {
             (
                 i,
-                probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT)).await,
+                probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT), background).await,
             )
         }))
         .await;
@@ -891,8 +1143,17 @@ pub async fn resolve_sequence_feed_after(
 /// cold peers' "not found", keeps the hint. The map holds at most
 /// [`FEED_HINTS_CAP`] feeds; past that, recording a new feed evicts an
 /// arbitrary one (a lost hint only costs that feed one cold walk).
+///
+/// The same handle carries the node's background probe fetches (issue
+/// #190): the speculative probes just past a hinted walk's anchor keep
+/// fetching after their deadline, one fetch per `(owner, topic, index)`,
+/// so a slow-to-reach new update still lands in the chunk cache and the
+/// next read moves the head (see [`FEED_PROBE_TIMEOUT`]).
 #[derive(Clone, Debug, Default)]
-pub struct FeedHints(Arc<Mutex<HashMap<FeedKey, u64>>>);
+pub struct FeedHints {
+    hints: Arc<Mutex<HashMap<FeedKey, u64>>>,
+    probes: Arc<FeedProbes>,
+}
 
 /// Most feeds one [`FeedHints`] map remembers. Every `/bzz`
 /// feed-manifest read and `GET /feeds` resolution writes an entry, and a
@@ -916,7 +1177,7 @@ impl FeedHints {
     /// node has none (or the lock is poisoned).
     #[must_use]
     pub fn get(&self, owner: &[u8; 20], topic: &[u8; 32]) -> u64 {
-        self.0
+        self.hints
             .lock()
             .ok()
             .and_then(|h| h.get(&(*owner, *topic)).copied())
@@ -927,7 +1188,7 @@ impl FeedHints {
     /// A feed the map doesn't hold yet evicts an arbitrary entry once the
     /// map is at [`FEED_HINTS_CAP`].
     pub fn record(&self, owner: &[u8; 20], topic: &[u8; 32], index: u64) {
-        if let Ok(mut h) = self.0.lock() {
+        if let Ok(mut h) = self.hints.lock() {
             let key = (*owner, *topic);
             if !h.contains_key(&key) && h.len() >= FEED_HINTS_CAP {
                 if let Some(victim) = h.keys().next().copied() {
@@ -943,7 +1204,7 @@ impl FeedHints {
     /// value a walk anchored at and failed on. A concurrent read that
     /// meanwhile raised the entry keeps its newer hint.
     fn forget(&self, owner: &[u8; 20], topic: &[u8; 32], stale: u64) {
-        if let Ok(mut h) = self.0.lock() {
+        if let Ok(mut h) = self.hints.lock() {
             let key = (*owner, *topic);
             if h.get(&key) == Some(&stale) {
                 h.remove(&key);
@@ -954,7 +1215,7 @@ impl FeedHints {
     /// Number of feeds the map holds.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.0.lock().map_or(0, |h| h.len())
+        self.hints.lock().map_or(0, |h| h.len())
     }
 }
 
@@ -982,8 +1243,19 @@ impl FeedHints {
 ///   too, the caller's retry pays the hinted anchor and the fallback
 ///   again, each bounded by three transient probe retries.
 ///
-/// On success the hint is raised to the resolved index. `hints = None` is exactly
-/// [`resolve_sequence_feed_after`].
+/// On success the hint is raised to the resolved index.
+///
+/// With `hints`, the speculative probes of the [`BACKGROUND_PROBE_SPAN`]
+/// indices past the anchor also keep fetching after their
+/// [`FEED_PROBE_TIMEOUT`] (when the fetcher can be
+/// [detached](ChunkFetcher::detached)), so a present update that is slow
+/// to reach is in the node's chunk cache, or still in flight for the next
+/// read to wait on, instead of lost (issue #190). This changes only how
+/// long a probe's fetch lives, never what the walk does with its outcome,
+/// so the resolved index is the one the plain walk would return for the
+/// same probe outcomes.
+///
+/// `hints = None` is exactly [`resolve_sequence_feed_after`].
 pub async fn resolve_sequence_feed_hinted(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
@@ -995,7 +1267,7 @@ pub async fn resolve_sequence_feed_hinted(
     };
     let hint = hints.get(&feed.owner, &feed.topic);
     let anchor = after.max(hint);
-    let mut result = resolve_sequence_feed_after(fetcher, feed, anchor).await;
+    let mut result = resolve_walk(fetcher, feed, anchor, Some(&hints.probes)).await;
     if let Err(e) = &result {
         if anchor > after {
             // Only an anchor miss the network corroborated proves the
@@ -1022,7 +1294,7 @@ pub async fn resolve_sequence_feed_hinted(
             if stale {
                 hints.forget(&feed.owner, &feed.topic, hint);
             }
-            result = resolve_sequence_feed_after(fetcher, feed, after).await;
+            result = resolve_walk(fetcher, feed, after, Some(&hints.probes)).await;
             if result.is_ok() && !stale {
                 // The plain walk served what the hinted one couldn't:
                 // replace the hint with what it resolved (below).
@@ -1068,7 +1340,7 @@ pub async fn resolve_sequence_feed_exact(
             return Ok(resolution);
         };
         let mut probed = 0;
-        let reason = match probe(fetcher, feed, next, &mut probed, None).await? {
+        let reason = match probe(fetcher, feed, next, &mut probed, None, None).await? {
             ProbeOutcome::Absent { corroborated: true } => return Ok(resolution),
             ProbeOutcome::Present(_) => {
                 debug!(
@@ -2356,6 +2628,22 @@ mod tests {
         }
     }
 
+    /// A fixture fetcher that can be detached, so hinted feed probes run
+    /// their fetches in the background (issue #190).
+    /// Counts how often it was detached.
+    struct Detachable(Arc<FlakyFetcher>, Arc<AtomicUsize>);
+    #[async_trait]
+    impl ChunkFetcher for Detachable {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            self.0.fetch(addr).await
+        }
+
+        fn detached(&self) -> Option<Arc<dyn ChunkFetcher>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Some(Arc::new(Self(Arc::clone(&self.0), Arc::clone(&self.1))))
+        }
+    }
+
     /// What a `/bzz` read observed: the resolved update index, or the
     /// error text.
     fn bzz_outcome(
@@ -2380,12 +2668,18 @@ mod tests {
     /// in `{0, 1, 3}`: a walk anchored there ends at the gap, like bee's
     /// finder from such an `after`, where the walk from 0 brackets over
     /// it).
+    ///
+    /// Every hinted read runs twice: through the plain fetcher, and
+    /// through one that can be detached, so the probes past the anchor
+    /// fetch in the background (issue #190) and must still resolve the
+    /// same update.
     #[tokio::test(start_paused = true)]
     async fn hinted_bzz_feed_read_matches_unhinted_walk() {
         use crate::mantaray::{lookup_path, lookup_path_with_hints};
 
         let secret: [u8; 32] = [31u8; 32];
         let owner = deterministic_eth_address(&secret);
+        let detaches = Arc::new(AtomicUsize::new(0));
         // (name, indices, transient indices)
         let patterns: Vec<(&str, Vec<u64>, Vec<u64>)> = vec![
             ("single-0", vec![0], vec![]),
@@ -2404,7 +2698,12 @@ mod tests {
         for (name, indices, transient) in patterns {
             let topic = keccak256(format!("hinted-bzz/{name}").as_bytes());
             let (fetcher, root, by_ref) = bzz_feed_fixture(&secret, &topic, &indices, &transient);
-            let unhinted = bzz_outcome(lookup_path(&fetcher, &root, "feed.txt").await, &by_ref);
+            let fetcher = Arc::new(fetcher);
+            let detachable = Detachable(Arc::clone(&fetcher), Arc::clone(&detaches));
+            let unhinted = bzz_outcome(
+                lookup_path(fetcher.as_ref(), &root, "feed.txt").await,
+                &by_ref,
+            );
             let head = *unhinted.as_ref().unwrap_or(&0);
             let max = indices.iter().copied().max().unwrap();
             let mut hints_to_try: Vec<u64> = (0..=max + 2)
@@ -2418,14 +2717,25 @@ mod tests {
                 })
                 .collect();
             hints_to_try.extend([max + 9, 1_000, u64::MAX / 2]);
-            for hint in hints_to_try {
+            for (hint, background) in hints_to_try
+                .into_iter()
+                .flat_map(|h| [(h, false), (h, true)])
+            {
                 let hints = FeedHints::new();
                 hints.record(&owner, &topic, hint);
+                let via: &dyn ChunkFetcher = if background {
+                    &detachable
+                } else {
+                    fetcher.as_ref()
+                };
                 let hinted = bzz_outcome(
-                    lookup_path_with_hints(&fetcher, &root, "feed.txt", &hints).await,
+                    lookup_path_with_hints(via, &root, "feed.txt", &hints).await,
                     &by_ref,
                 );
-                assert_eq!(hinted, unhinted, "{name}: hint {hint}");
+                assert_eq!(
+                    hinted, unhinted,
+                    "{name}: hint {hint}, background {background}"
+                );
                 // A hint the walk could anchor at is raised to the head
                 // (here the head is never below a usable hint); a hint
                 // whose walk failed is dropped and replaced by what the
@@ -2441,6 +2751,8 @@ mod tests {
                 );
             }
         }
+        // The `/bzz` walk really reached the background path.
+        assert!(detaches.load(Ordering::SeqCst) > 0);
     }
 
     /// The point of issue #159: once the node has resolved a long feed,
@@ -2936,5 +3248,268 @@ mod tests {
         assert_eq!(hints.get(&owner, &topic), 60);
         hints.forget(&owner, &topic, 60);
         assert_eq!(hints.get(&owner, &topic), 0);
+    }
+
+    // --- Background finish of timed-out probes (issue #190) -------------
+
+    /// Scripted network for issue #190. Present chunks answer at once,
+    /// except the `slow` ones, which take their delay until the first
+    /// fetch of them completes and land in a simulated node cache then
+    /// (as `RoutingFetcher`'s write-through does); every absent chunk
+    /// takes `absent_delay` to report "not found". A fetch dropped
+    /// before it completes caches nothing. Can be detached (state is
+    /// shared), and counts fetches started and in flight per address.
+    #[derive(Clone)]
+    struct ScriptedNetwork(Arc<ScriptedState>);
+    struct ScriptedState {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        slow: HashMap<[u8; 32], Duration>,
+        absent_delay: Duration,
+        cached: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+        started: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+        inflight: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+        max_inflight: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+    }
+    struct InflightGuard<'a>(&'a ScriptedState, [u8; 32]);
+    impl Drop for InflightGuard<'_> {
+        fn drop(&mut self) {
+            *self.0.inflight.lock().unwrap().get_mut(&self.1).unwrap() -= 1;
+        }
+    }
+    impl ScriptedNetwork {
+        fn new(
+            chunks: HashMap<[u8; 32], Vec<u8>>,
+            slow: HashMap<[u8; 32], Duration>,
+            absent_delay: Duration,
+        ) -> Self {
+            Self(Arc::new(ScriptedState {
+                chunks,
+                slow,
+                absent_delay,
+                cached: std::sync::Mutex::default(),
+                started: std::sync::Mutex::default(),
+                inflight: std::sync::Mutex::default(),
+                max_inflight: std::sync::Mutex::default(),
+            }))
+        }
+        fn started(&self, addr: &[u8; 32]) -> usize {
+            self.0
+                .started
+                .lock()
+                .unwrap()
+                .get(addr)
+                .copied()
+                .unwrap_or(0)
+        }
+        fn max_inflight(&self) -> usize {
+            self.0
+                .max_inflight
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        }
+    }
+    #[async_trait]
+    impl ChunkFetcher for ScriptedNetwork {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            let st = &*self.0;
+            if st.cached.lock().unwrap().contains(&addr) {
+                return Ok(st.chunks[&addr].clone());
+            }
+            *st.started.lock().unwrap().entry(addr).or_default() += 1;
+            let now = {
+                let mut inflight = st.inflight.lock().unwrap();
+                let n = inflight.entry(addr).or_default();
+                *n += 1;
+                *n
+            };
+            let _guard = InflightGuard(st, addr);
+            {
+                let mut max = st.max_inflight.lock().unwrap();
+                let m = max.entry(addr).or_default();
+                *m = (*m).max(now);
+            }
+            let Some(wire) = st.chunks.get(&addr) else {
+                tokio::time::sleep(st.absent_delay).await;
+                return Err(format!("not found: {}", hex::encode(addr)).into());
+            };
+            if let Some(delay) = st.slow.get(&addr) {
+                tokio::time::sleep(*delay).await;
+                st.cached.lock().unwrap().insert(addr);
+            }
+            Ok(wire.clone())
+        }
+
+        fn detached(&self) -> Option<Arc<dyn ChunkFetcher>> {
+            Some(Arc::new(self.clone()))
+        }
+    }
+
+    /// The same network seen through a fetcher that can't be detached:
+    /// what every probe was before issue #190.
+    struct Undetachable<'a>(&'a ScriptedNetwork);
+    #[async_trait]
+    impl ChunkFetcher for Undetachable<'_> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            self.0.fetch(addr).await
+        }
+    }
+
+    /// A feed with v1 updates at `0..=head` (each pointing at a present
+    /// target), plus update `head + 1` whose SOC takes `slow_next` to
+    /// fetch when `Some`. Every absent chunk takes `absent_delay`.
+    fn scripted_feed(
+        name: &str,
+        head: u64,
+        slow_next: Option<Duration>,
+        absent_delay: Duration,
+    ) -> (ScriptedNetwork, Feed) {
+        let secret: [u8; 32] = [41u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic = keccak256(format!("issue-190/{name}").as_bytes());
+        let mut chunks = HashMap::new();
+        let mut slow = HashMap::new();
+        let last = head + u64::from(slow_next.is_some());
+        for i in 0..=last {
+            let (target, target_wire) = cac_new(format!("{name} update {i}").as_bytes()).unwrap();
+            chunks.insert(target, target_wire);
+            let (addr, wire) = make_sequence_update_v1(&secret, &owner, &topic, i, &target);
+            chunks.insert(addr, wire);
+            if i > head {
+                slow.insert(addr, slow_next.unwrap());
+            }
+        }
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        (ScriptedNetwork::new(chunks, slow, absent_delay), feed)
+    }
+
+    /// Issue #190's acceptance test: update N+1 is present, but every
+    /// fetch of it takes 1.5 s, longer than `FEED_PROBE_TIMEOUT`. With
+    /// each probe's fetch thrown away at the deadline, every read starts
+    /// that fetch afresh and loses again, so the reader stays on N for
+    /// good. With the timed-out probe finishing in the background, the
+    /// second read at the latest returns N+1, and N+1 is fetched once.
+    #[tokio::test(start_paused = true)]
+    async fn slow_new_update_is_read_by_the_second_resolution() {
+        const N: u64 = 6;
+        let slow = Duration::from_millis(1_500);
+        let absent = Duration::from_secs(2);
+
+        // Before: no background fetch, so N forever.
+        let (net, feed) = scripted_feed("before", N, Some(slow), absent);
+        let next = sequence_update_address(&feed, N + 1);
+        for read in 0..5 {
+            let r = resolve_sequence_feed_after(&Undetachable(&net), &feed, N)
+                .await
+                .unwrap();
+            assert_eq!(r.index, N, "read {read} without a background finish");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(net.started(&next), 5, "one losing fetch per read");
+
+        // After: the first read's probe of N+1 keeps fetching.
+        let (net, feed) = scripted_feed("after", N, Some(slow), absent);
+        let next = sequence_update_address(&feed, N + 1);
+        let hints = FeedHints::new();
+        hints.record(&feed.owner, &feed.topic, N);
+        let first = resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(first.index, N, "the first read's probe of N+1 timed out");
+        assert_eq!(
+            hints.probes.inflight.lock().unwrap().len() as u64,
+            BACKGROUND_PROBE_SPAN,
+            "N+1 ..= N+span still fetching",
+        );
+        let second = resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(second.index, N + 1, "the second read sees N+1");
+        assert_eq!(hints.get(&feed.owner, &feed.topic), N + 1);
+        assert_eq!(net.started(&next), 1, "N+1 fetched once across both reads");
+        assert_eq!(net.max_inflight(), 1, "one fetch per index in flight");
+
+        // Every background fetch ends within its own budget and leaves
+        // the registry, and a later read finds N+1 locally.
+        tokio::time::sleep(absent * 2).await;
+        assert_eq!(hints.probes.len(), 0);
+        let third = resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints))
+            .await
+            .unwrap();
+        assert_eq!(third.index, N + 1);
+        assert_eq!(net.started(&next), 1);
+    }
+
+    /// Issue #190: on a feed polled while no new update exists, the
+    /// indices past the head are absent and slower to miss than
+    /// `FEED_PROBE_TIMEOUT`. The background fetches for them stay
+    /// bounded (one per index, only the span past the head), each read
+    /// still ends within the old bound, and the registry empties once
+    /// the fetches end.
+    #[tokio::test(start_paused = true)]
+    async fn absent_indices_keep_background_work_bounded() {
+        const N: u64 = 9;
+        let absent = Duration::from_secs(2);
+        let (net, feed) = scripted_feed("absent", N, None, absent);
+        let hints = FeedHints::new();
+        hints.record(&feed.owner, &feed.topic, N);
+        for read in 0..40 {
+            let start = tokio::time::Instant::now();
+            let r = resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints))
+                .await
+                .unwrap();
+            let took = start.elapsed();
+            assert_eq!(r.index, N, "read {read}");
+            assert!(
+                took <= FEED_PROBE_TIMEOUT * 3 / 2,
+                "read {read} took {took:?}"
+            );
+            let keys: Vec<ProbeKey> = hints
+                .probes
+                .inflight
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect();
+            assert!(keys.len() as u64 <= BACKGROUND_PROBE_SPAN, "read {read}");
+            assert!(
+                keys.iter()
+                    .all(|(_, i)| *i > N && *i <= N + BACKGROUND_PROBE_SPAN),
+                "read {read}: only the span past the head",
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!(net.max_inflight(), 1, "one fetch per index in flight");
+        tokio::time::sleep(absent * 2).await;
+        assert_eq!(hints.probes.len(), 0, "every background fetch cleaned up");
+    }
+
+    /// The node-wide cap: once `BACKGROUND_PROBES_CAP` background fetches
+    /// are in flight, a further probe isn't backgrounded (it is cut off
+    /// at its deadline, as before) and its read still resolves.
+    #[tokio::test(start_paused = true)]
+    async fn background_probes_are_capped_per_node() {
+        let absent = Duration::from_secs(30);
+        let hints = FeedHints::new();
+        let feeds = BACKGROUND_PROBES_CAP as u64 / BACKGROUND_PROBE_SPAN + 2;
+        for f in 0..feeds {
+            let (net, feed) = scripted_feed(&format!("cap-{f}"), 0, None, absent);
+            let r = resolve_sequence_feed_hinted(&net, &feed, 0, Some(&hints))
+                .await
+                .unwrap();
+            assert_eq!(r.index, 0);
+            assert!(hints.probes.len() <= BACKGROUND_PROBES_CAP);
+        }
+        assert_eq!(hints.probes.len(), BACKGROUND_PROBES_CAP);
+        tokio::time::sleep(absent * 2).await;
+        assert_eq!(hints.probes.len(), 0);
     }
 }

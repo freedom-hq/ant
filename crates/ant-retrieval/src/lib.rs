@@ -194,6 +194,19 @@ pub trait ChunkFetcher: Send + Sync {
     /// bytes are already CAC-validated against `addr` by the caller.
     /// Default is a no-op for map-backed test fetchers.
     async fn put_recovered(&self, _addr: [u8; 32], _wire: &[u8]) {}
+
+    /// An owned handle onto this fetcher, for a fetch that has to outlive
+    /// the `&self` borrow: a speculative feed probe past the head runs its
+    /// fetch in a detached task, so when the probe hits its deadline the
+    /// fetch keeps going and the update still lands in the node's chunk
+    /// caches for the next resolution (issue #190, see
+    /// [`feed::resolve_sequence_feed_hinted`]). The handle must store
+    /// what it fetches in the same caches `self` does. `None` (the
+    /// default) means the fetcher can't be detached, and such a probe is
+    /// simply cut off at its deadline, as before.
+    fn detached(&self) -> Option<std::sync::Arc<dyn ChunkFetcher>> {
+        None
+    }
 }
 
 /// A [`ChunkFetcher`] view that never waits for peer credit: it forwards
@@ -215,6 +228,10 @@ impl ChunkFetcher for NoCreditWait<'_> {
 
     async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
         self.0.put_recovered(addr, wire).await;
+    }
+
+    fn detached(&self) -> Option<std::sync::Arc<dyn ChunkFetcher>> {
+        self.0.detached()
     }
 }
 

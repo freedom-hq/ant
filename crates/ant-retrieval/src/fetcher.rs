@@ -1771,9 +1771,52 @@ impl ChunkFetcher for RoutingFetcher {
             }
         }
     }
+
+    /// A fresh fetcher over the same peers, caches, limits and accounting
+    /// (see [`RoutingFetcher::detached_copy`]).
+    fn detached(&self) -> Option<Arc<dyn ChunkFetcher>> {
+        Some(Arc::new(self.detached_copy()))
+    }
 }
 
 impl RoutingFetcher {
+    /// A copy for a fetch that outlives this one's borrow
+    /// ([`ChunkFetcher::detached`], a feed probe finishing in the
+    /// background, issue #190). It shares every node-wide handle (peer
+    /// watch, chunk caches, semaphores, accounting, payment and counters),
+    /// so what it fetches is cached and paid for like any retrieval, but
+    /// starts with an empty blacklist, none of the request's own state (its
+    /// progress tracker, its per-request in-flight cap) and the full
+    /// retrieval budget (`fast_miss` off): it finishes a lookup
+    /// nobody is waiting on any more, so it may as well run to the end.
+    fn detached_copy(&self) -> Self {
+        Self {
+            control: self.control.clone(),
+            peers_rx: self.peers_rx.clone(),
+            blacklist: Mutex::new(Vec::new()),
+            cache: self.cache.clone(),
+            disk_cache: self.disk_cache.clone(),
+            record_dir: self.record_dir.clone(),
+            progress: None,
+            inflight_limit: self.inflight_limit.clone(),
+            request_inflight_limit: None,
+            payment_notify: self.payment_notify.clone(),
+            accounting: self.accounting.clone(),
+            credit_deadline: self.credit_deadline,
+            counters: self.counters.clone(),
+            pushsync_settlement: self.pushsync_settlement.clone(),
+            push_skip: self.push_skip.clone(),
+            push_load: self.push_load.clone(),
+            shallow_memory: self.shallow_memory.clone(),
+            push_network_id: self.push_network_id,
+            neighborhood_dial: self.neighborhood_dial.clone(),
+            require_deep: self.require_deep,
+            fast_miss: false,
+            #[cfg(test)]
+            mock_retrieve: self.mock_retrieve.clone(),
+        }
+    }
+
     /// The fetch itself, waiting at most `credit_budget` in total for
     /// credit while every candidate peer is overdraft-skipped: zero for
     /// [`ChunkFetcher::fetch`], the caller's budget for
@@ -4703,5 +4746,30 @@ mod tests {
         let wire = fetcher.fetch(addr).await.expect("drained delivery cached");
         assert_eq!(wire, scripted_wire());
         assert_eq!(asked(&script), asked_before, "served from cache");
+    }
+
+    /// A detached copy (a feed probe finishing in the background, issue
+    /// #190) runs the full retrieval budget even when the original was a
+    /// fast-miss lookup, and what it fetches lands in the original's
+    /// chunk cache.
+    #[tokio::test(start_paused = true)]
+    async fn detached_copy_runs_the_full_budget_into_the_shared_cache() {
+        let addr = [0x47u8; 32];
+        // Past the fast-miss stop, inside the full error budget.
+        let mut answers = vec![Answer::NotFound(10); 28];
+        answers.push(Answer::Deliver(10));
+        let (fetcher, script) = scripted_fetcher(addr, &answers, true);
+        let fetcher = fetcher.with_cache(Arc::new(InMemoryChunkCache::new(16)));
+        fetcher
+            .fetch(addr)
+            .await
+            .expect_err("fast miss stops before the holder");
+        let detached = fetcher.detached().expect("RoutingFetcher detaches");
+        let wire = detached.fetch(addr).await.expect("full budget reaches it");
+        assert_eq!(wire, scripted_wire());
+        drop(detached);
+        let asked_before = asked(&script);
+        assert_eq!(fetcher.fetch(addr).await.expect("cached"), scripted_wire());
+        assert_eq!(asked(&script), asked_before, "served from the shared cache");
     }
 }
