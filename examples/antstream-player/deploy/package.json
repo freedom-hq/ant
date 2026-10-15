@@ -1,0 +1,9 @@
+{
+  "name": "antstream-player-deploy",
+  "private": true,
+  "type": "module",
+  "description": "Publishes examples/antstream-player to Swarm behind a feed (deploy-feed.mjs).",
+  "dependencies": {
+    "@ethersphere/bee-js": "13.2.0"
+  }
+}

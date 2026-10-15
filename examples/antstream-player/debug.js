@@ -91,7 +91,7 @@
   panel.append(
     el('div', { class: 'head' },
       el('b', {}, 'Debug'),
-      el('span', { class: 'muted' }, `hls.js ${window.Hls ? Hls.version : '?'}`),
+      el('span', { class: 'muted' }, `${player.buildLabel()} · hls.js ${window.Hls ? Hls.version : '?'}`),
       el('span', { class: 'spacer' }),
       pauseBtn,
       copyBtn,
@@ -273,6 +273,7 @@
       page: location.href,
       userAgent: navigator.userAgent,
       hlsVersion: window.Hls ? Hls.version : null,
+      playerBuild: player.build,
       settings,
       session: log.session,
       latency: hls && Number.isFinite(hls.latency) ? hls.latency : null,

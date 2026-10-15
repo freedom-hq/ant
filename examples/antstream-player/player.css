@@ -194,3 +194,5 @@ footer a { color: var(--muted); }
 .debug tr.warn td { color: var(--amber); }
 .debug tr.bad td { color: var(--live); }
 .debug tr.dim td { color: #5a5a64; }
+
+footer .version { display: block; margin-top: 6px; font-variant-numeric: tabular-nums; }
