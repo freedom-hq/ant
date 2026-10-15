@@ -1273,7 +1273,10 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a
  * nested event loop). It may be invoked concurrently from several such
- * threads, so `host_ctx` must be safe to use from any thread.
+ * threads, so `host_ctx` must be safe to use from any thread. Return
+ * within a minute: some reads (the chequebook funds refresh) stop
+ * waiting after 60 s, but the thread stays inside the callback until it
+ * returns, and that refresh starts no new read until it does.
  *
  * Lifetime: `transport` must stay callable and `host_ctx` valid until
  * the transport is replaced/cleared or ant_shutdown is called. Both of

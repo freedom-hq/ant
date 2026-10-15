@@ -13,9 +13,13 @@
 //! `ChainClient`'s seam already runs the transport on the runtime's
 //! blocking pool (`spawn_blocking`), so a host that blocks — a Merkle
 //! proof verification, a lock, a nested runtime `block_on` — starves
-//! nothing, and there is no per-request state to leak if the host never
-//! answers a correlation id. It also keeps the C surface to two symbols
-//! and no ant-owned queue, which is what the reporters sketched.
+//! nothing, and there is no correlation-id state to leak if the host
+//! never answers. (A caller that gives up on a call, like the funds
+//! refresh after its 60 s timeout, can't take the blocking thread back
+//! until the host returns; that refresh starts no new read meanwhile, so
+//! a hung host holds one thread per refresh, not one per attempt.) It
+//! also keeps the C surface to two symbols and no ant-owned queue, which
+//! is what the reporters sketched.
 
 use crate::AntHandle;
 use std::ffi::{c_char, c_int, c_void};
@@ -210,7 +214,10 @@ impl ant_chain::ChainTransport for HostChainTransport {
 ///
 /// **Threading:** the callback runs on ant's runtime blocking pool, so
 /// blocking inside it is fine and expected. It may be invoked
-/// concurrently from several such threads.
+/// concurrently from several such threads. Return within a minute: some
+/// reads (the chequebook funds refresh) stop waiting after 60 s, but the
+/// thread stays inside the callback until it returns, and that refresh
+/// starts no new read until it does.
 ///
 /// **Ordering:** takes effect immediately for the storage / settlement
 /// calls (`ant_storage_*`, including `ant_storage_settlement_*`, and

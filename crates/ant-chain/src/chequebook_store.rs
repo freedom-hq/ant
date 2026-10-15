@@ -652,6 +652,14 @@ async fn read_raw_retrieval_funds_unbounded(
 /// chequebook (or, in `antd`, is switched off): the node accepts funds
 /// for any chequebook, so a stale watch would otherwise keep overwriting
 /// the current one's.
+///
+/// A read that times out ([`FUNDS_READ_TIMEOUT`]) stops being waited
+/// for, but a host chain transport call inside it can't be cancelled:
+/// its blocking-pool thread stays in the host's `serve` until the host
+/// returns. So while one of this watch's own host calls is still
+/// outstanding, a tick starts no new read (the node keeps its last good
+/// value, as for a failed read): a host that never answers holds one
+/// thread for this watch, not one more per tick.
 #[cfg(feature = "chain-rpc")]
 pub async fn watch_retrieval_funds<F, Fut>(
     client: crate::ChainClient,
@@ -661,7 +669,19 @@ pub async fn watch_retrieval_funds<F, Fut>(
     F: FnMut(RetrievalFunds) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    let client = client.with_own_host_call_count();
     loop {
+        let parked = client.host_calls_in_flight();
+        if parked > 0 {
+            tracing::debug!(
+                target: "ant_chain::chequebook_store",
+                chequebook = %hex::encode(chequebook),
+                parked,
+                "retrieval funds not refreshed: an earlier read is still waiting on the host chain transport",
+            );
+            tokio::time::sleep(RETRIEVAL_FUNDS_REFRESH).await;
+            continue;
+        }
         match read_and_publish_retrieval_funds(&client, &chequebook, &mut publish).await {
             Ok((_, true)) => {}
             Ok((_, false)) => return,
@@ -2190,6 +2210,89 @@ mod tests {
         assert!(published.lock().unwrap().is_empty());
         assert!(read_retrieval_funds(&client, &cb).await.is_err());
         hold.abort();
+    }
+
+    /// A [`WithdrawChain`] whose host calls block until released while
+    /// `hang` is set, counting how many entered `serve`.
+    #[cfg(feature = "chain-rpc")]
+    struct HangingHost {
+        chain: std::sync::Arc<WithdrawChain>,
+        hang: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicUsize,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for HangingHost {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            self.chain.serve(request_json)
+        }
+    }
+
+    /// A host transport that never answers holds one blocking thread for
+    /// the funds watch, not one more per tick (R6-M1): after its read
+    /// times out, the watch starts no new read while that host call is
+    /// still parked in `serve`, and reads again once the host returns.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_host_parks_one_thread_per_funds_watch() {
+        use std::sync::atomic::Ordering;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let host = std::sync::Arc::new(HangingHost {
+            chain: withdraw_chain(0xce, None),
+            hang: std::sync::atomic::AtomicBool::new(true),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(host.clone()));
+        let cb = host.chain.cb;
+        let published = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let watch = tokio::spawn({
+            let published = published.clone();
+            async move {
+                watch_retrieval_funds(client, cb, move |funds| {
+                    published.lock().unwrap().push(funds.deposited_plur);
+                    async { true }
+                })
+                .await;
+            }
+        });
+        // A parked `spawn_blocking` keeps the paused clock from
+        // auto-advancing, so move it by hand.
+        async fn advance(by: std::time::Duration) {
+            let step = std::time::Duration::from_secs(1);
+            let mut left = by;
+            while !left.is_zero() {
+                tokio::time::advance(step.min(left)).await;
+                left = left.saturating_sub(step);
+                tokio::task::yield_now().await;
+            }
+        }
+        // Ten ticks' worth: each would start a new read without the gate.
+        advance(10 * (FUNDS_READ_TIMEOUT + RETRIEVAL_FUNDS_REFRESH)).await;
+        assert_eq!(host.entered.load(Ordering::SeqCst), 1, "one parked call");
+        assert!(published.lock().unwrap().is_empty());
+
+        // The host answers at last: that late read is not published (it
+        // was given up on), and the next tick reads again.
+        host.hang.store(false, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        for _ in 0..400 {
+            if !published.lock().unwrap().is_empty() {
+                break;
+            }
+            // Let the released thread finish before the clock moves on.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            advance(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(published.lock().unwrap().first(), Some(&1200));
+        watch.abort();
     }
 
     /// A deposit this process makes after a withdrawal counts at once
