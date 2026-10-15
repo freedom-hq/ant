@@ -82,7 +82,7 @@ class Channel(context: Context, val owner: String) {
         private const val KEY_REF = "reference"
 
         /** The AntStream web player's Swarm reference (examples/antstream-player). */
-        const val PLAYER_REF = "46a64755cccb2bf4ad1048e5518b287c0397799d8a1f8267e4145cb17b79ea4e"
+        const val PLAYER_REF = "31c703b000cf17d183df75c982e0d4b1895e635b2cb8f9eebb396025a89202d6"
 
         /** What "Share" sends: the channel in the web player, for Freedom and any browser. */
         fun watchLinks(channel: String): String =

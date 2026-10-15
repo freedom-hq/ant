@@ -315,8 +315,9 @@
     let result = { error };
     if (text !== null) {
       const info = playlistInfo(text);
-      row.seq = info.key[0];
-      row.segments = info.key[1];
+      // key is [recording, media sequence, entries, ended].
+      row.seq = info.key[1];
+      row.segments = info.key[2];
       const before = guard.text;
       const kept = guardPlaylist(text);
       row.note = kept !== text ? 'stale: kept the newer one' : kept === before ? 'unchanged' : 'newer';
