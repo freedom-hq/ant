@@ -1,28 +1,37 @@
 /*
  * AntStream web player.
  *
- * A channel is a Swarm feed manifest: `<channel>/stream.m3u8` resolves the
- * feed to the newest HLS playlist the publisher wrote
- * (crates/ant-ffi/src/publisher.rs), and every playlist reload resolves it
- * again, so hls.js follows the live edge by itself.
+ * A channel is a Swarm sequence feed named by its **owner** (an Ethereum
+ * address) and a **topic text**, the Solar Punk stream format the
+ * publisher writes with `"format": "solar-punk"`
+ * (crates/ant-ffi/src/publisher.rs): the topic is `keccak256(utf8(text))`
+ * (`topic_from_string`, bee-js `Topic.fromString`), and **every feed
+ * update is the HLS playlist itself** (a v2 update wrapping the
+ * playlist's root chunk). Segments and the `#EXT-X-MAP` are listed as
+ * bare 64-hex references to raw bytes. AntStream's own channels use the
+ * topic text `antstream`, one per account.
  *
  * The page runs in two kinds of places:
  *
- *  - Freedom (and any browser with a native `bzz:` scheme): the page is
- *    `bzz://<player>/#<channel>`, the playlist is `bzz://<channel>/stream.m3u8`.
- *  - An HTTP gateway (bee, ant): the page is `<root>/bzz/<player>/` and the
- *    playlist `<root>/bzz/<channel>/stream.m3u8`, `<root>` possibly a
- *    sub-path such as `https://example.org/ant`.
+ *  - Freedom (`bzz://<player>/#<owner>/<topic>`): the feed is read through
+ *    Freedom's Swarm provider, `window.swarm` (`swarm_readFeedEntry` for the
+ *    head, `swarm_readSingleOwnerChunk` for a slot or a ladder marker, and
+ *    `swarm_readFeedEntry` by index for a slot longer than one chunk), and
+ *    media as `bzz://<ref>`, which Freedom's node answers with the raw
+ *    bytes of a non-manifest reference. Permission-free provider reads are
+ *    budgeted (120 requests / 512 KiB a minute), so they are paced
+ *    ("provider budget" below).
+ *  - An HTTP gateway (bee, ant; the page is `<root>/bzz/<player>/`,
+ *    `<root>` possibly a sub-path): `GET <root>/feeds/{owner}/{topic}` for
+ *    the head, `GET <root>/soc/{owner}/{identifier}` for a slot or marker,
+ *    `GET <root>/bytes/<ref>` for media.
  *
- * The publisher lists segments by gateway-root path (`/bzz/<ref>/seg-N.m4s`).
- * Resolved against a `bzz://` playlist that path lands inside the channel
- * (`bzz://<channel>/bzz/<ref>/…`), and on a sub-path gateway it drops the
- * prefix, so every request goes through `toContentUrl`, which maps any
- * `…/bzz/<ref>/<rest>` back onto this environment's form.
- *
- * Freedom forwards no `Cache-Control` request header to its node, so
- * playlist reloads carry a `t=` query instead. Feed-resolved responses are
- * `no-cache` on the node side; segments are immutable and cache normally.
+ * The head lookup resolves "the newest update" by probing, which is slow
+ * and can come back stale. So it is made once, when joining; after that
+ * the player reads explicit slots (`identifier = keccak256(topic ‖
+ * index_be8)`), the next few side by side, as Solar Punk's `feedFollow.ts`
+ * does. A channel published with ladder time markers is joined from the
+ * newest marker too, without waiting for the head.
  *
  * Playlist reads and segment fetches bypass hls.js's one-at-a-time loading
  * (see "playlist reads" and "segment fetches" below), and debug.js shows
@@ -31,10 +40,12 @@
 (function () {
   'use strict';
 
-  const REF = /^(?:0x)?([0-9a-f]{64}(?:[0-9a-f]{64})?)$/i;
-  const NAME = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
-  const PLAYLIST = 'stream.m3u8';
-  const RECENT_KEY = 'antstream.recent';
+  const K = window.antstreamKeccak;
+  const OWNER = /^(?:0x)?([0-9a-f]{40})$/i;
+  const REF = /^([0-9a-f]{64}(?:[0-9a-f]{64})?)$/i;
+  // AntStream's own channels: one per account, told apart by the owner.
+  const DEFAULT_TOPIC = 'antstream';
+  const RECENT_KEY = 'antstream.recent.v2';
 
   const inBzz = location.protocol === 'bzz:';
   const gatewayRoot = (() => {
@@ -68,11 +79,16 @@
 
   // -- addressing -----------------------------------------------------------
 
-  function contentUrl(ref, path) {
-    return inBzz ? `bzz://${ref}/${path}` : `${gatewayRoot}/bzz/${ref}/${path}`;
+  /** Where the raw bytes of `ref` are read in this environment. */
+  function contentUrl(ref) {
+    return inBzz ? `bzz://${ref}` : `${gatewayRoot}/bytes/${ref}`;
   }
 
-  /** Map `…/bzz/<ref>/<rest>` onto this environment's content URL. */
+  /**
+   * hls.js resolves the playlist's bare references against the playlist's
+   * own URL (`PLAYLIST_URL`), so they reach the loaders as
+   * `…/<64 hex>`; map that onto this environment's content URL.
+   */
   function toContentUrl(url) {
     let u;
     try {
@@ -80,28 +96,61 @@
     } catch (_) {
       return url;
     }
-    const m = /\/bzz\/([^/]+)\/(.*)$/.exec(u.pathname);
-    if (!m) return url;
-    return contentUrl(m[1], m[2]) + u.search;
+    const last = u.pathname.split('/').pop();
+    return REF.test(last) ? contentUrl(last.toLowerCase()) : url;
   }
 
-  function withCacheBust(url) {
-    const u = new URL(url);
-    u.searchParams.set('t', Date.now().toString(36));
-    return u.toString();
-  }
+  // The URL hls.js is given for the playlist. Nothing is fetched from it
+  // (the playlist loader below reads the feed); it only anchors the bare
+  // references in the playlist for `toContentUrl`.
+  const PLAYLIST_URL = new URL('channel.m3u8', location.href.split('#')[0]).toString();
 
-  /** Accept a bare reference, `0x…`, a bzz:// or gateway link, or an ENS name. */
+  /**
+   * A channel from what the viewer pasted or the page's hash:
+   * `<owner>/<topic>` (the owner `0x` + 40 hex, the topic URL-encoded
+   * text), `swarm://<owner>/<topic>` (Solar Punk's form), or a player link
+   * carrying either after its `#`. An owner alone means AntStream's own
+   * topic, `antstream`.
+   */
   function parseChannel(input) {
     let s = (input || '').trim();
     if (!s) return null;
-    s = s.replace(/^#/, '').replace(/^channel=/, '');
-    const link = /(?:bzz:\/\/|\/bzz\/)([^/?#]+)/i.exec(s);
-    if (link) s = link[1];
-    const ref = REF.exec(s);
-    if (ref) return ref[1].toLowerCase();
-    if (NAME.test(s)) return s.toLowerCase();
-    return null;
+    const hash = s.indexOf('#');
+    if (hash >= 0) s = s.slice(hash + 1);
+    let owner;
+    let rest;
+    const uri = /^swarm:\/\/([^/?#]+)\/([^/?#]+)/i.exec(s);
+    if (uri) {
+      // parseSwarmUri: the topic is the piece up to the next `/`.
+      [, owner, rest] = uri;
+    } else {
+      const slash = s.indexOf('/');
+      owner = slash < 0 ? s : s.slice(0, slash);
+      rest = slash < 0 ? '' : s.slice(slash + 1);
+    }
+    const o = OWNER.exec(owner);
+    if (!o) return null;
+    let topic = rest;
+    try {
+      topic = decodeURIComponent(rest);
+    } catch (_) {
+      /* not URL-encoded: the text as it is */
+    }
+    return makeChannel(o[1].toLowerCase(), topic || DEFAULT_TOPIC);
+  }
+
+  function makeChannel(owner, topic) {
+    const topicHex = K.topicFromString(topic);
+    return {
+      owner,
+      topic,
+      topicHex,
+      // The ladder this channel's time markers are written for, as the
+      // publisher names it (`ladder_group_text`).
+      groupHex: K.topicFromString(`antstream-ladder-${topicHex}`),
+      // The hash and the recent list's form, also what is shown.
+      key: `0x${owner}/${encodeURIComponent(topic)}`,
+    };
   }
 
   // -- settings and debug log ------------------------------------------------
@@ -160,7 +209,7 @@
       return this.add({ kind: 'marker', text });
     },
     begin(ch) {
-      if (this.session && this.session.channel === ch) {
+      if (this.session && this.session.channel === ch.key) {
         // Same channel (a new broadcast, or a retry): keep the history,
         // time the first frame again.
         this.session.startedAt = Date.now();
@@ -171,7 +220,7 @@
       this.entries = [];
       this.samples = [];
       this.session = {
-        channel: ch,
+        channel: ch.key,
         startedAt: Date.now(),
         firstPlayingAt: null,
         stalls: 0,
@@ -198,22 +247,23 @@
 
   // -- playlist guard -------------------------------------------------------
   //
-  // A Swarm node resolves "the newest feed update" by probing indices with
-  // a short per-probe deadline, so a reload can come back with an *older*
-  // playlist than the last one (an update still propagating loses the
-  // race). Within a broadcast the playlist only moves forward, so an older
-  // one is replaced by the newest seen. The publisher names each broadcast
-  // in its playlists (`#ANTSTREAM-BROADCAST:<id>`): an id never seen before
-  // is a new broadcast on the channel, an id seen earlier is a stale read.
+  // The head lookup resolves "the newest feed update" by probing indices
+  // with a short per-probe deadline, so it can come back with an *older*
+  // playlist than one already read (an update still propagating loses the
+  // race), and side-by-side slot reads can finish out of order. Within a
+  // broadcast the playlist only moves forward, so an older one is replaced
+  // by the newest seen. The publisher names each broadcast in its
+  // playlists (`#ANTSTREAM-BROADCAST:<id>`): an id never seen before is a
+  // new broadcast on the channel, an id seen earlier is a stale read.
 
-  const guard = { text: null, key: null, id: null, ids: new Set(), newBroadcast: false };
+  const guard = { text: null, key: null, id: null, ids: new Set(), newBroadcast: null };
 
-  function resetGuard() {
+  function resetGuard(ids) {
     guard.text = null;
     guard.key = null;
     guard.id = null;
-    guard.ids = new Set();
-    guard.newBroadcast = false;
+    guard.ids = new Set(ids || []);
+    guard.newBroadcast = null;
   }
 
   function playlistInfo(text) {
@@ -244,104 +294,448 @@
     return text;
   }
 
-  function guardPlaylist(text) {
+  /**
+   * The playlist to keep after reading `text` (at feed index `index`):
+   * `text` itself, the newer one already held, or null when nothing is
+   * held yet and `text` belongs to a broadcast already played (a stale
+   * read after switching to a new broadcast).
+   */
+  function guardPlaylist(text, index) {
     const info = playlistInfo(text);
+    if (info.id && info.id !== guard.id && guard.ids.has(info.id)) return guard.text;
     if (guard.text === null) return accept(text, info);
     if (info.id && info.id !== guard.id) {
-      // Another broadcast's playlist: a new one starts the channel over,
-      // an earlier one is a stale read.
-      if (guard.ids.has(info.id)) return guard.text;
-      guard.newBroadcast = true;
+      // A broadcast never seen before: the channel starts over on it.
+      guard.newBroadcast = { id: info.id, index };
       return accept(text, info);
     }
     if (newer(info.key, guard.key) || info.key.join() === guard.key.join()) return accept(text, info);
     return guard.text;
   }
 
+  // -- reading the feed -----------------------------------------------------
+  //
+  // Three reads, each answered the same way (`{ status, text, index }`,
+  // status 200, 404 for "not written yet", 429 for a provider rate limit,
+  // else an error): the feed head, one feed slot, and one ladder time
+  // marker. Over HTTP they are gateway requests; in Freedom they go
+  // through `window.swarm`.
+
+  const READ_TIMEOUT_MS = 30000;
+  const VIA = inBzz ? 'window.swarm' : 'HTTP';
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function withTimeout(promise, ms, what) {
+    let timer;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error(`${what} timed out`), { timeout: true })), ms);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  function fromBase64(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  const textOf = (bytes) => new TextDecoder().decode(bytes);
+
+  // -- provider budget --
+  //
+  // Freedom answers permission-free `window.swarm` reads from a budget of
+  // 120 requests and 512 KiB per origin per 60 s (a fixed window from the
+  // first read). The player never asks to connect, so it keeps under that
+  // on its own, with room to spare (a rolling minute, which is stricter),
+  // and a read that is refused anyway (`rate_limited`) pauses every read
+  // for a while, longer each time. Media is read as `bzz://` URLs, which
+  // the budget does not count.
+
+  const BUDGET_WINDOW_MS = 60000;
+  const BUDGET_REQUESTS = 100;
+  const BUDGET_BYTES = 400 * 1024;
+  const budget = { reads: [], until: 0, backoffMs: 0, refused: 0 };
+
+  function budgetFree(now) {
+    budget.reads = budget.reads.filter((r) => now - r.at < BUDGET_WINDOW_MS);
+    if (now < budget.until) return false;
+    const bytes = budget.reads.reduce((n, r) => n + r.bytes, 0);
+    return budget.reads.length < BUDGET_REQUESTS && bytes < BUDGET_BYTES;
+  }
+
+  /** Wait for room in the budget; the entry to charge the read's bytes to. */
+  async function takeBudget() {
+    const asked = Date.now();
+    while (!budgetFree(Date.now())) await sleep(250);
+    const entry = { at: Date.now(), bytes: 0, waitedMs: Date.now() - asked };
+    budget.reads.push(entry);
+    return entry;
+  }
+
+  function refusedForRate(err) {
+    budget.refused += 1;
+    // Reads already under way when the first refusal came are refused
+    // too: one pause, not one longer pause each.
+    if (Date.now() < budget.until) return;
+    budget.backoffMs = Math.min(Math.max(budget.backoffMs * 2, 5000), BUDGET_WINDOW_MS);
+    const wait = (err.data && err.data.retryAfterMs) || budget.backoffMs;
+    budget.until = Math.max(budget.until, Date.now() + wait);
+    log.marker(`window.swarm rate limited: feed reads paused for ${(wait / 1000).toFixed(0)} s`);
+  }
+
+  const NOT_FOUND = new Set(['feed_empty', 'entry_not_found', 'chunk_not_found', 'feed_not_found']);
+
+  /** One `window.swarm` call, its refusal turned into an answer. */
+  async function provider(method, params, decode) {
+    const swarm = window.swarm;
+    if (!swarm || typeof swarm.request !== 'function') {
+      return { status: 'error', note: 'window.swarm is not available (open the channel in Freedom)' };
+    }
+    const entry = await takeBudget();
+    const waited = entry.waitedMs > 500 ? `waited ${(entry.waitedMs / 1000).toFixed(1)} s for the read budget` : '';
+    try {
+      const result = await withTimeout(swarm.request({ method, params }), READ_TIMEOUT_MS, method);
+      const answer = await decode(result);
+      entry.bytes = answer.size || 0;
+      budget.backoffMs = 0;
+      return { ...answer, note: waited };
+    } catch (err) {
+      const reason = err && err.data && err.data.reason;
+      if (reason === 'rate_limited') {
+        refusedForRate(err);
+        return { status: 429, note: 'rate_limited' };
+      }
+      if (NOT_FOUND.has(reason)) return { status: 404, note: [reason, waited].filter(Boolean).join(' · ') };
+      if (err && err.timeout) return { status: 'timeout', note: err.message };
+      return { status: 'error', note: `${err && err.code !== undefined ? `${err.code} ` : ''}${(err && err.message) || err}` };
+    }
+  }
+
+  /**
+   * A single-owner chunk's content when the wrapped chunk is all of it (a
+   * live playlist, a marker), else null. The span's top byte can carry
+   * the erasure-coding level of a larger body (Freedom returns such a span
+   * as a BigInt).
+   */
+  function socBody(result) {
+    const payload = fromBase64(result.data);
+    const raw = BigInt(result.span);
+    if (raw >> 56n !== 0n || raw > BigInt(payload.length)) return null;
+    return payload.subarray(0, Number(raw));
+  }
+
+  /** One gateway GET: 404 is "not written yet", a body shorter than declared an error. */
+  async function gateway(path, withIndex) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), READ_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${gatewayRoot}/${path}`, { cache: 'no-store', signal: ctl.signal });
+      if (!res.ok) {
+        const body = (await res.text().catch(() => '')).slice(0, 160);
+        return { status: res.status, note: body };
+      }
+      const buf = await res.arrayBuffer();
+      const declared = res.headers.get('content-length');
+      if (declared !== null && !res.headers.get('content-encoding') && Number(declared) !== buf.byteLength) {
+        return { status: 'error', note: `short body: ${buf.byteLength} of ${declared} bytes` };
+      }
+      let index = null;
+      if (withIndex) {
+        // 8 bytes big-endian, as 16 hex digits: `0000000000000022` is 34.
+        const raw = (res.headers.get('swarm-feed-index') || '').trim();
+        if (/^[0-9a-f]+$/i.test(raw)) index = parseInt(raw, 16);
+      }
+      return { status: 200, text: textOf(new Uint8Array(buf)), index };
+    } catch (err) {
+      return { status: err.name === 'AbortError' ? 'timeout' : 'error', note: err.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function readHead(ch) {
+    if (!inBzz) return gateway(`feeds/${ch.owner}/${ch.topicHex}`, true);
+    return provider('swarm_readFeedEntry', { topic: ch.topicHex, owner: `0x${ch.owner}` }, (r) => {
+      const bytes = fromBase64(r.data);
+      return { status: 200, text: textOf(bytes), index: typeof r.index === 'number' ? r.index : null, size: bytes.length };
+    });
+  }
+
+  function readSoc(owner, identifier) {
+    if (!inBzz) return gateway(`soc/${owner}/${identifier}`, false);
+    return provider('swarm_readSingleOwnerChunk', { owner: `0x${owner}`, identifier }, (r) => {
+      const bytes = socBody(r);
+      return bytes ? { status: 200, text: textOf(bytes), size: bytes.length } : { status: 'long', size: 0 };
+    });
+  }
+
+  async function readSlot(ch, index) {
+    const a = await readSoc(ch.owner, K.feedIdentifier(ch.topicHex, index));
+    if (a.status !== 'long') return { ...a, index };
+    // Longer than one chunk (a recording): the node joins it, a read whose
+    // bytes count against the budget. Only the broadcast's last update.
+    const whole = await provider('swarm_readFeedEntry', { topic: ch.topicHex, owner: `0x${ch.owner}`, index }, (r) => {
+      const bytes = fromBase64(r.data);
+      return { status: 200, text: textOf(bytes), size: bytes.length };
+    });
+    return { ...whole, index, note: ['longer than one chunk: read whole', whole.note].filter(Boolean).join(' · ') };
+  }
+
+  const MARKER_PERIOD_MS = 10000;
+
+  /**
+   * The feed index a ladder time marker names for this channel, or null:
+   * Solar Punk's `parseLadderMarker` (v2), and the publisher's
+   * `encode_ladder_marker`.
+   */
+  function markerIndex(text, ch, period) {
+    let m;
+    try {
+      m = JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+    const whole = (v) => Number.isSafeInteger(v) && v >= 0;
+    if (!m || m.v !== 2 || m.period !== period || !whole(m.writtenAt)) return null;
+    if (Math.floor(m.writtenAt / MARKER_PERIOD_MS) !== period || !whole(m.segmentMs) || !m.segmentMs) return null;
+    const index = m.rungs && m.rungs[ch.topicHex];
+    return whole(index) ? index : null;
+  }
+
   // -- playlist reads -------------------------------------------------------
   //
-  // Every read of `<channel>/stream.m3u8` makes the node resolve the feed on
-  // Swarm, which takes seconds. hls.js reloads a live playlist one read at
-  // a time, so it hears of a new segment a whole read plus a reload
-  // interval late, and the buffer drains meanwhile. Here reads overlap
-  // instead: while live, a new one starts every POLL_MS, at most
-  // `settings.polls` at once, and hls.js's reload is answered at once with
-  // the newest playlist any of them returned (or with the next read to
-  // finish, if none is newer than what hls.js has).
+  // **Joining.** The head lookup takes seconds (it probes the feed for its
+  // newest index) and can come back stale. So the player asks it once, and
+  // at the same time reads the ladder time markers of this ten-second
+  // period and the last one: a channel published with markers names its
+  // newest index there, and a slot read from it is a single chunk away.
+  // Whichever answers first gives the feed index to follow from.
+  //
+  // **Following.** From there, every read names an explicit slot (the one
+  // after the newest read, and the next ones side by side), which a node
+  // answers at once, with the update or with "not written yet". While
+  // live, a new read starts every POLL_MS, up to `settings.polls` at once
+  // on distinct slots. While catching up (from the join, which can land a
+  // few updates behind), each slot found starts the next read at once,
+  // until one comes back "not written yet". hls.js's reload is answered with the newest playlist any
+  // of them returned, or, once one finished, with the one it already has.
+  // After the broadcast ended, the slot after its last update is read now
+  // and then: the channel's next broadcast continues the same feed there.
 
   const POLL_MS = 1500;
   // A channel whose playlist stopped moving (broadcaster gone, or paused)
   // is read less often.
   const IDLE_AFTER_MS = 20000;
   const IDLE_POLL_MS = 5000;
-  const READ_TIMEOUT_MS = 30000;
-  const reads = { gen: 0, url: null, inflight: 0, lastStart: 0, lastNewer: 0, waiters: [], delivered: null };
+  const ENDED_POLL_MS = 5000;
+  // A slot found this long after the last newer playlist (reads paused, a
+  // slow node, the broadcaster back from a break) may be one of several
+  // waiting: read on at once. This much later, ask the ladder markers too,
+  // which can skip straight to the newest.
+  const CATCH_UP_AFTER_MS = 5000;
+  const REJOIN_AFTER_MS = 30000;
 
-  function resetReads(url) {
-    reads.gen += 1;
-    reads.url = url;
-    reads.inflight = 0;
-    reads.lastStart = 0;
-    reads.lastNewer = Date.now();
-    reads.waiters = [];
-    reads.delivered = null;
+  const feed = {
+    gen: 0,
+    ch: null,
+    // Slots after `cursor` are the ones still to read.
+    cursor: -1,
+    // The newest index read with a playlist, for the debug panel.
+    index: null,
+    joinedVia: null,
+    joinPending: 0,
+    slots: new Set(),
+    inflight: 0,
+    lastStart: 0,
+    lastNewer: 0,
+    waiters: [],
+    delivered: null,
+    lastError: null,
+  };
+
+  /** Start reading `ch`, from the feed index `from` when it is known. */
+  function resetReads(ch, from) {
+    feed.gen += 1;
+    feed.ch = ch;
+    const known = typeof from === 'number';
+    feed.cursor = known ? from - 1 : -1;
+    feed.index = null;
+    feed.joinedVia = known ? 'the new broadcast' : null;
+    feed.joinPending = 0;
+    feed.slots = new Set();
+    feed.inflight = 0;
+    feed.lastStart = 0;
+    feed.lastNewer = Date.now();
+    feed.waiters = [];
+    feed.delivered = null;
+    feed.lastError = null;
   }
 
-  async function readPlaylist() {
-    const gen = reads.gen;
-    reads.inflight += 1;
-    reads.lastStart = Date.now();
-    const row = log.add({ kind: 'playlist', start: performance.now(), ms: null, status: 'loading', seq: null, segments: null, note: '' });
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), READ_TIMEOUT_MS);
-    let text = null;
-    let error = null;
+  /**
+   * Start the next read: the join, or the next slot not being read.
+   * `chase`: catching up (joining, or right after a read that caught up),
+   * so a slot found sends the next read straight away.
+   */
+  function readPlaylist(chase) {
+    if (!feed.ch) return;
+    if (feed.joinedVia === null) {
+      if (feed.joinPending) return;
+      const period = Math.floor(Date.now() / MARKER_PERIOD_MS);
+      readOne('head');
+      readOne('marker', period);
+      readOne('marker', period - 1);
+      return;
+    }
+    const ahead = Math.max(settings.polls, 1);
+    for (let i = feed.cursor + 1; i <= feed.cursor + ahead; i++) {
+      if (!feed.slots.has(i)) {
+        readOne('slot', i, chase);
+        return;
+      }
+    }
+  }
+
+  async function readOne(kind, arg, chase) {
+    const gen = feed.gen;
+    const ch = feed.ch;
+    feed.inflight += 1;
+    feed.lastStart = Date.now();
+    if (kind === 'slot') feed.slots.add(arg);
+    else feed.joinPending += 1;
+    const row = log.add({
+      kind: 'playlist',
+      read: kind,
+      index: kind === 'slot' ? arg : null,
+      period: kind === 'marker' ? arg : null,
+      via: VIA,
+      start: performance.now(),
+      ms: null,
+      status: 'loading',
+      seq: null,
+      segments: null,
+      note: '',
+    });
+    let a;
     try {
-      const res = await fetch(withCacheBust(reads.url), { cache: 'no-store', signal: ctl.signal });
-      row.status = res.status;
-      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { code: res.status });
-      text = await res.text();
+      a = kind === 'head' ? await readHead(ch) : kind === 'slot' ? await readSlot(ch, arg) : await readSoc(ch.owner, K.ladderMarkerIdentifier(ch.groupHex, arg));
     } catch (err) {
-      error = err;
-      if (row.status === 'loading') row.status = err.name === 'AbortError' ? 'timeout' : 'error';
-      row.note = err.message;
-    } finally {
-      clearTimeout(timer);
+      a = { status: 'error', note: err.message };
     }
     row.ms = performance.now() - row.start;
+    row.status = a.status;
+    row.note = a.note || '';
     log.touch();
-    if (gen !== reads.gen) return;
-    reads.inflight -= 1;
-    let result = { error };
-    if (text !== null) {
-      const info = playlistInfo(text);
-      // key is [recording, media sequence, entries, ended].
-      row.seq = info.key[1];
-      row.segments = info.key[2];
-      const before = guard.text;
-      const kept = guardPlaylist(text);
-      row.note = kept !== text ? 'stale: kept the newer one' : kept === before ? 'unchanged' : 'newer';
-      if (row.note === 'newer') reads.lastNewer = Date.now();
-      result = { text: kept };
+    if (gen !== feed.gen) return;
+    feed.inflight -= 1;
+    if (kind === 'slot') feed.slots.delete(arg);
+    else feed.joinPending -= 1;
+    if (kind === 'marker') onMarker(a, arg, row);
+    else onPlaylist(kind, a, row, chase);
+    deliver(kind !== 'marker');
+  }
+
+  const note = (row, text) => {
+    row.note = row.note ? `${text} · ${row.note}` : text;
+  };
+
+  function onMarker(a, period, row) {
+    if (a.status === 404) return note(row, 'no marker this period');
+    if (a.status !== 200) return;
+    const index = markerIndex(a.text, feed.ch, period);
+    if (index === null) return note(row, 'not a v2 marker for this channel');
+    row.index = index;
+    if (index - 1 > feed.cursor) {
+      // Read from the slot it names on.
+      feed.cursor = index - 1;
+      if (feed.joinedVia === null) feed.joinedVia = 'marker';
+      note(row, `names index ${index}: reading from there`);
+      readPlaylist(true);
+    } else {
+      note(row, `names index ${index}: already past it`);
     }
-    const waiters = reads.waiters;
-    reads.waiters = [];
+  }
+
+  function onPlaylist(kind, a, row, chase) {
+    if (a.status !== 200) {
+      if (kind === 'slot' && a.status === 404) note(row, 'not written yet');
+      else if (kind === 'head' && a.status === 404) note(row, 'the feed has no updates yet');
+      if (a.status !== 404) feed.lastError = { code: typeof a.status === 'number' ? a.status : 0, message: a.note || String(a.status) };
+      else if (kind === 'head') feed.lastError = { code: 404, message: 'the feed has no updates yet' };
+      return;
+    }
+    const index = typeof a.index === 'number' ? a.index : null;
+    if (index !== null) row.index = index;
+    const info = playlistInfo(a.text);
+    // key is [recording, media sequence, entries, ended].
+    row.seq = info.key[1];
+    row.segments = info.key[2];
+    const before = guard.text;
+    const kept = guardPlaylist(a.text, index);
+    if (kept === null) note(row, 'stale: an earlier broadcast');
+    else if (kept !== a.text) note(row, 'stale: kept the newer one');
+    else note(row, kept === before ? 'unchanged' : 'newer');
+    const quiet = Date.now() - feed.lastNewer;
+    if (kept === a.text && kept !== before) feed.lastNewer = Date.now();
+    if (index !== null && (feed.index === null || index > feed.index)) feed.index = index;
+    if (index !== null && index > feed.cursor) {
+      feed.cursor = index;
+      if (feed.joinedVia === null) feed.joinedVia = kind;
+      // Joining, or catching up: there may be more after it, read on
+      // without waiting. (At the live edge the next slot is not written
+      // yet, so a regular poll that found one waits its turn.)
+      if (kind === 'head' || chase || quiet > CATCH_UP_AFTER_MS) {
+        note(row, 'reading on');
+        readPlaylist(true);
+      }
+      if (kind === 'slot' && !chase && quiet > REJOIN_AFTER_MS) {
+        const period = Math.floor(Date.now() / MARKER_PERIOD_MS);
+        readOne('marker', period);
+        readOne('marker', period - 1);
+      }
+    }
+    // After the end, the channel's next broadcast continues the feed. (While
+    // live, hls.js's next reload brings it and LEVEL_LOADED starts over.)
+    if (guard.newBroadcast && ended) {
+      log.marker('a new broadcast started on the channel');
+      restartOnNewBroadcast();
+    }
+  }
+
+  /**
+   * Answer hls.js's waiting reload, if there is something to answer: a
+   * newer playlist at once; the one it has once a playlist read finished
+   * without a newer one; an error once every read of a join came back
+   * without a playlist.
+   */
+  function deliver(playlistRead) {
+    if (!feed.waiters.length) return;
+    let result;
+    if (guard.text !== null && guard.text !== feed.delivered) result = { text: guard.text };
+    else if (guard.text !== null && playlistRead) result = { text: guard.text };
+    else if (guard.text !== null || feed.inflight > 0) return;
+    else result = { error: feed.lastError || { code: 404, message: 'the feed has no updates yet' } };
+    const waiters = feed.waiters;
+    feed.waiters = [];
     for (const w of waiters) w(result);
   }
 
   function nextPlaylist() {
-    if (guard.text !== null && guard.text !== reads.delivered) return Promise.resolve({ text: guard.text });
-    const p = new Promise((resolve) => reads.waiters.push(resolve));
-    if (reads.inflight === 0) readPlaylist();
+    if (guard.text !== null && guard.text !== feed.delivered) return Promise.resolve({ text: guard.text });
+    const p = new Promise((resolve) => feed.waiters.push(resolve));
+    if (feed.inflight === 0) readPlaylist(guard.text === null);
     return p;
   }
 
-  /** Called twice a second: keep `settings.polls` reads overlapping while live. */
+  /** Called four times a second: keep slot reads going while live, slowly once ended. */
   function pollPlaylist() {
-    if (!hls || ended || guard.text === null) return;
+    if (!hls || guard.text === null) return;
     const now = Date.now();
-    const every = now - reads.lastNewer > IDLE_AFTER_MS ? IDLE_POLL_MS : POLL_MS;
-    if (reads.inflight < settings.polls && now - reads.lastStart >= every) readPlaylist();
+    const every = ended ? ENDED_POLL_MS : now - feed.lastNewer > IDLE_AFTER_MS ? IDLE_POLL_MS : POLL_MS;
+    const most = ended ? 1 : settings.polls;
+    if (feed.inflight < most && now - feed.lastStart >= every) readPlaylist();
   }
 
   /** hls.js's playlist loader (`pLoader`), served by the reads above. */
@@ -365,7 +759,7 @@
           cb.onError({ code: r.error.code || 0, text: r.error.message }, context, null, stats);
           return;
         }
-        reads.delivered = r.text;
+        feed.delivered = r.text;
         stats.loaded = stats.total = r.text.length;
         cb.onSuccess({ url: context.url, data: r.text, code: 200 }, stats, context, null);
       });
@@ -409,7 +803,7 @@
     const row = log.add({
       kind: 'segment',
       sn,
-      name: url.split('?')[0].split('/').pop(),
+      name: url.split('?')[0].split('/').filter(Boolean).pop(),
       start: performance.now(),
       ttfb: null,
       ms: null,
@@ -758,10 +1152,11 @@
   let everPlayed = false;
   let segmentsLoaded = 0;
   let lastFetchMs = null;
+  // What the status line says while an ended broadcast plays.
+  let endedStatus = '';
   let retryTimer = null;
   let statsTimer = null;
   let tickTimer = null;
-  let endedPoll = null;
   let lastFragAt = 0;
 
   function setStatus(text) {
@@ -782,8 +1177,6 @@
     clearTimeout(retryTimer);
     clearInterval(statsTimer);
     clearInterval(tickTimer);
-    clearInterval(endedPoll);
-    endedPoll = null;
     if (hls) hls.destroy();
     hls = null;
     resetReads(null);
@@ -792,7 +1185,12 @@
     video.playbackRate = 1;
   }
 
-  function play(ch) {
+  /**
+   * Play channel `ch`. `next` carries on to a new broadcast on the same
+   * channel: the feed index its first playlist was read at, and the ids of
+   * the broadcasts before it, whose playlists are stale reads from then on.
+   */
+  function play(ch, next) {
     stop();
     channel = ch;
     ended = false;
@@ -804,35 +1202,34 @@
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
-    resetGuard();
+    resetGuard(next && next.ids);
     log.begin(ch);
     lastFragAt = Date.now();
     els.intro.hidden = true;
     els.stage.hidden = false;
-    els.channelRef.textContent = ch;
-    els.input.value = ch;
-    remember(ch);
+    els.channelRef.textContent = `0x${ch.owner} / ${ch.topic}`;
+    els.input.value = ch.key;
+    remember(ch.key);
     setBadge('', 'CONNECTING');
     setOverlay('Finding the channel on Swarm…');
     setStatus('Resolving the channel feed…');
 
     if (!Hls.isSupported()) {
-      // Safari-style native HLS: no custom loader, so this only works where
-      // the playlist's absolute paths already resolve (an HTTP gateway).
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = contentUrl(ch, PLAYLIST);
-        video.play().catch(() => {});
-        return;
-      }
-      setOverlay('This browser cannot play HLS video.');
+      // The feed is read by the player itself, so a native HLS player
+      // (Safari without Media Source Extensions) has nothing to load.
+      setOverlay('This browser cannot play HLS video through the player (no Media Source Extensions).');
+      return;
+    }
+    if (inBzz && !(window.swarm && typeof window.swarm.request === 'function')) {
+      setOverlay('This page reads channels through Freedom\'s Swarm provider (window.swarm), which this browser does not have.');
       return;
     }
 
-    resetReads(contentUrl(ch, PLAYLIST));
+    resetReads(ch, next && next.index);
     hold('start');
     hls = new Hls(HLS_CONFIG);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(contentUrl(ch, PLAYLIST)));
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(PLAYLIST_URL));
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setStatus('Buffering…');
       video.play().catch(() => {});
@@ -844,7 +1241,7 @@
       // on it.
       if (guard.newBroadcast) {
         log.marker('a new broadcast started on the channel');
-        play(channel);
+        restartOnNewBroadcast();
         return;
       }
       const wasEnded = ended;
@@ -858,16 +1255,17 @@
         // they were, to the end of the closing window (its last minutes) or
         // of the recording if the reload went straight to it; one who opens
         // a finished channel gets the recording the publisher leaves at the
-        // head, the whole broadcast as VOD, from its first segment.
-        const next = 'You will switch to the next one when it starts.';
+        // head, the whole broadcast as VOD, from its first segment. The
+        // slot after it keeps being read (pollPlaylist) for the next one.
+        const after = 'You will switch to the next one when it starts.';
         if (joinedLive) {
-          setStatus(`The broadcast has ended: playing on to its end. ${next}`);
+          endedStatus = `The broadcast has ended: playing on to its end. ${after}`;
         } else {
-          setStatus(details.type === 'VOD'
-            ? `The broadcast has ended: playing its recording from the start. ${next}`
-            : `The broadcast has ended: playing its last minutes. ${next}`);
+          endedStatus = details.type === 'VOD'
+            ? `The broadcast has ended: playing its recording from the start. ${after}`
+            : `The broadcast has ended: playing its last minutes. ${after}`;
         }
-        watchForNextBroadcast();
+        setStatus(endedStatus);
       }
     });
     hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
@@ -881,26 +1279,11 @@
     tickTimer = setInterval(tick, 250);
   }
 
-  /**
-   * After a broadcast ended, keep an eye on the channel: when a playlist
-   * without #EXT-X-ENDLIST shows up, the channel is live again.
-   */
-  function watchForNextBroadcast() {
-    if (endedPoll) return;
-    endedPoll = setInterval(async () => {
-      try {
-        const res = await fetch(withCacheBust(contentUrl(channel, PLAYLIST)), { cache: 'no-store' });
-        if (!res.ok) return;
-        const text = await res.text();
-        // Only a playlist from a *new* broadcast counts: a stale feed read
-        // can still return an older, not yet closed playlist of the
-        // broadcast that just ended.
-        const info = playlistInfo(text);
-        if (info.id && !guard.ids.has(info.id) && !info.ended) play(channel);
-      } catch (_) {
-        /* offline for a moment: try again on the next tick */
-      }
-    }, 10000);
+  /** Start over on the new broadcast the guard found, from where it was read. */
+  function restartOnNewBroadcast() {
+    const found = guard.newBroadcast;
+    const ids = [...guard.ids].filter((id) => id !== found.id);
+    play(channel, { index: found.index === null ? undefined : found.index, ids });
   }
 
   /** Four times a second: the gate, overlapping reads, buffer samples. */
@@ -937,7 +1320,8 @@
     // propagated), or Swarm is slow. Keep trying; a live channel shows up.
     const waiting = !everPlayed;
     setOverlay(waiting ? 'Waiting for the broadcast to start…' : 'Reconnecting…');
-    setStatus(`${data.details}${data.response && data.response.code ? ` (${data.response.code})` : ''}, retrying`);
+    const why = feed.lastError ? `: ${feed.lastError.message}` : '';
+    setStatus(`${data.details}${data.response && data.response.code ? ` (${data.response.code})` : ''}${why}, retrying`);
     clearTimeout(retryTimer);
     retryTimer = setTimeout(() => {
       if (!hls) return;
@@ -1009,7 +1393,7 @@
     els.goLive.hidden = ended || behind === null || behind <= target + 6;
 
     if (gate.holding && everPlayed) setStatus(`Buffering… ${bufferAhead().toFixed(1)} of ${settings.rebuffer} s`);
-    else if (everPlayed && playing && !ended) setStatus('Playing live');
+    else if (everPlayed && playing) setStatus(ended ? endedStatus : 'Playing live');
     else if (everPlayed && !playing && !video.paused) setStatus('Buffering…');
 
     els.latency.textContent = behind !== null ? `${behind.toFixed(1)} s` : '–';
@@ -1043,23 +1427,27 @@
 
   function shareLink(ch) {
     const u = new URL(location.href);
-    u.hash = ch;
+    u.hash = ch.key;
     return u.toString();
   }
 
   // -- channel selection ----------------------------------------------------
 
+  const ASK = 'Enter the broadcaster\'s address and topic: 0x<40 hex>/<topic> (AntStream channels: /antstream), or a swarm:// link';
+
+  /** Recent channels, by key; entries of the older reference form are dropped. */
   function recent() {
     try {
-      return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
+      const list = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
+      return Array.isArray(list) ? list.filter((k) => parseChannel(k)) : [];
     } catch (_) {
       return [];
     }
   }
 
-  function remember(ch) {
+  function remember(key) {
     try {
-      const list = [ch, ...recent().filter((c) => c !== ch)].slice(0, 8);
+      const list = [key, ...recent().filter((c) => c !== key)].slice(0, 8);
       localStorage.setItem(RECENT_KEY, JSON.stringify(list));
     } catch (_) {
       /* storage unavailable: not worth failing playback over */
@@ -1068,32 +1456,43 @@
 
   function renderRecent() {
     els.recent.textContent = '';
-    for (const ch of recent()) {
+    for (const key of recent()) {
+      const ch = parseChannel(key);
       const li = document.createElement('li');
       const a = document.createElement('a');
-      a.href = `#${ch}`;
-      a.textContent = ch;
+      a.href = `#${ch.key}`;
+      a.textContent = `0x${ch.owner} / ${ch.topic}`;
       li.appendChild(a);
       els.recent.appendChild(li);
     }
   }
 
   function fromHash() {
-    const ch = parseChannel(decodeURIComponent(location.hash));
-    if (ch && ch !== channel) play(ch);
+    const raw = location.hash.slice(1);
+    if (!raw) return;
+    const ch = parseChannel(raw);
+    if (!ch) {
+      // A link of the older form (a feed manifest reference, #<64 hex>):
+      // those channels are not played any more.
+      els.input.value = raw;
+      els.input.setCustomValidity(`This link names no owner/topic channel. ${ASK}`);
+      els.input.reportValidity();
+      return;
+    }
+    if (!channel || ch.key !== channel.key) play(ch);
   }
 
   els.form.addEventListener('submit', (e) => {
     e.preventDefault();
     const ch = parseChannel(els.input.value);
     if (!ch) {
-      els.input.setCustomValidity('Enter a 64-hex channel reference, a bzz:// link or an ENS name');
+      els.input.setCustomValidity(ASK);
       els.input.reportValidity();
       return;
     }
     els.input.setCustomValidity('');
-    if (location.hash.slice(1) === ch) play(ch);
-    else location.hash = ch;
+    if (location.hash.slice(1) === ch.key) play(ch);
+    else location.hash = ch.key;
   });
   els.input.addEventListener('input', () => els.input.setCustomValidity(''));
   window.addEventListener('hashchange', fromHash);
@@ -1101,7 +1500,6 @@
   renderRecent();
   fromHash();
 
-  // Exposed for the test harness and for debugging from the console.
   // -- build ------------------------------------------------------------------
   //
   // deploy-feed.mjs writes version.js next to the page at deploy time:
@@ -1123,6 +1521,7 @@
   const versionEl = document.getElementById('player-version');
   if (versionEl) versionEl.textContent = buildLabel();
 
+  // Exposed for the test harness and for debugging from the console.
   window.antstreamPlayer = {
     build,
     buildLabel,
@@ -1135,6 +1534,14 @@
     DEFAULTS,
     bufferAhead,
     gate,
+    feed,
+    budget,
+    via: VIA,
+    // One feed read by hand, e.g. `antstreamPlayer.read.slot(antstreamPlayer.channel, 12)`.
+    read: { head: readHead, slot: readSlot },
+    get channel() {
+      return channel;
+    },
     get hls() {
       return hls;
     },

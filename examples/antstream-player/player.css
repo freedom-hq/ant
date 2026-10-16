@@ -134,7 +134,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(-
 #intro p { color: var(--muted); max-width: 720px; line-height: 1.5; }
 #recent { list-style: none; padding: 0; }
 #recent li { margin: 6px 0; }
-#recent a { color: var(--text); font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+#recent a { color: var(--text); font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 
 footer { margin-top: 32px; color: var(--muted); font-size: 12px; }
 footer a { color: var(--muted); }

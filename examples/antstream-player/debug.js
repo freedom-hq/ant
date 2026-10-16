@@ -107,7 +107,7 @@
     summary,
     el('div', { class: 'controls' },
       knob('prefetch', 'Prefetch', 8, 'segments', 'Segments fetched in parallel ahead of the one hls.js loads. 0 = off (hls.js alone, one at a time).'),
-      knob('polls', 'Feed reads', 6, 'at once', 'Playlist (feed) reads kept overlapping while live, a new one every 1.5 s. 0 = off (hls.js reloads one at a time).'),
+      knob('polls', 'Feed reads', 6, 'at once', 'Feed slots read side by side while live, a new read every 1.5 s. 0 = off (one read per hls.js reload).'),
       knob('rebuffer', 'Rebuffer to', 20, 's', 'Hold playback until this much is buffered ahead after a start, seek or stall. 0 = off.'),
       el('button', { type: 'button', onclick: resetKnobs }, 'Defaults'),
     ),
@@ -191,10 +191,16 @@
     const ok = segs.filter((e) => e.status === 'ok');
     const failed = segs.filter((e) => e.status === 'error' || e.status === 'timeout');
     const cancelled = segs.filter((e) => e.status === 'cancelled');
-    const reads = log.entries.filter((e) => e.kind === 'playlist' && e.ms !== null);
+    const done = log.entries.filter((e) => e.kind === 'playlist' && e.ms !== null);
+    const reads = done.filter((e) => e.read !== 'marker');
     const readsOk = reads.filter((e) => e.status === 200);
-    const newerAt = readsOk.filter((e) => e.note === 'newer').map((e) => e.at);
+    const notYet = reads.filter((e) => e.status === 404);
+    const markers = done.filter((e) => e.read === 'marker');
+    const limited = done.filter((e) => e.status === 429);
+    const newerAt = readsOk.filter((e) => e.note.includes('newer')).map((e) => e.at);
     const gaps = newerAt.slice(1).map((t, i) => t - newerAt[i]);
+    const feed = player.feed;
+    const budget = player.budget;
     const bytes = ok.reduce((a, e) => a + e.bytes, 0);
     const ms = ok.reduce((a, e) => a + e.ms, 0);
     const stallMs = s ? s.stallMs + (s.stallSince !== null ? Date.now() - s.stallSince : 0) : 0;
@@ -204,8 +210,12 @@
       ['Segment first byte', `median ${sec(median(ok.map((e) => e.ttfb)))} · p95 ${sec(p95(ok.map((e) => e.ttfb)))}`],
       ['Segment total', `median ${sec(median(ok.map((e) => e.ms)))} · p95 ${sec(p95(ok.map((e) => e.ms)))} · ${mbps(bytes, ms)} Mbit/s per fetch`],
       ['Prefetch', `${c.ready} ready · ${c.joined} joined · ${c.miss} fetched by hls.js`],
-      ['Feed reads', `${readsOk.length} ok · ${reads.length - readsOk.length} failed · median ${sec(median(readsOk.map((e) => e.ms)))} · p95 ${sec(p95(readsOk.map((e) => e.ms)))}`],
-      ['Feed reads', `${readsOk.filter((e) => e.note === 'newer').length} newer · ${readsOk.filter((e) => e.note === 'unchanged').length} unchanged · ${readsOk.filter((e) => e.note.startsWith('stale')).length} stale`],
+      ['Feed index', feed.index === null ? '–' : `${feed.index} · joined via ${feed.joinedVia || '–'} · reading from ${feed.cursor + 1} · ${feed.ch ? feed.ch.topicHex.slice(0, 12) : ''}… over ${player.via}`],
+      ['Feed reads', `${readsOk.length} ok · ${notYet.length} not written yet · ${reads.length - readsOk.length - notYet.length} failed · median ${sec(median(readsOk.map((e) => e.ms)))} · p95 ${sec(p95(readsOk.map((e) => e.ms)))}`, reads.length - readsOk.length - notYet.length > 0],
+      ['Feed reads', `${readsOk.filter((e) => e.note.includes('newer')).length} newer · ${readsOk.filter((e) => e.note.includes('unchanged')).length} unchanged · ${readsOk.filter((e) => e.note.includes('stale')).length} stale · markers ${markers.filter((e) => e.status === 200).length} of ${markers.length} found`],
+      ...(player.via === 'window.swarm'
+        ? [['Read budget', `${budget.reads.length} reads · ${size(budget.reads.reduce((n, r) => n + r.bytes, 0))} in the last minute · ${budget.refused} rate limited${Date.now() < budget.until ? ` · paused ${sec(budget.until - Date.now())}` : ''}`, limited.length > 0]]
+        : []),
       ['Live edge moved', gaps.length ? `every ${sec(median(gaps))} (median) · longest ${sec(Math.max(...gaps))}` : '–'],
       ['Stalls', s ? `${s.stalls} · ${sec(stallMs)} in total` : '–', s && s.stalls > 0],
       ['First frame', s && s.firstPlayingAt ? sec(s.firstPlayingAt - s.startedAt) : '–'],
@@ -221,25 +231,28 @@
       return el('tr', { class: `marker${bad ? ' bad' : ''}` }, t, el('td', { colspan: '8' }, e.text));
     }
     if (e.kind === 'playlist') {
-      const bad = e.status !== 200 && e.status !== 'loading';
-      const stale = e.note.startsWith('stale');
-      return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : ''}` },
+      // How the read was answered: 200 with a playlist (or a marker), 404
+      // for a slot not written yet, 429 rate limited, else an error.
+      const bad = e.status !== 200 && e.status !== 404 && e.status !== 'loading';
+      const stale = e.note.includes('stale');
+      const what = e.read === 'head' ? 'feed head' : e.read === 'marker' ? `marker ${e.period}` : 'feed slot';
+      return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : e.status === 404 ? ' dim' : ''}` },
         t,
-        el('td', {}, 'feed read'),
-        el('td', { class: 'mono' }, e.seq === null ? '–' : `${e.seq}+${e.segments}`),
+        el('td', {}, what),
+        el('td', { class: 'mono' }, e.index === null || e.index === undefined ? '–' : String(e.index)),
         el('td', {}, ''),
         el('td', { class: e.ms > 4000 ? 'slow' : '' }, sec(e.ms)),
         el('td', {}, ''),
         el('td', {}, ''),
-        el('td', {}, ''),
-        el('td', {}, `${e.status}${e.note ? ` · ${e.note}` : ''}`),
+        el('td', {}, e.via || ''),
+        el('td', {}, `${e.status}${e.note ? ` · ${e.note}` : ''}${e.seq === null ? '' : ` · seq ${e.seq}+${e.segments}`}`),
       );
     }
     const slow = (e.ttfb || 0) > SLOW_MS;
     const bad = e.status === 'error' || e.status === 'timeout';
     return el('tr', { class: `segment${bad ? ' bad' : e.status === 'cancelled' ? ' dim' : ''}` },
       t,
-      el('td', { class: 'mono', title: e.name }, e.name),
+      el('td', { class: 'mono', title: e.name }, e.name.length > 16 ? `${e.name.slice(0, 12)}…` : e.name),
       el('td', { class: 'mono' }, e.sn === null || e.sn === undefined ? '' : String(e.sn)),
       el('td', { class: slow ? 'slow' : '' }, sec(e.ttfb)),
       el('td', { class: (e.ms || 0) > 2000 ? 'slow' : '' }, sec(e.ms)),
