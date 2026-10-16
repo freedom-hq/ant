@@ -45,17 +45,17 @@ struct LiveView: View {
     @State private var confirmLowCapacity = false
     /// The interface is laid out wider than tall (the phone is turned).
     @State private var landscape = false
-    /// The camera preview turns its picture upright-portrait relative to
-    /// the interface (its preview angle is 90°/270°), as reported by
+    /// The camera preview's rotation reading, as reported by
     /// ``CameraPreview``, with the session it was reported for. `nil`
     /// until a preview runs. A reading from an earlier session (a failed
-    /// engine replaced, the preview reopened) is ignored until the new
+    /// engine replaced, the preview reopened) or for another camera (a
+    /// flip the preview hasn't caught up with) is ignored until the
     /// preview reports its own (``previewFrameTall``).
-    @State private var previewAngle: PreviewAngle?
+    @State private var previewReading: PreviewReading?
 
-    struct PreviewAngle: Equatable {
+    struct PreviewReading: Equatable {
         let session: ObjectIdentifier
-        let portrait: Bool
+        let rotation: CameraPreview.Rotation
     }
 
     init(resume: Bool = false) {
@@ -255,21 +255,34 @@ struct LiveView: View {
     /// has the shape viewers get and the picture fills it as it will for
     /// them, instead of a 16:9 box laid across the portrait interface
     /// around a picture standing the other way.
+    ///
+    /// Both angles come from the preview's own rotation coordinator, for
+    /// the camera the preview shows, read together (#214): the preview's
+    /// angle as its connection actually has it, and the capture angle
+    /// beside it. Only a reading for this session *and* this camera
+    /// counts, so a flip can't pair one camera's preview with another's
+    /// capture. The decision itself is ``PreviewGeometry/frameTall``.
     private var previewFrameTall: Bool {
         guard let session = broadcast.engine?.previewSession,
-              let angle = previewAngle, angle.session == ObjectIdentifier(session),
-              let capturePortrait = broadcast.capturePortrait
+              let camera = broadcast.previewCamera,
+              let reading = previewReading,
+              reading.session == ObjectIdentifier(session),
+              reading.rotation.camera == camera.uniqueID
         else { return broadcast.portrait }
-        let turned = angle.portrait != capturePortrait
-        return broadcast.portrait != turned
+        return PreviewGeometry.frameTall(
+            broadcastPortrait: broadcast.portrait,
+            previewAngle: reading.rotation.previewAngle,
+            captureAngle: reading.rotation.captureAngle,
+            facing: reading.rotation.facing
+        )
     }
 
     @ViewBuilder
     private var previewContent: some View {
         if let session = broadcast.engine?.previewSession {
-            CameraPreview(session: session, camera: broadcast.previewCamera) { portrait in
-                let next = PreviewAngle(session: ObjectIdentifier(session), portrait: portrait)
-                if previewAngle != next { previewAngle = next }
+            CameraPreview(session: session, camera: broadcast.previewCamera) { rotation in
+                let next = PreviewReading(session: ObjectIdentifier(session), rotation: rotation)
+                if previewReading != next { previewReading = next }
             }
         } else if let problem = broadcast.previewProblem {
             previewPlaceholder(icon: "video.slash", text: problem) {
@@ -836,14 +849,26 @@ struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     /// The camera the session captures from; `nil` until it is set up.
     let camera: AVCaptureDevice?
-    /// Called with whether the preview's angle stands the picture
-    /// portrait in the interface (90°/270°), on every change, so the
+    /// Called with the preview's rotation on every change (the interface
+    /// or the device turning, a camera flip, a new connection), so the
     /// live screen can shape the frame around it.
-    var onPreviewAngle: (Bool) -> Void = { _ in }
+    var onRotation: (Rotation) -> Void = { _ in }
+
+    /// One reading of one camera's rotation coordinator: the angle the
+    /// preview's connection has (read back after setting it, so an angle
+    /// the connection refused isn't reported as applied) and that same
+    /// coordinator's capture angle, for ``PreviewGeometry/frameTall``.
+    struct Rotation: Equatable {
+        /// `AVCaptureDevice.uniqueID` of the camera it was read for.
+        let camera: String
+        let facing: PreviewGeometry.Facing
+        let previewAngle: CGFloat
+        let captureAngle: CGFloat
+    }
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
-        view.onPreviewAngle = onPreviewAngle
+        view.onRotation = onRotation
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspect
         view.follow(camera)
@@ -851,7 +876,7 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ view: PreviewView, context: Context) {
-        view.onPreviewAngle = onPreviewAngle
+        view.onRotation = onRotation
         if view.previewLayer.session !== session {
             // A new engine's session (a failed one replaced, the preview
             // reopened) brings a new preview connection: turn and report
@@ -864,51 +889,107 @@ struct CameraPreview: UIViewRepresentable {
 
     final class PreviewView: UIView {
         private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
-        private var rotationObservation: NSKeyValueObservation?
+        private var rotationObservations: [NSKeyValueObservation] = []
+        /// The camera last asked for, and the camera and preview
+        /// connection the coordinator above was set up for. A flip swaps
+        /// the session's input, which replaces the preview's connection:
+        /// a new camera *or* a new connection sets up afresh (#214).
+        private var camera: AVCaptureDevice?
         private var followedCamera: String?
-        var onPreviewAngle: (Bool) -> Void = { _ in }
+        private var followedConnection: ObjectIdentifier?
+        var onRotation: (Rotation) -> Void = { _ in }
 
         /// The next ``follow(_:)`` sets up even for the camera it already
         /// follows: the session, and so the connection, changed.
         func forgetCamera() {
             followedCamera = nil
-            rotationObservation?.invalidate()
-            rotationObservation = nil
+            followedConnection = nil
+            rotationObservations.forEach { $0.invalidate() }
+            rotationObservations = []
             rotationCoordinator = nil
         }
 
-        /// Keep the preview upright for `camera`, as the interface turns.
-        /// A camera flip brings a new device and a new coordinator.
+        /// Keep the preview upright for `camera`, as the interface turns,
+        /// and report its rotation. A camera flip brings a new device and
+        /// a new connection, and with them a new coordinator.
         func follow(_ camera: AVCaptureDevice?) {
-            guard let camera, camera.uniqueID != followedCamera else { return }
+            self.camera = camera
+            guard let camera,
+                  // No connection yet (the input isn't in the session):
+                  // nothing to turn. The next update or layout pass sets
+                  // up once there is one.
+                  let connection = previewLayer.connection
+            else { return }
+            let connectionID = ObjectIdentifier(connection)
+            guard camera.uniqueID != followedCamera || connectionID != followedConnection
+            else { return }
+            forgetCamera()
             followedCamera = camera.uniqueID
-            rotationObservation?.invalidate()
+            followedConnection = connectionID
             let coordinator = AVCaptureDevice.RotationCoordinator(
                 device: camera,
                 previewLayer: previewLayer
             )
             rotationCoordinator = coordinator
-            applyRotation(coordinator.videoRotationAngleForHorizonLevelPreview)
-            rotationObservation = coordinator.observe(
-                \.videoRotationAngleForHorizonLevelPreview,
-                options: [.new]
-            ) { [weak self] _, change in
-                guard let angle = change.newValue else { return }
-                Task { @MainActor in self?.applyRotation(angle) }
-            }
+            applyRotation()
+            // Both angles, so the frame follows the device turning under
+            // Portrait Orientation Lock too, where the preview angle stays
+            // put and only the capture angle moves. `applyRotation` reads
+            // the *current* coordinator, so a late change from one a flip
+            // already replaced only re-reports the new camera.
+            rotationObservations = [
+                coordinator.observe(\.videoRotationAngleForHorizonLevelPreview) { [weak self] _, _ in
+                    Task { @MainActor in self?.applyRotation() }
+                },
+                coordinator.observe(\.videoRotationAngleForHorizonLevelCapture) { [weak self] _, _ in
+                    Task { @MainActor in self?.applyRotation() }
+                },
+            ]
         }
 
-        private func applyRotation(_ angle: CGFloat) {
-            guard let connection = previewLayer.connection,
-                  connection.isVideoRotationAngleSupported(angle)
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            // The coordinator's preview angle is relative to the preview
+            // layer's place in the interface: one set up before the view
+            // was in a window starts again now that it is.
+            guard window != nil else { return }
+            forgetCamera()
+            follow(camera)
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            // Catches a connection replaced (an input swapped) without a
+            // SwiftUI update; a no-op when nothing changed.
+            follow(camera)
+        }
+
+        /// Turn the preview's connection to the coordinator's current
+        /// preview angle and report both of the coordinator's angles.
+        private func applyRotation() {
+            guard let coordinator = rotationCoordinator,
+                  let camera,
+                  camera.uniqueID == followedCamera,
+                  let connection = previewLayer.connection
             else { return }
-            connection.videoRotationAngle = angle
+            let angle = coordinator.videoRotationAngleForHorizonLevelPreview
+            if connection.isVideoRotationAngleSupported(angle) {
+                connection.videoRotationAngle = angle
+            }
+            // The angle the connection ended up at is what the picture is
+            // drawn with, so that is what is reported (as #194 does for
+            // the capture side), not the request.
+            let rotation = Rotation(
+                camera: camera.uniqueID,
+                facing: camera.position == .front ? .front : .back,
+                previewAngle: connection.videoRotationAngle,
+                captureAngle: coordinator.videoRotationAngleForHorizonLevelCapture
+            )
             // Reported after the current view update: `follow` runs inside
             // SwiftUI's make/update, where state must not change.
             // The closure current now is the one for this session.
-            let portrait = CaptureEngine.isPortrait(captureAngle: angle)
-            let report = onPreviewAngle
-            Task { @MainActor in report(portrait) }
+            let report = onRotation
+            Task { @MainActor in report(rotation) }
         }
 
         override static var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }

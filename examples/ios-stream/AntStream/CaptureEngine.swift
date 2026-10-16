@@ -560,9 +560,17 @@ final class CaptureEngine: NSObject {
         rotationObservation = coordinator.observe(
             \.videoRotationAngleForHorizonLevelCapture,
             options: [.new]
-        ) { [weak self] _, change in
+        ) { [weak self, weak coordinator] _, change in
             guard let angle = change.newValue else { return }
-            self?.queue.async { self?.applyRotation(angle) }
+            self?.queue.async {
+                // A change queued just before a camera flip belongs to the
+                // previous camera's coordinator: the new camera's own
+                // angle (applied by the flip) must not be overwritten by
+                // it (#214).
+                guard let self, let coordinator, self.rotationCoordinator === coordinator
+                else { return }
+                self.applyRotation(angle)
+            }
         }
     }
 
@@ -580,9 +588,10 @@ final class CaptureEngine: NSObject {
     }
 
     /// A capture angle of 90° or 270° turns the sensor's landscape frames
-    /// upright: the picture is portrait.
+    /// upright: the picture is portrait. Either camera: the front one's
+    /// mirrored 270° counts as the back one's 90° (``PreviewGeometry``).
     static func isPortrait(captureAngle angle: CGFloat) -> Bool {
-        Int(angle.rounded()).quotientAndRemainder(dividingBy: 180).remainder != 0
+        PreviewGeometry.isPortrait(angle: angle)
     }
 
     private func applyRotation(_ angle: CGFloat) {
