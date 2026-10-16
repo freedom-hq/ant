@@ -60,24 +60,11 @@ pub const MAX_LEVEL: u8 = 4;
 /// Dispersed replica counts per level (bee `redundancy.GetReplicaCounts`).
 pub const REPLICA_COUNTS: [usize; 5] = [0, 2, 4, 8, 16];
 
-/// Owner address of every dispersed replica SOC: the Ethereum address of
-/// the well-known private key `0x01 ‖ [0u8; 31]` (bee
-/// `swarm.ReplicasOwner`).
-pub const REPLICAS_OWNER: [u8; 20] = [
-    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
-    0x5a, 0x76, 0x17, 0xb5,
-];
-
-/// The well-known private key behind [`REPLICAS_OWNER`] (bee
-/// `pkg/replicas/replicas.go`: `crypto.DecodeSecp256k1PrivateKey(
-/// append([]byte{1}, make([]byte, 31)...))`). Deliberately public —
-/// anyone must be able to mint (and verify) dispersed replicas of any
-/// chunk; the upload side signs replica SOCs with it.
-pub const REPLICAS_OWNER_SECRET: [u8; 32] = {
-    let mut k = [0u8; 32];
-    k[0] = 1;
-    k
-};
+/// Owner address of every dispersed replica SOC and its well-known
+/// private key. They live in [`ant_crypto::soc`] (where `soc_valid`
+/// enforces the replica id rule) and are re-exported here so existing
+/// paths keep working.
+pub use ant_crypto::soc::{REPLICAS_OWNER, REPLICAS_OWNER_SECRET};
 
 /// How many sibling shard fetches a recovery sweep keeps in flight at
 /// once. The sweep touches at most 128 chunks; 16 matches the joiner's
