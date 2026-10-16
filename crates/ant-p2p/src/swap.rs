@@ -1403,7 +1403,8 @@ impl Drop for JournalStore {
 /// line. A torn tail ([`journal_intact_len`]: a last line without its
 /// newline, or a NUL-filled range a crash left) was cut off mid-write and
 /// never confirmed (no cheque went out on it), so it is skipped; any other line
-/// that doesn't parse means the journal is damaged, and it is moved aside
+/// that doesn't parse, or holds a cumulative that isn't a decimal number
+/// ([`bad_cumulative`]), means the journal is damaged, and it is moved aside
 /// like an unparseable file (its figures count as lost), reading as empty.
 /// `Ok(vec![])` when it doesn't exist; an I/O error is returned.
 fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String, String>>> {
@@ -1422,7 +1423,13 @@ fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String,
             continue;
         }
         match serde_json::from_slice::<HashMap<String, String>>(line) {
-            Ok(m) => lines.push(m),
+            Ok(m) => {
+                if let Some(bad) = bad_cumulative(&m) {
+                    quarantine_outbound_file(path, part, &format!("line {}: {bad}", n + 1))?;
+                    return Ok(Vec::new());
+                }
+                lines.push(m);
+            }
             Err(e) => {
                 quarantine_outbound_file(path, part, &format!("line {}: {e}", n + 1))?;
                 return Ok(Vec::new());
@@ -1634,7 +1641,8 @@ fn flag_survivors(survivors: &[Arc<OutboundShared>]) {
 }
 
 /// Read `path`. `Ok(None)` when it doesn't exist. A file that is
-/// neither shape is moved aside (see [`OutboundLedger`]) and reads as
+/// neither shape, or holds a cumulative that isn't a decimal number
+/// ([`bad_cumulative`]), is moved aside (see [`OutboundLedger`]) and reads as
 /// missing; an I/O error, which may pass, is returned.
 fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
     let bytes = match std::fs::read(path) {
@@ -1642,16 +1650,43 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-        Ok(flat) => Ok(Some(OutboundFile::from_flat(flat))),
-        Err(e) => {
-            if let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) {
-                return Ok(Some(nested));
+    let file = match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        Ok(flat) => {
+            if let Some(bad) = bad_cumulative(&flat) {
+                quarantine_outbound_file(path, path, &bad)?;
+                return Ok(None);
             }
-            quarantine_outbound_file(path, path, &e)?;
-            Ok(None)
+            OutboundFile::from_flat(flat)
         }
+        Err(e) => {
+            let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) else {
+                quarantine_outbound_file(path, path, &e)?;
+                return Ok(None);
+            };
+            nested
+        }
+    };
+    if let Some(bad) = file.chequebooks.values().find_map(bad_cumulative) {
+        quarantine_outbound_file(path, path, &bad)?;
+        return Ok(None);
     }
+    Ok(Some(file))
+}
+
+/// The first entry of a stored `key → cumulative` map whose cumulative
+/// isn't a decimal number that fits a `U256` (empty, a sign, an exponent,
+/// any non-digit, too large), described for the quarantine message. Such
+/// an entry can't be skipped as absent: its cheques would restart from
+/// zero (`0 + amount`, which the peer rejects as not increasing), the
+/// issued total would read low, and the next write would replace the
+/// real figure with the lower one (bee#5656). The ledger it is in is
+/// moved aside instead, its figures lost, like unparseable JSON.
+fn bad_cumulative(map: &HashMap<String, String>) -> Option<String> {
+    map.iter()
+        .find(|(_, v)| {
+            v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) || U256::from_dec_str(v).is_err()
+        })
+        .map(|(k, v)| format!("entry {k:?} has cumulative {v:?}, not a decimal number"))
 }
 
 /// Move `part` — the outbound ledger at `path` or one of its journals —
@@ -4223,6 +4258,85 @@ mod tests {
         drop(ledger);
         let reopened = OutboundLedger::open(Some(path), [0xc1; 20]);
         assert_eq!(reopened.cumulative_for(&peer), U256::from(70u64));
+    }
+
+    /// A stored cumulative that isn't a decimal number (bee#5656) is a
+    /// loss, not an absent entry: read as absent, the next cheque would
+    /// restart from zero and a write would replace the real figure. Both
+    /// on-disk shapes are checked; the file is moved aside and the
+    /// chequebook's figures count as lost until confirmed.
+    #[test]
+    fn a_non_numeric_cumulative_is_a_loss_not_zero() {
+        let cb = [0xc1u8; 20];
+        let peer = [0x11u8; 20];
+        let good = format!("{}:{}", hex::encode(cb), hex::encode([0x22u8; 20]));
+        let bad_key = format!("{}:{}", hex::encode(cb), hex::encode(peer));
+        for bad in ["", "abc", "-5", "1e3", " 7", &"9".repeat(80)] {
+            for nested in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("pushsync_outbound.json");
+                let body = if nested {
+                    serde_json::json!({"chequebooks": {hex::encode(cb): {
+                        hex::encode([0x22u8; 20]): "40",
+                        hex::encode(peer): bad,
+                    }}})
+                } else {
+                    serde_json::json!({ good.clone(): "40", bad_key.clone(): bad })
+                };
+                let bytes = serde_json::to_vec(&body).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+
+                let ledger = OutboundLedger::open(Some(path.clone()), cb);
+                ledger.ensure_readable().unwrap();
+                let why = ledger.lost_figures();
+                assert!(why.is_some(), "{bad:?} nested={nested}: not a loss");
+                assert!(!path.exists(), "{bad:?} nested={nested}: not moved");
+                let aside: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .filter(|n| n.starts_with("pushsync_outbound.json.corrupt-"))
+                    .collect();
+                assert_eq!(aside.len(), 1, "{bad:?} nested={nested}: {aside:?}");
+                assert_eq!(std::fs::read(dir.path().join(&aside[0])).unwrap(), bytes);
+            }
+        }
+    }
+
+    /// A journal line whose cumulative isn't a decimal number is a damaged
+    /// journal: moved aside, the figures lost, like an unparseable line.
+    #[test]
+    fn a_journal_line_with_a_non_numeric_cumulative_is_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        crash(&path, [l]);
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        let line = format!(
+            "{{\"{}:{}\":\"abc\"}}\n",
+            hex::encode(cb),
+            hex::encode(beneficiary(1))
+        );
+        std::io::Write::write_all(&mut j, line.as_bytes()).unwrap();
+        drop(j);
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.ensure_readable().unwrap();
+        assert!(l.lost_figures().is_some());
+        assert!(!journal_path(&path).exists(), "journal not moved aside");
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(std::fs::read_to_string(dir.path().join(&aside[0]))
+            .unwrap()
+            .contains("\"abc\""));
     }
 
     /// Moving a ledger aside loses its chequebooks' figures (PR #126

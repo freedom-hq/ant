@@ -243,8 +243,15 @@ fn add_dec(a: &str, b: &str) -> String {
     }
 }
 
+/// A non-empty string of ASCII digits: what [`add_dec`] can add.
+fn is_dec(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Bee's `settlementsResponse` for a row source: `sent`/`received`
-/// accessors return `None` when the peer has no record of that kind.
+/// accessors return `None` when the peer has no record of that kind. A
+/// figure that isn't a decimal number (a damaged stored ledger entry,
+/// bee#5656) counts as no record rather than reaching [`add_dec`].
 fn settlements_body<S, R>(rows: &[PeerAccountingView], sent: S, received: R) -> Value
 where
     S: Fn(&PeerAccountingView) -> Option<&str>,
@@ -254,8 +261,8 @@ where
     let mut total_received = "0".to_string();
     let mut settlements = Vec::new();
     for row in rows {
-        let s = sent(row);
-        let r = received(row);
+        let s = sent(row).filter(|v| is_dec(v));
+        let r = received(row).filter(|v| is_dec(v));
         if s.is_none() && r.is_none() {
             continue;
         }
@@ -417,7 +424,8 @@ pub async fn chequebook_cheque_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::{add_dec, render_balance};
+    use super::{add_dec, render_balance, settlements_body};
+    use ant_control::PeerAccountingView;
 
     #[test]
     fn decimal_addition_handles_carries_and_zero() {
@@ -430,6 +438,33 @@ mod tests {
             add_dec("18446744073709551616", "18446744073709551616"),
             "36893488147419103232"
         );
+    }
+
+    /// A stored figure that isn't a decimal number is no record: it
+    /// neither panics nor garbles the totals (bee#5656).
+    #[test]
+    fn settlements_skip_figures_that_are_not_decimal_numbers() {
+        let row = |peer: &str, sent: Option<&str>, received: Option<&str>| PeerAccountingView {
+            peer: peer.to_string(),
+            swap_sent: sent.map(str::to_string),
+            swap_received: received.map(str::to_string),
+            ..Default::default()
+        };
+        let rows = [
+            row("aa", Some("10"), None),
+            row("bb", Some("x9"), None),
+            row("cc", None, Some("")),
+        ];
+        let body = settlements_body(
+            &rows,
+            |r| r.swap_sent.as_deref(),
+            |r| r.swap_received.as_deref(),
+        );
+        assert_eq!(body["totalSent"], "10");
+        assert_eq!(body["totalReceived"], "0");
+        let settlements = body["settlements"].as_array().unwrap();
+        assert_eq!(settlements.len(), 1, "{body}");
+        assert_eq!(settlements[0]["peer"], "aa");
     }
 
     #[test]
