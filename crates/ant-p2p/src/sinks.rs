@@ -380,8 +380,17 @@ async fn read_delimited<R: AsyncReadExt + Unpin>(
             format!("message too large: {len} bytes (cap {max})"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    // Grow the buffer only as body bytes actually arrive: reserving `len`
+    // up front would let a peer pin up to the cap per stream by declaring a
+    // large frame and then sending nothing.
+    let mut buf = Vec::new();
+    (&mut *r).take(len as u64).read_to_end(&mut buf).await?;
+    if buf.len() < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("frame truncated: {} of {len} bytes", buf.len()),
+        ));
+    }
     Ok(buf)
 }
 
@@ -432,6 +441,25 @@ async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<
 mod tests {
     use super::*;
     use crate::underlay::serialize_underlays;
+
+    /// A frame that declares more bytes than the peer sends fails with
+    /// `UnexpectedEof` (the body buffer only grows with bytes received).
+    #[tokio::test]
+    async fn read_delimited_rejects_short_body() {
+        let mut wire: &[u8] = &[100, 0xAA, 0xBB, 0xCC]; // says 100, carries 3
+        let err = read_delimited(&mut wire, 1024).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A complete frame reads back exactly and leaves trailing bytes on
+    /// the stream for the next read.
+    #[tokio::test]
+    async fn read_delimited_reads_exact_frame() {
+        let mut wire: &[u8] = &[3, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let body = read_delimited(&mut wire, 1024).await.unwrap();
+        assert_eq!(body, vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(wire, &[0xDD, 0xEE]);
+    }
 
     #[test]
     fn decodes_single_peer_hive_message() {

@@ -2913,8 +2913,17 @@ async fn read_delimited<R: AsyncReadExt + Unpin>(
             format!("message too large: {len} bytes (cap {max})"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    // Grow the buffer only as body bytes actually arrive: reserving `len`
+    // up front would let a peer pin up to the cap per stream by declaring a
+    // large frame and then sending nothing.
+    let mut buf = Vec::new();
+    (&mut *r).take(len as u64).read_to_end(&mut buf).await?;
+    if buf.len() < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("frame truncated: {} of {len} bytes", buf.len()),
+        ));
+    }
     Ok(buf)
 }
 
