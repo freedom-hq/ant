@@ -4744,11 +4744,11 @@ async fn publish_bzz_with(
 /// starts in the background. A segment's playlist entry waits for every
 /// segment before it, and a feed update for its playlist's upload, so
 /// without this one chunk hunting a deep storer (12 shallow receipts at
-/// most, a 2.5 s wait after each from the 2nd to the 11th) held back the feed for everything behind it: the
-/// 10-30 s pauses of #212. The hunt itself is unchanged. The feed
-/// update (`POST /soc`), the channel manifest, the ladder's writes and
-/// the recording go without it, and answer once placed. Other gateways
-/// (bee) ignore the header.
+/// most, a 2.5 s wait after each from the 2nd to the 11th) held back
+/// the feed for everything behind it: the 10-30 s pauses of #212. The
+/// hunt itself is unchanged. The feed update (`POST /soc`), the channel
+/// manifest, the ladder's writes and the recording go without it, and
+/// answer once placed. Other gateways (bee) ignore the header.
 fn stored_ack_headers() -> [(String, String); 1] {
     [("ant-ack-when-stored".to_string(), "true".to_string())]
 }

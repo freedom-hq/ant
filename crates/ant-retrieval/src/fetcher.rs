@@ -436,8 +436,11 @@ impl RoutingFetcher {
     /// that only needs the chunk stored, not yet deep, answers on this
     /// and leaves the hunt to finish in the background. A deep receipt
     /// never fires it: the push returns `Ok` then anyway. For one push.
-    /// Such a push also hedges sooner until then: after 1 s, not bee's
-    /// 5 s (`STORED_PREEMPTIVE_INTERVAL`).
+    /// Such a push also hedges sooner until the signal fires: after 1 s,
+    /// not bee's 5 s (`STORED_PREEMPTIVE_INTERVAL`). The signal firing
+    /// ends that, whatever the receiver does with it: a caller that
+    /// still waits for the push to end afterwards (`ant-p2p` does when
+    /// every background-hunt slot is taken) waits on the 5 s hedge.
     #[must_use]
     pub fn with_stored_signal(mut self, stored: oneshot::Sender<()>) -> Self {
         self.stored = Some(Arc::new(Mutex::new(Some(stored))));
@@ -458,11 +461,16 @@ impl RoutingFetcher {
     }
 
     /// The preemptive hedge interval of a push: the short
-    /// [`Self::STORED_PREEMPTIVE_INTERVAL`] while a caller waits for its
-    /// stored answer ([`Self::with_stored_signal`]), bee's
+    /// [`Self::STORED_PREEMPTIVE_INTERVAL`] until its stored signal
+    /// ([`Self::with_stored_signal`]) has fired, bee's
     /// [`Self::PREEMPTIVE_INTERVAL`] otherwise, including the hunt for a
-    /// deep storer that goes on after that answer: nobody waits on its
-    /// latency any more, and every hedge is a paid push.
+    /// deep storer that goes on after it: once answered, nobody waits on
+    /// its latency any more, and every hedge is a paid push. The switch
+    /// keys off the signal, not the answer: a caller that declines to
+    /// answer early on it (`ant-p2p` with every `MAX_BACKGROUND_HUNTS`
+    /// slot taken) gets the 5 s hedge for the rest of the push, like a
+    /// push without the header, which is what that cap is for: fewer
+    /// extra pushes while the node is already busy hunting.
     fn preemptive_interval(&self) -> Duration {
         let waiting = self.stored.as_ref().is_some_and(|slot| {
             slot.lock()

@@ -214,7 +214,8 @@ What the fix changes:
   because someone is waiting on it; the background hunt after it goes
   back to 5 s. At most 64 such hunts run in the background node-wide
   (`MAX_BACKGROUND_HUNTS`); with all taken, a push waits for placement
-  as without the header. The feed update, the channel manifest, the
+  as without the header, and from its first receipt on with the 5 s
+  hedge as well. The feed update, the channel manifest, the
   ladder and the recording still answer once placed.
 
 Placement held: hunts that ended without a deep storer were 1, 1, 0

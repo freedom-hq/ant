@@ -5229,10 +5229,12 @@ fn stamp_jobs(
 /// Once every slot is taken, a push that gets its first receipt is not
 /// answered early: its caller waits for placement as without the
 /// header, which keeps it inside its request's window and slows the
-/// request down instead of adding more pushes. 64 is two requests'
-/// worth of data pushes; at about one shallow first receipt in ten
-/// (issue #212's measurement) a 2 s live cadence leaves a handful of
-/// hunts running at a time.
+/// request down instead of adding more pushes. That wait also hedges as
+/// without the header, every 5 s: the fetcher's 1 s hedge ends at the
+/// stored signal, whether or not a slot was free to answer on it. 64 is
+/// two requests' worth of data pushes; at about one shallow first
+/// receipt in ten (issue #212's measurement) a 2 s live cadence leaves
+/// a handful of hunts running at a time.
 const MAX_BACKGROUND_HUNTS: usize = 64;
 
 /// How a push that may answer early ended its first wait.

@@ -292,7 +292,8 @@ pub enum ControlCommand {
         /// hunt goes on in the background exactly as it would have, and
         /// its outcome is only logged. At most `MAX_BACKGROUND_HUNTS` (64)
         /// such hunts run node-wide; with every slot taken the push is
-        /// answered when done, as with `false`. For a caller that needs
+        /// answered when done, as with `false` (and from its first
+        /// receipt on, hedging every 5 s like it). For a caller that needs
         /// the chunk held by the network now and in its own neighbourhood
         /// seconds later, rather than deep before it may go on: a live broadcast's
         /// segments, which every later segment waits behind (issue #212).
