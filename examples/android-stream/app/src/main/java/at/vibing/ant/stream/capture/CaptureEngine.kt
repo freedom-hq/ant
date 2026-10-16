@@ -215,63 +215,94 @@ class CaptureEngine(
      * the new camera's turn: a frame of the old camera still queued on the
      * GL thread is never drawn with the new camera's angle (half a turn off
      * for 90° back / 270° front in portrait).
+     *
+     * Taps while a switch is still underway never run two cameras at once:
+     * while the old camera closes they just retarget the pending open, and
+     * while the new camera is still opening they are latched and applied
+     * (an even number cancelling out) once it reports opened.
      */
     fun switchCamera() {
-        cameraHandler.post {
-            if (!running || !canSwitchCamera) return@post
-            if (closing != null) {
-                // A switch is still waiting for its camera to close: just
-                // change where it goes (the pending step reads both fields).
-                frontCamera = !frontCamera
-                val next = cameraManager.getCameraCharacteristics(cameraId)
-                chars = next
-                rotation = rotationFor(next)
-                return@post
-            }
-            renderer?.hold()
-            runCatching { session?.stopRepeating() }
-            runCatching { session?.close() }
-            session = null
-            val old = camera
-            camera = null
+        cameraHandler.post { switchNow() }
+    }
+
+    /** [switchCamera]'s body, on the camera thread. */
+    private fun switchNow() {
+        if (!running || !canSwitchCamera) return
+        if (!switchLatch.tap()) {
+            // The previous switch's camera hasn't opened yet: switching
+            // now would open a second one alongside it. The tap is applied
+            // once it is open.
+            return
+        }
+        if (closing != null) {
+            // A switch is still waiting for its camera to close: just
+            // change where it goes (the pending step reads both fields).
             frontCamera = !frontCamera
-            val chars = cameraManager.getCameraCharacteristics(cameraId)
-            this.chars = chars
-            rotation = rotationFor(chars)
-            var opened = false
-            val next = next@{
-                if (opened || !running) return@next
-                opened = true
-                closing = null
-                renderer?.resume(rotation)
-                // Cut promptly: the next segment starts on the new camera.
-                runCatching {
-                    videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
-                }
-                openCamera(cameraId)
+            val next = cameraManager.getCameraCharacteristics(cameraId)
+            chars = next
+            rotation = rotationFor(next)
+            return
+        }
+        renderer?.hold()
+        runCatching { session?.stopRepeating() }
+        runCatching { session?.close() }
+        session = null
+        val old = camera
+        camera = null
+        frontCamera = !frontCamera
+        val chars = cameraManager.getCameraCharacteristics(cameraId)
+        this.chars = chars
+        rotation = rotationFor(chars)
+        var opened = false
+        val next = next@{
+            if (opened || !running) return@next
+            opened = true
+            closing = null
+            renderer?.resume(rotation)
+            // Cut promptly: the next segment starts on the new camera.
+            runCatching {
+                videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
             }
-            if (old == null) {
-                next()
-            } else {
-                closing = old to next
-                old.close()
-                // onClosed should come within milliseconds; never leave the
-                // broadcast frozen on a camera that fails to report it.
-                cameraHandler.postDelayed({ next() }, CLOSE_TIMEOUT_MS)
-            }
+            openCamera(cameraId)
+        }
+        if (old == null) {
+            next()
+        } else {
+            closing = old to next
+            old.close()
+            // onClosed should come within milliseconds; never leave the
+            // broadcast frozen on a camera that fails to report it.
+            cameraHandler.postDelayed({ next() }, CLOSE_TIMEOUT_MS)
         }
     }
 
     /** The camera being closed by [switchCamera], and what runs once it is. */
     private var closing: Pair<CameraDevice, () -> Unit>? = null
 
+    /** Switch taps that arrive while a camera is still opening. */
+    private val switchLatch = SwitchLatch()
+
     @SuppressLint("MissingPermission")
     private fun openCamera(id: String) {
+        switchLatch.startOpen()
         cameraManager.openCamera(
             id,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    val switchAgain = switchLatch.opened()
+                    if (!running) {
+                        // Stopped while it was opening.
+                        device.close()
+                        return
+                    }
                     camera = device
+                    if (switchAgain) {
+                        // Switched again while this camera was opening:
+                        // close it straight away and open the other one.
+                        switchNow()
+                        if (camera == device) startSession(device)
+                        return
+                    }
                     startSession(device)
                 }
 
@@ -282,12 +313,14 @@ class CaptureEngine(
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
+                    switchLatch.failed()
                     device.close()
                     camera = null
                     fail("the camera was taken by another app")
                 }
 
                 override fun onError(device: CameraDevice, error: Int) {
+                    switchLatch.failed()
                     device.close()
                     camera = null
                     fail("camera error $error")
