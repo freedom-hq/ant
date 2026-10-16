@@ -104,7 +104,10 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   steps past its slot without reading it (the next broadcast continues
   the feed after it), and one who opens the channel after such a
   broadcast ended can't join through the head (it returns the whole
-  recording) and should use an HTTP gateway.
+  recording) and should use an HTTP gateway. The player tells them so,
+  and after one refused head read it joins through the ladder markers
+  only for five minutes instead of spending a budget window on the head
+  every retry; a new broadcast on the channel is found that way.
 
 ## Keeping the buffer full
 

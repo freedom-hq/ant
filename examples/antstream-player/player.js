@@ -568,6 +568,27 @@
   // which can skip straight to the newest.
   const CATCH_UP_AFTER_MS = 5000;
   const REJOIN_AFTER_MS = 30000;
+  // In Freedom, a head read the budget refuses is most likely the head
+  // itself being over it: an ended broadcast's recording, which the
+  // provider joins and charges in full before refusing (the player's own
+  // reads stay well under the budget). Re-reading it on every retry would
+  // spend a whole budget window each time, so for this long the join only
+  // asks the ladder markers, which a new broadcast on the channel writes
+  // from its start.
+  const HEAD_REFUSED_HOLD_MS = 5 * 60000;
+  // { key, at } of the channel whose head read was refused; kept across
+  // `play()` retries, which start the join over.
+  let headRefused = null;
+  const headRefusedError = () => ({
+    code: 429,
+    message: "the last broadcast's recording is over Freedom's read budget; open the channel through an HTTP gateway to play it",
+  });
+
+  const HEAD_REFUSED_OVERLAY = 'This channel’s last broadcast is too large to read here. Watching for a new one…';
+
+  function headHeld(ch) {
+    return !!headRefused && headRefused.key === ch.key && Date.now() - headRefused.at < HEAD_REFUSED_HOLD_MS;
+  }
 
   const feed = {
     gen: 0,
@@ -602,7 +623,7 @@
     feed.lastNewer = Date.now();
     feed.waiters = [];
     feed.delivered = null;
-    feed.lastError = null;
+    feed.lastError = ch && headHeld(ch) ? headRefusedError() : null;
   }
 
   /**
@@ -615,7 +636,7 @@
     if (feed.joinedVia === null) {
       if (feed.joinPending) return;
       const period = Math.floor(Date.now() / MARKER_PERIOD_MS);
-      readOne('head');
+      if (!headHeld(feed.ch)) readOne('head');
       readOne('marker', period);
       readOne('marker', period - 1);
       return;
@@ -710,7 +731,14 @@
     if (a.status !== 200) {
       if (kind === 'slot' && a.status === 404) note(row, 'not written yet');
       else if (kind === 'head' && a.status === 404) note(row, 'the feed has no updates yet');
-      if (a.status !== 404) feed.lastError = { code: typeof a.status === 'number' ? a.status : 0, message: a.note || String(a.status) };
+      if (kind === 'head' && a.status === 429 && inBzz) {
+        if (!headHeld(feed.ch)) {
+          log.marker(`head read refused by the read budget: joining through the ladder markers only for ${HEAD_REFUSED_HOLD_MS / 60000} min`);
+        }
+        headRefused = { key: feed.ch.key, at: Date.now() };
+        feed.lastError = headRefusedError();
+        note(row, 'over the read budget: not read again for a while');
+      } else if (a.status !== 404) feed.lastError = { code: typeof a.status === 'number' ? a.status : 0, message: a.note || String(a.status) };
       else if (kind === 'head') feed.lastError = { code: 404, message: 'the feed has no updates yet' };
       return;
     }
@@ -1259,8 +1287,15 @@
     els.input.value = ch.key;
     remember(ch.key);
     setBadge('', 'CONNECTING');
-    setOverlay('Finding the channel on Swarm…');
-    setStatus('Resolving the channel feed…');
+    if (headHeld(ch)) {
+      // A retry after the head was refused: say so rather than start over
+      // with "Finding the channel" each time.
+      setOverlay(HEAD_REFUSED_OVERLAY);
+      setStatus(`The last broadcast's recording is over Freedom's read budget. Open the channel through an HTTP gateway to play it; a new broadcast shows up here.`);
+    } else {
+      setOverlay('Finding the channel on Swarm…');
+      setStatus('Resolving the channel feed…');
+    }
 
     if (!Hls.isSupported()) {
       // The feed is read by the player itself, so a native HLS player
@@ -1367,7 +1402,8 @@
     // Network: the feed may not exist yet (broadcast not started, or not
     // propagated), or Swarm is slow. Keep trying; a live channel shows up.
     const waiting = !everPlayed;
-    setOverlay(waiting ? 'Waiting for the broadcast to start…' : 'Reconnecting…');
+    const tooLarge = waiting && channel && headHeld(channel);
+    setOverlay(tooLarge ? HEAD_REFUSED_OVERLAY : waiting ? 'Waiting for the broadcast to start…' : 'Reconnecting…');
     const why = feed.lastError ? `: ${feed.lastError.message}` : '';
     setStatus(`${data.details}${data.response && data.response.code ? ` (${data.response.code})` : ''}${why}, retrying`);
     clearTimeout(retryTimer);
@@ -1590,6 +1626,11 @@
     read: { head: readHead, slot: readSlot },
     get channel() {
       return channel;
+    },
+    // The channel's head read was refused as over the read budget: the join
+    // asks only the markers for now.
+    get headHeld() {
+      return !!channel && headHeld(channel);
     },
     get hls() {
       return hls;
