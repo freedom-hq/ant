@@ -261,7 +261,14 @@ struct LiveView: View {
     /// angle as its connection actually has it, and the capture angle
     /// beside it. Only a reading for this session *and* this camera
     /// counts, so a flip can't pair one camera's preview with another's
-    /// capture. The decision itself is ``PreviewGeometry/frameTall``.
+    /// capture. Before Go live the broadcast's shape is still
+    /// ``CaptureEngine``'s own reading, from its own coordinator on its
+    /// own queue, so it isn't mixed in at all: the frame is the shape the
+    /// preview's connection shows the picture in. Once pinned (live, or a
+    /// resume's shape), the capture angle is this coordinator's
+    /// horizon-level one, the angle the engine applies too (the video
+    /// data output supports all four), not read back from the engine's
+    /// connection. The decision itself is ``PreviewGeometry/frameTall``.
     private var previewFrameTall: Bool {
         guard let session = broadcast.engine?.previewSession,
               let camera = broadcast.previewCamera,
@@ -271,9 +278,9 @@ struct LiveView: View {
         else { return broadcast.portrait }
         return PreviewGeometry.frameTall(
             broadcastPortrait: broadcast.portrait,
+            pinned: broadcast.state.isActive || broadcast.resumePortrait != nil,
             previewAngle: reading.rotation.previewAngle,
-            captureAngle: reading.rotation.captureAngle,
-            facing: reading.rotation.facing
+            captureAngle: reading.rotation.captureAngle
         )
     }
 
@@ -861,7 +868,6 @@ struct CameraPreview: UIViewRepresentable {
     struct Rotation: Equatable {
         /// `AVCaptureDevice.uniqueID` of the camera it was read for.
         let camera: String
-        let facing: PreviewGeometry.Facing
         let previewAngle: CGFloat
         let captureAngle: CGFloat
     }
@@ -893,10 +899,19 @@ struct CameraPreview: UIViewRepresentable {
         /// The camera last asked for, and the camera and preview
         /// connection the coordinator above was set up for. A flip swaps
         /// the session's input, which replaces the preview's connection:
-        /// a new camera *or* a new connection sets up afresh (#214).
+        /// a new camera *or* a new connection sets up afresh (#214). The
+        /// connection is held weakly, not by address: a replaced one that
+        /// is freed reads as `nil`, so a new connection allocated at the
+        /// old one's address can't pass for it.
         private var camera: AVCaptureDevice?
         private var followedCamera: String?
-        private var followedConnection: ObjectIdentifier?
+        private weak var followedConnection: AVCaptureConnection?
+        /// A retry is scheduled for a camera announced before the preview
+        /// has its connection, and how many have run since there last was
+        /// one (bounded: ``connectionRetryLimit``).
+        private var connectionRetryPending = false
+        private var connectionRetries = 0
+        private static let connectionRetryLimit = 20
         var onRotation: (Rotation) -> Void = { _ in }
 
         /// The next ``follow(_:)`` sets up even for the camera it already
@@ -914,18 +929,21 @@ struct CameraPreview: UIViewRepresentable {
         /// a new connection, and with them a new coordinator.
         func follow(_ camera: AVCaptureDevice?) {
             self.camera = camera
-            guard let camera,
-                  // No connection yet (the input isn't in the session):
-                  // nothing to turn. The next update or layout pass sets
-                  // up once there is one.
-                  let connection = previewLayer.connection
-            else { return }
-            let connectionID = ObjectIdentifier(connection)
-            guard camera.uniqueID != followedCamera || connectionID != followedConnection
+            guard let camera else { return }
+            guard let connection = previewLayer.connection else {
+                // No connection yet (the input isn't in the session):
+                // nothing to turn. Look again shortly rather than wait for
+                // an unrelated SwiftUI update or layout pass that may
+                // never come.
+                retryForConnection()
+                return
+            }
+            connectionRetries = 0
+            guard camera.uniqueID != followedCamera || connection !== followedConnection
             else { return }
             forgetCamera()
             followedCamera = camera.uniqueID
-            followedConnection = connectionID
+            followedConnection = connection
             let coordinator = AVCaptureDevice.RotationCoordinator(
                 device: camera,
                 previewLayer: previewLayer
@@ -945,6 +963,23 @@ struct CameraPreview: UIViewRepresentable {
                     Task { @MainActor in self?.applyRotation() }
                 },
             ]
+        }
+
+        /// Run ``follow(_:)`` again in 0.1 s, at most
+        /// ``connectionRetryLimit`` times in a row (2 s) without a
+        /// connection, one retry pending at a time.
+        private func retryForConnection() {
+            guard !connectionRetryPending,
+                  connectionRetries < Self.connectionRetryLimit
+            else { return }
+            connectionRetryPending = true
+            connectionRetries += 1
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let self else { return }
+                self.connectionRetryPending = false
+                self.follow(self.camera)
+            }
         }
 
         override func didMoveToWindow() {
@@ -981,7 +1016,6 @@ struct CameraPreview: UIViewRepresentable {
             // the capture side), not the request.
             let rotation = Rotation(
                 camera: camera.uniqueID,
-                facing: camera.position == .front ? .front : .back,
                 previewAngle: connection.videoRotationAngle,
                 captureAngle: coordinator.videoRotationAngleForHorizonLevelCapture
             )

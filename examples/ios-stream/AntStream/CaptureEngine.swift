@@ -474,7 +474,26 @@ final class CaptureEngine: NSObject {
     private func configureSession() throws {
         guard !sessionConfigured else { return }
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
+        let camera: AVCaptureDevice
+        do {
+            camera = try addCameraAndOutput()
+        } catch {
+            session.commitConfiguration()
+            throw error
+        }
+        // Committed before the camera is announced: the preview's
+        // connection only exists once the input is in the running
+        // configuration, and the preview sets up its rotation from that
+        // connection when it hears of the camera (#214).
+        session.commitConfiguration()
+        sessionConfigured = true
+        observeRotation(of: camera)
+        announceCamera()
+    }
+
+    /// The camera input and video output of ``configureSession()``,
+    /// inside its configuration block. Returns the camera.
+    private func addCameraAndOutput() throws -> AVCaptureDevice {
         session.sessionPreset = .high
 
         guard let camera = Self.captureDevice(front: false) ?? Self.captureDevice(front: true)
@@ -500,9 +519,7 @@ final class CaptureEngine: NSObject {
         }
         session.addOutput(vOut)
         videoOutput = vOut
-        sessionConfigured = true
-        observeRotation(of: camera)
-        announceCamera()
+        return camera
     }
 
     /// Add the microphone for a recording. Into the running session, so
