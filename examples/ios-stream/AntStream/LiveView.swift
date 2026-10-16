@@ -907,16 +907,22 @@ struct CameraPreview: UIViewRepresentable {
         private var followedCamera: String?
         private weak var followedConnection: AVCaptureConnection?
         /// A retry is scheduled for a camera announced before the preview
-        /// has its connection, and how many have run since there last was
-        /// one (bounded: ``connectionRetryLimit``).
+        /// has its connection, and how many have run for this camera and
+        /// session since there last was one (bounded:
+        /// ``connectionRetryLimit``). A new camera (`retriesCamera`) or a
+        /// new session (``forgetCamera()``) starts the count again, so one
+        /// that used the budget up doesn't leave every later one without.
         private var connectionRetryPending = false
         private var connectionRetries = 0
+        private var retriesCamera: String?
         private static let connectionRetryLimit = 20
         var onRotation: (Rotation) -> Void = { _ in }
 
         /// The next ``follow(_:)`` sets up even for the camera it already
         /// follows: the session, and so the connection, changed.
         func forgetCamera() {
+            connectionRetries = 0
+            retriesCamera = nil
             followedCamera = nil
             followedConnection = nil
             rotationObservations.forEach { $0.invalidate() }
@@ -930,6 +936,10 @@ struct CameraPreview: UIViewRepresentable {
         func follow(_ camera: AVCaptureDevice?) {
             self.camera = camera
             guard let camera else { return }
+            if camera.uniqueID != retriesCamera {
+                retriesCamera = camera.uniqueID
+                connectionRetries = 0
+            }
             guard let connection = previewLayer.connection else {
                 // No connection yet (the input isn't in the session):
                 // nothing to turn. Look again shortly rather than wait for
@@ -950,9 +960,12 @@ struct CameraPreview: UIViewRepresentable {
             )
             rotationCoordinator = coordinator
             applyRotation()
-            // Both angles, so the frame follows the device turning under
-            // Portrait Orientation Lock too, where the preview angle stays
-            // put and only the capture angle moves. `applyRotation` reads
+            // Both angles: under Portrait Orientation Lock the preview
+            // angle stays put and only the capture angle moves. That
+            // turns the frame only once its shape is pinned (live, or a
+            // resume); before Go live `PreviewGeometry.frameTall` uses the
+            // preview angle alone, so a capture-only change re-reports a
+            // reading that leaves the frame as it is. `applyRotation` reads
             // the *current* coordinator, so a late change from one a flip
             // already replaced only re-reports the new camera.
             rotationObservations = [
@@ -967,7 +980,8 @@ struct CameraPreview: UIViewRepresentable {
 
         /// Run ``follow(_:)`` again in 0.1 s, at most
         /// ``connectionRetryLimit`` times in a row (2 s) without a
-        /// connection, one retry pending at a time.
+        /// connection for one camera and session, one retry pending at a
+        /// time.
         private func retryForConnection() {
             guard !connectionRetryPending,
                   connectionRetries < Self.connectionRetryLimit
