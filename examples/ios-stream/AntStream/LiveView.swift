@@ -276,6 +276,10 @@ struct LiveView: View {
             }
             .foregroundStyle(.white.opacity(0.55))
             .padding(32)
+            // In landscape the card and the button cover the middle of
+            // the frame: the words go under the top bar instead.
+            .padding(.top, landscape ? 40 : 0)
+            .frame(maxHeight: .infinity, alignment: landscape ? .top : .center)
         }
     }
 
