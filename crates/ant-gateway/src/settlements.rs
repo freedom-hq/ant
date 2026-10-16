@@ -243,8 +243,15 @@ fn add_dec(a: &str, b: &str) -> String {
     }
 }
 
+/// A non-empty string of ASCII digits: what [`add_dec`] can add.
+fn is_dec(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Bee's `settlementsResponse` for a row source: `sent`/`received`
-/// accessors return `None` when the peer has no record of that kind.
+/// accessors return `None` when the peer has no record of that kind. A
+/// figure that isn't a decimal number (a damaged stored ledger entry,
+/// bee#5656) counts as no record rather than reaching [`add_dec`].
 fn settlements_body<S, R>(rows: &[PeerAccountingView], sent: S, received: R) -> Value
 where
     S: Fn(&PeerAccountingView) -> Option<&str>,
@@ -254,8 +261,8 @@ where
     let mut total_received = "0".to_string();
     let mut settlements = Vec::new();
     for row in rows {
-        let s = sent(row);
-        let r = received(row);
+        let s = sent(row).filter(|v| is_dec(v));
+        let r = received(row).filter(|v| is_dec(v));
         if s.is_none() && r.is_none() {
             continue;
         }
@@ -294,7 +301,8 @@ pub async fn settlements(State(handle): State<GatewayHandle>) -> Response {
 
 /// `GET /settlements/{peer}` — 404 `no settlements for peer` when the
 /// peer has neither a sent nor a received SWAP record (bee's
-/// `settlement.ErrPeerNoSettlements` on both lookups).
+/// `settlement.ErrPeerNoSettlements` on both lookups). A figure that
+/// isn't a decimal number counts as no record, as in `/settlements`.
 pub async fn peer_settlements(
     State(handle): State<GatewayHandle>,
     Path(peer): Path<String>,
@@ -307,22 +315,27 @@ pub async fn peer_settlements(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let row = snapshot.peers.iter().find(|row| row.peer == peer);
-    let (sent, received) = match row {
-        Some(row) => (row.swap_sent.as_deref(), row.swap_received.as_deref()),
-        None => (None, None),
-    };
-    if sent.is_none() && received.is_none() {
-        return json_error(StatusCode::NOT_FOUND, ERR_NO_SETTLEMENTS);
+    match peer_settlement_body(&snapshot.peers, &peer) {
+        Some(body) => json_response(StatusCode::OK, &body),
+        None => json_error(StatusCode::NOT_FOUND, ERR_NO_SETTLEMENTS),
     }
-    json_response(
-        StatusCode::OK,
-        &json!({
-            "peer": peer,
-            "received": received.unwrap_or("0"),
-            "sent": sent.unwrap_or("0"),
-        }),
-    )
+}
+
+/// `GET /settlements/{peer}`'s body, `None` for its 404. Same filter as
+/// [`settlements_body`]: a figure that isn't a decimal number is no
+/// record, so both endpoints agree on which peers have settlements.
+fn peer_settlement_body(rows: &[PeerAccountingView], peer: &str) -> Option<Value> {
+    let row = rows.iter().find(|row| row.peer == peer)?;
+    let sent = row.swap_sent.as_deref().filter(|v| is_dec(v));
+    let received = row.swap_received.as_deref().filter(|v| is_dec(v));
+    if sent.is_none() && received.is_none() {
+        return None;
+    }
+    Some(json!({
+        "peer": peer,
+        "received": received.unwrap_or("0"),
+        "sent": sent.unwrap_or("0"),
+    }))
 }
 
 /// `GET /timesettlements` — pseudosettle settlements, same shape as
@@ -417,7 +430,8 @@ pub async fn chequebook_cheque_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::{add_dec, render_balance};
+    use super::{add_dec, peer_settlement_body, render_balance, settlements_body};
+    use ant_control::PeerAccountingView;
 
     #[test]
     fn decimal_addition_handles_carries_and_zero() {
@@ -430,6 +444,56 @@ mod tests {
             add_dec("18446744073709551616", "18446744073709551616"),
             "36893488147419103232"
         );
+    }
+
+    /// A stored figure that isn't a decimal number is no record: it
+    /// neither panics nor garbles the totals (bee#5656).
+    #[test]
+    fn settlements_skip_figures_that_are_not_decimal_numbers() {
+        let row = |peer: &str, sent: Option<&str>, received: Option<&str>| PeerAccountingView {
+            peer: peer.to_string(),
+            swap_sent: sent.map(str::to_string),
+            swap_received: received.map(str::to_string),
+            ..Default::default()
+        };
+        let rows = [
+            row("aa", Some("10"), None),
+            row("bb", Some("x9"), None),
+            row("cc", None, Some("")),
+        ];
+        let body = settlements_body(
+            &rows,
+            |r| r.swap_sent.as_deref(),
+            |r| r.swap_received.as_deref(),
+        );
+        assert_eq!(body["totalSent"], "10");
+        assert_eq!(body["totalReceived"], "0");
+        let settlements = body["settlements"].as_array().unwrap();
+        assert_eq!(settlements.len(), 1, "{body}");
+        assert_eq!(settlements[0]["peer"], "aa");
+    }
+
+    /// `/settlements/<peer>` agrees with `/settlements`: a peer whose only
+    /// figures aren't decimal numbers has no settlements (404).
+    #[test]
+    fn peer_settlement_skips_figures_that_are_not_decimal_numbers() {
+        let row = |peer: &str, sent: Option<&str>, received: Option<&str>| PeerAccountingView {
+            peer: peer.to_string(),
+            swap_sent: sent.map(str::to_string),
+            swap_received: received.map(str::to_string),
+            ..Default::default()
+        };
+        let rows = [
+            row("aa", Some("10"), Some("abc")),
+            row("bb", None, Some("abc")),
+            row("cc", Some(""), Some("x9")),
+        ];
+        let aa = peer_settlement_body(&rows, "aa").unwrap();
+        assert_eq!(aa["sent"], "10");
+        assert_eq!(aa["received"], "0");
+        assert!(peer_settlement_body(&rows, "bb").is_none());
+        assert!(peer_settlement_body(&rows, "cc").is_none());
+        assert!(peer_settlement_body(&rows, "dd").is_none());
     }
 
     #[test]
