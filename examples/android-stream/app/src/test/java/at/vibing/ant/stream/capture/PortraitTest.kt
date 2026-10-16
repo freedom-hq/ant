@@ -65,13 +65,19 @@ class PortraitTest {
      * way GL does (texture coordinates interpolated across the quad,
      * sampled at each output pixel's centre) and return the output rows.
      */
-    private fun render(frame: List<String>, rotation: Int): List<String> {
+    private fun render(
+        frame: List<String>,
+        rotation: Int,
+        crop: FloatArray = UprightRenderer.FULL,
+        pictureW: Int = frame[0].length,
+        pictureH: Int = frame.size,
+    ): List<String> {
         val w = frame[0].length
         val h = frame.size
         val quarter = rotation % 180 != 0
-        val outW = if (quarter) h else w
-        val outH = if (quarter) w else h
-        val c = UprightRenderer.texCoords(rotation)
+        val outW = if (quarter) pictureH else pictureW
+        val outH = if (quarter) pictureW else pictureH
+        val c = UprightRenderer.texCoords(rotation, crop)
         // Corners: 0 bottom-left, 1 bottom-right, 2 top-left, 3 top-right.
         val tl = c[4] to c[5]
         val tr = c[6] to c[7]
@@ -112,5 +118,68 @@ class PortraitTest {
     fun halfTurnIsUpsideDown() {
         assertEquals(listOf("hgfe", "dcba"), render(frame, 180))
         assertEquals(render(frame, 90), render(frame, -270))
+    }
+
+    // -- the SurfaceTexture's crop ([UprightRenderer.cropOf]) ---------------
+
+    /** 4×4 column-major product a·b, as android.opengl.Matrix.multiplyMM. */
+    private fun mul(a: FloatArray, b: FloatArray): FloatArray = FloatArray(16).also { r ->
+        for (c in 0 until 4) for (row in 0 until 4) {
+            r[c * 4 + row] = (0 until 4).sumOf { k -> (a[k * 4 + row] * b[c * 4 + k]).toDouble() }.toFloat()
+        }
+    }
+
+    // The matrices GLConsumer::computeTransformMatrix composes.
+    private val rot90 = floatArrayOf(0f, 1f, 0f, 0f, -1f, 0f, 0f, 0f, 0f, 0f, 1f, 0f, 1f, 0f, 0f, 1f)
+    private val flipH = floatArrayOf(-1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 1f, 0f, 0f, 1f)
+    private val flipV = floatArrayOf(1f, 0f, 0f, 0f, 0f, -1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f)
+    private val identity = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
+
+    /**
+     * The transform matrix for a [bufW]×[bufH] buffer whose picture is the
+     * crop rect left..right × top..bottom (rows counted from the buffer's
+     * first), built the way GLConsumer does: transform, then the crop with
+     * its [shrink]-texel inset (in GL's bottom-up rows), then a vertical flip.
+     */
+    private fun stMatrix(
+        bufW: Int, bufH: Int, left: Int, top: Int, right: Int, bottom: Int,
+        shrink: Float, xform: FloatArray,
+    ): FloatArray {
+        var tx = 0f; var ty = 0f; var sx = 1f; var sy = 1f
+        if (right - left < bufW) {
+            tx = (left + shrink) / bufW
+            sx = (right - left - 2 * shrink) / bufW
+        }
+        if (bottom - top < bufH) {
+            ty = (bufH - bottom + shrink) / bufH
+            sy = (bottom - top - 2 * shrink) / bufH
+        }
+        val crop = floatArrayOf(sx, 0f, 0f, 0f, 0f, sy, 0f, 0f, 0f, 0f, 1f, 0f, tx, ty, 0f, 1f)
+        return mul(flipV, mul(crop, xform))
+    }
+
+    @Test
+    fun cropIsReadFromTheMatrixWhateverItsTurnAndMirror() {
+        // A 640×368 buffer holding a 640×360 picture: 8 aligned padding rows.
+        val want = floatArrayOf(0f, 1f / 368, 1f, 359f / 368)
+        for (xform in listOf(identity, rot90, mul(flipH, rot90), flipH)) {
+            assertArrayEquals(want, UprightRenderer.cropOf(stMatrix(640, 368, 0, 0, 640, 360, 1f, xform)), 1e-6f)
+        }
+        // No crop: the whole buffer, even through a turn and a mirror.
+        assertArrayEquals(UprightRenderer.FULL, UprightRenderer.cropOf(mul(flipV, mul(flipH, rot90))), 1e-6f)
+        // Before the first frame the matrix is all zero.
+        assertArrayEquals(UprightRenderer.FULL, UprightRenderer.cropOf(FloatArray(16)), 0f)
+    }
+
+    @Test
+    fun paddingRowsAreNeverSampled() {
+        // The buffer has a row of padding ("#") under the 4×2 picture.
+        val padded = frame + "####"
+        val crop = UprightRenderer.cropOf(stMatrix(4, 3, 0, 0, 4, 2, 0f, mul(flipH, rot90)))
+        assertEquals(frame, render(padded, 0, crop, 4, 2))
+        assertEquals(listOf("ea", "fb", "gc", "hd"), render(padded, 90, crop, 4, 2))
+        assertEquals(listOf("dh", "cg", "bf", "ae"), render(padded, 270, crop, 4, 2))
+        // Without the crop the padding shows up at the picture's edge.
+        assertEquals(true, render(padded, 90, UprightRenderer.FULL, 4, 2).joinToString("").contains('#'))
     }
 }

@@ -123,9 +123,23 @@ class CaptureEngine(
     private val cameraId: String
         get() = cameraIdFor(frontCamera) ?: cameraIdFor(!frontCamera) ?: cameraManager.cameraIdList.first()
 
-    /** Whether this device has both a front and a back camera to switch between. */
+    /**
+     * Whether this device has both a front and a back camera to switch
+     * between live. The encoder keeps its frame shape across a switch, so
+     * the two cameras must need the same kind of turn for this orientation
+     * (both a quarter turn, or neither): on a device whose sensors are
+     * mounted a quarter apart, the other camera's upright frames would be
+     * the other shape and come out stretched, so there is no live switch.
+     */
     val canSwitchCamera: Boolean
-        get() = cameraIdFor(true) != null && cameraIdFor(false) != null
+        get() {
+            val back = cameraIdFor(false) ?: return false
+            val front = cameraIdFor(true) ?: return false
+            return quarterTurn(cameraManager.getCameraCharacteristics(back)) ==
+                quarterTurn(cameraManager.getCameraCharacteristics(front))
+        }
+
+    private fun quarterTurn(chars: CameraCharacteristics): Boolean = rotationFor(chars) % 180 != 0
 
     /**
      * Clockwise rotation that makes this camera's frames upright for the
@@ -147,10 +161,11 @@ class CaptureEngine(
     /** Pick the frame size before the preview surface is laid out. */
     fun prepare(): Size {
         // Fixed for the broadcast: a camera switch keeps the encoder. Both
-        // cameras of a phone need the same quarter turns for an
+        // cameras of a phone usually need the same quarter turns for an
         // orientation (90° back / 270° front for portrait), so the
-        // switched-to camera's upright frames have the same shape.
-        val quarter = rotationFor(cameraManager.getCameraCharacteristics(cameraId)) % 180 != 0
+        // switched-to camera's upright frames have the same shape; where
+        // they don't, [canSwitchCamera] is false.
+        val quarter = quarterTurn(cameraManager.getCameraCharacteristics(cameraId))
         videoSize = chooseSize(quarter)
         encodedSize = if (quarter) Size(videoSize.height, videoSize.width) else videoSize
         return videoSize
@@ -194,27 +209,61 @@ class CaptureEngine(
      * ways) is turned differently by [UprightRenderer]; the encoded frames
      * keep their size and orientation, so the stream needs no new
      * initialization segment.
+     *
+     * The renderer holds (drops) frames from the moment the switch starts
+     * until the old camera has reported itself closed, and only then takes
+     * the new camera's turn: a frame of the old camera still queued on the
+     * GL thread is never drawn with the new camera's angle (half a turn off
+     * for 90° back / 270° front in portrait).
      */
     fun switchCamera() {
         cameraHandler.post {
             if (!running || !canSwitchCamera) return@post
+            if (closing != null) {
+                // A switch is still waiting for its camera to close: just
+                // change where it goes (the pending step reads both fields).
+                frontCamera = !frontCamera
+                val next = cameraManager.getCameraCharacteristics(cameraId)
+                chars = next
+                rotation = rotationFor(next)
+                return@post
+            }
+            renderer?.hold()
             runCatching { session?.stopRepeating() }
             runCatching { session?.close() }
             session = null
-            camera?.close()
+            val old = camera
             camera = null
             frontCamera = !frontCamera
             val chars = cameraManager.getCameraCharacteristics(cameraId)
             this.chars = chars
             rotation = rotationFor(chars)
-            renderer?.rotation = rotation
-            // Cut promptly: the next segment starts on the new camera.
-            runCatching {
-                videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+            var opened = false
+            val next = next@{
+                if (opened || !running) return@next
+                opened = true
+                closing = null
+                renderer?.resume(rotation)
+                // Cut promptly: the next segment starts on the new camera.
+                runCatching {
+                    videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+                }
+                openCamera(cameraId)
             }
-            openCamera(cameraId)
+            if (old == null) {
+                next()
+            } else {
+                closing = old to next
+                old.close()
+                // onClosed should come within milliseconds; never leave the
+                // broadcast frozen on a camera that fails to report it.
+                cameraHandler.postDelayed({ next() }, CLOSE_TIMEOUT_MS)
+            }
         }
     }
+
+    /** The camera being closed by [switchCamera], and what runs once it is. */
+    private var closing: Pair<CameraDevice, () -> Unit>? = null
 
     @SuppressLint("MissingPermission")
     private fun openCamera(id: String) {
@@ -224,6 +273,12 @@ class CaptureEngine(
                 override fun onOpened(device: CameraDevice) {
                     camera = device
                     startSession(device)
+                }
+
+                override fun onClosed(device: CameraDevice) {
+                    // By now the old camera has let go of the renderer's
+                    // surface: no further frame of it can arrive.
+                    closing?.let { (d, next) -> if (d == device) next() }
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
@@ -568,5 +623,6 @@ class CaptureEngine(
     companion object {
         private const val TAG = "CaptureEngine"
         private const val AUDIO_RATE = 48_000
+        private const val CLOSE_TIMEOUT_MS = 1_000L
     }
 }

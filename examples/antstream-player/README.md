@@ -97,7 +97,8 @@ contain`. `test/portrait-test.mjs` checks it in Freedom's Electron at a
 desktop and a phone-sized window, for a portrait stream (480×640, what the
 apps publish), an older portrait broadcast stored sideways with a rotate-90
 track matrix, and a landscape one: the element box must have the display
-aspect and a disc drawn in every frame must come out round.
+aspect and a disc drawn in every frame must come out round. Each run then
+opens a channel that never loads, and the stage must go back to 16:9.
 
 ```sh
 ELECTRON=<path to electron> node test/portrait-test.mjs   # needs ffmpeg, xvfb-run

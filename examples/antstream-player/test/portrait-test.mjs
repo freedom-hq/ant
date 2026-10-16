@@ -25,6 +25,10 @@
 //            dimensions; the stage must follow them.
 //  landscape 640×360: the stage stays landscape.
 //
+// After the measurement, every run opens a second channel that never loads
+// (SWITCH_TO): the stage must go back to 16:9 rather than keep the first
+// channel's shape.
+//
 // Each case runs at a desktop window (1280×900) and a phone-sized one
 // (390×844). Screenshots go to $OUT_DIR (default: a temp dir).
 
@@ -142,6 +146,7 @@ for (const c of CASES) {
       OUT: shot,
       WIDTH: String(vp.width),
       HEIGHT: String(vp.height),
+      SWITCH_TO: 'd'.repeat(64),
     });
     gw.kill();
     const label = `${c.name}/${vp.name}`;
@@ -171,6 +176,11 @@ for (const c of CASES) {
     check((box < 1) === (c.display < 1), `element box is ${box < 1 ? 'portrait' : 'landscape'}`);
     check(g.video.height <= g.viewport.height * 0.8 + 2, `element ${g.video.height}px tall, over 80vh of ${g.viewport.height}`);
     check(g.wrap.width <= g.viewport.width + 1, `stage ${g.wrap.width}px wider than the ${g.viewport.width}px viewport`);
+    const after = state.afterSwitch;
+    if (check(after, 'no state after switching channel')) {
+      check(Math.abs(after.width / after.height - 16 / 9) < 0.03,
+        `stage ${after.width.toFixed(0)}×${after.height.toFixed(0)} after opening a channel that never loads, not back to 16:9`);
+    }
     if (check(disc, 'disc not found in the picture')) {
       check(Math.abs(disc.width / disc.height - 1) < 0.08, `disc ${disc.width}×${disc.height}: picture is stretched`);
       check(Math.abs(disc.cx - 0.5) < 0.05 && Math.abs(disc.cy - 0.5) < 0.05, `disc off-centre (${disc.cx.toFixed(2)}, ${disc.cy.toFixed(2)})`);

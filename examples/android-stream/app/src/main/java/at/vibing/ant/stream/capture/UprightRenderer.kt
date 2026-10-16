@@ -35,10 +35,14 @@ import java.util.concurrent.TimeUnit
  *
  * The texture is sampled through [texCoords], which addresses the
  * buffer's memory directly (row 0 at t = 0), not through the
- * SurfaceTexture's transform matrix: that matrix carries the framework's
- * own preview rotation and selfie mirroring, which the encoder path has
- * never had and must not get — [rotation] is the complete turn, worked
- * out from the sensor orientation as before.
+ * SurfaceTexture's transform matrix as a whole: that matrix carries the
+ * framework's own preview rotation and selfie mirroring, which the encoder
+ * path has never had and must not get — [rotation] is the complete turn,
+ * worked out from the sensor orientation as before. Only the matrix's crop
+ * is kept ([cropOf]): a HAL may allocate a taller, aligned buffer (368
+ * rows for 360) and mark the picture with a crop rect, and the matrix also
+ * insets the crop by half a texel so linear filtering never reads the
+ * padding.
  */
 internal class UprightRenderer(
     encoderSurface: Surface,
@@ -48,8 +52,12 @@ internal class UprightRenderer(
     private val outHeight: Int,
     rotation: Int,
 ) {
-    /** Clockwise turn applied to each camera frame; changes on a camera switch. */
+    /** Clockwise turn applied to each camera frame; changes on a camera switch ([resume]). */
     @Volatile var rotation: Int = rotation
+        private set
+
+    /** Frames are dropped while set: a camera switch is in progress ([hold]). */
+    @Volatile private var held = false
 
     private val thread = HandlerThread("antstream.gl").apply { start() }
     private val handler = Handler(thread.looper)
@@ -65,6 +73,9 @@ internal class UprightRenderer(
     private val positions = floatBuffer(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
     private var drawnRotation = Int.MIN_VALUE
     private val coords = floatBuffer(FloatArray(8))
+    private val matrix = FloatArray(16)
+    private var drawnCrop = FloatArray(0)
+    private var latchedTs = Long.MIN_VALUE
     private var released = false
 
     /** Where the camera renders. Valid until [release]. */
@@ -136,12 +147,24 @@ internal class UprightRenderer(
     private fun draw() {
         if (released) return
         try {
+            // Latch even while held, so the old camera's buffers are
+            // consumed (and dropped) rather than drawn later.
             surfaceTexture.updateTexImage()
+            val ts = surfaceTexture.timestamp
+            // Nothing new latched (a callback whose buffer an earlier draw
+            // already took, or the old camera's last frame still in the
+            // texture after a switch): don't draw it again.
+            val fresh = ts != latchedTs || ts == 0L
+            latchedTs = ts
+            if (held || !fresh) return
+            surfaceTexture.getTransformMatrix(matrix)
+            val crop = cropOf(matrix)
             val r = rotation
-            if (r != drawnRotation) {
+            if (r != drawnRotation || !crop.contentEquals(drawnCrop)) {
                 coords.clear()
-                coords.put(texCoords(r)).position(0)
+                coords.put(texCoords(r, crop)).position(0)
                 drawnRotation = r
+                drawnCrop = crop
             }
             GLES20.glViewport(0, 0, outWidth, outHeight)
             GLES20.glUseProgram(program)
@@ -159,6 +182,27 @@ internal class UprightRenderer(
         } catch (e: RuntimeException) {
             // A frame racing teardown; the next one (if any) tries again.
             Log.w(TAG, "frame dropped: ${e.message}")
+        }
+    }
+
+    /**
+     * Drop every frame from now on, until [resume]. Takes effect at once,
+     * also for frames already queued on the GL thread.
+     */
+    fun hold() {
+        held = true
+    }
+
+    /**
+     * Draw again, turning frames by [rotation] from now on. Call once the
+     * camera that was rendering has closed (so nothing it rendered can be
+     * latched any more); runs on the GL thread after every frame callback
+     * already queued there, which are still dropped.
+     */
+    fun resume(rotation: Int) {
+        handler.post {
+            this.rotation = rotation
+            held = false
         }
     }
 
@@ -248,8 +292,12 @@ internal class UprightRenderer(
          * source pixel the turn carries there: for 90° that is the
          * source's bottom-left, for 180° its bottom-right, for 270° its
          * top-right.
+         *
+         * [crop] is the part of the buffer that holds the picture, as
+         * (s0, t0, s1, t1) in the same coordinates ([cropOf]); the turned
+         * coordinates are mapped into it.
          */
-        fun texCoords(rotation: Int): FloatArray {
+        fun texCoords(rotation: Int, crop: FloatArray = FULL): FloatArray {
             // Output corners in frame coordinates (x right, y down).
             val corners = arrayOf(0f to 1f, 1f to 1f, 0f to 0f, 1f to 0f)
             val r = (rotation % 360 + 360) % 360
@@ -261,11 +309,43 @@ internal class UprightRenderer(
                     270 -> 1f - y to x
                     else -> x to y
                 }
-                out[2 * i] = s
-                out[2 * i + 1] = t
+                out[2 * i] = crop[0] + s * (crop[2] - crop[0])
+                out[2 * i + 1] = crop[1] + t * (crop[3] - crop[1])
             }
             return out
         }
+
+        /** The whole buffer, (s0, t0, s1, t1). */
+        val FULL = floatArrayOf(0f, 0f, 1f, 1f)
+
+        /**
+         * The picture's rectangle in the buffer, (s0, t0, s1, t1) with t = 0
+         * at the buffer's first row, taken from a SurfaceTexture transform
+         * matrix (column-major, as [SurfaceTexture.getTransformMatrix]
+         * fills it). The matrix is a crop (with its half-texel inset)
+         * composed with rotations and flips; those only permute the unit
+         * square's corners, so the corners' bounding box is the crop alone.
+         */
+        fun cropOf(m: FloatArray): FloatArray {
+            var s0 = Float.MAX_VALUE
+            var t0 = Float.MAX_VALUE
+            var s1 = -Float.MAX_VALUE
+            var t1 = -Float.MAX_VALUE
+            for ((x, y) in arrayOf(0f to 0f, 1f to 0f, 0f to 1f, 1f to 1f)) {
+                val s = m[0] * x + m[4] * y + m[12]
+                val t = m[1] * x + m[5] * y + m[13]
+                s0 = minOf(s0, s); s1 = maxOf(s1, s)
+                t0 = minOf(t0, t); t1 = maxOf(t1, t)
+            }
+            // A matrix that isn't one (all zero before the first frame)
+            // or strays outside the buffer: sample the whole buffer.
+            if (!(s1 - s0 > 0f && t1 - t0 > 0f) || s0 < -EPS || t0 < -EPS || s1 > 1f + EPS || t1 > 1f + EPS) {
+                return FULL
+            }
+            return floatArrayOf(s0, t0, s1, t1)
+        }
+
+        private const val EPS = 1e-4f
 
         private fun floatBuffer(values: FloatArray): FloatBuffer =
             ByteBuffer.allocateDirect(values.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {

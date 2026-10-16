@@ -152,6 +152,17 @@ app.whenReady().then(async () => {
     };
   })()`);
   if (process.env.MEASURE) state.geometry = await measure(win);
+  if (process.env.SWITCH_TO) {
+    // Open another channel (one that never loads) and report the stage's
+    // shape a moment later: it must not keep the last channel's aspect.
+    await win.webContents.executeJavaScript(`location.hash = ${JSON.stringify(process.env.SWITCH_TO)}`);
+    await new Promise((r) => setTimeout(r, 3000));
+    state.afterSwitch = await win.webContents.executeJavaScript(`(() => {
+      const w = document.querySelector('.video-wrap');
+      const r = w.getBoundingClientRect();
+      return { width: r.width, height: r.height, aspect: w.style.getPropertyValue('--aspect'), size: document.getElementById('video').videoWidth + 'x' + document.getElementById('video').videoHeight };
+    })()`);
+  }
   if (process.env.DUMP_LOG) {
     const entries = await win.webContents.executeJavaScript(`JSON.stringify(window.antstreamPlayer.log.entries)`);
     require('fs').writeFileSync(process.env.DUMP_LOG, entries);

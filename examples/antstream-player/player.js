@@ -760,6 +760,10 @@
     channel = ch;
     ended = false;
     joinedLive = null;
+    // Back to the default 16:9 stage until this channel's own first frame
+    // sets it (fitStage): the last channel's shape says nothing about this
+    // one, which may also never load at all.
+    video.parentElement.style.removeProperty('--aspect');
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;
