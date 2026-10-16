@@ -286,7 +286,9 @@ struct LedgerSnapshot {
 /// the **trust anchor**: every accepted cheque must
 ///
 /// 1. carry a `cumulative_payout` strictly greater than what we have
-///    on file for that chequebook,
+///    on file for that chequebook — except the first cheque after a
+///    damaged figure (see below), which has nothing to compare against
+///    and is accepted as the new baseline with no monotonic check,
 /// 2. recover to the same issuer EOA that signed the first cheque
 ///    we ever accepted from that chequebook (sticky binding), and
 /// 3. signature-verify against the cheque's own `Chequebook` /
@@ -299,6 +301,17 @@ struct LedgerSnapshot {
 /// the new cheque unrecorded — bee's cumulative model means the
 /// peer just re-emits the same (or higher) cheque on the next
 /// connection and we accept it then.
+///
+/// A stored `cumulative_payout_dec` that isn't a decimal number
+/// (bee#5656: an empty string, which `U256::from_dec_str` reads as
+/// zero) is not dropped: [`Self::open`] keeps the entry, so the issuer
+/// pin (rule 2) still holds, and logs a warning for it. The next cheque
+/// from that chequebook is checked against rules 2 and 3 only and
+/// becomes the new baseline, crediting nothing (`rebaseline`); rule 1
+/// applies again from the cheque after it. The true previous figure is
+/// gone, so a cheque at or below it can't be told apart from a new
+/// payment once the baseline is set; see `rebaseline` for what that
+/// costs.
 pub struct CreditLedger {
     inner: Mutex<LedgerSnapshot>,
     persist_path: Option<PathBuf>,
@@ -314,7 +327,9 @@ impl CreditLedger {
     /// Build an empty ledger backed by `persist_path` (or memory-only
     /// if `None`). Loads any existing snapshot if the file exists; an
     /// unreadable / unparseable snapshot is treated as empty after
-    /// logging — better to lose history than refuse to start.
+    /// logging — better to lose history than refuse to start. An entry
+    /// whose cumulative isn't a decimal number is kept (its issuer pin
+    /// still applies) with a warning; the next cheque rebaselines it.
     pub fn open(persist_path: Option<PathBuf>, chain_id: u64, our_beneficiary: [u8; 20]) -> Self {
         let inner = match &persist_path {
             Some(p) if p.exists() => match std::fs::read(p) {
@@ -372,8 +387,9 @@ impl CreditLedger {
     /// Apply `signed` to the ledger, returning the previous
     /// cumulative payout for that chequebook (zero on first sight; the
     /// cheque's own cumulative when the stored one is damaged, see
-    /// [`rebaseline`]). Validates: signature, beneficiary, monotonicity, sticky-issuer
-    /// binding. A pure read-only check (no ledger mutation) is
+    /// [`rebaseline`]). Validates: signature, beneficiary, sticky-issuer
+    /// binding, and monotonicity against the stored figure (skipped when
+    /// that figure is damaged and this cheque becomes the baseline). A pure read-only check (no ledger mutation) is
     /// available via [`Self::would_accept`].
     pub fn record_accepted(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
         if signed.cheque.beneficiary != self.our_beneficiary {
@@ -521,8 +537,18 @@ fn parse_stored_cumulative(s: &str) -> Option<U256> {
 /// the chequebook for good either. The incoming cheque becomes the new
 /// baseline instead: it is accepted and recorded, and the previous
 /// cumulative reported for it is its own, so it credits nothing. Cheques
-/// after it credit their increase as usual. The peer loses at most that
-/// one cheque's increase; no payment is credited twice.
+/// after it credit their increase as usual.
+///
+/// This is not exact in either direction, because the real previous
+/// figure is lost. An honest peer, whose next cheque is above it, loses
+/// that one cheque's increase. A peer that instead re-sends its older
+/// cheques in ascending order gets the first one as the baseline and
+/// every increase after it, up to the lost figure, credited a second
+/// time; the stored figure meanwhile drops back to the replayed value
+/// until the peer's cheques pass it again. What can be credited twice is
+/// bounded by the lost figure minus the replayed baseline (at most the
+/// lost figure) and is accounting credit only: the chequebook pays out on
+/// the highest cumulative, so no extra money is cashed.
 fn rebaseline(key: &str, signed: &SignedCheque, log: bool) -> U256 {
     if log {
         warn!(
@@ -3678,8 +3704,8 @@ mod tests {
 
     /// A damaged stored cumulative (bee#5656) is neither zero nor a
     /// permanent refusal: the next cheque becomes the baseline and credits
-    /// nothing, so a re-sent old cheque isn't credited again, and later
-    /// cheques credit their increase. The issuer pin still holds.
+    /// nothing, so the re-sent old cheque isn't credited again in full,
+    /// and later cheques credit their increase. The issuer pin still holds.
     #[test]
     fn a_damaged_inbound_cumulative_rebaselines_instead_of_reading_zero() {
         let issuer_secret = make_secret();
@@ -3742,6 +3768,53 @@ mod tests {
             let reopened = CreditLedger::open(Some(path), 100, our_eoa);
             assert_eq!(reopened.cumulative_for(&cb), U256::from(1_200u64));
         }
+    }
+
+    /// What [`rebaseline`]'s doc admits: after a damaged figure, a peer
+    /// re-sending its older cheques in ascending order is credited the
+    /// increases above the replayed baseline a second time, bounded by
+    /// the lost figure, and the stored figure follows the replay down.
+    /// Pinned so the doc and the behaviour can't drift apart again.
+    #[test]
+    fn a_replay_after_a_damaged_inbound_cumulative_is_bounded_by_the_lost_figure() {
+        let issuer_secret = make_secret();
+        let our_eoa = [0xaau8; 20];
+        let cb = [0x78u8; 20];
+        let cheque = |cum: u64| {
+            let c = Cheque {
+                chequebook: cb,
+                beneficiary: our_eoa,
+                cumulative_payout: U256::from(cum),
+            };
+            sign_cheque(&issuer_secret, &c, 100).unwrap()
+        };
+        let credit =
+            |l: &CreditLedger, cum: u64| U256::from(cum) - l.record_accepted(&cheque(cum)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credits.json");
+        let ledger = CreditLedger::open(Some(path.clone()), 100, our_eoa);
+        let mut first = U256::zero();
+        for cum in [1_000, 1_200, 1_500] {
+            first += credit(&ledger, cum);
+        }
+        assert_eq!(first, U256::from(1_500u64));
+        drop(ledger);
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snap["cheques"][hex::encode(cb)]["cumulative_payout_dec"] = "".into();
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let ledger = CreditLedger::open(Some(path), 100, our_eoa);
+        let mut replayed = U256::zero();
+        for cum in [1_000, 1_200, 1_500] {
+            replayed += credit(&ledger, cum);
+        }
+        // 1000 is the baseline (0); 1200 and 1500 credit 500 again.
+        assert_eq!(replayed, U256::from(500u64));
+        assert!(replayed <= U256::from(1_500u64 - 1_000));
+        assert_eq!(ledger.cumulative_for(&cb), U256::from(1_500u64));
+        // Past the lost figure, cheques credit only their real increase.
+        assert_eq!(credit(&ledger, 1_700), U256::from(200u64));
     }
 
     /// Outbound ledger persists across restarts and rejects
