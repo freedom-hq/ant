@@ -823,6 +823,16 @@ fn decode_header(bytes: &[u8]) -> Result<StoreHeader, PostageError> {
     }
     let batch_depth = bytes[6];
     let bucket_depth = bytes[7];
+    // Same bounds `build` enforces, plus a ceiling at 32 (bucket indices
+    // are u32). Without this a corrupt or crafted header with a huge
+    // `bucket_depth` reaches `decode_buckets` and its `1 << bucket_depth`
+    // sizing, which aborts the process instead of failing the load.
+    if bucket_depth == 0 || bucket_depth >= batch_depth || bucket_depth > 32 {
+        return Err(PostageError::Load(format!(
+            "invalid depths: bucket_depth {bucket_depth}, batch_depth {batch_depth} \
+             (need 0 < bucket_depth < batch_depth and bucket_depth <= 32)"
+        )));
+    }
     let immutable = bytes[8] != 0;
     let mut batch_id = [0u8; 32];
     batch_id.copy_from_slice(&bytes[16..48]);
@@ -838,12 +848,23 @@ fn decode_buckets(bytes: &[u8], bucket_depth: u8) -> Result<Vec<u32>, PostageErr
     let n = 1usize
         .checked_shl(u32::from(bucket_depth))
         .ok_or_else(|| PostageError::Load("bucket_depth overflow".into()))?;
-    let body_len = STORE_HEADER_LEN + 4 * n;
-    if bytes.len() != body_len + 32 {
+    // Checked so an oversized depth can never wrap to a small length that
+    // matches a short file; overflow is reported as a size mismatch.
+    let body_len = n
+        .checked_mul(4)
+        .and_then(|b| b.checked_add(STORE_HEADER_LEN));
+    let expected = body_len.and_then(|b| b.checked_add(32));
+    let (Some(body_len), Some(expected)) = (body_len, expected) else {
         return Err(PostageError::Load(format!(
-            "size mismatch: file is {} bytes, expected {}",
+            "size mismatch: file is {} bytes, expected more than usize::MAX \
+             for bucket_depth {bucket_depth}",
             bytes.len(),
-            body_len + 32,
+        )));
+    };
+    if bytes.len() != expected {
+        return Err(PostageError::Load(format!(
+            "size mismatch: file is {} bytes, expected {expected}",
+            bytes.len(),
         )));
     }
     let body = &bytes[..body_len];
@@ -2669,6 +2690,37 @@ mod tests {
             "expected Load error on checksum mismatch, got {err:?}",
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A header with out-of-range depths but a valid magic, version and
+    /// checksum trailer must fail the load cleanly, never abort sizing the
+    /// bucket vector (bee#5663 analog). `(64, 62)` is the case where
+    /// `4 * (1 << 62)` used to wrap to 0 in release builds and let an
+    /// 80-byte file through to `Vec::with_capacity(2^62)`.
+    #[test]
+    fn open_existing_rejects_invalid_depths() {
+        let dir = tmpdir();
+        for (batch_depth, bucket_depth) in [(64u8, 62u8), (20, 0), (12, 12), (255, 40)] {
+            let path = dir.join(format!("{batch_depth}-{bucket_depth}.bin"));
+            // Header only, no bucket counters: the length `4 * n` wraps
+            // to 0 for depth 62 on 64-bit release builds.
+            let bytes = encode_store(&[0x5au8; 32], batch_depth, bucket_depth, true, &[]);
+            assert_eq!(bytes.len(), STORE_HEADER_LEN + 32);
+            std::fs::write(&path, &bytes).unwrap();
+            let err = StampIssuer::open_existing(path).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Load(_)),
+                "({batch_depth}, {bucket_depth}): expected Load, got {err:?}",
+            );
+            // The sizing in `decode_buckets` must hold on its own too,
+            // even if a header check ever lets such a depth through.
+            let err = decode_buckets(&bytes, bucket_depth).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Load(_)),
+                "decode_buckets({bucket_depth}): expected Load, got {err:?}",
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
