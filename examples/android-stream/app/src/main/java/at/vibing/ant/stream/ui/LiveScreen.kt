@@ -260,8 +260,23 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                 }
                 LiveBroadcast.State.Starting -> Text("Starting the broadcast…")
                 LiveBroadcast.State.Live -> {
-                    OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (front) "Switch to back camera" else "Switch to selfie camera")
+                    // Fixed for the broadcast: the engine and orientation are.
+                    val canSwitch = remember { broadcast.canSwitchLive }
+                    // A one-camera device (front-only tablet, Chromebook) has
+                    // nothing to switch to, so it gets no note at all.
+                    val hasBoth = remember { broadcast.hasBothCamerasLive }
+                    if (canSwitch) {
+                        OutlinedButton(onClick = { broadcast.switchCamera() }, modifier = Modifier.fillMaxWidth()) {
+                            Text(if (front) "Switch to back camera" else "Switch to selfie camera")
+                        }
+                    } else if (hasBoth) {
+                        Text(
+                            "This phone's front and back cameras are mounted differently, so they can't be " +
+                                "switched mid-broadcast in ${if (portrait) "portrait" else "landscape"}. " +
+                                "Pick the camera before going live.",
+                            color = Color.Gray,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                     Button(
                         onClick = { scope.launch { broadcast.stop() } },

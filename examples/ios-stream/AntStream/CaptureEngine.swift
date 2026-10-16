@@ -163,6 +163,26 @@ final class CaptureEngine: NSObject {
     private(set) var settings: Settings
     let source: Source
 
+    /// Whether frames are upright portrait. On the camera path this follows
+    /// the capture connection's rotation (90°/270° = portrait), which
+    /// physically turns the buffers the camera hands over; the test
+    /// pattern takes it from `init`. The writer encodes at the matching
+    /// size (``encodedWidth`` × ``encodedHeight``) with no track
+    /// transform, so a portrait broadcast is real portrait frames (#194):
+    /// before, portrait buffers went into a landscape-sized writer and
+    /// were squeezed into it, which no player can undo.
+    private var portrait: Bool
+
+    /// The rendition's size the way frames arrive: its long side vertical
+    /// in portrait (360p is 360×640 there, not 640×360).
+    private var encodedWidth: Int {
+        portrait ? min(settings.width, settings.height) : max(settings.width, settings.height)
+    }
+
+    private var encodedHeight: Int {
+        portrait ? max(settings.width, settings.height) : min(settings.width, settings.height)
+    }
+
     /// Everything below runs here: capture callbacks, writer lifecycle,
     /// and the test-pattern generator. One serial queue means the writer
     /// can never be torn down underneath an in-flight `append`.
@@ -223,9 +243,12 @@ final class CaptureEngine: NSObject {
     /// there is nothing to preview.
     var previewSession: AVCaptureSession? { source == .camera ? session : nil }
 
-    init(source: Source, settings: Settings = Settings()) {
+    /// `portrait` only applies to the test pattern (a generated frame has no
+    /// device to turn); the camera's orientation comes from the device.
+    init(source: Source, settings: Settings = Settings(), portrait: Bool = false) {
         self.source = source
         self.settings = settings
+        self.portrait = source == .testPattern && portrait
         self.baseSettings = settings
         self.delegateSettings = (settings.segmentSeconds, settings.ringCapacity)
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -399,8 +422,8 @@ final class CaptureEngine: NSObject {
     }
 
     /// Keep the encoded frames upright as the device turns. A rotation
-    /// changes the encoded dimensions, so it also restarts the writer —
-    /// #65's "orientation" interruption case.
+    /// changes the encoded dimensions (``portrait``), so it also restarts
+    /// the writer — #65's "orientation" interruption case.
     private func observeRotation(of device: AVCaptureDevice?) {
         rotationObservation?.invalidate()
         guard let device else { return }
@@ -417,12 +440,20 @@ final class CaptureEngine: NSObject {
     }
 
     private func applyRotation(_ angle: CGFloat) {
-        guard let connection = videoOutput?.connection(with: .video),
-              connection.isVideoRotationAngleSupported(angle),
-              connection.videoRotationAngle != angle
-        else { return }
-        connection.videoRotationAngle = angle
-        if state.isRunning { restartWriter() }
+        guard let connection = videoOutput?.connection(with: .video) else { return }
+        var changed = false
+        if connection.isVideoRotationAngleSupported(angle), connection.videoRotationAngle != angle {
+            connection.videoRotationAngle = angle
+            changed = true
+        }
+        // Whatever angle the connection ended up at decides the buffers'
+        // shape, so the writer is sized from it, not from the request.
+        let turned = Int(connection.videoRotationAngle.rounded()) % 180 != 0
+        if turned != portrait {
+            portrait = turned
+            changed = true
+        }
+        if changed, state.isRunning { restartWriter() }
     }
 
     // MARK: - Writer
@@ -456,8 +487,10 @@ final class CaptureEngine: NSObject {
             mediaType: .video,
             outputSettings: [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: settings.width,
-                AVVideoHeightKey: settings.height,
+                // Sized like the frames that arrive (portrait or not), so
+                // the encoder never scales them into the other shape.
+                AVVideoWidthKey: encodedWidth,
+                AVVideoHeightKey: encodedHeight,
                 AVVideoCompressionPropertiesKey: compression,
             ]
         )
@@ -490,8 +523,8 @@ final class CaptureEngine: NSObject {
                 assetWriterInput: vInput,
                 sourcePixelBufferAttributes: [
                     kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                    kCVPixelBufferWidthKey as String: settings.width,
-                    kCVPixelBufferHeightKey as String: settings.height,
+                    kCVPixelBufferWidthKey as String: encodedWidth,
+                    kCVPixelBufferHeightKey as String: encodedHeight,
                 ]
             )
         }
@@ -727,15 +760,18 @@ final class CaptureEngine: NSObject {
         testPatternFrame += 1
     }
 
-    /// A moving bar over a slowly-shifting background. Deliberately not
-    /// a static image: identical frames encode to nothing, which would
-    /// make the segments unrepresentative of real video.
+    /// A moving bar over a slowly-shifting background, with a white disc
+    /// in the middle. Deliberately not a static image: identical frames
+    /// encode to nothing, which would make the segments unrepresentative
+    /// of real video. The disc shows the frame's geometry: it is round
+    /// only if nothing between here and the viewer stretched the picture
+    /// (#194).
     private func makeTestPixelBuffer() -> CVPixelBuffer? {
         if pixelBufferPool == nil {
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: settings.width,
-                kCVPixelBufferHeightKey as String: settings.height,
+                kCVPixelBufferWidthKey as String: encodedWidth,
+                kCVPixelBufferHeightKey as String: encodedHeight,
                 kCVPixelBufferCGImageCompatibilityKey as String: true,
             ]
             var pool: CVPixelBufferPool?
@@ -756,11 +792,18 @@ final class CaptureEngine: NSObject {
         let phase = Double(testPatternFrame)
         let barX = Int((sin(phase / 18.0) * 0.4 + 0.5) * Double(width - 40))
         let shade = UInt8(24 + 24 * (sin(phase / 40.0) * 0.5 + 0.5))
+        let radius = min(width, height) / 4
+        let (cx, cy) = (width / 2, height / 2)
         for y in 0..<height {
             let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
             for x in 0..<width {
                 let inBar = x >= barX && x < barX + 40
+                let inDisc = (x - cx) * (x - cx) + (y - cy) * (y - cy) < radius * radius
                 let p = row.advanced(by: x * 4)
+                if inDisc {
+                    p[0] = 255; p[1] = 255; p[2] = 255; p[3] = 255
+                    continue
+                }
                 p[0] = inBar ? 200 : shade                       // B
                 p[1] = inBar ? 90 : UInt8(shade / 2)             // G
                 p[2] = inBar ? 40 : UInt8(y * 200 / max(1, height)) // R

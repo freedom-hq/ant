@@ -684,6 +684,23 @@
     if (hls && s && s.firstPlayingAt !== null && bufferAheadAcrossGaps() < settings.rebuffer) hold('seek');
   });
 
+  // The stage takes the picture's own shape (#194): a portrait broadcast
+  // gets a portrait box instead of a narrow strip inside a 16:9 one.
+  // `videoWidth`/`videoHeight` are the display size: Chromium (Freedom's
+  // Electron 44 included), Safari and Firefox report a rotated track
+  // (portrait broadcasts made before #194 store the picture sideways with
+  // a rotate-90 track matrix) at its turned size, so no correction is
+  // needed here; test/portrait-test.mjs checks both kinds. `resize` fires
+  // again when a new broadcast on the channel changes orientation.
+  function fitStage() {
+    const wrap = video.parentElement;
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      wrap.style.setProperty('--aspect', String(video.videoWidth / video.videoHeight));
+    }
+  }
+  video.addEventListener('loadedmetadata', fitStage);
+  video.addEventListener('resize', fitStage);
+
   video.addEventListener('playing', () => {
     const s = log.session;
     if (!s || gate.holding || video.playbackRate === 0) return;
@@ -743,6 +760,10 @@
     channel = ch;
     ended = false;
     joinedLive = null;
+    // Back to the default 16:9 stage until this channel's own first frame
+    // sets it (fitStage): the last channel's shape says nothing about this
+    // one, which may also never load at all.
+    video.parentElement.style.removeProperty('--aspect');
     everPlayed = false;
     segmentsLoaded = 0;
     lastFetchMs = null;

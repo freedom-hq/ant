@@ -90,6 +90,20 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         discardEngine()
     }
 
+    /**
+     * Whether [switchCamera] can swap cameras during the running broadcast
+     * ([CaptureEngine.canSwitchCamera]): the live screen offers the switch
+     * only when it does something.
+     */
+    val canSwitchLive: Boolean get() = engine?.canSwitchCamera ?: false
+
+    /**
+     * Whether the running engine's device has a second camera at all, so
+     * the live screen can tell "only one camera" (nothing to say) apart from
+     * "two cameras mounted differently" when [canSwitchLive] is false.
+     */
+    val hasBothCamerasLive: Boolean get() = engine?.hasBothCameras ?: false
+
     /** Swap front/back camera, live or not. */
     fun switchCamera() {
         val e = engine

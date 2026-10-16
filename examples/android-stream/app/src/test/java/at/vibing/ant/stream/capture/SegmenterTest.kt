@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SegmenterTest {
-    private val video = Fmp4Muxer.VideoConfig(640, 360, byteArrayOf(0x67, 0x42, 0x00, 0x1e), byteArrayOf(0x68, 0x01), 0)
+    private val video = Fmp4Muxer.VideoConfig(640, 360, byteArrayOf(0x67, 0x42, 0x00, 0x1e), byteArrayOf(0x68, 0x01))
     private val audio = Fmp4Muxer.AudioConfig(48_000, 1, byteArrayOf(0x11, 0x88.toByte()))
 
     /** Count `traf` boxes (one per track carrying samples) in a media segment. */
