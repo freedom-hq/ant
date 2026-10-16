@@ -175,6 +175,7 @@ struct BroadcastView: View {
                             in: .capsule
                         )
                         .foregroundStyle(.white.opacity(node.isReadyToBroadcast ? 1 : 0.5))
+                        .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
                 .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil)
@@ -237,10 +238,14 @@ struct BroadcastView: View {
                         }
                     }
                     .disabled(!node.isReadyToBroadcast)
-                    Button("Discard it") { confirmDiscard = true }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.6))
-                        .buttonStyle(.plain)
+                    Button { confirmDiscard = true } label: {
+                        Text("Discard it")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -318,6 +323,7 @@ struct BroadcastView: View {
                         }
                         .padding(12)
                         .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                        .contentShape(.rect(cornerRadius: 12))
                     }
                     .buttonStyle(.plain)
                     HStack(spacing: 10) {
@@ -327,6 +333,7 @@ struct BroadcastView: View {
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 16).padding(.vertical, 10)
                                 .glassEffect(.regular.tint(.blue.opacity(0.35)), in: .capsule)
+                                .contentShape(.capsule)
                         }
                         .buttonStyle(.plain)
                         GlassPillButton(title: "Watch", icon: "play.fill",

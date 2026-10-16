@@ -246,7 +246,10 @@ jobs:
           sleep 30
           xcrun simctl io booted screenshot shots/16-getstarted-pay-help.png
           # 17 — the live screen before going live: the quality presets
-          # (360p / 540p / 720p) and what each costs in bandwidth.
+          # (360p / 540p / 720p) and what each costs in bandwidth, over
+          # the preview (#193). A simulator has no camera, so the preview
+          # is its placeholder, drawn in the broadcast's frame (9:16 for
+          # a phone held upright) and saying why there is no picture.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live-idle
           sleep 25
@@ -316,6 +319,25 @@ jobs:
             -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-withdraw
           sleep 22
           xcrun simctl io booted screenshot shots/28-credit-withdraw-sheet.png
+          # --- Orientation (#193) ---
+          # The runner can't turn the simulator, so `-antstream-shot-
+          # landscape` has the live screen turn its interface to
+          # landscape (`requestGeometryUpdate`), as a turned phone does.
+          # 29 — before going live: the controls re-laid out side by
+          # side, the preview placeholder in a 16:9 frame, and "Landscape
+          # broadcast, as the phone is held".
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-landscape
+          sleep 25
+          xcrun simctl io booted screenshot shots/29-live-idle-landscape.png
+          # 30 — live in landscape (the test pattern, as in 11/12): the
+          # metrics card and the Stop button laid out for landscape.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-landscape
+          sleep 45
+          xcrun simctl io booted screenshot shots/30-live-landscape.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

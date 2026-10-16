@@ -278,6 +278,23 @@ window is 4 deep. Window 4 is measured, not arbitrary — window 8
 collapsed the connection layer in the stage-1 soaks — so it is not
 exposed as a UI knob.
 
+The live screen shows the camera as soon as it opens (#193), before Go
+live: camera access is asked for then (the microphone at Go live), and
+the capture session runs without a writer, so the shot can be framed,
+the camera switched and the quality picked first. Going live adds the
+microphone and a writer to that running session rather than restarting
+the camera; a stop goes back to the preview, and leaving the screen
+turns the camera off. The preview is drawn in the broadcast's own frame
+(16:9 or 9:16), aspect-fit, so it shows what viewers get.
+
+The live screen's interface turns with the device (the rest of the app
+stays portrait on a phone; an `AppDelegate` orientation lock widens it
+while the screen is open), and its controls re-lay out for landscape.
+The broadcast's orientation is picked by holding the phone: portrait
+(360×640, …) or landscape (640×360, …), following the phone until Go
+live and then fixed for the whole broadcast. Turning the phone after
+that keeps the picture upright, with black bars inside the fixed frame.
+
 Interruptions (incoming call, backgrounding, camera flip, orientation,
 thermal downshift) finish the current segment cleanly and start a fresh
 writer; the first segment after one is marked `#EXT-X-DISCONTINUITY` in

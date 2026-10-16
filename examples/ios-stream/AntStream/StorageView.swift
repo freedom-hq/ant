@@ -314,8 +314,13 @@ struct StorageView: View {
                             UIPasteboard.general.string = addr
                             banner.flash("Address copied")
                         } label: {
+                            // A bare icon is a small target: pad it out to
+                            // a finger-sized square that takes the tap.
                             Image(systemName: "doc.on.doc").foregroundStyle(.white.opacity(0.85))
+                                .padding(10)
+                                .contentShape(.rect)
                         }
+                        .accessibilityLabel("Copy address")
                     }
                 }
             }
@@ -831,6 +836,7 @@ private struct ExtendStorageSheet: View {
                         .glassEffect(.regular.tint(.blue.opacity(quote.sufficientFunds ? 0.6 : 0.2)),
                                      in: .capsule)
                         .foregroundStyle(.white.opacity(quote.sufficientFunds ? 1 : 0.5))
+                        .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
                 .disabled(!quote.sufficientFunds)
@@ -876,6 +882,7 @@ private struct ExtendStorageSheet: View {
                         }
                         .padding(12)
                         .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                        .contentShape(.rect(cornerRadius: 12))
                     }
                     .buttonStyle(.plain)
                 }

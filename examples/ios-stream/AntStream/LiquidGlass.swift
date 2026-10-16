@@ -146,6 +146,10 @@ struct GlassPillButton: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .glassEffect(.regular.tint(tint), in: .capsule)
+                // A plain-styled button hit-tests only what its label
+                // draws, and the glass is not part of that: without this
+                // only the text and icon took a tap (#193).
+                .contentShape(.capsule)
         }
         .buttonStyle(.plain)
     }

@@ -13,6 +13,13 @@ import UIKit
 /// the feed update that makes the segment playable) is on screen the
 /// whole time, next to how many segments the live-edge discipline had to
 /// drop to hold it there.
+///
+/// The camera runs from the moment the screen opens (#193), so the shot
+/// can be framed, the camera switched and the quality picked before Go
+/// live; the preview is drawn in the broadcast's own frame. The interface
+/// turns with the device (``OrientationLock``) and the controls re-lay
+/// out for landscape; the broadcast's orientation follows the phone until
+/// Go live and then stays as it was for the whole broadcast.
 struct LiveView: View {
     @EnvironmentObject var node: AntNode
     @StateObject private var broadcast = LiveBroadcast()
@@ -35,30 +42,42 @@ struct LiveView: View {
     /// Going live was tapped on a plan with under an hour of room at the
     /// picked quality, or one Swarm won't stamp with (#176): ask first.
     @State private var confirmLowCapacity = false
+    /// The interface is laid out wider than tall (the phone is turned).
+    @State private var landscape = false
 
     init(resume: Bool = false) {
         _resumePending = State(initialValue: resume)
     }
 
     var body: some View {
-        ZStack {
-            LiquidGlassBackground(palette: .broadcast)
-            preview
-            VStack(spacing: 14) {
-                topBar
-                Spacer()
-                if let report = broadcast.report, !broadcast.state.isActive {
-                    summaryCard(report)
+        GeometryReader { geo in
+            let wide = geo.size.width > geo.size.height
+            ZStack {
+                LiquidGlassBackground(palette: .broadcast)
+                preview
+                if wide {
+                    landscapeOverlay
                 } else {
-                    statusCard
+                    portraitOverlay
                 }
-                controls
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 24)
+            .onAppear { followLayout(wide: wide) }
+            .onChange(of: wide) { _, wide in followLayout(wide: wide) }
         }
         .preferredColorScheme(.dark)
+        .onAppear {
+            OrientationLock.allowRotation(true)
+            if RootView.shotArgs.contains("-antstream-shot-landscape") {
+                // A runner's simulator can't be turned from the workflow:
+                // turn the interface instead, for the landscape shots.
+                OrientationLock.requestLandscape()
+            }
+        }
+        .onDisappear {
+            OrientationLock.allowRotation(false)
+            broadcast.closePreview()
+        }
+        .task { await broadcast.openPreview() }
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .alert(lowCapacityTitle, isPresented: $confirmLowCapacity) {
             Button("Go live anyway", role: .destructive) {
@@ -69,6 +88,12 @@ struct LiveView: View {
             Text(capacity?.warning ?? "")
         }
         .onChange(of: broadcast.state) { _, state in
+            guard !state.isActive else { return }
+            // Back to the preview after a broadcast that took the camera
+            // down with it (a capture failure); a no-op while it runs. The
+            // next broadcast's orientation follows the phone again (#193).
+            Task { await broadcast.openPreview() }
+            broadcast.portrait = !landscape
             // A resumed run that ended with its entry still on disk (the
             // node refused it at the feed head, or it failed): the next
             // tap resumes again rather than replacing the entry with a
@@ -79,7 +104,7 @@ struct LiveView: View {
             // (see `blockedByUnfinished`) and the card ends it. Any run,
             // not only a resume, can leave such an entry behind (a stop
             // whose recording upload failed).
-            guard !state.isActive, lastRunWasResume else { return }
+            guard lastRunWasResume else { return }
             resumePending = resumable(now: Date())
         }
         .task {
@@ -128,24 +153,129 @@ struct LiveView: View {
         }
     }
 
-    // MARK: preview
+    // MARK: layout
+
+    /// The controls stacked under the picture, as before #193.
+    private var portraitOverlay: some View {
+        VStack(spacing: 14) {
+            topBar
+            Spacer()
+            card
+            controls
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 24)
+    }
+
+    /// Turned to landscape there is no room for the card above the
+    /// button: they sit side by side along the bottom, and the card
+    /// scrolls if it is taller than the screen is high.
+    private var landscapeOverlay: some View {
+        VStack(spacing: 10) {
+            topBar
+            HStack(alignment: .bottom, spacing: 16) {
+                ScrollView {
+                    card
+                }
+                .defaultScrollAnchor(.bottom, for: .alignment)
+                .scrollIndicators(.hidden)
+                .frame(maxWidth: 440)
+                Spacer(minLength: 0)
+                controls
+                    .frame(width: 260)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 12)
+    }
 
     @ViewBuilder
+    private var card: some View {
+        if let report = broadcast.report, !broadcast.state.isActive {
+            summaryCard(report)
+        } else {
+            statusCard
+        }
+    }
+
+    /// Until Go live the next broadcast takes the phone's orientation;
+    /// once live it keeps the one it started with.
+    private func followLayout(wide: Bool) {
+        landscape = wide
+        if !broadcast.state.isActive { broadcast.portrait = !wide }
+    }
+
+    // MARK: preview
+
+    /// The broadcast's frame (9:16 or 16:9), with the camera in it as
+    /// viewers will see it, or a placeholder that says why there is no
+    /// picture.
     private var preview: some View {
+        ZStack {
+            previewContent
+        }
+        .aspectRatio(broadcast.portrait ? 9.0 / 16.0 : 16.0 / 9.0, contentMode: .fit)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private var previewContent: some View {
         if let session = broadcast.engine?.previewSession {
-            CameraPreview(session: session)
-                .ignoresSafeArea()
-        } else if broadcast.state.isActive {
-            // Test-pattern mode has nothing to preview. Say so plainly
-            // rather than showing an empty frame that reads as a broken
-            // camera.
+            CameraPreview(session: session, camera: broadcast.previewCamera)
+        } else if let problem = broadcast.previewProblem {
+            previewPlaceholder(icon: "video.slash", text: problem) {
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Text("Open Settings")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 9)
+                        .glassEffect(.regular, in: .capsule)
+                        .contentShape(.capsule)
+                }
+                .buttonStyle(.plain)
+            }
+        } else if LiveBroadcast.defaultSource == .testPattern {
+            // Test-pattern mode (the simulator, CI) has nothing to
+            // preview. Say so plainly rather than showing an empty frame
+            // that reads as a broken camera.
+            previewPlaceholder(
+                icon: "waveform.badge.magnifyingglass",
+                text: "Test pattern — no camera on this device"
+            ) { EmptyView() }
+        } else {
+            // The camera is starting (or access is being asked for).
+            Color.black.opacity(0.35)
+        }
+    }
+
+    /// The broadcast frame's outline with an icon and a line of text in
+    /// it, so the frame's shape still shows when there is no picture.
+    private func previewPlaceholder<Extra: View>(
+        icon: String,
+        text: String,
+        @ViewBuilder extra: () -> Extra
+    ) -> some View {
+        ZStack {
+            Rectangle().fill(.black.opacity(0.3))
+            Rectangle().strokeBorder(.white.opacity(0.18), lineWidth: 1)
             VStack(spacing: 10) {
-                Image(systemName: "waveform.badge.magnifyingglass")
+                Image(systemName: icon)
                     .font(.system(size: 40))
-                Text("Test pattern — no camera on this device")
+                Text(text)
                     .font(.footnote)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                extra()
             }
             .foregroundStyle(.white.opacity(0.55))
+            .padding(32)
         }
     }
 
@@ -155,15 +285,19 @@ struct LiveView: View {
         HStack(spacing: 10) {
             liveBadge
             Spacer()
-            if broadcast.state.isActive, broadcast.engine?.previewSession != nil {
+            // Before going live too (#193): the camera is picked while
+            // framing the shot.
+            if broadcast.engine?.previewSession != nil {
                 Button { broadcast.engine?.flipCamera() } label: {
                     Image(systemName: "arrow.triangle.2.circlepath.camera")
                         .font(.title3)
                         .foregroundStyle(.white)
                         .padding(10)
                         .glassEffect(.regular, in: .circle)
+                        .contentShape(.circle)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Switch camera")
             }
             Button { dismiss() } label: {
                 Image(systemName: "xmark")
@@ -171,8 +305,10 @@ struct LiveView: View {
                     .foregroundStyle(.white)
                     .padding(10)
                     .glassEffect(.regular, in: .circle)
+                    .contentShape(.circle)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Close")
             .disabled(broadcast.state.isActive)
             .opacity(broadcast.state.isActive ? 0.3 : 1)
         }
@@ -233,6 +369,26 @@ struct LiveView: View {
                     Label(reason, systemImage: "pause.circle.fill")
                         .font(.footnote)
                         .foregroundStyle(.yellow)
+                }
+                if case .failed(let message) = broadcast.capture, broadcast.state == .idle {
+                    // The preview's camera failed to start (#193). A
+                    // broadcast it ended says so as its own failure.
+                    Label(message, systemImage: "video.slash")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+                if broadcast.state.isActive, broadcast.engine?.previewSession != nil,
+                   broadcast.portrait == landscape {
+                    // Turned away from the orientation the broadcast went
+                    // live in: the frame keeps its shape (#193).
+                    Label("Broadcasting in \(orientationName) as you went live: "
+                          + "turned this way the picture goes out with black bars. "
+                          + "Turn the phone back to fill the frame.",
+                          systemImage: broadcast.portrait
+                              ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate")
+                        .font(.footnote)
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let progress = broadcast.progress, progress.paused == true,
                    broadcast.state.isActive {
@@ -392,6 +548,8 @@ struct LiveView: View {
             Label("Copy recording reference", systemImage: "film")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.85))
+                .padding(.vertical, 6)
+                .contentShape(.rect)
         }
         .buttonStyle(.plain)
     }
@@ -416,6 +574,14 @@ struct LiveView: View {
                  + "segments. Lower is more reliable on mobile data.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
+                .fixedSize(horizontal: false, vertical: true)
+            // The orientation is picked by holding the phone (#193).
+            Label("\(orientationName.capitalized) broadcast, as the phone is held. "
+                  + "Turn it to switch; it stays \(orientationName) once you go live.",
+                  systemImage: broadcast.portrait ? "rectangle.portrait" : "rectangle")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.7))
+                .fixedSize(horizontal: false, vertical: true)
             if let estimate = capacity {
                 // The plan's room at this quality (#176), counted from
                 // its fullest bucket: the same estimate and the same
@@ -434,6 +600,8 @@ struct LiveView: View {
             }
         }
     }
+
+    private var orientationName: String { broadcast.portrait ? "portrait" : "landscape" }
 
     /// The plan's room for a broadcast at the picked quality (#176).
     private var capacity: CapacityEstimate? {
@@ -475,12 +643,16 @@ struct LiveView: View {
                 Label("Copy", systemImage: "doc.on.doc")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))
+                    .padding(.vertical, 6)
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
             ShareLink(item: Channel.watchLinks(reference)) {
                 Label("Share channel link", systemImage: "square.and.arrow.up")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))
+                    .padding(.vertical, 6)
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
             Spacer()
@@ -557,6 +729,7 @@ struct LiveView: View {
                     in: .capsule
                 )
                 .foregroundStyle(.white)
+                .contentShape(.capsule)
         }
         .buttonStyle(.plain)
         .disabled(broadcast.state == .starting || broadcast.state == .stopping || blocked)
@@ -596,13 +769,22 @@ struct LiveView: View {
 }
 
 /// `AVCaptureVideoPreviewLayer` as a SwiftUI view.
+///
+/// Shown inside the broadcast's frame, aspect-fit, so the picture is
+/// what viewers get: the whole frame, with the black bars a phone turned
+/// away from the broadcast's orientation puts in (#193). The picture is
+/// kept upright whichever way the interface faces, by the camera's own
+/// rotation coordinator.
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    /// The camera the session captures from; `nil` until it is set up.
+    let camera: AVCaptureDevice?
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspectFill
+        view.previewLayer.videoGravity = .resizeAspect
+        view.follow(camera)
         return view
     }
 
@@ -610,9 +792,42 @@ struct CameraPreview: UIViewRepresentable {
         if view.previewLayer.session !== session {
             view.previewLayer.session = session
         }
+        view.follow(camera)
     }
 
     final class PreviewView: UIView {
+        private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+        private var rotationObservation: NSKeyValueObservation?
+        private var followedCamera: String?
+
+        /// Keep the preview upright for `camera`, as the interface turns.
+        /// A camera flip brings a new device and a new coordinator.
+        func follow(_ camera: AVCaptureDevice?) {
+            guard let camera, camera.uniqueID != followedCamera else { return }
+            followedCamera = camera.uniqueID
+            rotationObservation?.invalidate()
+            let coordinator = AVCaptureDevice.RotationCoordinator(
+                device: camera,
+                previewLayer: previewLayer
+            )
+            rotationCoordinator = coordinator
+            applyRotation(coordinator.videoRotationAngleForHorizonLevelPreview)
+            rotationObservation = coordinator.observe(
+                \.videoRotationAngleForHorizonLevelPreview,
+                options: [.new]
+            ) { [weak self] _, change in
+                guard let angle = change.newValue else { return }
+                Task { @MainActor in self?.applyRotation(angle) }
+            }
+        }
+
+        private func applyRotation(_ angle: CGFloat) {
+            guard let connection = previewLayer.connection,
+                  connection.isVideoRotationAngleSupported(angle)
+            else { return }
+            connection.videoRotationAngle = angle
+        }
+
         override static var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         /// Safe by construction: `layerClass` above pins the layer type.
         var previewLayer: AVCaptureVideoPreviewLayer {
