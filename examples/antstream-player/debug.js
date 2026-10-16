@@ -210,7 +210,7 @@
       ['Segment first byte', `median ${sec(median(ok.map((e) => e.ttfb)))} · p95 ${sec(p95(ok.map((e) => e.ttfb)))}`],
       ['Segment total', `median ${sec(median(ok.map((e) => e.ms)))} · p95 ${sec(p95(ok.map((e) => e.ms)))} · ${mbps(bytes, ms)} Mbit/s per fetch`],
       ['Prefetch', `${c.ready} ready · ${c.joined} joined · ${c.miss} fetched by hls.js`],
-      ['Feed index', feed.index === null ? (player.headHeld ? '– · head over the read budget, joining through markers only' : '–') : `${feed.index} · joined via ${feed.joinedVia || '–'} · reading from ${feed.cursor + 1} · ${feed.ch ? feed.ch.topicHex.slice(0, 12) : ''}… over ${player.via}`],
+      ['Feed index', feed.index === null ? (player.headTooLarge ? '– · head over the read budget, joining through markers only' : player.headHeld ? '– · head refused by the read budget, read again in a fresh window' : '–') : `${feed.index} · joined via ${feed.joinedVia || '–'} · reading from ${feed.cursor + 1} · ${feed.ch ? feed.ch.topicHex.slice(0, 12) : ''}… over ${player.via}`],
       ['Feed reads', `${readsOk.length} ok · ${notYet.length} not written yet · ${reads.length - readsOk.length - notYet.length} failed · median ${sec(median(readsOk.map((e) => e.ms)))} · p95 ${sec(p95(readsOk.map((e) => e.ms)))}`, reads.length - readsOk.length - notYet.length > 0],
       ['Feed reads', `${readsOk.filter((e) => e.note.includes('newer')).length} newer · ${readsOk.filter((e) => e.note.includes('unchanged')).length} unchanged · ${readsOk.filter((e) => e.note.includes('stale')).length} stale · markers ${markers.filter((e) => e.status === 200).length} of ${markers.length} found`],
       ...(player.via === 'window.swarm'

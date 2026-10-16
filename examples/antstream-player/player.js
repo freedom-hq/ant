@@ -568,26 +568,46 @@
   // which can skip straight to the newest.
   const CATCH_UP_AFTER_MS = 5000;
   const REJOIN_AFTER_MS = 30000;
-  // In Freedom, a head read the budget refuses is most likely the head
-  // itself being over it: an ended broadcast's recording, which the
-  // provider joins and charges in full before refusing (the player's own
-  // reads stay well under the budget). Re-reading it on every retry would
-  // spend a whole budget window each time, so for this long the join only
-  // asks the ladder markers, which a new broadcast on the channel writes
-  // from its start.
+  // In Freedom, a head read the budget refuses may be the head itself being
+  // over it: an ended broadcast's recording, which the provider joins and
+  // charges in full before refusing. It may as well be a head that fits,
+  // refused only because the origin's window was already partly spent (by
+  // another tab on the same origin, or this page before a reload: the
+  // player can't see those reads). So the first refusal only waits out the
+  // window and reads the head once more, in a fresh one; a second refusal
+  // in a row means the head is over the budget, and re-reading it on every
+  // retry would spend a whole window each time, so for HEAD_REFUSED_HOLD_MS
+  // the join only asks the ladder markers, which a new broadcast on the
+  // channel writes from its start.
+  const HEAD_RETRY_AFTER_MS = BUDGET_WINDOW_MS + 5000;
   const HEAD_REFUSED_HOLD_MS = 5 * 60000;
-  // { key, at } of the channel whose head read was refused; kept across
-  // `play()` retries, which start the join over.
+  // { key, at, strikes } of the channel whose head read was refused
+  // (`strikes` refusals in a row); kept across `play()` retries, which
+  // start the join over, and cleared by a head read that is answered or a
+  // live broadcast found on the channel.
   let headRefused = null;
-  const headRefusedError = () => ({
-    code: 429,
-    message: "the last broadcast's recording is over Freedom's read budget; open the channel through an HTTP gateway to play it",
-  });
+
+  /** The head read was refused twice in a row: it is over the budget. */
+  const headTooLarge = (ch) => !!headRefused && headRefused.key === ch.key && headRefused.strikes >= 2;
+
+  function headRefusedError(ch) {
+    return headTooLarge(ch)
+      ? { code: 429, message: "the last broadcast's recording is over Freedom's read budget; open the channel through an HTTP gateway to play it" }
+      : { code: 429, message: "Freedom's read budget refused the channel's head (another tab or an earlier load may have used it); reading it again in the next budget window" };
+  }
 
   const HEAD_REFUSED_OVERLAY = 'This channel’s last broadcast is too large to read here. Watching for a new one…';
 
+  /** Skip the head read for now: refused once and waiting for a fresh window, or over the budget. */
   function headHeld(ch) {
-    return !!headRefused && headRefused.key === ch.key && Date.now() - headRefused.at < HEAD_REFUSED_HOLD_MS;
+    if (!headRefused || headRefused.key !== ch.key) return false;
+    const hold = headRefused.strikes >= 2 ? HEAD_REFUSED_HOLD_MS : HEAD_RETRY_AFTER_MS;
+    return Date.now() - headRefused.at < hold;
+  }
+
+  /** The channel's head is readable again (answered, or a live broadcast is on). */
+  function clearHeadRefused(ch) {
+    if (headRefused && ch && headRefused.key === ch.key) headRefused = null;
   }
 
   const feed = {
@@ -623,7 +643,7 @@
     feed.lastNewer = Date.now();
     feed.waiters = [];
     feed.delivered = null;
-    feed.lastError = ch && headHeld(ch) ? headRefusedError() : null;
+    feed.lastError = ch && headHeld(ch) ? headRefusedError(ch) : null;
   }
 
   /**
@@ -711,6 +731,7 @@
   }
 
   function onPlaylist(kind, a, row, chase) {
+    if (kind === 'head' && (a.status === 200 || a.status === 404 || a.status === 'too-long')) clearHeadRefused(feed.ch);
     if (a.status === 'too-long') {
       // A recording too large to read here. The next broadcast continues
       // the feed after it (#173), so step past it rather than read it
@@ -732,12 +753,18 @@
       if (kind === 'slot' && a.status === 404) note(row, 'not written yet');
       else if (kind === 'head' && a.status === 404) note(row, 'the feed has no updates yet');
       if (kind === 'head' && a.status === 429 && inBzz) {
-        if (!headHeld(feed.ch)) {
-          log.marker(`head read refused by the read budget: joining through the ladder markers only for ${HEAD_REFUSED_HOLD_MS / 60000} min`);
+        const prev = headRefused && headRefused.key === feed.ch.key ? headRefused : null;
+        // A refusal while already held (a read that started before the
+        // first one came back) is the same strike.
+        const strikes = prev && headHeld(feed.ch) ? prev.strikes : (prev ? prev.strikes : 0) + 1;
+        if (!prev || !headHeld(feed.ch)) {
+          log.marker(strikes >= 2
+            ? `head read refused by the read budget again: it is over the budget, joining through the ladder markers only for ${HEAD_REFUSED_HOLD_MS / 60000} min`
+            : `head read refused by the read budget: reading it again in a fresh window in ${HEAD_RETRY_AFTER_MS / 1000} s, joining through the ladder markers meanwhile`);
         }
-        headRefused = { key: feed.ch.key, at: Date.now() };
-        feed.lastError = headRefusedError();
-        note(row, 'over the read budget: not read again for a while');
+        headRefused = { key: feed.ch.key, at: Date.now(), strikes };
+        feed.lastError = headRefusedError(feed.ch);
+        note(row, strikes >= 2 ? 'over the read budget: not read again for a while' : 'refused by the read budget: reading again in a fresh window');
       } else if (a.status !== 404) feed.lastError = { code: typeof a.status === 'number' ? a.status : 0, message: a.note || String(a.status) };
       else if (kind === 'head') feed.lastError = { code: 404, message: 'the feed has no updates yet' };
       return;
@@ -753,6 +780,10 @@
     if (kept === null) note(row, 'stale: an earlier broadcast');
     else if (kept !== a.text) note(row, 'stale: kept the newer one');
     else note(row, kept === before ? 'unchanged' : 'newer');
+    // A live playlist on the channel (found through a marker or the slot
+    // after the recording): the head is that small playlist now, not the
+    // refused recording.
+    if (kept === a.text && !info.key[3]) clearHeadRefused(feed.ch);
     const quiet = Date.now() - feed.lastNewer;
     if (kept === a.text && kept !== before) feed.lastNewer = Date.now();
     if (index !== null && (feed.index === null || index > feed.index)) feed.index = index;
@@ -1287,9 +1318,9 @@
     els.input.value = ch.key;
     remember(ch.key);
     setBadge('', 'CONNECTING');
-    if (headHeld(ch)) {
-      // A retry after the head was refused: say so rather than start over
-      // with "Finding the channel" each time.
+    if (headHeld(ch) && headTooLarge(ch)) {
+      // A retry after the head was refused as over the budget: say so
+      // rather than start over with "Finding the channel" each time.
       setOverlay(HEAD_REFUSED_OVERLAY);
       setStatus(`The last broadcast's recording is over Freedom's read budget. Open the channel through an HTTP gateway to play it; a new broadcast shows up here.`);
     } else {
@@ -1366,6 +1397,8 @@
   function restartOnNewBroadcast() {
     const found = guard.newBroadcast;
     const ids = [...guard.ids].filter((id) => id !== found.id);
+    // The head is the new broadcast's playlist now: no "too large" copy.
+    clearHeadRefused(channel);
     play(channel, { index: found.index === null ? undefined : found.index, ids });
   }
 
@@ -1402,7 +1435,7 @@
     // Network: the feed may not exist yet (broadcast not started, or not
     // propagated), or Swarm is slow. Keep trying; a live channel shows up.
     const waiting = !everPlayed;
-    const tooLarge = waiting && channel && headHeld(channel);
+    const tooLarge = waiting && channel && headHeld(channel) && headTooLarge(channel);
     setOverlay(tooLarge ? HEAD_REFUSED_OVERLAY : waiting ? 'Waiting for the broadcast to start…' : 'Reconnecting…');
     const why = feed.lastError ? `: ${feed.lastError.message}` : '';
     setStatus(`${data.details}${data.response && data.response.code ? ` (${data.response.code})` : ''}${why}, retrying`);
@@ -1631,6 +1664,10 @@
     // asks only the markers for now.
     get headHeld() {
       return !!channel && headHeld(channel);
+    },
+    // ... and refused twice in a row: over the budget, held for minutes.
+    get headTooLarge() {
+      return !!channel && headHeld(channel) && headTooLarge(channel);
     },
     get hls() {
       return hls;

@@ -14,7 +14,9 @@
 //    feed-service.js, docs/swarm-provider-api.md), and Freedom's
 //    permission-free read budget: 120 requests / 512 KiB per fixed 60 s
 //    window (SWARM_MAX_REQUESTS to lower it), refused with
-//    `-32602 rate_limited`. NO_SWARM=1 leaves it out.
+//    `-32602 rate_limited`. NO_SWARM=1 leaves it out. PREFILL_BYTES=<n>
+//    starts the first window with n bytes already spent, as another tab
+//    on the origin (or the page before a reload) would leave it.
 //
 // Run with Electron (Freedom ships 44.x), against test/fake-gateway.mjs or
 // a real gateway (antd):
@@ -58,6 +60,7 @@ protocol.registerSchemesAsPrivileged([
 const WINDOW_MS = 60000;
 const MAX_REQUESTS = Number(process.env.SWARM_MAX_REQUESTS || 120);
 const MAX_BYTES = 512 * 1024;
+const PREFILL_BYTES = Number(process.env.PREFILL_BYTES || 0);
 const provider = {
   calls: {}, refused: 0, windows: [], current: null,
 };
@@ -70,7 +73,7 @@ async function swarmRead(method, params) {
   // A fixed window from the first read, as Freedom keeps it.
   const now = Date.now();
   if (!provider.current || now - provider.current.start >= WINDOW_MS) {
-    provider.current = { start: now, requests: 0, bytes: 0 };
+    provider.current = { start: now, requests: 0, bytes: provider.windows.length ? 0 : PREFILL_BYTES };
     provider.windows.push(provider.current);
   }
   const w = provider.current;
@@ -278,7 +281,8 @@ app.whenReady().then(async () => {
   }
   state.feed = await win.webContents.executeJavaScript(`(() => {
     const f = window.antstreamPlayer && window.antstreamPlayer.feed;
-    return f ? { index: f.index, cursor: f.cursor, joinedVia: f.joinedVia } : null;
+    const p = window.antstreamPlayer;
+    return f ? { index: f.index, cursor: f.cursor, joinedVia: f.joinedVia, headHeld: p.headHeld, headTooLarge: p.headTooLarge } : null;
   })()`);
   state.requests = {
     bzz: seen.filter((s) => !s.includes(PLAYER)).length,

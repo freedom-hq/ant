@@ -104,10 +104,15 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   steps past its slot without reading it (the next broadcast continues
   the feed after it), and one who opens the channel after such a
   broadcast ended can't join through the head (it returns the whole
-  recording) and should use an HTTP gateway. The player tells them so,
-  and after one refused head read it joins through the ladder markers
-  only for five minutes instead of spending a budget window on the head
-  every retry; a new broadcast on the channel is found that way.
+  recording) and should use an HTTP gateway. Freedom's budget is per
+  origin, so a head that fits can be refused too when another tab (or
+  the page before a reload) already spent part of the window: after a
+  first refused head read the player reads it once more in a fresh
+  window. Only a second refusal in a row counts as "too large": the
+  player tells them so and joins through the ladder markers only for
+  five minutes instead of spending a budget window on the head every
+  retry; a new broadcast on the channel is found that way, and clears
+  the hold.
 
 ## Keeping the buffer full
 
