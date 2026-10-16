@@ -529,7 +529,7 @@ async fn push_act_chunks(
     let guard = handle
         .activity
         .begin(GatewayRequestKind::Bytes, "act-store".to_string());
-    push_chunks(handle, chunks, batch_id, timeout, &guard).await
+    push_chunks(handle, chunks, batch_id, timeout, false, &guard).await
 }
 
 // --- grantee list handlers ------------------------------------------------------

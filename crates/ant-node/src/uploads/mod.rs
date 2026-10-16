@@ -585,6 +585,7 @@ async fn push_attempt(
             batch_id,
             stamp: None,
             require_deep: require_deep_receipts(),
+            ack_when_stored: false,
             ack: ack_tx,
         })
         .await

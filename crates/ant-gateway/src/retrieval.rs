@@ -136,6 +136,23 @@ const SWARM_TAG_UID: HeaderName = HeaderName::from_static("swarm-tag-uid");
 /// Required: the node selects the matching registered issuer, so a
 /// missing / malformed / unknown batch is a `400` (bee's shape).
 const SWARM_POSTAGE_BATCH_ID: HeaderName = HeaderName::from_static("swarm-postage-batch-id");
+
+/// `ant-ack-when-stored: true` on `POST /bytes` and `POST /bzz` (ant's
+/// own, not bee's; issue #212): answer the upload once every chunk is
+/// *stored*, its first receipt, shallow or deep, and let the hunt for a
+/// deeper storer that a shallow receipt starts finish in the background
+/// (see `ControlCommand::PushChunk::ack_when_stored`). For a live
+/// broadcast's segments, where each one's upload holds back every later
+/// one. Absent or anything but `true`, the upload answers once every
+/// push is done, as always.
+const ANT_ACK_WHEN_STORED: HeaderName = HeaderName::from_static("ant-ack-when-stored");
+
+fn parse_ack_when_stored(headers: &HeaderMap) -> bool {
+    headers
+        .get(&ANT_ACK_WHEN_STORED)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
 /// Bee request header on `POST /chunks` and `POST /soc/...`: a complete
 /// **pre-signed** 113-byte postage stamp (hex), layout `batch_id(32) ‖
 /// index(8) ‖ timestamp(8) ‖ sig(65)` — bee's `postage.Stamp`
@@ -797,6 +814,7 @@ pub async fn upload_chunk(
         // hunt, exactly like bee's own pusher (strict receipts are the
         // upload-job manager's policy, not the HTTP API's).
         require_deep: false,
+        ack_when_stored: false,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -1084,6 +1102,7 @@ pub async fn upload_pss(
         batch_id,
         stamp: None,
         require_deep: false,
+        ack_when_stored: false,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -1298,6 +1317,7 @@ pub async fn upload_soc(
         wire,
         batch_id,
         stamp: stamp.map(|s| s.to_vec()),
+        ack_when_stored: false,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -1469,11 +1489,16 @@ pub async fn upload_bzz(
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, batch_id, timeout, &guard).await
-    {
-        return err_resp;
-    }
-    if let Err(err_resp) = push_replica_socs(&handle, &assembled.replicas, batch_id, timeout).await
+    if let Err(err_resp) = push_upload(
+        &handle,
+        &assembled.chunks,
+        &assembled.replicas,
+        batch_id,
+        timeout,
+        parse_ack_when_stored(&headers),
+        &guard,
+    )
+    .await
     {
         return err_resp;
     }
@@ -1649,11 +1674,17 @@ pub async fn upload_bytes(
         );
         guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-        if let Err(err_resp) = push_chunks(&handle, &split.chunks, batch_id, timeout, &guard).await
+        if let Err(err_resp) = push_upload(
+            &handle,
+            &split.chunks,
+            &replicas,
+            batch_id,
+            timeout,
+            parse_ack_when_stored(&headers),
+            &guard,
+        )
+        .await
         {
-            return err_resp;
-        }
-        if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
             return err_resp;
         }
         if pin {
@@ -1724,10 +1755,17 @@ pub async fn upload_bytes(
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &split.chunks, batch_id, timeout, &guard).await {
-        return err_resp;
-    }
-    if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
+    if let Err(err_resp) = push_upload(
+        &handle,
+        &split.chunks,
+        &replicas,
+        batch_id,
+        timeout,
+        parse_ack_when_stored(&headers),
+        &guard,
+    )
+    .await
+    {
         return err_resp;
     }
     if pin {
@@ -1821,10 +1859,17 @@ pub async fn create_feed(
     let total_chunks = manifest.chunks.len() + replicas.len();
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &manifest.chunks, batch_id, timeout, &guard).await {
-        return err_resp;
-    }
-    if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
+    if let Err(err_resp) = push_upload(
+        &handle,
+        &manifest.chunks,
+        &replicas,
+        batch_id,
+        timeout,
+        false,
+        &guard,
+    )
+    .await
+    {
         return err_resp;
     }
 
@@ -2194,12 +2239,14 @@ pub(crate) fn upload_error_status(message: &str) -> StatusCode {
 /// commands. Bounded by `MAX_PUSH_CONCURRENCY` so a 1 K-chunk file
 /// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
 /// HTTP error response on the first chunk that fails to push.
+/// `ack_when_stored`: see [`ANT_ACK_WHEN_STORED`].
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 pub(crate) async fn push_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
     batch_id: [u8; 32],
     timeout: std::time::Duration,
+    ack_when_stored: bool,
     guard: &ActiveRequestGuard,
 ) -> Result<(), Response> {
     let total = chunks.len() as u64;
@@ -2217,6 +2264,7 @@ pub(crate) async fn push_chunks(
                 stamp: None,
                 // Bee-parity accept-shallow (see POST /chunks above).
                 require_deep: false,
+                ack_when_stored,
                 ack: ack_tx,
             };
             if handle.commands.send(cmd).await.is_err() {
@@ -2277,6 +2325,33 @@ pub(crate) async fn push_chunks(
     Ok(())
 }
 
+/// Push an upload's content chunks and its dispersed-replica SOCs
+/// **together**, not one after the other: the response waits for the
+/// slowest push either way, and a second phase that only starts once
+/// every content chunk has a receipt added its own slowest push (a
+/// replica SOC hunting a deep storer, seconds) on top of the first's.
+/// On a live broadcast that serial phase doubled a 150 KB segment's
+/// mean upload time at redundancy level 1 (issue #212). The first
+/// failure answers the request, as before; the other side's pushes
+/// are dropped with it. `ack_when_stored`: see [`ANT_ACK_WHEN_STORED`].
+#[allow(clippy::result_large_err)]
+async fn push_upload(
+    handle: &GatewayHandle,
+    chunks: &[SplitChunk],
+    replicas: &[SplitChunk],
+    batch_id: [u8; 32],
+    timeout: std::time::Duration,
+    ack_when_stored: bool,
+    guard: &ActiveRequestGuard,
+) -> Result<(), Response> {
+    futures::future::try_join(
+        push_chunks(handle, chunks, batch_id, timeout, ack_when_stored, guard),
+        push_replica_socs(handle, replicas, batch_id, timeout, ack_when_stored),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Push dispersed-replica SOC chunks (minted by
 /// `ant_retrieval::replica_chunks`) via `PushSoc` control commands —
 /// the upload-side counterpart of bee's `replicas.NewPutter`, which
@@ -2289,6 +2364,7 @@ async fn push_replica_socs(
     replicas: &[SplitChunk],
     batch_id: [u8; 32],
     timeout: std::time::Duration,
+    ack_when_stored: bool,
 ) -> Result<(), Response> {
     let push_one = |chunk: SplitChunk| {
         let handle = handle.clone();
@@ -2299,6 +2375,7 @@ async fn push_replica_socs(
                 wire: chunk.wire,
                 batch_id,
                 stamp: None,
+                ack_when_stored,
                 ack: ack_tx,
             };
             if handle.commands.send(cmd).await.is_err() {
