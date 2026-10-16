@@ -342,7 +342,58 @@ jobs:
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
 
+      # --- Portrait broadcast (#194) ---
+      # A portrait broadcast must be encoded as real portrait frames
+      # (360x640, identity track matrix), not as landscape frames the
+      # picture was squeezed into. `-antstream-shot-portrait` runs the
+      # test pattern through the real writer as a phone held upright
+      # would (it sets the broadcast's orientation, fixed at Go live
+      # since #193, whatever the layout); the step reads the app's own on-disk segment ring (the same
+      # bytes the publisher uploads), checks the init segment's geometry,
+      # and grabs a frame as AVFoundation presents it: the pattern's white
+      # disc must be round in a portrait frame. The camera path's rotation
+      # (AVCaptureConnection.videoRotationAngle) needs a device.
+      - name: Portrait broadcast geometry
+        working-directory: examples/ios-stream
+        run: |
+          set -euo pipefail
+          SEGS="$(xcrun simctl get_app_container booted baby.freedom.antstream data)/Library/Caches/antstream/segments"
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          rm -rf "$SEGS"
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-portrait
+          sleep 45
+          xcrun simctl io booted screenshot shots/31-live-portrait.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          mkdir -p shots/portrait
+          ls -l "$SEGS"
+          cp "$SEGS"/* shots/portrait/
+          INIT=$(ls "$SEGS"/init-*.mp4 | sort -V | head -1)
+          N=${INIT##*/init-}; N=${N%.mp4}
+          # The init segment and the media segments that follow it, as one
+          # fragmented MP4.
+          { cat "$INIT"; for i in $(seq $((N + 1)) $((N + 5))); do
+              f="$SEGS/seg-$i.m4s"; [ -f "$f" ] && cat "$f"; done; } > shots/portrait/portrait.mp4
+          python3 ci/mp4-geometry.py --expect portrait "$INIT" | tee shots/portrait/geometry.txt
+          swift ci/frame-grab.swift shots/portrait/portrait.mp4 shots/32-portrait-frame.png 2 \
+            | tee -a shots/portrait/geometry.txt
+          # The other way round: a broadcast started with the interface in
+          # landscape (no portrait flag) is encoded 640x360, so the check
+          # above passes because the orientation reached the writer, not
+          # because every broadcast comes out portrait.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          rm -rf "$SEGS"
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-landscape
+          sleep 45
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          mkdir -p shots/landscape
+          cp "$SEGS"/* shots/landscape/
+          INIT=$(ls "$SEGS"/init-*.mp4 | sort -V | head -1)
+          python3 ci/mp4-geometry.py --expect landscape "$INIT" | tee shots/landscape/geometry.txt
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: antstream-simulator-evidence
           path: examples/ios-stream/shots/

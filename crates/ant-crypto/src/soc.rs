@@ -29,6 +29,27 @@ pub const SOC_HEADER_SIZE: usize = SOC_ID_SIZE + SOC_SIG_SIZE;
 /// span. Anything below this can't possibly be a valid SOC chunk.
 pub const SOC_MIN_CHUNK_SIZE: usize = SOC_HEADER_SIZE + SPAN_SIZE;
 
+/// Owner address of every dispersed replica SOC: the Ethereum address of
+/// the well-known private key [`REPLICAS_OWNER_SECRET`] (bee
+/// `swarm.ReplicasOwner`).
+pub const REPLICAS_OWNER: [u8; 20] = [
+    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
+    0x5a, 0x76, 0x17, 0xb5,
+];
+
+/// The well-known private key behind [`REPLICAS_OWNER`] (bee
+/// `pkg/replicas/replicas.go`: `crypto.DecodeSecp256k1PrivateKey(
+/// append([]byte{1}, make([]byte, 31)...))`). Deliberately public —
+/// anyone must be able to mint (and verify) dispersed replicas of any
+/// chunk; the upload side signs replica SOCs with it. Because anyone can
+/// sign with it, [`soc_valid`] additionally pins a replica SOC's id to
+/// the chunk it wraps (check 4).
+pub const REPLICAS_OWNER_SECRET: [u8; 32] = {
+    let mut k = [0u8; 32];
+    k[0] = 1;
+    k
+};
+
 /// Validate a single-owner-chunk whose wire bytes are
 /// `id ‖ sig ‖ inner_cac` (where `inner_cac = span(8 LE) ‖ payload`).
 /// **No outer span** — that's what `swarm.Chunk.Data()` returns for a
@@ -46,6 +67,12 @@ pub const SOC_MIN_CHUNK_SIZE: usize = SOC_HEADER_SIZE + SPAN_SIZE;
 /// 3. The signature recovers an Ethereum address `owner_eth` such that
 ///    `keccak256(id ‖ owner_eth) == expected_addr` (the SOC's
 ///    self-binding property).
+/// 4. If `owner_eth` is [`REPLICAS_OWNER`] (a dispersed replica), bytes
+///    `1..32` of the id equal bytes `1..32` of the inner CAC's address.
+///    The replicas key is public, so without this anyone could sign a
+///    SOC at a genuine replica id wrapping arbitrary content (bee
+///    `soc.Valid`, ethersphere/bee#5640). Byte 0 is free: it's the
+///    replica's dispersal nibble.
 ///
 /// Like Bee's `soc.Valid`, this is a self-validating check: it doesn't
 /// take an external owner — recovering the owner *is* the validation.
@@ -92,6 +119,9 @@ pub fn soc_valid(expected_addr: &[u8; 32], wire: &[u8]) -> bool {
         return false;
     };
     let owner = ethereum_address_from_public_key(&pubkey);
+    if owner == REPLICAS_OWNER && inner_cac_addr[1..] != id[1..] {
+        return false;
+    }
 
     let mut soc_addr_input = [0u8; SOC_ID_SIZE + 20];
     soc_addr_input[..SOC_ID_SIZE].copy_from_slice(id);
@@ -205,6 +235,65 @@ mod tests {
         // The recovered owner from the tampered sig won't equal the
         // real owner, so the recomputed address can't match real_addr.
         assert!(!soc_valid(&real_addr, &wire));
+    }
+
+    /// Build `id ‖ sig ‖ inner_cac` signed by `secret`, returning the
+    /// SOC address and wire bytes.
+    fn signed_soc(secret: &[u8; 32], id: &[u8; 32], payload: &[u8]) -> ([u8; 32], Vec<u8>) {
+        let sk = SigningKey::from_bytes(&(*secret).into()).unwrap();
+        let owner = ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        let (inner_cac_addr, inner_cac_wire) = cac_new(payload).unwrap();
+        let mut digest_input = [0u8; 64];
+        digest_input[..32].copy_from_slice(id);
+        digest_input[32..].copy_from_slice(&inner_cac_addr);
+        let sig = sign_handshake_data(secret, &keccak256(&digest_input)).unwrap();
+        let mut soc_addr_input = [0u8; 52];
+        soc_addr_input[..32].copy_from_slice(id);
+        soc_addr_input[32..].copy_from_slice(&owner);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(&inner_cac_wire);
+        (keccak256(&soc_addr_input), wire)
+    }
+
+    /// The public replicas key derives the well-known replicas owner.
+    #[test]
+    fn replicas_secret_derives_owner() {
+        let sk = SigningKey::from_bytes(&REPLICAS_OWNER_SECRET.into()).unwrap();
+        let owner = ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        assert_eq!(owner, REPLICAS_OWNER);
+    }
+
+    /// A genuine dispersed replica (`id` = wrapped chunk's address with
+    /// byte 0 replaced) validates; a SOC signed with the same public key
+    /// at the same id but wrapping different content lands at the very
+    /// same address and must be rejected (bee#5640).
+    #[test]
+    fn forged_replica_soc_rejected() {
+        let payload = b"genuine replicated root";
+        let (root, _) = cac_new(payload).unwrap();
+        let mut id = root;
+        id[0] = 0x80;
+
+        let (addr, wire) = signed_soc(&REPLICAS_OWNER_SECRET, &id, payload);
+        assert!(soc_valid(&addr, &wire), "genuine replica must validate");
+
+        let (forged_addr, forged_wire) =
+            signed_soc(&REPLICAS_OWNER_SECRET, &id, b"attacker content");
+        assert_eq!(forged_addr, addr, "forgery sits at the replica address");
+        assert!(
+            !soc_valid(&forged_addr, &forged_wire),
+            "replica SOC wrapping other content must be rejected"
+        );
+    }
+
+    /// The replica id rule only binds the replicas owner: any other
+    /// owner may use an arbitrary id.
+    #[test]
+    fn non_replica_owner_id_unconstrained() {
+        let (addr, wire) = signed_soc(&[7u8; 32], &[0x80u8; 32], b"anything");
+        assert!(soc_valid(&addr, &wire));
     }
 
     /// Wire bytes shorter than the minimum SOC layout are rejected

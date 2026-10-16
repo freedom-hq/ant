@@ -89,6 +89,21 @@ of up to 3 s, this took 150 s of playback from 18 stalls (21 s stalled) to
 5 (0.5 s); with 4–9 s feed reads and segment reads of up to 5 s, from
 16 stalls (37 s) to 6 (2.6 s).
 
+## Portrait streams
+
+The stage takes the picture's own aspect from `videoWidth`/`videoHeight`
+(16:9 until the first frame), at most 80vh tall, with `object-fit:
+contain`. `test/portrait-test.mjs` checks it in Freedom's Electron at a
+desktop and a phone-sized window, for a portrait stream (480×640, what the
+apps publish), an older portrait broadcast stored sideways with a rotate-90
+track matrix, and a landscape one: the element box must have the display
+aspect and a disc drawn in every frame must come out round. Each run then
+opens a channel that never loads, and the stage must go back to 16:9.
+
+```sh
+ELECTRON=<path to electron> node test/portrait-test.mjs   # needs ffmpeg, xvfb-run
+```
+
 ## Debug panel
 
 The **Debug** button (or `?debug` in the URL) opens a panel with:

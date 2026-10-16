@@ -47,8 +47,16 @@ struct LiveView: View {
     @State private var landscape = false
     /// The camera preview turns its picture upright-portrait relative to
     /// the interface (its preview angle is 90°/270°), as reported by
-    /// ``CameraPreview``. `nil` until a preview runs.
-    @State private var previewAnglePortrait: Bool?
+    /// ``CameraPreview``, with the session it was reported for. `nil`
+    /// until a preview runs. A reading from an earlier session (a failed
+    /// engine replaced, the preview reopened) is ignored until the new
+    /// preview reports its own (``previewFrameTall``).
+    @State private var previewAngle: PreviewAngle?
+
+    struct PreviewAngle: Equatable {
+        let session: ObjectIdentifier
+        let portrait: Bool
+    }
 
     init(resume: Bool = false) {
         _resumePending = State(initialValue: resume)
@@ -248,11 +256,11 @@ struct LiveView: View {
     /// them, instead of a 16:9 box laid across the portrait interface
     /// around a picture standing the other way.
     private var previewFrameTall: Bool {
-        guard broadcast.engine?.previewSession != nil,
-              let previewPortrait = previewAnglePortrait,
+        guard let session = broadcast.engine?.previewSession,
+              let angle = previewAngle, angle.session == ObjectIdentifier(session),
               let capturePortrait = broadcast.capturePortrait
         else { return broadcast.portrait }
-        let turned = previewPortrait != capturePortrait
+        let turned = angle.portrait != capturePortrait
         return broadcast.portrait != turned
     }
 
@@ -260,7 +268,8 @@ struct LiveView: View {
     private var previewContent: some View {
         if let session = broadcast.engine?.previewSession {
             CameraPreview(session: session, camera: broadcast.previewCamera) { portrait in
-                if previewAnglePortrait != portrait { previewAnglePortrait = portrait }
+                let next = PreviewAngle(session: ObjectIdentifier(session), portrait: portrait)
+                if previewAngle != next { previewAngle = next }
             }
         } else if let problem = broadcast.previewProblem {
             previewPlaceholder(icon: "video.slash", text: problem) {
@@ -844,7 +853,11 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ view: PreviewView, context: Context) {
         view.onPreviewAngle = onPreviewAngle
         if view.previewLayer.session !== session {
+            // A new engine's session (a failed one replaced, the preview
+            // reopened) brings a new preview connection: turn and report
+            // it afresh, even for the same camera.
             view.previewLayer.session = session
+            view.forgetCamera()
         }
         view.follow(camera)
     }
@@ -854,6 +867,15 @@ struct CameraPreview: UIViewRepresentable {
         private var rotationObservation: NSKeyValueObservation?
         private var followedCamera: String?
         var onPreviewAngle: (Bool) -> Void = { _ in }
+
+        /// The next ``follow(_:)`` sets up even for the camera it already
+        /// follows: the session, and so the connection, changed.
+        func forgetCamera() {
+            followedCamera = nil
+            rotationObservation?.invalidate()
+            rotationObservation = nil
+            rotationCoordinator = nil
+        }
 
         /// Keep the preview upright for `camera`, as the interface turns.
         /// A camera flip brings a new device and a new coordinator.
@@ -883,8 +905,10 @@ struct CameraPreview: UIViewRepresentable {
             connection.videoRotationAngle = angle
             // Reported after the current view update: `follow` runs inside
             // SwiftUI's make/update, where state must not change.
+            // The closure current now is the one for this session.
             let portrait = CaptureEngine.isPortrait(captureAngle: angle)
-            Task { @MainActor [weak self] in self?.onPreviewAngle(portrait) }
+            let report = onPreviewAngle
+            Task { @MainActor in report(portrait) }
         }
 
         override static var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }

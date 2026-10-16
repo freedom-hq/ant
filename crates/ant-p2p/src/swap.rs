@@ -286,7 +286,9 @@ struct LedgerSnapshot {
 /// the **trust anchor**: every accepted cheque must
 ///
 /// 1. carry a `cumulative_payout` strictly greater than what we have
-///    on file for that chequebook,
+///    on file for that chequebook — except the first cheque after a
+///    damaged figure (see below), which has nothing to compare against
+///    and is accepted as the new baseline with no monotonic check,
 /// 2. recover to the same issuer EOA that signed the first cheque
 ///    we ever accepted from that chequebook (sticky binding), and
 /// 3. signature-verify against the cheque's own `Chequebook` /
@@ -299,6 +301,17 @@ struct LedgerSnapshot {
 /// the new cheque unrecorded — bee's cumulative model means the
 /// peer just re-emits the same (or higher) cheque on the next
 /// connection and we accept it then.
+///
+/// A stored `cumulative_payout_dec` that isn't a decimal number
+/// (bee#5656: an empty string, which `U256::from_dec_str` reads as
+/// zero) is not dropped: [`Self::open`] keeps the entry, so the issuer
+/// pin (rule 2) still holds, and logs a warning for it. The next cheque
+/// from that chequebook is checked against rules 2 and 3 only and
+/// becomes the new baseline, crediting nothing (`rebaseline`); rule 1
+/// applies again from the cheque after it. The true previous figure is
+/// gone, so a cheque at or below it can't be told apart from a new
+/// payment once the baseline is set; see `rebaseline` for what that
+/// costs.
 pub struct CreditLedger {
     inner: Mutex<LedgerSnapshot>,
     persist_path: Option<PathBuf>,
@@ -314,7 +327,9 @@ impl CreditLedger {
     /// Build an empty ledger backed by `persist_path` (or memory-only
     /// if `None`). Loads any existing snapshot if the file exists; an
     /// unreadable / unparseable snapshot is treated as empty after
-    /// logging — better to lose history than refuse to start.
+    /// logging — better to lose history than refuse to start. An entry
+    /// whose cumulative isn't a decimal number is kept (its issuer pin
+    /// still applies) with a warning; the next cheque rebaselines it.
     pub fn open(persist_path: Option<PathBuf>, chain_id: u64, our_beneficiary: [u8; 20]) -> Self {
         let inner = match &persist_path {
             Some(p) if p.exists() => match std::fs::read(p) {
@@ -326,6 +341,19 @@ impl CreditLedger {
                             chequebooks = snap.cheques.len(),
                             "loaded credit ledger snapshot",
                         );
+                        for (k, c) in &snap.cheques {
+                            if parse_stored_cumulative(&c.cumulative_payout_dec).is_none() {
+                                warn!(
+                                    target: "ant_p2p::swap",
+                                    path = %p.display(),
+                                    chequebook = %k,
+                                    stored = ?c.cumulative_payout_dec,
+                                    "stored cumulative is not a decimal number; \
+                                     the next cheque from this chequebook \
+                                     becomes its baseline and credits nothing",
+                                );
+                            }
+                        }
                         snap
                     }
                     Err(e) => {
@@ -357,9 +385,11 @@ impl CreditLedger {
     }
 
     /// Apply `signed` to the ledger, returning the previous
-    /// cumulative payout for that chequebook (zero on first sight).
-    /// Validates: signature, beneficiary, monotonicity, sticky-issuer
-    /// binding. A pure read-only check (no ledger mutation) is
+    /// cumulative payout for that chequebook (zero on first sight; the
+    /// cheque's own cumulative when the stored one is damaged, see
+    /// [`rebaseline`]). Validates: signature, beneficiary, sticky-issuer
+    /// binding, and monotonicity against the stored figure (skipped when
+    /// that figure is damaged and this cheque becomes the baseline). A pure read-only check (no ledger mutation) is
     /// available via [`Self::would_accept`].
     pub fn record_accepted(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
         if signed.cheque.beneficiary != self.our_beneficiary {
@@ -373,7 +403,8 @@ impl CreditLedger {
         let chequebook_key = hex::encode(signed.cheque.chequebook);
         let recovered_hex = hex::encode(recovered);
         let mut guard = self.inner.lock().expect("ledger mutex poisoned");
-        let prev_cum = match guard.cheques.get(&chequebook_key) {
+        let warn_rebaseline = true;
+        let stored = match guard.cheques.get(&chequebook_key) {
             Some(c) => {
                 if c.issuer_eoa_hex != recovered_hex {
                     return Err(SwapError::Rejected(format!(
@@ -382,12 +413,15 @@ impl CreditLedger {
                         c.issuer_eoa_hex,
                     )));
                 }
-                U256::from_dec_str(&c.cumulative_payout_dec)
-                    .map_err(|e| SwapError::Decimal(format!("stored cumulative: {e}")))?
+                parse_stored_cumulative(&c.cumulative_payout_dec)
             }
-            None => U256::zero(),
+            None => Some(U256::zero()),
         };
-        if signed.cheque.cumulative_payout <= prev_cum {
+        let prev_cum = match stored {
+            Some(prev) => prev,
+            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
+        };
+        if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
             return Err(SwapError::Rejected(format!(
                 "non-monotonic cheque for 0x{chequebook_key}: cum={} <= stored={}",
                 signed.cheque.cumulative_payout, prev_cum,
@@ -427,19 +461,23 @@ impl CreditLedger {
         let chequebook_key = hex::encode(signed.cheque.chequebook);
         let recovered_hex = hex::encode(recovered);
         let guard = self.inner.lock().expect("ledger mutex poisoned");
-        let prev_cum = match guard.cheques.get(&chequebook_key) {
+        let warn_rebaseline = false;
+        let stored = match guard.cheques.get(&chequebook_key) {
             Some(c) => {
                 if c.issuer_eoa_hex != recovered_hex {
                     return Err(SwapError::Rejected(format!(
                         "issuer for chequebook 0x{chequebook_key} changed",
                     )));
                 }
-                U256::from_dec_str(&c.cumulative_payout_dec)
-                    .map_err(|e| SwapError::Decimal(format!("stored cumulative: {e}")))?
+                parse_stored_cumulative(&c.cumulative_payout_dec)
             }
-            None => U256::zero(),
+            None => Some(U256::zero()),
         };
-        if signed.cheque.cumulative_payout <= prev_cum {
+        let prev_cum = match stored {
+            Some(prev) => prev,
+            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
+        };
+        if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
             return Err(SwapError::Rejected(format!(
                 "non-monotonic cumulative payout {} <= stored {}",
                 signed.cheque.cumulative_payout, prev_cum,
@@ -456,7 +494,7 @@ impl CreditLedger {
         let key = hex::encode(chequebook);
         let guard = self.inner.lock().expect("ledger mutex poisoned");
         match guard.cheques.get(&key) {
-            Some(c) => U256::from_dec_str(&c.cumulative_payout_dec).unwrap_or(U256::zero()),
+            Some(c) => parse_stored_cumulative(&c.cumulative_payout_dec).unwrap_or(U256::zero()),
             None => U256::zero(),
         }
     }
@@ -480,6 +518,48 @@ impl CreditLedger {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+}
+
+/// A stored cumulative as a `U256`: a non-empty string of ASCII digits
+/// that fits. `None` for anything else — an empty string, a sign, an
+/// exponent, spaces, too large. Stricter than `U256::from_dec_str`, which
+/// reads `""` as zero (bee#5656).
+fn parse_stored_cumulative(s: &str) -> Option<U256> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    U256::from_dec_str(s).ok()
+}
+
+/// The previous cumulative for `signed` when the stored one is damaged
+/// (bee#5656). That figure is not zero — read as zero, a re-sent old
+/// cheque would be credited in full again — and not a reason to refuse
+/// the chequebook for good either. The incoming cheque becomes the new
+/// baseline instead: it is accepted and recorded, and the previous
+/// cumulative reported for it is its own, so it credits nothing. Cheques
+/// after it credit their increase as usual.
+///
+/// This is not exact in either direction, because the real previous
+/// figure is lost. An honest peer, whose next cheque is above it, loses
+/// that one cheque's increase. A peer that instead re-sends its older
+/// cheques in ascending order gets the first one as the baseline and
+/// every increase after it, up to the lost figure, credited a second
+/// time; the stored figure meanwhile drops back to the replayed value
+/// until the peer's cheques pass it again. What can be credited twice is
+/// bounded by the lost figure minus the replayed baseline (at most the
+/// lost figure) and is accounting credit only: the chequebook pays out on
+/// the highest cumulative, so no extra money is cashed.
+fn rebaseline(key: &str, signed: &SignedCheque, log: bool) -> U256 {
+    if log {
+        warn!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            cumulative = %signed.cheque.cumulative_payout,
+            "stored cumulative for chequebook is not a decimal number; \
+             taking this cheque as the new baseline, crediting nothing for it",
+        );
+    }
+    signed.cheque.cumulative_payout
 }
 
 fn persist_snapshot(path: &Path, snap: &LedgerSnapshot) -> std::io::Result<()> {
@@ -1403,7 +1483,8 @@ impl Drop for JournalStore {
 /// line. A torn tail ([`journal_intact_len`]: a last line without its
 /// newline, or a NUL-filled range a crash left) was cut off mid-write and
 /// never confirmed (no cheque went out on it), so it is skipped; any other line
-/// that doesn't parse means the journal is damaged, and it is moved aside
+/// that doesn't parse, or holds a cumulative that isn't a decimal number
+/// ([`bad_cumulative`]), means the journal is damaged, and it is moved aside
 /// like an unparseable file (its figures count as lost), reading as empty.
 /// `Ok(vec![])` when it doesn't exist; an I/O error is returned.
 fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String, String>>> {
@@ -1422,7 +1503,13 @@ fn load_journal(path: &Path, part: &Path) -> std::io::Result<Vec<HashMap<String,
             continue;
         }
         match serde_json::from_slice::<HashMap<String, String>>(line) {
-            Ok(m) => lines.push(m),
+            Ok(m) => {
+                if let Some(bad) = bad_cumulative(&m) {
+                    quarantine_outbound_file(path, part, &format!("line {}: {bad}", n + 1))?;
+                    return Ok(Vec::new());
+                }
+                lines.push(m);
+            }
             Err(e) => {
                 quarantine_outbound_file(path, part, &format!("line {}: {e}", n + 1))?;
                 return Ok(Vec::new());
@@ -1634,7 +1721,8 @@ fn flag_survivors(survivors: &[Arc<OutboundShared>]) {
 }
 
 /// Read `path`. `Ok(None)` when it doesn't exist. A file that is
-/// neither shape is moved aside (see [`OutboundLedger`]) and reads as
+/// neither shape, or holds a cumulative that isn't a decimal number
+/// ([`bad_cumulative`]), is moved aside (see [`OutboundLedger`]) and reads as
 /// missing; an I/O error, which may pass, is returned.
 fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
     let bytes = match std::fs::read(path) {
@@ -1642,16 +1730,41 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-        Ok(flat) => Ok(Some(OutboundFile::from_flat(flat))),
-        Err(e) => {
-            if let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) {
-                return Ok(Some(nested));
+    let file = match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        Ok(flat) => {
+            if let Some(bad) = bad_cumulative(&flat) {
+                quarantine_outbound_file(path, path, &bad)?;
+                return Ok(None);
             }
-            quarantine_outbound_file(path, path, &e)?;
-            Ok(None)
+            OutboundFile::from_flat(flat)
         }
+        Err(e) => {
+            let Ok(nested) = serde_json::from_slice::<OutboundFile>(&bytes) else {
+                quarantine_outbound_file(path, path, &e)?;
+                return Ok(None);
+            };
+            nested
+        }
+    };
+    if let Some(bad) = file.chequebooks.values().find_map(bad_cumulative) {
+        quarantine_outbound_file(path, path, &bad)?;
+        return Ok(None);
     }
+    Ok(Some(file))
+}
+
+/// The first entry of a stored `key → cumulative` map whose cumulative
+/// isn't a decimal number that fits a `U256` (empty, a sign, an exponent,
+/// any non-digit, too large), described for the quarantine message. Such
+/// an entry can't be skipped as absent: its cheques would restart from
+/// zero (`0 + amount`, which the peer rejects as not increasing), the
+/// issued total would read low, and the next write would replace the
+/// real figure with the lower one (bee#5656). The ledger it is in is
+/// moved aside instead, its figures lost, like unparseable JSON.
+fn bad_cumulative(map: &HashMap<String, String>) -> Option<String> {
+    map.iter()
+        .find(|(_, v)| parse_stored_cumulative(v).is_none())
+        .map(|(k, v)| format!("entry {k:?} has cumulative {v:?}, not a decimal number"))
 }
 
 /// Move `part` — the outbound ledger at `path` or one of its journals —
@@ -2913,9 +3026,9 @@ async fn read_delimited<R: AsyncReadExt + Unpin>(
             format!("message too large: {len} bytes (cap {max})"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(buf)
+    // Grows with the bytes that arrive, not the declared `len`, so a peer
+    // can't pin the cap per stream by declaring a frame and stalling (#203).
+    ant_retrieval::frame::read_frame_body(r, len).await
 }
 
 async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<usize> {
@@ -3589,6 +3702,121 @@ mod tests {
         assert!(matches!(err, SwapError::Rejected(_)));
     }
 
+    /// A damaged stored cumulative (bee#5656) is neither zero nor a
+    /// permanent refusal: the next cheque becomes the baseline and credits
+    /// nothing, so the re-sent old cheque isn't credited again in full,
+    /// and later cheques credit their increase. The issuer pin still holds.
+    #[test]
+    fn a_damaged_inbound_cumulative_rebaselines_instead_of_reading_zero() {
+        let issuer_secret = make_secret();
+        let our_eoa = [0xaau8; 20];
+        let cb = [0x77u8; 20];
+        let cheque = |cum: u64, secret: &[u8; SECP256K1_SECRET_LEN]| {
+            let c = Cheque {
+                chequebook: cb,
+                beneficiary: our_eoa,
+                cumulative_payout: U256::from(cum),
+            };
+            sign_cheque(secret, &c, 100).unwrap()
+        };
+        for bad in ["", "abc", "-5", "1e3", " 7", &"9".repeat(80)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credits.json");
+            CreditLedger::open(Some(path.clone()), 100, our_eoa)
+                .record_accepted(&cheque(1_000, &issuer_secret))
+                .unwrap();
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["cheques"][hex::encode(cb)]["cumulative_payout_dec"] = bad.into();
+            std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+            let ledger = CreditLedger::open(Some(path.clone()), 100, our_eoa);
+            // Another key can't take the chequebook over while it's damaged.
+            let attacker = make_secret();
+            assert!(
+                matches!(
+                    ledger.record_accepted(&cheque(2_000, &attacker)),
+                    Err(SwapError::Rejected(_))
+                ),
+                "{bad:?}: issuer pin lost",
+            );
+            // The old cheque, re-sent: accepted as the baseline, credits 0.
+            let old = cheque(1_000, &issuer_secret);
+            assert_eq!(
+                ledger.would_accept(&old).unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}"
+            );
+            assert_eq!(
+                ledger.record_accepted(&old).unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}: re-sent cheque credited again"
+            );
+            // Replayed again: now refused as non-monotonic.
+            assert!(matches!(
+                ledger.record_accepted(&old),
+                Err(SwapError::Rejected(_))
+            ));
+            // A higher cheque credits only its increase, and survives a reopen.
+            assert_eq!(
+                ledger
+                    .record_accepted(&cheque(1_200, &issuer_secret))
+                    .unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}"
+            );
+            let reopened = CreditLedger::open(Some(path), 100, our_eoa);
+            assert_eq!(reopened.cumulative_for(&cb), U256::from(1_200u64));
+        }
+    }
+
+    /// What [`rebaseline`]'s doc admits: after a damaged figure, a peer
+    /// re-sending its older cheques in ascending order is credited the
+    /// increases above the replayed baseline a second time, bounded by
+    /// the lost figure, and the stored figure follows the replay down.
+    /// Pinned so the doc and the behaviour can't drift apart again.
+    #[test]
+    fn a_replay_after_a_damaged_inbound_cumulative_is_bounded_by_the_lost_figure() {
+        let issuer_secret = make_secret();
+        let our_eoa = [0xaau8; 20];
+        let cb = [0x78u8; 20];
+        let cheque = |cum: u64| {
+            let c = Cheque {
+                chequebook: cb,
+                beneficiary: our_eoa,
+                cumulative_payout: U256::from(cum),
+            };
+            sign_cheque(&issuer_secret, &c, 100).unwrap()
+        };
+        let credit =
+            |l: &CreditLedger, cum: u64| U256::from(cum) - l.record_accepted(&cheque(cum)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credits.json");
+        let ledger = CreditLedger::open(Some(path.clone()), 100, our_eoa);
+        let mut first = U256::zero();
+        for cum in [1_000, 1_200, 1_500] {
+            first += credit(&ledger, cum);
+        }
+        assert_eq!(first, U256::from(1_500u64));
+        drop(ledger);
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snap["cheques"][hex::encode(cb)]["cumulative_payout_dec"] = "".into();
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let ledger = CreditLedger::open(Some(path), 100, our_eoa);
+        let mut replayed = U256::zero();
+        for cum in [1_000, 1_200, 1_500] {
+            replayed += credit(&ledger, cum);
+        }
+        // 1000 is the baseline (0); 1200 and 1500 credit 500 again.
+        assert_eq!(replayed, U256::from(500u64));
+        assert!(replayed <= U256::from(1_500u64 - 1_000));
+        assert_eq!(ledger.cumulative_for(&cb), U256::from(1_500u64));
+        // Past the lost figure, cheques credit only their real increase.
+        assert_eq!(credit(&ledger, 1_700), U256::from(200u64));
+    }
+
     /// Outbound ledger persists across restarts and rejects
     /// going-backwards mistakes by surfacing the previous value.
     #[test]
@@ -4223,6 +4451,85 @@ mod tests {
         drop(ledger);
         let reopened = OutboundLedger::open(Some(path), [0xc1; 20]);
         assert_eq!(reopened.cumulative_for(&peer), U256::from(70u64));
+    }
+
+    /// A stored cumulative that isn't a decimal number (bee#5656) is a
+    /// loss, not an absent entry: read as absent, the next cheque would
+    /// restart from zero and a write would replace the real figure. Both
+    /// on-disk shapes are checked; the file is moved aside and the
+    /// chequebook's figures count as lost until confirmed.
+    #[test]
+    fn a_non_numeric_cumulative_is_a_loss_not_zero() {
+        let cb = [0xc1u8; 20];
+        let peer = [0x11u8; 20];
+        let good = format!("{}:{}", hex::encode(cb), hex::encode([0x22u8; 20]));
+        let bad_key = format!("{}:{}", hex::encode(cb), hex::encode(peer));
+        for bad in ["", "abc", "-5", "1e3", " 7", &"9".repeat(80)] {
+            for nested in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("pushsync_outbound.json");
+                let body = if nested {
+                    serde_json::json!({"chequebooks": {hex::encode(cb): {
+                        hex::encode([0x22u8; 20]): "40",
+                        hex::encode(peer): bad,
+                    }}})
+                } else {
+                    serde_json::json!({ good.clone(): "40", bad_key.clone(): bad })
+                };
+                let bytes = serde_json::to_vec(&body).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+
+                let ledger = OutboundLedger::open(Some(path.clone()), cb);
+                ledger.ensure_readable().unwrap();
+                let why = ledger.lost_figures();
+                assert!(why.is_some(), "{bad:?} nested={nested}: not a loss");
+                assert!(!path.exists(), "{bad:?} nested={nested}: not moved");
+                let aside: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .filter(|n| n.starts_with("pushsync_outbound.json.corrupt-"))
+                    .collect();
+                assert_eq!(aside.len(), 1, "{bad:?} nested={nested}: {aside:?}");
+                assert_eq!(std::fs::read(dir.path().join(&aside[0])).unwrap(), bytes);
+            }
+        }
+    }
+
+    /// A journal line whose cumulative isn't a decimal number is a damaged
+    /// journal: moved aside, the figures lost, like an unparseable line.
+    #[test]
+    fn a_journal_line_with_a_non_numeric_cumulative_is_a_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc1u8; 20];
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.record_issued(&beneficiary(1), U256::from(10u64)).unwrap();
+        crash(&path, [l]);
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&path))
+            .unwrap();
+        let line = format!(
+            "{{\"{}:{}\":\"abc\"}}\n",
+            hex::encode(cb),
+            hex::encode(beneficiary(1))
+        );
+        std::io::Write::write_all(&mut j, line.as_bytes()).unwrap();
+        drop(j);
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        l.ensure_readable().unwrap();
+        assert!(l.lost_figures().is_some());
+        assert!(!journal_path(&path).exists(), "journal not moved aside");
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(std::fs::read_to_string(dir.path().join(&aside[0]))
+            .unwrap()
+            .contains("\"abc\""));
     }
 
     /// Moving a ledger aside loses its chequebooks' figures (PR #126

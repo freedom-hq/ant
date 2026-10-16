@@ -122,7 +122,14 @@ final class LiveBroadcast: ObservableObject {
     @Published private(set) var resumePortrait: Bool?
 
     /// The shape the picture currently has.
-    var picturePortrait: Bool { capturePortrait ?? layoutPortrait }
+    var picturePortrait: Bool { capturePortrait ?? Self.shotPortrait ?? layoutPortrait }
+
+    /// `-antstream-shot-portrait` makes the test pattern a portrait
+    /// broadcast whatever the layout (#194's CI geometry check), the shape
+    /// a phone held upright produces. Only where there is no camera
+    /// reading: ``capturePortrait`` still wins.
+    private static let shotPortrait: Bool? =
+        RootView.shotArgs.contains("-antstream-shot-portrait") ? true : nil
 
     /// Pin the next broadcast to the orientation the unfinished broadcast
     /// of `owner` went out in (#175), or release it (`nil`).

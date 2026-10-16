@@ -36,10 +36,12 @@ import kotlin.math.abs
  * hands finished segments to [onSegment] in order.
  *
  * The activity is locked to the broadcast's orientation while live. The
- * camera's frames are encoded as the sensor delivers them; the rotation
- * that makes them upright for that orientation (none for landscape on
- * usual sensors, 90° or 270° for portrait) is recorded in the track
- * header, as phone cameras do for portrait video.
+ * camera's frames are turned upright for that orientation before they are
+ * encoded (none for landscape on usual sensors, 90° or 270° for portrait,
+ * see [UprightRenderer]), so a portrait broadcast is real portrait frames
+ * (e.g. 480×640) with an identity track matrix (#194): a rotation flag in
+ * the track header is ignored or misapplied by enough players (a sideways
+ * or squeezed picture in Chromium) that the stream must not rely on it.
  */
 class CaptureEngine(
     private val context: Context,
@@ -81,6 +83,7 @@ class CaptureEngine(
     private var session: CameraCaptureSession? = null
     private var videoCodec: MediaCodec? = null
     private var encoderSurface: Surface? = null
+    private var renderer: UprightRenderer? = null
     private var audioThread: Thread? = null
     @Volatile private var running = false
     @Volatile private var realtimeClock = false
@@ -92,8 +95,18 @@ class CaptureEngine(
     var hasAudio = false
         private set
 
-    /** The encoded frame size; the preview uses the same aspect. */
+    /**
+     * The camera's frame size, as the sensor delivers it (landscape); the
+     * preview uses the same aspect.
+     */
     lateinit var videoSize: Size
+        private set
+
+    /**
+     * The encoded frame size: [videoSize] turned upright, so portrait
+     * (e.g. 480×640) when the frames need a quarter turn.
+     */
+    lateinit var encodedSize: Size
         private set
 
     /** True while the front (selfie) camera is in use. */
@@ -110,17 +123,35 @@ class CaptureEngine(
     private val cameraId: String
         get() = cameraIdFor(frontCamera) ?: cameraIdFor(!frontCamera) ?: cameraManager.cameraIdList.first()
 
-    /** Whether this device has both a front and a back camera to switch between. */
-    val canSwitchCamera: Boolean
-        get() = cameraIdFor(true) != null && cameraIdFor(false) != null
+    /** Whether this device has both a front and a back camera at all. */
+    val hasBothCameras: Boolean
+        get() = cameraIdFor(false) != null && cameraIdFor(true) != null
 
     /**
-     * Rotation that makes this camera's frames upright for the locked
-     * screen orientation (landscape = `ROTATION_90`, portrait =
-     * `ROTATION_0`), written into the track header so players turn the
-     * picture: back cameras turn against the display, front cameras with
-     * it. Landscape on the usual 90° back / 270° front sensors needs none;
-     * portrait needs 90° / 270°, a vertical video like any phone camera's.
+     * Whether this device has both a front and a back camera to switch
+     * between live. The encoder keeps its frame shape across a switch, so
+     * the two cameras must need the same kind of turn for this orientation
+     * (both a quarter turn, or neither): on a device whose sensors are
+     * mounted a quarter apart, the other camera's upright frames would be
+     * the other shape and come out stretched, so there is no live switch.
+     */
+    val canSwitchCamera: Boolean
+        get() {
+            val back = cameraIdFor(false) ?: return false
+            val front = cameraIdFor(true) ?: return false
+            return quarterTurn(cameraManager.getCameraCharacteristics(back)) ==
+                quarterTurn(cameraManager.getCameraCharacteristics(front))
+        }
+
+    private fun quarterTurn(chars: CameraCharacteristics): Boolean = rotationFor(chars) % 180 != 0
+
+    /**
+     * Clockwise rotation that makes this camera's frames upright for the
+     * locked screen orientation (landscape = `ROTATION_90`, portrait =
+     * `ROTATION_0`), applied to every frame by [UprightRenderer]: back
+     * cameras turn against the display, front cameras with it. Landscape
+     * on the usual 90° back / 270° front sensors needs none; portrait needs
+     * 90° / 270°, a vertical video like any phone camera's.
      */
     private fun rotationFor(chars: CameraCharacteristics): Int {
         val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -133,7 +164,14 @@ class CaptureEngine(
 
     /** Pick the frame size before the preview surface is laid out. */
     fun prepare(): Size {
-        videoSize = chooseSize()
+        // Fixed for the broadcast: a camera switch keeps the encoder. Both
+        // cameras of a phone usually need the same quarter turns for an
+        // orientation (90° back / 270° front for portrait), so the
+        // switched-to camera's upright frames have the same shape; where
+        // they don't, [canSwitchCamera] is false.
+        val quarter = quarterTurn(cameraManager.getCameraCharacteristics(cameraId))
+        videoSize = chooseSize(quarter)
+        encodedSize = if (quarter) Size(videoSize.height, videoSize.width) else videoSize
         return videoSize
     }
 
@@ -155,7 +193,7 @@ class CaptureEngine(
         hasAudio = audioRecord != null
         segmenter = Segmenter(settings.segmentSeconds * 1_000_000L, hasAudio, onSegment)
         try {
-            startVideoEncoder(rotation)
+            startVideoEncoder()
         } catch (e: Exception) {
             fail("video encoder: ${e.message}")
             return
@@ -171,49 +209,122 @@ class CaptureEngine(
      * Switch between the front and back camera, live: the encoder keeps
      * running and only the camera feeding its input surface changes, so the
      * broadcast goes on with a short freeze. A camera whose frames need a
-     * different rotation gets a fresh initialization segment.
+     * different rotation (front and back sensors usually face opposite
+     * ways) is turned differently by [UprightRenderer]; the encoded frames
+     * keep their size and orientation, so the stream needs no new
+     * initialization segment.
+     *
+     * The renderer holds (drops) frames from the moment the switch starts
+     * until the old camera has reported itself closed, and only then takes
+     * the new camera's turn: a frame of the old camera still queued on the
+     * GL thread is never drawn with the new camera's angle (half a turn off
+     * for 90° back / 270° front in portrait).
+     *
+     * Taps while a switch is still underway never run two cameras at once:
+     * while the old camera closes they just retarget the pending open, and
+     * while the new camera is still opening they are latched and applied
+     * (an even number cancelling out) once it reports opened.
      */
     fun switchCamera() {
-        cameraHandler.post {
-            if (!running || !canSwitchCamera) return@post
-            runCatching { session?.stopRepeating() }
-            runCatching { session?.close() }
-            session = null
-            camera?.close()
-            camera = null
+        cameraHandler.post { switchNow() }
+    }
+
+    /** [switchCamera]'s body, on the camera thread. */
+    private fun switchNow() {
+        if (!running || !canSwitchCamera) return
+        if (!switchLatch.tap()) {
+            // The previous switch's camera hasn't opened yet: switching
+            // now would open a second one alongside it. The tap is applied
+            // once it is open.
+            return
+        }
+        if (closing != null) {
+            // A switch is still waiting for its camera to close: just
+            // change where it goes (the pending step reads both fields).
             frontCamera = !frontCamera
-            val chars = cameraManager.getCameraCharacteristics(cameraId)
-            this.chars = chars
-            val r = rotationFor(chars)
-            if (r != rotation) {
-                rotation = r
-                segmenter.reconfigure(r)
-            }
+            val next = cameraManager.getCameraCharacteristics(cameraId)
+            chars = next
+            rotation = rotationFor(next)
+            return
+        }
+        renderer?.hold()
+        runCatching { session?.stopRepeating() }
+        runCatching { session?.close() }
+        session = null
+        val old = camera
+        camera = null
+        frontCamera = !frontCamera
+        val chars = cameraManager.getCameraCharacteristics(cameraId)
+        this.chars = chars
+        rotation = rotationFor(chars)
+        var opened = false
+        val next = next@{
+            if (opened || !running) return@next
+            opened = true
+            closing = null
+            renderer?.resume(rotation)
             // Cut promptly: the next segment starts on the new camera.
             runCatching {
                 videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
             }
             openCamera(cameraId)
         }
+        if (old == null) {
+            next()
+        } else {
+            closing = old to next
+            old.close()
+            // onClosed should come within milliseconds; never leave the
+            // broadcast frozen on a camera that fails to report it.
+            cameraHandler.postDelayed({ next() }, CLOSE_TIMEOUT_MS)
+        }
     }
+
+    /** The camera being closed by [switchCamera], and what runs once it is. */
+    private var closing: Pair<CameraDevice, () -> Unit>? = null
+
+    /** Switch taps that arrive while a camera is still opening. */
+    private val switchLatch = SwitchLatch()
 
     @SuppressLint("MissingPermission")
     private fun openCamera(id: String) {
+        switchLatch.startOpen()
         cameraManager.openCamera(
             id,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    val switchAgain = switchLatch.opened()
+                    if (!running) {
+                        // Stopped while it was opening.
+                        device.close()
+                        return
+                    }
                     camera = device
+                    if (switchAgain) {
+                        // Switched again while this camera was opening:
+                        // close it straight away and open the other one.
+                        switchNow()
+                        if (camera == device) startSession(device)
+                        return
+                    }
                     startSession(device)
                 }
 
+                override fun onClosed(device: CameraDevice) {
+                    // By now the old camera has let go of the renderer's
+                    // surface: no further frame of it can arrive.
+                    closing?.let { (d, next) -> if (d == device) next() }
+                }
+
                 override fun onDisconnected(device: CameraDevice) {
+                    switchLatch.failed()
                     device.close()
                     camera = null
                     fail("the camera was taken by another app")
                 }
 
                 override fun onError(device: CameraDevice, error: Int) {
+                    switchLatch.failed()
                     device.close()
                     camera = null
                     fail("camera error $error")
@@ -255,7 +366,7 @@ class CaptureEngine(
 
     @Suppress("DEPRECATION")
     private fun startSession(device: CameraDevice, onConfigured: (() -> Unit)? = null) {
-        val encoderSurface = encoderSurface ?: return
+        val encoderSurface = renderer?.inputSurface ?: return
         val chars = chars ?: return
         val preview = previewSurface
         device.createCaptureSession(
@@ -306,6 +417,10 @@ class CaptureEngine(
             previewSurface?.release()
             previewSurface = null
             encoderHandler.post {
+                // Stop drawing into the encoder's surface before the
+                // encoder goes away.
+                renderer?.release()
+                renderer = null
                 runCatching { videoCodec?.stop() }
                 runCatching { videoCodec?.release() }
                 videoCodec = null
@@ -335,8 +450,8 @@ class CaptureEngine(
 
     // -- video -------------------------------------------------------------
 
-    private fun startVideoEncoder(rotation: Int) {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, videoSize.width, videoSize.height).apply {
+    private fun startVideoEncoder() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodedSize.width, encodedSize.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, settings.bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, settings.frameRate)
@@ -371,7 +486,7 @@ class CaptureEngine(
                         fail("the video encoder gave no H.264 parameters")
                         return
                     }
-                    segmenter.setVideoConfig(Fmp4Muxer.VideoConfig(videoSize.width, videoSize.height, sps, pps, rotation))
+                    segmenter.setVideoConfig(Fmp4Muxer.VideoConfig(encodedSize.width, encodedSize.height, sps, pps))
                 }
 
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
@@ -381,7 +496,18 @@ class CaptureEngine(
             encoderHandler,
         )
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoderSurface = codec.createInputSurface()
+        val input = codec.createInputSurface()
+        encoderSurface = input
+        // The camera renders into the renderer, which draws each frame
+        // upright into the encoder's input surface.
+        renderer = try {
+            UprightRenderer(input, videoSize.width, videoSize.height, encodedSize.width, encodedSize.height, rotation)
+        } catch (e: Exception) {
+            input.release()
+            encoderSurface = null
+            codec.release()
+            throw e
+        }
         codec.start()
         videoCodec = codec
     }
@@ -393,7 +519,7 @@ class CaptureEngine(
      * bigger frame: many cameras lack a small 16:9 size, and 640x480 beats
      * 1280x720 for a 360p budget.
      */
-    private fun chooseSize(): Size {
+    private fun chooseSize(quarterTurn: Boolean): Size {
         val caps = avcCapabilities()
         val ids = listOfNotNull(cameraIdFor(false), cameraIdFor(true)).ifEmpty { listOf(cameraId) }
         val perCamera = ids.map { id ->
@@ -402,8 +528,12 @@ class CaptureEngine(
             val preview = map?.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
             encoder intersect preview
         }
+        // The encoder takes the frames upright: turned a quarter, a size
+        // is encoded the other way round.
         var usable = perCamera.reduce { a, b -> a intersect b }
-            .filter { caps?.isSizeSupported(it.width, it.height) ?: true }
+            .filter { s ->
+                caps?.let { if (quarterTurn) it.isSizeSupported(s.height, s.width) else it.isSizeSupported(s.width, s.height) } ?: true
+            }
         if (usable.isEmpty()) usable = perCamera.first().toList()
         val q = settings.quality
         val wide = { s: Size -> abs(s.width * 9 - s.height * 16) <= 16 }
@@ -530,5 +660,6 @@ class CaptureEngine(
     companion object {
         private const val TAG = "CaptureEngine"
         private const val AUDIO_RATE = 48_000
+        private const val CLOSE_TIMEOUT_MS = 1_000L
     }
 }

@@ -60,24 +60,11 @@ pub const MAX_LEVEL: u8 = 4;
 /// Dispersed replica counts per level (bee `redundancy.GetReplicaCounts`).
 pub const REPLICA_COUNTS: [usize; 5] = [0, 2, 4, 8, 16];
 
-/// Owner address of every dispersed replica SOC: the Ethereum address of
-/// the well-known private key `0x01 ‖ [0u8; 31]` (bee
-/// `swarm.ReplicasOwner`).
-pub const REPLICAS_OWNER: [u8; 20] = [
-    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
-    0x5a, 0x76, 0x17, 0xb5,
-];
-
-/// The well-known private key behind [`REPLICAS_OWNER`] (bee
-/// `pkg/replicas/replicas.go`: `crypto.DecodeSecp256k1PrivateKey(
-/// append([]byte{1}, make([]byte, 31)...))`). Deliberately public —
-/// anyone must be able to mint (and verify) dispersed replicas of any
-/// chunk; the upload side signs replica SOCs with it.
-pub const REPLICAS_OWNER_SECRET: [u8; 32] = {
-    let mut k = [0u8; 32];
-    k[0] = 1;
-    k
-};
+/// Owner address of every dispersed replica SOC and its well-known
+/// private key. They live in [`ant_crypto::soc`] (where `soc_valid`
+/// enforces the replica id rule) and are re-exported here so existing
+/// paths keep working.
+pub use ant_crypto::soc::{REPLICAS_OWNER, REPLICAS_OWNER_SECRET};
 
 /// How many sibling shard fetches a recovery sweep keeps in flight at
 /// once. The sweep touches at most 128 chunks; 16 matches the joiner's
@@ -367,11 +354,23 @@ pub fn reference_count_enc(span: u64, level: u8) -> (usize, usize) {
 /// Shared geometry of `reference_count`(`_enc`): brute-force the BMT
 /// level whose per-reference capacity covers `span`, then count the
 /// references needed on that level.
+///
+/// All arithmetic saturates (bee v2.8.3's security fix,
+/// <https://github.com/ethersphere/bee/pull/5664>, and the same shape as
+/// `ant-crypto`'s `enc_reference_count`). `span` is untrusted: besides
+/// fetched chunks, [`recovered_wire_len`] calls this on an RS-reconstructed
+/// shard *before* its content address is checked, and an uploader picks
+/// those bytes through the parities. With plain `*=` a span above 2^61
+/// (branching 128) wrapped `branch_size` to 0, so the first loop never
+/// ended — a busy loop with no await point that pinned a tokio worker
+/// (release) or panicked (debug). Saturating stops the walk at
+/// `u64::MAX`; results for every span that didn't overflow are unchanged,
+/// and an oversized span yields at most `branching` shards.
 fn count_data_shards(span: u64, branching: u64) -> usize {
     let mut branch_size = CHUNK_SIZE as u64;
     let mut branch_level: u32 = 1;
     while branch_size < span {
-        branch_size *= branching;
+        branch_size = branch_size.saturating_mul(branching);
         branch_level += 1;
     }
     // Capacity of one reference at this node's level:
@@ -379,13 +378,13 @@ fn count_data_shards(span: u64, branching: u64) -> usize {
     let mut reference_size = CHUNK_SIZE as u64;
     let mut i = 1;
     while i + 1 < branch_level {
-        reference_size *= branching;
+        reference_size = reference_size.saturating_mul(branching);
         i += 1;
     }
     let mut data_shards = 1usize;
     let mut span_offset = reference_size;
     while span_offset < span {
-        span_offset += reference_size;
+        span_offset = span_offset.saturating_add(reference_size);
         data_shards += 1;
     }
     data_shards
@@ -1188,6 +1187,45 @@ mod tests {
         assert_eq!(reference_count(614_400, 1), (2, 3));
         // Exactly one full branch.
         assert_eq!(reference_count(4096 * 119, 1), (119, 9));
+    }
+
+    /// Spans that used to overflow `count_data_shards`' unchecked
+    /// arithmetic (bee#5664): above 2^61, `branch_size` wrapped to 0 and
+    /// the level walk spun forever. Every level must now return a shard
+    /// count within its branching, and a recovered shard carrying such a
+    /// span must get a wire length (or `None`) instead of hanging.
+    #[test]
+    fn reference_count_saturates_on_huge_spans() {
+        for level in 0..=MAX_LEVEL {
+            for span in [1u64 << 62, u64::MAX] {
+                let (shards, _) = reference_count(span, level);
+                assert!(
+                    (1..=128).contains(&shards),
+                    "plain level {level} span {span}: {shards}"
+                );
+                assert!(
+                    shards <= max_shards(level),
+                    "plain level {level} span {span}: {shards}"
+                );
+                let (shards, _) = reference_count_enc(span, level);
+                assert!(
+                    (1..=64).contains(&shards),
+                    "enc level {level} span {span}: {shards}"
+                );
+                assert!(
+                    shards <= max_enc_shards(level),
+                    "enc level {level} span {span}: {shards}"
+                );
+            }
+        }
+        // The recovered-shard path from the issue: a zero-padded 4104-byte
+        // shard whose span reads 2^62 (`00 .. 00 40`). A level-encoded span
+        // can't carry that bit (the top byte holds the level), so the plain
+        // span is the one that reached the overflow.
+        let mut shard = vec![0u8; SPAN_SIZE + CHUNK_SIZE];
+        shard[..SPAN_SIZE].copy_from_slice(&(1u64 << 62).to_le_bytes());
+        let len = recovered_wire_len(&shard).expect("2^62 span fits a chunk");
+        assert!(len <= SPAN_SIZE + CHUNK_SIZE);
     }
 
     /// Replica derivation matches the pinned bee vector for the base

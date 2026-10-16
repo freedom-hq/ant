@@ -39,6 +39,60 @@ protocol.registerSchemesAsPrivileged([
 
 const seen = [];
 
+// MEASURE=1: where the picture actually lands on screen, for the aspect
+// test (test/portrait-test.mjs). The fixtures draw one bright disc on a
+// dark frame; its bounding box in a capture of the video element says
+// whether the picture is upright-and-round or squeezed, whatever the
+// element's own box claims.
+async function measure(win) {
+  // Hide the native controls and the badge/overlay text so they can't be
+  // mistaken for the disc, and bring the whole element on screen.
+  await win.webContents.executeJavaScript(`(() => {
+    const v = document.getElementById('video');
+    v.controls = false;
+    for (const id of ['badge', 'overlay']) document.getElementById(id).style.visibility = 'hidden';
+    v.scrollIntoView({ block: 'start' });
+  })()`);
+  await new Promise((r) => setTimeout(r, 400));
+  const box = await win.webContents.executeJavaScript(`(() => {
+    const v = document.getElementById('video');
+    const r = v.getBoundingClientRect();
+    const w = document.querySelector('.video-wrap').getBoundingClientRect();
+    return {
+      video: { x: r.x, y: r.y, width: r.width, height: r.height },
+      wrap: { width: w.width, height: w.height },
+      videoWidth: v.videoWidth, videoHeight: v.videoHeight,
+      viewport: { width: innerWidth, height: innerHeight },
+      dpr: devicePixelRatio,
+    };
+  })()`);
+  const rect = {
+    x: Math.round(box.video.x), y: Math.round(box.video.y),
+    width: Math.round(box.video.width), height: Math.round(box.video.height),
+  };
+  const img = await win.webContents.capturePage(rect);
+  const { width, height } = img.getSize();
+  const px = img.toBitmap(); // BGRA
+  let minX = width, minY = height, maxX = -1, maxY = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      if (px[i] > 215 && px[i + 1] > 215 && px[i + 2] > 215) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  box.capture = { width, height };
+  box.disc = maxX < 0 ? null : {
+    width: maxX - minX + 1, height: maxY - minY + 1,
+    cx: (minX + maxX) / 2 / width, cy: (minY + maxY) / 2 / height,
+  };
+  return box;
+}
+
 app.whenReady().then(async () => {
   protocol.handle('bzz', async (request) => {
     const u = new URL(request.url);
@@ -50,7 +104,8 @@ app.whenReady().then(async () => {
     return new Response(res.body, { status: res.status, headers: res.headers });
   });
 
-  const win = new BrowserWindow({ width: 1280, height: 900, show: true, webPreferences: { sandbox: true } });
+  const win = new BrowserWindow({
+    width: Number(process.env.WIDTH || 1280), height: Number(process.env.HEIGHT || 900), useContentSize: true, show: true, webPreferences: { sandbox: true } });
   win.webContents.on('console-message', (e) => {
     const { level, message } = e;
     if (level === 'error' || level === 'warning' || /error/i.test(message)) console.error(`[page] ${message}`);
@@ -96,6 +151,18 @@ app.whenReady().then(async () => {
       }),
     };
   })()`);
+  if (process.env.MEASURE) state.geometry = await measure(win);
+  if (process.env.SWITCH_TO) {
+    // Open another channel (one that never loads) and report the stage's
+    // shape a moment later: it must not keep the last channel's aspect.
+    await win.webContents.executeJavaScript(`location.hash = ${JSON.stringify(process.env.SWITCH_TO)}`);
+    await new Promise((r) => setTimeout(r, 3000));
+    state.afterSwitch = await win.webContents.executeJavaScript(`(() => {
+      const w = document.querySelector('.video-wrap');
+      const r = w.getBoundingClientRect();
+      return { width: r.width, height: r.height, aspect: w.style.getPropertyValue('--aspect'), size: document.getElementById('video').videoWidth + 'x' + document.getElementById('video').videoHeight };
+    })()`);
+  }
   if (process.env.DUMP_LOG) {
     const entries = await win.webContents.executeJavaScript(`JSON.stringify(window.antstreamPlayer.log.entries)`);
     require('fs').writeFileSync(process.env.DUMP_LOG, entries);

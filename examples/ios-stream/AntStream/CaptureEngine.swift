@@ -586,14 +586,19 @@ final class CaptureEngine: NSObject {
     }
 
     private func applyRotation(_ angle: CGFloat) {
-        let portrait = Self.isPortrait(captureAngle: angle)
+        let connection = videoOutput?.connection(with: .video)
+        var changed = false
+        if let connection, connection.isVideoRotationAngleSupported(angle),
+           connection.videoRotationAngle != angle {
+            connection.videoRotationAngle = angle
+            changed = true
+        }
+        // Whatever angle the connection ended up at decides the buffers'
+        // shape (#194), so that is the orientation reported, not the
+        // request (which an unsupported angle leaves unapplied).
+        let portrait = Self.isPortrait(captureAngle: connection?.videoRotationAngle ?? angle)
         Task { @MainActor [onOrientationChange] in onOrientationChange?(portrait) }
-        guard let connection = videoOutput?.connection(with: .video),
-              connection.isVideoRotationAngleSupported(angle),
-              connection.videoRotationAngle != angle
-        else { return }
-        connection.videoRotationAngle = angle
-        if state.isRunning { restartWriter() }
+        if changed, state.isRunning { restartWriter() }
     }
 
     // MARK: - Writer
@@ -915,9 +920,12 @@ final class CaptureEngine: NSObject {
         testPatternFrame += 1
     }
 
-    /// A moving bar over a slowly-shifting background. Deliberately not
-    /// a static image: identical frames encode to nothing, which would
-    /// make the segments unrepresentative of real video.
+    /// A moving bar over a slowly-shifting background, with a white disc
+    /// in the middle. Deliberately not a static image: identical frames
+    /// encode to nothing, which would make the segments unrepresentative
+    /// of real video. The disc shows the frame's geometry: it is round
+    /// only if nothing between here and the viewer stretched the picture
+    /// (#194).
     private func makeTestPixelBuffer() -> CVPixelBuffer? {
         if pixelBufferPool == nil {
             let attributes: [String: Any] = [
@@ -944,11 +952,18 @@ final class CaptureEngine: NSObject {
         let phase = Double(testPatternFrame)
         let barX = Int((sin(phase / 18.0) * 0.4 + 0.5) * Double(width - 40))
         let shade = UInt8(24 + 24 * (sin(phase / 40.0) * 0.5 + 0.5))
+        let radius = min(width, height) / 4
+        let (cx, cy) = (width / 2, height / 2)
         for y in 0..<height {
             let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
             for x in 0..<width {
                 let inBar = x >= barX && x < barX + 40
+                let inDisc = (x - cx) * (x - cx) + (y - cy) * (y - cy) < radius * radius
                 let p = row.advanced(by: x * 4)
+                if inDisc {
+                    p[0] = 255; p[1] = 255; p[2] = 255; p[3] = 255
+                    continue
+                }
                 p[0] = inBar ? 200 : shade                       // B
                 p[1] = inBar ? 90 : UInt8(shade / 2)             // G
                 p[2] = inBar ? 40 : UInt8(y * 200 / max(1, height)) // R

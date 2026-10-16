@@ -298,8 +298,10 @@ The broadcast's orientation is picked by holding the phone: portrait
 live and then fixed for the whole broadcast. It follows the camera's
 picture (the device as physically held), not the interface, so it is the
 same with Portrait Orientation Lock on or in a narrow iPad window.
-Turning the phone after that keeps the picture upright, with black bars
-inside the fixed frame. A resumed broadcast (#175) keeps the orientation
+Either way the frames are encoded upright at that size with no track
+rotation (#194), so no player has to turn or unsqueeze them. Turning the
+phone after that keeps the picture upright, with black bars inside the
+fixed frame. A resumed broadcast (#175) keeps the orientation
 it went out in (one before this choice existed was landscape).
 
 Interruptions (incoming call, backgrounding, camera flip, orientation,

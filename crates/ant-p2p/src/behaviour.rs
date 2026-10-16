@@ -820,7 +820,11 @@ struct SwarmState {
     /// All peer ids we've ever had a hint for, whether enqueued or already
     /// dialed. Stops hive's Peers broadcasts from queueing the same peer
     /// repeatedly as every bootnode gossips its neighbourhood to us.
+    /// Rebuilt from `hint_queue` once it passes twice
+    /// [`KNOWN_DIALABLE_CAP`] (see `enqueue_hint`).
     seen_hints: HashSet<PeerId>,
+    /// FIFO of hints waiting to be dialed, at most [`KNOWN_DIALABLE_CAP`]
+    /// long (the oldest is evicted).
     hint_queue: VecDeque<sinks::PeerHint>,
     /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
     allow_private_dials: bool,
@@ -1477,6 +1481,31 @@ impl SwarmState {
             || !self.seen_hints.insert(hint.peer_id)
         {
             return;
+        }
+        // Issue #202: bound the queue and its dedup set. With a full peer
+        // set `fill_pipeline_from_hints` drains nothing, so a peer
+        // streaming fabricated hive adverts would otherwise grow both
+        // without limit. Evict the oldest queued hint and forget its
+        // dedup entry, so fresh gossip can re-queue it later.
+        if self.hint_queue.len() >= KNOWN_DIALABLE_CAP {
+            if let Some(evicted) = self.hint_queue.pop_front() {
+                if evicted.peer_id != hint.peer_id {
+                    self.seen_hints.remove(&evicted.peer_id);
+                }
+            }
+        }
+        // `seen_hints` also keeps every peer already popped and dialed.
+        // Past twice the cap, rebuild it from what is still queued: the
+        // dialed peers are forgotten, as the churn re-warm in
+        // `maybe_top_up_peers` already does wholesale, and live / mid-dial
+        // peers stay filtered by the checks above.
+        if self.seen_hints.len() > 2 * KNOWN_DIALABLE_CAP {
+            self.seen_hints = self
+                .hint_queue
+                .iter()
+                .map(|h| h.peer_id)
+                .chain(std::iter::once(hint.peer_id))
+                .collect();
         }
         self.hint_queue.push_back(hint);
     }
@@ -10107,6 +10136,65 @@ mod tests {
             addrs: vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
             overlay,
         }
+    }
+
+    /// Issue #202: a peer streaming fabricated public hints must not grow
+    /// `hint_queue` / `seen_hints` without bound. The queue holds at most
+    /// `KNOWN_DIALABLE_CAP` (oldest evicted, and forgotten by the dedup so
+    /// gossip can re-queue it), and `seen_hints` is rebuilt from the queue
+    /// once dialed peers push it past twice the cap.
+    #[tokio::test]
+    async fn enqueue_hint_bounds_queue_and_dedup() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = PeerId::random();
+
+        let peers: Vec<PeerId> = (0..KNOWN_DIALABLE_CAP + 10)
+            .map(|_| PeerId::random())
+            .collect();
+        for (i, peer) in peers.iter().enumerate() {
+            state.enqueue_hint(hint_in_bin(*peer, 0x80, i as u8), local);
+        }
+        assert_eq!(state.hint_queue.len(), KNOWN_DIALABLE_CAP);
+        assert!(state.seen_hints.len() <= 2 * KNOWN_DIALABLE_CAP);
+        for evicted in &peers[..10] {
+            assert!(!state.seen_hints.contains(evicted));
+            assert!(state.hint_queue.iter().all(|h| h.peer_id != *evicted));
+        }
+        assert_eq!(state.hint_queue[0].peer_id, peers[10]);
+        assert_eq!(
+            state.hint_queue.back().unwrap().peer_id,
+            *peers.last().unwrap()
+        );
+
+        // An evicted peer can be re-queued by fresh gossip.
+        state.enqueue_hint(hint_in_bin(peers[0], 0x80, 0), local);
+        assert_eq!(state.hint_queue.back().unwrap().peer_id, peers[0]);
+        assert_eq!(state.hint_queue.len(), KNOWN_DIALABLE_CAP);
+
+        // Dialed peers (popped from the queue, still deduped) pile up in
+        // `seen_hints`; past twice the cap it is rebuilt from the queue.
+        state
+            .seen_hints
+            .extend((0..=KNOWN_DIALABLE_CAP).map(|_| PeerId::random()));
+        assert_eq!(state.seen_hints.len(), 2 * KNOWN_DIALABLE_CAP + 1);
+        let fresh = PeerId::random();
+        state.enqueue_hint(hint_in_bin(fresh, 0x80, 1), local);
+        assert_eq!(state.hint_queue.len(), KNOWN_DIALABLE_CAP);
+        assert_eq!(state.seen_hints.len(), KNOWN_DIALABLE_CAP);
+        assert!(state.seen_hints.contains(&fresh));
+        assert!(state
+            .hint_queue
+            .iter()
+            .all(|h| state.seen_hints.contains(&h.peer_id)));
     }
 
     /// Issue #88: a hive hint's pod/RFC1918/loopback underlays must never

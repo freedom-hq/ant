@@ -369,6 +369,12 @@ impl StampIssuer {
                 self.bucket_depth
             )));
         }
+        if new_depth - self.bucket_depth > MAX_BUCKET_SPAN {
+            return Err(PostageError::Msg(format!(
+                "new depth {new_depth} exceeds bucket_depth {} by more than {MAX_BUCKET_SPAN}",
+                self.bucket_depth
+            )));
+        }
         if new_depth < self.batch_depth {
             return Err(PostageError::Msg(format!(
                 "refusing to lower batch depth {} → {new_depth}",
@@ -390,6 +396,12 @@ impl StampIssuer {
             return Err(PostageError::Msg(
                 "bucketDepth must be >0 and < batchDepth".into(),
             ));
+        }
+        if batch_depth - bucket_depth > MAX_BUCKET_SPAN {
+            return Err(PostageError::Msg(format!(
+                "batchDepth {batch_depth} exceeds bucketDepth {bucket_depth} \
+                 by more than {MAX_BUCKET_SPAN}"
+            )));
         }
         let n = 1usize
             .checked_shl(u32::from(bucket_depth))
@@ -538,10 +550,13 @@ impl StampIssuer {
 
     /// Max collisions per bucket: `2^(batch_depth - bucket_depth)`.
     /// Public because bee's `GET /stamps/{id}/buckets` surfaces it as
-    /// `bucketUpperBound`.
+    /// `bucketUpperBound`. Every path that sets the depths (`build`,
+    /// `decode_header`, `set_batch_depth`) holds the span to
+    /// `1..=MAX_BUCKET_SPAN`, so the shift always fits a `u32`.
     #[must_use]
     pub fn bucket_upper_bound(&self) -> u32 {
-        1u32 << u32::from(self.batch_depth - self.bucket_depth)
+        bucket_capacity(self.batch_depth, self.bucket_depth)
+            .expect("depth span is validated on every path that sets it")
     }
 
     /// Raw per-bucket collision counters, indexed by bucket id. Backs
@@ -823,6 +838,25 @@ fn decode_header(bytes: &[u8]) -> Result<StoreHeader, PostageError> {
     }
     let batch_depth = bytes[6];
     let bucket_depth = bytes[7];
+    // Same bounds `build` enforces, plus a ceiling at 32 (bucket indices
+    // are u32). Without this a corrupt or crafted header with a huge
+    // `bucket_depth` reaches `decode_buckets` and its `1 << bucket_depth`
+    // sizing, which aborts the process instead of failing the load. The
+    // span `batch_depth - bucket_depth` is bounded too: it sizes each
+    // bucket's `u32` capacity in `bucket_upper_bound`, where an
+    // oversized span would overflow the shift (a panic in debug, a
+    // silently masked bogus capacity in release).
+    if bucket_depth == 0
+        || bucket_depth >= batch_depth
+        || bucket_depth > 32
+        || batch_depth - bucket_depth > MAX_BUCKET_SPAN
+    {
+        return Err(PostageError::Load(format!(
+            "invalid depths: bucket_depth {bucket_depth}, batch_depth {batch_depth} \
+             (need 0 < bucket_depth < batch_depth, bucket_depth <= 32 and \
+             batch_depth - bucket_depth <= {MAX_BUCKET_SPAN})"
+        )));
+    }
     let immutable = bytes[8] != 0;
     let mut batch_id = [0u8; 32];
     batch_id.copy_from_slice(&bytes[16..48]);
@@ -838,12 +872,23 @@ fn decode_buckets(bytes: &[u8], bucket_depth: u8) -> Result<Vec<u32>, PostageErr
     let n = 1usize
         .checked_shl(u32::from(bucket_depth))
         .ok_or_else(|| PostageError::Load("bucket_depth overflow".into()))?;
-    let body_len = STORE_HEADER_LEN + 4 * n;
-    if bytes.len() != body_len + 32 {
+    // Checked so an oversized depth can never wrap to a small length that
+    // matches a short file; overflow is reported as a size mismatch.
+    let body_len = n
+        .checked_mul(4)
+        .and_then(|b| b.checked_add(STORE_HEADER_LEN));
+    let expected = body_len.and_then(|b| b.checked_add(32));
+    let (Some(body_len), Some(expected)) = (body_len, expected) else {
         return Err(PostageError::Load(format!(
-            "size mismatch: file is {} bytes, expected {}",
+            "size mismatch: file is {} bytes, expected more than usize::MAX \
+             for bucket_depth {bucket_depth}",
             bytes.len(),
-            body_len + 32,
+        )));
+    };
+    if bytes.len() != expected {
+        return Err(PostageError::Load(format!(
+            "size mismatch: file is {} bytes, expected {expected}",
+            bytes.len(),
         )));
     }
     let body = &bytes[..body_len];
@@ -1615,11 +1660,31 @@ fn bucket_check(
     }
 
     let within = read_u32_be(&index[4..8]);
-    let max_idx = 1u32 << u32::from(depth - bucket_depth);
+    // `depth`/`bucket_depth` come from the caller's batch record, not a
+    // validated issuer, so the span is checked rather than shifted raw.
+    let max_idx = bucket_capacity(depth, bucket_depth).ok_or_else(|| {
+        PostageError::Msg(format!(
+            "invalid depths: depth {depth}, bucket_depth {bucket_depth}"
+        ))
+    })?;
     if within >= max_idx {
         return Err(PostageError::Msg("invalid stamp index".into()));
     }
     Ok(())
+}
+
+/// Largest `batch_depth - bucket_depth` whose per-bucket capacity
+/// `2^span` still fits the `u32` bucket counters and stamp indices.
+const MAX_BUCKET_SPAN: u8 = 31;
+
+/// Per-bucket capacity `2^(batch_depth - bucket_depth)`, or `None` when
+/// `bucket_depth > batch_depth` or the span exceeds [`MAX_BUCKET_SPAN`].
+/// (Issuers additionally require `bucket_depth < batch_depth`.)
+fn bucket_capacity(batch_depth: u8, bucket_depth: u8) -> Option<u32> {
+    batch_depth
+        .checked_sub(bucket_depth)
+        .filter(|span| *span <= MAX_BUCKET_SPAN)
+        .map(|span| 1u32 << u32::from(span))
 }
 
 fn read_u32_be(b: &[u8]) -> u32 {
@@ -2670,6 +2735,86 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A header with out-of-range depths but a valid magic, version and
+    /// checksum trailer must fail the load cleanly, never abort sizing the
+    /// bucket vector (bee#5663 analog). `(64, 62)` is the case where
+    /// `4 * (1 << 62)` used to wrap to 0 in release builds and let an
+    /// 80-byte file through to `Vec::with_capacity(2^62)`.
+    #[test]
+    fn open_existing_rejects_invalid_depths() {
+        let dir = tmpdir();
+        for (batch_depth, bucket_depth) in [(64u8, 62u8), (20, 0), (12, 12), (255, 40)] {
+            let path = dir.join(format!("{batch_depth}-{bucket_depth}.bin"));
+            // Header only, no bucket counters: the length `4 * n` wraps
+            // to 0 for depth 62 on 64-bit release builds.
+            let bytes = encode_store(&[0x5au8; 32], batch_depth, bucket_depth, true, &[]);
+            assert_eq!(bytes.len(), STORE_HEADER_LEN + 32);
+            std::fs::write(&path, &bytes).unwrap();
+            let err = StampIssuer::open_existing(path).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Load(_)),
+                "({batch_depth}, {bucket_depth}): expected Load, got {err:?}",
+            );
+            // The sizing in `decode_buckets` must hold on its own too,
+            // even if a header check ever lets such a depth through.
+            let err = decode_buckets(&bytes, bucket_depth).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Load(_)),
+                "decode_buckets({bucket_depth}): expected Load, got {err:?}",
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A header whose `bucket_depth` is fine but whose span
+    /// `batch_depth - bucket_depth` overflows the `u32` per-bucket
+    /// capacity must fail the load, even with a correctly sized body and
+    /// a valid trailer. `(255, 16)` used to load and then panic in
+    /// `bucket_upper_bound` (debug) or report a masked bogus capacity
+    /// (release); `(48, 16)` is the first span (32) that no longer fits.
+    #[test]
+    fn open_existing_rejects_oversized_depth_span() {
+        let dir = tmpdir();
+        let buckets = vec![0u32; 1 << 16];
+        for batch_depth in [255u8, 48] {
+            let path = dir.join(format!("span-{batch_depth}.bin"));
+            let bytes = encode_store(&[0x5au8; 32], batch_depth, 16, true, &buckets);
+            std::fs::write(&path, &bytes).unwrap();
+            let err = StampIssuer::open_existing(path).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Load(_)),
+                "({batch_depth}, 16): expected Load, got {err:?}",
+            );
+        }
+        // The widest span that fits (31) still loads, with its true capacity.
+        let path = dir.join("span-47.bin");
+        std::fs::write(&path, encode_store(&[0x5au8; 32], 47, 16, true, &buckets)).unwrap();
+        let issuer = StampIssuer::open_existing(path).unwrap();
+        assert_eq!(issuer.bucket_upper_bound(), 1 << 31);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The span bound holds on every other path that sets depths: a fresh
+    /// issuer, a dilute, and stamp verification against a batch record.
+    #[test]
+    fn oversized_depth_span_is_rejected_everywhere() {
+        assert!(StampIssuer::new([1u8; 32], 48, 16, true).is_err());
+        let mut issuer = StampIssuer::new([1u8; 32], 47, 16, true).unwrap();
+        assert!(issuer.set_batch_depth(48).is_err());
+        assert_eq!(issuer.batch_depth(), 47);
+        assert_eq!(issuer.bucket_upper_bound(), 1 << 31);
+
+        let addr = [0u8; 32];
+        let index = [0u8; 8];
+        assert!(bucket_check(&addr, index, 16, 47).is_ok());
+        for depth in [48u8, 255, 10] {
+            assert!(
+                bucket_check(&addr, index, 16, depth).is_err(),
+                "bucket_check(depth {depth}, bucket_depth 16) must error, not panic",
+            );
+        }
     }
 
     /// Re-stamping the same chunk must be idempotent: it returns the
