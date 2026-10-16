@@ -38,7 +38,9 @@ struct RootView: View {
             // sees the same flag and starts one from the generated test
             // pattern, since a runner has neither a camera nor a tap
             // driver. `-antstream-shot-live-idle` stops short of going
-            // live, to capture the quality picker.
+            // live, to capture the quality picker and the preview's
+            // frame (#193). `-antstream-shot-landscape` turns either one's
+            // interface to landscape, as a turned phone would (#193).
             LiveView().preferredColorScheme(.dark)
         } else if Self.shotArgs.contains("-antstream-shot-getstarted") {
             // The buy flow (Get Started) full-screen, so CI can capture

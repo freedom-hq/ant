@@ -232,6 +232,7 @@ struct GetStartedView: View {
                         }
                         .padding(.horizontal, 14).padding(.vertical, 10)
                         .background(.white.opacity(0.08), in: .rect(cornerRadius: 12))
+                        .contentShape(.rect(cornerRadius: 12))
                     }
                     .buttonStyle(.plain)
                     HStack(spacing: 8) {
@@ -272,6 +273,7 @@ struct GetStartedView: View {
                 Text("\(send) xDAI")
                     .font(.system(size: 40, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white)
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
             HStack(spacing: 6) {

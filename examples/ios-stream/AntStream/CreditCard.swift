@@ -377,6 +377,7 @@ private struct CreditMoveSheet: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14).padding(.vertical, 8)
                 .glassEffect(.regular.tint(.white.opacity(0.12)), in: .capsule)
+                .contentShape(.capsule)
         }
         .buttonStyle(.plain)
         .disabled(!enabled)

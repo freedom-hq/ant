@@ -29,6 +29,20 @@ import UniformTypeIdentifiers
 ///   bitrate and keyframe interval are set at input creation), which is
 ///   the same clean-cut path an interruption takes.
 ///
+/// * **The preview runs before the broadcast does (#193).** On the
+///   camera path ``startPreview()`` runs the capture session with no
+///   writer and no microphone, so the live screen shows the picture
+///   before Go live; ``start(settings:)`` then adds the microphone and a
+///   writer to that same running session (the camera is not restarted),
+///   and ``stopRecording(completion:)`` takes them away again, leaving
+///   the preview running.
+/// * **The frame's shape is fixed per broadcast.** ``Settings/portrait``
+///   is chosen at Go live and sets the encoded width and height for the
+///   whole stream. Turning the phone afterwards still keeps the picture
+///   upright (the capture rotation follows the device), and the encoder
+///   fits the turned picture into the fixed frame with black bars rather
+///   than switching the stream between landscape and portrait.
+///
 /// Segments are also kept in a small on-disk ring buffer. They are
 /// uploaded from memory, so the ring is not on the publish path; it
 /// exists so a segment can be inspected, replayed locally with
@@ -50,6 +64,15 @@ final class CaptureEngine: NSObject {
         var frameRate = 30
         /// Segments kept on disk. 60 × 2 s = the last two minutes.
         var ringCapacity = 60
+        /// A vertical broadcast: the encoded frame is `height` wide and
+        /// `width` tall (the presets are named by their short side, like
+        /// any phone camera's 720p). Chosen at Go live, fixed for the
+        /// broadcast (#193).
+        var portrait = false
+
+        /// The encoded frame's size, after ``portrait``.
+        var encodedWidth: Int { portrait ? height : width }
+        var encodedHeight: Int { portrait ? width : height }
 
         /// The rendition the thermal guard falls back to. Halving the
         /// bitrate is the cheapest lever that keeps a broadcast alive on
@@ -119,6 +142,9 @@ final class CaptureEngine: NSObject {
 
     enum State: Equatable {
         case idle
+        /// The camera is running for the preview only: no writer, no
+        /// microphone, nothing is encoded (#193).
+        case previewing
         case starting
         case running
         /// Capture is paused by something outside our control (call,
@@ -151,6 +177,17 @@ final class CaptureEngine: NSObject {
     /// carries that isolation so a SwiftUI observer can publish straight
     /// from it.
     var onStateChange: (@MainActor (State) -> Void)?
+    /// Called on the main actor with the camera the session now captures
+    /// from (after the session is set up and after every flip), so the
+    /// preview can keep its own rotation coordinator on the same device.
+    var onCameraChange: (@MainActor (AVCaptureDevice?) -> Void)?
+    /// Called on the main actor with whether the camera's picture is
+    /// upright-portrait (`true`) or landscape, from the capture rotation
+    /// angle — the *physical* device's orientation, which the encoded
+    /// frames follow even when the interface doesn't turn (Portrait
+    /// Orientation Lock, a narrow iPad window). The broadcast takes its
+    /// shape from this at Go live (#193).
+    var onOrientationChange: (@MainActor (Bool) -> Void)?
 
     private(set) var state: State = .idle {
         didSet {
@@ -162,26 +199,6 @@ final class CaptureEngine: NSObject {
 
     private(set) var settings: Settings
     let source: Source
-
-    /// Whether frames are upright portrait. On the camera path this follows
-    /// the capture connection's rotation (90°/270° = portrait), which
-    /// physically turns the buffers the camera hands over; the test
-    /// pattern takes it from `init`. The writer encodes at the matching
-    /// size (``encodedWidth`` × ``encodedHeight``) with no track
-    /// transform, so a portrait broadcast is real portrait frames (#194):
-    /// before, portrait buffers went into a landscape-sized writer and
-    /// were squeezed into it, which no player can undo.
-    private var portrait: Bool
-
-    /// The rendition's size the way frames arrive: its long side vertical
-    /// in portrait (360p is 360×640 there, not 640×360).
-    private var encodedWidth: Int {
-        portrait ? min(settings.width, settings.height) : max(settings.width, settings.height)
-    }
-
-    private var encodedHeight: Int {
-        portrait ? max(settings.width, settings.height) : min(settings.width, settings.height)
-    }
 
     /// Everything below runs here: capture callbacks, writer lifecycle,
     /// and the test-pattern generator. One serial queue means the writer
@@ -204,6 +221,13 @@ final class CaptureEngine: NSObject {
     /// capture outputs are dropped instead of appended to a finished
     /// writer (which throws).
     private var restarting = false
+    /// A broadcast is being recorded: segments are written. Off while the
+    /// session only feeds the preview, so no interruption-recovery path
+    /// starts a writer behind the preview's back.
+    private var recording = false
+    /// The camera session has its video input and output.
+    private var sessionConfigured = false
+    private var audioDeviceInput: AVCaptureDeviceInput?
     /// The rendition the operator asked for, before any thermal
     /// downshift — so recovery restores it rather than the reduced one.
     private var baseSettings: Settings
@@ -243,12 +267,9 @@ final class CaptureEngine: NSObject {
     /// there is nothing to preview.
     var previewSession: AVCaptureSession? { source == .camera ? session : nil }
 
-    /// `portrait` only applies to the test pattern (a generated frame has no
-    /// device to turn); the camera's orientation comes from the device.
-    init(source: Source, settings: Settings = Settings(), portrait: Bool = false) {
+    init(source: Source, settings: Settings = Settings()) {
         self.source = source
         self.settings = settings
-        self.portrait = source == .testPattern && portrait
         self.baseSettings = settings
         self.delegateSettings = (settings.segmentSeconds, settings.ringCapacity)
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -273,6 +294,12 @@ final class CaptureEngine: NSObject {
         return nil
     }
 
+    /// Camera access alone, asked for when the live screen opens its
+    /// preview (#193). The microphone waits for Go live.
+    static func cameraAccess() async -> Bool {
+        await requestAccess(.video)
+    }
+
     private static func requestAccess(_ media: AVMediaType) async -> Bool {
         switch AVCaptureDevice.authorizationStatus(for: media) {
         case .authorized: return true
@@ -281,9 +308,36 @@ final class CaptureEngine: NSObject {
         }
     }
 
-    func start() {
+    /// Run the camera for the preview only (#193): the capture session,
+    /// without a writer or the microphone, so nothing is encoded and the
+    /// mic indicator stays off. The test pattern has nothing to preview.
+    /// The caller asks for camera access first.
+    func startPreview() {
         queue.async { [weak self] in
-            guard let self, !self.state.isRunning else { return }
+            guard let self, self.source == .camera, self.state == .idle else { return }
+            self.observeSystemEvents()
+            do {
+                try self.configureSession()
+            } catch {
+                self.state = .failed(error.localizedDescription)
+                return
+            }
+            if !self.session.isRunning { self.session.startRunning() }
+            self.state = .previewing
+        }
+    }
+
+    /// Start recording, in `settings` when given. On the camera path this
+    /// joins a session the preview already runs (adding the microphone),
+    /// so going live does not restart the camera.
+    func start(settings newSettings: Settings? = nil) {
+        queue.async { [weak self] in
+            guard let self, !self.recording else { return }
+            if let newSettings, newSettings != self.settings {
+                self.baseSettings = newSettings
+                self.publish(settings: newSettings)
+            }
+            self.recording = true
             self.state = .starting
             self.observeSystemEvents()
             switch self.source {
@@ -291,16 +345,44 @@ final class CaptureEngine: NSObject {
                 do {
                     try self.configureSession()
                 } catch {
+                    self.recording = false
                     self.state = .failed(error.localizedDescription)
                     return
                 }
+                self.attachAudio()
                 self.startWriter()
-                self.session.startRunning()
+                if !self.session.isRunning { self.session.startRunning() }
             case .testPattern:
                 self.startWriter()
                 self.startTestPattern()
             }
             self.state = .running
+        }
+    }
+
+    /// End the recording but keep the preview (#193): flush the segment in
+    /// progress like ``stop(completion:)`` does, drop the microphone, and
+    /// leave the camera session running. The test pattern, which has no
+    /// preview, stops altogether.
+    func stopRecording(completion: (() -> Void)? = nil) {
+        queue.async { [weak self] in
+            guard let self else {
+                completion?()
+                return
+            }
+            guard self.source == .camera, self.sessionConfigured else {
+                self.stopNow()
+                completion?()
+                return
+            }
+            self.finishWriter()
+            self.recording = false
+            self.detachAudio()
+            if !self.session.isRunning { self.session.startRunning() }
+            // Still interrupted (a call, another app on the camera): keep
+            // saying so; the interruption's end puts the preview back.
+            if case .interrupted = self.state {} else { self.state = .previewing }
+            completion?()
         }
     }
 
@@ -317,17 +399,23 @@ final class CaptureEngine: NSObject {
                 completion?()
                 return
             }
-            self.stopTestPattern()
-            if self.session.isRunning { self.session.stopRunning() }
-            self.finishWriter()
-            NotificationCenter.default.removeObserver(self)
-            self.observingSystemEvents = false
-            self.rotationObservation?.invalidate()
-            self.rotationObservation = nil
-            self.rotationCoordinator = nil
-            self.state = .idle
+            self.stopNow()
             completion?()
         }
+    }
+
+    /// ``stop(completion:)``'s body, on ``queue``.
+    private func stopNow() {
+        stopTestPattern()
+        if session.isRunning { session.stopRunning() }
+        finishWriter()
+        recording = false
+        NotificationCenter.default.removeObserver(self)
+        observingSystemEvents = false
+        rotationObservation?.invalidate()
+        rotationObservation = nil
+        rotationCoordinator = nil
+        state = .idle
     }
 
     /// Change the rendition mid-broadcast. Restarts the writer, so the
@@ -363,7 +451,10 @@ final class CaptureEngine: NSObject {
             }
             self.session.commitConfiguration()
             self.observeRotation(of: self.videoDeviceInput?.device)
-            self.restartWriter()
+            self.announceCamera()
+            // Only a recording has a writer to cut; flipping in the
+            // preview must not start one.
+            if self.recording { self.restartWriter() }
         }
     }
 
@@ -377,7 +468,11 @@ final class CaptureEngine: NSObject {
         )
     }
 
+    /// Set up the camera input and the video output, once: the preview
+    /// sets the session up and a recording joins it. The microphone is
+    /// added separately (``attachAudio()``), only while recording.
     private func configureSession() throws {
+        guard !sessionConfigured else { return }
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         session.sessionPreset = .high
@@ -393,12 +488,6 @@ final class CaptureEngine: NSObject {
         session.addInput(videoIn)
         videoDeviceInput = videoIn
 
-        if let mic = AVCaptureDevice.default(for: .audio),
-           let audioIn = try? AVCaptureDeviceInput(device: mic),
-           session.canAddInput(audioIn) {
-            session.addInput(audioIn)
-        }
-
         let vOut = AVCaptureVideoDataOutput()
         vOut.alwaysDiscardsLateVideoFrames = true
         vOut.videoSettings = [
@@ -411,19 +500,57 @@ final class CaptureEngine: NSObject {
         }
         session.addOutput(vOut)
         videoOutput = vOut
-
-        let aOut = AVCaptureAudioDataOutput()
-        aOut.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(aOut) {
-            session.addOutput(aOut)
-            audioOutput = aOut
-        }
+        sessionConfigured = true
         observeRotation(of: camera)
+        announceCamera()
+    }
+
+    /// Add the microphone for a recording. Into the running session, so
+    /// the camera carries on; best effort, as before (a broadcast without
+    /// a mic is still a broadcast).
+    private func attachAudio() {
+        guard audioDeviceInput == nil,
+              let mic = AVCaptureDevice.default(for: .audio),
+              let audioIn = try? AVCaptureDeviceInput(device: mic)
+        else { return }
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        guard session.canAddInput(audioIn) else { return }
+        session.addInput(audioIn)
+        audioDeviceInput = audioIn
+        if audioOutput == nil {
+            let aOut = AVCaptureAudioDataOutput()
+            aOut.setSampleBufferDelegate(self, queue: queue)
+            if session.canAddOutput(aOut) {
+                session.addOutput(aOut)
+                audioOutput = aOut
+            }
+        }
+    }
+
+    /// Take the microphone away again once the recording ends, so the
+    /// preview doesn't keep it (and its privacy indicator) on.
+    private func detachAudio() {
+        guard let audioIn = audioDeviceInput else { return }
+        session.beginConfiguration()
+        session.removeInput(audioIn)
+        if let aOut = audioOutput { session.removeOutput(aOut) }
+        session.commitConfiguration()
+        audioDeviceInput = nil
+        audioOutput = nil
+    }
+
+    /// Tell the preview which camera the session captures from.
+    private func announceCamera() {
+        let device = videoDeviceInput?.device
+        Task { @MainActor [onCameraChange] in onCameraChange?(device) }
     }
 
     /// Keep the encoded frames upright as the device turns. A rotation
-    /// changes the encoded dimensions (``portrait``), so it also restarts
-    /// the writer — #65's "orientation" interruption case.
+    /// changes the shape of the frames the camera delivers, so it also
+    /// restarts the writer — #65's "orientation" interruption case. The
+    /// encoded frame keeps the shape chosen at Go live (#193): the new
+    /// writer fits the turned picture into it (`AVVideoScalingModeKey`).
     private func observeRotation(of device: AVCaptureDevice?) {
         rotationObservation?.invalidate()
         guard let device else { return }
@@ -439,20 +566,38 @@ final class CaptureEngine: NSObject {
         }
     }
 
+    /// Whether the camera a fresh engine would capture from (the one
+    /// ``configureSession()`` picks) would deliver a portrait picture as
+    /// the device is held right now, read once from its own rotation
+    /// coordinator. For Go live with no engine that has reported its
+    /// angle yet (#193): its shape must come from the camera, not from the
+    /// interface. `nil` with no camera.
+    static func defaultCameraPortrait() -> Bool? {
+        guard let camera = captureDevice(front: false) ?? captureDevice(front: true)
+        else { return nil }
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: camera, previewLayer: nil)
+        return isPortrait(captureAngle: coordinator.videoRotationAngleForHorizonLevelCapture)
+    }
+
+    /// A capture angle of 90° or 270° turns the sensor's landscape frames
+    /// upright: the picture is portrait.
+    static func isPortrait(captureAngle angle: CGFloat) -> Bool {
+        Int(angle.rounded()).quotientAndRemainder(dividingBy: 180).remainder != 0
+    }
+
     private func applyRotation(_ angle: CGFloat) {
-        guard let connection = videoOutput?.connection(with: .video) else { return }
+        let connection = videoOutput?.connection(with: .video)
         var changed = false
-        if connection.isVideoRotationAngleSupported(angle), connection.videoRotationAngle != angle {
+        if let connection, connection.isVideoRotationAngleSupported(angle),
+           connection.videoRotationAngle != angle {
             connection.videoRotationAngle = angle
             changed = true
         }
         // Whatever angle the connection ended up at decides the buffers'
-        // shape, so the writer is sized from it, not from the request.
-        let turned = Int(connection.videoRotationAngle.rounded()) % 180 != 0
-        if turned != portrait {
-            portrait = turned
-            changed = true
-        }
+        // shape (#194), so that is the orientation reported, not the
+        // request (which an unsupported angle leaves unapplied).
+        let portrait = Self.isPortrait(captureAngle: connection?.videoRotationAngle ?? angle)
+        Task { @MainActor [onOrientationChange] in onOrientationChange?(portrait) }
         if changed, state.isRunning { restartWriter() }
     }
 
@@ -487,10 +632,12 @@ final class CaptureEngine: NSObject {
             mediaType: .video,
             outputSettings: [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                // Sized like the frames that arrive (portrait or not), so
-                // the encoder never scales them into the other shape.
-                AVVideoWidthKey: encodedWidth,
-                AVVideoHeightKey: encodedHeight,
+                AVVideoWidthKey: settings.encodedWidth,
+                AVVideoHeightKey: settings.encodedHeight,
+                // A phone turned away from the broadcast's orientation
+                // delivers frames of the other shape: fit them in with
+                // black bars rather than stretch them (#193).
+                AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
                 AVVideoCompressionPropertiesKey: compression,
             ]
         )
@@ -523,8 +670,8 @@ final class CaptureEngine: NSObject {
                 assetWriterInput: vInput,
                 sourcePixelBufferAttributes: [
                     kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                    kCVPixelBufferWidthKey as String: encodedWidth,
-                    kCVPixelBufferHeightKey as String: encodedHeight,
+                    kCVPixelBufferWidthKey as String: settings.encodedWidth,
+                    kCVPixelBufferHeightKey as String: settings.encodedHeight,
                 ]
             )
         }
@@ -663,7 +810,12 @@ final class CaptureEngine: NSObject {
     @objc private func sessionInterruptionEnded(_ note: Notification) {
         queue.async { [weak self] in
             guard let self, self.state != .idle else { return }
-            // Recovery starts a *new* segment on a new timeline.
+            // Recovery starts a *new* segment on a new timeline; the
+            // preview alone has no writer to start.
+            guard self.recording else {
+                self.state = .previewing
+                return
+            }
             if self.writer == nil { self.startWriter() }
             self.state = .running
         }
@@ -678,6 +830,10 @@ final class CaptureEngine: NSObject {
             self.state = .interrupted(error?.localizedDescription ?? "Capture error")
             if self.source == .camera, !self.session.isRunning {
                 self.session.startRunning()
+            }
+            guard self.recording else {
+                self.state = .previewing
+                return
             }
             self.startWriter()
             self.state = .running
@@ -697,6 +853,10 @@ final class CaptureEngine: NSObject {
     @objc private func willEnterForeground() {
         queue.async { [weak self] in
             guard let self, case .interrupted = self.state else { return }
+            guard self.recording else {
+                self.state = .previewing
+                return
+            }
             if self.writer == nil { self.startWriter() }
             if self.source == .testPattern { self.startTestPattern() }
             self.state = .running
@@ -770,8 +930,8 @@ final class CaptureEngine: NSObject {
         if pixelBufferPool == nil {
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: encodedWidth,
-                kCVPixelBufferHeightKey as String: encodedHeight,
+                kCVPixelBufferWidthKey as String: settings.encodedWidth,
+                kCVPixelBufferHeightKey as String: settings.encodedHeight,
                 kCVPixelBufferCGImageCompatibilityKey as String: true,
             ]
             var pool: CVPixelBufferPool?

@@ -246,7 +246,10 @@ jobs:
           sleep 30
           xcrun simctl io booted screenshot shots/16-getstarted-pay-help.png
           # 17 — the live screen before going live: the quality presets
-          # (360p / 540p / 720p) and what each costs in bandwidth.
+          # (360p / 540p / 720p) and what each costs in bandwidth, over
+          # the preview (#193). A simulator has no camera, so the preview
+          # is its placeholder, drawn in the broadcast's frame (9:16 for
+          # a phone held upright) and saying why there is no picture.
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-live-idle
           sleep 25
@@ -316,6 +319,25 @@ jobs:
             -antstream-shot-storage -antstream-shot-credit -antstream-shot-credit-withdraw
           sleep 22
           xcrun simctl io booted screenshot shots/28-credit-withdraw-sheet.png
+          # --- Orientation (#193) ---
+          # The runner can't turn the simulator, so `-antstream-shot-
+          # landscape` has the live screen turn its interface to
+          # landscape (`requestGeometryUpdate`), as a turned phone does.
+          # 29 — before going live: the controls re-laid out side by
+          # side, the preview placeholder in a 16:9 frame, and "Landscape
+          # broadcast, as the phone is held".
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live-idle -antstream-shot-landscape
+          sleep 25
+          xcrun simctl io booted screenshot shots/29-live-idle-landscape.png
+          # 30 — live in landscape (the test pattern, as in 11/12): the
+          # metrics card and the Stop button laid out for landscape.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-landscape
+          sleep 45
+          xcrun simctl io booted screenshot shots/30-live-landscape.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
@@ -325,7 +347,8 @@ jobs:
       # (360x640, identity track matrix), not as landscape frames the
       # picture was squeezed into. `-antstream-shot-portrait` runs the
       # test pattern through the real writer as a phone held upright
-      # would; the step reads the app's own on-disk segment ring (the same
+      # would (it sets the broadcast's orientation, fixed at Go live
+      # since #193, whatever the layout); the step reads the app's own on-disk segment ring (the same
       # bytes the publisher uploads), checks the init segment's geometry,
       # and grabs a frame as AVFoundation presents it: the pattern's white
       # disc must be round in a portrait frame. The camera path's rotation
@@ -340,7 +363,7 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream \
             -antstream-shot-live -antstream-shot-portrait
           sleep 45
-          xcrun simctl io booted screenshot shots/29-live-portrait.png
+          xcrun simctl io booted screenshot shots/31-live-portrait.png
           xcrun simctl terminate booted baby.freedom.antstream || true
           mkdir -p shots/portrait
           ls -l "$SEGS"
@@ -352,8 +375,22 @@ jobs:
           { cat "$INIT"; for i in $(seq $((N + 1)) $((N + 5))); do
               f="$SEGS/seg-$i.m4s"; [ -f "$f" ] && cat "$f"; done; } > shots/portrait/portrait.mp4
           python3 ci/mp4-geometry.py --expect portrait "$INIT" | tee shots/portrait/geometry.txt
-          swift ci/frame-grab.swift shots/portrait/portrait.mp4 shots/30-portrait-frame.png 2 \
+          swift ci/frame-grab.swift shots/portrait/portrait.mp4 shots/32-portrait-frame.png 2 \
             | tee -a shots/portrait/geometry.txt
+          # The other way round: a broadcast started with the interface in
+          # landscape (no portrait flag) is encoded 640x360, so the check
+          # above passes because the orientation reached the writer, not
+          # because every broadcast comes out portrait.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          rm -rf "$SEGS"
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-landscape
+          sleep 45
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          mkdir -p shots/landscape
+          cp "$SEGS"/* shots/landscape/
+          INIT=$(ls "$SEGS"/init-*.mp4 | sort -V | head -1)
+          python3 ci/mp4-geometry.py --expect landscape "$INIT" | tee shots/landscape/geometry.txt
 
       - uses: actions/upload-artifact@v4
         if: always()

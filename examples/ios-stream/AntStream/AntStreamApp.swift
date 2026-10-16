@@ -19,6 +19,7 @@ import UIKit
 /// counterpart here — a live broadcast is foreground-only by nature.
 @main
 struct AntStreamApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var node = AntNode()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -70,6 +71,68 @@ struct AntStreamApp: App {
                     bgTask = .invalid
                 }
             }
+        }
+    }
+}
+
+
+/// Only here for the orientation lock: SwiftUI has no scene-level way to
+/// say which orientations a screen may take.
+@MainActor
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        OrientationLock.mask
+    }
+}
+
+/// Which way the interface may face (#193). On a phone the tabs stay in
+/// portrait, as before; the live screen lets the interface turn with the
+/// device (``LiveView`` calls ``allowRotation(_:)`` while it is shown),
+/// so its controls re-lay out for landscape. The Info.plist lists every
+/// orientation either may use; this narrows it. An iPad keeps all four
+/// everywhere (#192).
+@MainActor
+enum OrientationLock {
+    private static var rotates = false
+
+    static var mask: UIInterfaceOrientationMask {
+        if UIDevice.current.userInterfaceIdiom == .pad { return .all }
+        return rotates ? .allButUpsideDown : .portrait
+    }
+
+    /// Let the interface follow the device (`true`), or bring it back to
+    /// portrait (`false`).
+    static func allowRotation(_ allow: Bool) {
+        guard allow != rotates else { return }
+        rotates = allow
+        for scene in UIApplication.shared.connectedScenes {
+            guard let scene = scene as? UIWindowScene else { continue }
+            // Every controller up the presentation chain re-reads the
+            // mask: the live screen is a full-screen cover.
+            for window in scene.windows {
+                var controller = window.rootViewController
+                while let current = controller {
+                    current.setNeedsUpdateOfSupportedInterfaceOrientations()
+                    controller = current.presentedViewController
+                }
+            }
+            if !allow, UIDevice.current.userInterfaceIdiom != .pad {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
+            }
+        }
+    }
+
+    /// Turn the interface to landscape without turning the device. Only
+    /// for `antstream-visual`: a simulator on a CI runner can't be
+    /// rotated from the workflow.
+    static func requestLandscape() {
+        for scene in UIApplication.shared.connectedScenes {
+            (scene as? UIWindowScene)?.requestGeometryUpdate(
+                .iOS(interfaceOrientations: .landscapeRight)
+            )
         }
     }
 }

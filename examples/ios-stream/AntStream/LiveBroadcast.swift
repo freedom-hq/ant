@@ -16,6 +16,13 @@ import UIKit
 /// pushes arrive and that number decides both playlist order and which
 /// `#EXT-X-MAP` each segment is listed under.
 ///
+/// It also owns the camera preview the live screen shows before Go live
+/// (#193): ``openPreview()`` starts a ``CaptureEngine`` that only runs
+/// the camera, ``start(node:channel:source:resume:)`` records with that
+/// same engine (the camera is not restarted), a stop goes back to the
+/// preview, and ``closePreview()`` turns the camera off when the screen
+/// goes away.
+///
 /// It also owns the foreground keep-alive a broadcast needs: the idle
 /// timer is held off for the duration (a screen that sleeps mid-stream
 /// takes the camera with it) and the audio session is configured for
@@ -39,7 +46,9 @@ final class LiveBroadcast: ObservableObject {
         }
     }
 
-    @Published private(set) var state: State = .idle
+    @Published private(set) var state: State = .idle {
+        didSet { if !state.isActive { followOrientation() } }
+    }
     @Published private(set) var capture: CaptureEngine.State = .idle
     @Published private(set) var progress: PublisherSnapshot?
     @Published private(set) var report: PublisherReport?
@@ -49,6 +58,13 @@ final class LiveBroadcast: ObservableObject {
     @Published private(set) var capturedSegments: UInt64 = 0
 
     private(set) var engine: CaptureEngine?
+    /// The camera the preview shows, for its rotation coordinator.
+    @Published private(set) var previewCamera: AVCaptureDevice?
+    /// Why there is no preview (camera access refused), in words.
+    @Published private(set) var previewProblem: String?
+    /// The live screen is open: a stopped broadcast goes back to the
+    /// preview rather than turning the camera off.
+    private var previewOpen = false
     private var pollTask: Task<Void, Never>?
     /// The capture → publisher hand-off queue. The writer's delivery
     /// queue enqueues into it synchronously and ``pumpTask`` is its only
@@ -82,13 +98,79 @@ final class LiveBroadcast: ObservableObject {
         return CaptureEngine.Quality(rawValue: stored) ?? .low
     }
 
+    /// The next broadcast is vertical. Follows the way the picture comes
+    /// off the camera (``picturePortrait``) until Go live, then stays as
+    /// it was for the whole broadcast (#193). A resume (#175) takes the
+    /// orientation the unfinished broadcast went out in instead
+    /// (``pinForResume(owner:)``).
+    @Published private(set) var portrait = true
+    /// How the camera turns the picture: the physical device's
+    /// orientation (its rotation coordinator's capture angle), which is
+    /// what the encoded frames follow. Not the interface's layout: with
+    /// Portrait Orientation Lock on, or in a narrow iPad window, the two
+    /// disagree, and the broadcast must take the picture's shape or it
+    /// letterboxes from the first frame. `nil` with no camera running.
+    @Published private(set) var capturePortrait: Bool?
+    /// The live screen's layout is taller than wide. Only the fallback
+    /// for ``picturePortrait`` when there is no camera (the test pattern
+    /// in the simulator and CI), set by ``LiveView``.
+    var layoutPortrait = true {
+        didSet { followOrientation() }
+    }
+    /// The orientation of the unfinished broadcast the next go-live
+    /// resumes, which it keeps (one feed, one recording, one shape).
+    @Published private(set) var resumePortrait: Bool?
+
+    /// The shape the picture currently has.
+    var picturePortrait: Bool { capturePortrait ?? Self.shotPortrait ?? layoutPortrait }
+
+    /// `-antstream-shot-portrait` makes the test pattern a portrait
+    /// broadcast whatever the layout (#194's CI geometry check), the shape
+    /// a phone held upright produces. Only where there is no camera
+    /// reading: ``capturePortrait`` still wins.
+    private static let shotPortrait: Bool? =
+        RootView.shotArgs.contains("-antstream-shot-portrait") ? true : nil
+
+    /// Pin the next broadcast to the orientation the unfinished broadcast
+    /// of `owner` went out in (#175), or release it (`nil`).
+    func pinForResume(owner: String?) {
+        resumePortrait = owner.map(Self.storedPortrait(owner:))
+        followOrientation()
+    }
+
+    /// Re-derive ``portrait`` while no broadcast runs.
+    private func followOrientation() {
+        guard !state.isActive else { return }
+        let next = resumePortrait ?? picturePortrait
+        if portrait != next { portrait = next }
+    }
+
+    /// The orientation each account's last broadcast went out in, so a
+    /// resume after a kill (#175) keeps it: the recovery entry is the
+    /// node's and doesn't carry it. One per account, as the entry is.
+    private static func portraitKey(owner: String) -> String {
+        "antstream.broadcastPortrait." + owner.lowercased()
+            .replacingOccurrences(of: "0x", with: "")
+    }
+
+    /// A broadcast with nothing stored went out before #193, when every
+    /// broadcast was landscape (640x360).
+    static func storedPortrait(owner: String) -> Bool {
+        UserDefaults.standard.object(forKey: portraitKey(owner: owner)) as? Bool ?? false
+    }
+
     init() {
         quality = Self.storedQuality
     }
 
-    /// The rendition for ``quality``, with 2 s segments. The same values
-    /// are handed to both halves so the encoder and the playlist agree.
-    var settings: CaptureEngine.Settings { CaptureEngine.Settings(quality: quality) }
+    /// The rendition for ``quality`` and ``portrait``, with 2 s segments.
+    /// The same values are handed to both halves so the encoder and the
+    /// playlist agree.
+    var settings: CaptureEngine.Settings {
+        var settings = CaptureEngine.Settings(quality: quality)
+        settings.portrait = portrait
+        return settings
+    }
 
     /// Which source a broadcast started here would use. The simulator
     /// has no capture device, and CI drives the whole pipeline with the
@@ -99,6 +181,71 @@ final class LiveBroadcast: ObservableObject {
         #else
         return RootView.shotArgs.contains("-antstream-shot-live") ? .testPattern : .camera
         #endif
+    }
+
+    // MARK: - Preview
+
+    /// Show the camera before going live (#193): ask for camera access
+    /// (only the camera: the microphone is asked for at Go live) and run
+    /// the capture session without encoding. Nothing to show for the test
+    /// pattern (the simulator, CI), which the screen says in words.
+    func openPreview() async {
+        previewOpen = true
+        guard engine == nil, !state.isActive, Self.defaultSource == .camera else { return }
+        guard await CaptureEngine.cameraAccess() else {
+            previewProblem = "AntStream needs camera access to show the preview and broadcast. "
+                + "Enable it in Settings › AntStream."
+            return
+        }
+        // The screen may have gone while the permission prompt was up.
+        guard previewOpen, engine == nil, !state.isActive else { return }
+        previewProblem = nil
+        let engine = makeEngine(source: .camera)
+        self.engine = engine
+        engine.startPreview()
+    }
+
+    /// The live screen went away: turn the camera off, unless a broadcast
+    /// is still running on it.
+    func closePreview() {
+        previewOpen = false
+        guard !state.isActive, let engine else { return }
+        engine.stop()
+        detachEngine()
+    }
+
+    /// Let go of the engine: its own late state changes (a stop's
+    /// `.idle`) no longer reach this class (see ``makeEngine``), so what
+    /// it showed is cleared here.
+    private func detachEngine() {
+        engine = nil
+        previewCamera = nil
+        capturePortrait = nil
+        capture = .idle
+        followOrientation()
+    }
+
+    /// A capture engine wired to publish its state, camera and picture
+    /// orientation here, for as long as it is *the* engine: one that was
+    /// replaced or closed still finishes its stop asynchronously, and its
+    /// late `.idle` must not overwrite the current engine's state. The
+    /// recording's own hooks (segments, failures) are added by ``start``.
+    private func makeEngine(source: CaptureEngine.Source) -> CaptureEngine {
+        let engine = CaptureEngine(source: source, settings: settings)
+        engine.onStateChange = { [weak self, weak engine] newState in
+            guard let self, let engine, self.engine === engine else { return }
+            self.capture = newState
+        }
+        engine.onCameraChange = { [weak self, weak engine] device in
+            guard let self, let engine, self.engine === engine else { return }
+            self.previewCamera = device
+        }
+        engine.onOrientationChange = { [weak self, weak engine] portrait in
+            guard let self, let engine, self.engine === engine else { return }
+            self.capturePortrait = portrait
+            self.followOrientation()
+        }
+        return engine
     }
 
     // MARK: - Lifecycle
@@ -136,6 +283,19 @@ final class LiveBroadcast: ObservableObject {
             return
         }
 
+        // A resume keeps the orientation its broadcast went out in; a new
+        // broadcast takes the picture's (``followOrientation`` kept it
+        // current up to here). With no camera reading yet (the preview's
+        // engine never got the camera, or Go live came before it was
+        // made), the picture's shape is read from the camera once here
+        // rather than taken from the layout, which disagrees with it under
+        // Portrait Orientation Lock or in a narrow iPad window.
+        if resume {
+            portrait = Self.storedPortrait(owner: permanent.owner)
+        } else if capturePortrait == nil, source == .camera,
+                  let held = CaptureEngine.defaultCameraPortrait() {
+            portrait = held
+        }
         let settings = self.settings
         do {
             permanent.name = channel
@@ -154,21 +314,28 @@ final class LiveBroadcast: ObservableObject {
             state = .failed(error.localizedDescription)
             return
         }
+        UserDefaults.standard.set(settings.portrait, forKey: Self.portraitKey(owner: permanent.owner))
 
         configureAudioSession(for: source)
         holdIdleTimer()
 
-        // `-antstream-shot-portrait` runs the test pattern as a portrait
-        // broadcast (#194), the shape a phone held upright produces.
-        let engine = CaptureEngine(
-            source: source,
-            settings: settings,
-            portrait: RootView.shotArgs.contains("-antstream-shot-portrait")
-        )
-        engine.onStateChange = { [weak self] newState in
-            guard let self else { return }
+        // Record with the engine the preview runs (#193), so going live
+        // doesn't restart the camera. One for another source, or one that
+        // failed, is replaced.
+        let engine: CaptureEngine
+        if let running = self.engine, running.source == source, !Self.isFailed(capture) {
+            engine = running
+        } else {
+            self.engine?.stop()
+            detachEngine()
+            engine = makeEngine(source: source)
+        }
+        // The engine is current before anything it publishes arrives.
+        self.engine = engine
+        engine.onStateChange = { [weak self, weak engine] newState in
+            guard let self, let engine, self.engine === engine else { return }
             self.capture = newState
-            if case .failed(let message) = newState {
+            if case .failed(let message) = newState, self.state.isActive {
                 Task { await self.stop(node: node, failure: message) }
             }
         }
@@ -200,8 +367,7 @@ final class LiveBroadcast: ObservableObject {
             }
             self?.pumpDrained = true
         }
-        self.engine = engine
-        engine.start()
+        engine.start(settings: settings)
         state = .live
         startPolling(node: node)
     }
@@ -225,12 +391,20 @@ final class LiveBroadcast: ObservableObject {
         // segment to reach the publisher before closing the publisher's
         // queue — otherwise the last seconds of the broadcast are
         // captured, encoded and then thrown away.
+        //
+        // With the live screen still open the camera carries on as the
+        // preview (#193); a failed engine, or a closed screen, stops it.
         if let engine {
+            let keepPreview = previewOpen && failure == nil && engine.source == .camera
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                engine.stop { continuation.resume() }
+                if keepPreview {
+                    engine.stopRecording { continuation.resume() }
+                } else {
+                    engine.stop { continuation.resume() }
+                }
             }
+            if !keepPreview { detachEngine() }
         }
-        engine = nil
         // The writer has delivered its last segment, so the hand-off
         // queue now holds everything capture produced. Close it and let
         // the pump drain: every queued segment must reach the publisher
@@ -267,6 +441,11 @@ final class LiveBroadcast: ObservableObject {
             return
         }
         state = failure.map(State.failed) ?? .idle
+    }
+
+    private static func isFailed(_ capture: CaptureEngine.State) -> Bool {
+        if case .failed = capture { return true }
+        return false
     }
 
     // MARK: - Progress
