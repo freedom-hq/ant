@@ -91,7 +91,7 @@ class BroadcastService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_antstream)
             .setContentTitle("Live on Swarm")
             .setContentText(channel?.let { "Broadcasting to $it" } ?: "Broadcasting")
             .setOngoing(true)
