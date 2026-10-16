@@ -24,6 +24,11 @@
 //   GATEWAY=http://127.0.0.1:1733 OUT=$TMPDIR/player.png WAIT_S=40 \
 //     xvfb-run -a electron test/freedom-harness.cjs
 //
+// SWITCH_WAITING=<owner>/<topic> fills the player's read budget, switches
+// to that channel while feed reads wait for it, then frees the budget and
+// reports (`switchWaiting.ok`) that none of the old channel's waiting
+// reads was sent.
+//
 // CHANNEL=<owner>/<topic> picks the channel (the fake gateway's by
 // default), URL= any other page (e.g. the fake gateway's own HTTP page).
 // Prints the player's state as JSON and writes a screenshot to OUT.
@@ -63,6 +68,8 @@ const MAX_BYTES = 512 * 1024;
 const PREFILL_BYTES = Number(process.env.PREFILL_BYTES || 0);
 const provider = {
   calls: {}, refused: 0, windows: [], current: null,
+  // Every read's owner and time, for SWITCH_WAITING.
+  log: [],
 };
 
 const fail = (code, message, data) => ({ error: { code, message, data } });
@@ -70,6 +77,7 @@ const hexIndex = (h) => (h && /^[0-9a-f]+$/i.test(h) ? parseInt(h, 16) : null);
 
 async function swarmRead(method, params) {
   provider.calls[method] = (provider.calls[method] || 0) + 1;
+  provider.log.push({ owner: String(params.owner || '').replace(/^0x/i, '').toLowerCase(), at: Date.now() });
   // A fixed window from the first read, as Freedom keeps it.
   const now = Date.now();
   if (!provider.current || now - provider.current.start >= WINDOW_MS) {
@@ -274,6 +282,38 @@ app.whenReady().then(async () => {
       const r = w.getBoundingClientRect();
       return { width: r.width, height: r.height, aspect: w.style.getPropertyValue('--aspect'), size: document.getElementById('video').videoWidth + 'x' + document.getElementById('video').videoHeight };
     })()`);
+  }
+  if (process.env.SWITCH_WAITING) {
+    // Switch channel while feed reads wait for the player's read budget
+    // (the budget filled by hand): those reads are the old channel's and
+    // must be dropped, never sent to window.swarm, even once room returns.
+    const from = await win.webContents.executeJavaScript(`window.antstreamPlayer.channel.owner`);
+    const atFill = await win.webContents.executeJavaScript(`(() => {
+      const b = window.antstreamPlayer.budget;
+      b.reads.push({ at: Date.now(), bytes: 1 << 30, waitedMs: 0, fill: true });
+      return Date.now();
+    })()`);
+    // Long enough for the next polls to start and queue behind the fill.
+    await new Promise((r) => setTimeout(r, 4000));
+    const waiting = await win.webContents.executeJavaScript(`window.antstreamPlayer.log.entries.filter((e) => e.kind === 'playlist' && e.status === 'loading').length`);
+    const switchedAt = Date.now();
+    await win.webContents.executeJavaScript(`location.hash = ${JSON.stringify(process.env.SWITCH_WAITING)}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    await win.webContents.executeJavaScript(`(() => {
+      const b = window.antstreamPlayer.budget;
+      b.reads = b.reads.filter((r) => !r.fill);
+    })()`);
+    await new Promise((r) => setTimeout(r, 3000));
+    const entries = await win.webContents.executeJavaScript(`JSON.stringify(window.antstreamPlayer.log.entries.filter((e) => e.kind === 'playlist').map((e) => ({ status: e.status, note: e.note })))`);
+    const sentAfterSwitch = provider.log.filter((c) => c.owner === from && c.at >= switchedAt).length;
+    state.switchWaiting = {
+      waitingAtSwitch: waiting,
+      sentDuringFill: provider.log.filter((c) => c.at > atFill + 500 && c.at < switchedAt).length,
+      oldChannelReadsSentAfterSwitch: sentAfterSwitch,
+      newChannelReads: provider.log.filter((c) => c.owner !== from && c.at >= switchedAt).length,
+      cancelled: JSON.parse(entries).filter((e) => e.status === 'cancelled').length,
+      ok: waiting > 0 && sentAfterSwitch === 0,
+    };
   }
   if (process.env.DUMP_LOG) {
     const entries = await win.webContents.executeJavaScript(`JSON.stringify(window.antstreamPlayer.log.entries)`);

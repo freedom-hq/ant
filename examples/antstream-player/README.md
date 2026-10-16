@@ -99,7 +99,9 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   feed reads for 5 s, doubling up to a minute. Segments are `bzz://`
   reads and not counted. A recording's size is known from its slot's
   root chunk before it is read, and the read waits until the budget has
-  room for all of it. A recording over the budget (several hours of
+  room for all of it. A read still waiting for room when the viewer
+  switches channel is dropped, not sent, so it can't spend the new
+  channel's window. A recording over the budget (several hours of
   broadcast) can't be read without a connection grant: a live viewer
   steps past its slot without reading it (the next broadcast continues
   the feed after it), and one who opens the channel after such a

@@ -382,10 +382,17 @@
    * Wait for room in the budget; the entry to charge the read's bytes to.
    * `expected`: the bytes the read will bring, when known, held from the
    * start so reads started meanwhile can't take that room.
+   * `wanted`: whether the read is still wanted (the viewer hasn't moved
+   * to another channel); null, with nothing charged, once it isn't, so a
+   * stale read never reaches Freedom and spends the new channel's window.
    */
-  async function takeBudget(expected = 0) {
+  async function takeBudget(expected = 0, wanted = () => true) {
     const asked = Date.now();
-    while (!budgetFree(Date.now(), expected)) await sleep(250);
+    for (;;) {
+      if (!wanted()) return null;
+      if (budgetFree(Date.now(), expected)) break;
+      await sleep(250);
+    }
     const entry = { at: Date.now(), bytes: expected, waitedMs: Date.now() - asked };
     budget.reads.push(entry);
     return entry;
@@ -405,12 +412,13 @@
   const NOT_FOUND = new Set(['feed_empty', 'entry_not_found', 'chunk_not_found', 'feed_not_found']);
 
   /** One `window.swarm` call, its refusal turned into an answer. */
-  async function provider(method, params, decode, expected) {
+  async function provider(method, params, decode, expected, wanted) {
     const swarm = window.swarm;
     if (!swarm || typeof swarm.request !== 'function') {
       return { status: 'error', note: 'window.swarm is not available (open the channel in Freedom)' };
     }
-    const entry = await takeBudget(expected);
+    const entry = await takeBudget(expected, wanted);
+    if (!entry) return { status: 'cancelled', note: 'not sent: the channel changed while it waited for the read budget' };
     const waited = entry.waitedMs > 500 ? `waited ${(entry.waitedMs / 1000).toFixed(1)} s for the read budget` : '';
     try {
       const result = await withTimeout(swarm.request({ method, params }), READ_TIMEOUT_MS, method);
@@ -474,26 +482,27 @@
     }
   }
 
-  function readHead(ch) {
+  // `wanted` (below): see takeBudget.
+  function readHead(ch, wanted) {
     if (!inBzz) return gateway(`feeds/${ch.owner}/${ch.topicHex}`, true);
     return provider('swarm_readFeedEntry', { topic: ch.topicHex, owner: `0x${ch.owner}` }, (r) => {
       const bytes = fromBase64(r.data);
       return { status: 200, text: textOf(bytes), index: typeof r.index === 'number' ? r.index : null, size: bytes.length };
-    });
+    }, 0, wanted);
   }
 
-  function readSoc(owner, identifier) {
+  function readSoc(owner, identifier, wanted) {
     if (!inBzz) return gateway(`soc/${owner}/${identifier}`, false);
     return provider('swarm_readSingleOwnerChunk', { owner: `0x${owner}`, identifier }, (r) => {
       const { bytes, length } = socBody(r);
       return bytes ? { status: 200, text: textOf(bytes), size: bytes.length } : { status: 'long', size: 0, length };
-    });
+    }, 0, wanted);
   }
 
   const kib = (n) => `${Math.ceil(n / 1024)} KiB`;
 
-  async function readSlot(ch, index) {
-    const a = await readSoc(ch.owner, K.feedIdentifier(ch.topicHex, index));
+  async function readSlot(ch, index, wanted) {
+    const a = await readSoc(ch.owner, K.feedIdentifier(ch.topicHex, index), wanted);
     if (a.status !== 'long') return { ...a, index };
     // Longer than one chunk (a recording): the node joins it, a read whose
     // bytes count against the budget. Only the broadcast's last update.
@@ -511,7 +520,7 @@
     const whole = await provider('swarm_readFeedEntry', { topic: ch.topicHex, owner: `0x${ch.owner}`, index }, (r) => {
       const bytes = fromBase64(r.data);
       return { status: 200, text: textOf(bytes), size: bytes.length };
-    }, a.length);
+    }, a.length, wanted);
     return { ...whole, index, note: [`longer than one chunk (${kib(a.length)}): read whole`, whole.note].filter(Boolean).join(' · ') };
   }
 
@@ -711,9 +720,13 @@
       segments: null,
       note: '',
     });
+    // A read still waiting for the read budget when the channel changes is
+    // dropped there, not sent: Freedom would charge it to the origin's
+    // window, which the new channel's head read then may not fit in.
+    const wanted = () => gen === feed.gen;
     let a;
     try {
-      a = kind === 'head' ? await readHead(ch) : kind === 'slot' ? await readSlot(ch, arg) : await readSoc(ch.owner, K.ladderMarkerIdentifier(ch.groupHex, arg));
+      a = kind === 'head' ? await readHead(ch, wanted) : kind === 'slot' ? await readSlot(ch, arg, wanted) : await readSoc(ch.owner, K.ladderMarkerIdentifier(ch.groupHex, arg), wanted);
     } catch (err) {
       a = { status: 'error', note: err.message };
     }

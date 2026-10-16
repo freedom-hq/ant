@@ -236,7 +236,7 @@
       const bad = e.status !== 200 && e.status !== 404 && e.status !== 'loading';
       const stale = e.note.includes('stale');
       const what = e.read === 'head' ? 'feed head' : e.read === 'marker' ? `marker ${e.period}` : 'feed slot';
-      return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : e.status === 404 ? ' dim' : ''}` },
+      return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : e.status === 404 || e.status === 'cancelled' ? ' dim' : ''}` },
         t,
         el('td', {}, what),
         el('td', { class: 'mono' }, e.index === null || e.index === undefined ? '–' : String(e.index)),
