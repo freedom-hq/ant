@@ -12,6 +12,17 @@
 //! the row; that is the same durability model as bee’s localstore cache
 //! path.
 //!
+//! One exception: a row stored at a dispersed-replica SOC address
+//! (`keccak256(id ‖ REPLICAS_OWNER)`) is re-checked with
+//! [`ant_crypto::soc_valid`] on every hit and read as a miss if it
+//! fails. Builds before the replica id rule (bee#5640) accepted and
+//! cached forged replicas signed with the public replicas key; without
+//! this they would keep being served from disk after an upgrade and
+//! block replica recovery. The filter is one keccak per hit; only the
+//! rare replica rows pay the full SOC check. A miss sends the caller to
+//! the network, and the validated replica it fetches overwrites the
+//! row. See [`forged_replica_row`].
+//!
 //! Concurrency (bee-ish throughput goals):
 //!
 //! - **Dedicated read threads** — `get` is a prepared `SELECT` on a read-only
@@ -537,7 +548,8 @@ impl DiskChunkCache {
     }
 
     /// Look up a chunk by address. Trusts stored bytes (bee `chunkstore`
-    /// semantics). A stale `last_access` is refreshed via the writer
+    /// semantics), except that a dispersed-replica SOC failing
+    /// [`ant_crypto::soc_valid`] reads as `None` (see the module docs). A stale `last_access` is refreshed via the writer
     /// queue (best-effort). Serviced by a dedicated read thread + prepared
     /// statement (no `spawn_blocking` on the hot path).
     pub async fn get(&self, addr: [u8; 32]) -> Result<Option<Vec<u8>>, DiskCacheError> {
@@ -777,6 +789,14 @@ fn read_worker_loop(
                     let Some((data, last_access)) = row else {
                         return Ok(None);
                     };
+                    if forged_replica_row(&addr, &data) {
+                        debug!(
+                            target: "ant_retrieval::disk_cache",
+                            "ignoring cached replica SOC {} that fails soc_valid",
+                            hex::encode(addr),
+                        );
+                        return Ok(None);
+                    }
                     let now = unix_now() as i64;
                     if now.saturating_sub(last_access) > LAST_ACCESS_REFRESH_MS {
                         let _ = write_tx.send(WriteMsg::Touch {
@@ -799,6 +819,25 @@ fn read_worker_loop(
             }
         }
     }
+}
+
+/// Whether a cached row is a dispersed-replica SOC that fails
+/// [`ant_crypto::soc_valid`]: a forgery signed with the public replicas
+/// key, cached by a build that predates the replica id rule. Rows that
+/// don't sit at `keccak256(id ‖ REPLICAS_OWNER)` (every CAC, every
+/// other owner's SOC) return `false` after one keccak, so ordinary hits
+/// keep bee's trust-the-disk contract.
+fn forged_replica_row(addr: &[u8; 32], data: &[u8]) -> bool {
+    if data.len() < ant_crypto::SOC_MIN_CHUNK_SIZE {
+        return false;
+    }
+    let mut input = [0u8; ant_crypto::SOC_ID_SIZE + 20];
+    input[..ant_crypto::SOC_ID_SIZE].copy_from_slice(&data[..ant_crypto::SOC_ID_SIZE]);
+    input[ant_crypto::SOC_ID_SIZE..].copy_from_slice(&ant_crypto::soc::REPLICAS_OWNER);
+    if &ant_crypto::keccak256(&input) != addr {
+        return false;
+    }
+    !ant_crypto::soc_valid(addr, data)
 }
 
 fn process_put_batch_transaction(
@@ -1982,6 +2021,72 @@ mod tests {
 
         let got = cache.get(addr).await.unwrap();
         assert_eq!(got, Some(bad));
+    }
+
+    /// Wire bytes and address of a SOC signed by `secret` at `id`
+    /// wrapping `payload`.
+    fn signed_soc(secret: &[u8; 32], id: &[u8; 32], payload: &[u8]) -> ([u8; 32], Vec<u8>) {
+        let (inner_addr, inner_wire) = cac_new(payload).unwrap();
+        let mut digest_input = [0u8; 64];
+        digest_input[..32].copy_from_slice(id);
+        digest_input[32..].copy_from_slice(&inner_addr);
+        let sig =
+            ant_crypto::sign_handshake_data(secret, &ant_crypto::keccak256(&digest_input)).unwrap();
+        let sk = k256::ecdsa::SigningKey::from_bytes(secret.into()).unwrap();
+        let owner =
+            ant_crypto::ethereum_address_from_public_key(&k256::ecdsa::VerifyingKey::from(&sk));
+        let mut addr_input = [0u8; 52];
+        addr_input[..32].copy_from_slice(id);
+        addr_input[32..].copy_from_slice(&owner);
+        let mut wire = id.to_vec();
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(&inner_wire);
+        (ant_crypto::keccak256(&addr_input), wire)
+    }
+
+    /// A forged replica SOC cached by a build that predates the replica
+    /// id rule (bee#5640) reads as a miss, so retrieval goes to the
+    /// network; the genuine replica it fetches overwrites the row and
+    /// is served from disk from then on. Other SOCs keep the
+    /// trust-the-disk contract.
+    #[tokio::test]
+    async fn forged_replica_row_reads_as_miss() {
+        use ant_crypto::soc::REPLICAS_OWNER_SECRET;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("replica.sqlite");
+
+        let payload = b"genuine replicated root";
+        let (root, _) = cac_new(payload).unwrap();
+        let mut id = root;
+        id[0] = 0x80;
+        let (addr, genuine) = signed_soc(&REPLICAS_OWNER_SECRET, &id, payload);
+        let (forged_addr, forged) = signed_soc(&REPLICAS_OWNER_SECRET, &id, b"attacker content");
+        assert_eq!(forged_addr, addr);
+
+        // What an older build left behind: the forgery at the replica
+        // address, written straight to the table.
+        drop(DiskChunkCache::open(&path, 1 << 20).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO chunks (address, data, size, last_access, inserted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                rparams![&addr[..], &forged, forged.len() as i64, 0i64, 0i64],
+            )
+            .unwrap();
+        }
+        let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
+        assert_eq!(cache.row_count().await.unwrap(), 1);
+        assert_eq!(cache.get(addr).await.unwrap(), None);
+
+        cache.put(addr, genuine.clone()).await.unwrap();
+        assert_eq!(cache.get(addr).await.unwrap(), Some(genuine));
+        assert_eq!(cache.row_count().await.unwrap(), 1);
+
+        // A non-replica owner's SOC is still trusted from disk.
+        let (other_addr, other) = signed_soc(&[7u8; 32], &[0x80u8; 32], b"anything");
+        cache.put(other_addr, other.clone()).await.unwrap();
+        assert_eq!(cache.get(other_addr).await.unwrap(), Some(other));
     }
 
     #[tokio::test]
