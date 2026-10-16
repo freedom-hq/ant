@@ -474,7 +474,26 @@ final class CaptureEngine: NSObject {
     private func configureSession() throws {
         guard !sessionConfigured else { return }
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
+        let camera: AVCaptureDevice
+        do {
+            camera = try addCameraAndOutput()
+        } catch {
+            session.commitConfiguration()
+            throw error
+        }
+        // Committed before the camera is announced: the preview's
+        // connection only exists once the input is in the running
+        // configuration, and the preview sets up its rotation from that
+        // connection when it hears of the camera (#214).
+        session.commitConfiguration()
+        sessionConfigured = true
+        observeRotation(of: camera)
+        announceCamera()
+    }
+
+    /// The camera input and video output of ``configureSession()``,
+    /// inside its configuration block. Returns the camera.
+    private func addCameraAndOutput() throws -> AVCaptureDevice {
         session.sessionPreset = .high
 
         guard let camera = Self.captureDevice(front: false) ?? Self.captureDevice(front: true)
@@ -500,9 +519,7 @@ final class CaptureEngine: NSObject {
         }
         session.addOutput(vOut)
         videoOutput = vOut
-        sessionConfigured = true
-        observeRotation(of: camera)
-        announceCamera()
+        return camera
     }
 
     /// Add the microphone for a recording. Into the running session, so
@@ -560,9 +577,17 @@ final class CaptureEngine: NSObject {
         rotationObservation = coordinator.observe(
             \.videoRotationAngleForHorizonLevelCapture,
             options: [.new]
-        ) { [weak self] _, change in
+        ) { [weak self, weak coordinator] _, change in
             guard let angle = change.newValue else { return }
-            self?.queue.async { self?.applyRotation(angle) }
+            self?.queue.async {
+                // A change queued just before a camera flip belongs to the
+                // previous camera's coordinator: the new camera's own
+                // angle (applied by the flip) must not be overwritten by
+                // it (#214).
+                guard let self, let coordinator, self.rotationCoordinator === coordinator
+                else { return }
+                self.applyRotation(angle)
+            }
         }
     }
 
@@ -580,9 +605,10 @@ final class CaptureEngine: NSObject {
     }
 
     /// A capture angle of 90° or 270° turns the sensor's landscape frames
-    /// upright: the picture is portrait.
+    /// upright: the picture is portrait. Either camera: the front one's
+    /// mirrored 270° counts as the back one's 90° (``PreviewGeometry``).
     static func isPortrait(captureAngle angle: CGFloat) -> Bool {
-        Int(angle.rounded()).quotientAndRemainder(dividingBy: 180).remainder != 0
+        PreviewGeometry.isPortrait(angle: angle)
     }
 
     private func applyRotation(_ angle: CGFloat) {

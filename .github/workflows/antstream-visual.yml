@@ -46,6 +46,17 @@ jobs:
           sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
           xcodebuild -version
 
+      # The live screen's frame-shape decision (#214), compiled on its own
+      # with its tests: the app has no test target, and the simulator has
+      # no camera to drive the preview path with.
+      - name: Preview geometry unit tests
+        working-directory: examples/ios-stream
+        run: |
+          mkdir -p build
+          swiftc -parse-as-library AntStream/PreviewGeometry.swift \
+            ci/preview-geometry-tests.swift -o build/preview-geometry-tests
+          build/preview-geometry-tests
+
       - name: Pick a simulator
         id: sim
         run: |
