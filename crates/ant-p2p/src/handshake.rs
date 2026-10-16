@@ -204,9 +204,9 @@ async fn read_delimited(r: &mut (impl AsyncReadExt + Unpin)) -> Result<Vec<u8>, 
     if len > MAX_PROTO_MESSAGE {
         return Err(HandshakeError::MessageTooLarge);
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(buf)
+    // Grows with the bytes that arrive, not the declared `len`, so a peer
+    // can't pin the cap per stream by declaring a frame and stalling (#203).
+    Ok(ant_retrieval::frame::read_frame_body(r, len).await?)
 }
 
 async fn read_varint_len(r: &mut (impl AsyncReadExt + Unpin)) -> Result<usize, HandshakeError> {

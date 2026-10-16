@@ -208,9 +208,9 @@ async fn read_delimited<R: AsyncReadExt + Unpin>(
             format!("message too large: {len} bytes (cap {max})"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(buf)
+    // Grows with the bytes that arrive, not the declared `len`, so a peer
+    // can't pin the cap per stream by declaring a frame and stalling (#203).
+    ant_retrieval::frame::read_frame_body(r, len).await
 }
 
 async fn write_delimited<W, M>(w: &mut W, msg: &M) -> std::io::Result<()>

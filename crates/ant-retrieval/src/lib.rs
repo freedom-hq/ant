@@ -56,6 +56,7 @@ pub mod disk_cache;
 pub mod enc_split;
 pub mod feed;
 pub mod fetcher;
+pub mod frame;
 pub mod joiner;
 pub mod manifest_writer;
 pub mod mantaray;
@@ -501,8 +502,8 @@ pub(crate) async fn read_delimited<M: Message + Default>(
     if len > cap {
         return Err(RetrievalError::MessageTooLarge { got: len, cap });
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    // Grows with the bytes that arrive, not the declared `len` (#203).
+    let buf = frame::read_frame_body(r, len).await?;
     Ok(M::decode(buf.as_slice())?)
 }
 
