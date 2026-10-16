@@ -11,7 +11,7 @@
   <header>
     <h1>AntStream <span>Player</span></h1>
     <form id="channel-form" autocomplete="off">
-      <input id="channel-input" placeholder="Channel reference (64 hex), bzz://… link or ENS name" spellcheck="false">
+      <input id="channel-input" placeholder="Channel: 0x… owner/topic, or a swarm:// link" spellcheck="false">
       <button type="submit">Watch</button>
     </form>
   </header>
@@ -43,10 +43,11 @@
   </section>
 
   <section id="intro">
-    <p>Paste the channel reference an AntStream broadcaster shared (the Android
-      or iOS app shows it on the live screen). The player follows the channel's
-      Swarm feed and keeps you at the live edge; a finished broadcast plays back
-      from the start.</p>
+    <p>Paste the channel an AntStream broadcaster shared: their address and the
+      channel's topic, <code>0x…/&lt;topic&gt;</code> (the topic as text, or as
+      64 hex digits for a channel without a text topic), or a Solar Punk <code>swarm://&lt;owner&gt;/&lt;topic&gt;</code> link. The
+      player follows the channel's Swarm feed and keeps you at the live edge; a
+      finished broadcast plays back from the start.</p>
     <ul id="recent"></ul>
   </section>
 
@@ -56,6 +57,7 @@
 </main>
 <script src="version.js"></script>
 <script src="vendor/hls.light.min.js"></script>
+<script src="keccak.js"></script>
 <script src="player.js"></script>
 <script src="debug.js"></script>
 </body>

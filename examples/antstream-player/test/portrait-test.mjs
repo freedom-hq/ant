@@ -146,7 +146,7 @@ for (const c of CASES) {
       OUT: shot,
       WIDTH: String(vp.width),
       HEIGHT: String(vp.height),
-      SWITCH_TO: 'd'.repeat(64),
+      SWITCH_TO: `0x${'d'.repeat(40)}/nothing-here`,
     });
     gw.kill();
     const label = `${c.name}/${vp.name}`;

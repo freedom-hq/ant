@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url'
 const PLAYER_FILES = [
   'index.html',
   'player.css',
+  'keccak.js',
   'player.js',
   'debug.js',
   'vendor/hls.light.min.js',
