@@ -181,6 +181,13 @@ final class CaptureEngine: NSObject {
     /// from (after the session is set up and after every flip), so the
     /// preview can keep its own rotation coordinator on the same device.
     var onCameraChange: (@MainActor (AVCaptureDevice?) -> Void)?
+    /// Called on the main actor with whether the camera's picture is
+    /// upright-portrait (`true`) or landscape, from the capture rotation
+    /// angle — the *physical* device's orientation, which the encoded
+    /// frames follow even when the interface doesn't turn (Portrait
+    /// Orientation Lock, a narrow iPad window). The broadcast takes its
+    /// shape from this at Go live (#193).
+    var onOrientationChange: (@MainActor (Bool) -> Void)?
 
     private(set) var state: State = .idle {
         didSet {
@@ -372,7 +379,9 @@ final class CaptureEngine: NSObject {
             self.recording = false
             self.detachAudio()
             if !self.session.isRunning { self.session.startRunning() }
-            self.state = .previewing
+            // Still interrupted (a call, another app on the camera): keep
+            // saying so; the interruption's end puts the preview back.
+            if case .interrupted = self.state {} else { self.state = .previewing }
             completion?()
         }
     }
@@ -557,7 +566,15 @@ final class CaptureEngine: NSObject {
         }
     }
 
+    /// A capture angle of 90° or 270° turns the sensor's landscape frames
+    /// upright: the picture is portrait.
+    static func isPortrait(captureAngle angle: CGFloat) -> Bool {
+        Int(angle.rounded()).quotientAndRemainder(dividingBy: 180).remainder != 0
+    }
+
     private func applyRotation(_ angle: CGFloat) {
+        let portrait = Self.isPortrait(captureAngle: angle)
+        Task { @MainActor [onOrientationChange] in onOrientationChange?(portrait) }
         guard let connection = videoOutput?.connection(with: .video),
               connection.isVideoRotationAngleSupported(angle),
               connection.videoRotationAngle != angle

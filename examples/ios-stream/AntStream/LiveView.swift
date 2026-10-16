@@ -18,8 +18,9 @@ import UIKit
 /// can be framed, the camera switched and the quality picked before Go
 /// live; the preview is drawn in the broadcast's own frame. The interface
 /// turns with the device (``OrientationLock``) and the controls re-lay
-/// out for landscape; the broadcast's orientation follows the phone until
-/// Go live and then stays as it was for the whole broadcast.
+/// out for landscape; the broadcast's orientation follows the camera's
+/// picture (the device as held, even with rotation lock on) until Go live
+/// and then stays as it was for the whole broadcast.
 struct LiveView: View {
     @EnvironmentObject var node: AntNode
     @StateObject private var broadcast = LiveBroadcast()
@@ -78,6 +79,10 @@ struct LiveView: View {
             broadcast.closePreview()
         }
         .task { await broadcast.openPreview() }
+        // A resume keeps the orientation its broadcast went out in (#175).
+        .onChange(of: resumeOwner, initial: true) { _, owner in
+            broadcast.pinForResume(owner: owner)
+        }
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .alert(lowCapacityTitle, isPresented: $confirmLowCapacity) {
             Button("Go live anyway", role: .destructive) {
@@ -91,9 +96,9 @@ struct LiveView: View {
             guard !state.isActive else { return }
             // Back to the preview after a broadcast that took the camera
             // down with it (a capture failure); a no-op while it runs. The
-            // next broadcast's orientation follows the phone again (#193).
+            // next broadcast's orientation follows the camera again (#193,
+            // `LiveBroadcast.followOrientation`).
             Task { await broadcast.openPreview() }
-            broadcast.portrait = !landscape
             // A resumed run that ended with its entry still on disk (the
             // node refused it at the feed head, or it failed): the next
             // tap resumes again rather than replacing the entry with a
@@ -200,11 +205,17 @@ struct LiveView: View {
         }
     }
 
-    /// Until Go live the next broadcast takes the phone's orientation;
-    /// once live it keeps the one it started with.
+    /// Lays the controls out, and stands in for the camera's orientation
+    /// where there is no camera (the test pattern): the broadcast's own
+    /// orientation follows the camera's picture (``LiveBroadcast``).
     private func followLayout(wide: Bool) {
         landscape = wide
-        if !broadcast.state.isActive { broadcast.portrait = !wide }
+        broadcast.layoutPortrait = !wide
+    }
+
+    /// The account whose unfinished broadcast the next go-live resumes.
+    private var resumeOwner: String? {
+        resumePending ? node.channel?.owner : nil
     }
 
     // MARK: preview
@@ -381,13 +392,16 @@ struct LiveView: View {
                         .font(.footnote)
                         .foregroundStyle(.orange)
                 }
-                if broadcast.state.isActive, broadcast.engine?.previewSession != nil,
-                   broadcast.portrait == landscape {
-                    // Turned away from the orientation the broadcast went
-                    // live in: the frame keeps its shape (#193).
-                    Label("Broadcasting in \(orientationName) as you went live: "
+                if broadcast.state.isActive || broadcast.resumePortrait != nil,
+                   broadcast.engine?.previewSession != nil,
+                   broadcast.portrait != broadcast.picturePortrait {
+                    // The camera's picture is turned away from the
+                    // broadcast's fixed frame (#193): it went live the
+                    // other way, or the broadcast being resumed did.
+                    Label("\(broadcast.state.isActive ? "Broadcasting" : "Resuming") in "
+                          + "\(orientationName) as \(broadcast.state.isActive ? "you went live" : "it went out"): "
                           + "turned this way the picture goes out with black bars. "
-                          + "Turn the phone back to fill the frame.",
+                          + "Turn the phone to \(orientationName) to fill the frame.",
                           systemImage: broadcast.portrait
                               ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate")
                         .font(.footnote)
@@ -579,9 +593,13 @@ struct LiveView: View {
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
-            // The orientation is picked by holding the phone (#193).
-            Label("\(orientationName.capitalized) broadcast, as the phone is held. "
-                  + "Turn it to switch; it stays \(orientationName) once you go live.",
+            // The orientation is picked by holding the phone (#193); a
+            // resume keeps the one its broadcast went out in.
+            Label(broadcast.resumePortrait != nil
+                  ? "\(orientationName.capitalized) broadcast, as it went out before. "
+                    + "Resuming keeps it \(orientationName)."
+                  : "\(orientationName.capitalized) broadcast, as the phone is held. "
+                    + "Turn it to switch; it stays \(orientationName) once you go live.",
                   systemImage: broadcast.portrait ? "rectangle.portrait" : "rectangle")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
