@@ -278,8 +278,17 @@ final class LiveBroadcast: ObservableObject {
 
         // A resume keeps the orientation its broadcast went out in; a new
         // broadcast takes the picture's (``followOrientation`` kept it
-        // current up to here).
-        if resume { portrait = Self.storedPortrait(owner: permanent.owner) }
+        // current up to here). With no camera reading yet (the preview's
+        // engine never got the camera, or Go live came before it was
+        // made), the picture's shape is read from the camera once here
+        // rather than taken from the layout, which disagrees with it under
+        // Portrait Orientation Lock or in a narrow iPad window.
+        if resume {
+            portrait = Self.storedPortrait(owner: permanent.owner)
+        } else if capturePortrait == nil, source == .camera,
+                  let held = CaptureEngine.defaultCameraPortrait() {
+            portrait = held
+        }
         let settings = self.settings
         do {
             permanent.name = channel

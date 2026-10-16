@@ -285,7 +285,10 @@ the camera switched and the quality picked first. Going live adds the
 microphone and a writer to that running session rather than restarting
 the camera; a stop goes back to the preview, and leaving the screen
 turns the camera off. The preview is drawn in the broadcast's own frame
-(16:9 or 9:16), aspect-fit, so it shows what viewers get.
+(16:9 or 9:16), aspect-fit, so it shows what viewers get. With
+Portrait Orientation Lock on and the phone held sideways the preview
+draws the picture turned against the (portrait) interface, so the frame
+is turned with it and still has the broadcast's shape as held.
 
 The live screen's interface turns with the device (the rest of the app
 stays portrait on a phone; an `AppDelegate` orientation lock widens it

@@ -45,6 +45,10 @@ struct LiveView: View {
     @State private var confirmLowCapacity = false
     /// The interface is laid out wider than tall (the phone is turned).
     @State private var landscape = false
+    /// The camera preview turns its picture upright-portrait relative to
+    /// the interface (its preview angle is 90°/270°), as reported by
+    /// ``CameraPreview``. `nil` until a preview runs.
+    @State private var previewAnglePortrait: Bool?
 
     init(resume: Bool = false) {
         _resumePending = State(initialValue: resume)
@@ -227,15 +231,37 @@ struct LiveView: View {
         ZStack {
             previewContent
         }
-        .aspectRatio(broadcast.portrait ? 9.0 / 16.0 : 16.0 / 9.0, contentMode: .fit)
+        .aspectRatio(previewFrameTall ? 9.0 / 16.0 : 16.0 / 9.0, contentMode: .fit)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()
+    }
+
+    /// The broadcast's frame is drawn taller than wide in the interface.
+    /// Normally that is just ``LiveBroadcast/portrait``. But the preview
+    /// keeps the picture level with the horizon relative to the
+    /// *interface*, while the broadcast's frame follows the camera's
+    /// capture angle (the device as held): with Portrait Orientation Lock
+    /// on and the phone sideways (or a narrow iPad window), the preview
+    /// draws the landscape picture turned a quarter against the interface
+    /// (#193). The frame is then turned the same way, so on the screen it
+    /// has the shape viewers get and the picture fills it as it will for
+    /// them, instead of a 16:9 box laid across the portrait interface
+    /// around a picture standing the other way.
+    private var previewFrameTall: Bool {
+        guard broadcast.engine?.previewSession != nil,
+              let previewPortrait = previewAnglePortrait,
+              let capturePortrait = broadcast.capturePortrait
+        else { return broadcast.portrait }
+        let turned = previewPortrait != capturePortrait
+        return broadcast.portrait != turned
     }
 
     @ViewBuilder
     private var previewContent: some View {
         if let session = broadcast.engine?.previewSession {
-            CameraPreview(session: session, camera: broadcast.previewCamera)
+            CameraPreview(session: session, camera: broadcast.previewCamera) { portrait in
+                if previewAnglePortrait != portrait { previewAnglePortrait = portrait }
+            }
         } else if let problem = broadcast.previewProblem {
             previewPlaceholder(icon: "video.slash", text: problem) {
                 Button {
@@ -801,9 +827,14 @@ struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     /// The camera the session captures from; `nil` until it is set up.
     let camera: AVCaptureDevice?
+    /// Called with whether the preview's angle stands the picture
+    /// portrait in the interface (90°/270°), on every change, so the
+    /// live screen can shape the frame around it.
+    var onPreviewAngle: (Bool) -> Void = { _ in }
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
+        view.onPreviewAngle = onPreviewAngle
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspect
         view.follow(camera)
@@ -811,6 +842,7 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ view: PreviewView, context: Context) {
+        view.onPreviewAngle = onPreviewAngle
         if view.previewLayer.session !== session {
             view.previewLayer.session = session
         }
@@ -821,6 +853,7 @@ struct CameraPreview: UIViewRepresentable {
         private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
         private var rotationObservation: NSKeyValueObservation?
         private var followedCamera: String?
+        var onPreviewAngle: (Bool) -> Void = { _ in }
 
         /// Keep the preview upright for `camera`, as the interface turns.
         /// A camera flip brings a new device and a new coordinator.
@@ -848,6 +881,10 @@ struct CameraPreview: UIViewRepresentable {
                   connection.isVideoRotationAngleSupported(angle)
             else { return }
             connection.videoRotationAngle = angle
+            // Reported after the current view update: `follow` runs inside
+            // SwiftUI's make/update, where state must not change.
+            let portrait = CaptureEngine.isPortrait(captureAngle: angle)
+            Task { @MainActor [weak self] in self?.onPreviewAngle(portrait) }
         }
 
         override static var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }

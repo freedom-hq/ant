@@ -566,6 +566,19 @@ final class CaptureEngine: NSObject {
         }
     }
 
+    /// Whether the camera a fresh engine would capture from (the one
+    /// ``configureSession()`` picks) would deliver a portrait picture as
+    /// the device is held right now, read once from its own rotation
+    /// coordinator. For Go live with no engine that has reported its
+    /// angle yet (#193): its shape must come from the camera, not from the
+    /// interface. `nil` with no camera.
+    static func defaultCameraPortrait() -> Bool? {
+        guard let camera = captureDevice(front: false) ?? captureDevice(front: true)
+        else { return nil }
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: camera, previewLayer: nil)
+        return isPortrait(captureAngle: coordinator.videoRotationAngleForHorizonLevelCapture)
+    }
+
     /// A capture angle of 90° or 270° turns the sensor's landscape frames
     /// upright: the picture is portrait.
     static func isPortrait(captureAngle angle: CGFloat) -> Bool {
