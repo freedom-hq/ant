@@ -8,8 +8,12 @@
  * (`topic_from_string`, bee-js `Topic.fromString`), and **every feed
  * update is the HLS playlist itself** (a v2 update wrapping the
  * playlist's root chunk). Segments and the `#EXT-X-MAP` are listed as
- * bare 64-hex references to raw bytes. AntStream's own channels use the
- * topic text `antstream`, one per account.
+ * bare 64-hex references to raw bytes. A channel's topic can also be given
+ * as the raw 32 topic bytes (64 hex, `0x` optional), for a channel whose
+ * random topic no text names (the Android app's, an iOS channel created
+ * before text topics). There is no default topic: AntStream channels each
+ * have their own (iOS `antstream-<uuid>`, the publisher's own default
+ * `antstream/<channel>`, Android random bytes), so a link names it.
  *
  * The page runs in two kinds of places:
  *
@@ -43,8 +47,8 @@
   const K = window.antstreamKeccak;
   const OWNER = /^(?:0x)?([0-9a-f]{40})$/i;
   const REF = /^([0-9a-f]{64}(?:[0-9a-f]{64})?)$/i;
-  // AntStream's own channels: one per account, told apart by the owner.
-  const DEFAULT_TOPIC = 'antstream';
+  // A topic given as its raw 32 bytes rather than as text.
+  const RAW_TOPIC = /^(?:0x)?([0-9a-f]{64})$/i;
   const RECENT_KEY = 'antstream.recent.v2';
 
   const inBzz = location.protocol === 'bzz:';
@@ -109,8 +113,9 @@
    * A channel from what the viewer pasted or the page's hash:
    * `<owner>/<topic>` (the owner `0x` + 40 hex, the topic URL-encoded
    * text), `swarm://<owner>/<topic>` (Solar Punk's form), or a player link
-   * carrying either after its `#`. An owner alone means AntStream's own
-   * topic, `antstream`.
+   * carrying either after its `#`. A topic of 64 hex digits (`0x`
+   * optional) is the raw topic itself, not text to hash. An owner without
+   * a topic names no channel: there is no default topic.
    */
   function parseChannel(input) {
     let s = (input || '').trim();
@@ -136,20 +141,24 @@
     } catch (_) {
       /* not URL-encoded: the text as it is */
     }
-    return makeChannel(o[1].toLowerCase(), topic || DEFAULT_TOPIC);
+    if (!topic) return null;
+    const raw = RAW_TOPIC.exec(topic);
+    return makeChannel(o[1].toLowerCase(), topic, raw ? raw[1].toLowerCase() : null);
   }
 
-  function makeChannel(owner, topic) {
-    const topicHex = K.topicFromString(topic);
+  /** `rawHex`: the topic's raw bytes as hex, when `topic` is not text. */
+  function makeChannel(owner, topic, rawHex) {
+    const topicHex = rawHex || K.topicFromString(topic);
     return {
       owner,
-      topic,
+      // What is shown: the text, or `0x<hex>` for a raw topic.
+      topic: rawHex ? `0x${rawHex}` : topic,
       topicHex,
       // The ladder this channel's time markers are written for, as the
       // publisher names it (`ladder_group_text`).
       groupHex: K.topicFromString(`antstream-ladder-${topicHex}`),
       // The hash and the recent list's form, also what is shown.
-      key: `0x${owner}/${encodeURIComponent(topic)}`,
+      key: `0x${owner}/${rawHex ? `0x${rawHex}` : encodeURIComponent(topic)}`,
     };
   }
 
@@ -359,18 +368,25 @@
   const BUDGET_BYTES = 400 * 1024;
   const budget = { reads: [], until: 0, backoffMs: 0, refused: 0 };
 
-  function budgetFree(now) {
+  function budgetFree(now, expected) {
     budget.reads = budget.reads.filter((r) => now - r.at < BUDGET_WINDOW_MS);
     if (now < budget.until) return false;
     const bytes = budget.reads.reduce((n, r) => n + r.bytes, 0);
-    return budget.reads.length < BUDGET_REQUESTS && bytes < BUDGET_BYTES;
+    if (budget.reads.length >= BUDGET_REQUESTS) return false;
+    // A read of known size (a recording) needs room for all of it: Freedom
+    // charges the bytes after the read, and refuses it if they don't fit.
+    return expected > 0 ? bytes + expected <= BUDGET_BYTES : bytes < BUDGET_BYTES;
   }
 
-  /** Wait for room in the budget; the entry to charge the read's bytes to. */
-  async function takeBudget() {
+  /**
+   * Wait for room in the budget; the entry to charge the read's bytes to.
+   * `expected`: the bytes the read will bring, when known, held from the
+   * start so reads started meanwhile can't take that room.
+   */
+  async function takeBudget(expected = 0) {
     const asked = Date.now();
-    while (!budgetFree(Date.now())) await sleep(250);
-    const entry = { at: Date.now(), bytes: 0, waitedMs: Date.now() - asked };
+    while (!budgetFree(Date.now(), expected)) await sleep(250);
+    const entry = { at: Date.now(), bytes: expected, waitedMs: Date.now() - asked };
     budget.reads.push(entry);
     return entry;
   }
@@ -389,17 +405,17 @@
   const NOT_FOUND = new Set(['feed_empty', 'entry_not_found', 'chunk_not_found', 'feed_not_found']);
 
   /** One `window.swarm` call, its refusal turned into an answer. */
-  async function provider(method, params, decode) {
+  async function provider(method, params, decode, expected) {
     const swarm = window.swarm;
     if (!swarm || typeof swarm.request !== 'function') {
       return { status: 'error', note: 'window.swarm is not available (open the channel in Freedom)' };
     }
-    const entry = await takeBudget();
+    const entry = await takeBudget(expected);
     const waited = entry.waitedMs > 500 ? `waited ${(entry.waitedMs / 1000).toFixed(1)} s for the read budget` : '';
     try {
       const result = await withTimeout(swarm.request({ method, params }), READ_TIMEOUT_MS, method);
       const answer = await decode(result);
-      entry.bytes = answer.size || 0;
+      entry.bytes = Math.max(answer.size || 0, entry.bytes);
       budget.backoffMs = 0;
       return { ...answer, note: waited };
     } catch (err) {
@@ -416,15 +432,17 @@
 
   /**
    * A single-owner chunk's content when the wrapped chunk is all of it (a
-   * live playlist, a marker), else null. The span's top byte can carry
-   * the erasure-coding level of a larger body (Freedom returns such a span
-   * as a BigInt).
+   * live playlist, a marker), else `{ length }`, the whole body's size.
+   * The span's top byte can carry the erasure-coding level of a larger
+   * body (Freedom returns such a span as a BigInt); the 7 bytes under it
+   * are the body's length.
    */
   function socBody(result) {
     const payload = fromBase64(result.data);
     const raw = BigInt(result.span);
-    if (raw >> 56n !== 0n || raw > BigInt(payload.length)) return null;
-    return payload.subarray(0, Number(raw));
+    const length = raw & ((1n << 56n) - 1n);
+    if (raw >> 56n !== 0n || length > BigInt(payload.length)) return { length: Number(length) };
+    return { bytes: payload.subarray(0, Number(length)) };
   }
 
   /** One gateway GET: 404 is "not written yet", a body shorter than declared an error. */
@@ -467,21 +485,34 @@
   function readSoc(owner, identifier) {
     if (!inBzz) return gateway(`soc/${owner}/${identifier}`, false);
     return provider('swarm_readSingleOwnerChunk', { owner: `0x${owner}`, identifier }, (r) => {
-      const bytes = socBody(r);
-      return bytes ? { status: 200, text: textOf(bytes), size: bytes.length } : { status: 'long', size: 0 };
+      const { bytes, length } = socBody(r);
+      return bytes ? { status: 200, text: textOf(bytes), size: bytes.length } : { status: 'long', size: 0, length };
     });
   }
+
+  const kib = (n) => `${Math.ceil(n / 1024)} KiB`;
 
   async function readSlot(ch, index) {
     const a = await readSoc(ch.owner, K.feedIdentifier(ch.topicHex, index));
     if (a.status !== 'long') return { ...a, index };
     // Longer than one chunk (a recording): the node joins it, a read whose
     // bytes count against the budget. Only the broadcast's last update.
+    if (a.length > BUDGET_BYTES) {
+      // More than a minute's budget: Freedom would refuse it on every try
+      // (and charge the refused bytes, so other reads stop too). The slot
+      // is written, though: the feed goes on after it.
+      return {
+        status: 'too-long',
+        index,
+        length: a.length,
+        note: `longer than one chunk (${kib(a.length)}): more than Freedom lets a page read without a connection grant, not read`,
+      };
+    }
     const whole = await provider('swarm_readFeedEntry', { topic: ch.topicHex, owner: `0x${ch.owner}`, index }, (r) => {
       const bytes = fromBase64(r.data);
       return { status: 200, text: textOf(bytes), size: bytes.length };
-    });
-    return { ...whole, index, note: ['longer than one chunk: read whole', whole.note].filter(Boolean).join(' · ') };
+    }, a.length);
+    return { ...whole, index, note: [`longer than one chunk (${kib(a.length)}): read whole`, whole.note].filter(Boolean).join(' · ') };
   }
 
   const MARKER_PERIOD_MS = 10000;
@@ -659,6 +690,23 @@
   }
 
   function onPlaylist(kind, a, row, chase) {
+    if (a.status === 'too-long') {
+      // A recording too large to read here. The next broadcast continues
+      // the feed after it (#173), so step past it rather than read it
+      // again and again.
+      feed.lastError = {
+        code: 0,
+        message: `this broadcast's recording (${kib(a.length)}) is larger than Freedom lets a page read without a connection grant; open the channel through an HTTP gateway to play it`,
+      };
+      if (a.index > feed.cursor) {
+        feed.cursor = a.index;
+        if (feed.index === null || a.index > feed.index) feed.index = a.index;
+        if (feed.joinedVia === null) feed.joinedVia = kind;
+        log.marker(`slot ${a.index} is a ${kib(a.length)} recording, over the read budget: not read, following on from slot ${a.index + 1}`);
+        if (chase) readPlaylist(true);
+      }
+      return;
+    }
     if (a.status !== 200) {
       if (kind === 'slot' && a.status === 404) note(row, 'not written yet');
       else if (kind === 'head' && a.status === 404) note(row, 'the feed has no updates yet');
@@ -1433,7 +1481,7 @@
 
   // -- channel selection ----------------------------------------------------
 
-  const ASK = 'Enter the broadcaster\'s address and topic: 0x<40 hex>/<topic> (AntStream channels: /antstream), or a swarm:// link';
+  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, or a swarm:// link';
 
   /** Recent channels, by key; entries of the older reference form are dropped. */
   function recent() {
@@ -1472,8 +1520,9 @@
     if (!raw) return;
     const ch = parseChannel(raw);
     if (!ch) {
-      // A link of the older form (a feed manifest reference, #<64 hex>):
-      // those channels are not played any more.
+      // A link of the older form (a feed manifest reference, #<64 hex>),
+      // whose channels are not played any more, or an owner without a
+      // topic.
       els.input.value = raw;
       els.input.setCustomValidity(`This link names no owner/topic channel. ${ASK}`);
       els.input.reportValidity();

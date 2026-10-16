@@ -36,6 +36,9 @@
 //   SLOT_MS=<a>-<b>     every slot read (`GET /soc`) waits a..b ms
 //   LADDER=1            write a ladder time marker every 10 s period
 //                       naming the newest index (issue #174)
+//   RECORDING_PAD=<n>   pad each recording with n bytes of comment lines
+//                       (a recording past Freedom's 512 KiB read budget,
+//                       as hours of broadcast make one)
 //   PRE_UPDATES=<n>     n older updates (an earlier, ended broadcast)
 //                       before this run's first, so a join from index 0
 //                       would be a long walk
@@ -82,6 +85,7 @@ const gapEvery = Number(env.GAP_EVERY || 0);
 const windowSize = Number(env.WINDOW || 8);
 const ladder = env.LADDER === '1';
 const preUpdates = Number(env.PRE_UPDATES || 0);
+const recordingPad = Number(env.RECORDING_PAD || 0);
 const upstream = env.UPSTREAM || '';
 const range = (v) => {
   const [a, b] = (v || '0').split('-').map(Number);
@@ -180,6 +184,7 @@ function recordingPlaylist() {
   out += `#EXT-X-MEDIA-SEQUENCE:${published[0].seq}\n`;
   if (discSeq) out += `#EXT-X-DISCONTINUITY-SEQUENCE:${discSeq}\n`;
   published.forEach((p, i) => { out += entryLines(p, i === 0); });
+  for (let n = 0; n < recordingPad; n += 1024) out += `#ANTSTREAM-PAD:${'x'.repeat(1024 - 16)}\n`;
   return `${out}#EXT-X-ENDLIST\n`;
 }
 
@@ -247,22 +252,24 @@ function prefill() {
 /**
  * A SOC body as `swarm-only-root-chunk` answers it: `span(8 LE) ‖
  * payload`, the payload being the body itself up to one chunk, else the
- * references of its 4096-byte parts (each served by `/bytes`), as a
- * chunk tree one level deep would carry them.
+ * references of its parts (each served by `/bytes` as the bytes under
+ * it), as a chunk tree carries them: 4096-byte leaves, 128 references
+ * to an intermediate chunk.
  */
 function rootChunk(body) {
   const bytes = Buffer.from(body);
   const span = Buffer.alloc(8);
   span.writeBigUInt64LE(BigInt(bytes.length));
   if (bytes.length <= 4096) return Buffer.concat([span, bytes]);
+  let size = 4096;
+  while (size * 128 < bytes.length) size *= 128;
   const refs = [];
-  for (let at = 0; at < bytes.length; at += 4096) {
-    const part = bytes.subarray(at, at + 4096);
+  for (let at = 0; at < bytes.length; at += size) {
+    const part = bytes.subarray(at, at + size);
     const ref = refOf(`part-${refOf(part.toString('binary'))}`);
     blobs.set(ref, { bytes: part, type: 'application/octet-stream' });
     refs.push(Buffer.from(ref, 'hex'));
   }
-  if (refs.length > 128) throw new Error('fake gateway: playlist too large for one level');
   return Buffer.concat([span, ...refs]);
 }
 

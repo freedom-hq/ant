@@ -53,9 +53,14 @@ A **channel is an owner and a topic text**:
 `<gateway>/bzz/<player>/#<owner>/<topic>`, the owner as `0x` + 40 hex, the
 topic URL-encoded. The feed topic is `keccak256(utf8(text))`, bee-js
 `Topic.fromString`, `topic_from_string` in
-`crates/ant-ffi/src/publisher.rs`. AntStream's own channels use the topic
-`antstream`, one per account, so an owner alone (`#0x…`) means that
-topic. The channel field also takes Solar Punk's `swarm://<owner>/<topic>`
+`crates/ant-ffi/src/publisher.rs`. There is no default topic: each
+AntStream channel has its own (the iOS app's `antstream-<uuid>`, the
+publisher's own default `antstream/<channel>`), so a link always names
+one. A channel whose topic is random bytes with no text (the Android
+app's, an iOS channel created before text topics) is named by the raw
+topic, 64 hex digits (`#0x<owner>/0x<topic hex>`, `0x` optional); a
+topic of exactly 64 hex digits is always read that way, never as text.
+The channel field also takes Solar Punk's `swarm://<owner>/<topic>`
 and any player link.
 
 Every feed update **is** the playlist (a v2 update wrapping the
@@ -92,8 +97,14 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   requests / 400 KiB a minute on its own (about 45 a minute while live,
   12 once a broadcast ended), and a `rate_limited` refusal pauses its
   feed reads for 5 s, doubling up to a minute. Segments are `bzz://`
-  reads and not counted. A recording over 512 KiB (several hours of
-  broadcast) can't be read without a connection grant.
+  reads and not counted. A recording's size is known from its slot's
+  root chunk before it is read, and the read waits until the budget has
+  room for all of it. A recording over the budget (several hours of
+  broadcast) can't be read without a connection grant: a live viewer
+  steps past its slot without reading it (the next broadcast continues
+  the feed after it), and one who opens the channel after such a
+  broadcast ended can't join through the head (it returns the whole
+  recording) and should use an HTTP gateway.
 
 ## Keeping the buffer full
 
