@@ -49,6 +49,9 @@ const slowMs = Number(process.env.SLOW_MS || 0);
 const restartMs = Number(process.env.RESTART_MS || 0);
 const stallAfter = Number(process.env.STALL || 0);
 const stalePct = Number(process.env.STALE_PCT || 0);
+// GAP_EVERY=<n>: every n-th segment is lost and listed as #EXT-X-GAP, as the
+// publisher lists a segment it had to drop (issue #169).
+const gapEvery = Number(process.env.GAP_EVERY || 0);
 const recording = process.env.RECORDING === '1';
 const [playlistMin, playlistMax] = (process.env.PLAYLIST_MS || '0').split('-').map(Number);
 if (!dir) {
@@ -109,7 +112,11 @@ function playlist() {
     published.forEach((p, i) => {
       if (p.discontinuity) out += '#EXT-X-DISCONTINUITY\n';
       if (i === 0 || p.discontinuity) out += `#EXT-X-MAP:URI="/bzz/${initRef}/init-1.mp4"\n`;
+      if (gapEvery && p.seq > 0 && p.seq % gapEvery === 0) {
+      out += `#EXT-X-GAP\n#EXTINF:${(p.ms / 1000).toFixed(3)},\ngap-${p.seq}\n`;
+    } else {
       out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
+    }
     });
     return `${out}#EXT-X-ENDLIST\n`;
   }
@@ -128,7 +135,11 @@ function playlist() {
     // and counts in the sequence only once that segment has slid out.
     if (p.discontinuity) out += '#EXT-X-DISCONTINUITY\n';
     if (i === 0 || p.discontinuity) out += `#EXT-X-MAP:URI="/bzz/${initRef}/init-1.mp4"\n`;
-    out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
+    if (gapEvery && p.seq > 0 && p.seq % gapEvery === 0) {
+      out += `#EXT-X-GAP\n#EXTINF:${(p.ms / 1000).toFixed(3)},\ngap-${p.seq}\n`;
+    } else {
+      out += `#EXTINF:${(p.ms / 1000).toFixed(3)},\n/bzz/${p.ref}/${p.name}\n`;
+    }
   });
   if (ended && lag === 0) out += '#EXT-X-ENDLIST\n';
   return out;

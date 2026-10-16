@@ -474,6 +474,8 @@
     const frags = (level && level.details && level.details.fragments) || [];
     for (const frag of frags) {
       if (frag.sn <= sn || frag.sn > sn + depth) continue;
+      // An #EXT-X-GAP entry has no media behind its URI.
+      if (frag.gap) continue;
       const url = toContentUrl(frag.url);
       if (!segs.has(url)) fetchSegment(url, frag.sn, true);
     }
@@ -619,8 +621,14 @@
   // hls.js keeps loading and treats rate 0 as halted rather than stalled.
 
   const HOLD_MAX_MS = 15000;
-  const MAX_GAP_S = 1;
+  // A hole the player jumps instead of waiting at: up to a few lost
+  // segments. A segment the broadcaster dropped is listed as #EXT-X-GAP,
+  // which hls.js never loads, so the media has a hole of one segment's
+  // length (~2 s) there. Holding at it would wait for media that never
+  // comes (the gate's rate 0 also keeps hls.js from skipping it).
+  const MAX_HOLE_S = 6;
   const gate = { holding: false, why: '', since: 0 };
+  let jumping = false;
 
   function hold(why) {
     if (!settings.rebuffer) return;
@@ -648,8 +656,32 @@
     log.marker(`first frame after ${((s.firstPlayingAt - s.startedAt) / 1000).toFixed(1)} s`);
   }
 
+  /**
+   * Stuck in front of a hole (a lost segment, a discontinuity) with media
+   * beyond it: jump to that media instead of waiting. Returns true if it
+   * jumped.
+   */
+  function jumpHole() {
+    if (bufferAhead() > 0.3) return false;
+    const t = video.currentTime;
+    for (let i = 0; i < video.buffered.length; i++) {
+      const s = video.buffered.start(i);
+      if (s > t + 0.05 && s - t <= MAX_HOLE_S) {
+        log.marker(`jumped a ${(s - t).toFixed(1)} s hole at ${t.toFixed(1)} s (lost segment)`);
+        // Our own seek: it lands on buffered media, so it must not start a
+        // rebuffer hold, and a hold this stall began has done its job.
+        jumping = true;
+        video.currentTime = s + 0.05;
+        if (gate.holding) release('jumped the hole');
+        return true;
+      }
+    }
+    return false;
+  }
+
   function checkGate() {
     if (!gate.holding) return;
+    jumpHole();
     if (!settings.rebuffer) release('gate off');
     else if (bufferAheadAcrossGaps() >= settings.rebuffer) release(`${bufferAheadAcrossGaps().toFixed(1)} s buffered`);
     else if (ended && video.buffered.length) release('broadcast ended');
@@ -674,14 +706,19 @@
       s.stallSince = Date.now();
       log.marker(`stall at ${video.currentTime.toFixed(1)} s, ${bufferAhead().toFixed(1)} s buffered`);
     }
-    // Stuck at a hole with video beyond it: hls.js skips it, but only
-    // while playback runs.
+    // Stuck at a hole with video beyond it: jump it rather than hold.
+    if (jumpHole()) return;
     if (bufferAheadAcrossGaps() < settings.rebuffer) hold('stall');
   });
 
   video.addEventListener('seeking', () => {
     const s = log.session;
+    if (jumping) return;
     if (hls && s && s.firstPlayingAt !== null && bufferAheadAcrossGaps() < settings.rebuffer) hold('seek');
+  });
+
+  video.addEventListener('seeked', () => {
+    jumping = false;
   });
 
   // The stage takes the picture's own shape (#194): a portrait broadcast
@@ -925,8 +962,8 @@
   }
 
   /**
-   * Buffered ahead counting past small holes (a discontinuity often leaves
-   * one), which hls.js jumps by itself once playback runs.
+   * Buffered ahead counting past holes up to MAX_HOLE_S (a discontinuity or
+   * a lost segment leaves one), which `jumpHole` skips.
    */
   function bufferAheadAcrossGaps() {
     const t = video.currentTime;
@@ -935,7 +972,7 @@
     for (let i = 0; i < video.buffered.length; i++) {
       const s = video.buffered.start(i);
       const e = video.buffered.end(i);
-      if (e <= end || s > end + MAX_GAP_S) continue;
+      if (e <= end || s > end + MAX_HOLE_S) continue;
       total += e - Math.max(s, end);
       end = e;
     }
