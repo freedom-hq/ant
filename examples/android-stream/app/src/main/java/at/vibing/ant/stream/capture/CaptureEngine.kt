@@ -123,6 +123,10 @@ class CaptureEngine(
     private val cameraId: String
         get() = cameraIdFor(frontCamera) ?: cameraIdFor(!frontCamera) ?: cameraManager.cameraIdList.first()
 
+    /** Whether this device has both a front and a back camera at all. */
+    val hasBothCameras: Boolean
+        get() = cameraIdFor(false) != null && cameraIdFor(true) != null
+
     /**
      * Whether this device has both a front and a back camera to switch
      * between live. The encoder keeps its frame shape across a switch, so
