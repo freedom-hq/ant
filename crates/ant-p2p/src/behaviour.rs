@@ -2227,7 +2227,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 spawn_due_batch_probes(&state, &control, upload_rt.as_ref(), cfg.network_id);
             }
             Some(p) = stamped_rx.recv() => {
-                push_with_stamp(&state, &control, cfg.network_id, p.addr, p.wire, p.stamp, p.require_deep, p.ack);
+                push_with_stamp(&state, &control, cfg.network_id, p.addr, p.wire, p.stamp, p.require_deep, p.ack_when_stored, p.ack);
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
                 match cmd {
@@ -2634,6 +2634,7 @@ fn handle_control_command(
             batch_id,
             stamp,
             require_deep,
+            ack_when_stored,
             ack,
         } => {
             // Validate wire bytes locally before paying for a stamp,
@@ -2693,6 +2694,7 @@ fn handle_control_command(
                     wire,
                     stamp,
                     require_deep,
+                    ack_when_stored,
                     ack,
                 );
                 return;
@@ -2789,6 +2791,7 @@ fn handle_control_command(
                 wire,
                 stamp,
                 require_deep,
+                ack_when_stored,
                 ack,
             );
         }
@@ -2797,6 +2800,7 @@ fn handle_control_command(
             wire,
             batch_id,
             stamp,
+            ack_when_stored,
             ack,
         } => {
             // Re-check the wire layout locally even though the gateway
@@ -2837,7 +2841,16 @@ fn handle_control_command(
                         return;
                     }
                 };
-                push_soc_with_stamp(state, control, network_id, address, wire, stamp, ack);
+                push_soc_with_stamp(
+                    state,
+                    control,
+                    network_id,
+                    address,
+                    wire,
+                    stamp,
+                    ack_when_stored,
+                    ack,
+                );
                 return;
             }
 
@@ -2914,7 +2927,16 @@ fn handle_control_command(
                 }
             };
 
-            push_soc_with_stamp(state, control, network_id, address, wire, stamp, ack);
+            push_soc_with_stamp(
+                state,
+                control,
+                network_id,
+                address,
+                wire,
+                stamp,
+                ack_when_stored,
+                ack,
+            );
         }
         ControlCommand::Envelope {
             address,
@@ -5052,6 +5074,7 @@ struct StampJob {
     addr: [u8; 32],
     wire: Vec<u8>,
     require_deep: bool,
+    ack_when_stored: bool,
     ack: oneshot::Sender<ControlAck>,
 }
 
@@ -5061,6 +5084,7 @@ struct StampedPush {
     wire: Vec<u8>,
     stamp: [u8; ant_postage::STAMP_SIZE],
     require_deep: bool,
+    ack_when_stored: bool,
     ack: oneshot::Sender<ControlAck>,
 }
 
@@ -5104,6 +5128,7 @@ async fn run_stamper(
                         wire: job.wire,
                         stamp,
                         require_deep: job.require_deep,
+                        ack_when_stored: job.ack_when_stored,
                         ack: job.ack,
                     };
                     if let Err(mpsc::error::SendError(push)) = stamped.send(push) {
@@ -5190,6 +5215,51 @@ fn stamp_jobs(
         .collect()
 }
 
+/// How a push that may answer early ended its first wait.
+enum PushStep {
+    Done(Result<(), ant_retrieval::pushsync::PushSyncError>),
+    /// A storer receipted it (shallow): answered, the hunt goes on.
+    Stored,
+    Abandoned,
+}
+
+/// `fetcher` with a stored signal when `enabled` (`ack_when_stored`,
+/// issue #212), and the receiver to wait on. Without it the receiver
+/// errors at once, which disables its `select!` arm.
+fn with_stored_signal(
+    fetcher: ant_retrieval::RoutingFetcher,
+    enabled: bool,
+) -> (ant_retrieval::RoutingFetcher, oneshot::Receiver<()>) {
+    let (tx, rx) = oneshot::channel();
+    let fetcher = if enabled {
+        fetcher.with_stored_signal(tx)
+    } else {
+        fetcher
+    };
+    (fetcher, rx)
+}
+
+/// The end of a hunt for a deep storer that went on after the push was
+/// answered as stored (`ack_when_stored`): the chunk is held by the
+/// storer that receipted it whatever this says, so a failure is only
+/// logged (and fed to the batch's rejection memory, as any push is).
+fn finish_hunt_in_background(
+    outcome: Result<(), ant_retrieval::pushsync::PushSyncError>,
+    rejected_batches: &RejectedBatches,
+    stamp: &[u8; ant_postage::STAMP_SIZE],
+    addr: &[u8; 32],
+) {
+    note_stamp_outcome(rejected_batches, stamp, outcome.as_ref().err());
+    if let Err(e) = outcome {
+        debug!(
+            target: "ant_p2p",
+            addr = %hex::encode(addr),
+            err = %e,
+            "push answered as stored; its hunt for a deeper storer ended without one",
+        );
+    }
+}
+
 /// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
 /// then pushsync it with `stamp` and ack. Used by both the local-issuer
 /// and the presigned-stamp paths.
@@ -5202,6 +5272,7 @@ fn push_with_stamp(
     wire: Vec<u8>,
     stamp: [u8; ant_postage::STAMP_SIZE],
     require_deep: bool,
+    ack_when_stored: bool,
     ack: oneshot::Sender<ControlAck>,
 ) {
     let rejected_batches = state.rejected_batches.clone();
@@ -5221,6 +5292,8 @@ fn push_with_stamp(
         .with_credit_deadline(
             tokio::time::Instant::now() + ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
         );
+    // A strict push's answer is the deep receipt itself.
+    let (fetcher, stored) = with_stored_signal(fetcher, ack_when_stored && !require_deep);
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     tokio::spawn(async move {
@@ -5262,9 +5335,22 @@ fn push_with_stamp(
             false,
             lag_until,
         );
-        let outcome = tokio::select! {
-            outcome = push => outcome,
-            () = ack.closed() => {
+        tokio::pin!(push);
+        let step = tokio::select! {
+            outcome = &mut push => PushStep::Done(outcome),
+            Ok(()) = stored => PushStep::Stored,
+            () = ack.closed() => PushStep::Abandoned,
+        };
+        let outcome = match step {
+            PushStep::Done(outcome) => outcome,
+            PushStep::Stored => {
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(addr)),
+                });
+                finish_hunt_in_background(push.await, &rejected_batches, &stamp, &addr);
+                return;
+            }
+            PushStep::Abandoned => {
                 debug!(
                     target: "ant_p2p",
                     addr = %hex::encode(addr),
@@ -5294,6 +5380,7 @@ fn push_with_stamp(
 /// Shared `PushSoc` tail: cache the SOC (and its wrapped CAC) locally,
 /// then pushsync with `stamp` and ack. Used by both the local-issuer
 /// and the presigned-stamp paths.
+#[allow(clippy::too_many_arguments)]
 fn push_soc_with_stamp(
     state: &SwarmState,
     control: &Control,
@@ -5301,6 +5388,7 @@ fn push_soc_with_stamp(
     address: [u8; 32],
     wire: Vec<u8>,
     stamp: [u8; ant_postage::STAMP_SIZE],
+    ack_when_stored: bool,
     ack: oneshot::Sender<ControlAck>,
 ) {
     const SOC_HEADER: usize = 32 + 65;
@@ -5317,6 +5405,7 @@ fn push_soc_with_stamp(
     let fetcher = build_push_fetcher(state, control.clone(), network_id).with_credit_deadline(
         tokio::time::Instant::now() + ant_retrieval::accounting::CREDIT_WAIT_BUDGET,
     );
+    let (fetcher, stored) = with_stored_signal(fetcher, ack_when_stored);
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     tokio::spawn(async move {
@@ -5369,7 +5458,7 @@ fn push_soc_with_stamp(
         // Fix B: SOCs run strict-receipt during the patience budget —
         // the walk hunts a DEEP placement (re-walking after deepening)
         // and only degrades to shallow-accept at the ceiling.
-        let reply = match push_with_patience(
+        let push = push_with_patience(
             &fetcher,
             patience_peers,
             address,
@@ -5377,9 +5466,19 @@ fn push_soc_with_stamp(
             stamp,
             true,
             lag_until,
-        )
-        .await
-        {
+        );
+        tokio::pin!(push);
+        let outcome = tokio::select! {
+            outcome = &mut push => outcome,
+            Ok(()) = stored => {
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
+                });
+                finish_hunt_in_background(push.await, &rejected_batches, &stamp, &address);
+                return;
+            }
+        };
+        let reply = match outcome {
             Ok(()) => {
                 note_stamp_outcome(&rejected_batches, &stamp, None);
                 ControlAck::ChunkUploaded {
@@ -12049,6 +12148,7 @@ mod tests {
             vec![0u8; 16],
             [0u8; ant_postage::STAMP_SIZE],
             false,
+            false,
             ack,
         );
         let reply = rx.await.expect("acked");
@@ -12230,6 +12330,7 @@ mod tests {
             addr: [n; 32],
             wire: vec![n],
             require_deep: false,
+            ack_when_stored: false,
             ack: oneshot::channel().0,
         };
         let jobs = vec![

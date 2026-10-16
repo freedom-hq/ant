@@ -286,6 +286,17 @@ pub enum ControlCommand {
         /// bee-parity endpoints pass `false` (bee's own accept-shallow
         /// semantics).
         require_deep: bool,
+        /// Answer `ChunkUploaded` as soon as the chunk is **stored**: the
+        /// first receipt, shallow or deep. A shallow one no longer holds
+        /// the answer back while the push hunts for a deeper storer; the
+        /// hunt goes on in the background exactly as it would have, and
+        /// its outcome is only logged. For a caller that needs the chunk
+        /// held by the network now and in its own neighbourhood seconds
+        /// later, rather than deep before it may go on: a live broadcast's
+        /// segments, which every later segment waits behind (issue #212).
+        /// `false` (every other caller) answers when the push is done.
+        /// Ignored with `require_deep`, whose answer is the deep receipt.
+        ack_when_stored: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /soc/{owner}/{id}`: stamp the SOC at `address` and
@@ -303,6 +314,10 @@ pub enum ControlCommand {
         batch_id: [u8; 32],
         /// Pre-signed 113-byte stamp; `None` = stamp locally.
         stamp: Option<Vec<u8>>,
+        /// See [`ControlCommand::PushChunk`]: answer at the first
+        /// receipt, shallow or deep, and finish the hunt for a deep
+        /// storer in the background (a live segment's replica SOCs).
+        ack_when_stored: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /envelope/{address}`: issue (and persist) a postage

@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tracing::{debug, trace, warn};
 
 /// 32-byte Swarm overlay. Duplicated locally rather than re-exported from
@@ -340,6 +340,9 @@ pub struct RoutingFetcher {
     require_deep: bool,
     /// Single-chunk lookup mode ([`Self::with_fast_miss`]).
     fast_miss: bool,
+    /// Fired by a push the first time a storer receipts the chunk
+    /// shallow ([`Self::with_stored_signal`]).
+    stored: Option<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
     /// Test stand-in for [`retrieve_chunk`]: answers each request
     /// instead of the network.
     #[cfg(test)]
@@ -397,6 +400,7 @@ impl RoutingFetcher {
             neighborhood_dial: None,
             require_deep: false,
             fast_miss: false,
+            stored: None,
             #[cfg(test)]
             mock_retrieve: None,
         }
@@ -424,6 +428,52 @@ impl RoutingFetcher {
     pub const fn with_require_deep(mut self, require_deep: bool) -> Self {
         self.require_deep = require_deep;
         self
+    }
+
+    /// Tell `stored` the first time a push of this fetcher draws a
+    /// shallow receipt: the chunk is stored from then on, while the push
+    /// itself goes on hunting for a deep storer (issue #212). A caller
+    /// that only needs the chunk stored, not yet deep, answers on this
+    /// and leaves the hunt to finish in the background. A deep receipt
+    /// never fires it: the push returns `Ok` then anyway. For one push.
+    /// Such a push also hedges sooner until then: after 1 s, not bee's
+    /// 5 s (`STORED_PREEMPTIVE_INTERVAL`).
+    #[must_use]
+    pub fn with_stored_signal(mut self, stored: oneshot::Sender<()>) -> Self {
+        self.stored = Some(Arc::new(Mutex::new(Some(stored))));
+        self
+    }
+
+    /// See [`Self::with_stored_signal`]. Whether this call fired it.
+    fn note_stored(&self) -> bool {
+        let sender = self.stored.as_ref().and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        });
+        sender.is_some_and(|sender| {
+            let _ = sender.send(());
+            true
+        })
+    }
+
+    /// The preemptive hedge interval of a push: the short
+    /// [`Self::STORED_PREEMPTIVE_INTERVAL`] while a caller waits for its
+    /// stored answer ([`Self::with_stored_signal`]), bee's
+    /// [`Self::PREEMPTIVE_INTERVAL`] otherwise, including the hunt for a
+    /// deep storer that goes on after that answer: nobody waits on its
+    /// latency any more, and every hedge is a paid push.
+    fn preemptive_interval(&self) -> Duration {
+        let waiting = self.stored.as_ref().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        });
+        if waiting {
+            Self::STORED_PREEMPTIVE_INTERVAL
+        } else {
+            Self::PREEMPTIVE_INTERVAL
+        }
     }
 
     /// Single-chunk lookup mode, for a read whose miss is an answer the
@@ -771,6 +821,16 @@ impl RoutingFetcher {
     /// receipt.
     const PREEMPTIVE_INTERVAL: Duration = Duration::from_secs(5);
 
+    /// The preemptive hedge interval of a push answered once stored
+    /// ([`Self::with_stored_signal`]): someone is waiting on exactly this
+    /// push's first receipt (a live segment, which every later segment
+    /// waits behind), so a closest peer that hasn't answered within a
+    /// second gets company instead of up to five seconds' grace. On a
+    /// live broadcast (issue #212) a push that hung until the 5 s hedge
+    /// was what was left of the slowest segments once shallow receipts
+    /// no longer held them back.
+    const STORED_PREEMPTIVE_INTERVAL: Duration = Duration::from_secs(1);
+
     /// How many distinct peers may return a *shallow* receipt before we
     /// stop hunting for a deeper storer and accept the chunk as stored.
     ///
@@ -798,8 +858,9 @@ impl RoutingFetcher {
     /// after the fact — a chunk that lands shallow stays readable *by the
     /// uploader* (it's connected to the shallow storer) but not by the wider
     /// network, which routes to the proper neighbourhood. So we spend more
-    /// rounds — each preceded by an active neighbourhood dial + a bounded
-    /// wait for a deeper peer to connect (see [`SHALLOW_REDIAL_WAIT`]) —
+    /// rounds — each preceded by an active neighbourhood dial and, from the
+    /// second shallow receipt on, a bounded wait for a deeper peer to
+    /// connect (see [`SHALLOW_REDIAL_WAIT`] and `waits_for_deeper_peer`) —
     /// hunting for a deep storer before falling back to accepting shallow.
     const MAX_SHALLOW_ATTEMPTS: u32 = 12;
 
@@ -824,7 +885,9 @@ impl RoutingFetcher {
     /// dial complete and the first gossip batch arrive; [`dial_and_await_deeper`]
     /// re-issues the dial on every peer-set change within the window so the
     /// deepening cycle advances across rounds. Chunks whose neighbourhood is
-    /// already connected skip the wait entirely.
+    /// already connected skip the wait entirely, and so does the retry after
+    /// a chunk's first shallow receipt, which goes straight to the
+    /// next-closest peer (`waits_for_deeper_peer`, issue #212).
     const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(2500);
 
     /// Rank the live peer set closest-first to `chunk_addr`, leaving out
@@ -1105,7 +1168,7 @@ impl RoutingFetcher {
         // soft (shallow / failed) outcomes bump it.
         let mut want: i32 = 1;
 
-        let mut preempt = tokio::time::interval(Self::PREEMPTIVE_INTERVAL);
+        let mut preempt = tokio::time::interval(self.preemptive_interval());
         // The first tick fires immediately; consume it so the real hedge
         // doesn't go out until one interval has elapsed.
         preempt.tick().await;
@@ -1282,6 +1345,14 @@ impl RoutingFetcher {
                             if let Some(credit) = credit {
                                 credit.apply();
                             }
+                            if self.note_stored() {
+                                // Answered: back to bee's hedge for the
+                                // rest of the hunt.
+                                preempt = tokio::time::interval_at(
+                                    tokio::time::Instant::now() + Self::PREEMPTIVE_INTERVAL,
+                                    Self::PREEMPTIVE_INTERVAL,
+                                );
+                            }
                             shallow_attempts += 1;
                             shallow_seen = true;
                             last_shallow = (po, storage_radius);
@@ -1340,12 +1411,19 @@ impl RoutingFetcher {
                             }
                             // A shallow receipt is direct evidence we lack a
                             // connected peer in this chunk's neighbourhood.
-                            // Dial it and wait (bounded) for a peer at least as
-                            // deep as the storer radius to connect before
-                            // retrying, so the next attempt can land deep
-                            // instead of re-drawing shallow off the same set.
+                            // Dial it, and from the second shallow receipt on
+                            // wait (bounded) for a peer at least as deep as
+                            // the storer radius to connect before retrying, so
+                            // the next attempt can land deep instead of
+                            // re-drawing shallow off the same set. The first
+                            // retry goes straight to the next-closest peer
+                            // (see `waits_for_deeper_peer`).
                             let target_po = storage_radius.min(u32::from(u8::MAX)) as u8;
-                            self.dial_and_await_deeper(&chunk_addr, target_po).await;
+                            if waits_for_deeper_peer(shallow_attempts) {
+                                self.dial_and_await_deeper(&chunk_addr, target_po).await;
+                            } else {
+                                self.request_neighborhood_dial(&chunk_addr);
+                            }
                             want += 1;
                         }
                         Err(e) if is_transient_pushsync_error(&e) && !retried.contains(&peer) => {
@@ -1609,6 +1687,25 @@ const fn shallow_verdict(
     }
 }
 
+/// Whether the retry after the `shallow_attempts`-th shallow receipt
+/// (1-based) first waits, up to [`RoutingFetcher::SHALLOW_REDIAL_WAIT`],
+/// for a peer deeper than the shallow storer to connect.
+///
+/// Not after the first one: that retry goes at once to the next-closest
+/// peer, while the neighbourhood dial runs alongside. Measured on
+/// mainnet (issue #212): about one chunk in ten drew a shallow first
+/// receipt, mostly one bit short of the storer's radius, and the retry
+/// landed deep for 84% of them after the wait and for 87-90% with no
+/// wait at all. The wait itself nearly always ran its full 2.5 s (no
+/// deeper peer connected in time), so it bought nothing there and set a
+/// ~2.7 s floor under almost every multi-chunk upload (a 150 KB live
+/// segment is ~45 pushes, so one of them nearly always draws a shallow
+/// receipt). A chunk that comes back shallow twice is the one that needs
+/// the gossip-deepening cycle, and gets the wait from then on.
+const fn waits_for_deeper_peer(shallow_attempts: u32) -> bool {
+    shallow_attempts > 1
+}
+
 /// Given how many distinct peers have answered this chunk with a
 /// *shallow* receipt so far (1-based, counting the current one), decide
 /// whether to stop hunting for a deeper storer and accept the chunk as
@@ -1812,6 +1909,7 @@ impl RoutingFetcher {
             neighborhood_dial: self.neighborhood_dial.clone(),
             require_deep: self.require_deep,
             fast_miss: false,
+            stored: self.stored.clone(),
             #[cfg(test)]
             mock_retrieve: self.mock_retrieve.clone(),
         }
@@ -3131,6 +3229,43 @@ mod tests {
         push.abort();
     }
 
+    /// Issue #212: a push answered once stored hedges onto the
+    /// next-closest peer after one second of silence from the closest,
+    /// where any other push gives it bee's five.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_answered_when_stored_hedges_after_a_second() {
+        let addr = [0u8; 32];
+        for stored in [true, false] {
+            let (near, far) = (PeerId::random(), PeerId::random());
+            let acc = Arc::new(Accounting::new());
+            let (fetcher, load, _behaviour) =
+                credit_gated_push_fetcher(vec![(near, [0x01u8; 32]), (far, [0x80u8; 32])], &acc);
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let fetcher = if stored {
+                fetcher.with_stored_signal(tx)
+            } else {
+                fetcher
+            };
+            let push = tokio::spawn(async move {
+                fetcher
+                    .push_stamped_chunk(addr, vec![0u8; 16], [0u8; ant_postage::STAMP_SIZE])
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(load.at_cap(&near), "the closest peer gets the push");
+            assert!(!load.at_cap(&far));
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert_eq!(
+                load.at_cap(&far),
+                stored,
+                "hedged by 1.1 s (stored: {stored})"
+            );
+            tokio::time::sleep(RoutingFetcher::PREEMPTIVE_INTERVAL).await;
+            assert!(load.at_cap(&far), "hedged by 6.1 s (stored: {stored})");
+            push.abort();
+        }
+    }
+
     /// Pushes still in flight when `push_stamped_chunk` returns (a winner
     /// beat the hedges) or is dropped keep running in a detached drain,
     /// and every receipt that still arrives — deep or shallow — is debited
@@ -3433,6 +3568,49 @@ mod tests {
     /// a light node can't lean on pull-sync to deepen a shallow placement
     /// after the fact, so it spends extra rounds — each with an active
     /// neighbourhood dial + bounded wait — hunting for a deep storer first.
+    /// Issue #212: a stored signal fires once, at the first shallow
+    /// receipt, however many follow; a fetcher without one has nothing
+    /// to fire. The push hedges after 1 s only while its caller still
+    /// waits for that answer, and after bee's 5 s once it went out.
+    #[test]
+    fn the_stored_signal_fires_once_and_ends_the_short_hedge() {
+        let behaviour = libp2p_stream::Behaviour::default();
+        let plain = RoutingFetcher::with_static_peers(behaviour.new_control(), Vec::new());
+        assert_eq!(
+            plain.preemptive_interval(),
+            RoutingFetcher::PREEMPTIVE_INTERVAL
+        );
+        assert!(!plain.note_stored());
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let fetcher = RoutingFetcher::with_static_peers(behaviour.new_control(), Vec::new())
+            .with_stored_signal(tx);
+        assert!(rx.try_recv().is_err(), "fired before any receipt");
+        assert_eq!(
+            fetcher.preemptive_interval(),
+            RoutingFetcher::STORED_PREEMPTIVE_INTERVAL
+        );
+        assert!(fetcher.note_stored());
+        assert!(!fetcher.note_stored(), "fired twice");
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(
+            fetcher.preemptive_interval(),
+            RoutingFetcher::PREEMPTIVE_INTERVAL
+        );
+    }
+
+    /// Issue #212: the retry after a chunk's first shallow receipt goes
+    /// straight to the next-closest peer; every later one waits for the
+    /// neighbourhood dial first.
+    #[test]
+    fn only_a_repeated_shallow_receipt_waits_for_a_deeper_peer() {
+        assert!(!waits_for_deeper_peer(1));
+        assert!(waits_for_deeper_peer(2));
+        assert!(waits_for_deeper_peer(
+            RoutingFetcher::MAX_SHALLOW_ATTEMPTS - 1
+        ));
+    }
+
     #[test]
     fn shallow_receipt_accepted_after_bounded_attempts() {
         assert_eq!(

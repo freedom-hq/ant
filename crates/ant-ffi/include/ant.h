@@ -1718,7 +1718,21 @@ int ant_publisher_resume(const AntHandle *handle, char **out_err);
  *    "paused":false,"segments_withheld":0,"reaped":false,
  *    "ladder_group":"","master_reference":"","markers_written":0,
  *    "ladder_failures":0,"ladder_error":"","recovery_error":"",
- *    "batch_full_refusals":0,"batch_unusable_refusals":0,"batch_error":""}
+ *    "batch_full_refusals":0,"batch_unusable_refusals":0,"batch_error":"",
+ *    "timings":{"segment":{"count":21,"p50_ms":900,"p95_ms":2100,
+ *               "max_ms":2400},"head_of_line":{...},"playlist":{...},
+ *               "recovery":{...},"feed":{...},"update":{...},
+ *               "marker":{...}}}
+ *
+ * "timings" says where the broadcast's time goes (issue #212), each
+ * stage as a run count and its p50/p95/max in ms: "segment" one
+ * segment's upload (the newest 2048), "head_of_line" a landed media
+ * segment waiting to be folded into a playlist (the segments before it
+ * still uploading, or the previous update still going out), "playlist"
+ * the playlist's upload, "recovery" writing the "recovery_path" entry,
+ * "feed" the feed update's POST /soc, "update" all three of those
+ * together (the committer's critical path), and "marker" one ladder
+ * marker write (off that path). A stage that never ran is all zeros.
  *
  * "paused" is ant_publisher_pause in force; "segments_withheld" counts
  * the media segments outages withheld (never uploaded, never listed);

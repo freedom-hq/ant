@@ -1271,6 +1271,143 @@ async fn post_bzz_single_file_returns_manifest_reference() {
     );
 }
 
+/// Issue #212: an upload's dispersed-replica SOCs go out alongside its
+/// content chunks, not after every chunk has a receipt, so the response
+/// waits for the slowest push once instead of for the slowest of each
+/// phase in turn. Every content chunk's receipt here is held until a
+/// replica push has arrived; pushed one phase after the other, no
+/// replica would ever arrive while a chunk was still unanswered.
+#[tokio::test]
+async fn post_bzz_pushes_replicas_alongside_the_content_chunks() {
+    let replica_seen = Arc::new(tokio::sync::Notify::new());
+    let chunks_waited = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let (seen, waited) = (replica_seen.clone(), chunks_waited.clone());
+    let router = router_with_dispatcher(move |cmd| {
+        let (seen, waited) = (seen.clone(), waited.clone());
+        async move {
+            match cmd {
+                ControlCommand::PushChunk { wire, ack, .. } => {
+                    let mut span = [0u8; 8];
+                    span.copy_from_slice(&wire[..8]);
+                    let addr = ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).unwrap();
+                    let replica_in_flight =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), seen.notified())
+                            .await
+                            .is_ok();
+                    // Pass the wake on to the next chunk waiting.
+                    if replica_in_flight {
+                        seen.notify_one();
+                    }
+                    waited.lock().await.push(replica_in_flight);
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    });
+                }
+                ControlCommand::PushSoc { address, ack, .. } => {
+                    seen.notify_one();
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bzz?name=seg.m4s")
+            .header(header::CONTENT_TYPE, "video/iso.segment")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .header("swarm-redundancy-level", "1")
+            .body(Body::from(vec![7u8; 10_000]))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let waited = chunks_waited.lock().await;
+    assert!(!waited.is_empty());
+    assert!(
+        waited.iter().all(|&in_flight| in_flight),
+        "a content chunk was answered before any replica was pushed: {waited:?}",
+    );
+}
+
+/// Issue #212: `ant-ack-when-stored: true` on an upload asks the node to
+/// answer every push of it, content chunks and replica SOCs alike, once
+/// the chunk is stored; without the header (or with anything but
+/// `true`) every push is answered when it is done, as before.
+#[tokio::test]
+async fn ack_when_stored_header_reaches_every_push_of_the_upload() {
+    for (header, want) in [(Some("true"), true), (Some("no"), false), (None, false)] {
+        let flags = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let seen = flags.clone();
+        let router = router_with_dispatcher(move |cmd| {
+            let seen = seen.clone();
+            async move {
+                match cmd {
+                    ControlCommand::PushChunk {
+                        wire,
+                        ack_when_stored,
+                        ack,
+                        ..
+                    } => {
+                        seen.lock().await.push(ack_when_stored);
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr = ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).unwrap();
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::PushSoc {
+                        address,
+                        ack_when_stored,
+                        ack,
+                        ..
+                    } => {
+                        seen.lock().await.push(ack_when_stored);
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(address)),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        for uri in ["/bytes", "/bzz?name=seg.m4s"] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(
+                    "swarm-postage-batch-id",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                );
+            if let Some(value) = header {
+                request = request.header("ant-ack-when-stored", value);
+            }
+            let resp = send(
+                router.clone(),
+                request.body(Body::from(vec![9u8; 10_000])).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{uri} {header:?}");
+        }
+        let flags = flags.lock().await;
+        assert!(!flags.is_empty());
+        assert!(
+            flags.iter().all(|&flag| flag == want),
+            "{header:?}: {flags:?}"
+        );
+    }
+}
+
 /// `POST /bzz` with `swarm-collection: true` and a tar archive should
 /// produce a multi-file manifest. The returned reference must be
 /// retrievable as a manifest with each archive entry's path resolving

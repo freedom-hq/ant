@@ -1097,6 +1097,102 @@ fn iso8601_utc_ms(unix_ms: u64) -> String {
 /// of a live run is what the indicator is about anyway.
 const LATENCY_SAMPLES: usize = 2048;
 
+/// One stage's latencies: the newest [`LATENCY_SAMPLES`] for the
+/// percentiles, plus a whole-run count and maximum.
+#[derive(Default)]
+struct Samples {
+    recent: VecDeque<u64>,
+    count: u64,
+    max: u64,
+}
+
+impl Samples {
+    fn record(&mut self, value: u64) {
+        PublisherState::record_latency(&mut self.recent, value);
+        self.count += 1;
+        self.max = self.max.max(value);
+    }
+
+    fn timing(&self) -> StageTiming {
+        let mut sorted: Vec<u64> = self.recent.iter().copied().collect();
+        sorted.sort_unstable();
+        StageTiming {
+            count: self.count,
+            p50_ms: percentile(&sorted, 50),
+            p95_ms: percentile(&sorted, 95),
+            max_ms: self.max,
+        }
+    }
+}
+
+/// Where a broadcast's time goes, stage by stage (issue #212).
+#[derive(Default)]
+struct StageSamples {
+    head_of_line: Samples,
+    playlist: Samples,
+    recovery: Samples,
+    feed: Samples,
+    update: Samples,
+    marker: Samples,
+}
+
+impl StageSamples {
+    fn timings(&self, segment: &VecDeque<u64>) -> PublisherTimings {
+        let mut sorted: Vec<u64> = segment.iter().copied().collect();
+        sorted.sort_unstable();
+        PublisherTimings {
+            segment: StageTiming {
+                count: sorted.len() as u64,
+                p50_ms: percentile(&sorted, 50),
+                p95_ms: percentile(&sorted, 95),
+                max_ms: sorted.last().copied().unwrap_or(0),
+            },
+            head_of_line: self.head_of_line.timing(),
+            playlist: self.playlist.timing(),
+            recovery: self.recovery.timing(),
+            feed: self.feed.timing(),
+            update: self.update.timing(),
+            marker: self.marker.timing(),
+        }
+    }
+}
+
+/// One stage's latency figures, milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StageTiming {
+    /// How many times the stage ran (a segment's `count` is capped at
+    /// the newest 2048 samples).
+    pub count: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Per-stage timings of the live loop (issue #212): what a segment
+/// waits on between capture and the feed update that makes it playable.
+/// Cheap: one sample per stage run, folded only when a snapshot or the
+/// report is read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PublisherTimings {
+    /// One media segment's upload (`publish_ms_p50`/`_p95` above).
+    pub segment: StageTiming,
+    /// A landed media segment waiting for the committer to fold it into
+    /// a playlist: the segments before it still uploading (head of
+    /// line), or the committer still busy with the previous update.
+    pub head_of_line: StageTiming,
+    /// The playlist's upload.
+    pub playlist: StageTiming,
+    /// Writing the recovery entry ([`PublisherConfig::recovery_path`]).
+    pub recovery: StageTiming,
+    /// The feed update's `POST /soc`.
+    pub feed: StageTiming,
+    /// One whole feed update: playlist, recovery entry and `POST /soc`,
+    /// the committer's critical path.
+    pub update: StageTiming,
+    /// One ladder marker write (off the critical path).
+    pub marker: StageTiming,
+}
+
 #[derive(Default)]
 struct PublisherState {
     /// Identifies this broadcast in every playlist it writes
@@ -1220,6 +1316,10 @@ struct PublisherState {
     recording_reference: Option<String>,
 
     publish_ms: VecDeque<u64>,
+    /// When each landed media segment's upload finished, until the
+    /// committer folds it in: its head-of-line wait.
+    landed_at: BTreeMap<u64, Instant>,
+    stages: StageSamples,
     lag_ms: VecDeque<u64>,
     lag_ms_max: u64,
     /// **The live edge**: the capture instant of the newest media
@@ -1390,6 +1490,9 @@ impl PublisherState {
     fn advance(&mut self, window: usize, target_ms: u32) -> Option<Instant> {
         let mut newest: Option<Instant> = None;
         while let Some(outcome) = self.done.remove(&self.next_commit) {
+            if let Some(landed) = self.landed_at.remove(&self.next_commit) {
+                self.stages.head_of_line.record(ms(landed.elapsed()));
+            }
             self.next_commit += 1;
             match outcome {
                 Committed::Init { uri } => {
@@ -2480,6 +2583,9 @@ pub struct PublisherSnapshot {
     /// The newest of those refusals, empty while there has been none.
     #[serde(default)]
     pub batch_error: String,
+    /// Where the broadcast's time goes, stage by stage (issue #212).
+    #[serde(default)]
+    pub timings: PublisherTimings,
 }
 
 /// Final result of a broadcast, returned by the stop call.
@@ -2593,6 +2699,9 @@ pub struct PublisherReport {
     /// See [`PublisherSnapshot::batch_error`].
     #[serde(default)]
     pub batch_error: String,
+    /// See [`PublisherSnapshot::timings`].
+    #[serde(default)]
+    pub timings: PublisherTimings,
 }
 
 // ---------------------------------------------------------------------------
@@ -2856,6 +2965,7 @@ impl LiveRun {
             batch_full_refusals: state.batch_full_refusals,
             batch_unusable_refusals: state.batch_unusable_refusals,
             batch_error: state.batch_error.clone().unwrap_or_default(),
+            timings: state.stages.timings(&state.publish_ms),
         }
     }
 
@@ -2995,6 +3105,7 @@ impl LiveRun {
             batch_full_refusals: state.batch_full_refusals,
             batch_unusable_refusals: state.batch_unusable_refusals,
             batch_error: state.batch_error.clone().unwrap_or_default(),
+            timings: state.stages.timings(&state.publish_ms),
         }
     }
 }
@@ -3529,12 +3640,21 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                 SegmentKind::Init => (format!("init-{}.mp4", pending.seq), "video/mp4"),
                 SegmentKind::Media => (format!("seg-{}.m4s", pending.seq), "video/iso.segment"),
             };
-            publish_bzz(&ctx.target, ctx.batch, &name, content_type, &pending.data)
-                .await
-                .map(|reference| bzz_uri(&reference, &name))
+            publish_bzz_with(
+                &ctx.target,
+                ctx.batch,
+                &name,
+                content_type,
+                &pending.data,
+                &stored_ack_headers(),
+            )
+            .await
+            .map(|reference| bzz_uri(&reference, &name))
         }
         // The bare reference is the URI: see `publish_bytes`.
-        StreamFormat::SolarPunk => publish_bytes(&ctx.target, ctx.batch, &pending.data, &[]).await,
+        StreamFormat::SolarPunk => {
+            publish_bytes(&ctx.target, ctx.batch, &pending.data, &stored_ack_headers()).await
+        }
     };
     let elapsed = started.elapsed();
 
@@ -3548,6 +3668,7 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                         state.done.insert(pending.seq, Committed::Init { uri });
                     }
                     SegmentKind::Media => {
+                        state.landed_at.insert(pending.seq, Instant::now());
                         state.segments_published += 1;
                         state.bytes_published += bytes;
                         state.chunks_published += data_chunk_count(bytes);
@@ -4052,8 +4173,15 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
             PlaylistShape::Recording => state.render_recording(ctx.config.segment_ms),
         }
     };
-    let (playlist_ref, root) = match upload_playlist(ctx, &body).await {
-        Ok(uploaded) => uploaded,
+    let update_started = Instant::now();
+    let (playlist_ref, root) = match upload_playlist(ctx, &body, shape).await {
+        Ok(uploaded) => {
+            lock(&ctx.state)
+                .stages
+                .playlist
+                .record(ms(update_started.elapsed()));
+            uploaded
+        }
         Err(error) => {
             let what = if shape == PlaylistShape::Recording {
                 "recording"
@@ -4098,7 +4226,16 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
     // On disk before the update can land (issue #175): a kill after it
     // went out leaves an entry holding every entry a viewer could have
     // seen, and naming the index it took.
+    let saving = Instant::now();
+    let saved = recovery.is_some();
     ctx.save_recovery_entry(recovery).await;
+    let soc_started = Instant::now();
+    if saved {
+        lock(&ctx.state)
+            .stages
+            .recovery
+            .record(ms(soc_started - saving));
+    }
     let result = publish_feed_update(ctx, index, &root).await;
     let landed = result.is_ok();
     {
@@ -4106,6 +4243,8 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
         state.feed_update_in_flight = false;
         match result {
             Ok(()) => {
+                state.stages.feed.record(ms(soc_started.elapsed()));
+                state.stages.update.record(ms(update_started.elapsed()));
                 state.feed_index += 1;
                 state.feed_updates += 1;
                 if let Some(captured_at) = captured_at {
@@ -4163,22 +4302,33 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
 async fn upload_playlist(
     ctx: &RunCtx,
     body: &str,
+    shape: PlaylistShape,
 ) -> Result<(String, ([u8; 32], Vec<u8>)), UploadError> {
+    // A live window is superseded by the next one seconds later, and the
+    // feed update that names it waits on its upload: answered once
+    // stored, like the segments (see `stored_ack_headers`). The
+    // recording is the broadcast's lasting copy and waits for placement.
+    let extra: &[(String, String)] = if shape == PlaylistShape::Recording {
+        &[]
+    } else {
+        &stored_ack_headers()
+    };
     match ctx.config.format {
         StreamFormat::Bzz => {
-            let playlist_ref = publish_bzz(
+            let playlist_ref = publish_bzz_with(
                 &ctx.target,
                 ctx.batch,
                 PLAYLIST_NAME,
                 "application/vnd.apple.mpegurl",
                 body.as_bytes(),
+                extra,
             )
             .await?;
             let reference = parse_hex32(&playlist_ref).map_err(|e| format!("reference {e}"))?;
             let wrapped = v1_update_chunk(&reference)?;
             Ok((playlist_ref, wrapped))
         }
-        StreamFormat::SolarPunk => upload_v2_payload(ctx, body).await,
+        StreamFormat::SolarPunk => upload_v2_payload(ctx, body, extra).await,
     }
 }
 
@@ -4188,13 +4338,15 @@ async fn upload_playlist(
 async fn upload_v2_payload(
     ctx: &RunCtx,
     body: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<(String, ([u8; 32], Vec<u8>)), UploadError> {
     // The level is sent rather than left to the gateway's default so the
     // root chunk rebuilt below is the one the gateway stored. It is that
     // default (bee's MEDIUM), which is also what bee-js `uploadPayload`
     // gets for a playlist too big for one chunk.
     let level = PLAYLIST_REDUNDANCY_LEVEL.to_string();
-    let headers = [("swarm-redundancy-level".to_string(), level)];
+    let mut headers = vec![("swarm-redundancy-level".to_string(), level)];
+    headers.extend_from_slice(extra_headers);
     let reference = publish_bytes(&ctx.target, ctx.batch, body.as_bytes(), &headers).await?;
     let root = playlist_root_chunk(body.as_bytes(), &reference)?;
     Ok((reference, root))
@@ -4397,10 +4549,14 @@ async fn marker_loop(ctx: Arc<RunCtx>) {
         };
         last_period = Some(period);
         let deadline = (period + 1) * LADDER_MARKER_PERIOD_MS;
+        let writing = Instant::now();
         let outcome = write_marker(&ctx, &group, period, written_at, index, deadline).await;
         let mut state = lock(&ctx.state);
         match outcome {
-            Ok(()) => state.markers_written += 1,
+            Ok(()) => {
+                state.markers_written += 1;
+                state.stages.marker.record(ms(writing.elapsed()));
+            }
             Err(message) => state.record_ladder_failure(format!(
                 "ladder marker for period {period}: {message}; viewers search \
                  the feed instead until one lands"
@@ -4460,7 +4616,7 @@ async fn publish_master(ctx: &RunCtx) {
             Some(index) => index,
             None => feed_next_index(ctx, &group).await?,
         };
-        let (reference, root) = upload_v2_payload(ctx, &body).await?;
+        let (reference, root) = upload_v2_payload(ctx, &body, &[]).await?;
         publish_soc(ctx, ant_retrieval::sequence_update_id(&group, index), &root).await?;
         Ok::<_, String>((index, peak, reference))
     }
@@ -4555,12 +4711,41 @@ pub(crate) async fn publish_bzz(
     content_type: &str,
     payload: &[u8],
 ) -> Result<String, UploadError> {
+    publish_bzz_with(target, batch, name, content_type, payload, &[]).await
+}
+
+/// [`publish_bzz`] with `extra_headers` on the request.
+async fn publish_bzz_with(
+    target: &Target,
+    batch: [u8; 32],
+    name: &str,
+    content_type: &str,
+    payload: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<String, UploadError> {
     let path = format!("{}/bzz?name={name}", target.prefix);
-    let headers = [
+    let mut headers = vec![
         ("content-type".to_string(), content_type.to_string()),
         ("swarm-postage-batch-id".to_string(), hex::encode(batch)),
     ];
+    headers.extend_from_slice(extra_headers);
     post_reference(target, &path, &headers, payload).await
+}
+
+/// What a segment's and a live window's upload carry on top of the
+/// format's own headers: `ant-ack-when-stored: true` (issue #212), so
+/// ant's gateway answers once every chunk is stored, its first receipt,
+/// and finishes the hunt for a deep storer that a shallow receipt
+/// starts in the background. A segment's playlist entry waits for every
+/// segment before it, and a feed update for its playlist's upload, so
+/// without this one chunk hunting a deep storer (2.5 s a round, up to a
+/// dozen rounds) held back the feed for everything behind it: the
+/// 10-30 s pauses of #212. The hunt itself is unchanged. The feed
+/// update (`POST /soc`), the channel manifest, the ladder's writes and
+/// the recording go without it, and answer once placed. Other gateways
+/// (bee) ignore the header.
+fn stored_ack_headers() -> [(String, String); 1] {
+    [("ant-ack-when-stored".to_string(), "true".to_string())]
 }
 
 /// Why the gateway refused an upload, when the refusal is the postage
@@ -6322,6 +6507,9 @@ mod tests {
         fail_ladder: bool,
         /// Extra latency on `POST /feeds` only.
         feeds_delay: Duration,
+        /// Extra latency on the upload of a segment whose body starts
+        /// with this byte.
+        segment_delay: Option<(u8, Duration)>,
         /// Refuse the recording's upload (a playlist marked VOD) only.
         fail_recording: bool,
         /// Extra latency on every request carrying the recording (its
@@ -6578,7 +6766,12 @@ mod tests {
                                         } else if is_recording {
                                             slot.recording_delay
                                         } else {
-                                            Duration::ZERO
+                                            slot.segment_delay
+                                                .filter(|(first, _)| {
+                                                    is_segment(&request)
+                                                        && request.body.first() == Some(first)
+                                                })
+                                                .map_or(Duration::ZERO, |(_, d)| d)
                                         },
                                     )
                                 };
@@ -6636,6 +6829,107 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("publisher never finished");
+    }
+
+    /// Issue #212: the report says where the time went. A slow segment
+    /// shows as its own upload time and as the head-of-line wait of the
+    /// segment behind it, which landed first and waited for it; every
+    /// landed feed update has a playlist, a `POST /soc` and a whole-update
+    /// time, and no recovery entry is timed when none is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_report_times_each_stage_and_the_head_of_line_wait() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        lock(&log).segment_delay = Some((1, Duration::from_millis(400)));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.start_index = Some(0);
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        let _ = run.push(SegmentKind::Media, vec![2u8; 4096], 2000, false);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        run.cancel();
+        settle(&run).await;
+
+        let report = run.report();
+        let t = report.timings;
+        assert_eq!(t.segment.count, 3, "{t:?}");
+        assert!(t.segment.max_ms >= 400, "{t:?}");
+        assert_eq!(t.head_of_line.count, 2, "{t:?}");
+        assert!(t.head_of_line.max_ms >= 300, "{t:?}");
+        assert_eq!(t.feed.count, report.feed_updates, "{t:?}");
+        assert_eq!(t.update.count, report.feed_updates, "{t:?}");
+        assert!(t.playlist.count >= report.feed_updates, "{t:?}");
+        assert!(t.update.max_ms >= t.feed.max_ms, "{t:?}");
+        assert_eq!(t.recovery, StageTiming::default(), "{t:?}");
+        assert_eq!(t.marker, StageTiming::default(), "{t:?}");
+        assert_eq!(run.snapshot().timings, t);
+    }
+
+    /// Issue #212: segments (initialization and media) and the live
+    /// windows ask the gateway to answer once their chunks are stored, in
+    /// either format; the recording, the feed updates and the channel
+    /// manifest don't, and answer once placed, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn segments_and_live_windows_ask_for_the_stored_answer() {
+        for format in [StreamFormat::SolarPunk, StreamFormat::Bzz] {
+            let log = Arc::new(Mutex::new(StubLog::default()));
+            let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+            let mut config = config();
+            config.gateway = format!("http://{addr}");
+            config.start_index = Some(0);
+            config.format = format;
+            let run = start(
+                &tokio::runtime::Handle::current(),
+                config,
+                TEST_SECRET,
+                test_owner(),
+                None,
+            )
+            .unwrap();
+            let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+            let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            run.cancel();
+            settle(&run).await;
+
+            let seen = lock(&log).seen.clone();
+            let mut kinds = Vec::new();
+            for request in seen.iter().filter(|r| r.method_path.starts_with("POST ")) {
+                let path = &request.method_path;
+                let recording = request
+                    .body
+                    .windows(24)
+                    .any(|w| w == b"#EXT-X-PLAYLIST-TYPE:VOD");
+                let (kind, wants) = if path.contains("/soc/") || path.contains("/feeds/") {
+                    ("soc or manifest", false)
+                } else if recording {
+                    ("recording", false)
+                } else if path.contains("/bzz?name=stream.m3u8") || is_playlist(request) {
+                    ("live window", true)
+                } else {
+                    ("segment", true)
+                };
+                assert_eq!(
+                    request.header("ant-ack-when-stored") == Some("true"),
+                    wants,
+                    "{format:?} {kind}: {path}",
+                );
+                kinds.push(kind);
+            }
+            for kind in ["segment", "live window", "recording", "soc or manifest"] {
+                assert!(kinds.contains(&kind), "{format:?}: no {kind} in {kinds:?}");
+            }
+            assert_eq!(kinds.iter().filter(|k| **k == "segment").count(), 2);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

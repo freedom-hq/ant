@@ -143,6 +143,105 @@ Paid bandwidth cost: ~0.03 xBZZ/GB at 360p (the free pseudosettle
 allowance carries most of it), ~0.17 xBZZ/GB at 720p. The 0.001 xBZZ
 default chequebook deposit therefore covers only ~6 MB of 720p.
 
+### The whole live loop on mainnet, 2026-10-16 (issue #212)
+
+The rows above time one `POST /bzz` per segment. A viewer waits on
+more: a segment is playable once it, every segment before it, its
+playlist and the feed update naming that playlist have all landed.
+`examples/live_bench.rs` runs the real publisher (`publisher::start`,
+segment uploads, playlist uploads, `POST /soc` feed updates, ladder
+markers, the recovery entry) from a generator, and measures what a
+viewer sees: the gaps between landed feed updates, the publish lag
+(capture to the feed update that made the segment playable), the
+live-edge lag sampled every second, and drops.
+
+Linux x86_64 (24 cores, datacenter link), the team's funded `antd`
+(~115 peers, paying chequebook), a depth-17 mutable batch, 600 kbit/s
+(the 360p rung) in 2 s segments, 30 min, fresh content and a fresh
+feed per run. v0.5.72 and this fix ran the iOS config (`"bzz"`, ladder
+markers, recovery entry); v0.5.68 has neither, so it ran plain `"bzz"`.
+
+| build | dropped | publish lag p50/p95/max s | feed gap p50/p95/max s | gaps > 4 s / > 10 s | live-edge lag p95 s | segment upload p50/p95/max s | cheques xBZZ |
+|---|---|---|---|---|---|---|---|
+| v0.5.68 | 0 / 899 | 8.3 / 15.7 / 23.5 | 3.8 / 11.9 / 24.1 | 185 / 34 | 19.3 | 5.4 / 10.6 / 30.7 | 0.026 |
+| v0.5.72 | 0 / 899 | 7.3 / 14.1 / 28.8 | 3.9 / 12.2 / 27.7 | 178 / 33 | 22.6 | 5.4 / 13.0 / 28.3 | 0.041 |
+| fix, without the 1 s hedge | 0 / 899 | 1.3 / 3.9 / 17.9 | 2.0 / 5.0 / 19.0 | 91 / 3 | 6.4 | 0.7 / 3.1 / 5.2 | 0.023 |
+| fix, 1 s hedge for the whole hunt | 0 / 899 | 0.9 / 1.6 / 8.8 | 2.0 / 2.9 / 10.3 | 16 / 1 | 3.3 | 0.5 / 1.1 / 1.3 | 0.046 |
+| **fix (this code), 10 min** | **0 / 299** | **0.6 / 0.9 / 3.2** | **2.0 / 2.3 / 4.9** | **3 / 0** | **2.5** | **0.3 / 0.4 / 1.1** | 0.007 |
+
+v0.5.68 and v0.5.72 behave the same: the pauses are not a regression
+from the publisher series (PRs #177 to #186). The new per-stage
+`timings` (v0.5.72 plus timings, 5 min) show where the time went:
+
+| stage | p50 ms | p95 ms | max ms |
+|---|---|---|---|
+| segment upload | 5309 | 10597 | 28172 |
+| head-of-line wait (landed, waiting for the segments before it) | 538 | 11335 | 23207 |
+| playlist upload | 309 | 2932 | 7848 |
+| recovery entry | 0 | 1 | 1 |
+| feed update (`POST /soc`) | 93 | 172 | 2722 |
+| whole feed update | 421 | 3045 | 7939 |
+| ladder marker (off the critical path) | 94 | 2652 | 2654 |
+
+So the feed paused behind slow *segments*. A paused feed resumed with
+several segments at once, as the issue saw. Ladder markers and the
+recovery entry were never on the path. A segment was slow for two
+reasons, both in the push path:
+
+* **Shallow receipts.** About 1 chunk in 10 drew a first receipt from
+  a storer one bit short of its radius. The push then waited 2.5 s for
+  a deeper peer to connect, which almost never happened in time, and
+  retried. A ~45-push segment nearly always has such a chunk, so every
+  segment paid at least 2.5 s, and a chunk that hunted several rounds
+  held its segment, and the feed behind it, for 10-30 s.
+* **Redundancy replicas after the data.** At redundancy level 1 the
+  gateway pushed the dispersed-replica SOCs only after every data chunk
+  had a receipt: a second serial phase with its own hunts. A 150 KB
+  segment took 7.6 s on average (max 28 s) against 3.2 s at level 0.
+
+What the fix changes:
+
+* The gateway pushes an upload's replicas alongside its data chunks
+  (all uploads): level 1 went from 7.6 s to 4.3 s mean.
+* After a chunk's first shallow receipt the retry goes straight to the
+  next-closest peer (all pushes). It landed deep as often without the
+  wait (87-90%) as with it (84%). Level 1 dropped to 2.6 s mean.
+* `ant-ack-when-stored: true` (ant's own header), sent by the publisher
+  on segments and live windows: the gateway answers once every chunk
+  has a receipt, shallow or deep. The hunt for a deep storer goes on in
+  the background exactly as before. Until that answer such a push also
+  hedges onto the next-closest peer after 1 s instead of bee's 5 s,
+  because someone is waiting on it; the background hunt after it goes
+  back to 5 s. The feed update, the channel manifest, the ladder and the
+  recording still answer once placed.
+
+Placement held: hunts that ended without a deep storer were 1, 1, 0
+and 4 per run (of ~40 000 pushes each). The last 20 segments of the
+final run's recording all read back in full (1.2-2.3 s each) through a
+fresh, unconnected node.
+
+An earlier hedge costs money: a push still unanswered after 1 s also
+goes to a second peer, and both receipts are paid. The first version
+kept the 1 s hedge for the whole background hunt too, and its 30 min
+run was the dearest at 0.046 xBZZ (0.013 in its first 10 min). With
+the short hedge ending at the stored answer, the last run's 10 min
+cost 0.007, about the rate of the fix without the early hedge (0.023
+per 30 min). Cheque spend is noisy run to run, though: the two
+baselines differ 1.6× on nearly the same push volume.
+
+None of the runs here dropped a segment, though the issue's emulator
+dropped 89 of 1713. Drops start when the in-flight window (4) and the
+backlog (4) are both full, i.e. several segments in a row take about
+8 s or more. Here segments peaked at 28-31 s but rarely in a row; with
+the fix they peak at 1.3 s. The emulator run is the one to repeat on a
+device.
+
+Caveat: by the last runs the depth-17 test batch was full, and every
+new chunk wrapped its bucket ("collision bucket full on mutable batch").
+That costs nothing on the publish side measured here, but it means
+chunks from early in a run can be evicted, so only the end of a
+recording was read back.
+
 ### Owed
 
 | environment | what's needed |
@@ -196,6 +295,24 @@ Add `ANT_FFI_DATA_DIR=<dir with a funded identity.json>` and drop
 `ANT_BENCH_GATEWAY` to publish through an *embedded* node instead —
 the shape the phone actually runs (the example then starts the node and
 its gateway itself on `127.0.0.1:1733`).
+
+### The live publisher end to end (issue #212)
+
+```bash
+ANT_LIVE_GATEWAY=http://127.0.0.1:1833 ANT_LIVE_BATCH=0x<batch> \
+ANT_LIVE_BITRATE_KBPS=600 ANT_LIVE_DURATION_S=1800 \
+ANT_LIVE_CONFIG='{"ladder":true,"recovery_path":"/path/recovery.json"}' \
+ANT_LIVE_EVENTS=feed.csv \
+  cargo run --release -p ant-ffi --example live_bench
+```
+
+It prints a Markdown row (published/pushed, dropped, failed, publish
+lag, feed gaps, segment uploads) and a JSON summary with the report,
+including its per-stage `timings`. Every minute it logs progress and,
+on a publisher that has them, the stage timings so far. `ANT_LIVE_CONFIG`
+is merged into the publisher config as is. The driver reads snapshot
+and report as JSON, so the same file builds against older publishers
+(copy it into a checkout of the tag).
 
 ### On a phone — the rows that gate the decision
 

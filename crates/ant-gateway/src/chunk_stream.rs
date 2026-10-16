@@ -217,6 +217,7 @@ async fn handle_upload_stream(
             stamp,
             // Bee-parity accept-shallow (see POST /chunks).
             require_deep: false,
+            ack_when_stored: false,
             ack: ack_tx,
         };
         if handle.commands.send(cmd).await.is_err() {
