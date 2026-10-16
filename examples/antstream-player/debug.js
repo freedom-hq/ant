@@ -191,7 +191,9 @@
     const ok = segs.filter((e) => e.status === 'ok');
     const failed = segs.filter((e) => e.status === 'error' || e.status === 'timeout');
     const cancelled = segs.filter((e) => e.status === 'cancelled');
-    const done = log.entries.filter((e) => e.kind === 'playlist' && e.ms !== null);
+    // A read dropped before it was sent (a restart or channel change while it
+    // waited for the read budget) was never answered: not a failure.
+    const done = log.entries.filter((e) => e.kind === 'playlist' && e.ms !== null && e.status !== 'cancelled');
     const reads = done.filter((e) => e.read !== 'marker');
     const readsOk = reads.filter((e) => e.status === 200);
     const notYet = reads.filter((e) => e.status === 404);
@@ -232,8 +234,9 @@
     }
     if (e.kind === 'playlist') {
       // How the read was answered: 200 with a playlist (or a marker), 404
-      // for a slot not written yet, 429 rate limited, else an error.
-      const bad = e.status !== 200 && e.status !== 404 && e.status !== 'loading';
+      // for a slot not written yet, 429 rate limited, else an error. A read
+      // dropped before it was sent (channel changed) is dimmed, not an error.
+      const bad = e.status !== 200 && e.status !== 404 && e.status !== 'loading' && e.status !== 'cancelled';
       const stale = e.note.includes('stale');
       const what = e.read === 'head' ? 'feed head' : e.read === 'marker' ? `marker ${e.period}` : 'feed slot';
       return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : e.status === 404 || e.status === 'cancelled' ? ' dim' : ''}` },
