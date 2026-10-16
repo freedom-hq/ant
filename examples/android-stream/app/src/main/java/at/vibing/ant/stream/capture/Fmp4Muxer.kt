@@ -19,8 +19,13 @@ import java.io.DataOutputStream
  */
 class Fmp4Muxer(private val video: VideoConfig, private val audio: AudioConfig?) {
 
-    /** H.264 parameters: SPS and PPS NAL units *without* start codes. */
-    class VideoConfig(val width: Int, val height: Int, val sps: ByteArray, val pps: ByteArray, val rotation: Int)
+    /**
+     * H.264 parameters: SPS and PPS NAL units *without* start codes.
+     * [width] × [height] is the coded size, which is also the displayed
+     * size: frames are encoded upright (portrait as e.g. 480×640), and the
+     * track matrix is always identity (#194).
+     */
+    class VideoConfig(val width: Int, val height: Int, val sps: ByteArray, val pps: ByteArray)
 
     /** AAC parameters: the AudioSpecificConfig from the encoder's csd-0. */
     class AudioConfig(val sampleRate: Int, val channels: Int, val asc: ByteArray)
@@ -41,7 +46,7 @@ class Fmp4Muxer(private val video: VideoConfig, private val audio: AudioConfig?)
                 int(0x00010000) // rate 1.0
                 short(0x0100) // volume 1.0
                 zeros(10)
-                matrix(0)
+                matrix()
                 zeros(24) // pre_defined
                 int(if (audio != null) 3 else 2) // next_track_ID
             }
@@ -126,7 +131,7 @@ class Fmp4Muxer(private val video: VideoConfig, private val audio: AudioConfig?)
             short(0); short(0) // layer, alternate_group
             short(0) // volume
             short(0)
-            matrix(video.rotation)
+            matrix()
             int(video.width shl 16)
             int(video.height shl 16)
         }
@@ -178,7 +183,7 @@ class Fmp4Muxer(private val video: VideoConfig, private val audio: AudioConfig?)
             short(0); short(1) // layer, alternate_group
             short(0x0100) // volume
             short(0)
-            matrix(0)
+            matrix()
             int(0); int(0)
         }
         box("mdia") {
@@ -273,18 +278,14 @@ class Fmp4Muxer(private val video: VideoConfig, private val audio: AudioConfig?)
         int(0); int(0); int(0)
     }
 
-    /** The tkhd/mvhd transformation matrix for a clockwise rotation. */
-    private fun Writer.matrix(rotation: Int) {
-        val one = 0x00010000
-        val minusOne = -0x00010000
-        val (a, b, c, d) = when ((rotation % 360 + 360) % 360) {
-            90 -> listOf(0, one, minusOne, 0)
-            180 -> listOf(minusOne, 0, 0, minusOne)
-            270 -> listOf(0, minusOne, one, 0)
-            else -> listOf(one, 0, 0, one)
-        }
-        int(a); int(b); int(0)
-        int(c); int(d); int(0)
+    /**
+     * The tkhd/mvhd transformation matrix: identity. Players disagree on
+     * how to apply a rotation here (#194), so frames are turned upright
+     * before encoding instead.
+     */
+    private fun Writer.matrix() {
+        int(0x00010000); int(0); int(0)
+        int(0); int(0x00010000); int(0)
         int(0); int(0); int(0x40000000)
     }
 

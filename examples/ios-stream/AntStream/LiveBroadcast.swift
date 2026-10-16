@@ -158,7 +158,13 @@ final class LiveBroadcast: ObservableObject {
         configureAudioSession(for: source)
         holdIdleTimer()
 
-        let engine = CaptureEngine(source: source, settings: settings)
+        // `-antstream-shot-portrait` runs the test pattern as a portrait
+        // broadcast (#194), the shape a phone held upright produces.
+        let engine = CaptureEngine(
+            source: source,
+            settings: settings,
+            portrait: RootView.shotArgs.contains("-antstream-shot-portrait")
+        )
         engine.onStateChange = { [weak self] newState in
             guard let self else { return }
             self.capture = newState

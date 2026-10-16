@@ -36,10 +36,12 @@ import kotlin.math.abs
  * hands finished segments to [onSegment] in order.
  *
  * The activity is locked to the broadcast's orientation while live. The
- * camera's frames are encoded as the sensor delivers them; the rotation
- * that makes them upright for that orientation (none for landscape on
- * usual sensors, 90° or 270° for portrait) is recorded in the track
- * header, as phone cameras do for portrait video.
+ * camera's frames are turned upright for that orientation before they are
+ * encoded (none for landscape on usual sensors, 90° or 270° for portrait,
+ * see [UprightRenderer]), so a portrait broadcast is real portrait frames
+ * (e.g. 480×640) with an identity track matrix (#194): a rotation flag in
+ * the track header is ignored or misapplied by enough players (a sideways
+ * or squeezed picture in Chromium) that the stream must not rely on it.
  */
 class CaptureEngine(
     private val context: Context,
@@ -81,6 +83,7 @@ class CaptureEngine(
     private var session: CameraCaptureSession? = null
     private var videoCodec: MediaCodec? = null
     private var encoderSurface: Surface? = null
+    private var renderer: UprightRenderer? = null
     private var audioThread: Thread? = null
     @Volatile private var running = false
     @Volatile private var realtimeClock = false
@@ -92,8 +95,18 @@ class CaptureEngine(
     var hasAudio = false
         private set
 
-    /** The encoded frame size; the preview uses the same aspect. */
+    /**
+     * The camera's frame size, as the sensor delivers it (landscape); the
+     * preview uses the same aspect.
+     */
     lateinit var videoSize: Size
+        private set
+
+    /**
+     * The encoded frame size: [videoSize] turned upright, so portrait
+     * (e.g. 480×640) when the frames need a quarter turn.
+     */
+    lateinit var encodedSize: Size
         private set
 
     /** True while the front (selfie) camera is in use. */
@@ -115,12 +128,12 @@ class CaptureEngine(
         get() = cameraIdFor(true) != null && cameraIdFor(false) != null
 
     /**
-     * Rotation that makes this camera's frames upright for the locked
-     * screen orientation (landscape = `ROTATION_90`, portrait =
-     * `ROTATION_0`), written into the track header so players turn the
-     * picture: back cameras turn against the display, front cameras with
-     * it. Landscape on the usual 90° back / 270° front sensors needs none;
-     * portrait needs 90° / 270°, a vertical video like any phone camera's.
+     * Clockwise rotation that makes this camera's frames upright for the
+     * locked screen orientation (landscape = `ROTATION_90`, portrait =
+     * `ROTATION_0`), applied to every frame by [UprightRenderer]: back
+     * cameras turn against the display, front cameras with it. Landscape
+     * on the usual 90° back / 270° front sensors needs none; portrait needs
+     * 90° / 270°, a vertical video like any phone camera's.
      */
     private fun rotationFor(chars: CameraCharacteristics): Int {
         val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -133,7 +146,13 @@ class CaptureEngine(
 
     /** Pick the frame size before the preview surface is laid out. */
     fun prepare(): Size {
-        videoSize = chooseSize()
+        // Fixed for the broadcast: a camera switch keeps the encoder. Both
+        // cameras of a phone need the same quarter turns for an
+        // orientation (90° back / 270° front for portrait), so the
+        // switched-to camera's upright frames have the same shape.
+        val quarter = rotationFor(cameraManager.getCameraCharacteristics(cameraId)) % 180 != 0
+        videoSize = chooseSize(quarter)
+        encodedSize = if (quarter) Size(videoSize.height, videoSize.width) else videoSize
         return videoSize
     }
 
@@ -155,7 +174,7 @@ class CaptureEngine(
         hasAudio = audioRecord != null
         segmenter = Segmenter(settings.segmentSeconds * 1_000_000L, hasAudio, onSegment)
         try {
-            startVideoEncoder(rotation)
+            startVideoEncoder()
         } catch (e: Exception) {
             fail("video encoder: ${e.message}")
             return
@@ -171,7 +190,10 @@ class CaptureEngine(
      * Switch between the front and back camera, live: the encoder keeps
      * running and only the camera feeding its input surface changes, so the
      * broadcast goes on with a short freeze. A camera whose frames need a
-     * different rotation gets a fresh initialization segment.
+     * different rotation (front and back sensors usually face opposite
+     * ways) is turned differently by [UprightRenderer]; the encoded frames
+     * keep their size and orientation, so the stream needs no new
+     * initialization segment.
      */
     fun switchCamera() {
         cameraHandler.post {
@@ -184,11 +206,8 @@ class CaptureEngine(
             frontCamera = !frontCamera
             val chars = cameraManager.getCameraCharacteristics(cameraId)
             this.chars = chars
-            val r = rotationFor(chars)
-            if (r != rotation) {
-                rotation = r
-                segmenter.reconfigure(r)
-            }
+            rotation = rotationFor(chars)
+            renderer?.rotation = rotation
             // Cut promptly: the next segment starts on the new camera.
             runCatching {
                 videoCodec?.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
@@ -255,7 +274,7 @@ class CaptureEngine(
 
     @Suppress("DEPRECATION")
     private fun startSession(device: CameraDevice, onConfigured: (() -> Unit)? = null) {
-        val encoderSurface = encoderSurface ?: return
+        val encoderSurface = renderer?.inputSurface ?: return
         val chars = chars ?: return
         val preview = previewSurface
         device.createCaptureSession(
@@ -306,6 +325,10 @@ class CaptureEngine(
             previewSurface?.release()
             previewSurface = null
             encoderHandler.post {
+                // Stop drawing into the encoder's surface before the
+                // encoder goes away.
+                renderer?.release()
+                renderer = null
                 runCatching { videoCodec?.stop() }
                 runCatching { videoCodec?.release() }
                 videoCodec = null
@@ -335,8 +358,8 @@ class CaptureEngine(
 
     // -- video -------------------------------------------------------------
 
-    private fun startVideoEncoder(rotation: Int) {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, videoSize.width, videoSize.height).apply {
+    private fun startVideoEncoder() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodedSize.width, encodedSize.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, settings.bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, settings.frameRate)
@@ -371,7 +394,7 @@ class CaptureEngine(
                         fail("the video encoder gave no H.264 parameters")
                         return
                     }
-                    segmenter.setVideoConfig(Fmp4Muxer.VideoConfig(videoSize.width, videoSize.height, sps, pps, rotation))
+                    segmenter.setVideoConfig(Fmp4Muxer.VideoConfig(encodedSize.width, encodedSize.height, sps, pps))
                 }
 
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
@@ -381,7 +404,18 @@ class CaptureEngine(
             encoderHandler,
         )
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoderSurface = codec.createInputSurface()
+        val input = codec.createInputSurface()
+        encoderSurface = input
+        // The camera renders into the renderer, which draws each frame
+        // upright into the encoder's input surface.
+        renderer = try {
+            UprightRenderer(input, videoSize.width, videoSize.height, encodedSize.width, encodedSize.height, rotation)
+        } catch (e: Exception) {
+            input.release()
+            encoderSurface = null
+            codec.release()
+            throw e
+        }
         codec.start()
         videoCodec = codec
     }
@@ -393,7 +427,7 @@ class CaptureEngine(
      * bigger frame: many cameras lack a small 16:9 size, and 640x480 beats
      * 1280x720 for a 360p budget.
      */
-    private fun chooseSize(): Size {
+    private fun chooseSize(quarterTurn: Boolean): Size {
         val caps = avcCapabilities()
         val ids = listOfNotNull(cameraIdFor(false), cameraIdFor(true)).ifEmpty { listOf(cameraId) }
         val perCamera = ids.map { id ->
@@ -402,8 +436,12 @@ class CaptureEngine(
             val preview = map?.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
             encoder intersect preview
         }
+        // The encoder takes the frames upright: turned a quarter, a size
+        // is encoded the other way round.
         var usable = perCamera.reduce { a, b -> a intersect b }
-            .filter { caps?.isSizeSupported(it.width, it.height) ?: true }
+            .filter { s ->
+                caps?.let { if (quarterTurn) it.isSizeSupported(s.height, s.width) else it.isSizeSupported(s.width, s.height) } ?: true
+            }
         if (usable.isEmpty()) usable = perCamera.first().toList()
         val q = settings.quality
         val wide = { s: Size -> abs(s.width * 9 - s.height * 16) <= 16 }
