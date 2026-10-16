@@ -1011,6 +1011,10 @@ struct SwarmState {
     /// ever pushes with a rejected batch again — the node re-validates
     /// it itself with backoff and clears the mark when peers accept.
     rejected_batches: RejectedBatches,
+    /// Pushes answered at "stored" whose deep-storer hunt is still
+    /// running (`ack_when_stored`, issue #212); see
+    /// [`MAX_BACKGROUND_HUNTS`].
+    background_hunts: Arc<Semaphore>,
     /// When each batch was registered at runtime via
     /// `ControlCommand::RegisterBatch` (a buy or connect). Surfaced as
     /// `PostageStatusView::registered_secs_ago` so the gateway's
@@ -1132,6 +1136,7 @@ impl SwarmState {
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            background_hunts: Arc::new(Semaphore::new(MAX_BACKGROUND_HUNTS)),
             runtime_registered: HashMap::new(),
             bought_batches: HashMap::new(),
             feed_hints: ant_retrieval::FeedHints::new(),
@@ -5215,12 +5220,64 @@ fn stamp_jobs(
         .collect()
 }
 
+/// Node-wide cap on deep-storer hunts that go on after their push was
+/// answered as stored (`ack_when_stored`, issue #212). An answered push
+/// leaves its request's `MAX_PUSH_CONCURRENCY` window (32 per request in
+/// `ant-gateway`/`ant-node`), so without this the hunts left behind by
+/// one request after another would add up with nothing bounding them,
+/// and per-peer stream pressure is what collapses a push run (PR #72).
+/// Once every slot is taken, a push that gets its first receipt is not
+/// answered early: its caller waits for placement as without the
+/// header, which keeps it inside its request's window and slows the
+/// request down instead of adding more pushes. 64 is two requests'
+/// worth of data pushes; at about one shallow first receipt in ten
+/// (issue #212's measurement) a 2 s live cadence leaves a handful of
+/// hunts running at a time.
+const MAX_BACKGROUND_HUNTS: usize = 64;
+
 /// How a push that may answer early ended its first wait.
 enum PushStep {
     Done(Result<(), ant_retrieval::pushsync::PushSyncError>),
-    /// A storer receipted it (shallow): answered, the hunt goes on.
-    Stored,
+    /// A storer receipted it (shallow): answered, the hunt goes on,
+    /// holding one of the [`MAX_BACKGROUND_HUNTS`] slots until it ends.
+    Stored(tokio::sync::OwnedSemaphorePermit),
     Abandoned,
+}
+
+/// Wait for the first of: the push ending, its stored signal (answered
+/// early only if a [`MAX_BACKGROUND_HUNTS`] slot is free, otherwise it
+/// keeps waiting for the push to end), or, when `abandonable`, its
+/// requester going away.
+async fn next_push_step<F>(
+    mut push: std::pin::Pin<&mut F>,
+    stored: oneshot::Receiver<()>,
+    ack: &mut oneshot::Sender<ControlAck>,
+    abandonable: bool,
+    background_hunts: &Arc<Semaphore>,
+) -> PushStep
+where
+    F: std::future::Future<Output = Result<(), ant_retrieval::pushsync::PushSyncError>>,
+{
+    let abandoned = async {
+        if abandonable {
+            ack.closed().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(abandoned);
+    tokio::select! {
+        outcome = &mut push => return PushStep::Done(outcome),
+        Ok(()) = stored => {}
+        () = &mut abandoned => return PushStep::Abandoned,
+    }
+    if let Ok(slot) = background_hunts.clone().try_acquire_owned() {
+        return PushStep::Stored(slot);
+    }
+    tokio::select! {
+        outcome = &mut push => PushStep::Done(outcome),
+        () = &mut abandoned => PushStep::Abandoned,
+    }
 }
 
 /// `fetcher` with a stored signal when `enabled` (`ack_when_stored`,
@@ -5276,6 +5333,7 @@ fn push_with_stamp(
     ack: oneshot::Sender<ControlAck>,
 ) {
     let rejected_batches = state.rejected_batches.clone();
+    let background_hunts = state.background_hunts.clone();
     let lag_until = rejection_lag_deadline(state, &stamp);
     let patience_peers = state.peers_watch.subscribe();
     if state.peers_watch.subscribe().borrow().is_empty() {
@@ -5336,18 +5394,15 @@ fn push_with_stamp(
             lag_until,
         );
         tokio::pin!(push);
-        let step = tokio::select! {
-            outcome = &mut push => PushStep::Done(outcome),
-            Ok(()) = stored => PushStep::Stored,
-            () = ack.closed() => PushStep::Abandoned,
-        };
+        let step = next_push_step(push.as_mut(), stored, &mut ack, true, &background_hunts).await;
         let outcome = match step {
             PushStep::Done(outcome) => outcome,
-            PushStep::Stored => {
+            PushStep::Stored(slot) => {
                 let _ = ack.send(ControlAck::ChunkUploaded {
                     reference: format!("0x{}", hex::encode(addr)),
                 });
                 finish_hunt_in_background(push.await, &rejected_batches, &stamp, &addr);
+                drop(slot);
                 return;
             }
             PushStep::Abandoned => {
@@ -5393,6 +5448,7 @@ fn push_soc_with_stamp(
 ) {
     const SOC_HEADER: usize = 32 + 65;
     let rejected_batches = state.rejected_batches.clone();
+    let background_hunts = state.background_hunts.clone();
     let lag_until = rejection_lag_deadline(state, &stamp);
     let patience_peers = state.peers_watch.subscribe();
     if state.peers_watch.subscribe().borrow().is_empty() {
@@ -5468,16 +5524,20 @@ fn push_soc_with_stamp(
             lag_until,
         );
         tokio::pin!(push);
-        let outcome = tokio::select! {
-            outcome = &mut push => outcome,
-            Ok(()) = stored => {
-                let _ = ack.send(ControlAck::ChunkUploaded {
-                    reference: format!("0x{}", hex::encode(address)),
-                });
-                finish_hunt_in_background(push.await, &rejected_batches, &stamp, &address);
-                return;
-            }
-        };
+        let mut ack = ack;
+        let outcome =
+            match next_push_step(push.as_mut(), stored, &mut ack, false, &background_hunts).await {
+                PushStep::Done(outcome) => outcome,
+                PushStep::Stored(slot) => {
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    });
+                    finish_hunt_in_background(push.await, &rejected_batches, &stamp, &address);
+                    drop(slot);
+                    return;
+                }
+                PushStep::Abandoned => unreachable!("a SOC push is not abandonable"),
+            };
         let reply = match outcome {
             Ok(()) => {
                 note_stamp_outcome(&rejected_batches, &stamp, None);
@@ -12736,5 +12796,67 @@ mod tests {
     async fn retrieval_that_finishes_hands_back_its_reply() {
         let (ack, _rx) = mpsc::channel::<ControlAck>(1);
         assert_eq!(unless_client_gone(&ack, async { 7 }).await, Some(7));
+    }
+
+    /// Issue #212 (PR #213 R1-M4): a push answered at "stored" holds a
+    /// node-wide background-hunt slot until its hunt ends; with every
+    /// slot taken, the stored signal answers nothing early and the
+    /// caller waits for the push itself, as without the header.
+    #[tokio::test]
+    async fn background_hunts_are_capped_node_wide() {
+        let hunts = Arc::new(Semaphore::new(1));
+
+        // A free slot: answered at stored, the slot held by the hunt.
+        let (stored_tx, stored) = oneshot::channel();
+        let (mut ack, _ack_rx) = oneshot::channel();
+        let push = std::future::pending::<Result<(), ant_retrieval::pushsync::PushSyncError>>();
+        tokio::pin!(push);
+        stored_tx.send(()).unwrap();
+        let step = next_push_step(push.as_mut(), stored, &mut ack, true, &hunts).await;
+        let PushStep::Stored(slot) = step else {
+            panic!("a free slot should answer at stored");
+        };
+        assert_eq!(hunts.available_permits(), 0);
+
+        // Every slot taken: the stored signal is ignored and the step
+        // waits for the push to end.
+        let (stored_tx, stored) = oneshot::channel();
+        let (mut ack2, _ack2_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let push = async move {
+            done_rx.await.unwrap();
+            Ok::<(), ant_retrieval::pushsync::PushSyncError>(())
+        };
+        tokio::pin!(push);
+        stored_tx.send(()).unwrap();
+        let step = next_push_step(push.as_mut(), stored, &mut ack2, true, &hunts);
+        tokio::pin!(step);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut step)
+                .await
+                .is_err(),
+            "answered early with no slot free",
+        );
+        done_tx.send(()).unwrap();
+        assert!(matches!(step.await, PushStep::Done(Ok(()))));
+
+        // The first hunt ends: its slot is free again.
+        drop(slot);
+        assert_eq!(hunts.available_permits(), 1);
+    }
+
+    /// With every slot taken, a push still ends as abandoned when its
+    /// requester goes away, rather than hunting on for nobody.
+    #[tokio::test]
+    async fn a_capped_push_is_still_abandoned_with_its_requester() {
+        let hunts = Arc::new(Semaphore::new(0));
+        let (stored_tx, stored) = oneshot::channel();
+        let (mut ack, ack_rx) = oneshot::channel();
+        let push = std::future::pending::<Result<(), ant_retrieval::pushsync::PushSyncError>>();
+        tokio::pin!(push);
+        stored_tx.send(()).unwrap();
+        drop(ack_rx);
+        let step = next_push_step(push.as_mut(), stored, &mut ack, true, &hunts).await;
+        assert!(matches!(step, PushStep::Abandoned));
     }
 }

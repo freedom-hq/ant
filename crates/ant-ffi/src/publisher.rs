@@ -4307,7 +4307,12 @@ async fn upload_playlist(
     // A live window is superseded by the next one seconds later, and the
     // feed update that names it waits on its upload: answered once
     // stored, like the segments (see `stored_ack_headers`). The
-    // recording is the broadcast's lasting copy and waits for placement.
+    // recording is the broadcast's lasting copy, so its playlist's own
+    // chunks wait for placement. The segments it lists were answered at
+    // stored: a deep-storer hunt one of them started may still be running
+    // in the node's background when this returns, and ends with the node
+    // (an app suspended or shut down right after stop), leaving that
+    // chunk on its shallow storer only.
     let extra: &[(String, String)] = if shape == PlaylistShape::Recording {
         &[]
     } else {
@@ -4738,8 +4743,8 @@ async fn publish_bzz_with(
 /// and finishes the hunt for a deep storer that a shallow receipt
 /// starts in the background. A segment's playlist entry waits for every
 /// segment before it, and a feed update for its playlist's upload, so
-/// without this one chunk hunting a deep storer (2.5 s a round, up to a
-/// dozen rounds) held back the feed for everything behind it: the
+/// without this one chunk hunting a deep storer (12 shallow receipts at
+/// most, a 2.5 s wait after each from the 2nd to the 11th) held back the feed for everything behind it: the
 /// 10-30 s pauses of #212. The hunt itself is unchanged. The feed
 /// update (`POST /soc`), the channel manifest, the ladder's writes and
 /// the recording go without it, and answer once placed. Other gateways

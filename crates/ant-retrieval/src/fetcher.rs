@@ -3561,13 +3561,6 @@ mod tests {
         assert_eq!(shallow_verdict(12, true, false), Strict);
     }
 
-    /// Pin shallow-receipt acceptance: we hunt for a deeper storer for a
-    /// bounded number of shallow hits, then accept (a shallow receipt still
-    /// means the chunk *is* stored, so failing the upload would be wrong).
-    /// The threshold sits above bee's pusher `DefaultRetryCount` (6) because
-    /// a light node can't lean on pull-sync to deepen a shallow placement
-    /// after the fact, so it spends extra rounds — each with an active
-    /// neighbourhood dial + bounded wait — hunting for a deep storer first.
     /// Issue #212: a stored signal fires once, at the first shallow
     /// receipt, however many follow; a fetcher without one has nothing
     /// to fire. The push hedges after 1 s only while its caller still
@@ -3611,6 +3604,13 @@ mod tests {
         ));
     }
 
+    /// Pin shallow-receipt acceptance: we hunt for a deeper storer for a
+    /// bounded number of shallow hits, then accept (a shallow receipt still
+    /// means the chunk *is* stored, so failing the upload would be wrong).
+    /// The threshold sits above bee's pusher `DefaultRetryCount` (6) because
+    /// a light node can't lean on pull-sync to deepen a shallow placement
+    /// after the fact, so it spends extra rounds — each with an active
+    /// neighbourhood dial + bounded wait — hunting for a deep storer first.
     #[test]
     fn shallow_receipt_accepted_after_bounded_attempts() {
         assert_eq!(

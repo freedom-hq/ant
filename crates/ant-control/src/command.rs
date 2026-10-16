@@ -290,9 +290,11 @@ pub enum ControlCommand {
         /// first receipt, shallow or deep. A shallow one no longer holds
         /// the answer back while the push hunts for a deeper storer; the
         /// hunt goes on in the background exactly as it would have, and
-        /// its outcome is only logged. For a caller that needs the chunk
-        /// held by the network now and in its own neighbourhood seconds
-        /// later, rather than deep before it may go on: a live broadcast's
+        /// its outcome is only logged. At most `MAX_BACKGROUND_HUNTS` (64)
+        /// such hunts run node-wide; with every slot taken the push is
+        /// answered when done, as with `false`. For a caller that needs
+        /// the chunk held by the network now and in its own neighbourhood
+        /// seconds later, rather than deep before it may go on: a live broadcast's
         /// segments, which every later segment waits behind (issue #212).
         /// `false` (every other caller) answers when the push is done.
         /// Ignored with `require_deep`, whose answer is the deep receipt.
