@@ -581,11 +581,32 @@
   // channel writes from its start.
   const HEAD_RETRY_AFTER_MS = BUDGET_WINDOW_MS + 5000;
   const HEAD_REFUSED_HOLD_MS = 5 * 60000;
+  // "In a row" means the retry the first refusal scheduled: a second
+  // refusal counts only if it comes within this long of the first, i.e.
+  // the read made once HEAD_RETRY_AFTER_MS is up (give or take a poll). A
+  // refusal any later (the channel reopened minutes after, or the read
+  // after a 5 min hold ran out) starts over at one strike, with its own
+  // retry in a fresh window.
+  const HEAD_STRIKE_WITHIN_MS = HEAD_RETRY_AFTER_MS + BUDGET_WINDOW_MS;
   // { key, at, strikes } of the channel whose head read was refused
   // (`strikes` refusals in a row); kept across `play()` retries, which
   // start the join over, and cleared by a head read that is answered or a
   // live broadcast found on the channel.
   let headRefused = null;
+
+  /**
+   * The refusal state after the head read of channel `key` is refused at
+   * `now`, given the one before (`prev`, any channel's, or null).
+   */
+  function headRefusal(prev, key, now) {
+    if (!prev || prev.key !== key) return { key, at: now, strikes: 1 };
+    const hold = prev.strikes >= 2 ? HEAD_REFUSED_HOLD_MS : HEAD_RETRY_AFTER_MS;
+    // A refusal while already held (a read that started before the first
+    // one came back) is the same strike.
+    if (now - prev.at < hold) return { key, at: prev.at, strikes: prev.strikes };
+    if (prev.strikes === 1 && now - prev.at < HEAD_STRIKE_WITHIN_MS) return { key, at: now, strikes: 2 };
+    return { key, at: now, strikes: 1 };
+  }
 
   /** The head read was refused twice in a row: it is over the budget. */
   const headTooLarge = (ch) => !!headRefused && headRefused.key === ch.key && headRefused.strikes >= 2;
@@ -753,16 +774,14 @@
       if (kind === 'slot' && a.status === 404) note(row, 'not written yet');
       else if (kind === 'head' && a.status === 404) note(row, 'the feed has no updates yet');
       if (kind === 'head' && a.status === 429 && inBzz) {
-        const prev = headRefused && headRefused.key === feed.ch.key ? headRefused : null;
-        // A refusal while already held (a read that started before the
-        // first one came back) is the same strike.
-        const strikes = prev && headHeld(feed.ch) ? prev.strikes : (prev ? prev.strikes : 0) + 1;
-        if (!prev || !headHeld(feed.ch)) {
+        const wasHeld = headHeld(feed.ch);
+        headRefused = headRefusal(headRefused, feed.ch.key, Date.now());
+        const strikes = headRefused.strikes;
+        if (!wasHeld) {
           log.marker(strikes >= 2
             ? `head read refused by the read budget again: it is over the budget, joining through the ladder markers only for ${HEAD_REFUSED_HOLD_MS / 60000} min`
             : `head read refused by the read budget: reading it again in a fresh window in ${HEAD_RETRY_AFTER_MS / 1000} s, joining through the ladder markers meanwhile`);
         }
-        headRefused = { key: feed.ch.key, at: Date.now(), strikes };
         feed.lastError = headRefusedError(feed.ch);
         note(row, strikes >= 2 ? 'over the read budget: not read again for a while' : 'refused by the read budget: reading again in a fresh window');
       } else if (a.status !== 404) feed.lastError = { code: typeof a.status === 'number' ? a.status : 0, message: a.note || String(a.status) };

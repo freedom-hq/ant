@@ -108,7 +108,8 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   origin, so a head that fits can be refused too when another tab (or
   the page before a reload) already spent part of the window: after a
   first refused head read the player reads it once more in a fresh
-  window. Only a second refusal in a row counts as "too large": the
+  window. Only a second refusal in a row (that retry, refused again;
+  a refusal minutes later starts over) counts as "too large": the
   player tells them so and joins through the ladder markers only for
   five minutes instead of spending a budget window on the head every
   retry; a new broadcast on the channel is found that way, and clears
