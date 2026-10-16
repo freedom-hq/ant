@@ -326,6 +326,19 @@ impl CreditLedger {
                             chequebooks = snap.cheques.len(),
                             "loaded credit ledger snapshot",
                         );
+                        for (k, c) in &snap.cheques {
+                            if parse_stored_cumulative(&c.cumulative_payout_dec).is_none() {
+                                warn!(
+                                    target: "ant_p2p::swap",
+                                    path = %p.display(),
+                                    chequebook = %k,
+                                    stored = ?c.cumulative_payout_dec,
+                                    "stored cumulative is not a decimal number; \
+                                     the next cheque from this chequebook \
+                                     becomes its baseline and credits nothing",
+                                );
+                            }
+                        }
                         snap
                     }
                     Err(e) => {
@@ -357,8 +370,9 @@ impl CreditLedger {
     }
 
     /// Apply `signed` to the ledger, returning the previous
-    /// cumulative payout for that chequebook (zero on first sight).
-    /// Validates: signature, beneficiary, monotonicity, sticky-issuer
+    /// cumulative payout for that chequebook (zero on first sight; the
+    /// cheque's own cumulative when the stored one is damaged, see
+    /// [`rebaseline`]). Validates: signature, beneficiary, monotonicity, sticky-issuer
     /// binding. A pure read-only check (no ledger mutation) is
     /// available via [`Self::would_accept`].
     pub fn record_accepted(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
@@ -373,7 +387,8 @@ impl CreditLedger {
         let chequebook_key = hex::encode(signed.cheque.chequebook);
         let recovered_hex = hex::encode(recovered);
         let mut guard = self.inner.lock().expect("ledger mutex poisoned");
-        let prev_cum = match guard.cheques.get(&chequebook_key) {
+        let warn_rebaseline = true;
+        let stored = match guard.cheques.get(&chequebook_key) {
             Some(c) => {
                 if c.issuer_eoa_hex != recovered_hex {
                     return Err(SwapError::Rejected(format!(
@@ -382,12 +397,15 @@ impl CreditLedger {
                         c.issuer_eoa_hex,
                     )));
                 }
-                U256::from_dec_str(&c.cumulative_payout_dec)
-                    .map_err(|e| SwapError::Decimal(format!("stored cumulative: {e}")))?
+                parse_stored_cumulative(&c.cumulative_payout_dec)
             }
-            None => U256::zero(),
+            None => Some(U256::zero()),
         };
-        if signed.cheque.cumulative_payout <= prev_cum {
+        let prev_cum = match stored {
+            Some(prev) => prev,
+            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
+        };
+        if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
             return Err(SwapError::Rejected(format!(
                 "non-monotonic cheque for 0x{chequebook_key}: cum={} <= stored={}",
                 signed.cheque.cumulative_payout, prev_cum,
@@ -427,19 +445,23 @@ impl CreditLedger {
         let chequebook_key = hex::encode(signed.cheque.chequebook);
         let recovered_hex = hex::encode(recovered);
         let guard = self.inner.lock().expect("ledger mutex poisoned");
-        let prev_cum = match guard.cheques.get(&chequebook_key) {
+        let warn_rebaseline = false;
+        let stored = match guard.cheques.get(&chequebook_key) {
             Some(c) => {
                 if c.issuer_eoa_hex != recovered_hex {
                     return Err(SwapError::Rejected(format!(
                         "issuer for chequebook 0x{chequebook_key} changed",
                     )));
                 }
-                U256::from_dec_str(&c.cumulative_payout_dec)
-                    .map_err(|e| SwapError::Decimal(format!("stored cumulative: {e}")))?
+                parse_stored_cumulative(&c.cumulative_payout_dec)
             }
-            None => U256::zero(),
+            None => Some(U256::zero()),
         };
-        if signed.cheque.cumulative_payout <= prev_cum {
+        let prev_cum = match stored {
+            Some(prev) => prev,
+            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
+        };
+        if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
             return Err(SwapError::Rejected(format!(
                 "non-monotonic cumulative payout {} <= stored {}",
                 signed.cheque.cumulative_payout, prev_cum,
@@ -456,7 +478,7 @@ impl CreditLedger {
         let key = hex::encode(chequebook);
         let guard = self.inner.lock().expect("ledger mutex poisoned");
         match guard.cheques.get(&key) {
-            Some(c) => U256::from_dec_str(&c.cumulative_payout_dec).unwrap_or(U256::zero()),
+            Some(c) => parse_stored_cumulative(&c.cumulative_payout_dec).unwrap_or(U256::zero()),
             None => U256::zero(),
         }
     }
@@ -480,6 +502,38 @@ impl CreditLedger {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+}
+
+/// A stored cumulative as a `U256`: a non-empty string of ASCII digits
+/// that fits. `None` for anything else — an empty string, a sign, an
+/// exponent, spaces, too large. Stricter than `U256::from_dec_str`, which
+/// reads `""` as zero (bee#5656).
+fn parse_stored_cumulative(s: &str) -> Option<U256> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    U256::from_dec_str(s).ok()
+}
+
+/// The previous cumulative for `signed` when the stored one is damaged
+/// (bee#5656). That figure is not zero — read as zero, a re-sent old
+/// cheque would be credited in full again — and not a reason to refuse
+/// the chequebook for good either. The incoming cheque becomes the new
+/// baseline instead: it is accepted and recorded, and the previous
+/// cumulative reported for it is its own, so it credits nothing. Cheques
+/// after it credit their increase as usual. The peer loses at most that
+/// one cheque's increase; no payment is credited twice.
+fn rebaseline(key: &str, signed: &SignedCheque, log: bool) -> U256 {
+    if log {
+        warn!(
+            target: "ant_p2p::swap",
+            chequebook = %key,
+            cumulative = %signed.cheque.cumulative_payout,
+            "stored cumulative for chequebook is not a decimal number; \
+             taking this cheque as the new baseline, crediting nothing for it",
+        );
+    }
+    signed.cheque.cumulative_payout
 }
 
 fn persist_snapshot(path: &Path, snap: &LedgerSnapshot) -> std::io::Result<()> {
@@ -1683,9 +1737,7 @@ fn read_outbound_file(path: &Path) -> std::io::Result<Option<OutboundFile>> {
 /// moved aside instead, its figures lost, like unparseable JSON.
 fn bad_cumulative(map: &HashMap<String, String>) -> Option<String> {
     map.iter()
-        .find(|(_, v)| {
-            v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) || U256::from_dec_str(v).is_err()
-        })
+        .find(|(_, v)| parse_stored_cumulative(v).is_none())
         .map(|(k, v)| format!("entry {k:?} has cumulative {v:?}, not a decimal number"))
 }
 
@@ -3622,6 +3674,74 @@ mod tests {
         // Replay of the same cheque must be rejected as non-monotonic.
         let err = ledger2.record_accepted(&signed).unwrap_err();
         assert!(matches!(err, SwapError::Rejected(_)));
+    }
+
+    /// A damaged stored cumulative (bee#5656) is neither zero nor a
+    /// permanent refusal: the next cheque becomes the baseline and credits
+    /// nothing, so a re-sent old cheque isn't credited again, and later
+    /// cheques credit their increase. The issuer pin still holds.
+    #[test]
+    fn a_damaged_inbound_cumulative_rebaselines_instead_of_reading_zero() {
+        let issuer_secret = make_secret();
+        let our_eoa = [0xaau8; 20];
+        let cb = [0x77u8; 20];
+        let cheque = |cum: u64, secret: &[u8; SECP256K1_SECRET_LEN]| {
+            let c = Cheque {
+                chequebook: cb,
+                beneficiary: our_eoa,
+                cumulative_payout: U256::from(cum),
+            };
+            sign_cheque(secret, &c, 100).unwrap()
+        };
+        for bad in ["", "abc", "-5", "1e3", " 7", &"9".repeat(80)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credits.json");
+            CreditLedger::open(Some(path.clone()), 100, our_eoa)
+                .record_accepted(&cheque(1_000, &issuer_secret))
+                .unwrap();
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["cheques"][hex::encode(cb)]["cumulative_payout_dec"] = bad.into();
+            std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+            let ledger = CreditLedger::open(Some(path.clone()), 100, our_eoa);
+            // Another key can't take the chequebook over while it's damaged.
+            let attacker = make_secret();
+            assert!(
+                matches!(
+                    ledger.record_accepted(&cheque(2_000, &attacker)),
+                    Err(SwapError::Rejected(_))
+                ),
+                "{bad:?}: issuer pin lost",
+            );
+            // The old cheque, re-sent: accepted as the baseline, credits 0.
+            let old = cheque(1_000, &issuer_secret);
+            assert_eq!(
+                ledger.would_accept(&old).unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}"
+            );
+            assert_eq!(
+                ledger.record_accepted(&old).unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}: re-sent cheque credited again"
+            );
+            // Replayed again: now refused as non-monotonic.
+            assert!(matches!(
+                ledger.record_accepted(&old),
+                Err(SwapError::Rejected(_))
+            ));
+            // A higher cheque credits only its increase, and survives a reopen.
+            assert_eq!(
+                ledger
+                    .record_accepted(&cheque(1_200, &issuer_secret))
+                    .unwrap(),
+                U256::from(1_000u64),
+                "{bad:?}"
+            );
+            let reopened = CreditLedger::open(Some(path), 100, our_eoa);
+            assert_eq!(reopened.cumulative_for(&cb), U256::from(1_200u64));
+        }
     }
 
     /// Outbound ledger persists across restarts and rejects
