@@ -38,6 +38,8 @@ APK.
 | `capture/Fmp4Muxer.kt` | Writes fMP4 HLS segments (`ftyp`+`moov` init segment, `moof`+`mdat` media segments). Android's `MediaMuxer` cannot emit standalone segments. |
 | `capture/Segmenter.kt` | Cuts segments on keyframes (requested every second) at about the target duration, keeping audio and video on one timeline. |
 | `LiveBroadcast.kt` | Hands capture segments to `ant_publisher_push_segment` in order, polls progress, drains on stop. |
+| `Channel.kt` | The account's channel (owner + topic `antstream`), link parsing and the links Share sends. `Keccak.kt` hashes topics and feed slot ids in plain Kotlin. |
+| `FeedPlaylist.kt` | Follows a channel's feed for the Watch tab and serves ExoPlayer its playlist. |
 | `ui/` | Broadcast checklist, onboarding (plan pricing, payment detection, auto-activation), live screen, Watch (ExoPlayer HLS through the local gateway), Storage (plan, key backup / restore). |
 
 ## Going live
@@ -48,17 +50,41 @@ APK.
    deploys the chequebook.
 2. **Go live**: the screen turns landscape. Encoding is H.264 at
    ~900 kbit/s (the stage-1 rendition from #67) with AAC audio, in 2 s
-   segments. Each segment is `POST /bzz`'d, the rolling playlist is
-   republished and the channel's sequence feed is updated, exactly as on
-   iOS: the publisher's default `"bzz"` format, which the Watch tab below
-   and the web player read. (The Solar Punk format from #167 is an
-   opt-in `format: "solar-punk"` this app does not set.) The screen shows
-   the publish lag and the channel reference.
-3. **Watch**: paste a channel reference. The player loads
-   `http://127.0.0.1:1633/bzz/<channel>/stream.m3u8`, which re-resolves
-   the feed on every playlist refresh. A channel published in the
-   `"solar-punk"` format doesn't resolve on this path; the iOS Watch tab
-   reads both.
+   segments. Broadcasts go out in the publisher's `"solar-punk"` format
+   only (#217): each segment is `POST /bytes`'d, the rolling playlist
+   lists them as bare references, and every update of the channel's
+   sequence feed **is** that playlist. Ladder time markers and a master
+   playlist go out too (`"ladder": true`), so a viewer joining late
+   reaches the live edge in two reads. Each broadcast continues the
+   channel's feed after its head (#173); the app tracks no index. The
+   screen shows the publish lag and the channel.
+3. **Watch**: the field starts on your own channel; enter any other as
+   `0x<owner>/<topic>`, `swarm://<owner>/<topic>` or a web player link
+   (an owner alone means its `antstream` topic). The player
+   (`FeedPlaylist.kt`) joins from a ladder marker or
+   `GET /feeds/{owner}/{topic}` on the local gateway, then follows the
+   feed slot by slot (`GET /soc/{owner}/{id}`), and hands ExoPlayer each
+   playlist with its bare references made
+   `http://127.0.0.1:1633/bytes/<ref>` (the `#EXT-X-MAP` too). A
+   finished broadcast's recording plays from the start. Channels in the
+   older `"bzz"` format don't play any more.
+
+## Your channel
+
+A channel is an **owner and a topic**: your account address and the
+topic text `antstream`, the same for every broadcast, so there is one
+channel per account and nothing to create before sharing it. The
+channel's name is only a label (the broadcast's notes and the UI), never
+part of the topic, so renaming it never forks the channel. The Broadcast
+tab shows it and shares:
+
+- the web player, `bzz://<player>/#0x<owner>/antstream` in the Freedom
+  browser, and its gateway twin
+  `https://api.gateway.ethswarm.org/bzz/<player>/#0x<owner>/antstream` for
+  any browser (`<player>` is `PLAYER_REF`, the player's feed manifest, so
+  the link outlives player updates);
+- `swarm://<owner>/antstream`, the URI Solar Punk's players open a
+  channel by.
 
 The broadcast is foreground-only: leaving the app ends it cleanly (the
 playlist gets `#EXT-X-ENDLIST`). Without microphone permission it

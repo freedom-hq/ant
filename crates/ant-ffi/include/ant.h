@@ -1457,14 +1457,15 @@ char *ant_publisher_capacity(const char *config_json,
  *     paths, and a v1 update (bee-js upload shape: payload
  *     timestamp_be8 || reference of the playlist's manifest). A viewer
  *     plays /bzz/<channel reference>/stream.m3u8, which re-resolves the
- *     feed; the web player and the Android Watch tab read this.
+ *     feed. No viewer in this repository reads it any more (#217).
  *   "solar-punk": POST /bytes for segments and the playlist, segments
  *     and EXT-X-MAP listed by bare 64-hex reference (a viewer fetches
  *     each from <its gateway>/bytes/<ref>), and a v2 update (bee-js
  *     uploadPayload shape: the SOC wraps the playlist's own root chunk).
  *     GET /soc/{owner}/{id} and GET /feeds/{owner}/{topic} then both
  *     return the playlist text, on any bee gateway and on ant; this is
- *     what Solar Punk's viewers read. The channel reference does not
+ *     what Solar Punk's viewers, the web player and both AntStream apps
+ *     read, and what the apps publish (#217). The channel reference does not
  *     resolve to the playlist through /bzz.
  *
  * A feed manifest is created once at start with POST /feeds; its

@@ -73,7 +73,7 @@ fun RootScreen(node: AntNode, broadcast: LiveBroadcast) {
                         tab = Tab.Watch
                     },
                 )
-                Tab.Watch -> WatchScreen(node = node, initialReference = watchRef)
+                Tab.Watch -> WatchScreen(node = node, initialChannel = watchRef)
                 Tab.Storage -> StorageScreen(node = node, onGetStarted = { gettingStarted = true })
             }
         }

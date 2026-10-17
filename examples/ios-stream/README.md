@@ -26,7 +26,8 @@ Bundle id: `baby.freedom.antstream`. Data dir:
 | `CaptureEngine.swift` | #65: `AVCaptureSession` → H.264 → `AVAssetWriter` in `.mpeg4AppleHLS` mode, emitting fMP4 segments; interruption handling and the on-disk segment ring. |
 | `LiveBroadcast.swift` | Joins capture to `ant_publisher_*`, holds the foreground keep-alive, polls publish progress. |
 | `LiveView.swift` | The going-live screen: quality presets, preview, publish-lag indicator, live counters, channel share. |
-| `WatchView.swift` | The Watch tab: `AVPlayer` on a channel from the in-process gateway, in either publisher format (`/bzz/<ref>/stream.m3u8`, or `GET /feeds` with segment references rewritten to `/bytes/`), with automatic retry. |
+| `WatchView.swift` | The Watch tab: `AVPlayer` on a solar-punk channel from the in-process gateway (`GET /feeds`, segment references rewritten to `/bytes/`), with automatic retry. |
+| `ChannelAddress.swift` | A channel as owner + topic: link parsing, the links Share sends, the playlist rewrite and the publisher config. Foundation only; `ci/channel-address-tests.swift` tests it in CI. |
 | `BenchView.swift` | #67 stage 1: the throughput bench sheet. |
 | `GetStartedView.swift` | Ported onboarding: plan tiers → on-chain quote → payment detection → one-shot auto-activation. |
 | `StorageView.swift` | Ported storage tab: plan meter, extend/top-up, settlement warning, account + key backup/restore. |
@@ -243,28 +244,20 @@ device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM
    `AVAssetWriter` in `.mpeg4AppleHLS` mode. The writer emits one fMP4
    initialization segment and then a media segment every
    `segmentSeconds`; both are handed straight to the node.
-2. `ant_publisher_push_segment` queues each one. Per segment the node
-   does `POST /bzz`, rebuilds the rolling HLS playlist, publishes it,
-   and points the channel's sequence feed at it with `POST /soc` — the
-   publisher's `"bzz"` format, the bee-js update shape, so any bee
-   gateway resolves the channel from the feed manifest `POST /feeds`
-   created at start. The app passes `format: "bzz"` on purpose: the web
-   player the Share links open and the Android Watch tab only read that
-   format. The Solar Punk stream format (#167: `POST /bytes`, bare
-   segment references, v2 updates whose content is the playlist, read
-   with `GET /feeds/{owner}/{topic}`) is a `format: "solar-punk"` away
-   once those viewers read it.
-   New channels get a text topic (`antstream-<uuid>`, passed as
-   `topic_text`), which a Solar Punk catalog entry can name; a channel
-   made before keeps its random topic bytes, and with them its link.
-   Every broadcast also passes `"ladder": true` (#174): every ten
-   seconds the node writes a small ladder time marker at an address
-   computed from the clock (`ant_ladder_marker_id`), naming the feed's
-   newest index, so a viewer joining hours in reads one marker and then
-   one round of feed slots instead of walking the feed from 0. 360
-   chunks an hour on the plan. (Under `"solar-punk"` the node would also
-   write a one-rung master playlist for Solar Punk's players; not under
-   `"bzz"`.)
+2. `ant_publisher_push_segment` queues each one. Every broadcast goes
+   out in the publisher's Solar Punk format (`format: "solar-punk"`,
+   #167, the only format since #217): per segment the node does
+   `POST /bytes`, rebuilds the rolling HLS playlist listing bare segment
+   references, uploads it and writes it as the channel's next sequence
+   feed update with `POST /soc`, a v2 update whose content *is* the
+   playlist, so `GET /feeds/{owner}/{topic}` on any bee or ant gateway
+   answers with it. Every broadcast also passes `"ladder": true` (#174):
+   every ten seconds the node writes a small ladder time marker at an
+   address computed from the clock (`ant_ladder_marker_id`), naming the
+   feed's newest index, and a one-rung master playlist naming the
+   channel as `swarm://<owner>/antstream`, so a viewer joining hours in
+   reads one marker and then one round of feed slots instead of walking
+   the feed from 0. 360 chunks an hour on the plan.
 3. The screen shows the **publish lag** (capture → the feed update that
    makes the segment playable) the whole time, plus how many segments
    the live-edge discipline dropped to hold it there.
@@ -341,54 +334,62 @@ payment ⓘ sheet), plus the Storage and Get Started hooks in
 
 ## Permanent channel
 
-Every account has one channel: a random 32-byte feed topic created on
-first use and kept in `UserDefaults` under the account address (a
-restored account gets its own). The channel reference is the feed
-manifest of owner + topic, so it is one link for all broadcasts.
+Every account has one channel: an **owner and a topic**, the account
+address and the topic text `antstream` (`ChannelAddress.swift`), the
+same for every broadcast (a restored account is another owner, so
+another channel). There is nothing to create before sharing it. The
+channel's name is only a label (the broadcast's notes and the UI), never
+part of the topic, so renaming it never forks the channel.
 
-* As soon as a storage plan exists and the gateway is up, the app
-  creates that manifest itself (`POST /feeds/{owner}/{topic}` with
-  `swarm-postage-batch-id`, retried every 15 s until it lands) and keeps
-  the reference, so the link can be shared before the first broadcast.
-* **Broadcast → Your channel** shows it, with **Share** (the web player
-  links, for the Freedom browser and for any browser), copy, and
-  **Watch**. The live screen's copy/share buttons send the same links.
-* Every broadcast passes the channel's topic (`"topic_text"`, or
-  `"topic"` for a channel older than text topics) to
-  `ant_publisher_start` and no `"start_index"`: the node reads the feed
-  head and continues after it (#173), so it never rewrites the indices
-  that hold the last broadcast, even after a reinstall or from another
-  device on the same account. The new broadcast numbers its segments on
-  from the last one's (one `#EXT-X-DISCONTINUITY` at the seam, so a
-  viewer's media sequence only ever increases), and its recording opens
-  with the last one's, so the channel's head plays every broadcast.
-  Reading the head needs the node to confirm a miss (an empty feed, or
-  the slot after the head) with more than two peers, so **Go Live**
-  waits for three connected peers; until the node has them no playlist
-  or feed update would go up.
+* **Broadcast → Your channel** shows it with its links, each copied on
+  a tap, **Share** and **Watch**:
+  - the web player, `bzz://<player>/#0x<owner>/antstream` in the
+    Freedom browser, and its gateway twin
+    `https://api.gateway.ethswarm.org/bzz/<player>/#0x<owner>/antstream`
+    for any browser (`<player>` is `ChannelAddress.playerReference`, the
+    player's feed manifest, so the links outlive player updates);
+  - `swarm://<owner>/antstream`, the URI Solar Punk's players open a
+    channel by.
+
+  The live screen's copy/share buttons send the same links.
+* Every broadcast passes `"topic_text": "antstream"` to
+  `ant_publisher_start` and no `"topic"` or `"start_index"`: the node
+  reads the feed head and continues after it (#173), so it never
+  rewrites the indices that hold the last broadcast, even after a
+  reinstall or from another device on the same account. The new
+  broadcast numbers its segments on from the last one's (one
+  `#EXT-X-DISCONTINUITY` at the seam, so a viewer's media sequence only
+  ever increases), and its recording opens with the last one's, so the
+  channel's head plays every broadcast. Reading the head needs the node
+  to confirm a miss (an empty feed, or the slot after the head) with
+  more than two peers, so **Go Live** waits for three connected peers;
+  until the node has them no playlist or feed update would go up.
+* An unfinished broadcast (#175) is resumed or ended on the feed and in
+  the format its recovery entry names. One left by a build from before
+  #217 (a `"bzz"` broadcast on the old per-install topic) can only be
+  ended, in its own format: carrying it on would keep writing a format
+  the viewers no longer read.
 
 ## Watch
 
-The **Watch** tab plays a channel reference (pasted, or handed over by
-the channel card's Watch button) with `AVPlayer` through the in-process
-gateway. The reference is the channel's feed manifest; the tab reads the
-feed's owner and topic out of it (`GET /bytes/<ref>`), then every
-playlist load and reload goes through a resource-loader delegate that
-plays either publisher format. It reads `GET /feeds/<owner>/<topic>`:
-for a `"solar-punk"` channel that is the playlist, and each bare segment
-reference is rewritten to `http://<gateway address>/bytes/<ref>`, the
-same rewrite Solar Punk's viewers do; for a `"bzz"` channel (what the
-app publishes) it is not, so the delegate reads `/bzz/<ref>/stream.m3u8`
-instead and makes its `/bzz/...` segment paths absolute on the gateway.
-Once a channel is known to be `"bzz"`, the tab's automatic reloads go
-straight to `/bzz` without the feed lookup; playing it again by hand
-checks the format afresh. The first read of every load joins from the newest
-ladder marker when the channel has one (#174): the previous ten-second
-period's marker, then the one before, read with `GET /soc`, and the feed
-read anchored at the index it names (`GET /feeds/...?after=<index>`),
-which the node then remembers for the `/bzz` read and every reload. No
-marker (a channel published before markers, a device clock off by more
-than a period) just means the feed is walked as before. The player follows the live edge. A channel that is not live
+The **Watch** tab plays a channel with `AVPlayer` through the
+in-process gateway. The field starts on the account's own channel and
+takes `0x<owner>/<topic>`, `swarm://<owner>/<topic>` or a web player
+link (an owner alone means its `antstream` topic); the channel card's
+Watch button hands its own over. Channels in the Solar Punk format only:
+every playlist load and reload goes through a resource-loader delegate
+that reads `GET /feeds/<owner>/<topic>`, whose body is the playlist, and
+rewrites each bare segment and `#EXT-X-MAP` reference to
+`http://<gateway address>/bytes/<ref>`, the same rewrite Solar Punk's
+viewers do. A feed whose update is not a playlist (a channel in the
+older `"bzz"` format) fails to load. The first read of every load joins
+from the newest ladder marker when the channel has one (#174): the
+previous ten-second period's marker, then the one before, read with
+`GET /soc`, and the feed read anchored at the index it names
+(`GET /feeds/...?after=<index>`), which the node then remembers for
+every reload. No marker (a device clock off by more than a period) just
+means the feed is walked as before. A finished broadcast's recording
+plays from the start. The player follows the live edge. A channel that is not live
 yet, an item that fails to load, and a live playlist that stops moving
 (a broadcast that ended without closing its playlist) all reload the
 channel after a short pause, with a plain message saying so; a closed

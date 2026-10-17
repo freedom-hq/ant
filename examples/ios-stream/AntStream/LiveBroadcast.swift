@@ -301,8 +301,6 @@ final class LiveBroadcast: ObservableObject {
             permanent.name = channel
             try await node.startPublisher(
                 channel: channel,
-                topic: permanent.topic,
-                topicText: permanent.topicText,
                 owner: permanent.owner,
                 batchId: batchId,
                 bitrateKbps: UInt32(settings.bitrateKbps),

@@ -57,6 +57,17 @@ jobs:
             ci/preview-geometry-tests.swift -o build/preview-geometry-tests
           build/preview-geometry-tests
 
+      # The solar-punk channel (#217): link parsing, the links a channel
+      # is shared by, the Watch tab's playlist rewrite and the publisher
+      # config. Pure Swift, compiled on its own with its tests.
+      - name: Channel address unit tests
+        working-directory: examples/ios-stream
+        run: |
+          mkdir -p build
+          swiftc -parse-as-library AntStream/ChannelAddress.swift \
+            ci/channel-address-tests.swift -o build/channel-address-tests
+          build/channel-address-tests
+
       - name: Pick a simulator
         id: sim
         run: |
@@ -218,11 +229,11 @@ jobs:
           xcrun simctl io booted screenshot shots/19-live-reaped.png
           # --- Android parity (permanent channel, Watch tab, quality,
           # payment help) ---
-          # 13 — the Broadcast tab's "Your channel" card: the permanent
-          # channel reference with Share / Watch. The link exists once a
-          # plan has stamped the channel's feed manifest, and a runner
-          # account has no plan, so `-antstream-shot-channel` installs a
-          # sample plan and reference (nothing persisted).
+          # 13 — the Broadcast tab's "Your channel" card: the account's
+          # address and the `antstream` topic (#217), its web player link
+          # and swarm:// URI, with Share / Watch. A runner account has no
+          # plan, so `-antstream-shot-channel` installs a sample plan for
+          # the checklist next to it (nothing persisted).
           xcrun simctl terminate booted baby.freedom.antstream || true
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-channel
           sleep 25
@@ -238,7 +249,8 @@ jobs:
           sleep 25
           xcrun simctl io booted screenshot shots/20-broadcast-unfinished.png
           # 14/15 — the Watch tab playing a channel through the in-process
-          # gateway. The sample reference points at nothing, so this
+          # gateway. The sample channel (an owner nobody broadcasts as,
+          # topic `antstream`) has no feed, so this
           # captures the player loading and then the plain-language retry
           # state a channel that isn't live yet ends up in.
           xcrun simctl terminate booted baby.freedom.antstream || true

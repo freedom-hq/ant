@@ -56,7 +56,7 @@ struct BroadcastView: View {
                             }
                         }
                         liveCard
-                        if node.hasStorage { channelCard }
+                        if let address = node.channel?.address { channelCard(address) }
                         checklistCard
                             .id(Self.checklistID)
                         benchCard
@@ -106,8 +106,8 @@ struct BroadcastView: View {
                 return
             }
             // antstream-visual: `-antstream-shot-channel` shows the "Your
-            // channel" card, which needs a plan (a fresh runner account
-            // has none) and a channel link; sample state supplies both.
+            // channel" card next to a ready checklist, which needs a plan
+            // (a fresh runner account has none); sample state supplies it.
             if RootView.shotArgs.contains("-antstream-shot-channel") {
                 for _ in 0..<60 where !node.status.isReady {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -296,61 +296,67 @@ struct BroadcastView: View {
 
     // MARK: permanent channel
 
-    /// The account's permanent channel link, shareable before the first
-    /// broadcast: viewers who open it join whenever this device is live.
-    private var channelCard: some View {
+    /// The account's permanent channel: its address and the `antstream`
+    /// topic, shareable before the first broadcast (there is nothing to
+    /// create first): viewers who open it join whenever this device is
+    /// live, and see the last broadcast otherwise.
+    private func channelCard(_ address: ChannelAddress) -> some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Your channel")
                     .font(.headline)
                     .foregroundStyle(.white)
-                if let ref = node.channelReference {
-                    Text("One link for all your broadcasts. Share it any time: viewers who open it join whenever you're live, and see your last broadcast otherwise.")
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.7))
-                    Button {
-                        UIPasteboard.general.string = ref
-                        banner.flash("Channel reference copied")
-                    } label: {
-                        HStack {
-                            Text(ref)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.white)
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer()
-                            Image(systemName: "doc.on.doc")
-                                .foregroundStyle(.white.opacity(0.85))
-                        }
-                        .padding(12)
-                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
-                        .contentShape(.rect(cornerRadius: 12))
+                Text("Your account address and the topic \u{201C}\(address.topicLabel)\u{201D}: one channel for all your broadcasts. Share it any time: viewers who open it join whenever you're live, and see your last broadcast otherwise.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                copyRow("Web player link", address.playerLink)
+                if let uri = address.swarmURI {
+                    copyRow("Solar Punk players", uri)
+                }
+                HStack(spacing: 10) {
+                    ShareLink(item: address.watchLinks) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .glassEffect(.regular.tint(.blue.opacity(0.35)), in: .capsule)
+                            .contentShape(.capsule)
                     }
                     .buttonStyle(.plain)
-                    HStack(spacing: 10) {
-                        ShareLink(item: Channel.watchLinks(ref)) {
-                            Label("Share", systemImage: "square.and.arrow.up")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 16).padding(.vertical, 10)
-                                .glassEffect(.regular.tint(.blue.opacity(0.35)), in: .capsule)
-                                .contentShape(.capsule)
-                        }
-                        .buttonStyle(.plain)
-                        GlassPillButton(title: "Watch", icon: "play.fill",
-                                        tint: .white.opacity(0.18)) {
-                            onWatch(ref)
-                        }
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small).tint(.white)
-                        Text("Creating your channel link…")
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.7))
+                    GlassPillButton(title: "Watch", icon: "play.fill",
+                                    tint: .white.opacity(0.18)) {
+                        onWatch(address.key)
                     }
                 }
             }
         }
+    }
+
+    /// One of the channel's links, labelled; a tap copies it.
+    private func copyRow(_ label: String, _ value: String) -> some View {
+        Button {
+            UIPasteboard.general.string = value
+            banner.flash("\(label) copied")
+        } label: {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(label)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer()
+                Image(systemName: "doc.on.doc")
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .padding(12)
+            .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+            .contentShape(.rect(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: readiness checklist

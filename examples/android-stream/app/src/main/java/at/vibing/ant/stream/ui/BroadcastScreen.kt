@@ -13,7 +13,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -22,8 +21,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import at.vibing.ant.stream.AntNode
-import at.vibing.ant.stream.Channel
-import kotlinx.coroutines.delay
+import at.vibing.ant.stream.ChannelAddress
 import at.vibing.ant.stream.LiveBroadcast
 import at.vibing.ant.stream.formatBytes
 
@@ -47,7 +45,6 @@ fun BroadcastScreen(
     val network by node.networkLabel.collectAsState()
     val hardware by node.keyHardwareBacked.collectAsState()
     val report by broadcast.report.collectAsState()
-    val channelRef by node.channelReference.collectAsState()
     val channel by node.channel.collectAsState()
     val context = LocalContext.current
 
@@ -55,12 +52,6 @@ fun BroadcastScreen(
     val hasPlan = plan?.enabled == true
     val settled = settlement?.enabled == true
     val ready = connected && hasPlan && settled && gatewayUp
-
-    // The permanent channel's link exists as soon as there is a plan to
-    // stamp its feed manifest with; retried until it lands.
-    LaunchedEffect(hasPlan, gatewayUp, channel) {
-        while (hasPlan && gatewayUp && node.ensureChannelReference() == null) delay(15_000)
-    }
 
     Column(
         Modifier
@@ -116,29 +107,8 @@ fun BroadcastScreen(
             Button(onClick = onGetStarted, modifier = Modifier.fillMaxWidth()) { Text("Get started") }
         }
         Button(onClick = onGoLive, enabled = ready || broadcast.selfTestDir != null, modifier = Modifier.fillMaxWidth()) { Text("Go live") }
-        if (hasPlan) {
-            SectionCard {
-                Text("Your channel", style = MaterialTheme.typography.titleMedium)
-                val ref = channelRef
-                if (ref == null) {
-                    Text("Creating your channel link…", color = Color.Gray)
-                } else {
-                    Text(
-                        "One link for all your broadcasts. Share it any time: viewers who open it " +
-                            "join whenever you're live, and see your last broadcast otherwise.",
-                        color = Color.Gray,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    MonoText(ref)
-                    Button(onClick = { shareText(context, Channel.watchLinks(ref)) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Share channel link")
-                    }
-                    OutlinedButton(onClick = { copyToClipboard(context, "Channel", ref) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Copy channel reference")
-                    }
-                    OutlinedButton(onClick = { onWatch(ref) }, modifier = Modifier.fillMaxWidth()) { Text("Watch") }
-                }
-            }
+        channel?.address?.let { address ->
+            ChannelCard(address, onWatch)
         }
         report?.let { r ->
             SectionCard {
@@ -152,15 +122,54 @@ fun BroadcastScreen(
                         r.sustainedMbitS,
                     ),
                 )
-                if (r.channelReference.isNotEmpty()) {
-                    MonoText(r.channelReference)
-                    OutlinedButton(onClick = { copyToClipboard(context, "Channel", r.channelReference) }) {
-                        Text("Copy channel reference")
-                    }
-                    OutlinedButton(onClick = { onWatch(r.channelReference) }) { Text("Watch") }
-                }
+                r.channel?.let { c -> OutlinedButton(onClick = { onWatch(c.key) }) { Text("Watch") } }
             }
         }
+    }
+}
+
+/**
+ * The account's channel: owner + topic, what viewers open it by. It
+ * exists from the start (no plan needed to share it); viewers who open
+ * it join whenever the account is live, and see the last broadcast
+ * otherwise.
+ */
+@Composable
+fun ChannelCard(address: ChannelAddress, onWatch: (String) -> Unit) {
+    val context = LocalContext.current
+    SectionCard {
+        Text("Your channel", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Your account address and the topic \"${address.topic}\": one channel for all your " +
+                "broadcasts. Share it any time: viewers who open it join whenever you're live, and " +
+                "see your last broadcast otherwise.",
+            color = Color.Gray,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text("Owner", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+        MonoText("0x${address.owner}")
+        Text("Topic", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+        MonoText(address.topic)
+        Text("Web player (Freedom browser)", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+        MonoText(address.playerLink)
+        address.swarmUri?.let {
+            Text("Solar Punk players", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+            MonoText(it)
+        }
+        Button(onClick = { shareText(context, address.watchLinks()) }, modifier = Modifier.fillMaxWidth()) {
+            Text("Share channel links")
+        }
+        OutlinedButton(
+            onClick = { copyToClipboard(context, "Player link", address.playerLink) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Copy player link") }
+        address.swarmUri?.let { uri ->
+            OutlinedButton(
+                onClick = { copyToClipboard(context, "Swarm URI", uri) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Copy swarm:// URI") }
+        }
+        OutlinedButton(onClick = { onWatch(address.key) }, modifier = Modifier.fillMaxWidth()) { Text("Watch") }
     }
 }
 

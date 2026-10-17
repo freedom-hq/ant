@@ -627,9 +627,9 @@ struct PublisherSnapshot: Codable, Equatable {
     let channel: String
     let topic: String
     let owner: String
-    /// The feed manifest a viewer resolves the channel from — the one
-    /// reference worth sharing.
-    let channelReference: String
+    /// The topic's text, `antstream` for this app's broadcasts. Optional
+    /// so a snapshot from a node without it decodes.
+    let topicText: String?
     let playlistReference: String
     /// `nil` until the node has read the channel's feed head.
     let feedIndex: UInt64?
@@ -691,7 +691,7 @@ struct PublisherSnapshot: Codable, Equatable {
         case batchError = "batch_error"
         case segmentsWithheld = "segments_withheld"
         case elapsedS = "elapsed_s"
-        case channelReference = "channel_reference"
+        case topicText = "topic_text"
         case playlistReference = "playlist_reference"
         case feedIndex = "feed_index"
         case segmentsPushed = "segments_pushed"
@@ -760,6 +760,28 @@ struct BatchProblem: Equatable {
     }
 }
 
+extension PublisherSnapshot {
+    /// The channel this broadcast goes out on: its owner and topic.
+    var channelAddress: ChannelAddress? { ChannelAddress.of(owner: owner, topic: topic, text: topicText) }
+}
+
+extension PublisherReport {
+    /// The channel the broadcast went out on: its owner and topic.
+    var channelAddress: ChannelAddress? { ChannelAddress.of(owner: owner, topic: topic, text: topicText) }
+}
+
+extension ChannelAddress {
+    /// The channel a publisher snapshot or report names, `nil` when it
+    /// names no owner yet.
+    static func of(owner: String, topic: String, text: String?) -> ChannelAddress? {
+        let bare = stripHexPrefix(owner)
+        guard bare.count == 40 else { return nil }
+        if let text, !text.isEmpty { return ChannelAddress(owner: bare, text: text) }
+        guard stripHexPrefix(topic).count == 64 else { return nil }
+        return ChannelAddress(owner: bare, rawTopic: topic)
+    }
+}
+
 /// A broadcast the app was killed or crashed in the middle of (#175):
 /// the publisher's recovery entry (`recovery_path`), read back at
 /// launch. Only what the Broadcast tab shows; resuming hands the node
@@ -779,6 +801,11 @@ struct UnfinishedBroadcast: Equatable {
     /// its `#EXT-X-ENDLIST` window or recording may already be the head,
     /// and live viewers have stopped there, so it can only be ended.
     let ended: Bool
+    /// The feed and format it went out on, which ending or resuming it
+    /// must name again (the node refuses anything else). Not
+    /// ``BroadcastFeed/current`` for an entry left by a build from before
+    /// the switch to "solar-punk" (#217): that one can only be ended.
+    let feed: BroadcastFeed
 
     /// Decode a recovery entry, or `nil` for one this build can't read
     /// (left on disk all the same: it is the only record of the
@@ -790,7 +817,9 @@ struct UnfinishedBroadcast: Equatable {
               let owner = obj["owner"] as? String,
               let id = obj["broadcast_id"] as? String,
               let savedMs = (obj["saved_at_ms"] as? NSNumber)?.doubleValue,
-              let recording = obj["recording"] as? [[String: Any]]
+              let recording = obj["recording"] as? [[String: Any]],
+              let topic = obj["topic"] as? String,
+              let format = obj["format"] as? String
         else { return nil }
         let media = recording.filter { ($0["gap"] as? Bool) != true }
         let ms = media.reduce(0.0) { $0 + ((($1["duration_ms"] as? NSNumber)?.doubleValue) ?? 0) }
@@ -801,7 +830,8 @@ struct UnfinishedBroadcast: Equatable {
             savedAt: Date(timeIntervalSince1970: savedMs / 1000),
             segments: media.count,
             seconds: ms / 1000,
-            ended: (obj["shape"] as? String ?? "live") != "live"
+            ended: (obj["shape"] as? String ?? "live") != "live",
+            feed: .recovery(topic: topic, topicText: obj["topic_text"] as? String ?? "", format: format)
         )
     }
 
@@ -809,9 +839,11 @@ struct UnfinishedBroadcast: Equatable {
     /// inside the reap window (a minute), the time a viewer would have
     /// waited for it anyway. Older, it can only be ended into its
     /// recording. An entry a stop had begun closing is never resumed
-    /// (the node only finalizes it).
+    /// (the node only finalizes it), nor one on another feed or format
+    /// than every broadcast now uses (#217): carrying it on would go on
+    /// writing a format the viewers no longer read.
     func canResume(now: Date = Date(), reapMs: UInt64) -> Bool {
-        !ended && now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
+        !ended && feed == .current && now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
     }
 
     var durationLabel: String {
@@ -825,7 +857,8 @@ struct PublisherReport: Codable, Equatable {
     let channel: String
     let topic: String
     let owner: String
-    let channelReference: String
+    /// See ``PublisherSnapshot/topicText``.
+    let topicText: String?
     let playlistReference: String
     /// The whole broadcast as one VOD playlist, the channel's final feed
     /// update (issue #168), playable by itself without the feed. Empty
@@ -883,7 +916,7 @@ struct PublisherReport: Codable, Equatable {
         case batchUnusableRefusals = "batch_unusable_refusals"
         case batchError = "batch_error"
         case segmentsWithheld = "segments_withheld"
-        case channelReference = "channel_reference"
+        case topicText = "topic_text"
         case playlistReference = "playlist_reference"
         case recordingReference = "recording_reference"
         case targetBitrateKbps = "target_bitrate_kbps"

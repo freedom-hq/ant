@@ -15,10 +15,10 @@ https://api.gateway.ethswarm.org/bzz/b268072928bd99d637992eb54c2a826b83affa36f61
 ```
 
 This is a **feed manifest**: the address stays the same and always serves
-the newest build. The Android app's Share button sends both links, and
+the newest build. Both apps' Share buttons send both links, and
 the apps (`PLAYER_REF` in
 `examples/android-stream/app/src/main/java/at/vibing/ant/stream/Channel.kt`,
-`playerReference` in `examples/ios-stream/AntStream/AntNode.swift`) never
+`playerReference` in `examples/ios-stream/AntStream/ChannelAddress.swift`) never
 need a new reference for a player update.
 
 The page footer and the debug panel show which build is being served:
@@ -53,13 +53,14 @@ A **channel is an owner and a topic text**:
 `<gateway>/bzz/<player>/#<owner>/<topic>`, the owner as `0x` + 40 hex, the
 topic URL-encoded. The feed topic is `keccak256(utf8(text))`, bee-js
 `Topic.fromString`, `topic_from_string` in
-`crates/ant-ffi/src/publisher.rs`. There is no default topic: each
-AntStream channel has its own (the iOS app's `antstream-<uuid>`, the
-publisher's own default `antstream/<channel>`), so a link always names
-one. A channel whose topic is random bytes with no text (the Android
-app's, an iOS channel created before text topics) is named by the raw
-topic, 64 hex digits (`#0x<owner>/0x<topic hex>`, `0x` optional); a
-topic of exactly 64 hex digits is always read that way, never as text.
+`crates/ant-ffi/src/publisher.rs`. The AntStream apps broadcast on the
+topic text `antstream`, one channel per account, so an app channel is
+`#0x<owner>/antstream` (issue #217); the apps' Share buttons send exactly
+these links. The player itself has no default topic, so a link always
+names one. A channel whose topic is raw bytes with no text is named by
+the raw topic, 64 hex digits (`#0x<owner>/0x<topic hex>`, `0x`
+optional); a topic of exactly 64 hex digits is always read that way,
+never as text.
 The channel field also takes Solar Punk's `swarm://<owner>/<topic>`
 and any player link.
 

@@ -11,7 +11,8 @@
 //!
 //! What stage 2 adds on top of the measured path, per segment, in one of
 //! two formats ([`StreamFormat`], chosen per broadcast; `"bzz"` is the
-//! default because it is what the repository's viewers read):
+//! default for hosts that don't ask, while the repository's apps and web
+//! player use and read `"solar-punk"` only, issue #217):
 //!
 //! 1. Upload the segment (and, when the writer restarts, its fMP4
 //!    initialization segment): `POST /bzz` (`"bzz"`, what stage 1
@@ -297,8 +298,9 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub topic_text: String,
     /// What a broadcast writes to Swarm; see [`StreamFormat`]. Defaults
-    /// to [`StreamFormat::Bzz`], the format every `AntStream` viewer in
-    /// this repository reads.
+    /// to [`StreamFormat::Bzz`] for hosts that don't ask; the `AntStream`
+    /// apps send `"solar-punk"`, the only format their Watch tabs and the
+    /// web player read (issue #217).
     #[serde(default)]
     pub format: StreamFormat,
     /// Override for the sequence-feed index of this broadcast's first
@@ -518,12 +520,11 @@ pub const ORPHAN_REAP_MS: u64 = 60_000;
 /// The shape a broadcast takes on Swarm. The two are not
 /// interchangeable for a viewer: each reads only its own.
 ///
-/// `"bzz"` stays the default while the `AntStream` viewers (the web
-/// player the apps' Share links open, and the Android Watch tab) read
-/// the channel through `/bzz/<channel>/stream.m3u8`: switching the
-/// default would leave every broadcast from a host that doesn't ask
-/// unplayable there. A host opts into `"solar-punk"` to be playable in
-/// the Solar Punk viewers (issue #167).
+/// `"bzz"` stays the default so a host that doesn't ask keeps the shape
+/// it always got. The `AntStream` apps, their Watch tabs and the web
+/// player their Share links open use `"solar-punk"` only (issue #217),
+/// the shape the Solar Punk viewers read too (issue #167); none of them
+/// plays a `"bzz"` channel any more.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StreamFormat {
