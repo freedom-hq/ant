@@ -89,15 +89,33 @@ struct ChannelAddress: Equatable, Hashable {
     }
 
     /// A channel from what a viewer typed or pasted, read the way the web
-    /// player's `parseChannel` reads it: `<owner>/<topic>` (the owner `0x`
+    /// player's `parseChannel` reads one link or URI (input with no
+    /// whitespace): `<owner>/<topic>` (the owner `0x`
     /// + 40 hex, the topic text, URL-encoded or not), Solar Punk's
     /// `swarm://<owner>/<topic>`, or a player link carrying either after
     /// its `#`. A topic of 64 hex digits (`0x` optional) is the raw topic.
     /// An owner alone (`<owner>` or `<owner>/`, not `swarm://<owner>/`) is
-    /// that account's AntStream channel (topic ``antstreamTopic``). `nil` for anything else.
+    /// that account's AntStream channel (topic ``antstreamTopic``). One
+    /// link in quotes (`"0x<owner>/antstream"`, curly, single or `«…»`/
+    /// `<…>` too) is the link, quotes dropped, as in the web player.
+    /// `nil` for anything else.
+    /// Unlike the web player, this does not search free text (the Share
+    /// text, a message it was pasted into) for a channel: the whole input
+    /// is the one link, so input over more than one line (pasted Share
+    /// text) is `nil` here. A topic never has a line break in it. That
+    /// only holds while the line breaks reach this: a field that turns
+    /// them into spaces hands over one line, read as one link whose topic
+    /// is the rest of the text.
     static func parse(_ input: String) -> ChannelAddress? {
         var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { return nil }
+        if s.isEmpty || s.unicodeScalars.contains(where: CharacterSet.newlines.contains) { return nil }
+        // A link pasted in quotes: drop them, as the web player does.
+        let open = s.unicodeScalars.prefix(while: { quoteOpen.contains($0) }).count
+        if open > 0 {
+            var scalars = s.unicodeScalars.dropFirst(open)
+            while let last = scalars.last, quoteClose.contains(last) { scalars = scalars.dropLast() }
+            s = String(String.UnicodeScalarView(scalars))
+        }
         if let hash = s.firstIndex(of: "#") { s = String(s[s.index(after: hash)...]) }
         var owner: Substring
         var rest: Substring
@@ -130,6 +148,11 @@ struct ChannelAddress: Equatable, Hashable {
         }
         return ChannelAddress(owner: String(owner), text: topic)
     }
+
+    /// Quotes around a whole pasted link (a channel never starts with one),
+    /// the web player's `QUOTE_OPEN`/`QUOTE_CLOSE`.
+    private static let quoteOpen = CharacterSet(charactersIn: "\"'\u{201C}\u{2018}\u{00AB}<")
+    private static let quoteClose = CharacterSet(charactersIn: "\"'\u{201D}\u{2019}\u{00BB}>")
 
     /// `encodeURIComponent`: what the web player decodes.
     static func encodeComponent(_ text: String) -> String {

@@ -125,6 +125,22 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
 
         private val OWNER = Regex("^(?:0[xX])?([0-9a-fA-F]{40})$")
         private val RAW_TOPIC = Regex("^(?:0[xX])?([0-9a-fA-F]{64})$")
+        // What Swift's `CharacterSet.newlines` holds: U+000A-U+000D, NEL,
+        // LS and PS.
+        private const val LINE_BREAKS = "\n\u000B\u000C\r\u0085\u2028\u2029"
+
+        /**
+         * Swift's `CharacterSet.whitespacesAndNewlines`: tab, the space
+         * separators (Zs) and [LINE_BREAKS]. Kotlin's own `trim()` differs
+         * both ways (it keeps NEL, it drops U+001C-U+001F), so `parse` trims
+         * with this to read the same input as iOS.
+         */
+        private fun isSwiftWhitespace(c: Char): Boolean =
+            c == '\t' || c in LINE_BREAKS || Character.getType(c) == Character.SPACE_SEPARATOR.toInt()
+        /** Quotes around a whole pasted link, the web player's `QUOTE_OPEN`/`QUOTE_CLOSE`. */
+        private const val QUOTE_OPEN = "\"'\u201C\u2018\u00AB<"
+        private const val QUOTE_CLOSE = "\"'\u201D\u2019\u00BB>"
+
         private val SWARM_URI = Regex("^swarm://([^/?#]+)/([^/?#]+)", RegexOption.IGNORE_CASE)
 
         /** The channel `owner` (with or without `0x`) broadcasts on topic text `text`. */
@@ -135,16 +151,29 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
 
         /**
          * A channel from what a viewer typed or pasted, read the way the web
-         * player's `parseChannel` reads it: `<owner>/<topic>` (the owner `0x`
+         * player's `parseChannel` reads one link or URI (input with no
+         * whitespace): `<owner>/<topic>` (the owner `0x`
          * + 40 hex, the topic text, URL-encoded or not), Solar Punk's
          * `swarm://<owner>/<topic>`, or a player link carrying either after
          * its `#`. A topic of 64 hex digits (`0x` optional) is the raw topic.
          * An owner alone is that account's AntStream channel (topic
-         * [TOPIC]). `null` for anything else.
+         * [TOPIC]). One link in quotes (`"0x<owner>/antstream"`, curly,
+         * single or `«…»`/`<…>` too) is the link, quotes dropped, as in the
+         * web player. `null` for anything else. Unlike the web player, this
+         * does not search free text (the Share text, a message it was pasted
+         * into) for a channel: the whole input is the one link, so input
+         * over more than one line (pasted Share text) is `null` here. A
+         * topic never has a line break in it. That only holds while the
+         * line breaks reach this: a field that turns them into spaces hands
+         * over one line, read as one link whose topic is the rest of the
+         * text.
          */
         fun parse(input: String): ChannelAddress? {
-            var s = input.trim()
-            if (s.isEmpty()) return null
+            var s = input.trim(::isSwiftWhitespace)
+            if (s.isEmpty() || s.any { it in LINE_BREAKS }) return null
+            // A link pasted in quotes: drop them, as the web player does.
+            val open = s.takeWhile { it in QUOTE_OPEN }.length
+            if (open > 0) s = s.substring(open).trimEnd { it in QUOTE_CLOSE }
             val hash = s.indexOf('#')
             if (hash >= 0) s = s.substring(hash + 1)
             val owner: String

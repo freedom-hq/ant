@@ -55,6 +55,11 @@ struct ChannelAddressTests {
             "bzz://\(player)/#0x\(owner)/antstream",
             "https://api.gateway.ethswarm.org/bzz/\(player)/#0x\(owner)/antstream",
             "0x\(owner)",
+            // One link in quotes, as the web player reads it.
+            "\"0x\(owner)/antstream\"",
+            "\u{201C}0x\(owner)/antstream\u{201D}",
+            "'bzz://\(player)/#0x\(owner)/antstream'",
+            "\"0x\(owner)\"",
         ] {
             expect(ChannelAddress.parse(input), own, "parse \(input)")
         }
@@ -71,8 +76,20 @@ struct ChannelAddressTests {
         expect(raw.flatMap { ChannelAddress.parse($0.playerLink) }, raw, "raw round trip")
 
         for input in ["", "   ", "antstream", "0x1234/antstream", "bzz://\(hex)", "swarm://nope/antstream",
-                      "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream"] {
+                      "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream",
+                      "\"swarm://\(owner)/\""] {
             expect(ChannelAddress.parse(input), nil, "reject \(input)")
+        }
+        // The Share text, pasted whole: more than one line, not one link.
+        for sep in ["\n", "\r\n", "\u{2028}"] {
+            let text = own.watchLinks.replacingOccurrences(of: "\n", with: sep)
+            expect(ChannelAddress.parse(text), nil, "reject Share text split by \(sep.debugDescription)")
+        }
+        // `whitespacesAndNewlines` around the one link goes, as on Android
+        // (its `isSwiftWhitespace`): NEL, LS, PS, no-break space, tab.
+        for around in ["\u{85}", "\u{2028}", "\u{2029}", "\u{A0}", "\t", " \r\n"] {
+            expect(ChannelAddress.parse("\(around)0x\(owner)/antstream\(around)")?.topic, .text("antstream"),
+                   "trim \(around.debugDescription)")
         }
         // Fullwidth hex (`０`-`９`, `ａ`-`ｆ`) passes `isHexDigit` but is no
         // owner or topic a gateway reads; Android's `[0-9a-fA-F]` rejects it too.

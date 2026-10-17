@@ -66,6 +66,11 @@ class ChannelAddressTest {
             "https://api.gateway.ethswarm.org/bzz/${ChannelAddress.PLAYER_REF}/#0x$owner/antstream",
             // An owner alone is that account's AntStream channel.
             "0x$owner",
+            // One link in quotes, as the web player reads it.
+            "\"0x$owner/antstream\"",
+            "\u201C0x$owner/antstream\u201D",
+            "'bzz://${ChannelAddress.PLAYER_REF}/#0x$owner/antstream'",
+            "\"0x$owner\"",
         )) {
             assertEquals(input, own, ChannelAddress.parse(input))
         }
@@ -90,9 +95,30 @@ class ChannelAddressTest {
     @Test
     fun rejectsNonChannels() {
         for (input in listOf("", "   ", "antstream", "0x1234/antstream", "bzz://$antstream", "swarm://nope/antstream",
-            "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream")) {
+            "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream",
+            "\"swarm://$owner/\"")) {
             assertNull(input, ChannelAddress.parse(input))
         }
+        // The Share text, pasted whole: more than one line, not one link.
+        val own = ChannelAddress.ofText(owner, "antstream")
+        for (sep in listOf("\n", "\r\n", "\u2028")) {
+            val text = own.watchLinks().replace("\n", sep)
+            assertNull(text, ChannelAddress.parse(text))
+        }
+    }
+
+    @Test
+    fun trimsWhatIosTrims() {
+        // Swift's `whitespacesAndNewlines` around the one link: NEL, LS, PS,
+        // no-break space and tab go, as on iOS.
+        val want = ChannelAddress.ofText(owner, "antstream")
+        for (around in listOf("\u0085", "\u2028", "\u2029", "\u00A0", "\t", " \r\n")) {
+            val input = "${around}0x$owner/antstream$around"
+            assertEquals(input, want, ChannelAddress.parse(input))
+        }
+        // Not whitespace to Swift (though Kotlin's `trim()` drops it): kept,
+        // so the topic is not `antstream`, as on iOS.
+        assertEquals("antstream\u001F", ChannelAddress.parse("0x$owner/antstream\u001F")?.topic)
     }
 
     @Test

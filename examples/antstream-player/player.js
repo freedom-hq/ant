@@ -11,9 +11,10 @@
  * bare 64-hex references to raw bytes. A channel's topic can also be given
  * as the raw 32 topic bytes (64 hex, `0x` optional), for a channel whose
  * random topic no text names (the Android app's, an iOS channel created
- * before text topics). There is no default topic: AntStream channels each
- * have their own (iOS `antstream-<uuid>`, the publisher's own default
- * `antstream/<channel>`, Android random bytes), so a link names it.
+ * before text topics). The iOS and Android apps broadcast on the topic
+ * text `antstream`, one channel per account, so an owner alone names that
+ * account's `antstream` channel; any other topic (the publisher's own
+ * default `antstream/<channel>`, an older app's) has to be in the link.
  *
  * The page runs in two kinds of places:
  *
@@ -50,6 +51,9 @@
   // A topic given as its raw 32 bytes rather than as text.
   const RAW_TOPIC = /^(?:0x)?([0-9a-f]{64})$/i;
   const RECENT_KEY = 'antstream.recent.v2';
+  // The topic text every AntStream app broadcast goes out on (the apps'
+  // `ChannelAddress` `antstreamTopic`/`TOPIC`): an owner alone names it.
+  const ANTSTREAM_TOPIC = 'antstream';
 
   const inBzz = location.protocol === 'bzz:';
   const gatewayRoot = (() => {
@@ -117,12 +121,62 @@
    * `<owner>/<topic>` (the owner `0x` + 40 hex, the topic URL-encoded
    * text), `swarm://<owner>/<topic>` (Solar Punk's form), or a player link
    * carrying either after its `#`. A topic of 64 hex digits (`0x`
-   * optional) is the raw topic itself, not text to hash. An owner without
-   * a topic names no channel: there is no default topic.
+   * optional) is the raw topic itself, not text to hash. An owner alone
+   * (`<owner>` or `<owner>/`, not `swarm://<owner>/`) is that account's
+   * AntStream channel, topic `antstream`, as the apps'
+   * `ChannelAddress.parse` reads it.
+   *
+   * Text with whitespace in it (the apps' Share text, a message it was
+   * pasted into) is searched for the channel instead: the first
+   * `swarm://<owner>/<topic>`, `#0x<owner>/<topic>` or `0x<owner>/<topic>`
+   * in it, the topic ending at whitespace (and at `?`/`#`/`/` in a
+   * `swarm://` URI). A text input drops the Share text's line breaks,
+   * gluing each line's link to the next line's label
+   * (`…/#0x<owner>/antstreamAny browser: …`): when the first channel's
+   * topic runs into such a label, the same channel further on whose topic
+   * is the first one's without the label is the one meant (the Share
+   * text's last line, `Channel: 0x<owner>/antstream`, is never glued),
+   * also when that one is cut at a space and the text after it goes on
+   * with the rest. Without a glued label, a later mention never shortens
+   * the first one's topic. Sentence punctuation after a
+   * channel in text (`… 0x<owner>/antstream.`) is not part of its topic,
+   * unless another mention of the same channel ends in it too (the Share
+   * text of topic `show.`). A mention that names its topic wins over an
+   * owner alone before it (`Tip jar 0x<a> - watch 0x<b>/antstream` is
+   * `0x<b>/antstream`); with only owners alone, they must all be the same
+   * one. A truncated `swarm://<owner>/` names no channel in text either,
+   * nor does an address in a URL's path (`…/address/0x<owner>/tokens`).
+   * A Markdown link's text ends at its `](`
+   * (`[0x<owner>/antstream](https://…)` is `0x<owner>/antstream`).
+   *
+   * One Markdown link and nothing else is read as text, also in quotes or
+   * followed by sentence punctuation (`"[…](…)"`, `[…](…).`).
+   *
+   * One link in quotes and nothing else (`"0x<owner>/antstream"`) is the
+   * link: the quotes are dropped, as in text.
    */
   function parseChannel(input) {
     let s = (input || '').trim();
     if (!s) return null;
+    if (/\s/.test(s) || MARKDOWN_LINK.test(s)) return findChannel(s);
+    const quoted = QUOTE_OPEN.exec(s);
+    if (quoted) s = s.slice(quoted[0].length).replace(QUOTE_CLOSE, '');
+    return parseChannelToken(s);
+  }
+
+  // A whole Markdown link, `[text](url)`: read as text, so its text ends
+  // at the `](` and the URL's `)` is no part of a topic. Also in quotes or
+  // with sentence punctuation after it (`"[…](…)"`, `[…](…).`), as text
+  // reads those.
+  const MARKDOWN_LINK = /^["'\u201c\u2018\u00ab<]*\[[^\]]*\]\(.*\)[.,;:!?'"\u2019\u201d\u00bb\u2026>]*$/;
+
+  // Quotes around a whole pasted link (a channel never starts with one).
+  const QUOTE_OPEN = /^["'\u201c\u2018\u00ab<]+/;
+  const QUOTE_CLOSE = /["'\u201d\u2019\u00bb>]+$/;
+
+  /** One channel string, the whole input: the form a link's hash carries. */
+  function parseChannelToken(input) {
+    let s = input;
     const hash = s.indexOf('#');
     if (hash >= 0) s = s.slice(hash + 1);
     let owner;
@@ -131,6 +185,9 @@
     if (uri) {
       // parseSwarmUri: the topic is the piece up to the next `/`.
       [, owner, rest] = uri;
+    } else if (/^swarm:/i.test(s)) {
+      // A truncated `swarm://<owner>/` names no topic, so no channel.
+      return null;
     } else {
       const slash = s.indexOf('/');
       owner = slash < 0 ? s : s.slice(0, slash);
@@ -138,15 +195,192 @@
     }
     const o = OWNER.exec(owner);
     if (!o) return null;
-    let topic = rest;
-    try {
-      topic = decodeURIComponent(rest);
-    } catch (_) {
-      /* not URL-encoded: the text as it is */
+    return channelOf(o[1], topicOf(rest));
+  }
+
+  // A channel inside text, by where it starts: a `swarm://` URI (its topic
+  // ends at `/`, `?` or `#`), or `0x<owner>` not inside a longer word or
+  // hex string nor right after a `/`: a URL path's address segment (a
+  // block explorer's `…/address/0x<owner>/tokens`) is not a channel, and
+  // neither is the owner of a truncated `swarm://` URI. Its topic comes
+  // after a `/` (none: the owner alone).
+  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z/])0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
+
+  /** The channel in free text, see `parseChannel`. */
+  function findChannel(text) {
+    const matches = [...text.matchAll(CHANNEL_IN_TEXT)].map((m) => {
+      const uri = Boolean(m[1]);
+      const token = markdownLinkText(uri ? m[2] : m[4] || '');
+      // Where the token, as cut, ends in the text.
+      const close = m.index + m[0].length - ((uri ? m[2] : m[4] || '').length - token.length);
+      return {
+        m,
+        uri,
+        close,
+        // Which of the Share text's forms this mention is: the Solar Punk
+        // URI, a player link (after its `#`) or a bare `0x<owner>/…`.
+        form: uri ? 'uri' : m.index > 0 && text[m.index - 1] === '#' ? 'link' : 'bare',
+        owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
+        token,
+        // Its topic, decoded, and the text that goes on after it: what a
+        // mention cut short (at a space, at a `/`) still says. Also as
+        // written, undecoded and with its trailing `/`s: the Solar Punk URI
+        // and the Channel line carry the display text, so a topic like
+        // `%2Ay.` or `?/ 2!` reads there as it is, not decoded.
+        reach: [token].flatMap((t) => [topicOf(t), t])
+          .map((t) => t + text.slice(close)),
+      };
+    });
+    const found = [];
+    for (const { m, uri, close, form, owner, token } of matches) {
+      // Sentence punctuation ends one word of a message, not every
+      // mention of a channel. The apps' Share text names its channel up
+      // to four times (two links, the Solar Punk URI, the Channel line),
+      // and `encodeURIComponent` leaves `.!'()*~` as they are, so a topic
+      // like `show.` ends every one of them in its `.`: when another
+      // mention of the same owner has this one's text whole (or glued to
+      // the next line's label, `show.Any`; or, cut at a space, goes on
+      // with it in the text: `0x<owner>/my show!`), the end is the
+      // topic's own. Only a mention in another of those forms counts: a
+      // message that writes the same form twice (`… 0x<owner>/antstream.
+      // Yes, 0x<owner>/antstream.`, or `…/antstream. Also …/antstream.v2`)
+      // is two sentences ending in it, not the Share text, which never
+      // repeats a form without also carrying another one (its Channel
+      // line is always bare, its links always after a `#`).
+      const decoded = topicOf(token);
+      const repeated = matches.some(
+        (o) => o.m !== m && o.form !== form && o.owner === owner && o.reach.some((r) => r.startsWith(decoded)),
+      );
+      const kept = repeated ? token : trimSentenceEnd(token);
+      found.push({
+        owner,
+        topic: topicOf(kept),
+        // The topic as written, undecoded and with its trailing `/`s: the
+        // Channel line carries the display text, not a URL-encoded one, so
+        // a topic like `100%25` or `news/ today` reads there as it is.
+        written: kept,
+        uri,
+        // Where the topic, as kept, ends in the text.
+        end: close - (token.length - kept.length),
+        // The topic this one has if its token runs into the label of the
+        // Share text's next line (line breaks dropped), else null.
+        unglued: gluedLabelTopic(text, token, close),
+      });
     }
-    if (!topic) return null;
-    const raw = RAW_TOPIC.exec(topic);
-    return makeChannel(o[1].toLowerCase(), topic, raw ? raw[1].toLowerCase() : null);
+    if (!found.length) return null;
+    // The first mention that names a topic: an owner alone before it (a
+    // tip-jar address, a wallet) is not the channel pasted. Only owners
+    // alone: the channel if they are all the same one, else none, rather
+    // than guess between accounts.
+    const at = found.findIndex((f) => f.topic !== '');
+    if (at < 0 && found.some((f) => f.owner !== found[0].owner)) return null;
+    const first = found[Math.max(at, 0)];
+    let topic = first.topic;
+    // The first one glued to the label after it (`…/antstreamAny browser:
+    // …`): the same channel further on whose topic is the first one's
+    // without that label. Only then: a later mention whose topic merely
+    // starts the first one's (`…/antstream-music and 0x<owner>/antstream`)
+    // is another channel, and the first in the text is the one meant. Not
+    // a `swarm://` URI's, whose topic stops at a `/` the topic text can
+    // have. A later one only stands for a shorter topic if the text after
+    // it doesn't go on with the first topic's rest: `0x<owner>/my show`
+    // (the Channel line of topic `my show`) is cut at its space, not a
+    // different, shorter channel. The later one is read both decoded (a
+    // link) and as written (the Channel line's display text, where `%25`
+    // is the topic's own `%25` and a `/` before a space is still its own).
+    if (first.unglued !== null) {
+      search: for (const f of found.slice(Math.max(at, 0) + 1)) {
+        if (f.owner !== first.owner || f.uri) continue;
+        for (const start of new Set([f.topic, f.written])) {
+          if (!start || !first.topic.startsWith(start)) continue;
+          const rest = first.topic.slice(start.length);
+          const after = text.slice(f.end);
+          let n = 0;
+          while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
+          const meant = start + rest.slice(0, n);
+          if (meant === first.unglued) {
+            topic = meant;
+            break search;
+          }
+        }
+      }
+    }
+    return channelOf(first.owner, topic);
+  }
+
+  // The labels starting the Share text's lines after the first link's
+  // (ChannelAddress.watchLinks in both apps). A text input that drops
+  // line breaks glues each line's link to the next one's label.
+  const SHARE_LABELS = ['Freedom browser:', 'Any browser:', 'Solar Punk players:', 'Channel:'];
+
+  /**
+   * The topic of a channel `token` ending at `end` in `text` when the
+   * token is glued to the start of a Share-text label (`antstreamAny` in
+   * `…antstreamAny browser: …`): the topic without the label's first
+   * word. Null when no label carries on from the token there.
+   */
+  function gluedLabelTopic(text, token, end) {
+    for (const label of SHARE_LABELS) {
+      const word = label.split(' ')[0];
+      if (token.length > word.length && token.endsWith(word) && text.startsWith(label, end - word.length)) {
+        return topicOf(token.slice(0, -word.length));
+      }
+    }
+    return null;
+  }
+
+  /**
+   * `token` (a topic as it stands in text) up to a Markdown link's `](`
+   * when it is a link's text (`[0x<owner>/antstream](https://…)`): the
+   * first `](` whose `]` closes no `[` of the topic's own (`a[b](c` keeps
+   * its `](`). A topic's own `[`/`]` are URL-encoded in a link, so only
+   * the display text of the Channel line could carry `](`, and the Share
+   * text's links say the topic whole before it.
+   */
+  function markdownLinkText(token) {
+    for (let at = token.indexOf(']('); at >= 0; at = token.indexOf('](', at + 1)) {
+      const before = token.slice(0, at);
+      if (before.split('[').length <= before.split(']').length) return before;
+    }
+    return token;
+  }
+
+  // Punctuation that ends a sentence or closes a quote rather than a
+  // topic, when a channel is the last word of a message
+  // (`… 0x<owner>/antstream.`). Brackets only when unbalanced in the topic.
+  const SENTENCE_END = /[.,;:!?'"\u2019\u201d\u00bb\u2026>)\]}]$/;
+  const OPENER = { ')': '(', ']': '[', '}': '{' };
+
+  /** `token` (a topic as it stands in text) without the sentence's end. */
+  function trimSentenceEnd(token) {
+    let t = token;
+    while (SENTENCE_END.test(t)) {
+      const last = t[t.length - 1];
+      const open = OPENER[last];
+      if (open && t.split(open).length > t.split(last).length - 1) break;
+      t = t.slice(0, -1);
+    }
+    return t;
+  }
+
+  /**
+   * The topic text a link carries after the owner, URL-encoded or not.
+   * Trailing slashes go, as in the apps: `0x<owner>/` is the owner alone.
+   */
+  function topicOf(rest) {
+    const bare = rest.replace(/\/+$/, '');
+    try {
+      return decodeURIComponent(bare);
+    } catch (_) {
+      return bare; // not URL-encoded: the text as it is
+    }
+  }
+
+  /** `topic`: decoded; empty is the owner alone. */
+  function channelOf(owner, topic) {
+    const text = topic || ANTSTREAM_TOPIC;
+    const raw = RAW_TOPIC.exec(text);
+    return makeChannel(owner.toLowerCase(), text, raw ? raw[1].toLowerCase() : null);
   }
 
   /** `rawHex`: the topic's raw bytes as hex, when `topic` is not text. */
@@ -1782,7 +2016,7 @@
 
   // -- channel selection ----------------------------------------------------
 
-  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, or a swarm:// link';
+  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, 0x<40 hex> alone for its antstream channel, a swarm:// link, or the text an AntStream app shares';
 
   /** Recent channels, by key; entries of the older reference form are dropped. */
   function recent() {
@@ -1822,8 +2056,7 @@
     const ch = parseChannel(raw);
     if (!ch) {
       // A link of the older form (a feed manifest reference, #<64 hex>),
-      // whose channels are not played any more, or an owner without a
-      // topic.
+      // whose channels are not played any more.
       els.input.value = raw;
       els.input.setCustomValidity(`This link names no owner/topic channel. ${ASK}`);
       els.input.reportValidity();

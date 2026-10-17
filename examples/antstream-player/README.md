@@ -56,13 +56,39 @@ topic URL-encoded. The feed topic is `keccak256(utf8(text))`, bee-js
 `crates/ant-ffi/src/publisher.rs`. The AntStream apps broadcast on the
 topic text `antstream`, one channel per account, so an app channel is
 `#0x<owner>/antstream` (issue #217); the apps' Share buttons send exactly
-these links. The player itself has no default topic, so a link always
-names one. A channel whose topic is raw bytes with no text is named by
+these links. An owner alone (`0x<owner>` or `<owner>`, a trailing `/`
+allowed) is that account's `antstream` channel, as the apps read it; any
+other topic has to be named. A channel whose topic is raw bytes with no text is named by
 the raw topic, 64 hex digits (`#0x<owner>/0x<topic hex>`, `0x`
 optional); a topic of exactly 64 hex digits is always read that way,
 never as text.
-The channel field also takes Solar Punk's `swarm://<owner>/<topic>`
-and any player link.
+The channel field also takes Solar Punk's `swarm://<owner>/<topic>`,
+any player link, and text with a channel in it, such as the whole text
+an app's Share button sends: the first `swarm://<owner>/<topic>`,
+`#0x<owner>/<topic>` or `0x<owner>/<topic>` in it, the topic ending at
+whitespace. The field drops the Share text's line breaks, gluing each
+link to the next line's label (`…/antstreamAny browser: …`); when the
+first channel's topic runs into such a label, the same channel later in
+the text whose topic is the glued one's without the label is the one
+played, also when it is cut at a space and the text right after it goes
+on with the glued topic's rest (the Channel line of a topic with a space,
+`0x<owner>/my show`). Without a glued label the first channel in the
+text is played as it is, even when a later one's topic starts it. Punctuation that
+ends a sentence or closes a quote or bracket (`… 0x<owner>/antstream.`)
+is not part of the topic, unless another mention of the same channel
+ends in it too (the Share text of a topic like `show.` names it four
+times, each ending in its `.`); a single link with no whitespace around
+it is read as it is (quotes around it are dropped). In text, a channel
+that names its topic wins over an owner alone before it (a tip-jar
+address ahead of `0x<owner>/antstream`); text with only owners alone
+plays that owner's `antstream` channel if they are all the same one, and
+nothing if they differ. A truncated `swarm://<owner>/` is rejected in
+text too, and so is an address in a URL's path (a block explorer's
+`…/address/0x<owner>/tokens`). A Markdown link's text ends at its `](`
+(`[0x<owner>/antstream](https://…)` plays `0x<owner>/antstream`), also
+when the link is all that was pasted, in quotes or with a full stop
+after it or not. `test/channel-parse-test.mjs` checks this against the apps'
+strings (`node test/channel-parse-test.mjs`, no dependencies).
 
 Every feed update **is** the playlist (a v2 update wrapping the
 playlist's root chunk), and the playlist lists segments and the
