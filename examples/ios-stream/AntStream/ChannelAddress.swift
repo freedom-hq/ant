@@ -98,10 +98,11 @@ struct ChannelAddress: Equatable, Hashable {
     /// that account's AntStream channel (topic ``antstreamTopic``). `nil` for anything else.
     /// Unlike the web player, this does not search free text (the Share
     /// text, a message it was pasted into) for a channel: the whole input
-    /// is the one link, so pasted Share text is `nil` here.
+    /// is the one link, so input over more than one line (pasted Share
+    /// text) is `nil` here. A topic never has a line break in it.
     static func parse(_ input: String) -> ChannelAddress? {
         var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { return nil }
+        if s.isEmpty || s.unicodeScalars.contains(where: CharacterSet.newlines.contains) { return nil }
         if let hash = s.firstIndex(of: "#") { s = String(s[s.index(after: hash)...]) }
         var owner: Substring
         var rest: Substring

@@ -175,6 +175,19 @@ expect('Solar Punk URI ending a sentence', `or swarm://${OWNER}/antstream.`, ant
 expect('owner alone ending a sentence', `my channel is 0x${OWNER}.`, antWant);
 expect('balanced brackets stay in the topic', `watch 0x${OWNER}/show(1) now`, channel(OWNER, { text: 'show(1)' }));
 expect('a link alone keeps a trailing dot', `0x${OWNER}/v1.`, channel(OWNER, { text: 'v1.' }));
+expect('two mentions, each ending its own sentence', `watch 0x${OWNER}/antstream, or 0x${OWNER}/antstream.`, antWant);
+
+// A topic that itself ends in what `encodeURIComponent` leaves unencoded
+// (`.!'()*~`): every mention in the Share text ends in it, so it is the
+// topic's, however the line breaks came through.
+for (const text of ['show.', 'my show!', 'a)', "it's'", 'v1.0.']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text, topic ending in punctuation ${JSON.stringify(text)}`, a.watchLinks, want);
+  expect(`Share text stripped, topic ending in punctuation ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
+  expect(`Share text as spaces, topic ending in punctuation ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
+  expect(`Share text in a message, topic ending in punctuation ${JSON.stringify(text)}`, `hey!\n\n${a.watchLinks}\n\nsee you`, want);
+}
 
 const raw = app(OWNER, { raw: RAW });
 const rawWant = channel(OWNER, { raw: RAW });

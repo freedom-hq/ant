@@ -137,7 +137,9 @@
    * text's last line, `Channel: 0x<owner>/antstream`, is never glued),
    * unless the text after that one goes on with the first topic's rest:
    * then it is the same topic cut at a space. Sentence punctuation after a
-   * channel in text (`… 0x<owner>/antstream.`) is not part of its topic.
+   * channel in text (`… 0x<owner>/antstream.`) is not part of its topic,
+   * unless another mention of the same channel ends in it too (the Share
+   * text of topic `show.`).
    */
   function parseChannel(input) {
     const s = (input || '').trim();
@@ -176,13 +178,30 @@
 
   /** The channel in free text, see `parseChannel`. */
   function findChannel(text) {
-    const found = [];
-    for (const m of text.matchAll(CHANNEL_IN_TEXT)) {
+    const matches = [...text.matchAll(CHANNEL_IN_TEXT)].map((m) => {
       const uri = Boolean(m[1]);
-      const token = uri ? m[2] : m[4] || '';
-      const kept = trimSentenceEnd(token);
-      found.push({
+      return {
+        m,
+        uri,
         owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
+        token: uri ? m[2] : m[4] || '',
+      };
+    });
+    const found = [];
+    for (const { m, uri, owner, token } of matches) {
+      // Sentence punctuation ends one word of a message, not every
+      // mention of a channel. The apps' Share text names its channel up
+      // to four times (two links, the Solar Punk URI, the Channel line),
+      // and `encodeURIComponent` leaves `.!'()*~` as they are, so a topic
+      // like `show.` ends every one of them in its `.`: when another
+      // mention of the same owner has this one's text whole (or glued to
+      // the next line's label, `show.Any`), the end is the topic's own.
+      const repeated = matches.some(
+        (o) => o.m !== m && o.owner === owner && o.token.startsWith(token),
+      );
+      const kept = repeated ? token : trimSentenceEnd(token);
+      found.push({
+        owner,
         topic: topicOf(kept),
         uri,
         // Where the topic, as kept, ends in the text.

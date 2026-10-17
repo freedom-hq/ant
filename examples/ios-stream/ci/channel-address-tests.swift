@@ -74,6 +74,11 @@ struct ChannelAddressTests {
                       "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream"] {
             expect(ChannelAddress.parse(input), nil, "reject \(input)")
         }
+        // The Share text, pasted whole: more than one line, not one link.
+        for sep in ["\n", "\r\n", "\u{2028}"] {
+            let text = own.watchLinks.replacingOccurrences(of: "\n", with: sep)
+            expect(ChannelAddress.parse(text), nil, "reject Share text split by \(sep.debugDescription)")
+        }
         // Fullwidth hex (`０`-`９`, `ａ`-`ｆ`) passes `isHexDigit` but is no
         // owner or topic a gateway reads; Android's `[0-9a-fA-F]` rejects it too.
         let fullwidth = String(owner.unicodeScalars.map {

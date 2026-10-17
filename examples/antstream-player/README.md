@@ -73,8 +73,10 @@ one played, unless the text right after it goes on with the glued
 topic's rest (the Channel line of a topic with a space, `0x<owner>/my show`,
 is that topic cut at its space, not a shorter channel). Punctuation that
 ends a sentence or closes a quote or bracket (`… 0x<owner>/antstream.`)
-is not part of the topic; a single link with no whitespace around it is
-read as it is. `test/channel-parse-test.mjs` checks this against the apps'
+is not part of the topic, unless another mention of the same channel
+ends in it too (the Share text of a topic like `show.` names it four
+times, each ending in its `.`); a single link with no whitespace around
+it is read as it is. `test/channel-parse-test.mjs` checks this against the apps'
 strings (`node test/channel-parse-test.mjs`, no dependencies).
 
 Every feed update **is** the playlist (a v2 update wrapping the

@@ -125,6 +125,9 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
 
         private val OWNER = Regex("^(?:0[xX])?([0-9a-fA-F]{40})$")
         private val RAW_TOPIC = Regex("^(?:0[xX])?([0-9a-fA-F]{64})$")
+        // What Swift's `CharacterSet.newlines` holds: U+000A-U+000D, NEL,
+        // LS and PS.
+        private const val LINE_BREAKS = "\n\u000B\u000C\r\u0085\u2028\u2029"
         private val SWARM_URI = Regex("^swarm://([^/?#]+)/([^/?#]+)", RegexOption.IGNORE_CASE)
 
         /** The channel `owner` (with or without `0x`) broadcasts on topic text `text`. */
@@ -143,12 +146,13 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
          * An owner alone is that account's AntStream channel (topic
          * [TOPIC]). `null` for anything else. Unlike the web player, this
          * does not search free text (the Share text, a message it was pasted
-         * into) for a channel: the whole input is the one link, so pasted
-         * Share text is `null` here.
+         * into) for a channel: the whole input is the one link, so input
+         * over more than one line (pasted Share text) is `null` here. A
+         * topic never has a line break in it.
          */
         fun parse(input: String): ChannelAddress? {
             var s = input.trim()
-            if (s.isEmpty()) return null
+            if (s.isEmpty() || s.any { it in LINE_BREAKS }) return null
             val hash = s.indexOf('#')
             if (hash >= 0) s = s.substring(hash + 1)
             val owner: String

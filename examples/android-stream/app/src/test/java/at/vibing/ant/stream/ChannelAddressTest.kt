@@ -93,6 +93,12 @@ class ChannelAddressTest {
             "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream")) {
             assertNull(input, ChannelAddress.parse(input))
         }
+        // The Share text, pasted whole: more than one line, not one link.
+        val own = ChannelAddress.ofText(owner, "antstream")
+        for (sep in listOf("\n", "\r\n", "\u2028")) {
+            val text = own.watchLinks().replace("\n", sep)
+            assertNull(text, ChannelAddress.parse(text))
+        }
     }
 
     @Test
