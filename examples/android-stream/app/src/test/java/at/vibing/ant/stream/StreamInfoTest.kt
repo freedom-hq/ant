@@ -165,6 +165,13 @@ class StreamInfoTest {
             {"owner":"$owner","topic":"antstream","title":"Second","timestamp":5}
         ]"""
         assertEquals("Second", Catalog.entryFor(tie, owner, "antstream")?.title)
+        // A fractional timestamp is compared as a double, as iOS and the web
+        // player do: 100.9 beats 100.2, it is no tie.
+        val fractional = """[
+            {"owner":"$owner","topic":"antstream","title":"A","timestamp":100.9},
+            {"owner":"$owner","topic":"antstream","title":"B","timestamp":100.2}
+        ]"""
+        assertEquals("A", Catalog.entryFor(fractional, owner, "antstream")?.title)
         // A raw-topic channel finds the entry whose text hashes to it.
         assertEquals("New", Catalog.select(Catalog.parse(body), owner, Keccak.topicFromString("antstream"))?.title)
     }

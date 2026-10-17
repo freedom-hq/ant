@@ -815,21 +815,34 @@ struct LiveView: View {
         }
     }
 
+    /// An announcement (#220) is still being written to the catalog, and
+    /// the library refuses a start until it returns: Go live waits.
+    private var heldByAnnouncement: Bool {
+        !broadcast.state.isActive && node.announcingBroadcast
+    }
+
     private func controlStack(now: Date) -> some View {
-        let blocked = blockedByUnfinished(now: now)
+        let held = heldByAnnouncement
+        let unfinished = blockedByUnfinished(now: now)
         return VStack(spacing: 8) {
-            if blocked {
+            if held {
+                Text(AntNode.announcingHoldNote)
+                    .font(.caption)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if unfinished {
                 Text("End your unfinished broadcast on the Broadcast tab first: a new one would leave it without its recording.")
                     .font(.caption)
                     .foregroundStyle(.yellow.opacity(0.9))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            controlButton(blocked: blocked)
+            controlButton(blocked: unfinished || held, title: controlTitle(blocked: unfinished))
         }
     }
 
-    private func controlButton(blocked: Bool) -> some View {
+    private func controlButton(blocked: Bool, title: String) -> some View {
         Button {
             Task {
                 if broadcast.state.isActive {
@@ -841,7 +854,7 @@ struct LiveView: View {
                 }
             }
         } label: {
-            Text(controlTitle(blocked: blocked))
+            Text(title)
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -861,7 +874,7 @@ struct LiveView: View {
         guard !broadcast.state.isActive else { return }
         // Checked again at the tap (and after the capacity question): the
         // entry may have aged past the reap window since the last redraw.
-        guard !blockedByUnfinished(now: Date()) else { return }
+        guard !blockedByUnfinished(now: Date()), !heldByAnnouncement else { return }
         let resume = resumePending
         resumePending = false
         lastRunWasResume = resume

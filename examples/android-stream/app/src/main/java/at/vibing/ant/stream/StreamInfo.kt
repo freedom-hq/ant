@@ -170,8 +170,12 @@ data class CatalogEntry(
     val state: String?,
     val thumbnail: String?,
     val scheduledStartTime: String?,
-    /** The entry's `timestamp` (Unix ms), 0 when missing or not a number. */
-    val timestamp: Long = 0,
+    /**
+     * The entry's `timestamp` (Unix ms), 0 when missing or not a finite
+     * number. Kept as a double, not truncated to `Long`, so a fractional
+     * value compares exactly as on iOS and the web player.
+     */
+    val timestamp: Double = 0.0,
 ) {
     /** The scheduled start in Unix ms, when the entry names a readable one. */
     val scheduledStartMs: Long? get() = scheduledStartTime?.let(::parseIsoMillis)
@@ -277,7 +281,7 @@ object Catalog {
             state = o.opt("state") as? String,
             thumbnail = (o.opt("thumbnail") as? String)?.takeIf(StreamInfo::isReference)?.lowercase(),
             scheduledStartTime = o.opt("scheduledStartTime") as? String,
-            timestamp = (o.opt("timestamp") as? Number)?.toLong() ?: 0,
+            timestamp = (o.opt("timestamp") as? Number)?.toDouble()?.takeIf { it.isFinite() } ?: 0.0,
         )
     }
 

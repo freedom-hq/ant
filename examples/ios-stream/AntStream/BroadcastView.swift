@@ -79,8 +79,11 @@ struct BroadcastView: View {
                     // antstream-visual: `-antstream-shot-info` (#220) is
                     // about the stream info card, below the channel card:
                     // bring it into the shot once the sample is in.
+                    // `-antstream-shot-info-announcing` is about the held
+                    // Go live at the top, so it stays there.
                     if RootView.shotArgs.contains("-antstream-shot-info"),
-                       !RootView.shotArgs.contains("-antstream-shot-info-edit") {
+                       !RootView.shotArgs.contains("-antstream-shot-info-edit"),
+                       !RootView.shotArgs.contains("-antstream-shot-info-announcing") {
                         for _ in 0..<60 where node.streamInfo.title.isEmpty {
                             try? await Task.sleep(nanoseconds: 1_000_000_000)
                         }
@@ -198,6 +201,13 @@ struct BroadcastView: View {
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if node.announcingBroadcast {
+                    Text(AntNode.announcingHoldNote)
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Button {
                     resumeLive = false
                     showLive = true
@@ -214,7 +224,8 @@ struct BroadcastView: View {
                         .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
-                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil)
+                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil
+                          || node.announcingBroadcast)
             }
             .frame(maxWidth: .infinity)
         }

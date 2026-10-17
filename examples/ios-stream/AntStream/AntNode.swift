@@ -106,6 +106,12 @@ final class AntNode: ObservableObject {
     /// Why the last thumbnail upload or catalog update failed; `nil` once
     /// one succeeds. Never a broadcast failure.
     @Published private(set) var streamInfoError: String?
+    /// ``announceBroadcast()`` is writing the catalog entry. Lives here,
+    /// not in the editor that started it: the write outlives that sheet,
+    /// and the library refuses `ant_publisher_start` until it returns, so
+    /// every Go live (the Broadcast tab's and the live screen's) is held
+    /// on it and says why.
+    @Published private(set) var announcingBroadcast = false
     /// ``finishUnfinishedBroadcast()`` is running: the publisher is that
     /// broadcast, so ``unfinishedBroadcast`` stays up (its card shows the
     /// finalize in progress, and Go live stays held) until the stop
@@ -995,6 +1001,11 @@ final class AntNode: ObservableObject {
         return trimmed.lowercased()
     }
 
+    /// Why Go live is held while ``announcingBroadcast``: the Broadcast
+    /// tab's and the live screen's note.
+    static let announcingHoldNote =
+        "An announcement is still being written to the catalog. Go live once it's done; it can take a few minutes on a slow network."
+
     /// Announce the scheduled broadcast (`ant_stream_catalog_publish`):
     /// the channel's catalog entry becomes a "scheduled" one with the
     /// stream info and its start, so players list it before it goes live.
@@ -1012,6 +1023,11 @@ final class AntNode: ObservableObject {
         guard let batchId = plan?.batchId, plan?.enabled == true, !batchId.isEmpty else {
             throw AntError.op("Connect a storage plan to announce a broadcast: the announcement is an upload.")
         }
+        guard !announcingBroadcast else {
+            throw AntError.op("An announcement is already being written.")
+        }
+        announcingBroadcast = true
+        defer { announcingBroadcast = false }
         await syncStreamInfo(pushToBroadcast: false)
         let info = streamInfo
         var settings = CaptureEngine.Settings(quality: LiveBroadcast.storedQuality)
@@ -1639,6 +1655,12 @@ final class AntNode: ObservableObject {
             announcedStartMs: startMs
         )
         streamInfoError = nil
+        // `-antstream-shot-info-announcing`: an announcement still being
+        // written, so Go live is held and the editor can't be cancelled.
+        // Nothing is written.
+        if RootView.shotArgs.contains("-antstream-shot-info-announcing") {
+            announcingBroadcast = true
+        }
     }
 
     /// Drive the Broadcast tab to its ready state, for the "Your channel"

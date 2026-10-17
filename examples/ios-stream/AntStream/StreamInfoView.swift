@@ -63,18 +63,24 @@ struct StreamInfoEditor: View {
             .navigationTitle("Stream info")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // Held while an announcement is being written: it carries
+                // on whether the sheet is open or not, and Go live is
+                // refused until it returns, so the sheet stays up to say
+                // how it went.
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .disabled(busy)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         save()
                         dismiss()
                     }
-                    .disabled(!canSave || announcing)
+                    .disabled(!canSave || busy)
                 }
             }
         }
+        .interactiveDismissDisabled(busy)
         .preferredColorScheme(.dark)
         .onAppear(perform: load)
         .onChange(of: pickerItem) { _, item in
@@ -227,7 +233,7 @@ struct StreamInfoEditor: View {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                         .fixedSize(horizontal: false, vertical: true)
-                    if announcing {
+                    if busy {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small).tint(.white)
                             Text("Announcing…")
@@ -260,8 +266,12 @@ struct StreamInfoEditor: View {
 
     private var canAnnounce: Bool {
         scheduled && canSave && node.hasStorage && !node.broadcastRunning
-            && !announcing && start > Date()
+            && !busy && start > Date()
     }
+
+    /// An announcement is being written: this sheet's, or one an earlier
+    /// opening of it started.
+    private var busy: Bool { announcing || node.announcingBroadcast }
 
     private func announce() async {
         announcing = true

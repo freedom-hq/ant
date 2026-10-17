@@ -390,6 +390,20 @@ jobs:
             -antstream-shot-watch -antstream-shot-watch-info
           sleep 30
           xcrun simctl io booted screenshot shots/35-watch-catalog-info.png
+          # 36/37: an announcement still being written (R2-M2):
+          # `-antstream-shot-info-announcing` holds the sample's
+          # announcement in flight. 36: the Broadcast tab's Go live held,
+          # saying why. 37: the editor, Cancel and Save held, "Announcing…".
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-info -antstream-shot-info-announcing
+          sleep 25
+          xcrun simctl io booted screenshot shots/36-broadcast-announcing.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-info -antstream-shot-info-edit -antstream-shot-info-announcing
+          sleep 25
+          xcrun simctl io booted screenshot shots/37-stream-info-announcing.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
