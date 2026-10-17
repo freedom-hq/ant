@@ -146,6 +146,10 @@
    * `0x<b>/antstream`); with only owners alone, they must all be the same
    * one. A truncated `swarm://<owner>/` names no channel in text either,
    * nor does an address in a URL's path (`…/address/0x<owner>/tokens`).
+   * A Markdown link's text ends at its `](`
+   * (`[0x<owner>/antstream](https://…)` is `0x<owner>/antstream`).
+   *
+   * One Markdown link and nothing else is read as text.
    *
    * One link in quotes and nothing else (`"0x<owner>/antstream"`) is the
    * link: the quotes are dropped, as in text.
@@ -153,11 +157,15 @@
   function parseChannel(input) {
     let s = (input || '').trim();
     if (!s) return null;
-    if (/\s/.test(s)) return findChannel(s);
+    if (/\s/.test(s) || MARKDOWN_LINK.test(s)) return findChannel(s);
     const quoted = QUOTE_OPEN.exec(s);
     if (quoted) s = s.slice(quoted[0].length).replace(QUOTE_CLOSE, '');
     return parseChannelToken(s);
   }
+
+  // A whole Markdown link, `[text](url)`: read as text, so its text ends
+  // at the `](` and the URL's `)` is no part of a topic.
+  const MARKDOWN_LINK = /^\[[^\]]*\]\(.*\)$/;
 
   // Quotes around a whole pasted link (a channel never starts with one).
   const QUOTE_OPEN = /^["'\u201c\u2018\u00ab<]+/;
@@ -199,25 +207,29 @@
   function findChannel(text) {
     const matches = [...text.matchAll(CHANNEL_IN_TEXT)].map((m) => {
       const uri = Boolean(m[1]);
+      const token = markdownLinkText(uri ? m[2] : m[4] || '');
+      // Where the token, as cut, ends in the text.
+      const close = m.index + m[0].length - ((uri ? m[2] : m[4] || '').length - token.length);
       return {
         m,
         uri,
+        close,
         // Which of the Share text's forms this mention is: the Solar Punk
         // URI, a player link (after its `#`) or a bare `0x<owner>/…`.
         form: uri ? 'uri' : m.index > 0 && text[m.index - 1] === '#' ? 'link' : 'bare',
         owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
-        token: uri ? m[2] : m[4] || '',
+        token,
         // Its topic, decoded, and the text that goes on after it: what a
         // mention cut short (at a space, at a `/`) still says. Also as
         // written, undecoded and with its trailing `/`s: the Solar Punk URI
         // and the Channel line carry the display text, so a topic like
         // `%2Ay.` or `?/ 2!` reads there as it is, not decoded.
-        reach: [uri ? m[2] : m[4] || ''].flatMap((t) => [topicOf(t), t])
-          .map((t) => t + text.slice(m.index + m[0].length)),
+        reach: [token].flatMap((t) => [topicOf(t), t])
+          .map((t) => t + text.slice(close)),
       };
     });
     const found = [];
-    for (const { m, uri, form, owner, token } of matches) {
+    for (const { m, uri, close, form, owner, token } of matches) {
       // Sentence punctuation ends one word of a message, not every
       // mention of a channel. The apps' Share text names its channel up
       // to four times (two links, the Solar Punk URI, the Channel line),
@@ -246,10 +258,10 @@
         written: kept,
         uri,
         // Where the topic, as kept, ends in the text.
-        end: m.index + m[0].length - (token.length - kept.length),
+        end: close - (token.length - kept.length),
         // The topic this one has if its token runs into the label of the
         // Share text's next line (line breaks dropped), else null.
-        unglued: gluedLabelTopic(text, token, m.index + m[0].length),
+        unglued: gluedLabelTopic(text, token, close),
       });
     }
     if (!found.length) return null;
@@ -312,6 +324,22 @@
       }
     }
     return null;
+  }
+
+  /**
+   * `token` (a topic as it stands in text) up to a Markdown link's `](`
+   * when it is a link's text (`[0x<owner>/antstream](https://…)`): the
+   * first `](` whose `]` closes no `[` of the topic's own (`a[b](c` keeps
+   * its `](`). A topic's own `[`/`]` are URL-encoded in a link, so only
+   * the display text of the Channel line could carry `](`, and the Share
+   * text's links say the topic whole before it.
+   */
+  function markdownLinkText(token) {
+    for (let at = token.indexOf(']('); at >= 0; at = token.indexOf('](', at + 1)) {
+      const before = token.slice(0, at);
+      if (before.split('[').length <= before.split(']').length) return before;
+    }
+    return token;
   }
 
   // Punctuation that ends a sentence or closes a quote rather than a

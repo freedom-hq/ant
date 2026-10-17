@@ -240,6 +240,15 @@ expect('two mentions, each ending its own sentence', `watch 0x${OWNER}/antstream
 // the other's sentence end (R3-M1).
 expect('same channel twice, both ending a sentence', `see 0x${OWNER}/antstream. — yes 0x${OWNER}/antstream.`, antWant);
 expect('same form twice, the later topic longer', `0x${OWNER}/antstream. My other: 0x${OWNER}/antstream.v2`, antWant);
+// A Markdown link whose text is the channel: the text ends at `](` (R4-M1).
+expect('Markdown link, the channel as its text', `Watch [0x${OWNER}/antstream](https://x/#0x${OWNER}/antstream) now`, antWant);
+expect('Markdown link, the channel as its text, ending the message', `[0x${OWNER}/antstream](https://x/#0x${OWNER}/antstream)`, antWant);
+expect('Markdown link, the channel in its text', `[watch 0x${OWNER}/antstream](${ant.gatewayPlayerLink}).`, antWant);
+expect('Markdown link, another link as its URL', `[0x${OWNER}/antstream](https://example.com/live) tonight`, antWant);
+expect('Markdown link, a topic with brackets of its own', `[0x${OWNER}/a[b](c](https://x) now`, channel(OWNER, { text: 'a[b](c' }));
+expect('Markdown link to the channel', `[watch](${ant.playerLink}) now`, antWant);
+expect('Markdown link alone, the URL somewhere else', `[0x${OWNER}/antstream](https://example.com/live)`, antWant);
+expect('Markdown link alone, to the channel', `[watch](${ant.playerLink})`, antWant);
 expect('swarm:// twice, both ending a sentence', `swarm://${OWNER}/antstream. Or swarm://${OWNER}/antstream.`, antWant);
 
 // A topic that itself ends in what `encodeURIComponent` leaves unencoded

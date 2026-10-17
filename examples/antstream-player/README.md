@@ -84,7 +84,9 @@ address ahead of `0x<owner>/antstream`); text with only owners alone
 plays that owner's `antstream` channel if they are all the same one, and
 nothing if they differ. A truncated `swarm://<owner>/` is rejected in
 text too, and so is an address in a URL's path (a block explorer's
-`…/address/0x<owner>/tokens`). `test/channel-parse-test.mjs` checks this against the apps'
+`…/address/0x<owner>/tokens`). A Markdown link's text ends at its `](`
+(`[0x<owner>/antstream](https://…)` plays `0x<owner>/antstream`), also
+when the link is all that was pasted. `test/channel-parse-test.mjs` checks this against the apps'
 strings (`node test/channel-parse-test.mjs`, no dependencies).
 
 Every feed update **is** the playlist (a v2 update wrapping the
