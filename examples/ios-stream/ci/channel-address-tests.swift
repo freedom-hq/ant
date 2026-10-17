@@ -68,7 +68,8 @@ struct ChannelAddressTests {
         expect(raw?.swarmURI, nil, "no swarm URI for a raw topic")
         expect(raw.flatMap { ChannelAddress.parse($0.playerLink) }, raw, "raw round trip")
 
-        for input in ["", "   ", "antstream", "0x1234/antstream", "bzz://\(hex)", "swarm://nope/antstream"] {
+        for input in ["", "   ", "antstream", "0x1234/antstream", "bzz://\(hex)", "swarm://nope/antstream",
+                      "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream"] {
             expect(ChannelAddress.parse(input), nil, "reject \(input)")
         }
         // Fullwidth hex (`０`-`９`, `ａ`-`ｆ`) passes `isHexDigit` but is no

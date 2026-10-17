@@ -40,6 +40,16 @@ class FeedPlaylistTest {
     }
 
     @Test
+    fun leavesNonAsciiDigitsAlone() {
+        // Fullwidth and Arabic-Indic digits pass Kotlin's Char.isDigit; a
+        // gateway reads only ASCII hex, and iOS passes these through too.
+        val fullwidth = "\uFF11".repeat(64)
+        val arabic = "\u0661".repeat(64)
+        val playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"$arabic\"\n#EXTINF:2.000,\n$fullwidth\n"
+        assertEquals(playlist, FeedFollower.rewrite(playlist, gw))
+    }
+
+    @Test
     fun readsOnlyVersion2MarkersOfThePeriod() {
         val topic = "f526f44fb746b8c958e2686aafec618f61351d834bd7d9c11b4a6726b6276646"
         val ok = """{"v":2,"period":100,"writtenAt":1004321,"rungs":{"$topic":42},"segmentMs":2000}"""

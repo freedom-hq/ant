@@ -93,8 +93,8 @@ struct ChannelAddress: Equatable, Hashable {
     /// + 40 hex, the topic text, URL-encoded or not), Solar Punk's
     /// `swarm://<owner>/<topic>`, or a player link carrying either after
     /// its `#`. A topic of 64 hex digits (`0x` optional) is the raw topic.
-    /// An owner alone is that account's AntStream channel (topic
-    /// ``antstreamTopic``). `nil` for anything else.
+    /// An owner alone (`<owner>` or `<owner>/`, not `swarm://<owner>/`) is
+    /// that account's AntStream channel (topic ``antstreamTopic``). `nil` for anything else.
     static func parse(_ input: String) -> ChannelAddress? {
         var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { return nil }
@@ -106,7 +106,10 @@ struct ChannelAddress: Equatable, Hashable {
             let body = s.dropFirst("swarm://".count)
             let cut = body.firstIndex(where: { "?#".contains($0) }) ?? body.endIndex
             let parts = body[..<cut].split(separator: "/", omittingEmptySubsequences: false)
-            guard parts.count >= 2 else { return nil }
+            // Like the web player's and Android's regex, the topic must be
+            // there: a truncated `swarm://<owner>/` is not the owner's
+            // AntStream channel.
+            guard parts.count >= 2, !parts[1].isEmpty else { return nil }
             owner = parts[0]
             rest = parts[1]
         } else if let slash = s.firstIndex(of: "/") {

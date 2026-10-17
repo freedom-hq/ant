@@ -149,7 +149,8 @@ class FeedFollower(val gateway: String, val channel: ChannelAddress) {
 
         /**
          * `playlist` with every bare reference (a segment line or the
-         * `#EXT-X-MAP` URI, 64 or 128 hex) made `<gateway>/bytes/<ref>`.
+         * `#EXT-X-MAP` URI, 64 or 128 ASCII hex digits, as iOS reads them) made
+         * `<gateway>/bytes/<ref>`.
          * Everything else, `#EXT-X-GAP` placeholders (`gap-<n>`) included,
          * passes through.
          */
@@ -157,7 +158,7 @@ class FeedFollower(val gateway: String, val channel: ChannelAddress) {
             val base = gateway.trimEnd('/')
             fun absolute(value: String): String? {
                 val v = value.trim()
-                return if ((v.length == 64 || v.length == 128) && v.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+                return if ((v.length == 64 || v.length == 128) && v.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
                     "$base/bytes/${v.lowercase()}"
                 } else {
                     null

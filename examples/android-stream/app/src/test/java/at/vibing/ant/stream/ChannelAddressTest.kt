@@ -89,7 +89,8 @@ class ChannelAddressTest {
 
     @Test
     fun rejectsNonChannels() {
-        for (input in listOf("", "   ", "antstream", "0x1234/antstream", "bzz://$antstream", "swarm://nope/antstream")) {
+        for (input in listOf("", "   ", "antstream", "0x1234/antstream", "bzz://$antstream", "swarm://nope/antstream",
+            "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream")) {
             assertNull(input, ChannelAddress.parse(input))
         }
     }
