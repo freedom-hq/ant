@@ -135,12 +135,16 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
 
         /**
          * A channel from what a viewer typed or pasted, read the way the web
-         * player's `parseChannel` reads it: `<owner>/<topic>` (the owner `0x`
+         * player's `parseChannel` reads one link or URI (input with no
+         * whitespace): `<owner>/<topic>` (the owner `0x`
          * + 40 hex, the topic text, URL-encoded or not), Solar Punk's
          * `swarm://<owner>/<topic>`, or a player link carrying either after
          * its `#`. A topic of 64 hex digits (`0x` optional) is the raw topic.
          * An owner alone is that account's AntStream channel (topic
-         * [TOPIC]). `null` for anything else.
+         * [TOPIC]). `null` for anything else. Unlike the web player, this
+         * does not search free text (the Share text, a message it was pasted
+         * into) for a channel: the whole input is the one link, so pasted
+         * Share text is `null` here.
          */
         fun parse(input: String): ChannelAddress? {
             var s = input.trim()

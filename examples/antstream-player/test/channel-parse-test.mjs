@@ -155,6 +155,27 @@ for (const text of ['antstream-4f1c2b9e', 'Café☕', 'a/b']) {
   expect(`Share text stripped, text topic ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
 }
 
+// A topic with a space: the links carry it URL-encoded, the Solar Punk and
+// Channel lines as it is, cut at the space. The Channel line is the same
+// channel cut short, not a shorter one the links were glued to.
+for (const text of ['my show', 'antstream/my show']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text, text topic with a space ${JSON.stringify(text)}`, a.watchLinks, want);
+  expect(`Share text stripped, text topic with a space ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
+  expect(`Share text as spaces, text topic with a space ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
+}
+
+// A channel ending a sentence keeps its topic, not the sentence's end.
+expect('channel ending a sentence', `come watch 0x${OWNER}/antstream.`, antWant);
+expect('channel in quotes', `link: "0x${OWNER}/antstream", see you`, antWant);
+expect('channel in brackets', `tonight (0x${OWNER}/antstream)!`, antWant);
+expect('channel ending a question', `seen 0x${OWNER}/antstream?`, antWant);
+expect('Solar Punk URI ending a sentence', `or swarm://${OWNER}/antstream.`, antWant);
+expect('owner alone ending a sentence', `my channel is 0x${OWNER}.`, antWant);
+expect('balanced brackets stay in the topic', `watch 0x${OWNER}/show(1) now`, channel(OWNER, { text: 'show(1)' }));
+expect('a link alone keeps a trailing dot', `0x${OWNER}/v1.`, channel(OWNER, { text: 'v1.' }));
+
 const raw = app(OWNER, { raw: RAW });
 const rawWant = channel(OWNER, { raw: RAW });
 expect('raw topic, hash link', raw.key, rawWant);

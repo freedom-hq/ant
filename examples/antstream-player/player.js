@@ -134,7 +134,10 @@
    * gluing each line's link to the next line's label
    * (`…/#0x<owner>/antstreamAny browser: …`): the same channel further on,
    * whose topic the first one's starts with, is the one meant (the Share
-   * text's last line, `Channel: 0x<owner>/antstream`, is never glued).
+   * text's last line, `Channel: 0x<owner>/antstream`, is never glued),
+   * unless the text after that one goes on with the first topic's rest:
+   * then it is the same topic cut at a space. Sentence punctuation after a
+   * channel in text (`… 0x<owner>/antstream.`) is not part of its topic.
    */
   function parseChannel(input) {
     const s = (input || '').trim();
@@ -175,21 +178,54 @@
   function findChannel(text) {
     const found = [];
     for (const m of text.matchAll(CHANNEL_IN_TEXT)) {
-      if (m[1]) found.push({ owner: m[1].replace(/^0x/i, '').toLowerCase(), topic: topicOf(m[2]), uri: true });
-      else found.push({ owner: m[3].toLowerCase(), topic: topicOf(m[4] || ''), uri: false });
+      const uri = Boolean(m[1]);
+      const token = uri ? m[2] : m[4] || '';
+      const kept = trimSentenceEnd(token);
+      found.push({
+        owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
+        topic: topicOf(kept),
+        uri,
+        // Where the topic, as kept, ends in the text.
+        end: m.index + m[0].length - (token.length - kept.length),
+      });
     }
     if (!found.length) return null;
     const first = found[0];
     let topic = first.topic;
     // The first one glued to the label after it: the same channel further
     // on whose topic it starts with. Not a `swarm://` URI's, whose topic
-    // stops at a `/` the topic text can have.
+    // stops at a `/` the topic text can have. A later one only stands for
+    // a shorter topic if the text after it doesn't go on with the first
+    // topic's rest: `0x<owner>/my show` (the Channel line of topic
+    // `my show`) is cut at its space, not a different, shorter channel.
     for (const f of found.slice(1)) {
-      if (f.owner === first.owner && !f.uri && f.topic && f.topic.length < topic.length && topic.startsWith(f.topic)) {
-        topic = f.topic;
-      }
+      if (f.owner !== first.owner || f.uri || !f.topic || !topic.startsWith(f.topic)) continue;
+      const rest = first.topic.slice(f.topic.length);
+      const after = text.slice(f.end);
+      let n = 0;
+      while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
+      const meant = f.topic + rest.slice(0, n);
+      if (meant.length < topic.length) topic = meant;
     }
     return channelOf(first.owner, topic);
+  }
+
+  // Punctuation that ends a sentence or closes a quote rather than a
+  // topic, when a channel is the last word of a message
+  // (`… 0x<owner>/antstream.`). Brackets only when unbalanced in the topic.
+  const SENTENCE_END = /[.,;:!?'"\u2019\u201d\u00bb\u2026>)\]}]$/;
+  const OPENER = { ')': '(', ']': '[', '}': '{' };
+
+  /** `token` (a topic as it stands in text) without the sentence's end. */
+  function trimSentenceEnd(token) {
+    let t = token;
+    while (SENTENCE_END.test(t)) {
+      const last = t[t.length - 1];
+      const open = OPENER[last];
+      if (open && t.split(open).length > t.split(last).length - 1) break;
+      t = t.slice(0, -1);
+    }
+    return t;
   }
 
   /**
