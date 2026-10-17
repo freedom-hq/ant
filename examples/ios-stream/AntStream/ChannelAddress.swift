@@ -195,7 +195,10 @@ struct BroadcastFeed: Equatable {
         notes: String,
         recoveryPath: String,
         resume: Bool,
-        reapMs: UInt64
+        reapMs: UInt64,
+        info: StreamInfo? = nil,
+        width: Int = 0,
+        height: Int = 0
     ) -> [String: Any] {
         var config: [String: Any] = [
             "recovery_path": recoveryPath,
@@ -213,7 +216,248 @@ struct BroadcastFeed: Equatable {
             "ladder": Self.ladder,
         ]
         config.merge(configEntries) { _, feed in feed }
+        // The stream info (#220): with it, the broadcast keeps the
+        // account's catalog entry for the channel.
+        if let info { config["info"] = info.infoObject() }
+        // The encoded size: the master's RESOLUTION and the catalog
+        // entry's rung (#220). Left out unless both are known.
+        if width > 0 && height > 0 {
+            config["width"] = width
+            config["height"] = height
+        }
         return config
+    }
+}
+
+/// The broadcaster's stream info (#220), remembered per account: what
+/// the account's catalog entry for the channel says about it. The
+/// publisher config's `"info"`, `ant_publisher_set_info`'s argument and
+/// part of `ant_stream_catalog_publish`'s (``infoObject()``), plus what
+/// the app keeps about the thumbnail and the announcement.
+struct StreamInfo: Codable, Equatable {
+    /// Empty is the channel's name (the node fills it in).
+    var title = ""
+    var description = ""
+    /// The uploaded thumbnail's reference (64 hex), empty without one or
+    /// while the image on the device is not uploaded yet.
+    var thumbnail = ""
+    /// The broadcaster chose the thumbnail (a photo). A chosen one is
+    /// never replaced by a frame captured from the camera.
+    var thumbnailPicked = false
+    /// The image on the device has not been uploaded yet: ``thumbnail``
+    /// is empty until it has.
+    var thumbnailPending = false
+    /// An upcoming broadcast's start, Unix ms.
+    var scheduledStartMs: UInt64?
+    /// The start the catalog last announced
+    /// (`ant_stream_catalog_publish`), Unix ms.
+    var announcedStartMs: UInt64?
+
+    init(
+        title: String = "",
+        description: String = "",
+        thumbnail: String = "",
+        thumbnailPicked: Bool = false,
+        thumbnailPending: Bool = false,
+        scheduledStartMs: UInt64? = nil,
+        announcedStartMs: UInt64? = nil
+    ) {
+        self.title = title
+        self.description = description
+        self.thumbnail = thumbnail
+        self.thumbnailPicked = thumbnailPicked
+        self.thumbnailPending = thumbnailPending
+        self.scheduledStartMs = scheduledStartMs
+        self.announcedStartMs = announcedStartMs
+    }
+
+    /// Every field optional, so what an older or newer build saved still
+    /// reads.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        thumbnail = try c.decodeIfPresent(String.self, forKey: .thumbnail) ?? ""
+        thumbnailPicked = try c.decodeIfPresent(Bool.self, forKey: .thumbnailPicked) ?? false
+        thumbnailPending = try c.decodeIfPresent(Bool.self, forKey: .thumbnailPending) ?? false
+        scheduledStartMs = try c.decodeIfPresent(UInt64.self, forKey: .scheduledStartMs)
+        announcedStartMs = try c.decodeIfPresent(UInt64.self, forKey: .announcedStartMs)
+    }
+
+    /// The `"info"` object the library takes: `title`, `description`,
+    /// `thumbnail` and `scheduled_start_ms` (`null` without one). A
+    /// thumbnail that is not a 64-hex reference is left out, since the
+    /// node refuses the whole object for it.
+    func infoObject() -> [String: Any] {
+        var object: [String: Any] = [
+            "title": title.trimmingCharacters(in: .whitespacesAndNewlines),
+            "description": description.trimmingCharacters(in: .whitespacesAndNewlines),
+            "thumbnail": Self.isReference(thumbnail) ? thumbnail.lowercased() : "",
+        ]
+        if let scheduledStartMs {
+            object["scheduled_start_ms"] = scheduledStartMs
+        } else {
+            object["scheduled_start_ms"] = NSNull()
+        }
+        return object
+    }
+
+    /// ``infoObject()`` as JSON text, for `ant_publisher_set_info`.
+    func infoJSON() -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: infoObject()) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// The info a broadcast goes live with: the broadcast an
+    /// announcement promised is the one starting, so the schedule is left
+    /// behind.
+    var forBroadcast: StreamInfo {
+        var info = self
+        info.scheduledStartMs = nil
+        info.announcedStartMs = nil
+        return info
+    }
+
+    /// The title shown for it: the broadcaster's, else the channel's name.
+    func displayTitle(channel: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? channel : trimmed
+    }
+
+    /// The scheduled start, when the catalog announced exactly this one.
+    var announcedStart: Date? {
+        guard let announcedStartMs, announcedStartMs == scheduledStartMs else { return nil }
+        return Date(timeIntervalSince1970: Double(announcedStartMs) / 1000)
+    }
+
+    var scheduledStart: Date? {
+        scheduledStartMs.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+    }
+
+    /// `ant_stream_catalog_publish`'s config: announce an upcoming
+    /// broadcast on the channel `topicText` (``ChannelAddress/antstreamTopic``)
+    /// with this info, the rendition the broadcast will go out in as the
+    /// entry's rung.
+    func catalogPublishConfig(
+        gateway: String,
+        batchId: String,
+        channel: String,
+        topicText: String = ChannelAddress.antstreamTopic,
+        width: Int,
+        height: Int,
+        bitrateKbps: Int
+    ) -> [String: Any] {
+        [
+            "gateway": gateway,
+            "batch_id": batchId,
+            "channel": channel,
+            "topic_text": topicText,
+            "info": infoObject(),
+            "width": width,
+            "height": height,
+            "bitrate_kbps": bitrateKbps,
+        ]
+    }
+
+    /// 64 hex digits, `0x` optional: what `info.thumbnail` takes.
+    static func isReference(_ text: String) -> Bool {
+        let bare = ChannelAddress.stripHexPrefix(text)
+        return bare.count == 64 && bare.allSatisfy(\.isASCIIHex)
+    }
+}
+
+/// A channel's entry in its owner's catalog (#220): what the Watch tab
+/// shows about the channel it plays. Each account publishes one catalog
+/// feed (owner the account, topic text ``topicText``) whose newest update
+/// is a JSON array of Solar Punk catalog entries.
+struct CatalogEntry: Equatable {
+    /// The catalog feed's topic text, hashed like the channel's.
+    static let topicText = "antstream-catalog"
+
+    let title: String
+    let description: String
+    /// `"scheduled"`, `"live"` or `"vod"` (anything else is kept as is).
+    let state: String
+    /// The thumbnail's reference (64 lowercase hex), when it has one.
+    let thumbnail: String?
+    /// `scheduledStartTime`, when it has a readable one.
+    let scheduledStart: Date?
+
+    /// The start an upcoming broadcast announces: a `"scheduled"` entry's.
+    var upcomingStart: Date? { state == "scheduled" ? scheduledStart : nil }
+
+    /// Caps on what is shown from an entry anyone could have written.
+    static let maxTitle = 200
+    static let maxDescription = 2000
+
+    /// The entry for `channel` in a catalog feed's body, or `nil`. The
+    /// body is untrusted: anything that is not an array, entries that are
+    /// not objects, fields of the wrong type are skipped, never trusted.
+    /// The same rule as Android's `Catalog.select` and the web player: an
+    /// entry is the channel's when its `owner` is the channel's owner
+    /// (`0x` and case aside) and its `topic` is the channel's topic text
+    /// (for a raw-topic channel, a text `topicHex` hashes to its topic;
+    /// without `topicHex` a raw-topic channel has none). Of several, the
+    /// newest `timestamp` wins, the later one on a tie. A chosen entry
+    /// with neither a title nor a description says nothing to show.
+    static func find(
+        in data: Data,
+        channel: ChannelAddress,
+        topicHex: ((String) -> String?)? = nil
+    ) -> CatalogEntry? {
+        guard let array = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return nil }
+        let matches: (String) -> Bool
+        switch channel.topic {
+        case .text(let topic):
+            matches = { $0 == topic }
+        case .raw(let hex):
+            guard let topicHex else { return nil }
+            matches = { topicHex($0)?.lowercased() == hex.lowercased() }
+        }
+        var best: (at: Double, object: [String: Any])?
+        for case let object as [String: Any] in array {
+            guard let owner = object["owner"] as? String,
+                  ChannelAddress.stripHexPrefix(owner).lowercased() == channel.owner,
+                  let topic = object["topic"] as? String, !topic.isEmpty, matches(topic)
+            else { continue }
+            // `Bool` bridges to `NSNumber` too: only a real number counts.
+            let number = object["timestamp"] as? NSNumber
+            let value = number.flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? nil : $0.doubleValue } ?? 0
+            let at = value.isFinite ? value : 0
+            if let best, at < best.at { continue }
+            best = (at, object)
+        }
+        guard let object = best?.object else { return nil }
+        let title = clean(object["title"], max: maxTitle)
+        let description = clean(object["description"], max: maxDescription)
+        guard !title.isEmpty || !description.isEmpty else { return nil }
+        let thumbnail = (object["thumbnail"] as? String).flatMap { ref -> String? in
+            StreamInfo.isReference(ref) ? ChannelAddress.stripHexPrefix(ref).lowercased() : nil
+        }
+        return CatalogEntry(
+            title: title,
+            description: description,
+            state: clean(object["state"], max: 20),
+            thumbnail: thumbnail,
+            scheduledStart: (object["scheduledStartTime"] as? String).flatMap(parseDate)
+        )
+    }
+
+    /// A string field, trimmed and capped; anything else is empty.
+    private static func clean(_ value: Any?, max: Int) -> String {
+        guard let text = value as? String else { return "" }
+        return String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(max))
+    }
+
+    /// ISO 8601, with or without fractional seconds (JavaScript's
+    /// `toISOString` has them).
+    static func parseDate(_ text: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: text) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: text)
     }
 }
 

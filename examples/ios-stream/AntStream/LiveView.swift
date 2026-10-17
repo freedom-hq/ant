@@ -52,6 +52,8 @@ struct LiveView: View {
     /// flip the preview hasn't caught up with) is ignored until the
     /// preview reports its own (``previewFrameTall``).
     @State private var previewReading: PreviewReading?
+    /// The stream info editor (#220), before going live and while live.
+    @State private var showInfo = false
 
     struct PreviewReading: Equatable {
         let session: ObjectIdentifier
@@ -96,6 +98,10 @@ struct LiveView: View {
             broadcast.pinForResume(owner: owner)
         }
         .overlay(alignment: .top) { BannerView(message: banner.message) }
+        .sheet(isPresented: $showInfo) {
+            StreamInfoEditor(live: broadcast.state.isActive,
+                             channelName: channel.isEmpty ? "AntStream" : channel)
+        }
         .alert(lowCapacityTitle, isPresented: $confirmLowCapacity) {
             Button("Go live anyway", role: .destructive) {
                 Task { await goLive() }
@@ -430,6 +436,7 @@ struct LiveView: View {
                         .foregroundStyle(.white)
                         .padding(.vertical, 6)
                 }
+                streamInfoRow
                 if case .failed(let message) = broadcast.state {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .font(.footnote)
@@ -528,12 +535,55 @@ struct LiveView: View {
                     .foregroundStyle(.orange.opacity(0.9))
                     .lineLimit(2)
             }
+            if let catalog = progress.catalogError, !catalog.isEmpty {
+                // The channel's catalog entry (#220) didn't go up: players'
+                // channel lists miss the title and thumbnail. Viewers of
+                // the channel itself are unaffected.
+                Text("Channel listing not updated: \(catalog)")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let recovery = progress.recoveryError, !recovery.isEmpty {
                 // The crash-recovery entry (#175) isn't saving: a kill now
                 // could not be resumed. Viewers are unaffected.
                 Text("Crash recovery off: \(recovery)")
                     .font(.caption2)
                     .foregroundStyle(.yellow.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The stream info's title (#220), a tap from its editor: before going
+    /// live and while live (where saving updates the channel's catalog
+    /// entry at once).
+    private var streamInfoRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Button { showInfo = true } label: {
+                HStack(spacing: 10) {
+                    StreamThumbnailView(jpeg: node.thumbnailJPEG, width: 48)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(node.streamInfo.displayTitle(channel: channel.isEmpty ? "AntStream" : channel))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                        Text(node.thumbnailUploading ? "Uploading the thumbnail…" : "Stream info")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "square.and.pencil")
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Edit stream info")
+            if let problem = node.streamInfoError {
+                Text(problem)
+                    .font(.caption2)
+                    .foregroundStyle(.orange.opacity(0.9))
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -765,21 +815,34 @@ struct LiveView: View {
         }
     }
 
+    /// An announcement (#220) is still being written to the catalog, and
+    /// the library refuses a start until it returns: Go live waits.
+    private var heldByAnnouncement: Bool {
+        !broadcast.state.isActive && node.announcingBroadcast
+    }
+
     private func controlStack(now: Date) -> some View {
-        let blocked = blockedByUnfinished(now: now)
+        let held = heldByAnnouncement
+        let unfinished = blockedByUnfinished(now: now)
         return VStack(spacing: 8) {
-            if blocked {
+            if held {
+                Text(AntNode.announcingHoldNote)
+                    .font(.caption)
+                    .foregroundStyle(.yellow.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if unfinished {
                 Text("End your unfinished broadcast on the Broadcast tab first: a new one would leave it without its recording.")
                     .font(.caption)
                     .foregroundStyle(.yellow.opacity(0.9))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            controlButton(blocked: blocked)
+            controlButton(blocked: unfinished || held, title: controlTitle(blocked: unfinished))
         }
     }
 
-    private func controlButton(blocked: Bool) -> some View {
+    private func controlButton(blocked: Bool, title: String) -> some View {
         Button {
             Task {
                 if broadcast.state.isActive {
@@ -791,7 +854,7 @@ struct LiveView: View {
                 }
             }
         } label: {
-            Text(controlTitle(blocked: blocked))
+            Text(title)
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -811,7 +874,7 @@ struct LiveView: View {
         guard !broadcast.state.isActive else { return }
         // Checked again at the tap (and after the capacity question): the
         // entry may have aged past the reap window since the last redraw.
-        guard !blockedByUnfinished(now: Date()) else { return }
+        guard !blockedByUnfinished(now: Date()), !heldByAnnouncement else { return }
         let resume = resumePending
         resumePending = false
         lastRunWasResume = resume

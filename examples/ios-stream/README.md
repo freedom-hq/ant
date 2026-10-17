@@ -26,8 +26,9 @@ Bundle id: `baby.freedom.antstream`. Data dir:
 | `CaptureEngine.swift` | #65: `AVCaptureSession` → H.264 → `AVAssetWriter` in `.mpeg4AppleHLS` mode, emitting fMP4 segments; interruption handling and the on-disk segment ring. |
 | `LiveBroadcast.swift` | Joins capture to `ant_publisher_*`, holds the foreground keep-alive, polls publish progress. |
 | `LiveView.swift` | The going-live screen: quality presets, preview, publish-lag indicator, live counters, channel share. |
-| `WatchView.swift` | The Watch tab: `AVPlayer` on a solar-punk channel from the in-process gateway (`GET /feeds`, segment references rewritten to `/bytes/`), with automatic retry. |
-| `ChannelAddress.swift` | A channel as owner + topic: link parsing, the links Share sends, the playlist rewrite and the publisher config. Foundation only; `ci/channel-address-tests.swift` tests it in CI. |
+| `StreamInfoView.swift` | The stream info editor (#220): title, description, thumbnail, scheduled start and Announce. |
+| `WatchView.swift` | The Watch tab: `AVPlayer` on a solar-punk channel from the in-process gateway (`GET /feeds`, segment references rewritten to `/bytes/`), with automatic retry, and the channel's catalog entry (title, description). |
+| `ChannelAddress.swift` | A channel as owner + topic: link parsing, the links Share sends, the playlist rewrite, the publisher config, the stream info and reading a catalog entry. Foundation only; `ci/channel-address-tests.swift` tests it in CI. |
 | `BenchView.swift` | #67 stage 1: the throughput bench sheet. |
 | `GetStartedView.swift` | Ported onboarding: plan tiers → on-chain quote → payment detection → one-shot auto-activation. |
 | `StorageView.swift` | Ported storage tab: plan meter, extend/top-up, settlement warning, account + key backup/restore. |
@@ -327,8 +328,11 @@ launch arguments open the app straight onto one surface each:
 `-antstream-shot-live-idle` (quality picker), `-antstream-shot-live-paused`
 (with `-antstream-shot-live`: the broadcast paused as if offline, then
 ending itself a minute on), `-antstream-shot-channel`
-(the channel card, with sample state), `-antstream-shot-watch` (the
-Watch tab on a sample channel), `-antstream-shot-getstarted-help` (the
+(the channel card, with sample state), `-antstream-shot-info` (the
+stream info card with sample info; `-antstream-shot-info-edit` opens its
+editor), `-antstream-shot-watch` (the
+Watch tab on a sample channel; `-antstream-shot-watch-info` adds a
+sample catalog entry), `-antstream-shot-getstarted-help` (the
 payment ⓘ sheet), plus the Storage and Get Started hooks in
 `RootView.swift`.
 
@@ -370,6 +374,44 @@ part of the topic, so renaming it never forks the channel.
   ended, in its own format: carrying it on would keep writing a format
   the viewers no longer read.
 
+## Stream info
+
+The Broadcast tab's **Stream info** card (and the stream info row on
+the live screen, before going live and while live) opens an editor for
+what players list the channel with (#220): a **title** (required; it
+starts as the channel's name, and a title left at the name follows it),
+an optional **description**, a **thumbnail** and an optional **scheduled
+start**. It is remembered per account (`UserDefaults`, keyed by the
+account address; the thumbnail image as
+`Application Support/antstream/stream-thumbnail-<owner>.jpg`) for the
+next broadcast.
+
+Every broadcast passes it as the publisher config's `"info"`, so the node
+keeps the account's catalog feed (topic text `antstream-catalog`)
+holding the channel's Solar Punk catalog entry: "live" while it runs,
+"vod" after. Saving while live calls `ant_publisher_set_info`, which
+rewrites the entry at once. **End broadcast** on a killed broadcast
+passes the info too, so its "live" entry is replaced with "vod". The live screen shows the progress's
+`catalog_error`, if any, under the counters; a catalog write that fails
+never stops the broadcast.
+
+The thumbnail is a frame from the camera, taken five seconds after Go
+live (`CaptureEngine.thumbnailJPEG()`: the next video frame, upright as
+encoded, scaled to 640 px on its long side and saved as a JPEG of a few
+tens of KB), unless the broadcaster chose a photo (`PhotosPicker`,
+scaled the same way). Either one goes up with
+`ant_stream_thumbnail_upload` through the in-process gateway, stamped
+with the plan's batch, and its reference goes into the info. A chosen
+photo goes up when it is saved if there is a plan, else at the next Go
+live; a captured frame replaces the last one on every broadcast.
+
+With a scheduled start, **Announce** (not while live) calls
+`ant_stream_catalog_publish`: the entry becomes "scheduled" with the
+start time, so players list the broadcast as upcoming; the library's
+message shows if it fails. The Broadcast tab's card shows the announced
+start. Going live replaces the entry with the live one and clears the
+schedule.
+
 ## Watch
 
 The **Watch** tab plays a channel with `AVPlayer` through the
@@ -395,6 +437,15 @@ yet, an item that fails to load, and a live playlist that stops moving
 channel after a short pause, with a plain message saying so; a closed
 playlist that played to the end says the broadcast has ended. Loopback
 HTTP is covered by the ATS exception in `Info.plist`.
+
+Over the player the tab shows the channel's title and description (and
+"Starts …" for an announced broadcast) from its owner's catalog feed
+(`GET /feeds/<owner>/<keccak256("antstream-catalog")>`, whose body is the
+catalog's JSON array; #220). It is read beside playback, never in front
+of it, when the channel changes and then once a minute; a result for a
+channel no longer shown is dropped, and a missing or unreadable catalog
+(the JSON is untrusted: wrong types and unknown fields are skipped)
+shows nothing extra.
 
 ## Differences from Android
 

@@ -35,6 +35,9 @@ struct BroadcastView: View {
     /// What ending it said, shown on the card until it goes.
     @State private var unfinishedOutcome: String?
     @State private var confirmDiscard = false
+    /// The stream info editor (#220). Opened on launch by
+    /// `-antstream-shot-info-edit` for `antstream-visual`.
+    @State private var showInfoEditor = false
 
     init(onWatch: @escaping (String) -> Void = { _ in }) {
         self.onWatch = onWatch
@@ -57,6 +60,10 @@ struct BroadcastView: View {
                         }
                         liveCard
                         if let address = node.channel?.address { channelCard(address) }
+                        if node.channel != nil {
+                            streamInfoCard
+                                .id(Self.streamInfoID)
+                        }
                         checklistCard
                             .id(Self.checklistID)
                         benchCard
@@ -69,6 +76,21 @@ struct BroadcastView: View {
                 .scrollIndicators(.hidden)
                 .refreshable { await node.refreshAll() }
                 .task {
+                    // antstream-visual: `-antstream-shot-info` (#220) is
+                    // about the stream info card, below the channel card:
+                    // bring it into the shot once the sample is in.
+                    // `-antstream-shot-info-announcing` is about the held
+                    // Go live at the top, so it stays there.
+                    if RootView.shotArgs.contains("-antstream-shot-info"),
+                       !RootView.shotArgs.contains("-antstream-shot-info-edit"),
+                       !RootView.shotArgs.contains("-antstream-shot-info-announcing") {
+                        for _ in 0..<60 where node.streamInfo.title.isEmpty {
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        withAnimation { proxy.scrollTo(Self.streamInfoID, anchor: .top) }
+                        return
+                    }
                     // antstream-visual: `-antstream-shot-low-capacity` and
                     // `-antstream-shot-unusable-plan` (#176) are about the
                     // checklist's "Room for a broadcast" row, which sits
@@ -89,11 +111,28 @@ struct BroadcastView: View {
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .sheet(isPresented: $showBench) { BenchView() }
+        .sheet(isPresented: $showInfoEditor) {
+            StreamInfoEditor(live: node.broadcastRunning, channelName: channelName)
+        }
         .fullScreenCover(isPresented: $showLive, onDismiss: {
             resumeLive = false
             node.refreshUnfinishedBroadcast()
         }) { LiveView(resume: resumeLive) }
         .task {
+            // antstream-visual: `-antstream-shot-info` shows the stream
+            // info card filled in (#220), `-antstream-shot-info-edit` its
+            // editor. A fresh runner account has no stream info, so sample
+            // info stands in (nothing saved or uploaded).
+            if RootView.shotArgs.contains("-antstream-shot-info") {
+                for _ in 0..<60 where !node.status.isReady || node.channel == nil {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                node.installStreamInfoSample()
+                if RootView.shotArgs.contains("-antstream-shot-info-edit") {
+                    showInfoEditor = true
+                }
+                return
+            }
             // antstream-visual: `-antstream-shot-unfinished` shows the
             // card a relaunch after a killed broadcast opens on (#175). A
             // runner never has a broadcast killed under it, so a sample
@@ -162,6 +201,13 @@ struct BroadcastView: View {
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if node.announcingBroadcast {
+                    Text(AntNode.announcingHoldNote)
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Button {
                     resumeLive = false
                     showLive = true
@@ -178,7 +224,8 @@ struct BroadcastView: View {
                         .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
-                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil)
+                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil
+                          || node.announcingBroadcast)
             }
             .frame(maxWidth: .infinity)
         }
@@ -357,6 +404,76 @@ struct BroadcastView: View {
             .contentShape(.rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: stream info (#220)
+
+    private static let streamInfoID = "streamInfo"
+
+    /// The channel's name: the last broadcast's, else the device's.
+    private var channelName: String {
+        node.channel?.name ?? UIDevice.current.name
+    }
+
+    /// What the channel's catalog entry tells players (#220): the title,
+    /// description and thumbnail the next broadcast goes out with, and an
+    /// announced start. Edited in ``StreamInfoEditor``.
+    private var streamInfoCard: some View {
+        let info = node.streamInfo
+        return GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Stream info")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                HStack(alignment: .top, spacing: 12) {
+                    StreamThumbnailView(jpeg: node.thumbnailJPEG, width: 112)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(info.displayTitle(channel: channelName))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(info.description.isEmpty ? "No description" : info.description)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(info.description.isEmpty ? 0.45 : 0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let announced = info.announcedStart, announced > Date() {
+                    Label("Announced: starts \(announced.formatted(date: .abbreviated, time: .shortened))",
+                          systemImage: "megaphone.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else if let scheduled = info.scheduledStart, scheduled > Date() {
+                    Label("Scheduled for \(scheduled.formatted(date: .abbreviated, time: .shortened)), not announced yet",
+                          systemImage: "calendar")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                }
+                if node.thumbnailUploading {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Uploading the thumbnail…")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                }
+                if let problem = node.streamInfoError {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(info.thumbnailPicked || node.thumbnailJPEG == nil
+                     ? "Players list your channel with these."
+                     : "Players list your channel with these. The thumbnail is a frame from the camera, taken a few seconds after you go live.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+                GlassPillButton(title: "Edit", icon: "square.and.pencil", tint: .white.opacity(0.18)) {
+                    showInfoEditor = true
+                }
+            }
+        }
     }
 
     // MARK: readiness checklist

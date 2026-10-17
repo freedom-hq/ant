@@ -22,7 +22,9 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 pub mod bench;
+
 mod cache;
+pub mod catalog;
 mod chain_transport;
 mod drive;
 mod gateway;
@@ -213,6 +215,12 @@ pub struct AntHandle {
     /// in-flight window, which is precisely what the stage-1 window
     /// measurements say not to do.
     publisher: Mutex<Option<Arc<publisher::LiveRun>>>,
+    /// An [`ant_stream_catalog_publish`] is writing the account's catalog
+    /// feed. Set and checked under the `publisher` lock, so neither a
+    /// second announcement nor [`ant_publisher_start`] (whose run writes
+    /// the same catalog feed) can read the same head and take the same
+    /// index while it is out.
+    announcing: AtomicBool,
     /// Host-provided JSON-RPC transport for chain reads/writes (issue
     /// #77), installed by [`ant_set_chain_transport`]. Empty by default,
     /// which means every chain request goes to the configured
@@ -1061,6 +1069,7 @@ fn init_inner(
         gateway_cors: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
         publisher: Mutex::new(None),
+        announcing: AtomicBool::new(false),
         #[cfg(feature = "chain")]
         chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
         #[cfg(feature = "chain")]
@@ -3765,7 +3774,9 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// head doesn't leave the broadcast unrecorded and the closing window
 /// and recording still get ~70 s of the grace), and the closing window
 /// and recording add up to four
-/// more (an upload and a feed update each), so a slow or wedged uplink can outlive
+/// more (an upload and a feed update each), and the closing catalog entry
+/// (with stream info, issue #220) one or two more after them, so a slow or
+/// wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an
 /// honest report and the loop finishes in the background and releases
@@ -3780,7 +3791,9 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
 /// the report. Whatever the background loop still uploads after that
 /// gets no feed update (the recording keeps its reference, but the
-/// closing window or the live window before it stays the feed's head).
+/// closing window or the live window before it stays the feed's head),
+/// and no catalog update either: the next broadcast reads the catalog
+/// feed's head and writes after it.
 const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
 
 /// How long [`ant_publisher_stop`] waits, past [`PUBLISHER_STOP_GRACE`],
@@ -3973,7 +3986,8 @@ pub unsafe extern "C" fn ant_publisher_capacity(
 ///
 /// Returns immediately — the loop drives itself on the node's runtime.
 /// Poll it with [`ant_publisher_progress`] and finish it with
-/// [`ant_publisher_stop`]. Only one broadcast at a time per handle.
+/// [`ant_publisher_stop`]. Only one broadcast at a time per handle, and
+/// none while [`ant_stream_catalog_publish`] is writing.
 ///
 /// Returns `true` on success, `false` with an allocated message in
 /// `out_err` (free with [`ant_free_string`]) otherwise.
@@ -4019,6 +4033,16 @@ pub unsafe extern "C" fn ant_publisher_start(
             write_out_err(
                 out_err,
                 "ant_publisher_start: this node is already broadcasting",
+            );
+            return false;
+        }
+        // Its catalog writer would read the same catalog head as the
+        // announcement still on the wire and take the same index.
+        if handle.announcing.load(Ordering::SeqCst) {
+            write_out_err(
+                out_err,
+                "ant_publisher_start: an announcement is still being written to the \
+                 catalog; go live once it is done",
             );
             return false;
         }
@@ -4230,6 +4254,194 @@ unsafe fn publisher_call(
     }
 }
 
+/// Replace the running broadcast's **stream info** (issue #220): title,
+/// description, thumbnail reference and scheduled start, a
+/// [`catalog::StreamInfo`] JSON object (`{"title": "...", "description":
+/// "...", "thumbnail": "<64 hex>", "scheduled_start_ms": <unix ms>}`, every
+/// field optional; an empty title is the channel's name). The account's
+/// catalog feed gets the new entry at once once the broadcast is live
+/// (before that, at its first feed update), and the closing entry at stop
+/// carries it; see [`publisher::PublisherConfig::info`]. Non-blocking: the
+/// write runs in the broadcast's background, its outcome in the progress
+/// `catalog_*` fields. On a run that writes no catalog (a `"bzz"` channel,
+/// a raw topic) nothing is written and `catalog_error` says why.
+///
+/// Returns `0`, or `-1` with an error (no broadcast, invalid JSON, a
+/// thumbnail that is not a reference).
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `info_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable `*mut c_char`
+/// slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_set_info(
+    handle: *const AntHandle,
+    info_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        let info = match cstr_to_str(info_json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<catalog::StreamInfo>(raw)
+                    .map_err(|e| format!("ant_publisher_set_info: invalid info: {e}"))
+            }) {
+            Ok(info) => info,
+            Err(msg) => {
+                clear_out_err(out_err);
+                write_out_err(out_err, &msg);
+                return -1;
+            }
+        };
+        let mut refused = None;
+        let code = publisher_call(handle, out_err, "ant_publisher_set_info", |run| {
+            refused = run.set_info(info).err();
+        });
+        if let Some(message) = refused {
+            write_out_err(out_err, &format!("ant_publisher_set_info: {message}"));
+            return -1;
+        }
+        code
+    }
+}
+
+/// Announce an upcoming broadcast (issue #220): write the channel's
+/// `scheduled` catalog entry, with its title, description, thumbnail and
+/// `scheduledStartTime`, as the next update of the account's catalog feed
+/// (topic text [`catalog::CATALOG_TOPIC_TEXT`], owner this node's
+/// account), where Solar Punk's player and the `AntStream` player read
+/// it. `config_json` is a [`catalog::CatalogPublishConfig`]: `gateway`,
+/// `batch_id`, `channel`, `topic_text` (the apps' `antstream`), `info`
+/// (with `scheduled_start_ms` required), and optionally `width`, `height`
+/// and `bitrate_kbps` for the entry's rung. The next broadcast replaces the
+/// entry with its `live` one.
+///
+/// Returns an allocated [`catalog::CatalogPublished`] JSON string
+/// (`{"index": n, "entry": {...}}`, free with [`ant_free_string`]), or
+/// null with an error. Refused while a broadcast is running on this
+/// handle (it owns the catalog then; use [`ant_publisher_set_info`]) or
+/// another announcement is out; while it is out, [`ant_publisher_start`]
+/// is refused, so the two never write the same catalog index.
+///
+/// **Blocking**: a feed-head read, an upload and a feed update, each
+/// bounded by the publisher's 60 s per-request deadline, so call it off
+/// the UI thread. Costs a few chunks on the batch.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `config_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable `*mut c_char`
+/// slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_catalog_publish(
+    handle: *const AntHandle,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_stream_catalog_publish", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let raw = cstr_to_str(config_json).map_err(|e| e.to_string())?;
+            let config: catalog::CatalogPublishConfig =
+                serde_json::from_str(raw).map_err(|e| format!("invalid config: {e}"))?;
+            // Checked and claimed under the publisher lock, and held for
+            // the whole write: a broadcast started meanwhile (or another
+            // announcement) would read the same catalog head and write
+            // the same index.
+            let _announcing = {
+                let slot = handle
+                    .publisher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|run| !run.is_finished()) {
+                    return Err(
+                        "a broadcast is running: it writes the catalog (ant_publisher_set_info)"
+                            .to_string(),
+                    );
+                }
+                if handle.announcing.swap(true, Ordering::SeqCst) {
+                    return Err("another announcement is being written".to_string());
+                }
+                AnnouncingGuard(&handle.announcing)
+            };
+            let now_ms = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            let published = handle.runtime.block_on(catalog::publish_scheduled(
+                &config,
+                handle.signing_secret,
+                handle.eth,
+                now_ms,
+            ))?;
+            serde_json::to_string(&published).map_err(|e| format!("serialize: {e}"))
+        })
+    }
+}
+
+/// Clears [`AntHandle::announcing`] when an announcement returns, however
+/// it returns.
+struct AnnouncingGuard<'a>(&'a AtomicBool);
+
+impl Drop for AnnouncingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Upload a stream thumbnail (issue #220): a JPEG (or PNG) image, best a
+/// downscaled one about 640 px on its long side, a few tens of KB. It goes
+/// up as Solar Punk's admin uploads one (`POST /bzz` of the one file
+/// `thumbnail.jpg`), so their player's `/bzz/<ref>/` and the `AntStream`
+/// player both show it. `gateway` is the loopback gateway URL and
+/// `batch_id` the postage batch, as in the publisher config. Returns the
+/// reference (64 hex, an allocated string; free with [`ant_free_string`])
+/// for [`catalog::StreamInfo::thumbnail`], or null with an error.
+///
+/// **Blocking**: one upload, bounded by the publisher's 60 s per-request
+/// deadline; call it off the UI thread.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `gateway` and `batch_id` must be NUL-terminated
+/// UTF-8 strings; `data` must point at `len` readable bytes for the
+/// duration of the call. `out_err`, if non-null, must point at a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_thumbnail_upload(
+    handle: *const AntHandle,
+    gateway: *const c_char,
+    batch_id: *const c_char,
+    data: *const u8,
+    len: usize,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_stream_thumbnail_upload", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let gateway = cstr_to_str(gateway).map_err(|e| e.to_string())?;
+            let batch_id = cstr_to_str(batch_id).map_err(|e| e.to_string())?;
+            if data.is_null() || len == 0 {
+                return Err("empty image".to_string());
+            }
+            let image = std::slice::from_raw_parts(data, len).to_vec();
+            let target = publisher::Target::parse(gateway)?;
+            let batch = publisher::parse_hex32(batch_id).map_err(|e| format!("batch_id {e}"))?;
+            handle
+                .runtime
+                .block_on(catalog::upload_thumbnail(&target, batch, &image))
+                .map_err(|e| format!("upload thumbnail: {e}"))
+        })
+    }
+}
+
 /// Live progress of the broadcast started by [`ant_publisher_start`], as
 /// an allocated [`publisher::PublisherSnapshot`] JSON string (free with
 /// [`ant_free_string`]). Non-blocking — this is what drives the
@@ -4276,8 +4488,9 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// Returns after
 /// [`PUBLISHER_STOP_GRACE`] (~130 s), plus at most
 /// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
-/// wire then — a worst-case drain, closing window and recording can
-/// still be finishing in the background past that (see the constant) —
+/// wire then — a worst-case drain, closing window, recording and the
+/// closing catalog entry (with stream info) can still be finishing in
+/// the background past that (see the constant) —
 /// so call it off the UI thread. The report's `feed_index` (`null` when
 /// the run ended before its feed head ever answered: no position to hand
 /// on) is final either way: a run that outlives the grace writes no further feed
@@ -4640,6 +4853,115 @@ mod tests {
             hex,
             "0d5e5bb0926a65e53a03775874d917202164fd5d7c84dcdd118ab4294e172cc5"
         );
+    }
+
+    /// An announcement still on the wire holds the account's catalog
+    /// feed: a broadcast started meanwhile would read the same catalog
+    /// head and write the same index, so `ant_publisher_start` is refused
+    /// until the announcement returns (and so is a second announcement).
+    #[test]
+    fn nothing_writes_the_catalog_beside_an_announcement_on_the_wire() {
+        let (h, dir) = cache_test_handle("announce-busy", None);
+        // A gateway that takes the announcement's head read and holds it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(conn);
+        });
+        let announce = CString::new(
+            serde_json::json!({
+                "gateway": gateway,
+                "batch_id": "ab".repeat(32),
+                "channel": "Kitchen",
+                "topic_text": "antstream",
+                "info": {"title": "Soon", "scheduled_start_ms": 1_792_224_000_000_u64},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let call = |config: &CString| -> Result<String, String> {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let out = unsafe { ant_stream_catalog_publish(h, config.as_ptr(), &raw mut err) };
+            let take = |p: *mut c_char| {
+                let text = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+                unsafe { ant_free_string(p) };
+                text
+            };
+            if out.is_null() {
+                Err(take(err))
+            } else {
+                Ok(take(out))
+            }
+        };
+        let handle_addr = h as usize;
+        let announcer = {
+            let announce = announce.clone();
+            std::thread::spawn(move || {
+                let h = handle_addr as *const AntHandle;
+                let mut err: *mut c_char = std::ptr::null_mut();
+                let out = unsafe { ant_stream_catalog_publish(h, announce.as_ptr(), &raw mut err) };
+                for p in [out, err] {
+                    if !p.is_null() {
+                        unsafe { ant_free_string(p) };
+                    }
+                }
+            })
+        };
+        accepted_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the announcement reads the catalog head");
+
+        let mut config = serde_json::to_value(publisher::PublisherConfig {
+            channel: "Kitchen".into(),
+            topic: String::new(),
+            topic_text: "antstream".into(),
+            format: publisher::StreamFormat::SolarPunk,
+            gateway: "http://127.0.0.1:9".into(),
+            batch_id: "ab".repeat(32),
+            segment_ms: 2000,
+            bitrate_kbps: 900,
+            max_in_flight: 4,
+            max_backlog: 4,
+            playlist_window: 3,
+            notes: String::new(),
+            start_index: Some(0),
+            reap_ms: 0,
+            ladder: false,
+            width: 0,
+            height: 0,
+            recovery_path: String::new(),
+            resume: false,
+            info: None,
+        })
+        .unwrap();
+        config["info"] = serde_json::json!({"title": "Now"});
+        let config = CString::new(config.to_string()).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let started = unsafe { ant_publisher_start(h, config.as_ptr(), &raw mut err) };
+        assert!(!started, "a broadcast started beside the announcement");
+        let why = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { ant_free_string(err) };
+        assert!(why.contains("announcement"), "{why}");
+        assert!(unsafe { &*h }.publisher.lock().unwrap().is_none());
+        let second = call(&announce).unwrap_err();
+        assert!(second.contains("another announcement"), "{second}");
+
+        release_tx.send(()).unwrap();
+        announcer.join().unwrap();
+        server.join().unwrap();
+        assert!(
+            !unsafe { &*h }.announcing.load(Ordering::SeqCst),
+            "the claim goes with the announcement, failed or not"
+        );
+        unsafe { ant_shutdown(h) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The viewer's marker address is the publisher's: the vector
@@ -5456,6 +5778,7 @@ mod tests {
             gateway_cors: Mutex::new(Vec::new()),
             bench: Mutex::new(None),
             publisher: Mutex::new(None),
+            announcing: AtomicBool::new(false),
             #[cfg(feature = "chain")]
             chain_transport: Arc::new(chain_transport::HostChainTransport::new()),
             #[cfg(feature = "chain")]

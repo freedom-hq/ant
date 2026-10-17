@@ -682,9 +682,17 @@ struct PublisherSnapshot: Codable, Equatable {
     let batchUnusableRefusals: UInt64?
     /// The newest of those refusals, empty while there has been none.
     let batchError: String?
+    /// The channel's catalog entry (#220): entries that landed, and why
+    /// the last write failed or was skipped (empty while they land).
+    /// Never a broadcast failure: the channel plays without its entry.
+    /// Optional so a node without them decodes.
+    let catalogWrites: UInt64?
+    let catalogError: String?
 
     enum CodingKeys: String, CodingKey {
         case running, channel, topic, owner, peers, paused, reaped
+        case catalogWrites = "catalog_writes"
+        case catalogError = "catalog_error"
         case recoveryError = "recovery_error"
         case batchFullRefusals = "batch_full_refusals"
         case batchUnusableRefusals = "batch_unusable_refusals"

@@ -430,6 +430,7 @@ async fn a_broadcast_is_accepted_end_to_end_by_the_real_gateway() {
         height: 0,
         recovery_path: String::new(),
         resume: false,
+        info: None,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -1026,6 +1027,7 @@ async fn a_lost_segment_is_a_gap_entry_and_numbers_never_shift() {
         height: 0,
         recovery_path: String::new(),
         resume: false,
+        info: None,
     };
     let run = publisher::start(
         &tokio::runtime::Handle::current(),
@@ -1997,6 +1999,7 @@ fn capacity_config(addr: &str, format: StreamFormat, topic_text: &str) -> Publis
         height: 0,
         recovery_path: String::new(),
         resume: false,
+        info: None,
     }
 }
 

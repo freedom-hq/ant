@@ -79,6 +79,9 @@
     bw: $('stat-bw'),
     segments: $('stat-segments'),
     res: $('stat-res'),
+    infoTitle: $('info-title'),
+    infoWhen: $('info-when'),
+    infoDesc: $('info-desc'),
   };
 
   // -- addressing -----------------------------------------------------------
@@ -543,6 +546,197 @@
     if (Math.floor(m.writtenAt / MARKER_PERIOD_MS) !== period || !whole(m.segmentMs) || !m.segmentMs) return null;
     const index = m.rungs && m.rungs[ch.topicHex];
     return whole(index) ? index : null;
+  }
+
+  // -- the catalog ------------------------------------------------------------
+  //
+  // The channel owner's catalog feed (topic `antstream-catalog`, owner the
+  // channel's owner; crates/ant-ffi/src/catalog.rs) says what the channel
+  // is: a title, a description, a thumbnail and, for an announced
+  // broadcast, when it starts. Every update is the whole catalog, a JSON
+  // array with an entry per channel, so only the head is read: once when
+  // the channel opens, then every CATALOG_EVERY_MS while it waits or is
+  // live (the publisher rewrites the entry when its info changes). It is
+  // extra, never in playback's way: it starts beside the first playlist
+  // read and nothing waits for it, in Freedom it is only sent while the
+  // read budget has CATALOG_SPARE_* left for the playlist reads (else it
+  // is put off), and a read the channel changed under is dropped. A
+  // missing or unreadable catalog shows nothing extra.
+
+  const CATALOG_TOPIC_HEX = K.topicFromString('antstream-catalog');
+  const CATALOG_EVERY_MS = 60000;
+  const CATALOG_DEFER_MS = 10000;
+  const CATALOG_SPARE_REQUESTS = 20;
+  const CATALOG_SPARE_BYTES = 64 * 1024;
+  // More than any one channel's catalog should be: not parsed.
+  const CATALOG_MAX_BYTES = 256 * 1024;
+
+  // `entry`: the channel's entry, cleaned (see catalogEntry), or null.
+  const catalog = { gen: 0, key: null, entry: null, timer: null, reads: 0, lastAt: 0, last: '' };
+
+  const str = (v) => (typeof v === 'string' ? v : '');
+
+  /**
+   * This channel's entry in a catalog body, every field checked (the
+   * catalog is the owner's own JSON, and may be anything): the entry whose
+   * owner is the channel's and whose topic text hashes to the channel's
+   * topic (`Topic.fromString`, as Solar Punk's readers do; a 64-hex topic
+   * is text too). Of several, the newest `timestamp` wins, the later one
+   * on a tie: the same rule as Android's `Catalog.select` and iOS's
+   * `CatalogEntry.find`. Null when there is none.
+   */
+  function catalogEntry(text, ch) {
+    let list;
+    try {
+      list = JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+    if (!Array.isArray(list)) return null;
+    let best = null;
+    for (const e of list) {
+      if (!e || typeof e !== 'object') continue;
+      const owner = OWNER.exec(str(e.owner));
+      if (!owner || owner[1].toLowerCase() !== ch.owner) continue;
+      const topic = str(e.topic);
+      if (!topic) continue;
+      if (K.topicFromString(topic) !== ch.topicHex) continue;
+      const at = Number.isFinite(e.timestamp) ? e.timestamp : 0;
+      if (best && at < best.at) continue;
+      const start = typeof e.scheduledStartTime === 'string' || Number.isFinite(e.scheduledStartTime)
+        ? new Date(e.scheduledStartTime) : null;
+      best = {
+        at,
+        title: str(e.title).trim(),
+        description: str(e.description).trim(),
+        state: str(e.state),
+        thumbnail: /^[0-9a-f]{64}$/i.test(str(e.thumbnail)) ? e.thumbnail.toLowerCase() : null,
+        start: start && !Number.isNaN(start.getTime()) ? start : null,
+      };
+    }
+    return best;
+  }
+
+  /** Where a thumbnail (a one-file /bzz manifest) is shown from here. */
+  function thumbnailUrl(ref) {
+    return inBzz ? `bzz://${ref}/` : `${gatewayRoot}/bzz/${ref}/`;
+  }
+
+  /** Room in Freedom's budget for an extra read, playback's reads kept clear of it. */
+  function catalogRoom(now) {
+    if (!inBzz) return true;
+    if (!budgetFree(now, 0)) return false;
+    const bytes = budget.reads.reduce((n, r) => n + r.bytes, 0);
+    return budget.reads.length <= BUDGET_REQUESTS - CATALOG_SPARE_REQUESTS && bytes <= BUDGET_BYTES - CATALOG_SPARE_BYTES;
+  }
+
+  function scheduleCatalog(ms) {
+    clearTimeout(catalog.timer);
+    catalog.timer = setTimeout(readCatalog, ms);
+  }
+
+  /**
+   * Open the catalog for channel `ch`: a new channel drops what the last
+   * one showed (and any of its reads still under way) and reads at once;
+   * the same channel (a retry, a new broadcast) keeps it, and `fresh`
+   * reads it again now.
+   */
+  function openCatalog(ch, fresh) {
+    if (catalog.key !== ch.key) {
+      catalog.gen += 1;
+      catalog.key = ch.key;
+      catalog.entry = null;
+      catalog.reads = 0;
+      catalog.lastAt = 0;
+      catalog.last = '';
+      renderCatalog();
+      scheduleCatalog(0);
+    } else if (fresh) {
+      scheduleCatalog(0);
+    }
+  }
+
+  async function readCatalog() {
+    const ch = channel;
+    if (!ch || ch.key !== catalog.key) return;
+    // A broadcast that ended plays its recording: nothing left to announce.
+    // A new one on the channel reads it again (openCatalog `fresh`).
+    if (ended) return scheduleCatalog(CATALOG_EVERY_MS);
+    if (!catalogRoom(Date.now())) return scheduleCatalog(CATALOG_DEFER_MS);
+    const gen = catalog.gen;
+    const wanted = () => gen === catalog.gen;
+    catalog.reads += 1;
+    const row = log.add({
+      kind: 'playlist',
+      read: 'catalog',
+      index: null,
+      period: null,
+      via: VIA,
+      start: performance.now(),
+      ms: null,
+      status: 'loading',
+      seq: null,
+      segments: null,
+      note: '',
+    });
+    let a;
+    try {
+      a = await readHead({ owner: ch.owner, topicHex: CATALOG_TOPIC_HEX }, wanted);
+    } catch (err) {
+      a = { status: 'error', note: err.message };
+    }
+    row.ms = performance.now() - row.start;
+    row.status = a.status;
+    row.note = a.note || '';
+    if (typeof a.index === 'number') row.index = a.index;
+    log.touch();
+    if (!wanted()) return;
+    catalog.lastAt = Date.now();
+    if (a.status === 200) {
+      const entry = a.text.length > CATALOG_MAX_BYTES ? null : catalogEntry(a.text, ch);
+      catalog.entry = entry;
+      catalog.last = entry ? `${entry.state || 'no state'}${entry.title ? ` · ${entry.title}` : ''}` : 'no entry for this channel';
+      note(row, entry ? `catalog: ${catalog.last}` : 'catalog: no readable entry for this channel');
+      renderCatalog();
+    } else {
+      // Not written (404), or not read this time: keep what is shown.
+      catalog.last = a.status === 404 ? 'no catalog' : `not read (${a.status})`;
+      if (a.status === 404) note(row, 'no catalog');
+    }
+    scheduleCatalog(CATALOG_EVERY_MS);
+  }
+
+  /**
+   * "Starts at …" for an announced broadcast while the channel waits for
+   * it; empty otherwise.
+   */
+  function startsAt() {
+    const e = catalog.entry;
+    if (!e || e.state !== 'scheduled' || !e.start || everPlayed) return '';
+    const when = e.start.toLocaleString(undefined, {
+      weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+    });
+    return e.start.getTime() > Date.now() ? `Starts at ${when}` : `Was scheduled to start at ${when}`;
+  }
+
+  /** Show the catalog entry (or nothing): heading, description, poster, start. */
+  function renderCatalog() {
+    const e = catalog.entry;
+    const title = e && e.title ? e.title : '';
+    els.infoTitle.textContent = title;
+    els.infoTitle.hidden = !title;
+    els.infoDesc.textContent = e ? e.description : '';
+    els.infoDesc.hidden = !(e && e.description);
+    const when = startsAt();
+    els.infoWhen.textContent = when;
+    els.infoWhen.hidden = !when;
+    document.title = title ? `${title} · AntStream Player` : 'AntStream Player';
+    const poster = e && e.thumbnail ? thumbnailUrl(e.thumbnail) : '';
+    if (poster) {
+      if (video.getAttribute('poster') !== poster) video.setAttribute('poster', poster);
+    } else {
+      video.removeAttribute('poster');
+    }
   }
 
   // -- playlist reads -------------------------------------------------------
@@ -1421,6 +1615,8 @@
       lastFetchMs = s.loading.end - s.loading.start;
     });
     hls.on(Hls.Events.ERROR, (_e, data) => onError(data));
+    // Beside the first playlist read, never before it: see "the catalog".
+    openCatalog(ch, !!next);
     statsTimer = setInterval(updateStats, 1000);
     tickTimer = setInterval(tick, 250);
   }
@@ -1516,7 +1712,11 @@
     if (!hls) return;
     const playing = !video.paused && video.readyState >= 3;
     if (playing) {
-      everPlayed = true;
+      if (!everPlayed) {
+        everPlayed = true;
+        // On now: no more "Starts at".
+        renderCatalog();
+      }
       setOverlay('');
     }
     const latency = hls.latency;
@@ -1686,9 +1886,10 @@
     gate,
     feed,
     budget,
+    catalog,
     via: VIA,
     // One feed read by hand, e.g. `antstreamPlayer.read.slot(antstreamPlayer.channel, 12)`.
-    read: { head: readHead, slot: readSlot },
+    read: { head: readHead, slot: readSlot, catalog: (ch) => readHead({ owner: ch.owner, topicHex: CATALOG_TOPIC_HEX }) },
     get channel() {
       return channel;
     },

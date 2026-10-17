@@ -453,6 +453,7 @@ mod tests {
             gateway_cors: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
             publisher: std::sync::Mutex::new(None),
+            announcing: std::sync::atomic::AtomicBool::new(false),
             chain_transport: std::sync::Arc::new(HostChainTransport::new()),
             unverified_logs: std::sync::Mutex::new(None),
             chain_init: std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(

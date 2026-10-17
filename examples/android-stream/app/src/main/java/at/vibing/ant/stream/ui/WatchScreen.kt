@@ -35,7 +35,13 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylistTracker
 import kotlinx.coroutines.delay
 import androidx.media3.ui.PlayerView
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.platform.testTag
 import at.vibing.ant.stream.AntNode
+import at.vibing.ant.stream.Catalog
+import at.vibing.ant.stream.CatalogEntry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import at.vibing.ant.stream.ChannelAddress
 import at.vibing.ant.stream.FeedDataSource
 import at.vibing.ant.stream.FeedFollower
@@ -148,6 +154,30 @@ fun WatchScreen(node: AntNode, initialChannel: String) {
                     delay(1_000)
                 }
             }
+            // The channel's listing (title, description, a scheduled start)
+            // from the owner's catalog feed: read beside playback, never
+            // before it, and again every minute. A read that lands after
+            // another channel took over is dropped; no catalog, or one
+            // without an entry for this channel, shows nothing extra.
+            var listing by remember(ref) { mutableStateOf<CatalogEntry?>(null) }
+            val shown by rememberUpdatedState(playing)
+            LaunchedEffect(ref) {
+                while (true) {
+                    val result = withContext(Dispatchers.IO) { runCatching { Catalog.fetch(node.gatewayUrl, channel) } }
+                    // A failed read (the gateway busy) keeps what was shown.
+                    if (shown?.let(ChannelAddress::parse)?.key == ref) result.onSuccess { listing = it }
+                    delay(CATALOG_REFRESH_MS)
+                }
+            }
+            listing?.let { entry ->
+                if (entry.title.isNotEmpty()) {
+                    Text(entry.title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.testTag("watchTitle"))
+                }
+                entry.description?.let {
+                    Text(it, color = Color.Gray, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("watchDescription"))
+                }
+                entry.startsAt()?.let { Text(it, color = Amber, modifier = Modifier.testTag("watchStartsAt")) }
+            }
             AndroidView(
                 factory = { PlayerView(it).apply { this.player = player } },
                 // Another channel played is another player.
@@ -160,3 +190,6 @@ fun WatchScreen(node: AntNode, initialChannel: String) {
         }
     }
 }
+
+/** How often the Watch tab re-reads the channel's catalog entry. */
+private const val CATALOG_REFRESH_MS = 60_000L

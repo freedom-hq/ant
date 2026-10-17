@@ -29,6 +29,8 @@ struct WatchView: View {
     /// The channel being played (``ChannelAddress/key``), or `nil`.
     @Binding var playing: String?
     @StateObject private var watcher = ChannelWatcher()
+    /// The channel's catalog entry (#220): its title and description.
+    @StateObject private var catalog = CatalogWatcher()
 
     init(reference: Binding<String>, playing: Binding<String?>) {
         _reference = reference
@@ -57,12 +59,22 @@ struct WatchView: View {
         // Android screen releasing its player when it goes away.
         .onAppear {
             if reference.isEmpty, let own = node.channel?.address { reference = own.display }
+            // antstream-visual: `-antstream-shot-watch-info` (with
+            // `-antstream-shot-watch`) shows a catalog entry's title and
+            // description over the player (#220). The sample channel has
+            // no catalog, so a sample entry stands in.
+            if RootView.shotArgs.contains("-antstream-shot-watch-info") {
+                catalog.installSample()
+            }
             resume()
         }
         .onChange(of: node.channel) { _, channel in
             if reference.isEmpty, let own = channel?.address { reference = own.display }
         }
-        .onDisappear { watcher.stop() }
+        .onDisappear {
+            watcher.stop()
+            catalog.stop()
+        }
         .onChange(of: playing) { _, _ in resume() }
         .onChange(of: node.gatewayAddress) { _, _ in resume() }
     }
@@ -127,14 +139,17 @@ struct WatchView: View {
         // viewer retries by hand.
         if let gateway = node.gatewayURL {
             watcher.play(channel: channel, gateway: gateway, restart: true)
+            catalog.follow(channel: channel, gateway: gateway)
         }
     }
 
     private func resume() {
         if let playing, let channel = ChannelAddress.parse(playing), let gateway = node.gatewayURL {
             watcher.play(channel: channel, gateway: gateway)
+            catalog.follow(channel: channel, gateway: gateway)
         } else {
             watcher.stop()
+            catalog.stop()
         }
     }
 
@@ -143,6 +158,9 @@ struct WatchView: View {
     private var playerCard: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 12) {
+                if let entry = catalog.entry {
+                    catalogInfo(entry)
+                }
                 VideoPlayer(player: watcher.player)
                     .aspectRatio(16 / 9, contentMode: .fit)
                     .clipShape(.rect(cornerRadius: 16))
@@ -168,6 +186,123 @@ struct WatchView: View {
                 }
             }
         }
+    }
+}
+
+extension WatchView {
+    /// What the channel's owner says about it in their catalog (#220):
+    /// the title, the description, and an announced start.
+    fileprivate func catalogInfo(_ entry: CatalogEntry) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if !entry.title.isEmpty {
+                Text(entry.title)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !entry.description.isEmpty {
+                Text(entry.description)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let start = entry.upcomingStart {
+                Label("Starts \(start.formatted(date: .abbreviated, time: .shortened))",
+                      systemImage: "calendar")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.yellow.opacity(0.9))
+            }
+        }
+    }
+}
+
+/// Reads the catalog of the channel the Watch tab plays (#220): the
+/// owner's catalog feed (`GET <gateway>/feeds/<owner>/<keccak256
+/// "antstream-catalog">`, whose body is the JSON array), for the channel's
+/// entry. Beside playback, never in front of it: its own task, read when
+/// the channel changes and then once a minute. A result for a channel no
+/// longer shown is dropped; a missing or unreadable catalog shows nothing.
+@MainActor
+final class CatalogWatcher: ObservableObject {
+    @Published private(set) var entry: CatalogEntry?
+
+    private struct Source: Equatable {
+        let channel: ChannelAddress
+        let gateway: URL
+    }
+
+    private var source: Source?
+    private var task: Task<Void, Never>?
+    /// Set by ``installSample()``: the sample stays put for the shot.
+    private var sampleActive = false
+
+    /// How often the catalog is read again: it changes with the
+    /// broadcaster's edits and at most once a minute while live.
+    private static let refreshSeconds: UInt64 = 60
+
+    /// Follow `channel`'s catalog entry. A no-op when it already does.
+    func follow(channel: ChannelAddress, gateway: URL) {
+        if sampleActive { return }
+        let next = Source(channel: channel, gateway: gateway)
+        guard next != source else { return }
+        if source?.channel != channel { entry = nil }
+        source = next
+        task?.cancel()
+        task = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.read(next)
+                try? await Task.sleep(nanoseconds: Self.refreshSeconds * 1_000_000_000)
+            }
+        }
+    }
+
+    func stop() {
+        if sampleActive { return }
+        task?.cancel()
+        task = nil
+        source = nil
+        entry = nil
+    }
+
+    /// One read of `source`'s catalog. A network failure keeps what is
+    /// shown; a catalog that isn't there or has no entry for the channel
+    /// clears it.
+    private func read(_ source: Source) async {
+        // A raw-topic channel finds the entry whose topic text hashes to
+        // it, as on Android and the web player.
+        guard let topic = FeedAddress.topicHex(CatalogEntry.topicText) else {
+            entry = nil
+            return
+        }
+        let url = source.gateway.appending(path: "feeds/\(source.channel.owner)/\(topic)")
+        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        let result = try? await URLSession.shared.data(for: request)
+        // The channel changed (or the tab stopped) while the read was out.
+        guard !Task.isCancelled, !sampleActive, self.source == source else { return }
+        guard let (data, response) = result else { return }
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let found = code == 200 ? CatalogEntry.find(in: data, channel: source.channel, topicHex: FeedAddress.topicHex) : nil
+        if found != entry { entry = found }
+    }
+
+    /// A catalog entry for the Watch tab's screenshot
+    /// (`-antstream-shot-watch-info`): the sample channel has no catalog.
+    /// Latched, so no read or channel change replaces it before the shot.
+    /// Sample only.
+    func installSample() {
+        sampleActive = true
+        task?.cancel()
+        task = nil
+        let calendar = Calendar.current
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: Date()) ?? Date()
+        entry = CatalogEntry(
+            title: "Morning walk",
+            description: "Along the river to the old bridge, with the swans if they're up.",
+            state: "scheduled",
+            thumbnail: nil,
+            scheduledStart: calendar.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow)
+        )
     }
 }
 
