@@ -1383,10 +1383,13 @@ struct PublisherState {
     /// on the feed; its recovery entry goes once the catalog says so too
     /// ([`drive`]).
     recording_landed: bool,
-    /// When the recovery entry a resumed run carries on was last saved,
-    /// Unix ms (`None` for a fresh run): a catalog entry announced after
-    /// it is newer than this broadcast, and its closing `vod` entry must
-    /// not replace it ([`catalog_head_verdict`]).
+    /// When the broadcast a resumed run carries on was last saved by a
+    /// run that was broadcasting it, Unix ms (`None` for a fresh run):
+    /// [`RecoveryEntry::broadcast_saved_ms`], moved to now by every live
+    /// save this run makes, never by its closing or recording saves. A
+    /// catalog entry announced after it is newer than this broadcast,
+    /// and its closing `vod` entry must not replace it
+    /// ([`catalog_head_verdict`]).
     resumed_saved_ms: Option<u64>,
 
     publish_ms: VecDeque<u64>,
@@ -2189,6 +2192,16 @@ pub(crate) struct RecoveryEntry {
     /// made since, a later broadcast's entry). Missing reads as false.
     #[serde(default)]
     recorded: bool,
+    /// When a run that was broadcasting last saved this entry, Unix ms:
+    /// `saved_at_ms` for a fresh run's saves and a resumed run's live
+    /// ones, carried over unchanged by a resumed run that only closes
+    /// the broadcast (its closing window and recording saves re-stamp
+    /// `saved_at_ms`). A catalog entry announced after it is newer than
+    /// the broadcast, however many times a relaunch tried to end it
+    /// ([`catalog_head_verdict`]). Missing (an older entry) reads as
+    /// `saved_at_ms`.
+    #[serde(default)]
+    broadcast_saved_ms: Option<u64>,
 }
 
 impl RecoveryEntry {
@@ -2295,9 +2308,16 @@ impl PublisherState {
             .pending_gaps
             .first()
             .map_or(self.next_number, |gap| gap.number);
+        let now = unix_ms_now();
+        // A resumed run that is only closing the broadcast keeps the time
+        // the run that broadcast it last saved; going live again moves it.
+        let broadcast_saved_ms = match self.resumed_saved_ms {
+            Some(saved) if shape != PlaylistShape::Live => saved,
+            _ => now,
+        };
         RecoveryEntry {
             version: RECOVERY_VERSION,
-            saved_at_ms: unix_ms_now(),
+            saved_at_ms: now,
             channel: run.channel.to_string(),
             owner: hex::encode(run.owner),
             topic: hex::encode(run.topic),
@@ -2318,6 +2338,7 @@ impl PublisherState {
             width: run.width,
             height: run.height,
             recorded: false,
+            broadcast_saved_ms: Some(broadcast_saved_ms),
         }
     }
 
@@ -2355,7 +2376,7 @@ impl PublisherState {
             feed_index: entry.feed_index,
             resume_index: Some(entry.feed_index),
             resume_shape: entry.shape,
-            resumed_saved_ms: Some(entry.saved_at_ms),
+            resumed_saved_ms: Some(entry.broadcast_saved_ms.unwrap_or(entry.saved_at_ms)),
             ..Self::default()
         }
     }
@@ -4588,6 +4609,10 @@ async fn publish_playlist(ctx: &Arc<RunCtx>, shape: PlaylistShape, captured_at: 
         // the update can make visible.
         let recovery = (!ctx.config.recovery_path.is_empty())
             .then(|| state.recovery_entry(&ctx.identity(), index, shape));
+        // A resumed run broadcasting again is as new as its live saves.
+        if let (Some(entry), Some(_)) = (&recovery, state.resumed_saved_ms) {
+            state.resumed_saved_ms = entry.broadcast_saved_ms;
+        }
         (index, recovery)
     };
     // On disk before the update can land (issue #175): a kill after it
@@ -5088,7 +5113,8 @@ async fn close_catalog(ctx: &RunCtx, mut writer: CatalogWriter) -> bool {
         )
     };
     // A resumed run whose own catalog writer wrote nothing: since the
-    // recovery entry was saved, the catalog may have moved on (an
+    // broadcast was last saved by a run broadcasting it (not by an
+    // earlier relaunch's closing saves), the catalog may have moved on (an
     // Announce made after the app was killed, a later broadcast), and
     // the catalog's head is what its viewers list, so a late `vod` must
     // never take that place. That holds whether the run found the
@@ -5126,7 +5152,8 @@ enum HeadVerdict {
     /// The head already is this `vod` entry: nothing to write.
     Closed,
     /// The head is newer than this broadcast: an entry announced
-    /// (`scheduled`) after its recovery entry was last saved, or one
+    /// (`scheduled`) after a run broadcasting it last saved its recovery
+    /// entry ([`RecoveryEntry::broadcast_saved_ms`]), or one
     /// naming a later feed index (a later broadcast). Writing the `vod`
     /// entry after it would replace it as the head, so none is written:
     /// the catalog has moved on, and this broadcast's `live` entry is no
@@ -5138,8 +5165,8 @@ enum HeadVerdict {
 }
 
 /// Classify the catalog's head for `closing`, the `vod` entry of a
-/// broadcast whose recovery entry was last saved at `saved_ms` (Unix
-/// ms), and the index after that head (see [`HeadVerdict`]). A head
+/// broadcast a run broadcasting it last saved at `saved_ms` (Unix ms,
+/// [`RecoveryEntry::broadcast_saved_ms`]), and the index after that head (see [`HeadVerdict`]). A head
 /// that can't be read is an error, not "open": writing on a guess could
 /// put a second `vod` entry after one that landed, or bury an
 /// announcement.
@@ -7237,6 +7264,9 @@ mod tests {
         feed_heads: HashMap<String, StubHead>,
         /// Answer this many `GET /feeds` with a 502 first.
         fail_head: u32,
+        /// Answer this many `GET /feeds` of the catalog's feed with a
+        /// 502, other feeds answering as usual.
+        fail_catalog_head: u32,
         /// Then this many with the node's 503 for an anchor miss only
         /// one or two cold peers answered (`ant_p2p::feed_lookup_ack`).
         cold_head: u32,
@@ -7303,6 +7333,16 @@ mod tests {
     fn stub_read_whole(log: &Arc<Mutex<StubLog>>, path: &str) -> Vec<u8> {
         let mut slot = lock(log);
         if path.contains("/feeds/") {
+            if slot.fail_catalog_head > 0
+                && path.contains(&hex::encode(crate::catalog::catalog_topic()))
+            {
+                slot.fail_catalog_head -= 1;
+                return stub_response(
+                    "502 Bad Gateway",
+                    &[],
+                    br#"{"message":"feed lookup failed"}"#,
+                );
+            }
             if slot.fail_head > 0 {
                 slot.fail_head -= 1;
                 return stub_response(
@@ -11870,10 +11910,19 @@ mod tests {
     /// closing window and recording still to write) after an Announce
     /// made since the kill writes no `vod` entry: the announcement stays
     /// the catalog's head. An announcement older than the entry (the one
-    /// this broadcast went live for) is closed after as usual.
+    /// this broadcast went live for) is closed after as usual. Both hold
+    /// for an End it retried after the first one's catalog head read
+    /// failed: that first End it re-saved the entry (closing window,
+    /// recording) after the announcement, which must not make the
+    /// announcement read as older than the broadcast.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ending_a_killed_broadcast_keeps_a_newer_announcement() {
-        for (case, newer) in [("announced", true), ("stale", false)] {
+        for (case, newer, retried) in [
+            ("announced", true, false),
+            ("announced-retried", true, true),
+            ("stale", false, false),
+            ("stale-retried", false, true),
+        ] {
             let log = Arc::new(Mutex::new(StubLog::default()));
             let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
             let path = recovery_path(&format!("killed-announced-{case}"));
@@ -11920,8 +11969,10 @@ mod tests {
             let mut head = catalog_payloads(&log).pop().unwrap();
             head[0]["state"] = "scheduled".into();
             head[0]["scheduledStartTime"] = "2099-01-01T19:00:00.000Z".into();
+            // Announced just after the kill: every save a relaunch makes
+            // is later still.
             head[0]["timestamp"] = if newer {
-                (entry.saved_at_ms + 60_000).into()
+                (entry.saved_at_ms + 1).into()
             } else {
                 (entry.saved_at_ms - 1).into()
             };
@@ -11941,6 +11992,31 @@ mod tests {
                 );
             }
             let written = catalog_updates(&log).len();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if retried {
+                // The first End it closes the feed, but can't read the
+                // catalog's head: the entry is kept, marked recorded.
+                lock(&log).fail_catalog_head = 1;
+                let first = start(
+                    &tokio::runtime::Handle::current(),
+                    solar_punk(true),
+                    TEST_SECRET,
+                    test_owner(),
+                    None,
+                )
+                .unwrap();
+                first.cancel();
+                settle(&first).await;
+                let report = first.report();
+                assert!(report.feed_updates > 0, "{case}: {report:?}");
+                assert!(report.catalog_failures > 0, "{case}: {report:?}");
+                assert_eq!(catalog_updates(&log).len(), written, "{case}");
+                let kept = load_recovery(&path).unwrap();
+                assert!(kept.recorded, "{case}");
+                assert!(kept.saved_at_ms > entry.saved_at_ms + 1, "{case}: re-saved");
+                let recording = first.snapshot().feed_index.unwrap() - 1;
+                lock(&log).head = Some(head_at(recording));
+            }
             let resumed = start(
                 &tokio::runtime::Handle::current(),
                 solar_punk(true),
@@ -11953,7 +12029,7 @@ mod tests {
             settle(&resumed).await;
             let report = resumed.report();
             assert!(
-                report.feed_updates > 0,
+                retried || report.feed_updates > 0,
                 "{case}: closed on the feed: {report:?}"
             );
             assert_eq!(report.catalog_failures, 0, "{case}: {report:?}");
