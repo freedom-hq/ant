@@ -1022,7 +1022,10 @@ final class AntNode: ObservableObject {
             channel: channel.name ?? UIDevice.current.name,
             width: settings.encodedWidth,
             height: settings.encodedHeight,
-            bitrateKbps: settings.bitrateKbps + CaptureEngine.audioBitrateKbps
+            // The video bitrate, as the broadcast's own config gives it
+            // (and Android's announcement): the rung an announcement
+            // promises is the one the live entry then starts with.
+            bitrateKbps: settings.bitrateKbps
         )
         guard let data = try? JSONSerialization.data(withJSONObject: config),
               let json = String(data: data, encoding: .utf8) else {
@@ -1169,7 +1172,12 @@ final class AntNode: ObservableObject {
             bitrateKbps: UInt32(settings.bitrateKbps),
             segmentMs: UInt32(settings.segmentSeconds * 1000),
             notes: "ending an unfinished broadcast",
-            resume: true
+            resume: true,
+            // The account's stream info, so the closing `vod` entry is
+            // written over the killed run's `live` one (#220). Without it
+            // the node falls back to the info the recovery entry saved;
+            // the rung's size comes from there too.
+            info: streamInfo.forBroadcast
         )
         return try await stopPublisher()
     }

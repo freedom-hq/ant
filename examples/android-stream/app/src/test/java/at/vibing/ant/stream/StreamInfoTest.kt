@@ -152,6 +152,34 @@ class StreamInfoTest {
     }
 
     @Test
+    fun theNewestEntryWinsAsOnIosAndTheWeb() {
+        val body = """[
+            {"owner":"$owner","topic":"antstream","title":"New","timestamp":300},
+            {"owner":"$owner","topic":"antstream","title":"Old","timestamp":100},
+            {"owner":"$owner","topic":"antstream","title":"Undated"},
+            {"owner":"$owner","topic":"elsewhere","title":"Other","timestamp":900}
+        ]"""
+        assertEquals("New", Catalog.entryFor(body, owner, "antstream")?.title)
+        val tie = """[
+            {"owner":"$owner","topic":"antstream","title":"First","timestamp":5},
+            {"owner":"$owner","topic":"antstream","title":"Second","timestamp":5}
+        ]"""
+        assertEquals("Second", Catalog.entryFor(tie, owner, "antstream")?.title)
+        // A raw-topic channel finds the entry whose text hashes to it.
+        assertEquals("New", Catalog.select(Catalog.parse(body), owner, Keccak.topicFromString("antstream"))?.title)
+    }
+
+    @Test
+    fun aBroadcastLeavesTheScheduleBehind() {
+        val saved = SavedStreamInfo(info = StreamInfo(title = " ", scheduledStartMs = 1792224000000), announcedStartMs = 1792224000000)
+        assertEquals(1792224000000, saved.published("Walk").scheduledStartMs)
+        val live = saved.forBroadcast("Walk")
+        assertNull(live.scheduledStartMs)
+        assertEquals("Walk", live.title)
+        assertFalse(live.toJson().has("scheduled_start_ms"))
+    }
+
+    @Test
     fun aBadCatalogShowsNothing() {
         for (body in listOf("", "null", "{}", "{\"owner\":\"$owner\"}", "[1,2,", "[null, 3, \"x\"]", "garbage", "[{}]")) {
             assertNull(body, Catalog.entryFor(body, owner, "antstream"))

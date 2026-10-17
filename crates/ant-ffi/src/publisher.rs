@@ -545,7 +545,10 @@ pub struct PublisherConfig {
     /// waits for the recording.
     ///
     /// Left out, the run writes no catalog until [`LiveRun::set_info`]
-    /// gives it info.
+    /// gives it info; a resumed run left without it takes the info its
+    /// recovery entry saved (and, when `width`/`height` are left out,
+    /// the rendition size), so ending a killed broadcast still closes its
+    /// `live` entry with the `vod` one.
     #[serde(default)]
     pub info: Option<StreamInfo>,
 }
@@ -674,6 +677,21 @@ impl PublisherConfig {
             self.topic_text.clone()
         };
         Ok((topic_from_string(&text), text))
+    }
+}
+
+/// Why a run with `config` on the topic `topic_text` can write no catalog
+/// entry, or `None` when it can: see [`PublisherConfig::info`].
+fn catalog_refusal(config: &PublisherConfig, topic_text: &str) -> Option<&'static str> {
+    if config.format != StreamFormat::SolarPunk {
+        Some("no catalog entry: a \"bzz\" channel is not one a catalog reader plays")
+    } else if !fits_swarm_uri(topic_text) {
+        Some(
+            "no catalog entry: the topic has no text a catalog entry can name \
+             (a raw topic, or a text with a `/`)",
+        )
+    } else {
+        None
     }
 }
 
@@ -2133,6 +2151,18 @@ pub(crate) struct RecoveryEntry {
     /// [`PublisherConfig::resume`]). Missing reads as `"live"`.
     #[serde(default)]
     shape: PlaylistShape,
+    /// The stream info the run had (issue #220), the newest
+    /// [`LiveRun::set_info`] included, and its rendition size: a resumed
+    /// run started without its own takes them, so a killed broadcast's
+    /// `live` catalog entry is still closed with a `vod` one when the
+    /// host only asks to finalize it. Missing (an older entry, a run
+    /// without info) reads as none.
+    #[serde(default)]
+    info: Option<StreamInfo>,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
 }
 
 impl RecoveryEntry {
@@ -2242,6 +2272,9 @@ impl PublisherState {
             recording: self.recording.clone(),
             predecessor: self.predecessor.clone(),
             shape,
+            info: self.info.clone(),
+            width: run.width,
+            height: run.height,
         }
     }
 
@@ -2308,6 +2341,8 @@ struct RunIdentity<'a> {
     topic_text: &'a str,
     format: StreamFormat,
     segment_ms: u32,
+    width: u32,
+    height: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -3124,13 +3159,18 @@ impl LiveRun {
     /// stop carries it. Before the first feed update landed it is held
     /// for the first entry. Refused when invalid (a thumbnail that is not
     /// a reference); see [`PublisherConfig::info`] for when a run writes
-    /// a catalog at all.
+    /// a catalog at all. On a run that can write none (a `"bzz"` channel,
+    /// a raw topic) the info is kept but nothing is written, and
+    /// `catalog_error` says why, as when the run starts with info.
     pub fn set_info(&self, info: StreamInfo) -> Result<(), String> {
         info.validate()?;
         {
             let mut state = lock(&self.state);
             state.info = Some(info);
             state.catalog_info_changed = true;
+            if let Some(why) = catalog_refusal(&self.config, &self.topic_text) {
+                state.record_catalog_failure(why.to_string());
+            }
         }
         self.catalog_notify.notify_one();
         Ok(())
@@ -3335,10 +3375,22 @@ pub fn start_with_wall_offset(
     // An entry a stop had begun closing is only finalized: the run starts
     // stopped, as if stopped straight away (see `PublisherConfig::resume`).
     let mut finalize_only = false;
+    let mut config = config;
     let state = if config.resume {
         let entry = load_recovery(&config.recovery_path).map_err(PublisherError::Config)?;
         check_resumable(&entry, &config, &owner, &topic)?;
         finalize_only = entry.ended();
+        // What the host left out comes from the broadcast it resumes: its
+        // stream info and its rendition size, so the closing catalog entry
+        // is written (and names the same rung) even when the host only
+        // asks to end a killed broadcast (issue #220).
+        if config.info.is_none() {
+            config.info.clone_from(&entry.info);
+        }
+        if config.width == 0 || config.height == 0 {
+            config.width = entry.width;
+            config.height = entry.height;
+        }
         PublisherState::resumed(entry)
     } else {
         PublisherState {
@@ -3521,6 +3573,8 @@ impl RunCtx {
             topic_text: &self.topic_text,
             format: self.config.format,
             segment_ms: self.config.segment_ms,
+            width: self.config.width,
+            height: self.config.height,
         }
     }
 
@@ -3538,16 +3592,7 @@ impl RunCtx {
     /// Why this run can write no catalog entry, or `None` when it can:
     /// see [`PublisherConfig::info`].
     fn catalog_refusal(&self) -> Option<&'static str> {
-        if self.config.format != StreamFormat::SolarPunk {
-            Some("no catalog entry: a \"bzz\" channel is not one a catalog reader plays")
-        } else if !fits_swarm_uri(&self.topic_text) {
-            Some(
-                "no catalog entry: the topic has no text a catalog entry can name \
-                 (a raw topic, or a text with a `/`)",
-            )
-        } else {
-            None
-        }
+        catalog_refusal(&self.config, &self.topic_text)
     }
 
     /// Whether this run writes a master playlist at all: see
@@ -10319,6 +10364,8 @@ mod tests {
             topic_text: "",
             format: StreamFormat::Bzz,
             segment_ms: 2000,
+            width: 0,
+            height: 0,
         };
         let entry = saved.recovery_entry(&identity, 9, PlaylistShape::Live);
         assert_eq!(entry.feed_index, 9);
@@ -10415,6 +10462,8 @@ mod tests {
             topic_text: "",
             format: StreamFormat::Bzz,
             segment_ms: 2000,
+            width: 0,
+            height: 0,
         };
         let mut entry = saved.recovery_entry(&identity, 0, PlaylistShape::Live);
         // The last listed segment, seq 6, ended at go-live + 14 s.
@@ -11172,16 +11221,17 @@ mod tests {
     }
 
     /// A channel no catalog entry can name (a raw topic, or `"bzz"`)
-    /// writes none, and says why.
+    /// writes none, and says why: with info at start, and with info only
+    /// from a later `set_info`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_channel_a_catalog_cant_name_writes_none() {
-        for raw in [true, false] {
+        for (raw, info_at_start) in [(true, true), (false, true), (true, false), (false, false)] {
             let log = Arc::new(Mutex::new(StubLog::default()));
             let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
             let mut config = config();
             config.gateway = format!("http://{addr}");
             config.start_index = Some(0);
-            config.info = Some(morning_walk());
+            config.info = info_at_start.then(morning_walk);
             if !raw {
                 config.topic = String::new();
                 config.topic_text = "antstream".into();
@@ -11197,17 +11247,110 @@ mod tests {
             .unwrap();
             let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
             let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+            if !info_at_start {
+                // Past the start's own check, which only sees info given
+                // at start.
+                wait_for(&run, "a feed update", |s| s.playlists_published > 0).await;
+                assert_eq!(run.snapshot().catalog_error, "");
+                run.set_info(morning_walk()).unwrap();
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
             run.cancel();
             settle(&run).await;
             let report = run.report();
             assert!(
                 report.catalog_error.starts_with("no catalog entry"),
-                "{report:?}"
+                "raw {raw}, info at start {info_at_start}: {report:?}"
             );
             assert_eq!(report.catalog_writes, 0, "{report:?}");
             assert_eq!(catalog_payloads(&log), Vec::<serde_json::Value>::new());
         }
+    }
+
+    /// A killed broadcast's `live` entry is closed with a `vod` one when
+    /// the relaunch only ends it, even with no info in the resumed run's
+    /// config: the recovery entry kept the info and the rung's size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ending_a_killed_broadcast_closes_its_catalog_entry() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("catalog");
+        let solar_punk = |resume: bool| {
+            let mut c = config();
+            c.gateway = format!("http://{addr}");
+            c.topic = String::new();
+            c.topic_text = "antstream".into();
+            c.max_backlog = 16;
+            c.recovery_path.clone_from(&path);
+            c.resume = resume;
+            c
+        };
+        let mut first = solar_punk(false);
+        first.start_index = Some(0);
+        first.width = 480;
+        first.height = 640;
+        first.info = Some(morning_walk());
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            first,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3 {
+            let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+        }
+        wait_for(&run, "the live entry", |s| {
+            s.catalog_writes == 1 && s.segments_listed == 3
+        })
+        .await;
+        for _ in 0..400 {
+            if !run.feed_update_in_flight()
+                && run.snapshot().feed_index == Some(run.report().feed_updates)
+                && load_recovery(&path).is_ok_and(|e| e.recording.len() == 3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entry = load_recovery(&path).unwrap();
+        assert_eq!(entry.info, Some(morning_walk()));
+        assert_eq!((entry.width, entry.height), (480, 640));
+        // "Killed": never stopped. The relaunch ends it, with no info.
+        {
+            let mut log = lock(&log);
+            log.head = Some(head_at(entry.feed_index));
+            log.feed_heads.insert(
+                hex::encode(crate::catalog::catalog_topic()),
+                StubHead {
+                    index: 0,
+                    version: "v2",
+                    reference: "ab".repeat(32),
+                    body: b"[]".to_vec(),
+                },
+            );
+        }
+        let resumed = start(
+            &tokio::runtime::Handle::current(),
+            solar_punk(true),
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        resumed.cancel();
+        settle(&resumed).await;
+        let report = resumed.report();
+        assert_eq!(report.catalog_state, "vod", "{report:?}");
+        assert_eq!(report.catalog_index, Some(1), "{report:?}");
+        assert_eq!(report.catalog_failures, 0, "{report:?}");
+        let closing = catalog_payloads(&log).pop().unwrap();
+        assert_eq!(closing[0]["state"], "vod");
+        assert_eq!(closing[0]["title"], "Morning walk");
+        assert_eq!(closing[0]["renditions"][0]["width"], 480);
+        assert_eq!(closing[0]["renditions"][0]["height"], 640);
     }
 
     /// Once the stop returned and sealed the feed, the closing entry is

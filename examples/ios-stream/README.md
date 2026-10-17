@@ -390,7 +390,8 @@ Every broadcast passes it as the publisher config's `"info"`, so the node
 keeps the account's catalog feed (topic text `antstream-catalog`)
 holding the channel's Solar Punk catalog entry: "live" while it runs,
 "vod" after. Saving while live calls `ant_publisher_set_info`, which
-rewrites the entry at once. The live screen shows the progress's
+rewrites the entry at once. **End broadcast** on a killed broadcast
+passes the info too, so its "live" entry is replaced with "vod". The live screen shows the progress's
 `catalog_error`, if any, under the counters; a catalog write that fails
 never stops the broadcast.
 

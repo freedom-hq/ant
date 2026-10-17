@@ -69,7 +69,9 @@ object AntNative {
 
     /**
      * Announce an upcoming broadcast: write the channel's `"scheduled"`
-     * catalog entry. Refused while a broadcast runs. Blocks for a head
+     * catalog entry. Refused while a broadcast runs or another
+     * announcement is out; while it is out, `nativePublisherStart` is
+     * refused (the two would write the same catalog index). Blocks for a head
      * read, an upload and a feed update; returns `{"index", "entry"}`.
      */
     @JvmStatic external fun nativeStreamCatalogPublish(handle: Long, configJson: String): String

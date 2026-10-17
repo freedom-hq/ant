@@ -126,7 +126,10 @@ The publisher keeps a catalog feed per account (issue #220,
 `crates/ant-ffi/src/catalog.rs`): owner the channel's owner, topic
 `keccak256("antstream-catalog")`, every update a JSON array with an entry
 per channel, as Solar Punk's viewer reads it. The player reads its head
-and takes the entry whose `owner` and `topic` name the channel, and shows:
+and takes the entry whose `owner` is the channel's and whose `topic` text
+hashes to the channel's topic; of several, the newest `timestamp` (the
+later one on a tie). The Android and iOS Watch tabs choose the same
+entry. It shows:
 
 - the `title` as the channel's heading (and the page title);
 - the `description` under the controls, as plain text with its line breaks;

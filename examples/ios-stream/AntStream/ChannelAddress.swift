@@ -393,33 +393,54 @@ struct CatalogEntry: Equatable {
     /// The entry for `channel` in a catalog feed's body, or `nil`. The
     /// body is untrusted: anything that is not an array, entries that are
     /// not objects, fields of the wrong type are skipped, never trusted.
-    /// The entry is the one whose `owner` is the channel's owner (`0x`
-    /// and case aside) and whose `topic` is its topic text; one with
-    /// neither a title nor a description says nothing to show.
-    static func find(in data: Data, channel: ChannelAddress) -> CatalogEntry? {
-        guard case .text(let topic) = channel.topic,
-              let array = try? JSONSerialization.jsonObject(with: data) as? [Any]
-        else { return nil }
+    /// The same rule as Android's `Catalog.select` and the web player: an
+    /// entry is the channel's when its `owner` is the channel's owner
+    /// (`0x` and case aside) and its `topic` is the channel's topic text
+    /// (for a raw-topic channel, a text `topicHex` hashes to its topic;
+    /// without `topicHex` a raw-topic channel has none). Of several, the
+    /// newest `timestamp` wins, the later one on a tie. A chosen entry
+    /// with neither a title nor a description says nothing to show.
+    static func find(
+        in data: Data,
+        channel: ChannelAddress,
+        topicHex: ((String) -> String?)? = nil
+    ) -> CatalogEntry? {
+        guard let array = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return nil }
+        let matches: (String) -> Bool
+        switch channel.topic {
+        case .text(let topic):
+            matches = { $0 == topic }
+        case .raw(let hex):
+            guard let topicHex else { return nil }
+            matches = { topicHex($0)?.lowercased() == hex.lowercased() }
+        }
+        var best: (at: Double, object: [String: Any])?
         for case let object as [String: Any] in array {
             guard let owner = object["owner"] as? String,
                   ChannelAddress.stripHexPrefix(owner).lowercased() == channel.owner,
-                  object["topic"] as? String == topic
+                  let topic = object["topic"] as? String, !topic.isEmpty, matches(topic)
             else { continue }
-            let title = clean(object["title"], max: maxTitle)
-            let description = clean(object["description"], max: maxDescription)
-            guard !title.isEmpty || !description.isEmpty else { return nil }
-            let thumbnail = (object["thumbnail"] as? String).flatMap { ref -> String? in
-                StreamInfo.isReference(ref) ? ChannelAddress.stripHexPrefix(ref).lowercased() : nil
-            }
-            return CatalogEntry(
-                title: title,
-                description: description,
-                state: clean(object["state"], max: 20),
-                thumbnail: thumbnail,
-                scheduledStart: (object["scheduledStartTime"] as? String).flatMap(parseDate)
-            )
+            // `Bool` bridges to `NSNumber` too: only a real number counts.
+            let number = object["timestamp"] as? NSNumber
+            let value = number.flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? nil : $0.doubleValue } ?? 0
+            let at = value.isFinite ? value : 0
+            if let best, at < best.at { continue }
+            best = (at, object)
         }
-        return nil
+        guard let object = best?.object else { return nil }
+        let title = clean(object["title"], max: maxTitle)
+        let description = clean(object["description"], max: maxDescription)
+        guard !title.isEmpty || !description.isEmpty else { return nil }
+        let thumbnail = (object["thumbnail"] as? String).flatMap { ref -> String? in
+            StreamInfo.isReference(ref) ? ChannelAddress.stripHexPrefix(ref).lowercased() : nil
+        }
+        return CatalogEntry(
+            title: title,
+            description: description,
+            state: clean(object["state"], max: 20),
+            thumbnail: thumbnail,
+            scheduledStart: (object["scheduledStartTime"] as? String).flatMap(parseDate)
+        )
     }
 
     /// A string field, trimmed and capped; anything else is empty.

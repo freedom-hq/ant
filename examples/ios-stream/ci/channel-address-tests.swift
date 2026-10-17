@@ -252,5 +252,32 @@ struct ChannelAddressTests {
                CatalogEntry.maxTitle, "a long title is capped")
         expect(CatalogEntry.parseDate("2026-10-17T08:00:00Z"), Date(timeIntervalSince1970: 1_792_224_000),
                "a start without fractional seconds")
+        // Several entries for the channel: the newest `timestamp` wins, the
+        // later one on a tie, whatever the order (Android and the web
+        // player choose the same), and an empty one never hides the rest.
+        let several = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "title": "New", "timestamp": 300},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Old", "timestamp": 100},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Undated"},
+             {"owner": "\(fixtureOwner)", "topic": "elsewhere", "title": "Other", "timestamp": 900}]
+            """
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: channel)?.title, "New", "newest entry wins")
+        let tie = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "title": "First", "timestamp": 5},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Second", "timestamp": 5}]
+            """
+        expect(CatalogEntry.find(in: Data(tie.utf8), channel: channel)?.title, "Second", "a tie goes to the later")
+        let emptyFirst = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "timestamp": 1},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Later", "timestamp": 2}]
+            """
+        expect(CatalogEntry.find(in: Data(emptyFirst.utf8), channel: channel)?.title, "Later",
+               "an empty entry before the channel's real one")
+        // A raw-topic channel finds the entry whose text hashes to it.
+        let raw = ChannelAddress(owner: fixtureOwner, rawTopic: String(repeating: "c", count: 64))
+        let hash: (String) -> String? = { $0 == "antstream" ? String(repeating: "C", count: 64) : nil }
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: raw, topicHex: hash)?.title, "New",
+               "raw topic matched by hash")
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: raw), nil, "raw topic without a hasher")
     }
 }

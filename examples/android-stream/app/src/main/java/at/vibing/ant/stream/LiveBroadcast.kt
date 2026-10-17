@@ -189,7 +189,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
                 segmentMs = settings.segmentSeconds * 1000,
                 notes = "Android ${Build.VERSION.RELEASE} / ${Build.MANUFACTURER} ${Build.MODEL} / " +
                     "${node.networkLabel.value} / camera",
-                info = info.published(channel),
+                info = info.forBroadcast(channel),
                 // The selected quality's size, as the announcement uses: the
                 // camera picks the nearest size it supports, which the
                 // publisher starts before.
@@ -329,7 +329,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
     /** The running broadcast takes the remembered info; nothing when not live. */
     private suspend fun pushInfo(ch: Channel, channelName: String) {
         if (!isLivePublishing) return
-        node.setPublisherInfo(ch.info.value.published(channelName))
+        node.setPublisherInfo(ch.info.value.forBroadcast(channelName))
         _infoError.value = null
     }
 

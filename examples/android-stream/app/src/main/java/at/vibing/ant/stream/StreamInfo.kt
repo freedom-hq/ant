@@ -76,6 +76,15 @@ data class SavedStreamInfo(
         thumbnail = if (thumbnailPending) null else info.thumbnail,
     )
 
+    /**
+     * The info a broadcast goes live with (its config's `info` and every
+     * `ant_publisher_set_info`): [published], with the scheduled start
+     * left behind, since the broadcast an announcement promised is the
+     * one now running. iOS's `StreamInfo.forBroadcast` does the same, so
+     * both apps write the same live entry.
+     */
+    fun forBroadcast(channelName: String): StreamInfo = published(channelName).copy(scheduledStartMs = null)
+
     /** After a broadcast: the announcement it fulfilled is spent, the rest stays for the next one. */
     fun afterBroadcast(): SavedStreamInfo = copy(info = info.copy(scheduledStartMs = null), announcedStartMs = null)
 
@@ -161,6 +170,8 @@ data class CatalogEntry(
     val state: String?,
     val thumbnail: String?,
     val scheduledStartTime: String?,
+    /** The entry's `timestamp` (Unix ms), 0 when missing or not a number. */
+    val timestamp: Long = 0,
 ) {
     /** The scheduled start in Unix ms, when the entry names a readable one. */
     val scheduledStartMs: Long? get() = scheduledStartTime?.let(::parseIsoMillis)
@@ -192,14 +203,29 @@ object Catalog {
         return (0 until array.length()).mapNotNull { i -> entryOf(array.opt(i) as? JSONObject ?: return@mapNotNull null) }
     }
 
-    /** The entry for channel `owner` / topic text `topic`, or null. */
-    fun select(entries: List<CatalogEntry>, owner: String, topic: String): CatalogEntry? {
+    /**
+     * The entry for the channel `owner` / topic `topicHex`, or null. The
+     * same rule as the iOS Watch tab and the web player: an entry is the
+     * channel's when its `owner` is the channel's (`0x` and case aside)
+     * and its `topic` text hashes to the channel's topic (bee-js
+     * `Topic.fromString`, so a raw-topic channel finds the entry naming
+     * its text too); of several, the newest `timestamp` wins, the later
+     * one on a tie.
+     */
+    fun select(entries: List<CatalogEntry>, owner: String, topicHex: String): CatalogEntry? {
         val o = normalizeOwner(owner)
-        return entries.lastOrNull { normalizeOwner(it.owner) == o && it.topic == topic }
+        val t = topicHex.removePrefix("0x").lowercase()
+        var best: CatalogEntry? = null
+        for (e in entries) {
+            if (normalizeOwner(e.owner) != o || e.topic.isEmpty() || Keccak.topicFromString(e.topic) != t) continue
+            if (best == null || e.timestamp >= best.timestamp) best = e
+        }
+        return best
     }
 
-    /** [select] over [parse]. */
-    fun entryFor(body: String, owner: String, topic: String): CatalogEntry? = select(parse(body), owner, topic)
+    /** [select] over [parse], for the channel with topic text `topic`. */
+    fun entryFor(body: String, owner: String, topic: String): CatalogEntry? =
+        select(parse(body), owner, Keccak.topicFromString(topic))
 
     /**
      * Read the channel's entry from the owner's catalog feed. Null when
@@ -208,7 +234,6 @@ object Catalog {
      * the caller can keep what it showed. Blocking.
      */
     fun fetch(gateway: String, channel: ChannelAddress, timeoutMs: Int = 30_000): CatalogEntry? {
-        if (channel.rawTopic) return null
         val conn = URL(url(gateway, channel.owner)).openConnection() as HttpURLConnection
         return try {
             conn.connectTimeout = 10_000
@@ -218,7 +243,7 @@ object Catalog {
                 200 -> {
                     // A catalog is a few KB; never read a large body.
                     val body = conn.inputStream.use { it.readNBytesCompat(MAX_BODY) }
-                    entryFor(String(body, Charsets.UTF_8), channel.owner, channel.topic)
+                    select(parse(String(body, Charsets.UTF_8)), channel.owner, channel.topicHex)
                 }
                 in 400..499 -> null
                 else -> throw IOException("catalog read: $code")
@@ -252,6 +277,7 @@ object Catalog {
             state = o.opt("state") as? String,
             thumbnail = (o.opt("thumbnail") as? String)?.takeIf(StreamInfo::isReference)?.lowercase(),
             scheduledStartTime = o.opt("scheduledStartTime") as? String,
+            timestamp = (o.opt("timestamp") as? Number)?.toLong() ?: 0,
         )
     }
 

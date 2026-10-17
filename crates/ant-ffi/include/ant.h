@@ -1627,6 +1627,9 @@ char *ant_publisher_capacity(const char *config_json,
  * topic text); otherwise nothing is written and "catalog_error" says
  * why. Catalog writes run in their own task, never in front of a
  * playlist or feed update, and their failures stay out of "errors".
+ * A "resume" run started without "info" takes the info the recovery
+ * entry saved (and its "width"/"height" when those are left out), so
+ * ending a killed broadcast also replaces its "live" entry with "vod".
  *
  * An interruption pauses a broadcast, it never ends it (issue #172):
  * see ant_publisher_pause / ant_publisher_resume. It ends on
@@ -1648,7 +1651,8 @@ char *ant_publisher_capacity(const char *config_json,
  * collapse (26/316). See crates/ant-ffi/ANTSTREAM_BENCH.md.
  *
  * Returns immediately; the loop drives itself on the node's runtime.
- * Only one broadcast at a time per handle. Returns true on success,
+ * Only one broadcast at a time per handle, and none while
+ * ant_stream_catalog_publish is writing. Returns true on success,
  * false with an allocated message in *out_err (free with
  * ant_free_string).
  */
@@ -1816,9 +1820,11 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * optional). The catalog entry is rewritten with it at once while live
  * (before the first feed update landed, it waits for that), and the
  * closing "vod" entry at stop carries it. Non-blocking: the write runs in
- * the broadcast's background; progress "catalog_*" reports it. Returns 0,
- * or -1 with an allocated message in *out_err (no broadcast, invalid JSON,
- * a thumbnail that is not a 64-hex reference).
+ * the broadcast's background; progress "catalog_*" reports it. On a run
+ * that writes no catalog (a "bzz" channel, a raw topic) nothing is
+ * written and "catalog_error" says why. Returns 0, or -1 with an
+ * allocated message in *out_err (no broadcast, invalid JSON, a thumbnail
+ * that is not a 64-hex reference).
  */
 int ant_publisher_set_info(const AntHandle *handle,
                            const char *info_json,
@@ -1838,7 +1844,9 @@ int ant_publisher_set_info(const AntHandle *handle,
  *
  * The next broadcast replaces the entry with its "live" one. Refused
  * while a broadcast runs on this handle (it owns the catalog then: use
- * ant_publisher_set_info). BLOCKING: a catalog head read, an upload and a
+ * ant_publisher_set_info) or another announcement is out; while it is
+ * out, ant_publisher_start is refused, so the two never write the same
+ * catalog index. BLOCKING: a catalog head read, an upload and a
  * feed update, each bounded by the 60 s publish deadline; call it off the
  * main thread. Returns an allocated JSON string {"index": n, "entry":
  * {...}} (free with ant_free_string), or NULL with an allocated message

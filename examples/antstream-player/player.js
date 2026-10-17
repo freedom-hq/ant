@@ -579,8 +579,11 @@
   /**
    * This channel's entry in a catalog body, every field checked (the
    * catalog is the owner's own JSON, and may be anything): the entry whose
-   * owner is the channel's and whose topic names the channel's topic, the
-   * newest one if there are several. Null when there is none.
+   * owner is the channel's and whose topic text hashes to the channel's
+   * topic (`Topic.fromString`, as Solar Punk's readers do; a 64-hex topic
+   * is text too). Of several, the newest `timestamp` wins, the later one
+   * on a tie: the same rule as Android's `Catalog.select` and iOS's
+   * `CatalogEntry.find`. Null when there is none.
    */
   function catalogEntry(text, ch) {
     let list;
@@ -597,8 +600,7 @@
       if (!owner || owner[1].toLowerCase() !== ch.owner) continue;
       const topic = str(e.topic);
       if (!topic) continue;
-      const raw = RAW_TOPIC.exec(topic);
-      if ((raw ? raw[1].toLowerCase() : K.topicFromString(topic)) !== ch.topicHex) continue;
+      if (K.topicFromString(topic) !== ch.topicHex) continue;
       const at = Number.isFinite(e.timestamp) ? e.timestamp : 0;
       if (best && at < best.at) continue;
       const start = typeof e.scheduledStartTime === 'string' || Number.isFinite(e.scheduledStartTime)

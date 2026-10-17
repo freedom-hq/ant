@@ -269,9 +269,9 @@ final class CatalogWatcher: ObservableObject {
     /// shown; a catalog that isn't there or has no entry for the channel
     /// clears it.
     private func read(_ source: Source) async {
-        guard case .text = source.channel.topic,
-              let topic = FeedAddress.topicHex(CatalogEntry.topicText)
-        else {
+        // A raw-topic channel finds the entry whose topic text hashes to
+        // it, as on Android and the web player.
+        guard let topic = FeedAddress.topicHex(CatalogEntry.topicText) else {
             entry = nil
             return
         }
@@ -282,7 +282,7 @@ final class CatalogWatcher: ObservableObject {
         guard !Task.isCancelled, !sampleActive, self.source == source else { return }
         guard let (data, response) = result else { return }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let found = code == 200 ? CatalogEntry.find(in: data, channel: source.channel) : nil
+        let found = code == 200 ? CatalogEntry.find(in: data, channel: source.channel, topicHex: FeedAddress.topicHex) : nil
         if found != entry { entry = found }
     }
 

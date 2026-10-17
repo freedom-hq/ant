@@ -97,7 +97,8 @@ The Watch tab shows the watched channel's title, description and a
 scheduled start from its owner's catalog feed
 (`GET /feeds/{owner}/{keccak256("antstream-catalog")}`), read beside
 playback and again every minute; a channel without a catalog shows
-nothing extra.
+nothing extra. Of several entries for the channel (`owner` and the topic
+text), the newest `timestamp` wins, as on iOS and the web player.
 
 ## Your channel
 
