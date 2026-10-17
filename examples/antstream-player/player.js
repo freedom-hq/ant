@@ -144,7 +144,8 @@
    * text of topic `show.`). A mention that names its topic wins over an
    * owner alone before it (`Tip jar 0x<a> - watch 0x<b>/antstream` is
    * `0x<b>/antstream`); with only owners alone, they must all be the same
-   * one. A truncated `swarm://<owner>/` names no channel in text either.
+   * one. A truncated `swarm://<owner>/` names no channel in text either,
+   * nor does an address in a URL's path (`…/address/0x<owner>/tokens`).
    *
    * One link in quotes and nothing else (`"0x<owner>/antstream"`) is the
    * link: the quotes are dropped, as in text.
@@ -188,9 +189,11 @@
 
   // A channel inside text, by where it starts: a `swarm://` URI (its topic
   // ends at `/`, `?` or `#`), or `0x<owner>` not inside a longer word or
-  // hex string nor right after `swarm://` (a truncated URI names no
-  // channel), its topic after a `/` (none: the owner alone).
-  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z])(?<!swarm:\/\/)0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
+  // hex string nor right after a `/`: a URL path's address segment (a
+  // block explorer's `…/address/0x<owner>/tokens`) is not a channel, and
+  // neither is the owner of a truncated `swarm://` URI. Its topic comes
+  // after a `/` (none: the owner alone).
+  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z/])0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
 
   /** The channel in free text, see `parseChannel`. */
   function findChannel(text) {

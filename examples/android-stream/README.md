@@ -61,7 +61,8 @@ APK.
    screen shows the publish lag and the channel.
 3. **Watch**: the field starts on your own channel; enter any other as
    `0x<owner>/<topic>`, `swarm://<owner>/<topic>` or a web player link
-   (an owner alone means its `antstream` topic). The player
+   (an owner alone means its `antstream` topic; quotes around a pasted
+   link are dropped, as in the web player). The player
    (`FeedPlaylist.kt`) joins from a ladder marker or
    `GET /feeds/{owner}/{topic}` on the local gateway, then follows the
    feed slot by slot (`GET /soc/{owner}/{id}`), and hands ExoPlayer each

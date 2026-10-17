@@ -417,7 +417,8 @@ schedule.
 The **Watch** tab plays a channel with `AVPlayer` through the
 in-process gateway. The field starts on the account's own channel and
 takes `0x<owner>/<topic>`, `swarm://<owner>/<topic>` or a web player
-link (an owner alone means its `antstream` topic); the channel card's
+link (an owner alone means its `antstream` topic; quotes around a pasted
+link are dropped, as in the web player); the channel card's
 Watch button hands its own over. Channels in the Solar Punk format only:
 every playlist load and reload goes through a resource-loader delegate
 that reads `GET /feeds/<owner>/<topic>`, whose body is the playlist, and

@@ -66,6 +66,11 @@ class ChannelAddressTest {
             "https://api.gateway.ethswarm.org/bzz/${ChannelAddress.PLAYER_REF}/#0x$owner/antstream",
             // An owner alone is that account's AntStream channel.
             "0x$owner",
+            // One link in quotes, as the web player reads it.
+            "\"0x$owner/antstream\"",
+            "\u201C0x$owner/antstream\u201D",
+            "'bzz://${ChannelAddress.PLAYER_REF}/#0x$owner/antstream'",
+            "\"0x$owner\"",
         )) {
             assertEquals(input, own, ChannelAddress.parse(input))
         }
@@ -90,7 +95,8 @@ class ChannelAddressTest {
     @Test
     fun rejectsNonChannels() {
         for (input in listOf("", "   ", "antstream", "0x1234/antstream", "bzz://$antstream", "swarm://nope/antstream",
-            "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream")) {
+            "swarm://$owner/", "swarm://0x$owner/", "swarm://$owner", "swarm://$owner//antstream",
+            "\"swarm://$owner/\"")) {
             assertNull(input, ChannelAddress.parse(input))
         }
         // The Share text, pasted whole: more than one line, not one link.

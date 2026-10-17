@@ -55,6 +55,11 @@ struct ChannelAddressTests {
             "bzz://\(player)/#0x\(owner)/antstream",
             "https://api.gateway.ethswarm.org/bzz/\(player)/#0x\(owner)/antstream",
             "0x\(owner)",
+            // One link in quotes, as the web player reads it.
+            "\"0x\(owner)/antstream\"",
+            "\u{201C}0x\(owner)/antstream\u{201D}",
+            "'bzz://\(player)/#0x\(owner)/antstream'",
+            "\"0x\(owner)\"",
         ] {
             expect(ChannelAddress.parse(input), own, "parse \(input)")
         }
@@ -71,7 +76,8 @@ struct ChannelAddressTests {
         expect(raw.flatMap { ChannelAddress.parse($0.playerLink) }, raw, "raw round trip")
 
         for input in ["", "   ", "antstream", "0x1234/antstream", "bzz://\(hex)", "swarm://nope/antstream",
-                      "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream"] {
+                      "swarm://\(owner)/", "swarm://0x\(owner)/", "swarm://\(owner)", "swarm://\(owner)//antstream",
+                      "\"swarm://\(owner)/\""] {
             expect(ChannelAddress.parse(input), nil, "reject \(input)")
         }
         // The Share text, pasted whole: more than one line, not one link.

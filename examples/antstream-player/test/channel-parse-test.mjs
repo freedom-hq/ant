@@ -139,6 +139,8 @@ expect('truncated swarm:// before a real channel', `swarm://0x${OWNER}/ or 0x${O
 
 // -- an owner alone before a channel with a topic is not the channel ------
 
+expect('explorer link with a sub-path before the channel', `https://gnosisscan.io/address/0x${OTHER}/tokens - watch 0x${OWNER}/antstream`, antWant);
+expect('explorer link with a sub-path alone', `see https://gnosisscan.io/address/0x${OTHER}/tokens`, null);
 expect('tip-jar address before the channel', `Tip jar 0x${OTHER} - watch 0x${OWNER}/antstream`, antWant);
 expect('owner alone before a named topic', `0x${OTHER} then 0x${OWNER}/news`, channel(OWNER, { text: 'news' }));
 expect('owner alone before the Share text', `tips: 0x${OTHER}\n${ant.watchLinks}`, antWant);
