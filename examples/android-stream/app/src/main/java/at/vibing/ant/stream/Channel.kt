@@ -128,6 +128,15 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
         // What Swift's `CharacterSet.newlines` holds: U+000A-U+000D, NEL,
         // LS and PS.
         private const val LINE_BREAKS = "\n\u000B\u000C\r\u0085\u2028\u2029"
+
+        /**
+         * Swift's `CharacterSet.whitespacesAndNewlines`: tab, the space
+         * separators (Zs) and [LINE_BREAKS]. Kotlin's own `trim()` differs
+         * both ways (it keeps NEL, it drops U+001C-U+001F), so `parse` trims
+         * with this to read the same input as iOS.
+         */
+        private fun isSwiftWhitespace(c: Char): Boolean =
+            c == '\t' || c in LINE_BREAKS || Character.getType(c) == Character.SPACE_SEPARATOR.toInt()
         private val SWARM_URI = Regex("^swarm://([^/?#]+)/([^/?#]+)", RegexOption.IGNORE_CASE)
 
         /** The channel `owner` (with or without `0x`) broadcasts on topic text `text`. */
@@ -151,7 +160,7 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
          * topic never has a line break in it.
          */
         fun parse(input: String): ChannelAddress? {
-            var s = input.trim()
+            var s = input.trim(::isSwiftWhitespace)
             if (s.isEmpty() || s.any { it in LINE_BREAKS }) return null
             val hash = s.indexOf('#')
             if (hash >= 0) s = s.substring(hash + 1)

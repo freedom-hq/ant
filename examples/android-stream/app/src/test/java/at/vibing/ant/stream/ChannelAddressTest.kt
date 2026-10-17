@@ -102,6 +102,20 @@ class ChannelAddressTest {
     }
 
     @Test
+    fun trimsWhatIosTrims() {
+        // Swift's `whitespacesAndNewlines` around the one link: NEL, LS, PS,
+        // no-break space and tab go, as on iOS.
+        val want = ChannelAddress.ofText(owner, "antstream")
+        for (around in listOf("\u0085", "\u2028", "\u2029", "\u00A0", "\t", " \r\n")) {
+            val input = "${around}0x$owner/antstream$around"
+            assertEquals(input, want, ChannelAddress.parse(input))
+        }
+        // Not whitespace to Swift (though Kotlin's `trim()` drops it): kept,
+        // so the topic is not `antstream`, as on iOS.
+        assertEquals("antstream\u001F", ChannelAddress.parse("0x$owner/antstream\u001F")?.topic)
+    }
+
+    @Test
     fun publisherConfigIsSolarPunkOnTheAntstreamTopic() {
         val config = AntNode.publisherConfig("Morning show", "http://127.0.0.1:1633", "0xabc", 900, 2000, "n")
         assertEquals("solar-punk", config.getString("format"))

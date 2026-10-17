@@ -79,6 +79,12 @@ struct ChannelAddressTests {
             let text = own.watchLinks.replacingOccurrences(of: "\n", with: sep)
             expect(ChannelAddress.parse(text), nil, "reject Share text split by \(sep.debugDescription)")
         }
+        // `whitespacesAndNewlines` around the one link goes, as on Android
+        // (its `isSwiftWhitespace`): NEL, LS, PS, no-break space, tab.
+        for around in ["\u{85}", "\u{2028}", "\u{2029}", "\u{A0}", "\t", " \r\n"] {
+            expect(ChannelAddress.parse("\(around)0x\(owner)/antstream\(around)")?.topic, .text("antstream"),
+                   "trim \(around.debugDescription)")
+        }
         // Fullwidth hex (`０`-`９`, `ａ`-`ｆ`) passes `isHexDigit` but is no
         // owner or topic a gateway reads; Android's `[0-9a-fA-F]` rejects it too.
         let fullwidth = String(owner.unicodeScalars.map {

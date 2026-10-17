@@ -183,21 +183,35 @@
       return {
         m,
         uri,
+        // Which of the Share text's forms this mention is: the Solar Punk
+        // URI, a player link (after its `#`) or a bare `0x<owner>/…`.
+        form: uri ? 'uri' : m.index > 0 && text[m.index - 1] === '#' ? 'link' : 'bare',
         owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
         token: uri ? m[2] : m[4] || '',
+        // Its topic, decoded, and the text that goes on after it: what a
+        // mention cut short (at a space, at a `/`) still says.
+        reach: topicOf(uri ? m[2] : m[4] || '') + text.slice(m.index + m[0].length),
       };
     });
     const found = [];
-    for (const { m, uri, owner, token } of matches) {
+    for (const { m, uri, form, owner, token } of matches) {
       // Sentence punctuation ends one word of a message, not every
       // mention of a channel. The apps' Share text names its channel up
       // to four times (two links, the Solar Punk URI, the Channel line),
       // and `encodeURIComponent` leaves `.!'()*~` as they are, so a topic
       // like `show.` ends every one of them in its `.`: when another
       // mention of the same owner has this one's text whole (or glued to
-      // the next line's label, `show.Any`), the end is the topic's own.
+      // the next line's label, `show.Any`; or, cut at a space, goes on
+      // with it in the text: `0x<owner>/my show!`), the end is the
+      // topic's own. Only a mention in another of those forms counts: a
+      // message that writes the same form twice (`… 0x<owner>/antstream.
+      // Yes, 0x<owner>/antstream.`, or `…/antstream. Also …/antstream.v2`)
+      // is two sentences ending in it, not the Share text, which never
+      // repeats a form without also carrying another one (its Channel
+      // line is always bare, its links always after a `#`).
+      const decoded = topicOf(token);
       const repeated = matches.some(
-        (o) => o.m !== m && o.owner === owner && o.token.startsWith(token),
+        (o) => o.m !== m && o.form !== form && o.owner === owner && o.reach.startsWith(decoded),
       );
       const kept = repeated ? token : trimSentenceEnd(token);
       found.push({

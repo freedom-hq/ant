@@ -176,6 +176,11 @@ expect('owner alone ending a sentence', `my channel is 0x${OWNER}.`, antWant);
 expect('balanced brackets stay in the topic', `watch 0x${OWNER}/show(1) now`, channel(OWNER, { text: 'show(1)' }));
 expect('a link alone keeps a trailing dot', `0x${OWNER}/v1.`, channel(OWNER, { text: 'v1.' }));
 expect('two mentions, each ending its own sentence', `watch 0x${OWNER}/antstream, or 0x${OWNER}/antstream.`, antWant);
+// The same form twice is two sentences, not the Share text: neither keeps
+// the other's sentence end (R3-M1).
+expect('same channel twice, both ending a sentence', `see 0x${OWNER}/antstream. — yes 0x${OWNER}/antstream.`, antWant);
+expect('same form twice, the later topic longer', `0x${OWNER}/antstream. My other: 0x${OWNER}/antstream.v2`, antWant);
+expect('swarm:// twice, both ending a sentence', `swarm://${OWNER}/antstream. Or swarm://${OWNER}/antstream.`, antWant);
 
 // A topic that itself ends in what `encodeURIComponent` leaves unencoded
 // (`.!'()*~`): every mention in the Share text ends in it, so it is the
