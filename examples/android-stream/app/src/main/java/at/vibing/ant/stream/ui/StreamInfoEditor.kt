@@ -147,7 +147,11 @@ private fun StreamInfoDialog(
     var start by remember { mutableStateOf(initial.info.scheduledStartMs) }
     var picked by remember { mutableStateOf<ByteArray?>(null) }
     var removePhoto by remember { mutableStateOf(false) }
-    var busy by remember { mutableStateOf<String?>(null) }
+    var work by remember { mutableStateOf<String?>(null) }
+    // An announcement this dialog (or one before a rotation) started is
+    // still out: the fields wait for it too.
+    val announcing by broadcast.announcing.collectAsState()
+    val busy = work ?: if (announcing) "Announcing…" else null
     var message by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     val hasPlan = plan?.enabled == true
 
@@ -309,16 +313,18 @@ private fun StreamInfoDialog(
                     OutlinedButton(
                         onClick = {
                             scope.launch {
-                                busy = "Announcing…"
+                                work = "Announcing…"
                                 message = null
                                 val saveProblem = save()
-                                val err = broadcast.announce(title.ifBlank { channelName })
+                                // Awaited here, run on the broadcast's own scope: a
+                                // rotation cancels this await, not the write.
+                                val err = broadcast.announceAsync(title.ifBlank { channelName }).await()
                                 message = when {
                                     err != null -> "Not announced: $err" to false
                                     saveProblem != null -> saveProblem to false
                                     else -> "Announced: ${ch.info.value.info.scheduledStartMs?.let { formatStartsAt(it) }}" to true
                                 }
-                                busy = null
+                                work = null
                             }
                         },
                         enabled = busy == null && hasPlan && start != null,
@@ -337,10 +343,10 @@ private fun StreamInfoDialog(
                     Button(
                         onClick = {
                             scope.launch {
-                                busy = "Saving…"
+                                work = "Saving…"
                                 message = null
                                 val problem = save()
-                                busy = null
+                                work = null
                                 if (problem == null) onDismiss() else message = problem to false
                             }
                         },

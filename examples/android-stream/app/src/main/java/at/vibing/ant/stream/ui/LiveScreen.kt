@@ -77,6 +77,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
     val quality by broadcast.quality.collectAsState()
     val front by broadcast.frontCamera.collectAsState()
     val portrait by broadcast.portrait.collectAsState()
+    val announcing by broadcast.announcing.collectAsState()
     var channel by rememberSaveable { mutableStateOf(node.channel.value?.name ?: "My channel") }
     var texture by remember { mutableStateOf<SurfaceTexture?>(null) }
     var permissionsAsked by remember { mutableStateOf(false) }
@@ -223,12 +224,16 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
             when (val s = state) {
                 LiveBroadcast.State.Idle, is LiveBroadcast.State.Failed -> {
                     if (s is LiveBroadcast.State.Failed) Text(s.message, color = Amber)
+                    if (announcing && (s as? LiveBroadcast.State.Failed)?.message != LiveBroadcast.ANNOUNCING_HOLD_NOTE) {
+                        Text(LiveBroadcast.ANNOUNCING_HOLD_NOTE, color = Amber)
+                    }
                     Button(
                         onClick = {
                             val st = texture ?: return@Button
                             scope.launch { broadcast.start(channel.ifBlank { "My channel" }, st, micOk) }
                         },
-                        enabled = cameraOk && texture != null && (node.isReadyToBroadcast || broadcast.selfTestDir != null),
+                        enabled = cameraOk && texture != null && !announcing &&
+                            (node.isReadyToBroadcast || broadcast.selfTestDir != null),
                         colors = ButtonDefaults.buttonColors(containerColor = Red),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Go live") }

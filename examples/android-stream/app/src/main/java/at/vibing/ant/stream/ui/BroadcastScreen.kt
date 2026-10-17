@@ -43,6 +43,7 @@ fun BroadcastScreen(
     val gatewayAddress by node.gatewayAddress.collectAsState()
     val offline by node.offline.collectAsState()
     val network by node.networkLabel.collectAsState()
+    val announcing by broadcast.announcing.collectAsState()
     val hardware by node.keyHardwareBacked.collectAsState()
     val report by broadcast.report.collectAsState()
     val channel by node.channel.collectAsState()
@@ -106,7 +107,12 @@ fun BroadcastScreen(
         if (!hasPlan && status == AntNode.Status.Ready) {
             Button(onClick = onGetStarted, modifier = Modifier.fillMaxWidth()) { Text("Get started") }
         }
-        Button(onClick = onGoLive, enabled = ready || broadcast.selfTestDir != null, modifier = Modifier.fillMaxWidth()) { Text("Go live") }
+        if (announcing) Text(LiveBroadcast.ANNOUNCING_HOLD_NOTE, color = Amber, style = MaterialTheme.typography.bodySmall)
+        Button(
+            onClick = onGoLive,
+            enabled = (ready || broadcast.selfTestDir != null) && !announcing,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Go live") }
         channel?.let { ch -> StreamInfoCard(node, broadcast, ch.name) }
         channel?.address?.let { address ->
             ChannelCard(address, onWatch)

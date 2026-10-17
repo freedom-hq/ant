@@ -8,6 +8,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -127,6 +128,14 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
     var selfTestDir: java.io.File? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val announcer = Announcer(scope)
+
+    /**
+     * An announcement is being written to the catalog ([announceAsync]):
+     * Go live waits for it ([ANNOUNCING_HOLD_NOTE]), as the node refuses a
+     * start meanwhile.
+     */
+    val announcing: StateFlow<Boolean> = announcer.running
     private var engine: CaptureEngine? = null
     private var pushQueue = Executors.newSingleThreadExecutor()
     private var poll: Job? = null
@@ -163,6 +172,10 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
 
     suspend fun start(channel: String, preview: SurfaceTexture, withAudio: Boolean) {
         if (isBusy) return
+        if (announcing.value) {
+            _state.value = State.Failed(ANNOUNCING_HOLD_NOTE)
+            return
+        }
         _report.value = null
         _progress.value = null
         capturedCount.set(0)
@@ -398,8 +411,15 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
      * feed (`ant_stream_catalog_publish`), with the rendition the next
      * broadcast will have. Needs a storage plan; refused while live.
      * Returns the library's error, or null once announced.
+     *
+     * Runs on this object's own scope, not the caller's: the native write
+     * keeps going once called, so a caller that goes away (the dialog on a
+     * rotation) must not take the recording of its result with it. One at
+     * a time; a call while one is out returns that one.
      */
-    suspend fun announce(channelName: String): String? {
+    fun announceAsync(channelName: String): Deferred<String?> = announcer.launch { announce(channelName) }
+
+    private suspend fun announce(channelName: String): String? {
         if (isBusy) return "Announcing is for an upcoming broadcast; you're live now."
         val ch = node.channel.value ?: return "The account is still loading; try again in a moment."
         if (!node.hasStorage) return "Connect a storage plan to announce a broadcast."
@@ -456,5 +476,10 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
     companion object {
         /** How long after Go live the thumbnail frame is taken. */
         private const val THUMBNAIL_DELAY_MS = 4_000L
+
+        /** Why Go live is held while [announcing]: the Broadcast and live screens' note. */
+        const val ANNOUNCING_HOLD_NOTE =
+            "An announcement is still being written to the catalog. Go live once it's done; " +
+                "it can take a few minutes on a slow network."
     }
 }

@@ -944,7 +944,9 @@ final class AntNode: ObservableObject {
             }
             thumbnailUploading = false
         }
-        guard (pushToBroadcast || uploaded), publisherActive else { return }
+        // Not while an unfinished broadcast is being ended: that run is
+        // the old broadcast, and its closing entry keeps its own info.
+        guard (pushToBroadcast || uploaded), publisherActive, !finalizingUnfinished else { return }
         do {
             try await setPublisherInfo(streamInfo.forBroadcast)
         } catch {
@@ -1189,11 +1191,11 @@ final class AntNode: ObservableObject {
             segmentMs: UInt32(settings.segmentSeconds * 1000),
             notes: "ending an unfinished broadcast",
             resume: true,
-            // The account's stream info, so the closing `vod` entry is
-            // written over the killed run's `live` one (#220). Without it
-            // the node falls back to the info the recovery entry saved;
-            // the rung's size comes from there too.
-            info: streamInfo.forBroadcast
+            // No info: the node takes the info the recovery entry saved,
+            // so the closing `vod` entry over the killed run's `live` one
+            // (#220) names that broadcast, not whatever the editor holds
+            // for the next one. The rung's size comes from there too.
+            info: nil
         )
         return try await stopPublisher()
     }
