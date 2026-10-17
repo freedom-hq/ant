@@ -1384,10 +1384,10 @@ struct PublisherState {
     /// ([`drive`]).
     recording_landed: bool,
     /// When the recovery entry a resumed run carries on was last saved,
-    /// Unix ms (0 for a fresh run): a catalog entry announced after it
-    /// is newer than this broadcast, and its closing `vod` entry must not
-    /// replace it ([`catalog_head_verdict`]).
-    resumed_saved_ms: u64,
+    /// Unix ms (`None` for a fresh run): a catalog entry announced after
+    /// it is newer than this broadcast, and its closing `vod` entry must
+    /// not replace it ([`catalog_head_verdict`]).
+    resumed_saved_ms: Option<u64>,
 
     publish_ms: VecDeque<u64>,
     /// When each landed media segment's upload finished, until the
@@ -2355,7 +2355,7 @@ impl PublisherState {
             feed_index: entry.feed_index,
             resume_index: Some(entry.feed_index),
             resume_shape: entry.shape,
-            resumed_saved_ms: entry.saved_at_ms,
+            resumed_saved_ms: Some(entry.saved_at_ms),
             ..Self::default()
         }
     }
@@ -5087,15 +5087,19 @@ async fn close_catalog(ctx: &RunCtx, mut writer: CatalogWriter) -> bool {
             },
         )
     };
-    // A resumed run that found the recording already the head: the `vod`
-    // entry may have landed too, and only the entry's removal failed (or
-    // the app went in between). Written again only if the head isn't it,
-    // and never after a head that is newer than this broadcast (an
-    // announcement, a later broadcast): the catalog's head is what its
-    // viewers list, and a late `vod` would take that place.
+    // A resumed run whose own catalog writer wrote nothing: since the
+    // recovery entry was saved, the catalog may have moved on (an
+    // Announce made after the app was killed, a later broadcast), and
+    // the catalog's head is what its viewers list, so a late `vod` must
+    // never take that place. That holds whether the run found the
+    // recording already the head (the `vod` entry may have landed too,
+    // and only the entry's removal failed: written again only if the
+    // head isn't it) or ended a really unfinished broadcast by writing
+    // its closing window and recording first. A run that wrote its own
+    // `live` entry already holds the head, as a fresh run does.
     let saved_ms = {
         let state = lock(&ctx.state);
-        (state.feed_updates == 0).then_some(state.resumed_saved_ms)
+        state.resumed_saved_ms.filter(|_| state.catalog_writes == 0)
     };
     if let Some(saved_ms) = saved_ms {
         match catalog_head_verdict(&writer, &entry, saved_ms).await {
@@ -11860,6 +11864,110 @@ mod tests {
         assert_eq!(closing[0]["title"], "Morning walk");
         assert_eq!(closing[0]["renditions"][0]["width"], 480);
         assert_eq!(closing[0]["renditions"][0]["height"], 640);
+    }
+
+    /// Ending a really unfinished broadcast (killed mid-stream, its
+    /// closing window and recording still to write) after an Announce
+    /// made since the kill writes no `vod` entry: the announcement stays
+    /// the catalog's head. An announcement older than the entry (the one
+    /// this broadcast went live for) is closed after as usual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ending_a_killed_broadcast_keeps_a_newer_announcement() {
+        for (case, newer) in [("announced", true), ("stale", false)] {
+            let log = Arc::new(Mutex::new(StubLog::default()));
+            let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+            let path = recovery_path(&format!("killed-announced-{case}"));
+            let solar_punk = |resume: bool| {
+                let mut c = config();
+                c.gateway = format!("http://{addr}");
+                c.topic = String::new();
+                c.topic_text = "antstream".into();
+                c.max_backlog = 16;
+                c.recovery_path.clone_from(&path);
+                c.resume = resume;
+                c
+            };
+            let mut first = solar_punk(false);
+            first.start_index = Some(0);
+            first.info = Some(morning_walk());
+            let run = start(
+                &tokio::runtime::Handle::current(),
+                first,
+                TEST_SECRET,
+                test_owner(),
+                None,
+            )
+            .unwrap();
+            let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+            for i in 0..3 {
+                let _ = run.push(SegmentKind::Media, vec![i; 1000], 2000, false);
+            }
+            wait_for(&run, "the live entry", |s| {
+                s.catalog_writes == 1 && s.segments_listed == 3
+            })
+            .await;
+            for _ in 0..400 {
+                if !run.feed_update_in_flight()
+                    && run.snapshot().feed_index == Some(run.report().feed_updates)
+                    && load_recovery(&path).is_ok_and(|e| e.recording.len() == 3)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let entry = load_recovery(&path).unwrap();
+            assert!(!entry.recorded, "{case}: really unfinished");
+            let mut head = catalog_payloads(&log).pop().unwrap();
+            head[0]["state"] = "scheduled".into();
+            head[0]["scheduledStartTime"] = "2099-01-01T19:00:00.000Z".into();
+            head[0]["timestamp"] = if newer {
+                (entry.saved_at_ms + 60_000).into()
+            } else {
+                (entry.saved_at_ms - 1).into()
+            };
+            head[0].as_object_mut().unwrap().remove("index");
+            // "Killed": never stopped. The relaunch ends it, with no info.
+            {
+                let mut log = lock(&log);
+                log.head = Some(head_at(entry.feed_index));
+                log.feed_heads.insert(
+                    hex::encode(crate::catalog::catalog_topic()),
+                    StubHead {
+                        index: 1,
+                        version: "v2",
+                        reference: "ab".repeat(32),
+                        body: serde_json::to_vec(&head).unwrap(),
+                    },
+                );
+            }
+            let written = catalog_updates(&log).len();
+            let resumed = start(
+                &tokio::runtime::Handle::current(),
+                solar_punk(true),
+                TEST_SECRET,
+                test_owner(),
+                None,
+            )
+            .unwrap();
+            resumed.cancel();
+            settle(&resumed).await;
+            let report = resumed.report();
+            assert!(
+                report.feed_updates > 0,
+                "{case}: closed on the feed: {report:?}"
+            );
+            assert_eq!(report.catalog_failures, 0, "{case}: {report:?}");
+            let updates = catalog_updates(&log);
+            if newer {
+                assert_eq!(updates.len(), written, "{case}: head kept: {updates:?}");
+            } else {
+                assert_eq!(updates.len(), written + 1, "{case}: {updates:?}");
+                assert_eq!(updates.last(), Some(&2), "{case}: after the head");
+                let vod = catalog_payloads(&log).pop().unwrap();
+                assert_eq!(vod[0]["state"], "vod", "{case}: {vod}");
+            }
+            assert!(!std::path::Path::new(&path).exists(), "{case}: removed");
+        }
     }
 
     /// Once the stop returned and sealed the feed, the closing entry is
