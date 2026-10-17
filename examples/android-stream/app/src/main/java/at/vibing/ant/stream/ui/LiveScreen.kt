@@ -224,9 +224,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
             when (val s = state) {
                 LiveBroadcast.State.Idle, is LiveBroadcast.State.Failed -> {
                     if (s is LiveBroadcast.State.Failed) Text(s.message, color = Amber)
-                    if (announcing && (s as? LiveBroadcast.State.Failed)?.message != LiveBroadcast.ANNOUNCING_HOLD_NOTE) {
-                        Text(LiveBroadcast.ANNOUNCING_HOLD_NOTE, color = Amber)
-                    }
+                    if (announcing) Text(LiveBroadcast.ANNOUNCING_HOLD_NOTE, color = Amber)
                     Button(
                         onClick = {
                             val st = texture ?: return@Button

@@ -58,4 +58,28 @@ class AnnouncerTest {
         assertEquals(null, announcer.launch { runs++; null }.await())
         assertEquals(2, runs)
     }
+
+    /**
+     * A failure is recorded on the announcer even when its caller went
+     * away, so the card can still show it; the next run clears it.
+     */
+    @Test
+    fun theLastErrorOutlivesACancelledCaller() = runBlocking {
+        val announcer = Announcer(CoroutineScope(SupervisorJob() + Dispatchers.Default))
+        val release = CompletableDeferred<Unit>()
+        val dialog = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val caller = dialog.launch { announcer.launch { release.await(); "gateway error" }.await() }
+        while (!announcer.running.value) Thread.yield()
+        caller.cancelAndJoin()
+        release.complete(Unit)
+        while (announcer.running.value) Thread.yield()
+        assertEquals("gateway error", announcer.lastError.value)
+        // A new announcement clears it while it runs, and on success.
+        val again = CompletableDeferred<Unit>()
+        val next = announcer.launch { again.await(); null }
+        assertEquals(null, announcer.lastError.value)
+        again.complete(Unit)
+        assertEquals(null, next.await())
+        assertEquals(null, announcer.lastError.value)
+    }
 }

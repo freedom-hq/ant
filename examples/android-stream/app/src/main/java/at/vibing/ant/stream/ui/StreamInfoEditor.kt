@@ -30,6 +30,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.ExperimentalComposeUiApi
@@ -71,7 +72,11 @@ fun StreamInfoCard(node: AntNode, broadcast: LiveBroadcast, channelName: String)
     val saved by ch.info.collectAsState()
     val state by broadcast.state.collectAsState()
     val infoError by broadcast.infoError.collectAsState()
-    var editing by remember { mutableStateOf(false) }
+    val announcing by broadcast.announcing.collectAsState()
+    val announceError by broadcast.announceError.collectAsState()
+    // Saveable: a rotation mid-announcement reopens the dialog, which
+    // picks the running write back up from [LiveBroadcast.announcing].
+    var editing by rememberSaveable { mutableStateOf(false) }
     val live = state is LiveBroadcast.State.Live
     val thumb = rememberThumbnail(ch.thumbnailFile, saved)
 
@@ -114,6 +119,15 @@ fun StreamInfoCard(node: AntNode, broadcast: LiveBroadcast, channelName: String)
                     color = if (saved.announced) Green else Amber,
                     modifier = Modifier.testTag("streamInfoStartsAt"),
                 )
+                when {
+                    announcing -> Text("Announcing…", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                    !saved.announced && announceError != null -> Text(
+                        "Not announced: $announceError",
+                        color = Amber,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.testTag("streamInfoAnnounceError"),
+                    )
+                }
             }
             infoError?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall) }
             OutlinedButton(
@@ -152,6 +166,9 @@ private fun StreamInfoDialog(
     // still out: the fields wait for it too.
     val announcing by broadcast.announcing.collectAsState()
     val busy = work ?: if (announcing) "Announcing…" else null
+    // A write this dialog no longer awaits (started before a rotation)
+    // still reports how it ended.
+    val announceError by broadcast.announceError.collectAsState()
     var message by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     val hasPlan = plan?.enabled == true
 
@@ -333,7 +350,7 @@ private fun StreamInfoDialog(
                 }
 
                 busy?.let { Text(it, color = Color.Gray) }
-                message?.let { (text, ok) ->
+                (message ?: announceError?.takeIf { !announcing }?.let { "Not announced: $it" to false })?.let { (text, ok) ->
                     Text(text, color = if (ok) Green else Amber, modifier = Modifier.testTag("streamInfoMessage"))
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, androidx.compose.ui.Alignment.End)) {

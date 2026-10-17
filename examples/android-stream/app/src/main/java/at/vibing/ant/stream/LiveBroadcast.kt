@@ -136,6 +136,9 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
      * start meanwhile.
      */
     val announcing: StateFlow<Boolean> = announcer.running
+
+    /** The last announcement's error (null once one succeeds), for the stream info card. */
+    val announceError: StateFlow<String?> = announcer.lastError
     private var engine: CaptureEngine? = null
     private var pushQueue = Executors.newSingleThreadExecutor()
     private var poll: Job? = null
@@ -172,10 +175,10 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
 
     suspend fun start(channel: String, preview: SurfaceTexture, withAudio: Boolean) {
         if (isBusy) return
-        if (announcing.value) {
-            _state.value = State.Failed(ANNOUNCING_HOLD_NOTE)
-            return
-        }
+        // Held while an announcement is out. Both screens show
+        // [ANNOUNCING_HOLD_NOTE] from [announcing] itself, so it goes away
+        // with the write; a Failed state here would outlive it.
+        if (announcing.value) return
         _report.value = null
         _progress.value = null
         capturedCount.set(0)

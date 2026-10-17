@@ -20,6 +20,15 @@ internal class Announcer(private val scope: CoroutineScope) {
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
     private var current: Deferred<String?>? = null
+    private val _lastError = MutableStateFlow<String?>(null)
+
+    /**
+     * The last finished announcement's error, null once one succeeds or
+     * while a new one is out. Recorded here, not by the caller, so a
+     * failure still reaches the screen when the dialog that started the
+     * write was closed (a rotation) before it returned.
+     */
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
     /**
      * Start [block] (the announcement; returns its error, or null) unless
@@ -31,9 +40,10 @@ internal class Announcer(private val scope: CoroutineScope) {
     fun launch(block: suspend () -> String?): Deferred<String?> {
         current?.takeIf { it.isActive }?.let { return it }
         _running.value = true
+        _lastError.value = null
         val run = scope.async {
             try {
-                block()
+                block().also { _lastError.value = it }
             } finally {
                 _running.value = false
             }
