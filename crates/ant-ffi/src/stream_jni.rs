@@ -16,7 +16,8 @@
 //! C function produced; handles cross as `jlong`.
 //!
 //! Every call blocks the calling thread for as long as the C function
-//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s, ~195 s worst case),
+//! does (chain calls take seconds, `nativePublisherStop` up to ~130 s, ~195 s worst case,
+//! `nativeStreamCatalogPublish` up to three 60 s publish deadlines),
 //! so the Kotlin side runs them on `Dispatchers.IO`.
 
 use std::ffi::{c_char, CStr, CString};
@@ -645,6 +646,106 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherPushSe
                     bytes.len(),
                     duration,
                     discontinuity,
+                    err,
+                )
+            }))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+// ---------------------------------------------------------------------------
+// Stream info and the catalog feed (issue #220)
+// ---------------------------------------------------------------------------
+
+/// `AntNative.nativePublisherSetInfo(handle, infoJson)` —
+/// `ant_publisher_set_info`. Non-blocking.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativePublisherSetInfo<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    info_json: JString<'caller>,
+) -> jint {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<jint> {
+            let Some(h) = handle_ptr(env, handle) else {
+                return Ok(-1);
+            };
+            let Some(info) = c_arg(env, &info_json, "infoJson") else {
+                return Ok(-1);
+            };
+            // SAFETY: live handle; `info` outlives the call.
+            Ok(int_call(env, "set stream info", |err| unsafe {
+                crate::ant_publisher_set_info(h, info.as_ptr(), err)
+            }))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `AntNative.nativeStreamCatalogPublish(handle, configJson): String` —
+/// `ant_stream_catalog_publish`. Blocking (a head read, an upload and a
+/// feed update).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStreamCatalogPublish<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    config_json: JString<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<JString<'caller>> {
+            let Some(h) = handle_ptr(env, handle) else {
+                return Ok(JString::null());
+            };
+            let Some(config) = c_arg(env, &config_json, "configJson") else {
+                return Ok(JString::null());
+            };
+            // SAFETY: live handle; `config` outlives the call.
+            Ok(string_call(env, "announce broadcast", |err| unsafe {
+                crate::ant_stream_catalog_publish(h, config.as_ptr(), err)
+            }))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `AntNative.nativeStreamThumbnailUpload(handle, gateway, batchId,
+/// image): String` — `ant_stream_thumbnail_upload`. Blocking (one
+/// upload).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStreamThumbnailUpload<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    gateway: JString<'caller>,
+    batch_id: JString<'caller>,
+    image: JByteArray<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<JString<'caller>> {
+            let Some(h) = handle_ptr(env, handle) else {
+                return Ok(JString::null());
+            };
+            let Some(gateway) = c_arg(env, &gateway, "gateway") else {
+                return Ok(JString::null());
+            };
+            let Some(batch) = c_arg(env, &batch_id, "batchId") else {
+                return Ok(JString::null());
+            };
+            let bytes = match env.convert_byte_array(&image) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    throw(env, &format!("read image bytes: {e}"));
+                    return Ok(JString::null());
+                }
+            };
+            // SAFETY: live handle; strings and `bytes` outlive the call.
+            Ok(string_call(env, "upload thumbnail", |err| unsafe {
+                crate::ant_stream_thumbnail_upload(
+                    h,
+                    gateway.as_ptr(),
+                    batch.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
                     err,
                 )
             }))

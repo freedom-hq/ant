@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import SwiftUI
+import UIKit
 
 /// Swift wrapper around the hand-written C API in `crates/ant-ffi/`.
 ///
@@ -94,6 +95,23 @@ final class AntNode: ObservableObject {
     /// A broadcast started on this node and its stop has not returned:
     /// the recovery entry on disk is its own, not an unfinished one.
     private var publisherActive = false
+    /// The account's stream info (#220), remembered per account for its
+    /// next broadcast: what its catalog entry says about the channel.
+    @Published private(set) var streamInfo = StreamInfo()
+    /// The thumbnail image on this device (a JPEG), chosen or captured;
+    /// `nil` without one.
+    @Published private(set) var thumbnailJPEG: Data?
+    /// The thumbnail is going up.
+    @Published private(set) var thumbnailUploading = false
+    /// Why the last thumbnail upload or catalog update failed; `nil` once
+    /// one succeeds. Never a broadcast failure.
+    @Published private(set) var streamInfoError: String?
+    /// ``announceBroadcast()`` is writing the catalog entry. Lives here,
+    /// not in the editor that started it: the write outlives that sheet,
+    /// and the library refuses `ant_publisher_start` until it returns, so
+    /// every Go live (the Broadcast tab's and the live screen's) is held
+    /// on it and says why.
+    @Published private(set) var announcingBroadcast = false
     /// ``finishUnfinishedBroadcast()`` is running: the publisher is that
     /// broadcast, so ``unfinishedBroadcast`` stays up (its card shows the
     /// finalize in progress, and Go live stays held) until the stop
@@ -319,6 +337,9 @@ final class AntNode: ObservableObject {
         recentPayments = []
         validity = nil
         channel = nil
+        streamInfo = StreamInfo()
+        thumbnailJPEG = nil
+        streamInfoError = nil
         await Task.detached(priority: .userInitiated) {
             _ = ant_stop_gateway(h)
             ant_shutdown(h)
@@ -733,7 +754,9 @@ final class AntNode: ObservableObject {
     /// kill or crash leaves what the next launch needs to carry it on
     /// (`resume`) or end it into its recording
     /// (``finishUnfinishedBroadcast()``). The node removes it once the
-    /// recording is the feed's head.
+    /// recording is the feed's head and, with stream info, the closing
+    /// `vod` catalog entry has landed (#220): a stop whose `vod` entry
+    /// failed leaves it, so the card can still close the catalog.
     func startPublisher(
         channel: String,
         feed: BroadcastFeed = .current,
@@ -742,7 +765,10 @@ final class AntNode: ObservableObject {
         bitrateKbps: UInt32,
         segmentMs: UInt32,
         notes: String,
-        resume: Bool = false
+        resume: Bool = false,
+        info: StreamInfo? = nil,
+        width: Int = 0,
+        height: Int = 0
     ) async throws {
         // `LiveBroadcast` notices a reap's `reaped` flag and finishes the
         // stop.
@@ -755,7 +781,10 @@ final class AntNode: ObservableObject {
             notes: notes,
             recoveryPath: Self.recoveryURL(owner: owner).path,
             resume: resume,
-            reapMs: Self.reapMsForThisLaunch
+            reapMs: Self.reapMsForThisLaunch,
+            info: info,
+            width: width,
+            height: height
         )
         guard let data = try? JSONSerialization.data(withJSONObject: config),
               let json = String(data: data, encoding: .utf8) else {
@@ -776,6 +805,281 @@ final class AntNode: ObservableObject {
         if let message = started { throw AntError.op(message) }
         publisherActive = true
         if !finalizingUnfinished { unfinishedBroadcast = nil }
+    }
+
+    // MARK: - Stream info (#220)
+
+    /// What the stream info editor does to the thumbnail.
+    enum ThumbnailEdit {
+        case keep
+        case remove
+        /// A photo the broadcaster chose, already scaled down to a JPEG.
+        case picked(Data)
+    }
+
+    /// A broadcast started on this node is running (its stop has not
+    /// returned): stream info edits go to it at once.
+    var broadcastRunning: Bool { publisherActive }
+
+    /// `UserDefaults` key of `owner`'s stream info.
+    private static func streamInfoKey(owner: String) -> String {
+        "antstream.streamInfo." + owner.lowercased().replacingOccurrences(of: "0x", with: "")
+    }
+
+    /// Where `owner`'s thumbnail image is kept, next to its recovery entry.
+    static func thumbnailURL(owner: String) -> URL {
+        let hex = owner.lowercased().replacingOccurrences(of: "0x", with: "")
+        return resolveDataDir().appendingPathComponent("stream-thumbnail-\(hex).jpg")
+    }
+
+    /// Read the account's stream info and thumbnail (a new account starts
+    /// with none). Nothing while a screenshot sample is showing.
+    private func loadStreamInfo() {
+        if streamInfoSampleActive { return }
+        guard let owner = channel?.owner else { return }
+        let saved = UserDefaults.standard.data(forKey: Self.streamInfoKey(owner: owner))
+            .flatMap { try? JSONDecoder().decode(StreamInfo.self, from: $0) }
+        streamInfo = saved ?? StreamInfo()
+        thumbnailJPEG = try? Data(contentsOf: Self.thumbnailURL(owner: owner))
+        streamInfoError = nil
+    }
+
+    /// Publish `info` and remember it for the account.
+    private func storeStreamInfo(_ info: StreamInfo) {
+        if info != streamInfo { streamInfo = info }
+        guard !streamInfoSampleActive, let owner = channel?.owner,
+              let data = try? JSONEncoder().encode(info)
+        else { return }
+        UserDefaults.standard.set(data, forKey: Self.streamInfoKey(owner: owner))
+    }
+
+    /// Replace (or with `nil`, remove) the thumbnail image on the device.
+    private func storeThumbnail(_ jpeg: Data?) {
+        thumbnailJPEG = jpeg
+        guard !streamInfoSampleActive, let owner = channel?.owner else { return }
+        let url = Self.thumbnailURL(owner: owner)
+        if let jpeg {
+            try? jpeg.write(to: url, options: .atomic)
+        } else {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Save what the stream info editor says. A chosen photo goes up
+    /// straight away when there is a storage plan to stamp it with, else
+    /// at the next Go live; a running broadcast gets the new info at once
+    /// (`ant_publisher_set_info`). Both run in the background (`sync`),
+    /// so the editor can close at once.
+    func saveStreamInfo(
+        title: String,
+        description: String,
+        scheduledStart: Date?,
+        thumbnail: ThumbnailEdit,
+        sync: Bool = true
+    ) {
+        var info = streamInfo
+        info.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        info.description = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        info.scheduledStartMs = scheduledStart.map { UInt64(max(0, $0.timeIntervalSince1970) * 1000) }
+        switch thumbnail {
+        case .keep:
+            break
+        case .remove:
+            storeThumbnail(nil)
+            info.thumbnail = ""
+            info.thumbnailPicked = false
+            info.thumbnailPending = false
+        case .picked(let jpeg):
+            storeThumbnail(jpeg)
+            info.thumbnail = ""
+            info.thumbnailPicked = true
+            info.thumbnailPending = true
+        }
+        storeStreamInfo(info)
+        guard sync else { return }
+        Task { await self.syncStreamInfo(pushToBroadcast: true) }
+    }
+
+    /// A frame the broadcast captured from the camera shortly after Go
+    /// live: the thumbnail, unless the broadcaster has chosen one (checked
+    /// again here, as a photo may have been chosen meanwhile). Uploaded
+    /// and handed to the running broadcast.
+    func useCapturedThumbnail(_ jpeg: Data) async {
+        guard !streamInfo.thumbnailPicked, channel != nil else { return }
+        storeThumbnail(jpeg)
+        var info = streamInfo
+        info.thumbnail = ""
+        info.thumbnailPending = true
+        storeStreamInfo(info)
+        await syncStreamInfo(pushToBroadcast: true)
+    }
+
+    /// Bring Swarm up to date with the stream info: upload a thumbnail
+    /// image that is not up yet (when there is a plan to stamp it with),
+    /// then, with `pushToBroadcast` or after an upload, hand the info to
+    /// a running broadcast. Best effort: a failure shows in
+    /// ``streamInfoError`` and the thumbnail stays pending for the next
+    /// try (the next save or Go live).
+    func syncStreamInfo(pushToBroadcast: Bool) async {
+        var uploaded = false
+        if !thumbnailUploading {
+            thumbnailUploading = true
+            // Again while the image changed under an upload (a new photo,
+            // a new frame): the reference must be the image on the device.
+            while streamInfo.thumbnailPending, let jpeg = thumbnailJPEG, hasStorage {
+                let owner = channel?.owner
+                do {
+                    let reference = try await uploadThumbnail(jpeg)
+                    guard channel?.owner == owner else { break }
+                    if thumbnailJPEG == jpeg, streamInfo.thumbnailPending {
+                        var info = streamInfo
+                        info.thumbnail = reference
+                        info.thumbnailPending = false
+                        storeStreamInfo(info)
+                        streamInfoError = nil
+                        uploaded = true
+                    }
+                } catch {
+                    streamInfoError = "Thumbnail not uploaded: \(error.localizedDescription)"
+                    break
+                }
+            }
+            thumbnailUploading = false
+        }
+        // Not while an unfinished broadcast is being ended: that run is
+        // the old broadcast, and its closing entry keeps its own info.
+        guard (pushToBroadcast || uploaded), publisherActive, !finalizingUnfinished else { return }
+        do {
+            try await setPublisherInfo(streamInfo.forBroadcast)
+        } catch {
+            streamInfoError = "Stream info not updated: \(error.localizedDescription)"
+        }
+    }
+
+    /// Hand the running broadcast new stream info
+    /// (`ant_publisher_set_info`): its catalog entry is rewritten at once.
+    /// Non-blocking node-side.
+    func setPublisherInfo(_ info: StreamInfo) async throws {
+        guard let json = info.infoJSON() else {
+            throw AntError.op("could not encode the stream info")
+        }
+        // `nil` from `withHandle` means there is no node; a non-nil
+        // inner value is the failure detail (`nil` inside = updated).
+        let failure: String?? = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { () -> String? in
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let code = json.withCString { ant_publisher_set_info(h, $0, &errPtr) }
+                let detail = code == 0 ? nil : errPtr.map { String(cString: $0) }
+                if let errPtr { ant_free_string(errPtr) }
+                return code == 0 ? nil : (detail ?? "could not update the stream info")
+            }.value
+        }
+        guard let outcome = failure else { throw AntError.notReady }
+        if let message = outcome { throw AntError.op(message) }
+    }
+
+    /// Upload a thumbnail image (`ant_stream_thumbnail_upload`, one
+    /// `POST /bzz` through the in-process gateway, stamped with the
+    /// connected plan's batch) and return its reference for
+    /// ``StreamInfo/thumbnail``. Blocks for the upload, off the main
+    /// thread (``ffiString``).
+    func uploadThumbnail(_ jpeg: Data) async throws -> String {
+        guard let batchId = plan?.batchId, plan?.enabled == true, !batchId.isEmpty else {
+            throw AntError.op("Connect a storage plan to upload a thumbnail.")
+        }
+        let gateway = "http://\(gatewayAddress)"
+        let reference = try await ffiString(name: "upload thumbnail") { h, errPtr in
+            jpeg.withUnsafeBytes { raw -> UnsafeMutablePointer<CChar>? in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                return gateway.withCString { cgw in
+                    batchId.withCString { cbatch in
+                        ant_stream_thumbnail_upload(h, cgw, cbatch, base, raw.count, errPtr)
+                    }
+                }
+            }
+        }
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard StreamInfo.isReference(trimmed) else {
+            throw AntError.op("the thumbnail upload returned no reference")
+        }
+        return trimmed.lowercased()
+    }
+
+    /// Why Go live is held while ``announcingBroadcast``: the Broadcast
+    /// tab's and the live screen's note.
+    static let announcingHoldNote =
+        "An announcement is still being written to the catalog. Go live once it's done; it can take a few minutes on a slow network."
+
+    /// Announce the scheduled broadcast (`ant_stream_catalog_publish`):
+    /// the channel's catalog entry becomes a "scheduled" one with the
+    /// stream info and its start, so players list it before it goes live.
+    /// Not while a broadcast runs (that one owns the catalog). Uploads a
+    /// thumbnail that is not up yet first. Blocks for the catalog write,
+    /// off the main thread; throws the library's message.
+    func announceBroadcast() async throws {
+        guard !publisherActive else {
+            throw AntError.op("A broadcast is running: its catalog entry already says it is live.")
+        }
+        guard streamInfo.scheduledStartMs != nil else {
+            throw AntError.op("Pick a start time to announce.")
+        }
+        guard let channel else { throw AntError.notReady }
+        guard let batchId = plan?.batchId, plan?.enabled == true, !batchId.isEmpty else {
+            throw AntError.op("Connect a storage plan to announce a broadcast: the announcement is an upload.")
+        }
+        guard !announcingBroadcast else {
+            throw AntError.op("An announcement is already being written.")
+        }
+        announcingBroadcast = true
+        defer { announcingBroadcast = false }
+        await syncStreamInfo(pushToBroadcast: false)
+        let info = streamInfo
+        var settings = CaptureEngine.Settings(quality: LiveBroadcast.storedQuality)
+        settings.portrait = LiveBroadcast.storedPortrait(owner: channel.owner)
+        let config = info.catalogPublishConfig(
+            gateway: "http://\(gatewayAddress)",
+            batchId: batchId,
+            channel: channel.name ?? UIDevice.current.name,
+            width: settings.encodedWidth,
+            height: settings.encodedHeight,
+            // The video bitrate, as the broadcast's own config gives it
+            // (and Android's announcement): the rung an announcement
+            // promises is the one the live entry then starts with.
+            bitrateKbps: settings.bitrateKbps
+        )
+        guard let data = try? JSONSerialization.data(withJSONObject: config),
+              let json = String(data: data, encoding: .utf8) else {
+            throw AntError.op("could not encode the announcement")
+        }
+        let result = try await ffiString(name: "announce broadcast") { h, errPtr in
+            json.withCString { ant_stream_catalog_publish(h, $0, errPtr) }
+        }
+        guard let object = (result.data(using: .utf8))
+                .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }),
+              object["entry"] is [String: Any]
+        else {
+            throw AntError.op("could not read the announcement's result")
+        }
+        // The account may have changed while the write was out, or the
+        // start been edited: remember only what was announced.
+        guard self.channel?.owner == channel.owner else { return }
+        var announced = streamInfo
+        if announced.scheduledStartMs == info.scheduledStartMs {
+            announced.announcedStartMs = info.scheduledStartMs
+            storeStreamInfo(announced)
+        }
+    }
+
+    /// A broadcast went live with the stream info: the announcement it
+    /// fulfilled is done with, and a thumbnail chosen while there was no
+    /// plan (or whose upload failed) goes up now.
+    func streamInfoWentLive() {
+        if streamInfo.scheduledStartMs != nil || streamInfo.announcedStartMs != nil {
+            storeStreamInfo(streamInfo.forBroadcast)
+        }
+        if streamInfo.thumbnailPending {
+            Task { await self.syncStreamInfo(pushToBroadcast: false) }
+        }
     }
 
     // MARK: - Storage room for a broadcast (#176)
@@ -888,7 +1192,12 @@ final class AntNode: ObservableObject {
             bitrateKbps: UInt32(settings.bitrateKbps),
             segmentMs: UInt32(settings.segmentSeconds * 1000),
             notes: "ending an unfinished broadcast",
-            resume: true
+            resume: true,
+            // No info: the node takes the info the recovery entry saved,
+            // so the closing `vod` entry over the killed run's `live` one
+            // (#220) names that broadcast, not whatever the editor holds
+            // for the next one. The rung's size comes from there too.
+            info: nil
         )
         return try await stopPublisher()
     }
@@ -1043,6 +1352,7 @@ final class AntNode: ObservableObject {
             // topic): a restored account gets its own.
             if let owner = decoded?.ethAddress, !owner.isEmpty, channel?.owner != owner {
                 channel = Channel(owner: owner)
+                loadStreamInfo()
             }
         }
     }
@@ -1304,8 +1614,10 @@ final class AntNode: ObservableObject {
     /// screenshot: a runner never has a broadcast killed under it, so
     /// this shows a sample one saved 20 s ago, recent enough to resume.
     /// Nothing is written to disk. Sample only, and only ever called
-    /// behind `-antstream-shot-unfinished`.
-    func installUnfinishedSample() {
+    /// behind `-antstream-shot-unfinished` (`recorded`: with
+    /// `-antstream-shot-unfinished-recorded`, one whose recording landed
+    /// and only its catalog entry is left, #220).
+    func installUnfinishedSample(recorded: Bool = false) {
         installChannelSample()
         unfinishedSampleActive = true
         unfinishedBroadcast = UnfinishedBroadcast(
@@ -1315,9 +1627,47 @@ final class AntNode: ObservableObject {
             savedAt: Date().addingTimeInterval(-20),
             segments: 214,
             seconds: 428,
-            ended: false,
+            ended: recorded,
+            recorded: recorded,
             feed: .current
         )
+    }
+
+    /// Set while ``installStreamInfoSample()``'s info is showing, so the
+    /// account read can't replace it with the runner's real (empty) info
+    /// before the shot fires, and nothing of it is saved.
+    private var streamInfoSampleActive = false
+
+    /// The Broadcast tab's stream info card, and with
+    /// `-antstream-shot-info-edit` its editor, filled in (#220): a title,
+    /// a description, a thumbnail and an announced start tomorrow at
+    /// 08:00. A fresh runner account has none, so sample info is shown
+    /// (with the channel sample's plan, so Announce reads as available).
+    /// Nothing is saved or uploaded. Sample only, and only ever called
+    /// behind `-antstream-shot-info`.
+    func installStreamInfoSample() {
+        installChannelSample()
+        streamInfoSampleActive = true
+        let calendar = Calendar.current
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: Date()) ?? Date()
+        let start = calendar.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow) ?? tomorrow
+        let startMs = UInt64(start.timeIntervalSince1970 * 1000)
+        thumbnailJPEG = StreamThumbnail.sampleJPEG()
+        streamInfo = StreamInfo(
+            title: "Morning walk",
+            description: "Along the river to the old bridge, with the swans if they're up.",
+            thumbnail: String(repeating: "ab", count: 32),
+            thumbnailPicked: true,
+            scheduledStartMs: startMs,
+            announcedStartMs: startMs
+        )
+        streamInfoError = nil
+        // `-antstream-shot-info-announcing`: an announcement still being
+        // written, so Go live is held and the editor can't be cancelled.
+        // Nothing is written.
+        if RootView.shotArgs.contains("-antstream-shot-info-announcing") {
+            announcingBroadcast = true
+        }
     }
 
     /// Drive the Broadcast tab to its ready state, for the "Your channel"

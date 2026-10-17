@@ -17,6 +17,11 @@
   </header>
 
   <section id="stage" hidden>
+    <!-- From the owner's catalog feed (player.js, "the catalog"). -->
+    <div class="info">
+      <h2 id="info-title" hidden></h2>
+      <p id="info-when" class="when" hidden></p>
+    </div>
     <div class="video-wrap">
       <video id="video" controls playsinline muted></video>
       <div id="badge" class="badge">CONNECTING</div>
@@ -30,6 +35,7 @@
       <button id="copy-link" type="button">Copy link</button>
       <button id="debug-toggle" type="button" title="Buffer, feed reads and segment fetches">Debug</button>
     </div>
+    <p id="info-desc" class="desc" hidden></p>
     <dl class="stats">
       <div><dt>Behind live</dt><dd id="stat-latency">–</dd></div>
       <div><dt>Buffer</dt><dd id="stat-buffer">–</dd></div>

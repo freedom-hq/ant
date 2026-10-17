@@ -35,6 +35,9 @@ struct BroadcastView: View {
     /// What ending it said, shown on the card until it goes.
     @State private var unfinishedOutcome: String?
     @State private var confirmDiscard = false
+    /// The stream info editor (#220). Opened on launch by
+    /// `-antstream-shot-info-edit` for `antstream-visual`.
+    @State private var showInfoEditor = false
 
     init(onWatch: @escaping (String) -> Void = { _ in }) {
         self.onWatch = onWatch
@@ -57,6 +60,10 @@ struct BroadcastView: View {
                         }
                         liveCard
                         if let address = node.channel?.address { channelCard(address) }
+                        if node.channel != nil {
+                            streamInfoCard
+                                .id(Self.streamInfoID)
+                        }
                         checklistCard
                             .id(Self.checklistID)
                         benchCard
@@ -69,6 +76,21 @@ struct BroadcastView: View {
                 .scrollIndicators(.hidden)
                 .refreshable { await node.refreshAll() }
                 .task {
+                    // antstream-visual: `-antstream-shot-info` (#220) is
+                    // about the stream info card, below the channel card:
+                    // bring it into the shot once the sample is in.
+                    // `-antstream-shot-info-announcing` is about the held
+                    // Go live at the top, so it stays there.
+                    if RootView.shotArgs.contains("-antstream-shot-info"),
+                       !RootView.shotArgs.contains("-antstream-shot-info-edit"),
+                       !RootView.shotArgs.contains("-antstream-shot-info-announcing") {
+                        for _ in 0..<60 where node.streamInfo.title.isEmpty {
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        withAnimation { proxy.scrollTo(Self.streamInfoID, anchor: .top) }
+                        return
+                    }
                     // antstream-visual: `-antstream-shot-low-capacity` and
                     // `-antstream-shot-unusable-plan` (#176) are about the
                     // checklist's "Room for a broadcast" row, which sits
@@ -89,11 +111,28 @@ struct BroadcastView: View {
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .sheet(isPresented: $showBench) { BenchView() }
+        .sheet(isPresented: $showInfoEditor) {
+            StreamInfoEditor(live: node.broadcastRunning, channelName: channelName)
+        }
         .fullScreenCover(isPresented: $showLive, onDismiss: {
             resumeLive = false
             node.refreshUnfinishedBroadcast()
         }) { LiveView(resume: resumeLive) }
         .task {
+            // antstream-visual: `-antstream-shot-info` shows the stream
+            // info card filled in (#220), `-antstream-shot-info-edit` its
+            // editor. A fresh runner account has no stream info, so sample
+            // info stands in (nothing saved or uploaded).
+            if RootView.shotArgs.contains("-antstream-shot-info") {
+                for _ in 0..<60 where !node.status.isReady || node.channel == nil {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                node.installStreamInfoSample()
+                if RootView.shotArgs.contains("-antstream-shot-info-edit") {
+                    showInfoEditor = true
+                }
+                return
+            }
             // antstream-visual: `-antstream-shot-unfinished` shows the
             // card a relaunch after a killed broadcast opens on (#175). A
             // runner never has a broadcast killed under it, so a sample
@@ -102,7 +141,8 @@ struct BroadcastView: View {
                 for _ in 0..<60 where !node.status.isReady || node.channel == nil {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
-                node.installUnfinishedSample()
+                node.installUnfinishedSample(
+                    recorded: RootView.shotArgs.contains("-antstream-shot-unfinished-recorded"))
                 return
             }
             // antstream-visual: `-antstream-shot-channel` shows the "Your
@@ -155,8 +195,15 @@ struct BroadcastView: View {
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
 
-                if node.unfinishedBroadcast != nil {
+                if node.unfinishedBroadcast?.blocksNewBroadcast == true {
                     Text("Resume or end your unfinished broadcast first: a new one would leave it without its recording.")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if node.announcingBroadcast {
+                    Text(AntNode.announcingHoldNote)
                         .font(.caption)
                         .foregroundStyle(.yellow.opacity(0.9))
                         .multilineTextAlignment(.center)
@@ -178,7 +225,9 @@ struct BroadcastView: View {
                         .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
-                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil)
+                .disabled(!node.isReadyToBroadcast
+                          || node.unfinishedBroadcast?.blocksNewBroadcast == true
+                          || node.announcingBroadcast)
             }
             .frame(maxWidth: .infinity)
         }
@@ -194,16 +243,27 @@ struct BroadcastView: View {
     private func unfinishedCard(_ unfinished: UnfinishedBroadcast, now: Date) -> some View {
         let resumable = unfinished.canResume(now: now, reapMs: AntNode.broadcastReapMs)
         let since: String = Self.ago(unfinished.savedAt, now: now)
-        let stopped: String = unfinished.ended ? "was ending" : "stopped"
-        let what: String = "\"\(unfinished.channel)\" \(stopped) \(since) when the app closed, "
-            + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
-        let next: String = resumable
-            ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."
-            : "End it so viewers get its recording instead of a stalled live stream."
-        let detail: String = what + next
+        let detail: String
+        if unfinished.recorded {
+            // The recording is the channel's head (#220): only the
+            // account's stream info still lists it live.
+            detail = "\"\(unfinished.channel)\" ended \(since): its recording "
+                + "(\(unfinished.segments) segments, \(unfinished.durationLabel)) is on the channel, "
+                + "but its stream info still says live. End it to mark it a recording there too; "
+                + "you can go live again either way."
+        } else {
+            let stopped: String = unfinished.ended ? "was ending" : "stopped"
+            let what: String = "\"\(unfinished.channel)\" \(stopped) \(since) when the app closed, "
+                + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
+            let next: String = resumable
+                ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."
+                : "End it so viewers get its recording instead of a stalled live stream."
+            detail = what + next
+        }
         return GlassCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Unfinished broadcast", systemImage: "exclamationmark.arrow.circlepath")
+                Label(unfinished.recorded ? "Stream info still live" : "Unfinished broadcast",
+                      systemImage: "exclamationmark.arrow.circlepath")
                     .font(.headline)
                     .foregroundStyle(.white)
                 Text(detail)
@@ -219,7 +279,9 @@ struct BroadcastView: View {
                 if endingUnfinished {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small).tint(.white)
-                        Text("Publishing its recording…")
+                        Text(unfinished.recorded
+                             ? "Updating its stream info…"
+                             : "Publishing its recording…")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
                     }
@@ -249,14 +311,18 @@ struct BroadcastView: View {
                 }
             }
         }
-        .confirmationDialog("Discard the unfinished broadcast?",
+        .confirmationDialog(unfinished.recorded
+                            ? "Leave its stream info as it is?"
+                            : "Discard the unfinished broadcast?",
                             isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Discard", role: .destructive) {
                 unfinishedOutcome = nil
                 node.discardUnfinishedBroadcast()
             }
         } message: {
-            Text("Its segments stay on Swarm, but it is never closed: viewers keep its last live window and get no recording.")
+            Text(unfinished.recorded
+                 ? "Its recording stays on the channel, but the stream info keeps listing it as live until your next broadcast."
+                 : "Its segments stay on Swarm, but it is never closed: viewers keep its last live window and get no recording.")
         }
     }
 
@@ -267,18 +333,40 @@ struct BroadcastView: View {
         do {
             let report = try await node.finishUnfinishedBroadcast()
             // The entry is gone only once the recording is the channel's
-            // head: landed just now, or already before (the update had
-            // landed ahead of the kill, so the node only cleared the
-            // entry and the report carries no new recording). Either way
-            // the card is gone, so the outcome goes in the banner.
+            // head (and, with stream info, the catalog's `vod` entry
+            // landed): landed just now, or already before (the update had
+            // landed ahead of the kill, so the node wrote at most the
+            // catalog entry and the report carries no new recording).
+            // Either way the card is gone, so the outcome goes in the
+            // banner.
             if node.unfinishedBroadcast == nil {
                 let landedNow = !(report.recordingReference ?? "").isEmpty
                 banner.flash(landedNow
                     ? "Broadcast ended: its recording is on the channel"
                     : "Broadcast ended: its recording was already on the channel")
+            } else if node.unfinishedBroadcast?.recorded == true {
+                // The recording is on the channel, but the account's
+                // catalog still lists it live (#220): the node kept the
+                // entry, marked, so this can be tried again. A catalog
+                // write that failed says so, ahead of `errors` (which can
+                // hold head reads that failed and were retried on the way
+                // to finding the recording there). With no catalog error
+                // the run stopped before the catalog: its last error says
+                // why (a resume refused because the channel moved on, a
+                // head that never answered), and "try again" may not help.
+                if let catalog = report.catalogError, !catalog.isEmpty {
+                    unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                        + "still says live (\(catalog)); try again in a moment."
+                } else if let error = report.errors.last {
+                    unfinishedOutcome = error
+                } else {
+                    unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                        + "still says live; try again in a moment."
+                }
+            } else if let error = report.errors.first {
+                unfinishedOutcome = error
             } else {
-                unfinishedOutcome = report.errors.first
-                    ?? "Its recording did not go up; try again in a moment."
+                unfinishedOutcome = "Its recording did not go up; try again in a moment."
             }
         } catch {
             unfinishedOutcome = error.localizedDescription
@@ -357,6 +445,76 @@ struct BroadcastView: View {
             .contentShape(.rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: stream info (#220)
+
+    private static let streamInfoID = "streamInfo"
+
+    /// The channel's name: the last broadcast's, else the device's.
+    private var channelName: String {
+        node.channel?.name ?? UIDevice.current.name
+    }
+
+    /// What the channel's catalog entry tells players (#220): the title,
+    /// description and thumbnail the next broadcast goes out with, and an
+    /// announced start. Edited in ``StreamInfoEditor``.
+    private var streamInfoCard: some View {
+        let info = node.streamInfo
+        return GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Stream info")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                HStack(alignment: .top, spacing: 12) {
+                    StreamThumbnailView(jpeg: node.thumbnailJPEG, width: 112)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(info.displayTitle(channel: channelName))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(info.description.isEmpty ? "No description" : info.description)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(info.description.isEmpty ? 0.45 : 0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let announced = info.announcedStart, announced > Date() {
+                    Label("Announced: starts \(announced.formatted(date: .abbreviated, time: .shortened))",
+                          systemImage: "megaphone.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else if let scheduled = info.scheduledStart, scheduled > Date() {
+                    Label("Scheduled for \(scheduled.formatted(date: .abbreviated, time: .shortened)), not announced yet",
+                          systemImage: "calendar")
+                        .font(.caption)
+                        .foregroundStyle(.yellow.opacity(0.9))
+                }
+                if node.thumbnailUploading {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Uploading the thumbnail…")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                }
+                if let problem = node.streamInfoError {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(info.thumbnailPicked || node.thumbnailJPEG == nil
+                     ? "Players list your channel with these."
+                     : "Players list your channel with these. The thumbnail is a frame from the camera, taken a few seconds after you go live.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+                GlassPillButton(title: "Edit", icon: "square.and.pencil", tint: .white.opacity(0.18)) {
+                    showInfoEditor = true
+                }
+            }
+        }
     }
 
     // MARK: readiness checklist

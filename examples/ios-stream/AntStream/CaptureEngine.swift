@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import CoreMedia
 import Foundation
 import UIKit
@@ -260,6 +261,10 @@ final class CaptureEngine: NSObject {
     private var testPatternTimer: DispatchSourceTimer?
     private var testPatternFrame = 0
     private var pixelBufferPool: CVPixelBufferPool?
+    /// A thumbnail asked for (``thumbnailJPEG()``): the next video frame
+    /// goes to it. Only touched on ``queue``.
+    private var frameRequest: (id: Int, deliver: (CVPixelBuffer?) -> Void)?
+    private var frameRequests = 0
 
     private let ringDirectory: URL
 
@@ -456,6 +461,69 @@ final class CaptureEngine: NSObject {
             // preview must not start one.
             if self.recording { self.restartWriter() }
         }
+    }
+
+    // MARK: - Thumbnail (#220)
+
+    /// The stream's thumbnail: the next video frame (as encoded, so the
+    /// picture is upright), scaled to ``thumbnailLongSide`` on its long
+    /// side, as a JPEG of a few tens of KB. `nil` when no frame comes
+    /// within 5 s (capture interrupted or stopped) or it can't be
+    /// encoded. The capture queue only hands the frame over; the scaling
+    /// and encoding run off it, so capture doesn't stall.
+    func thumbnailJPEG() async -> Data? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                // One request at a time: an older one gets nothing.
+                self.frameRequest?.deliver(nil)
+                self.frameRequests += 1
+                let id = self.frameRequests
+                self.frameRequest = (id: id, deliver: { pixels in
+                    guard let pixels else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                    DispatchQueue.global(qos: .utility).async {
+                        continuation.resume(returning: Self.jpeg(from: pixels))
+                    }
+                })
+                self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, let request = self.frameRequest, request.id == id else { return }
+                    self.frameRequest = nil
+                    request.deliver(nil)
+                }
+            }
+        }
+    }
+
+    /// The long side of a thumbnail, in pixels.
+    static let thumbnailLongSide: CGFloat = 640
+
+    private static let thumbnailContext = CIContext()
+
+    /// `pixels` scaled down to ``thumbnailLongSide`` on its long side, as
+    /// a JPEG.
+    static func jpeg(from pixels: CVPixelBuffer) -> Data? {
+        let image = CIImage(cvPixelBuffer: pixels)
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let scale = min(1, thumbnailLongSide / max(extent.width, extent.height))
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = thumbnailContext.createCGImage(scaled, from: scaled.extent.integral)
+        else { return nil }
+        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.7)
+    }
+
+    /// Hand `pixels` to a waiting thumbnail request, if there is one. On
+    /// ``queue``.
+    private func offerFrame(_ pixels: CVPixelBuffer) {
+        guard let request = frameRequest else { return }
+        frameRequest = nil
+        request.deliver(pixels)
     }
 
     // MARK: - Capture session
@@ -942,6 +1010,7 @@ final class CaptureEngine: NSObject {
               let adaptor = pixelAdaptor, let input = videoInput, input.isReadyForMoreMediaData,
               let buffer = makeTestPixelBuffer()
         else { return }
+        offerFrame(buffer)
         adaptor.append(buffer, withPresentationTime: time)
         testPatternFrame += 1
     }
@@ -1038,6 +1107,12 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        // A thumbnail can be taken from the preview too: before the
+        // writer check.
+        if frameRequest != nil, output is AVCaptureVideoDataOutput,
+           let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            offerFrame(pixels)
+        }
         guard !restarting, let writer else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !sessionStarted {

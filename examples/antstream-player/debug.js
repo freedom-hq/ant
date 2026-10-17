@@ -194,7 +194,7 @@
     // A read dropped before it was sent (a restart or channel change while it
     // waited for the read budget) was never answered: not a failure.
     const done = log.entries.filter((e) => e.kind === 'playlist' && e.ms !== null && e.status !== 'cancelled');
-    const reads = done.filter((e) => e.read !== 'marker');
+    const reads = done.filter((e) => e.read !== 'marker' && e.read !== 'catalog');
     const readsOk = reads.filter((e) => e.status === 200);
     const notYet = reads.filter((e) => e.status === 404);
     const markers = done.filter((e) => e.read === 'marker');
@@ -218,12 +218,21 @@
       ...(player.via === 'window.swarm'
         ? [['Read budget', `${budget.reads.length} reads · ${size(budget.reads.reduce((n, r) => n + r.bytes, 0))} in the last minute · ${budget.refused} rate limited${Date.now() < budget.until ? ` · paused ${sec(budget.until - Date.now())}` : ''}`, limited.length > 0]]
         : []),
+      ['Catalog', catalogLine(), false],
       ['Live edge moved', gaps.length ? `every ${sec(median(gaps))} (median) · longest ${sec(Math.max(...gaps))}` : '–'],
       ['Stalls', s ? `${s.stalls} · ${sec(stallMs)} in total` : '–', s && s.stalls > 0],
       ['First frame', s && s.firstPlayingAt ? sec(s.firstPlayingAt - s.startedAt) : '–'],
     ];
     summary.textContent = '';
     for (const [k, v, bad] of lines) summary.append(el('div', {}, el('span', { class: 'muted' }, k), ' ', el('b', { class: bad ? 'bad' : '' }, v)));
+  }
+
+  /** The channel's catalog entry as last read, and when. */
+  function catalogLine() {
+    const c = player.catalog;
+    if (!c || !c.reads) return '–';
+    const ago = c.lastAt ? ` · read ${Math.round((Date.now() - c.lastAt) / 1000)} s ago` : ' · reading';
+    return `${c.last || '–'}${ago} · ${c.reads} read${c.reads === 1 ? '' : 's'}`;
   }
 
   function row(e) {
@@ -238,7 +247,7 @@
       // dropped before it was sent (channel changed) is dimmed, not an error.
       const bad = e.status !== 200 && e.status !== 404 && e.status !== 'loading' && e.status !== 'cancelled';
       const stale = e.note.includes('stale');
-      const what = e.read === 'head' ? 'feed head' : e.read === 'marker' ? `marker ${e.period}` : 'feed slot';
+      const what = e.read === 'head' ? 'feed head' : e.read === 'marker' ? `marker ${e.period}` : e.read === 'catalog' ? 'catalog' : 'feed slot';
       return el('tr', { class: `playlist${bad ? ' bad' : stale ? ' warn' : e.status === 404 || e.status === 'cancelled' ? ' dim' : ''}` },
         t,
         el('td', {}, what),

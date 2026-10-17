@@ -59,7 +59,9 @@ jobs:
 
       # The solar-punk channel (#217): link parsing, the links a channel
       # is shared by, the Watch tab's playlist rewrite and the publisher
-      # config. Pure Swift, compiled on its own with its tests.
+      # config, plus the stream info and the catalog entry the Watch tab
+      # reads (#220, against crates/ant-ffi/testdata/catalog). Pure Swift,
+      # compiled on its own with its tests.
       - name: Channel address unit tests
         working-directory: examples/ios-stream
         run: |
@@ -248,6 +250,15 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-unfinished
           sleep 25
           xcrun simctl io booted screenshot shots/20-broadcast-unfinished.png
+          # 20b — the same card for an entry kept only because the closing
+          # `vod` catalog entry failed after the recording landed (#220):
+          # it says the recording is on the channel, and Go live is not
+          # held for it.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-unfinished -antstream-shot-unfinished-recorded
+          sleep 25
+          xcrun simctl io booted screenshot shots/20b-broadcast-unfinished-recorded.png
           # 14/15 — the Watch tab playing a channel through the in-process
           # gateway. The sample channel (an owner nobody broadcasts as,
           # topic `antstream`) has no feed, so this
@@ -361,6 +372,47 @@ jobs:
             -antstream-shot-live -antstream-shot-landscape
           sleep 45
           xcrun simctl io booted screenshot shots/30-live-landscape.png
+          # --- Stream info (#220) ---
+          # A runner account has no stream info, no photo library and no
+          # camera, so `-antstream-shot-info` installs sample info (a
+          # title, a description, a drawn thumbnail and a start tomorrow
+          # at 08:00, announced) with the channel sample's plan. Nothing
+          # is saved, uploaded or announced.
+          # 33: the Broadcast tab's stream info card, scrolled into view.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-info
+          sleep 25
+          xcrun simctl io booted screenshot shots/33-broadcast-stream-info.png
+          # 34: the stream info editor, filled in: title, description,
+          # thumbnail, the scheduled start and Announce.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-info -antstream-shot-info-edit
+          sleep 25
+          xcrun simctl io booted screenshot shots/34-stream-info-editor.png
+          # 35: the Watch tab with the channel's catalog entry over the
+          # player: its title, description and announced start. The
+          # sample channel has no catalog feed, so
+          # `-antstream-shot-watch-info` installs a sample entry.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-watch -antstream-shot-watch-info
+          sleep 30
+          xcrun simctl io booted screenshot shots/35-watch-catalog-info.png
+          # 36/37: an announcement still being written (R2-M2):
+          # `-antstream-shot-info-announcing` holds the sample's
+          # announcement in flight. 36: the Broadcast tab's Go live held,
+          # saying why. 37: the editor, Cancel and Save held, "Announcing…".
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-info -antstream-shot-info-announcing
+          sleep 25
+          xcrun simctl io booted screenshot shots/36-broadcast-announcing.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-info -antstream-shot-info-edit -antstream-shot-info-announcing
+          sleep 25
+          xcrun simctl io booted screenshot shots/37-stream-info-announcing.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

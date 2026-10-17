@@ -1,7 +1,9 @@
 // Unit tests for the solar-punk channel (#217), `AntStream/ChannelAddress.swift`:
 // link parsing, the links a channel is shared by, the playlist rewrite the
-// Watch tab feeds `AVPlayer`, and the publisher config every broadcast
-// starts with. The app has no test target, so the antstream-visual
+// Watch tab feeds `AVPlayer`, the publisher config every broadcast starts
+// with, and the stream info and catalog entry of #220 (the catalog read
+// from `crates/ant-ffi/testdata/catalog`, so run it from
+// `examples/ios-stream`). The app has no test target, so the antstream-visual
 // workflow compiles the file on its own with these tests and runs them on
 // the macOS runner:
 //
@@ -141,7 +143,141 @@ struct ChannelAddressTests {
         expect(BroadcastFeed.recovery(topic: hex, topicText: "antstream", format: "solar-punk"),
                .current, "a current entry is the current feed")
 
+        streamInfoChecks()
+        catalogChecks()
+
         print("channel address: \(checks - failures)/\(checks) checks passed")
         exit(failures == 0 ? 0 : 1)
+    }
+
+    /// Stream info (#220): the `"info"` object the library takes, in the
+    /// publisher config and the announcement's config, and what the app
+    /// keeps across launches.
+    static func streamInfoChecks() {
+        let ref = String(repeating: "AB", count: 32)
+        let info = StreamInfo(
+            title: "  Morning walk ", description: "Along the river.", thumbnail: "0x" + ref,
+            thumbnailPicked: true, scheduledStartMs: 1_792_224_000_000,
+            announcedStartMs: 1_792_224_000_000)
+        let object = info.infoObject()
+        expect(object["title"] as? String, "Morning walk", "info title trimmed")
+        expect(object["description"] as? String, "Along the river.", "info description")
+        expect(object["thumbnail"] as? String, "0x" + ref.lowercased(), "info thumbnail")
+        expect(object["scheduled_start_ms"] as? UInt64, 1_792_224_000_000, "info scheduled start")
+        expect(object.count, 4, "info carries the library's four fields only")
+        expect(info.announcedStart != nil, true, "announced start")
+        expect(info.forBroadcast.infoObject()["scheduled_start_ms"] is NSNull, true,
+               "going live leaves the schedule behind")
+        expect(StreamInfo(thumbnail: "not-a-ref").infoObject()["thumbnail"] as? String, "",
+               "a thumbnail that is no reference is left out")
+        expect(StreamInfo().displayTitle(channel: "Kitchen"), "Kitchen", "empty title is the channel")
+        var rescheduled = info
+        rescheduled.scheduledStartMs = 1_792_300_000_000
+        expect(rescheduled.announcedStart == nil, true, "a changed start is not announced yet")
+
+        // The JSON is what `ant_publisher_set_info` gets.
+        let json = info.infoJSON().flatMap { $0.data(using: .utf8) }
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        expect(json?["title"] as? String, "Morning walk", "info JSON")
+        let unscheduled = StreamInfo(title: "t").infoJSON() ?? ""
+        expect(unscheduled.contains("\"scheduled_start_ms\":null"), true, "no schedule is null")
+
+        // The publisher config carries it, the announcement's config too.
+        let config = BroadcastFeed.current.publisherConfig(
+            channel: "c", gateway: "g", batchId: "b", bitrateKbps: 1, segmentMs: 1, notes: "",
+            recoveryPath: "p", resume: false, reapMs: 0, info: info.forBroadcast)
+        expect((config["info"] as? [String: Any])?["title"] as? String, "Morning walk", "config info")
+        let without = BroadcastFeed.current.publisherConfig(
+            channel: "c", gateway: "g", batchId: "b", bitrateKbps: 1, segmentMs: 1, notes: "",
+            recoveryPath: "p", resume: false, reapMs: 0)
+        expect(without["info"] == nil, true, "no info without one")
+        let announce = info.catalogPublishConfig(
+            gateway: "http://127.0.0.1:1633", batchId: "0xabc", channel: "Kitchen",
+            width: 360, height: 640, bitrateKbps: 664)
+        expect(announce["topic_text"] as? String, "antstream", "announcement topic text")
+        expect(announce["channel"] as? String, "Kitchen", "announcement channel")
+        expect(((announce["info"] as? [String: Any])?["scheduled_start_ms"]) as? UInt64,
+               1_792_224_000_000, "announcement start")
+
+        // Saved and read back, and a saved record missing fields still reads.
+        let saved = (try? JSONEncoder().encode(info)).flatMap { try? JSONDecoder().decode(StreamInfo.self, from: $0) }
+        expect(saved, info, "stream info round trip")
+        let sparse = try? JSONDecoder().decode(StreamInfo.self, from: Data("{\"title\":\"x\"}".utf8))
+        expect(sparse, StreamInfo(title: "x"), "missing fields default")
+    }
+
+    /// The catalog entry the Watch tab shows (#220), read from the
+    /// library's fixtures and from catalogs nobody should trust.
+    static func catalogChecks() {
+        let fixtureOwner = "d5572300e441b77b72bdd318bbfa7b97a1f03096"
+        let channel = ChannelAddress(owner: "0x" + fixtureOwner.uppercased(), text: "antstream")
+        let dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("../../crates/ant-ffi/testdata/catalog")
+        for name in ["live", "vod", "scheduled"] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("\(name).json")) else {
+                expect("missing", "present", "fixture \(name).json")
+                continue
+            }
+            let entry = CatalogEntry.find(in: data, channel: channel)
+            expect(entry?.title, "Morning walk", "\(name) title")
+            expect(entry?.description, "Along the river.", "\(name) description")
+            expect(entry?.state, name, "\(name) state")
+            expect(entry?.thumbnail, String(repeating: "ab", count: 32), "\(name) thumbnail")
+            expect(entry?.scheduledStart, Date(timeIntervalSince1970: 1_792_224_000), "\(name) start")
+            expect(entry?.upcomingStart != nil, name == "scheduled", "\(name) upcoming")
+            let other = ChannelAddress(owner: owner, text: "antstream")
+            expect(CatalogEntry.find(in: data, channel: other), nil, "\(name) other owner")
+            let otherTopic = ChannelAddress(owner: fixtureOwner, text: "elsewhere")
+            expect(CatalogEntry.find(in: data, channel: otherTopic), nil, "\(name) other topic")
+        }
+
+        // Garbage never crashes and never shows.
+        for body in ["", "null", "{}", "\"x\"", "[1, \"a\", null]", "[{\"owner\": 5}]",
+                     "[{\"owner\": \"0x\(fixtureOwner)\", \"topic\": \"antstream\"}]",
+                     "[{\"owner\": \"\(fixtureOwner)\", \"topic\": \"antstream\", \"title\": 7}]",
+                     "#EXTM3U\n#EXT-X-VERSION:7\n"] {
+            expect(CatalogEntry.find(in: Data(body.utf8), channel: channel), nil, "garbage \(body)")
+        }
+        let odd = """
+            [{"owner": "0x\(fixtureOwner.uppercased())", "topic": "antstream", "title": "  Hi  ",
+              "description": ["no"], "thumbnail": "zz", "scheduledStartTime": 12, "state": "live"}]
+            """
+        let entry = CatalogEntry.find(in: Data(odd.utf8), channel: channel)
+        expect(entry?.title, "Hi", "odd title trimmed")
+        expect(entry?.description, "", "odd description ignored")
+        expect(entry?.thumbnail, nil, "odd thumbnail ignored")
+        expect(entry?.scheduledStart, nil, "odd start ignored")
+        let long = "[{\"owner\": \"\(fixtureOwner)\", \"topic\": \"antstream\", \"title\": \"\(String(repeating: "x", count: 5000))\"}]"
+        expect(CatalogEntry.find(in: Data(long.utf8), channel: channel)?.title.count,
+               CatalogEntry.maxTitle, "a long title is capped")
+        expect(CatalogEntry.parseDate("2026-10-17T08:00:00Z"), Date(timeIntervalSince1970: 1_792_224_000),
+               "a start without fractional seconds")
+        // Several entries for the channel: the newest `timestamp` wins, the
+        // later one on a tie, whatever the order (Android and the web
+        // player choose the same), and an empty one never hides the rest.
+        let several = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "title": "New", "timestamp": 300},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Old", "timestamp": 100},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Undated"},
+             {"owner": "\(fixtureOwner)", "topic": "elsewhere", "title": "Other", "timestamp": 900}]
+            """
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: channel)?.title, "New", "newest entry wins")
+        let tie = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "title": "First", "timestamp": 5},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Second", "timestamp": 5}]
+            """
+        expect(CatalogEntry.find(in: Data(tie.utf8), channel: channel)?.title, "Second", "a tie goes to the later")
+        let emptyFirst = """
+            [{"owner": "\(fixtureOwner)", "topic": "antstream", "timestamp": 1},
+             {"owner": "\(fixtureOwner)", "topic": "antstream", "title": "Later", "timestamp": 2}]
+            """
+        expect(CatalogEntry.find(in: Data(emptyFirst.utf8), channel: channel)?.title, "Later",
+               "an empty entry before the channel's real one")
+        // A raw-topic channel finds the entry whose text hashes to it.
+        let raw = ChannelAddress(owner: fixtureOwner, rawTopic: String(repeating: "c", count: 64))
+        let hash: (String) -> String? = { $0 == "antstream" ? String(repeating: "C", count: 64) : nil }
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: raw, topicHex: hash)?.title, "New",
+               "raw topic matched by hash")
+        expect(CatalogEntry.find(in: Data(several.utf8), channel: raw), nil, "raw topic without a hasher")
     }
 }

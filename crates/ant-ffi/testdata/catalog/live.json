@@ -1,0 +1,25 @@
+[
+  {
+    "owner": "d5572300e441b77b72bdd318bbfa7b97a1f03096",
+    "topic": "antstream",
+    "title": "Morning walk",
+    "description": "Along the river.",
+    "state": "live",
+    "mediatype": "video",
+    "timestamp": 1792224100000,
+    "index": 41,
+    "duration": 125.5,
+    "thumbnail": "abababababababababababababababababababababababababababababababab",
+    "scheduledStartTime": "2026-10-17T08:00:00.000Z",
+    "renditions": [
+      {
+        "name": "480p",
+        "width": 480,
+        "height": 640,
+        "topic": "antstream",
+        "bandwidth": 1050000,
+        "avgBandwidth": 880000
+      }
+    ]
+  }
+]

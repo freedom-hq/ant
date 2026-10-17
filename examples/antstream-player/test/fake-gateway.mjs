@@ -45,6 +45,22 @@
 //   UPSTREAM=<url>      no fake channel: proxy everything but the player
 //                       to a real gateway (e.g. antd)
 //
+// The owner's catalog feed (topic `antstream-catalog`, issue #220), off
+// unless one of these is set:
+//   CATALOG=<file>      its head is this file, served as it is (read again
+//                       on every request: edit it to change the entry, or
+//                       put anything in it to try a broken catalog)
+//   CATALOG_TITLE=<text>, CATALOG_DESCRIPTION=<text>, CATALOG_STATE=<s>,
+//   CATALOG_START=<ISO 8601 | +<minutes>>
+//                       without CATALOG: one entry for the channel, built
+//                       like crates/ant-ffi/src/catalog.rs writes it
+//                       (state `scheduled` when CATALOG_START is given,
+//                       else `live`)
+//   THUMBNAIL=<jpeg>    the thumbnail: a built entry names it, and it is
+//                       served at /bzz/<ref>/ for every `thumbnail` the
+//                       catalog names
+//   CATALOG_MS=<a>-<b>  every catalog read answers after a..b ms
+//
 // Routes:
 //   /bzz/<PLAYER_REF>/<file>        the player (examples/antstream-player)
 //   GET /feeds/<owner>/<topic hex>  the head: the newest update's playlist,
@@ -54,6 +70,9 @@
 //                                   the wrapped chunk (span ‖ payload)
 //   GET /bytes/<ref>                media, and the parts of a playlist
 //                                   longer than one chunk
+//   GET /feeds/<owner>/<catalog topic hex>
+//                                   the catalog's head (CATALOG...)
+//   GET /bzz/<thumbnail ref>/       the thumbnail (THUMBNAIL)
 
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -92,6 +111,7 @@ const range = (v) => {
   return () => a + Math.random() * ((b || a) - a);
 };
 const playlistDelay = range(env.PLAYLIST_MS);
+const catalogDelay = range(env.CATALOG_MS);
 const slotDelay = range(env.SLOT_MS);
 if (!dir && !upstream) {
   console.error('usage: fake-gateway.mjs <segments-dir> [port]   (or UPSTREAM=<url> fake-gateway.mjs - [port])');
@@ -101,11 +121,55 @@ if (!dir && !upstream) {
 const refOf = (name) => createHash('sha256').update(name).digest('hex');
 const blobs = new Map(); // ref -> { bytes, type }
 
+// -- the catalog -------------------------------------------------------------
+
+const CATALOG_TOPIC_HEX = K.topicFromString('antstream-catalog');
+const thumbnail = env.THUMBNAIL ? readFileSync(env.THUMBNAIL) : null;
+const thumbnailRef = thumbnail ? refOf(thumbnail) : null;
+const catalogBuilt = !env.CATALOG && ['CATALOG_TITLE', 'CATALOG_DESCRIPTION', 'CATALOG_STATE', 'CATALOG_START'].some((k) => env[k] !== undefined);
+const catalogStart = (() => {
+  const v = env.CATALOG_START;
+  if (!v) return null;
+  const at = v.startsWith('+') ? new Date(Date.now() + Number(v.slice(1)) * 60000) : new Date(v);
+  return Number.isNaN(at.getTime()) ? v : at.toISOString();
+})();
+const catalogAt = Date.now();
+
+/** The catalog feed's head as it is now, or null when there is none. */
+function catalogBody() {
+  if (env.CATALOG) return readFileSync(env.CATALOG);
+  if (!catalogBuilt) return null;
+  const entry = {
+    owner: OWNER,
+    topic: TOPIC,
+    title: env.CATALOG_TITLE || TOPIC,
+    ...(env.CATALOG_DESCRIPTION ? { description: env.CATALOG_DESCRIPTION } : {}),
+    state: env.CATALOG_STATE || (catalogStart ? 'scheduled' : 'live'),
+    mediatype: 'video',
+    timestamp: catalogAt,
+    ...(thumbnailRef ? { thumbnail: thumbnailRef } : {}),
+    ...(catalogStart ? { scheduledStartTime: catalogStart } : {}),
+  };
+  return Buffer.from(JSON.stringify([entry]));
+}
+
+/** Whether `ref` is a thumbnail the catalog names (served from THUMBNAIL). */
+function isThumbnail(ref) {
+  if (!thumbnail) return false;
+  if (ref === thumbnailRef) return true;
+  try {
+    const list = JSON.parse(String(catalogBody()));
+    return Array.isArray(list) && list.some((e) => e && String(e.thumbnail).toLowerCase() === ref);
+  } catch (_) {
+    return false;
+  }
+}
+
 // -- the feed ----------------------------------------------------------------
 
 const updates = []; // feed index -> playlist text
 const socs = new Map(); // identifier -> () => body
-const counts = { head: 0, slot: 0, marker: 0, bytes: 0, notFound: 0 };
+const counts = { head: 0, slot: 0, marker: 0, bytes: 0, catalog: 0, thumbnail: 0, notFound: 0 };
 
 function writeUpdate(text) {
   const index = updates.length;
@@ -294,6 +358,12 @@ createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', 'swarm-feed-index, swarm-feed-index-next');
   const player = /^\/bzz\/([0-9a-f]{64})\/?(.*)$/.exec(path);
+  if (player && player[1] !== PLAYER_REF && !upstream && isThumbnail(player[1])) {
+    counts.thumbnail += 1;
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=31536000, immutable' });
+    res.end(thumbnail);
+    return;
+  }
   if (player && player[1] === PLAYER_REF) {
     const file = join(playerDir, player[2] || 'index.html');
     if (!file.startsWith(playerDir) || !existsSync(file)) return notFound(res, 'not found');
@@ -306,6 +376,22 @@ createServer((req, res) => {
     return;
   }
   const feedRoute = /^\/feeds\/(?:0x)?([0-9a-f]{40})\/([0-9a-f]{64})$/i.exec(path);
+  if (feedRoute && feedRoute[2].toLowerCase() === CATALOG_TOPIC_HEX) {
+    counts.catalog += 1;
+    const body = feedRoute[1].toLowerCase() === OWNER ? catalogBody() : null;
+    setTimeout(() => {
+      if (!body) return notFound(res, 'no update found');
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Cache-Control': 'no-cache',
+        'swarm-feed-index': '0'.repeat(16),
+        'swarm-feed-index-next': '1'.padStart(16, '0'),
+        'swarm-feed-resolved-version': 'v2',
+      });
+      res.end(body);
+    }, catalogDelay());
+    return;
+  }
   if (feedRoute) {
     counts.head += 1;
     if (feedRoute[1].toLowerCase() !== OWNER || feedRoute[2].toLowerCase() !== TOPIC_HEX || !updates.length) {
@@ -363,6 +449,7 @@ createServer((req, res) => {
   console.log(`player:  http://127.0.0.1:${port}/bzz/${PLAYER_REF}/#${channel}`);
   if (upstream) return;
   console.log(`channel: owner 0x${OWNER}, topic "${TOPIC}" (${TOPIC_HEX})`);
+  if (env.CATALOG || catalogBuilt) console.log(`catalog: ${env.CATALOG || 'built from CATALOG_*'} at /feeds/${OWNER}/${CATALOG_TOPIC_HEX}${thumbnailRef ? `, thumbnail /bzz/${thumbnailRef}/` : ''}`);
   prefill();
   if (ladder) setInterval(writeMarker, 500);
   // Like a broadcast that starts a moment after the viewer opens the link.

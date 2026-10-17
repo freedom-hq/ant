@@ -511,10 +511,43 @@ class AntNode(private val context: Context) {
         bitrateKbps: Int,
         segmentMs: Int,
         notes: String,
+        info: StreamInfo? = null,
+        width: Int = 0,
+        height: Int = 0,
     ) =
         withContext(Dispatchers.IO) {
-            val config = publisherConfig(channel, gatewayUrl, batchId, bitrateKbps, segmentMs, notes)
+            val config = publisherConfig(channel, gatewayUrl, batchId, bitrateKbps, segmentMs, notes, info, width, height)
             withHandle { AntNative.nativePublisherStart(it, config.toString()) }
+        }
+
+    /** Replace the running broadcast's stream info; its catalog entry follows at once. */
+    suspend fun setPublisherInfo(info: StreamInfo) = withContext(Dispatchers.IO) {
+        withHandle { AntNative.nativePublisherSetInfo(it, info.toJson().toString()) }
+    }
+
+    /**
+     * Upload a stream thumbnail (a downscaled JPEG) through the in-process
+     * gateway on the storage plan's batch; returns its reference. Blocks
+     * for the upload (up to a minute).
+     */
+    suspend fun uploadThumbnail(jpeg: ByteArray): String = withContext(Dispatchers.IO) {
+        val batch = plan.value?.takeIf { it.enabled }?.batchId
+            ?: throw AntException("Connect a storage plan to upload a thumbnail.")
+        withHandle { AntNative.nativeStreamThumbnailUpload(it, gatewayUrl, batch, jpeg) }
+    }
+
+    /**
+     * Announce an upcoming broadcast on the account's catalog feed
+     * (`ant_stream_catalog_publish`): `info` must carry its scheduled
+     * start. Refused while live. Blocks for up to a few minutes.
+     */
+    suspend fun announceBroadcast(channel: String, info: StreamInfo, width: Int, height: Int, bitrateKbps: Int) =
+        withContext(Dispatchers.IO) {
+            val batch = plan.value?.takeIf { it.enabled }?.batchId
+                ?: throw AntException("Connect a storage plan to announce a broadcast.")
+            if (info.scheduledStartMs == null) throw AntException("Pick a start time to announce.")
+            val config = catalogPublishConfig(gatewayUrl, batch, channel, info, width, height, bitrateKbps)
+            withHandle { AntNative.nativeStreamCatalogPublish(it, config.toString()) }
         }
 
     /** Never blocks on the uplink; returns the 0/1/2 disposition, or -1. */
@@ -566,6 +599,8 @@ class AntNode(private val context: Context) {
          * markers and a master playlist so a viewer joining late reaches the
          * live edge in two reads. No raw `topic` and no `start_index`: the
          * publisher reads the feed head and continues after it (#173).
+         * With [info], the broadcast also keeps the account's catalog entry
+         * for the channel (issue #220).
          */
         fun publisherConfig(
             channel: String,
@@ -574,6 +609,9 @@ class AntNode(private val context: Context) {
             bitrateKbps: Int,
             segmentMs: Int,
             notes: String,
+            info: StreamInfo? = null,
+            width: Int = 0,
+            height: Int = 0,
         ): JSONObject = JSONObject()
             .put("channel", channel)
             .put("format", "solar-punk")
@@ -584,6 +622,10 @@ class AntNode(private val context: Context) {
             .put("bitrate_kbps", bitrateKbps)
             .put("segment_ms", segmentMs)
             .put("notes", notes)
+            .apply { info?.let { put("info", it.toJson()) } }
+            // The rendition's size: the master's RESOLUTION and the
+            // catalog entry's rung (#220). Left out unless both are known.
+            .apply { if (width > 0 && height > 0) put("width", width).put("height", height) }
 
         const val GATEWAY_PORT = 1633
         const val GATEWAY_ADDRESS = "127.0.0.1:$GATEWAY_PORT"

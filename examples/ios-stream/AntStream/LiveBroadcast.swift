@@ -66,6 +66,11 @@ final class LiveBroadcast: ObservableObject {
     /// preview rather than turning the camera off.
     private var previewOpen = false
     private var pollTask: Task<Void, Never>?
+    /// Takes the stream's thumbnail a few seconds into the broadcast (#220).
+    private var thumbnailTask: Task<Void, Never>?
+    /// How long into a broadcast its thumbnail is captured: past the
+    /// camera's first, often dark or blurred frames.
+    private static let thumbnailDelay: UInt64 = 5_000_000_000
     /// The capture → publisher hand-off queue. The writer's delivery
     /// queue enqueues into it synchronously and ``pumpTask`` is its only
     /// consumer, so segments reach `ant_publisher_push_segment` in
@@ -306,12 +311,18 @@ final class LiveBroadcast: ObservableObject {
                 bitrateKbps: UInt32(settings.bitrateKbps),
                 segmentMs: UInt32(settings.segmentSeconds * 1000),
                 notes: Self.deviceNotes(network: node.networkLabel, source: source),
-                resume: resume
+                resume: resume,
+                // The account's stream info (#220): the broadcast keeps the
+                // channel's catalog entry with it.
+                info: node.streamInfo.forBroadcast,
+                width: settings.encodedWidth,
+                height: settings.encodedHeight
             )
         } catch {
             state = .failed(error.localizedDescription)
             return
         }
+        node.streamInfoWentLive()
         UserDefaults.standard.set(settings.portrait, forKey: Self.portraitKey(owner: permanent.owner))
 
         configureAudioSession(for: source)
@@ -368,6 +379,26 @@ final class LiveBroadcast: ObservableObject {
         engine.start(settings: settings)
         state = .live
         startPolling(node: node)
+        captureThumbnail(node: node, engine: engine)
+    }
+
+    /// A few seconds into the broadcast, one frame becomes the stream's
+    /// thumbnail (#220): scaled down, uploaded and handed to the
+    /// broadcast's catalog entry. Not when the broadcaster chose a photo.
+    private func captureThumbnail(node: AntNode, engine: CaptureEngine) {
+        thumbnailTask?.cancel()
+        guard !node.streamInfo.thumbnailPicked else { return }
+        thumbnailTask = Task { @MainActor [weak self, weak engine] in
+            try? await Task.sleep(nanoseconds: Self.thumbnailDelay)
+            guard !Task.isCancelled, let self, self.state == .live,
+                  let engine, self.engine === engine,
+                  !node.streamInfo.thumbnailPicked
+            else { return }
+            guard let jpeg = await engine.thumbnailJPEG(),
+                  !Task.isCancelled, self.state.isActive
+            else { return }
+            await node.useCapturedThumbnail(jpeg)
+        }
     }
 
     /// End the broadcast. Capture stops first so the segment in flight
@@ -385,6 +416,8 @@ final class LiveBroadcast: ObservableObject {
         state = .stopping
         pollTask?.cancel()
         pollTask = nil
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
         // Wait for the writer to emit its final segment *and* for that
         // segment to reach the publisher before closing the publisher's
         // queue — otherwise the last seconds of the broadcast are

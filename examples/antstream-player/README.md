@@ -74,6 +74,8 @@ playlist's root chunk), and the playlist lists segments and the
 | Feed slot | `swarm_readSingleOwnerChunk { owner, identifier }`; a body longer than one chunk (a recording) `swarm_readFeedEntry { topic, owner, index }` | `GET /soc/{owner}/{identifier}` |
 | Ladder marker | `swarm_readSingleOwnerChunk` | `GET /soc/{owner}/{identifier}` |
 | Segments, init | `bzz://<ref>` (Freedom's node answers raw bytes) | `GET /bytes/<ref>` |
+| Catalog (channel info) | `swarm_readFeedEntry { topic: keccak256("antstream-catalog"), owner }` | `GET /feeds/{owner}/{catalog topic}` |
+| Thumbnail (poster) | `bzz://<ref>/` | `GET /bzz/<ref>/` |
 
 A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
 `keccak256("ladder-marker" ‖ group topic ‖ period_be8)` for the group
@@ -117,6 +119,38 @@ A slot's identifier is `keccak256(topic ‖ index_be8)`, a marker's
   five minutes instead of spending a budget window on the head every
   retry; a new broadcast on the channel is found that way, and clears
   the hold.
+
+## Channel info (the catalog)
+
+The publisher keeps a catalog feed per account (issue #220,
+`crates/ant-ffi/src/catalog.rs`): owner the channel's owner, topic
+`keccak256("antstream-catalog")`, every update a JSON array with an entry
+per channel, as Solar Punk's viewer reads it. The player reads its head
+and takes the entry whose `owner` is the channel's and whose `topic` text
+hashes to the channel's topic; of several, the newest `timestamp` (the
+later one on a tie). The Android and iOS Watch tabs choose the same
+entry. It shows:
+
+- the `title` as the channel's heading (and the page title);
+- the `description` under the controls, as plain text with its line breaks;
+- the `thumbnail` (a one-file `/bzz` manifest) as the video's poster until
+  the first frame;
+- for `state: "scheduled"` with a `scheduledStartTime`, "Starts at <local
+  date and time>" under the heading while the channel waits for the
+  broadcast.
+
+The catalog never holds up playback: it is read beside the first playlist
+read and nothing waits for it. It is read once when the channel opens and
+then once a minute while the channel waits or is live (not while a
+finished broadcast's recording plays; a new broadcast reads it again). In
+Freedom it counts against the player's read budget like every other read,
+and is only sent while 20 requests and 64 KiB of the minute's budget are
+left for the playlist reads; otherwise it waits 10 s and tries again. A read
+still under way when the viewer switches channel is dropped, so one
+channel's info never shows on another. A missing (404), unreadable or
+malformed catalog, or one without an entry for the channel, shows nothing
+extra; every field is checked before it is shown. Catalog reads show in
+the debug panel's read log (`catalog`) and as the *Catalog* summary line.
 
 ## Keeping the buffer full
 
@@ -163,7 +197,8 @@ The **Debug** button (or `?debug` in the URL) opens a panel with:
 - how often the live edge moved;
 - the feed index followed, how the channel was joined (head, marker), and
   in Freedom the read budget used in the last minute;
-- every feed read (head, slot or marker, its index, `HTTP` or
+- the catalog entry last read and when;
+- every feed read (head, slot, marker or catalog, its index, `HTTP` or
   `window.swarm`, and how it was answered: 200, 404 "not written yet",
   429 rate limited, or the error) and segment fetch with first-byte time,
   total time, size and outcome.
@@ -204,6 +239,23 @@ GATEWAY=http://127.0.0.1:1733 OUT=$TMPDIR/player.png WAIT_S=40 \
   xvfb-run -a electron test/freedom-harness.cjs
 ```
 
+With `CATALOG=<file>` (served as the catalog feed's head as it is), or
+`CATALOG_TITLE`, `CATALOG_DESCRIPTION`, `CATALOG_STATE` and
+`CATALOG_START=<ISO 8601 | +minutes>` (one entry built like the
+publisher's), the fake gateway also serves the owner's catalog;
+`THUMBNAIL=<jpeg>` serves the thumbnail at `/bzz/<ref>/` and
+`CATALOG_MS=<a>-<b>` slows the catalog's answers down. An announced
+broadcast that has not started is `START_DELAY_MS` large:
+
+```sh
+START_DELAY_MS=100000000 CATALOG_TITLE='Morning walk' CATALOG_START=+90 \
+  THUMBNAIL=thumb.jpg node test/fake-gateway.mjs <segments-dir> 1733
+```
+
+The harness serves an image request for `bzz://<ref>/` (the poster) from
+the gateway's `/bzz/<ref>/`, as Freedom answers a manifest, and prints
+what the page shows from the catalog (`info`).
+
 For the HTTP path, open the fake gateway's own page instead
 (`NO_SWARM=1 URL=http://127.0.0.1:1733/bzz/<64 × a>/#<owner>/<topic>`).
 A real channel plays the same way against a real node:
@@ -221,4 +273,17 @@ ffmpeg -f lavfi -i testsrc2=size=960x540:rate=30 -f lavfi -i sine -t 40 \
   -hls_segment_type fmp4 -hls_fmp4_init_filename init-1.mp4 \
   -hls_segment_filename 'seg-%d.m4s' -start_number 2 -hls_playlist_type vod p.m3u8
 (echo "1 true 0"; awk -F'[:,]' '/EXTINF/{d=$2} /^seg-/{sub(/seg-/,"");sub(/.m4s/,"");printf "%s false %d\n",$0,d*1000}' p.m3u8) > durations.txt
+```
+
+## Checking the catalog against Solar Punk's schema
+
+`test/catalog-schema.mjs` checks the publisher's catalog fixtures
+(`crates/ant-ffi/testdata/catalog/{live,vod,scheduled}.json`, or the files
+given) against the zod schema Solar Punk's viewer reads the catalog with
+(`viewerCatalogSchema`, vendored in `test/vendor/solar-punk-catalog.mjs`),
+and that the parse keeps every field, `description` included. zod 4 is not
+vendored; point `ZOD` at it, e.g. in a Solar Punk checkout:
+
+```sh
+ZOD=../stream-event-client/node_modules/zod/index.js node test/catalog-schema.mjs
 ```

@@ -1,5 +1,6 @@
 package at.vibing.ant.stream.capture
 
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -175,6 +176,10 @@ internal class UprightRenderer(
             GLES20.glEnableVertexAttribArray(texLoc)
             GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 0, coords)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            snapshotRequest?.let { request ->
+                snapshotRequest = null
+                request(readFrame())
+            }
             // The encoder stamps the frame with this: the camera's own
             // clock, exactly as when the camera fed the encoder directly.
             EGLExt.eglPresentationTimeANDROID(display, surface, surfaceTexture.timestamp)
@@ -184,6 +189,33 @@ internal class UprightRenderer(
             Log.w(TAG, "frame dropped: ${e.message}")
         }
     }
+
+    /** Who asked for the next drawn frame ([snapshot]); touched on the GL thread only. */
+    private var snapshotRequest: ((Bitmap?) -> Unit)? = null
+
+    /**
+     * Hand [onFrame] a copy of the next frame drawn into the encoder,
+     * upright as viewers get it (the stream thumbnail, issue #220). Read
+     * back from the GL surface right after the draw, so the camera and the
+     * encoder are untouched. Runs [onFrame] on the GL thread; with `null`
+     * when the read fails, never when no frame comes (the caller times out).
+     */
+    fun snapshot(onFrame: (Bitmap?) -> Unit) {
+        handler.post {
+            if (released) onFrame(null) else snapshotRequest = onFrame
+        }
+    }
+
+    /** The frame just drawn, as a bitmap; GL's rows run bottom-up, so flipped. */
+    private fun readFrame(): Bitmap? = runCatching {
+        val pixels = ByteBuffer.allocateDirect(outWidth * outHeight * 4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(0, 0, outWidth, outHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
+        pixels.rewind()
+        val raw = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        raw.copyPixelsFromBuffer(pixels)
+        val flip = android.graphics.Matrix().apply { preScale(1f, -1f) }
+        Bitmap.createBitmap(raw, 0, 0, outWidth, outHeight, flip, false).also { if (it !== raw) raw.recycle() }
+    }.onFailure { Log.w(TAG, "snapshot: ${it.message}") }.getOrNull()
 
     /**
      * Drop every frame from now on, until [resume]. Takes effect at once,
@@ -215,6 +247,8 @@ internal class UprightRenderer(
         val done = CountDownLatch(1)
         val posted = handler.post {
             released = true
+            snapshotRequest?.invoke(null)
+            snapshotRequest = null
             if (::surfaceTexture.isInitialized) {
                 surfaceTexture.setOnFrameAvailableListener(null)
                 runCatching { inputSurface.release() }
