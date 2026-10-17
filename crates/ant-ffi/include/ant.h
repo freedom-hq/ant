@@ -1574,7 +1574,10 @@ char *ant_publisher_capacity(const char *config_json,
  * "recording" once a stop began closing the broadcast). It is removed once the recording
  * is the feed's head and, with "info", the closing "vod" catalog entry
  * has landed; it is kept when the recording, its update or that catalog
- * entry fails.
+ * entry fails. Kept for the catalog entry alone (the recording is the
+ * head), it is marked "recorded": true: its viewers already have the
+ * recording, a new broadcast need not wait for it, and ending it only
+ * writes that catalog entry.
  * A fresh broadcast with the same path replaces it at its first feed
  * update. The whole list is rewritten each time, about 250 bytes an
  * entry (some 450 KB after an hour at 2 s segments). A failure to write
@@ -1603,7 +1606,8 @@ char *ant_publisher_capacity(const char *config_json,
  * stopped) is only finalized: the run starts stopped, refuses segments,
  * and writes the closing window and the recording, or, if the recording
  * is already the head, writes only the closing "vod" catalog entry (with
- * "info", when a stop before did not land it) and removes the entry. "resume" with
+ * "info", when a stop before did not land it and the catalog's head is
+ * not that entry already) and removes the entry. "resume" with
  * "start_index" is an error.
  *
  * "info" is the broadcaster's stream info (issue #220), every field

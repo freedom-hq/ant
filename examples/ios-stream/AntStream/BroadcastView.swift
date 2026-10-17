@@ -141,7 +141,8 @@ struct BroadcastView: View {
                 for _ in 0..<60 where !node.status.isReady || node.channel == nil {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
-                node.installUnfinishedSample()
+                node.installUnfinishedSample(
+                    recorded: RootView.shotArgs.contains("-antstream-shot-unfinished-recorded"))
                 return
             }
             // antstream-visual: `-antstream-shot-channel` shows the "Your
@@ -194,7 +195,7 @@ struct BroadcastView: View {
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
 
-                if node.unfinishedBroadcast != nil {
+                if node.unfinishedBroadcast?.blocksNewBroadcast == true {
                     Text("Resume or end your unfinished broadcast first: a new one would leave it without its recording.")
                         .font(.caption)
                         .foregroundStyle(.yellow.opacity(0.9))
@@ -224,7 +225,8 @@ struct BroadcastView: View {
                         .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
-                .disabled(!node.isReadyToBroadcast || node.unfinishedBroadcast != nil
+                .disabled(!node.isReadyToBroadcast
+                          || node.unfinishedBroadcast?.blocksNewBroadcast == true
                           || node.announcingBroadcast)
             }
             .frame(maxWidth: .infinity)
@@ -241,16 +243,27 @@ struct BroadcastView: View {
     private func unfinishedCard(_ unfinished: UnfinishedBroadcast, now: Date) -> some View {
         let resumable = unfinished.canResume(now: now, reapMs: AntNode.broadcastReapMs)
         let since: String = Self.ago(unfinished.savedAt, now: now)
-        let stopped: String = unfinished.ended ? "was ending" : "stopped"
-        let what: String = "\"\(unfinished.channel)\" \(stopped) \(since) when the app closed, "
-            + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
-        let next: String = resumable
-            ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."
-            : "End it so viewers get its recording instead of a stalled live stream."
-        let detail: String = what + next
+        let detail: String
+        if unfinished.recorded {
+            // The recording is the channel's head (#220): only the
+            // account's stream info still lists it live.
+            detail = "\"\(unfinished.channel)\" ended \(since): its recording "
+                + "(\(unfinished.segments) segments, \(unfinished.durationLabel)) is on the channel, "
+                + "but its stream info still says live. End it to mark it a recording there too; "
+                + "you can go live again either way."
+        } else {
+            let stopped: String = unfinished.ended ? "was ending" : "stopped"
+            let what: String = "\"\(unfinished.channel)\" \(stopped) \(since) when the app closed, "
+                + "with \(unfinished.segments) segments (\(unfinished.durationLabel)) on Swarm. "
+            let next: String = resumable
+                ? "Resume it to carry on in the same broadcast, or end it so viewers get its recording."
+                : "End it so viewers get its recording instead of a stalled live stream."
+            detail = what + next
+        }
         return GlassCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Unfinished broadcast", systemImage: "exclamationmark.arrow.circlepath")
+                Label(unfinished.recorded ? "Stream info still live" : "Unfinished broadcast",
+                      systemImage: "exclamationmark.arrow.circlepath")
                     .font(.headline)
                     .foregroundStyle(.white)
                 Text(detail)
@@ -266,7 +279,9 @@ struct BroadcastView: View {
                 if endingUnfinished {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small).tint(.white)
-                        Text("Publishing its recording…")
+                        Text(unfinished.recorded
+                             ? "Updating its stream info…"
+                             : "Publishing its recording…")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
                     }
@@ -296,14 +311,18 @@ struct BroadcastView: View {
                 }
             }
         }
-        .confirmationDialog("Discard the unfinished broadcast?",
+        .confirmationDialog(unfinished.recorded
+                            ? "Leave its stream info as it is?"
+                            : "Discard the unfinished broadcast?",
                             isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Discard", role: .destructive) {
                 unfinishedOutcome = nil
                 node.discardUnfinishedBroadcast()
             }
         } message: {
-            Text("Its segments stay on Swarm, but it is never closed: viewers keep its last live window and get no recording.")
+            Text(unfinished.recorded
+                 ? "Its recording stays on the channel, but the stream info keeps listing it as live until your next broadcast."
+                 : "Its segments stay on Swarm, but it is never closed: viewers keep its last live window and get no recording.")
         }
     }
 
@@ -325,15 +344,17 @@ struct BroadcastView: View {
                 banner.flash(landedNow
                     ? "Broadcast ended: its recording is on the channel"
                     : "Broadcast ended: its recording was already on the channel")
+            } else if node.unfinishedBroadcast?.recorded == true {
+                // The recording is on the channel, but the account's
+                // catalog still lists it live (#220): the node kept the
+                // entry, marked, so this can be tried again. Ahead of
+                // `errors`, which can hold head reads that failed and were
+                // retried on the way to finding the recording there.
+                let why = report.catalogError.flatMap { $0.isEmpty ? nil : " (\($0))" } ?? ""
+                unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                    + "still says live\(why); try again in a moment."
             } else if let error = report.errors.first {
                 unfinishedOutcome = error
-            } else if let catalog = report.catalogError, !catalog.isEmpty,
-                      report.catalogState != "vod" {
-                // The recording is on the channel, but the account's
-                // catalog still lists it live (#220): the entry is kept
-                // so this can be tried again.
-                unfinishedOutcome = "Its recording is on the channel, but the stream info "
-                    + "still says live (\(catalog)); try again in a moment."
             } else {
                 unfinishedOutcome = "Its recording did not go up; try again in a moment."
             }

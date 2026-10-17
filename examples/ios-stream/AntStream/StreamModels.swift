@@ -809,6 +809,13 @@ struct UnfinishedBroadcast: Equatable {
     /// its `#EXT-X-ENDLIST` window or recording may already be the head,
     /// and live viewers have stopped there, so it can only be ended.
     let ended: Bool
+    /// Its recording is already the channel's head, and only the closing
+    /// `vod` entry of the account's catalog (#220) did not go up (the
+    /// entry's `recorded`). Nothing is left unfinished for its viewers:
+    /// ending it only writes that catalog entry, and a new broadcast need
+    /// not wait for it (its first update replaces the entry, and its own
+    /// catalog entry follows the stale `live` one).
+    let recorded: Bool
     /// The feed and format it went out on, which ending or resuming it
     /// must name again (the node refuses anything else). Not
     /// ``BroadcastFeed/current`` for an entry left by a build from before
@@ -839,6 +846,7 @@ struct UnfinishedBroadcast: Equatable {
             segments: media.count,
             seconds: ms / 1000,
             ended: (obj["shape"] as? String ?? "live") != "live",
+            recorded: obj["recorded"] as? Bool ?? false,
             feed: .recovery(topic: topic, topicText: obj["topic_text"] as? String ?? "", format: format)
         )
     }
@@ -853,6 +861,12 @@ struct UnfinishedBroadcast: Equatable {
     func canResume(now: Date = Date(), reapMs: UInt64) -> Bool {
         !ended && feed == .current && now.timeIntervalSince(savedAt) * 1000 < Double(reapMs)
     }
+
+    /// A new broadcast would leave this one without its recording, so Go
+    /// live waits until it is resumed, ended or discarded: every screen
+    /// that can start one asks this. Not for an entry kept only for its
+    /// catalog entry (``recorded``).
+    var blocksNewBroadcast: Bool { !recorded }
 
     var durationLabel: String {
         let total = Int(seconds.rounded())

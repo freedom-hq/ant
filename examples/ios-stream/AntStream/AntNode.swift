@@ -1614,8 +1614,10 @@ final class AntNode: ObservableObject {
     /// screenshot: a runner never has a broadcast killed under it, so
     /// this shows a sample one saved 20 s ago, recent enough to resume.
     /// Nothing is written to disk. Sample only, and only ever called
-    /// behind `-antstream-shot-unfinished`.
-    func installUnfinishedSample() {
+    /// behind `-antstream-shot-unfinished` (`recorded`: with
+    /// `-antstream-shot-unfinished-recorded`, one whose recording landed
+    /// and only its catalog entry is left, #220).
+    func installUnfinishedSample(recorded: Bool = false) {
         installChannelSample()
         unfinishedSampleActive = true
         unfinishedBroadcast = UnfinishedBroadcast(
@@ -1625,7 +1627,8 @@ final class AntNode: ObservableObject {
             savedAt: Date().addingTimeInterval(-20),
             segments: 214,
             seconds: 428,
-            ended: false,
+            ended: recorded,
+            recorded: recorded,
             feed: .current
         )
     }

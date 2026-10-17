@@ -250,6 +250,15 @@ jobs:
           xcrun simctl launch booted baby.freedom.antstream -antstream-shot-unfinished
           sleep 25
           xcrun simctl io booted screenshot shots/20-broadcast-unfinished.png
+          # 20b — the same card for an entry kept only because the closing
+          # `vod` catalog entry failed after the recording landed (#220):
+          # it says the recording is on the channel, and Go live is not
+          # held for it.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-unfinished -antstream-shot-unfinished-recorded
+          sleep 25
+          xcrun simctl io booted screenshot shots/20b-broadcast-unfinished-recorded.png
           # 14/15 — the Watch tab playing a channel through the in-process
           # gateway. The sample channel (an owner nobody broadcasts as,
           # topic `antstream`) has no feed, so this

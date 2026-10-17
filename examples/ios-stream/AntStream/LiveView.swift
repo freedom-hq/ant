@@ -801,9 +801,12 @@ struct LiveView: View {
     /// screen was opened to go live, not to resume it). A new broadcast
     /// would replace that entry with its first feed update and leave it
     /// without its recording, so nothing starts from here: the Broadcast
-    /// tab's card ends it (or discards it, with confirmation).
+    /// tab's card ends it (or discards it, with confirmation). An entry
+    /// kept only for its catalog entry (its recording is the head, #220)
+    /// blocks nothing.
     private func blockedByUnfinished(now: Date) -> Bool {
-        guard !broadcast.state.isActive, node.unfinishedBroadcast != nil else { return false }
+        guard !broadcast.state.isActive,
+              node.unfinishedBroadcast?.blocksNewBroadcast == true else { return false }
         return !(resumePending && resumable(now: now))
     }
 

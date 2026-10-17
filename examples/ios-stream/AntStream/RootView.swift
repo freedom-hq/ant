@@ -68,7 +68,9 @@ struct RootView: View {
     /// `-antstream-shot-info` and `-antstream-shot-watch` land here too:
     /// the first three on the Broadcast tab's channel card,
     /// unfinished-broadcast card and stream info card (BroadcastView
-    /// installs the sample state; `-antstream-shot-info-edit` also opens
+    /// installs the sample state; `-antstream-shot-unfinished-recorded`
+    /// makes the unfinished one an entry kept only for its catalog entry;
+    /// `-antstream-shot-info-edit` also opens
     /// the stream info editor, #220), the last on the Watch tab already
     /// playing a sample channel (see the `@State` seeds above), with
     /// `-antstream-shot-watch-info` showing a sample catalog entry's title
