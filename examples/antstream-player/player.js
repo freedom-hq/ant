@@ -141,13 +141,26 @@
    * the first one's topic. Sentence punctuation after a
    * channel in text (`… 0x<owner>/antstream.`) is not part of its topic,
    * unless another mention of the same channel ends in it too (the Share
-   * text of topic `show.`).
+   * text of topic `show.`). A mention that names its topic wins over an
+   * owner alone before it (`Tip jar 0x<a> - watch 0x<b>/antstream` is
+   * `0x<b>/antstream`); with only owners alone, they must all be the same
+   * one. A truncated `swarm://<owner>/` names no channel in text either.
+   *
+   * One link in quotes and nothing else (`"0x<owner>/antstream"`) is the
+   * link: the quotes are dropped, as in text.
    */
   function parseChannel(input) {
-    const s = (input || '').trim();
+    let s = (input || '').trim();
     if (!s) return null;
-    return /\s/.test(s) ? findChannel(s) : parseChannelToken(s);
+    if (/\s/.test(s)) return findChannel(s);
+    const quoted = QUOTE_OPEN.exec(s);
+    if (quoted) s = s.slice(quoted[0].length).replace(QUOTE_CLOSE, '');
+    return parseChannelToken(s);
   }
+
+  // Quotes around a whole pasted link (a channel never starts with one).
+  const QUOTE_OPEN = /^["'\u201c\u2018\u00ab<]+/;
+  const QUOTE_CLOSE = /["'\u201d\u2019\u00bb>]+$/;
 
   /** One channel string, the whole input: the form a link's hash carries. */
   function parseChannelToken(input) {
@@ -175,8 +188,9 @@
 
   // A channel inside text, by where it starts: a `swarm://` URI (its topic
   // ends at `/`, `?` or `#`), or `0x<owner>` not inside a longer word or
-  // hex string, its topic after a `/` (none: the owner alone).
-  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z])0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
+  // hex string nor right after `swarm://` (a truncated URI names no
+  // channel), its topic after a `/` (none: the owner alone).
+  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z])(?<!swarm:\/\/)0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
 
   /** The channel in free text, see `parseChannel`. */
   function findChannel(text) {
@@ -236,7 +250,13 @@
       });
     }
     if (!found.length) return null;
-    const first = found[0];
+    // The first mention that names a topic: an owner alone before it (a
+    // tip-jar address, a wallet) is not the channel pasted. Only owners
+    // alone: the channel if they are all the same one, else none, rather
+    // than guess between accounts.
+    const at = found.findIndex((f) => f.topic !== '');
+    if (at < 0 && found.some((f) => f.owner !== found[0].owner)) return null;
+    const first = found[Math.max(at, 0)];
     let topic = first.topic;
     // The first one glued to the label after it (`…/antstreamAny browser:
     // …`): the same channel further on whose topic is the first one's
@@ -251,7 +271,7 @@
     // link) and as written (the Channel line's display text, where `%25`
     // is the topic's own `%25` and a `/` before a space is still its own).
     if (first.unglued !== null) {
-      search: for (const f of found.slice(1)) {
+      search: for (const f of found.slice(Math.max(at, 0) + 1)) {
         if (f.owner !== first.owner || f.uri) continue;
         for (const start of new Set([f.topic, f.written])) {
           if (!start || !first.topic.startsWith(start)) continue;

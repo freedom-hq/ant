@@ -78,7 +78,12 @@ ends a sentence or closes a quote or bracket (`… 0x<owner>/antstream.`)
 is not part of the topic, unless another mention of the same channel
 ends in it too (the Share text of a topic like `show.` names it four
 times, each ending in its `.`); a single link with no whitespace around
-it is read as it is. `test/channel-parse-test.mjs` checks this against the apps'
+it is read as it is (quotes around it are dropped). In text, a channel
+that names its topic wins over an owner alone before it (a tip-jar
+address ahead of `0x<owner>/antstream`); text with only owners alone
+plays that owner's `antstream` channel if they are all the same one, and
+nothing if they differ. A truncated `swarm://<owner>/` is rejected in
+text too. `test/channel-parse-test.mjs` checks this against the apps'
 strings (`node test/channel-parse-test.mjs`, no dependencies).
 
 Every feed update **is** the playlist (a v2 update wrapping the

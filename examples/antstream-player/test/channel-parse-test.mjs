@@ -49,6 +49,7 @@ const PLAYER_REF = 'b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac4285
 const PUBLIC_GATEWAY = 'https://api.gateway.ethswarm.org';
 const OWNER = '9f2c1a7e5b3d4c6a8e0f1b2d3c4e5f6a7b8c9d0e';
 const RAW = '0123456789abcdef'.repeat(4);
+const OTHER = '1111111111111111111111111111111111111111';
 
 /** `ChannelAddress(owner:text:)` / `(owner:rawTopic:)`'s strings. */
 function app(owner, topic) {
@@ -132,6 +133,26 @@ expect('only the Solar Punk line', `Solar Punk players: ${ant.swarmURI}`, antWan
 expect('truncated swarm://<owner>/', `swarm://${OWNER}/`, null);
 expect('truncated swarm://<owner>', `swarm://${OWNER}`, null);
 expect('truncated swarm://<owner>/ in text', `Solar Punk players: swarm://${OWNER}/`, null);
+expect('truncated swarm://0x<owner>/ in text', `swarm://0x${OWNER}/ more`, null);
+expect('truncated swarm://0x<owner> in text', `Solar Punk players: swarm://0x${OWNER} more`, null);
+expect('truncated swarm:// before a real channel', `swarm://0x${OWNER}/ or 0x${OTHER}/antstream`, channel(OTHER, { text: 'antstream' }));
+
+// -- an owner alone before a channel with a topic is not the channel ------
+
+expect('tip-jar address before the channel', `Tip jar 0x${OTHER} - watch 0x${OWNER}/antstream`, antWant);
+expect('owner alone before a named topic', `0x${OTHER} then 0x${OWNER}/news`, channel(OWNER, { text: 'news' }));
+expect('owner alone before the Share text', `tips: 0x${OTHER}\n${ant.watchLinks}`, antWant);
+expect('owner alone before the stripped Share text', `tips: 0x${OTHER} ${inputValue(ant.watchLinks)}`, antWant);
+expect('two different owners alone are ambiguous', `0x${OTHER} or 0x${OWNER}`, null);
+expect('the same owner alone twice', `0x${OWNER} (0x${OWNER})`, antWant);
+
+// -- one quoted link alone ------------------------------------------------
+
+expect('quoted link, straight quotes', `"0x${OWNER}/antstream"`, antWant);
+expect('quoted link, curly quotes', `\u201c0x${OWNER}/antstream\u201d`, antWant);
+expect('quoted link, single quotes', `'${ant.playerLink}'`, antWant);
+expect('quoted owner alone', `"0x${OWNER}"`, antWant);
+expect('quoted truncated swarm://', `"swarm://${OWNER}/"`, null);
 expect('owner too short', `0x${OWNER.slice(1)}`, null);
 expect('older manifest link (#<64 hex>)', `bzz://${PLAYER_REF}/#${RAW}`, null);
 expect('text without a channel', 'Watch my live stream on Swarm: soon', null);
