@@ -347,12 +347,22 @@ struct BroadcastView: View {
             } else if node.unfinishedBroadcast?.recorded == true {
                 // The recording is on the channel, but the account's
                 // catalog still lists it live (#220): the node kept the
-                // entry, marked, so this can be tried again. Ahead of
-                // `errors`, which can hold head reads that failed and were
-                // retried on the way to finding the recording there.
-                let why = report.catalogError.flatMap { $0.isEmpty ? nil : " (\($0))" } ?? ""
-                unfinishedOutcome = "Its recording is on the channel, but the stream info "
-                    + "still says live\(why); try again in a moment."
+                // entry, marked, so this can be tried again. A catalog
+                // write that failed says so, ahead of `errors` (which can
+                // hold head reads that failed and were retried on the way
+                // to finding the recording there). With no catalog error
+                // the run stopped before the catalog: its last error says
+                // why (a resume refused because the channel moved on, a
+                // head that never answered), and "try again" may not help.
+                if let catalog = report.catalogError, !catalog.isEmpty {
+                    unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                        + "still says live (\(catalog)); try again in a moment."
+                } else if let error = report.errors.last {
+                    unfinishedOutcome = error
+                } else {
+                    unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                        + "still says live; try again in a moment."
+                }
             } else if let error = report.errors.first {
                 unfinishedOutcome = error
             } else {

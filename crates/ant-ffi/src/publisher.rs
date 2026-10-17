@@ -1383,6 +1383,11 @@ struct PublisherState {
     /// on the feed; its recovery entry goes once the catalog says so too
     /// ([`drive`]).
     recording_landed: bool,
+    /// When the recovery entry a resumed run carries on was last saved,
+    /// Unix ms (0 for a fresh run): a catalog entry announced after it
+    /// is newer than this broadcast, and its closing `vod` entry must not
+    /// replace it ([`catalog_head_verdict`]).
+    resumed_saved_ms: u64,
 
     publish_ms: VecDeque<u64>,
     /// When each landed media segment's upload finished, until the
@@ -2174,11 +2179,14 @@ pub(crate) struct RecoveryEntry {
     #[serde(default)]
     height: u32,
     /// The recording is the feed's head, and only the closing `vod`
-    /// catalog entry is still to land (issue #220): set when that entry
-    /// failed after the recording's update landed. Nothing about the
-    /// broadcast is left unfinished for its viewers (they have the
-    /// recording); a host need not hold a new broadcast for it, and
-    /// ending it only writes that catalog entry. Missing reads as false.
+    /// catalog entry is still to land (issue #220): set once the
+    /// recording's update landed, before that entry is written, so an
+    /// entry kept by a failed write or a kill during it carries it.
+    /// Nothing about the broadcast is left unfinished for its viewers
+    /// (they have the recording); a host need not hold a new broadcast
+    /// for it, and ending it only writes that catalog entry, or none when
+    /// the catalog's head is newer than the broadcast (an announcement
+    /// made since, a later broadcast's entry). Missing reads as false.
     #[serde(default)]
     recorded: bool,
 }
@@ -2347,6 +2355,7 @@ impl PublisherState {
             feed_index: entry.feed_index,
             resume_index: Some(entry.feed_index),
             resume_shape: entry.shape,
+            resumed_saved_ms: entry.saved_at_ms,
             ..Self::default()
         }
     }
@@ -3832,6 +3841,18 @@ async fn drive(ctx: Arc<RunCtx>) {
     if let Some(master) = master {
         master.abort();
     }
+    // The recording is the head: from here on the recovery entry stands
+    // only for the closing `vod` catalog entry, so it says so before
+    // that entry's head read and upload begin. A kill during them then
+    // leaves an entry a relaunch knows is `recorded` (no Go live held,
+    // no "stalled live stream"), not one that looks mid-close.
+    let closing_due = catalog.is_some() && {
+        let state = lock(&ctx.state);
+        state.recording_landed && state.info.is_some()
+    };
+    if closing_due {
+        ctx.mark_recovery_recorded().await;
+    }
     // The catalog writer is joined, not aborted: a write it has on the
     // wire may land and take its index, and the closing entry goes after
     // it. It exits at its next wake, which the stop already gave it.
@@ -3850,14 +3871,11 @@ async fn drive(ctx: Arc<RunCtx>) {
     // recovery entry goes. Kept while the `vod` entry has not landed (a
     // failed or sealed write, a kill before it): a relaunch that ends
     // the broadcast finds the recording at the head and writes only that
-    // entry (issue #220). Marked `recorded` then, so the host knows the
-    // viewers already have the recording and only the catalog is open.
-    if lock(&ctx.state).recording_landed {
-        if catalog_closed {
-            ctx.clear_recovery_entry().await;
-        } else {
-            ctx.mark_recovery_recorded().await;
-        }
+    // entry (issue #220). Marked `recorded` (above, before the catalog
+    // was closed), so the host knows the viewers already have the
+    // recording and only the catalog is open.
+    if lock(&ctx.state).recording_landed && catalog_closed {
+        ctx.clear_recovery_entry().await;
     }
     // Join, don't abort, the manifest attempt still on the wire: it ran
     // alongside the drain, so this rarely waits, and a reference that
@@ -4399,7 +4417,9 @@ enum Resumed {
     /// The entry was written ahead of the recording, and the head is it:
     /// the broadcast is finished on its feed. Its entry was left behind by
     /// a closing `vod` catalog entry that did not land, or a removal that
-    /// failed: the run writes only that catalog entry, then removes it.
+    /// failed: the run writes only that catalog entry (none when the
+    /// catalog's head is newer, see [`HeadVerdict::MovedOn`]), then
+    /// removes it.
     Finished,
 }
 
@@ -5069,14 +5089,21 @@ async fn close_catalog(ctx: &RunCtx, mut writer: CatalogWriter) -> bool {
     };
     // A resumed run that found the recording already the head: the `vod`
     // entry may have landed too, and only the entry's removal failed (or
-    // the app went in between). Written again only if the head isn't it.
-    if lock(&ctx.state).feed_updates == 0 {
-        match catalog_already_closed(&writer, &entry).await {
-            Ok((true, next)) => {
+    // the app went in between). Written again only if the head isn't it,
+    // and never after a head that is newer than this broadcast (an
+    // announcement, a later broadcast): the catalog's head is what its
+    // viewers list, and a late `vod` would take that place.
+    let saved_ms = {
+        let state = lock(&ctx.state);
+        (state.feed_updates == 0).then_some(state.resumed_saved_ms)
+    };
+    if let Some(saved_ms) = saved_ms {
+        match catalog_head_verdict(&writer, &entry, saved_ms).await {
+            Ok((HeadVerdict::Closed | HeadVerdict::MovedOn, next)) => {
                 writer.next_index = Some(next);
                 return true;
             }
-            Ok((false, next)) => writer.next_index = Some(next),
+            Ok((HeadVerdict::Open, next)) => writer.next_index = Some(next),
             Err(message) => {
                 lock(&ctx.state).record_catalog_failure(format!(
                     "catalog entry ({}): head: {message}",
@@ -5089,14 +5116,34 @@ async fn close_catalog(ctx: &RunCtx, mut writer: CatalogWriter) -> bool {
     write_catalog(ctx, &mut writer, entry).await
 }
 
-/// Whether the catalog's head already is `closing`'s `vod` entry (same
-/// owner, topic and recording index), and the index after that head.
-/// A head that can't be read is an error, not "not closed": writing on
-/// a guess could put a second `vod` entry after one that landed.
-async fn catalog_already_closed(
+/// What a resumed run's closing `vod` entry finds at the catalog's head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadVerdict {
+    /// The head already is this `vod` entry: nothing to write.
+    Closed,
+    /// The head is newer than this broadcast: an entry announced
+    /// (`scheduled`) after its recovery entry was last saved, or one
+    /// naming a later feed index (a later broadcast). Writing the `vod`
+    /// entry after it would replace it as the head, so none is written:
+    /// the catalog has moved on, and this broadcast's `live` entry is no
+    /// longer what it lists.
+    MovedOn,
+    /// The head still is this broadcast's (or an earlier one's): the
+    /// `vod` entry goes after it.
+    Open,
+}
+
+/// Classify the catalog's head for `closing`, the `vod` entry of a
+/// broadcast whose recovery entry was last saved at `saved_ms` (Unix
+/// ms), and the index after that head (see [`HeadVerdict`]). A head
+/// that can't be read is an error, not "open": writing on a guess could
+/// put a second `vod` entry after one that landed, or bury an
+/// announcement.
+async fn catalog_head_verdict(
     writer: &CatalogWriter,
     closing: &CatalogEntry,
-) -> Result<(bool, u64), String> {
+    saved_ms: u64,
+) -> Result<(HeadVerdict, u64), String> {
     let topic = crate::catalog::catalog_topic();
     let path = format!(
         "{}/feeds/{}/{}?exact=true",
@@ -5106,21 +5153,32 @@ async fn catalog_already_closed(
     );
     let response = http_get_timed(&writer.target, &path).await?;
     match response.status {
-        404 if is_no_update_found(&response.body) => Ok((false, 0)),
+        404 if is_no_update_found(&response.body) => Ok((HeadVerdict::Open, 0)),
         200 => {
             let next = feed_index_of(&response)?
                 .checked_add(1)
                 .ok_or_else(|| "the feed is full".to_string())?;
-            let closed =
-                serde_json::from_slice::<Vec<CatalogEntry>>(&response.body).is_ok_and(|entries| {
-                    entries.iter().any(|e| {
-                        e.state == CatalogState::Vod
-                            && e.owner == closing.owner
-                            && e.topic == closing.topic
-                            && e.index == closing.index
-                    })
-                });
-            Ok((closed, next))
+            let entries =
+                serde_json::from_slice::<Vec<CatalogEntry>>(&response.body).unwrap_or_default();
+            let verdict = if entries.iter().any(|e| {
+                e.state == CatalogState::Vod
+                    && e.owner == closing.owner
+                    && e.topic == closing.topic
+                    && e.index == closing.index
+            }) {
+                HeadVerdict::Closed
+            } else if entries.iter().any(|e| {
+                (e.state == CatalogState::Scheduled && e.timestamp > saved_ms)
+                    || (e.topic == closing.topic
+                        && e.index
+                            .zip(closing.index)
+                            .is_some_and(|(at, ours)| at > ours))
+            }) {
+                HeadVerdict::MovedOn
+            } else {
+                HeadVerdict::Open
+            };
+            Ok((verdict, next))
         }
         status => Err(format!(
             "gateway returned {status} {}",
@@ -7154,6 +7212,8 @@ mod tests {
         /// Refuse the catalog's payload uploads only (a `POST /bytes`
         /// whose body is a JSON array).
         fail_catalog: bool,
+        /// Extra latency on the catalog's payload uploads only.
+        catalog_delay: Duration,
         /// Extra latency on `POST /feeds` only.
         feeds_delay: Duration,
         /// Extra latency on the upload of a segment whose body starts
@@ -7415,6 +7475,10 @@ mod tests {
                                         fail,
                                         if is_feeds {
                                             slot.feeds_delay
+                                        } else if request.method_path.ends_with("/bytes")
+                                            && request.body.starts_with(b"[{")
+                                        {
+                                            slot.catalog_delay
                                         } else if is_recording {
                                             slot.recording_delay
                                         } else {
@@ -11522,6 +11586,147 @@ mod tests {
         assert_eq!(catalog_updates(&log).len(), written, "no second vod entry");
         assert_eq!(catalog_payloads(&log).len(), uploads, "nothing uploaded");
         assert!(!std::path::Path::new(&path).exists(), "removed: closed");
+    }
+
+    /// A recorded entry ended after the catalog moved on (an Announce
+    /// made since it was saved, a later broadcast's entry) writes no `vod`
+    /// entry: the head stays the newer entry its viewers list, and the
+    /// recovery entry goes. A `scheduled` head older than the entry (the
+    /// announcement this broadcast went live for) is closed as usual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newer_catalog_head_is_not_buried_by_a_late_vod_entry() {
+        for (case, newer) in [("announced", true), ("later", true), ("stale", false)] {
+            let log = Arc::new(Mutex::new(StubLog::default()));
+            let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+            let path = recovery_path(&format!("newer-head-{case}"));
+            let mut c = config();
+            c.gateway = format!("http://{addr}");
+            c.topic = String::new();
+            c.topic_text = "antstream".into();
+            c.width = 480;
+            c.height = 640;
+            c.info = Some(morning_walk());
+            c.recovery_path = path.clone();
+            let run = start(
+                &tokio::runtime::Handle::current(),
+                c.clone(),
+                TEST_SECRET,
+                test_owner(),
+                None,
+            )
+            .unwrap();
+            let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+            let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+            wait_for(&run, "the live entry", |s| s.catalog_writes == 1).await;
+            lock(&log).fail_catalog = true;
+            run.cancel();
+            settle(&run).await;
+            let recording = run.snapshot().feed_index.unwrap() - 1;
+            let kept = load_recovery(&path).unwrap();
+            assert!(kept.recorded, "{case}");
+            let mut head = catalog_payloads(&log).pop().unwrap();
+            match case {
+                "announced" | "stale" => {
+                    head[0]["state"] = "scheduled".into();
+                    head[0]["scheduledStartTime"] = "2099-01-01T19:00:00.000Z".into();
+                    head[0]["timestamp"] = if newer {
+                        (kept.saved_at_ms + 1).into()
+                    } else {
+                        (kept.saved_at_ms - 1).into()
+                    };
+                    head[0].as_object_mut().unwrap().remove("index");
+                }
+                _ => head[0]["index"] = (recording + 3).into(),
+            }
+            let catalog_hex = hex::encode(crate::catalog::catalog_topic());
+            let written = catalog_updates(&log).len();
+            c.info = None;
+            c.resume = true;
+            {
+                let mut log = lock(&log);
+                log.fail_catalog = false;
+                log.head = Some(head_at(recording));
+                log.feed_heads.insert(
+                    catalog_hex,
+                    StubHead {
+                        index: 4,
+                        version: "v2",
+                        reference: "ab".repeat(32),
+                        body: serde_json::to_vec(&head).unwrap(),
+                    },
+                );
+            }
+            let ended = start(
+                &tokio::runtime::Handle::current(),
+                c,
+                TEST_SECRET,
+                test_owner(),
+                None,
+            )
+            .unwrap();
+            ended.cancel();
+            settle(&ended).await;
+            if newer {
+                assert_eq!(catalog_updates(&log).len(), written, "{case}: head kept");
+            } else {
+                let updates = catalog_updates(&log);
+                assert_eq!(updates.len(), written + 1, "{case}: {updates:?}");
+                assert_eq!(updates.last(), Some(&5), "{case}: after the head");
+                let vod = catalog_payloads(&log).pop().unwrap();
+                assert_eq!(vod[0]["state"], "vod", "{case}: {vod}");
+            }
+            assert!(!std::path::Path::new(&path).exists(), "{case}: removed");
+        }
+    }
+
+    /// The recovery entry is marked `recorded` as soon as the recording
+    /// is the head, before the closing `vod` entry's upload: a kill while
+    /// that entry is on the wire leaves an entry a relaunch knows needs
+    /// only the catalog closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_entry_is_marked_recorded_before_the_vod_entry_is_written() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let path = recovery_path("marked-early");
+        let mut c = config();
+        c.gateway = format!("http://{addr}");
+        c.topic = String::new();
+        c.topic_text = "antstream".into();
+        c.info = Some(morning_walk());
+        c.recovery_path = path.clone();
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            c,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        wait_for(&run, "the live entry", |s| s.catalog_writes == 1).await;
+        lock(&log).catalog_delay = Duration::from_secs(2);
+        run.cancel();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let vod_on_the_wire = catalog_payloads(&log)
+                .last()
+                .is_some_and(|p| p[0]["state"] == "vod");
+            if vod_on_the_wire {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no vod entry was sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            load_recovery(&path).unwrap().recorded,
+            "marked while the vod entry is on the wire"
+        );
+        settle(&run).await;
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "removed once it landed"
+        );
     }
 
     /// A channel no catalog entry can name (a raw topic, or `"bzz"`)

@@ -3968,7 +3968,10 @@ pub unsafe extern "C" fn ant_publisher_capacity(
 /// `recovery_path` keeps a recovery entry for the broadcast (issue #175),
 /// written ahead of every feed update and removed once the recording is
 /// the feed's head (and, with `info`, the closing `vod` catalog entry has
-/// landed; kept for that entry alone, it is marked `"recorded": true`); after a kill or crash, starting with `resume: true`
+/// landed; kept for that entry alone, it is marked `"recorded": true`
+/// as soon as the recording lands, and ending it writes that entry
+/// unless an announcement or a later broadcast is the catalog's head by
+/// then); after a kill or crash, starting with `resume: true`
 /// and the same path carries the same broadcast on in the same feed (or,
 /// stopped straight away, finalizes it into its recording). A resume is
 /// refused at start for another account's, topic's or format's entry,

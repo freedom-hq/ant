@@ -812,7 +812,9 @@ struct UnfinishedBroadcast: Equatable {
     /// Its recording is already the channel's head, and only the closing
     /// `vod` entry of the account's catalog (#220) did not go up (the
     /// entry's `recorded`). Nothing is left unfinished for its viewers:
-    /// ending it only writes that catalog entry, and a new broadcast need
+    /// ending it only writes that catalog entry (none if an announcement
+    /// or a later broadcast is the catalog's head by then, which it must
+    /// not bury), and a new broadcast need
     /// not wait for it (its first update replaces the entry, and its own
     /// catalog entry follows the stale `live` one).
     let recorded: Bool

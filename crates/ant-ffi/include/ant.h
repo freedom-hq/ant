@@ -1575,9 +1575,11 @@ char *ant_publisher_capacity(const char *config_json,
  * is the feed's head and, with "info", the closing "vod" catalog entry
  * has landed; it is kept when the recording, its update or that catalog
  * entry fails. Kept for the catalog entry alone (the recording is the
- * head), it is marked "recorded": true: its viewers already have the
+ * head; marked as soon as the recording lands, before that entry is
+ * written), it is marked "recorded": true: its viewers already have the
  * recording, a new broadcast need not wait for it, and ending it only
- * writes that catalog entry.
+ * writes that catalog entry, or none when the catalog's head is newer
+ * than the broadcast (an announcement made since, a later broadcast).
  * A fresh broadcast with the same path replaces it at its first feed
  * update. The whole list is rewritten each time, about 250 bytes an
  * entry (some 450 KB after an hour at 2 s segments). A failure to write
