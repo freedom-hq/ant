@@ -53,7 +53,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import at.vibing.ant.stream.AntNode
-import at.vibing.ant.stream.Channel
 import at.vibing.ant.stream.LiveBroadcast
 import at.vibing.ant.stream.capture.CaptureEngine
 import at.vibing.ant.stream.formatBytes
@@ -305,15 +304,15 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                 creditSummary(credit)?.let { Stat("Credit", it) }
                 credit?.takeIf { it.swap.issuedPlur != null }?.let { Stat("Paid this session", formatBzz(it.sessionPlur)) }
                 if (p.lastError.isNotEmpty()) Text(p.lastError, color = Amber, style = MaterialTheme.typography.bodySmall)
-                if (p.channelReference.isNotEmpty()) {
+                p.channel?.let { c ->
                     Text("Channel", color = Color.Gray)
-                    MonoText(p.channelReference)
+                    MonoText(c.display)
                     OutlinedButton(
-                        onClick = { copyToClipboard(context, "Channel", p.channelReference) },
+                        onClick = { copyToClipboard(context, "Player link", c.playerLink) },
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Copy") }
+                    ) { Text("Copy player link") }
                     OutlinedButton(
-                        onClick = { shareText(context, Channel.watchLinks(p.channelReference)) },
+                        onClick = { shareText(context, c.watchLinks()) },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Share") }
                 }
@@ -326,10 +325,10 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                 Stat("Published", formatBytes(r.bytesPublished))
                 Stat("Lag p50 / max", "${r.lagMsP50 / 1000.0} s / ${r.lagMsMax / 1000.0} s")
                 Stat("Kept up", if (r.keptUp) "yes" else "no")
-                if (r.channelReference.isNotEmpty()) {
-                    MonoText(r.channelReference)
+                r.channel?.let { c ->
+                    MonoText(c.display)
                     OutlinedButton(
-                        onClick = { onWatch(r.channelReference) },
+                        onClick = { onWatch(c.key) },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Watch it") }
                 }

@@ -3922,11 +3922,12 @@ pub unsafe extern "C" fn ant_publisher_capacity(
 /// must already be listening (see [`ant_start_gateway`]). The `format`
 /// field picks the shape ([`publisher::StreamFormat`]): `"bzz"`, the
 /// default, uploads with `POST /bzz`, lists `/bzz/<ref>/<name>` paths and
-/// writes v1 updates, so viewers play `/bzz/<channel>/stream.m3u8` (the
-/// web player and the Android Watch tab read this); `"solar-punk"`
+/// writes v1 updates, so viewers play `/bzz/<channel>/stream.m3u8` (no
+/// viewer in this repository reads it any more, #217); `"solar-punk"`
 /// uploads with `POST /bytes`, lists bare references and writes v2
 /// updates wrapping the playlist itself, so `GET /feeds/{owner}/{topic}`
-/// returns the playlist (what Solar Punk's viewers read). The topic is
+/// returns the playlist (what Solar Punk's viewers, the web player and
+/// both `AntStream` apps read, and what the apps publish). The topic is
 /// text (`topic_text`, hashed like bee-js `Topic.fromString`) or raw hex
 /// (`topic`), and with neither it is the channel's stable text topic
 /// `antstream/<channel>`; see [`publisher::PublisherConfig`].

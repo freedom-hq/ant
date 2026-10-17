@@ -10,12 +10,17 @@ struct RootView: View {
 
     @State private var tab: TabID = RootView.shotArgs.contains("-antstream-shot-watch")
         ? .watch : .broadcast
-    /// The Watch tab's reference field and what it plays. Owned here so
+    /// The Watch tab's channel field and what it plays. Owned here so
     /// the Broadcast tab's channel card can hand a channel over.
     @State private var watchReference = RootView.shotArgs.contains("-antstream-shot-watch")
-        ? Channel.sampleReference : ""
+        ? RootView.sampleChannel.display : ""
     @State private var watchPlaying: String? = RootView.shotArgs.contains("-antstream-shot-watch")
-        ? Channel.sampleReference : nil
+        ? RootView.sampleChannel.key : nil
+
+    /// A well-formed channel for the Watch screenshots (`antstream-visual`).
+    /// No account broadcasts on it, so the Watch tab shows its retry state.
+    static let sampleChannel = ChannelAddress(
+        owner: "5c0a5ef4b41d1b3c2e7a9d8f6e4c3b2a19f8e7d6", text: ChannelAddress.antstreamTopic)
 
     /// Launch-argument hooks for the `antstream-visual` CI workflow.
     ///
@@ -81,10 +86,12 @@ struct RootView: View {
         .preferredColorScheme(.dark)
     }
 
-    /// Open a channel on the Watch tab, already playing.
-    private func watch(_ reference: String) {
-        watchReference = reference
-        watchPlaying = WatchView.normalised(reference)
+    /// Open a channel (a ``ChannelAddress/key``) on the Watch tab,
+    /// already playing.
+    private func watch(_ channel: String) {
+        guard let address = ChannelAddress.parse(channel) else { return }
+        watchReference = address.display
+        watchPlaying = address.key
         tab = .watch
     }
 }

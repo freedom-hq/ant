@@ -488,8 +488,8 @@ struct LiveView: View {
                         .foregroundStyle(.white.opacity(0.7))
                 } else {
                     qualityPicker
-                    if let ref = node.channelReference {
-                        channelLinkRow(ref)
+                    if let address = node.channel?.address {
+                        channelLinkRow(address)
                     }
                 }
             }
@@ -519,8 +519,8 @@ struct LiveView: View {
                     }
                 }
             }
-            if let ref = liveReference(progress) {
-                channelLinkRow(ref)
+            if let address = progress.channelAddress ?? node.channel?.address {
+                channelLinkRow(address)
             }
             if !progress.lastError.isEmpty {
                 Text(progress.lastError)
@@ -600,8 +600,8 @@ struct LiveView: View {
                         .foregroundStyle(.white.opacity(0.55))
                         .lineLimit(3)
                 }
-                if !report.channelReference.isEmpty {
-                    channelLinkRow(report.channelReference)
+                if let address = report.channelAddress {
+                    channelLinkRow(address)
                 }
                 if let recording = report.recordingReference, !recording.isEmpty {
                     recordingRow(recording)
@@ -703,28 +703,22 @@ struct LiveView: View {
 
     // MARK: channel link
 
-    /// The reference the running broadcast reports, or the permanent
-    /// channel's before the publisher has created its manifest.
-    private func liveReference(_ progress: PublisherSnapshot) -> String? {
-        progress.channelReference.isEmpty ? node.channelReference : progress.channelReference
-    }
-
-    /// Copy the reference, or share the web player links for it (the
-    /// same text the Broadcast tab's channel card sends).
-    private func channelLinkRow(_ reference: String) -> some View {
+    /// Copy the channel's web player link, or share its links (the same
+    /// text the Broadcast tab's channel card sends).
+    private func channelLinkRow(_ address: ChannelAddress) -> some View {
         HStack(spacing: 10) {
             Button {
-                UIPasteboard.general.string = reference
-                banner.flash("Channel reference copied")
+                UIPasteboard.general.string = address.playerLink
+                banner.flash("Player link copied")
             } label: {
-                Label("Copy", systemImage: "doc.on.doc")
+                Label("Copy link", systemImage: "doc.on.doc")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))
                     .padding(.vertical, 6)
                     .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            ShareLink(item: Channel.watchLinks(reference)) {
+            ShareLink(item: address.watchLinks) {
                 Label("Share channel link", systemImage: "square.and.arrow.up")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))

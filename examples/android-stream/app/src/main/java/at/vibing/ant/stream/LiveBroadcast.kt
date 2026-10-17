@@ -182,8 +182,6 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
             ch!!.name = channel
             node.startPublisher(
                 channel = channel,
-                topic = ch.topic,
-                startIndex = ch.nextIndex,
                 batchId = plan!!.batchId,
                 bitrateKbps = settings.bitrateKbps,
                 segmentMs = settings.segmentSeconds * 1000,
@@ -208,12 +206,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         BroadcastService.start(context, channel, e.hasAudio)
         poll = scope.launch {
             while (isActive && selfTestDir == null) {
-                node.publisherProgress()?.let { p ->
-                    _progress.value = p
-                    // Saved as it advances, so the next broadcast continues
-                    // the feed even if this one is killed mid-stream.
-                    ch?.nextIndex = p.feedIndex
-                }
+                node.publisherProgress()?.let { _progress.value = it }
                 delay(1_000)
             }
         }
@@ -247,7 +240,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         // and the closing playlist (#EXT-X-ENDLIST) would never land.
         try {
             if (selfTestDir == null) {
-                _report.value = node.stopPublisher().also { r -> node.channel.value?.nextIndex = r.feedIndex }
+                _report.value = node.stopPublisher()
             }
         } catch (e: Exception) {
             if (failure == null) {

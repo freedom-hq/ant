@@ -1,94 +1,161 @@
 package at.vibing.ant.stream
 
 import android.content.Context
-import java.net.HttpURLConnection
-import java.net.URL
-import java.security.SecureRandom
-import org.json.JSONObject
 
 /**
- * The account's permanent channel: one feed topic kept across broadcasts,
- * so the channel reference (the feed manifest of owner + topic) is one
- * link a viewer can bookmark, shared before going live.
+ * The account's permanent channel: the account's address (the feed
+ * owner) and the topic text [ChannelAddress.TOPIC], `antstream`, the same
+ * for every broadcast. One channel per account; the owner is what tells
+ * channels apart.
  *
- * Every broadcast continues the feed where the last one stopped
- * ([nextIndex] becomes the publisher's `start_index`): rewriting indices
- * that already hold an old broadcast's playlists would collide with them.
- * The index is saved as the broadcast runs, so even an app killed
- * mid-stream resumes at most one update behind.
+ * Broadcasts go out in the publisher's `"solar-punk"` format, so a
+ * channel is shown and shared as owner + topic (no channel reference to
+ * create first), and every broadcast continues the feed the last one left:
+ * the publisher reads the feed head itself (issue #173), nothing here
+ * tracks an index.
  *
- * Scoped to the account address: a restored account gets its own channel.
+ * The [name] is only a label: it goes in the broadcast's notes and the
+ * UI, never in the topic, so renaming the channel never forks it.
  */
 class Channel(context: Context, val owner: String) {
     private val prefs = context.getSharedPreferences("antstream.channel.${owner.lowercase()}", Context.MODE_PRIVATE)
 
-    /** 32-byte feed topic, hex, created once. */
-    val topic: String = prefs.getString(KEY_TOPIC, null) ?: run {
-        val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        val hex = bytes.joinToString("") { "%02x".format(it) }
-        prefs.edit().putString(KEY_TOPIC, hex).apply()
-        hex
-    }
+    /** Where viewers find this channel. */
+    val address: ChannelAddress = ChannelAddress.ofText(owner, ChannelAddress.TOPIC)
 
     var name: String
         get() = prefs.getString(KEY_NAME, null) ?: "My channel"
         set(value) = prefs.edit().putString(KEY_NAME, value).apply()
 
-    var nextIndex: Long
-        get() = prefs.getLong(KEY_INDEX, 0)
-        set(value) {
-            // Only ever forward: a stale report must not rewind the feed.
-            if (value > nextIndex) prefs.edit().putLong(KEY_INDEX, value).apply()
-        }
+    companion object {
+        private const val KEY_NAME = "name"
+    }
+}
 
-    /** The shareable channel reference, once its feed manifest exists. */
-    var reference: String?
-        get() = prefs.getString(KEY_REF, null)
-        private set(value) = prefs.edit().putString(KEY_REF, value).apply()
+/**
+ * A solar-punk channel: the feed owner (40 lowercase hex, no `0x`) and its
+ * topic, as text ([topic], hashed to [topicHex] the way bee-js
+ * `Topic.fromString` does) or as 32 raw bytes ([rawTopic]).
+ */
+data class ChannelAddress(val owner: String, val topic: String, val topicHex: String, val rawTopic: Boolean) {
+    /**
+     * `0x<owner>/<topic>`, the form the web player's link carries after
+     * its `#`: the topic URL-encoded, or `0x<64 hex>` for a raw one.
+     */
+    val key: String get() = "0x$owner/" + if (rawTopic) "0x$topicHex" else encodeComponent(topic)
+
+    /** What the Watch field shows for it. */
+    val display: String get() = "0x$owner/" + if (rawTopic) "0x$topicHex" else topic
 
     /**
-     * Create the channel's feed manifest (`POST /feeds/{owner}/{topic}`,
-     * bee-js `createFeedManifest`) so the link exists before the first
-     * broadcast. Content-addressed, so re-creating it yields the same
-     * reference. Blocking: call off the main thread.
+     * Solar Punk's `swarm://<owner>/<topic>` URI, the form its players and
+     * the publisher's master playlist name a channel by. Only for a text
+     * topic: Solar Punk's readers hash the text in the URI.
      */
-    fun ensureReference(gatewayUrl: String, batchId: String): String {
-        reference?.let { return it }
-        val ownerHex = owner.removePrefix("0x").lowercase()
-        val conn = URL("$gatewayUrl/feeds/$ownerHex/$topic").openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 120_000
-            conn.doOutput = true
-            conn.setRequestProperty("swarm-postage-batch-id", batchId.removePrefix("0x"))
-            conn.outputStream.use { }
-            val code = conn.responseCode
-            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) throw AntException("could not create the channel ($code): ${body.take(200)}")
-            val ref = JSONObject(body).getString("reference")
-            reference = ref
-            return ref
-        } finally {
-            conn.disconnect()
-        }
+    val swarmUri: String? get() = if (rawTopic) null else "swarm://$owner/$topic"
+
+    /** The web player on this channel, in Freedom (`bzz://`). */
+    val playerLink: String get() = "bzz://$PLAYER_REF/#$key"
+
+    /** The web player on this channel, through a public gateway, for any browser. */
+    val gatewayPlayerLink: String get() = "$PUBLIC_GATEWAY/bzz/$PLAYER_REF/#$key"
+
+    /** The ladder group topic its time markers are written for. */
+    val groupHex: String get() = Keccak.ladderGroup(topicHex)
+
+    /** What "Share" sends: the web player links, then the Solar Punk URI. */
+    fun watchLinks(): String = buildString {
+        append("Watch my live stream on Swarm:\n")
+        append("Freedom browser: $playerLink\n")
+        append("Any browser: $gatewayPlayerLink\n")
+        swarmUri?.let { append("Solar Punk players: $it\n") }
+        append("Channel: $display")
     }
 
     companion object {
-        private const val KEY_TOPIC = "topic"
-        private const val KEY_NAME = "name"
-        private const val KEY_INDEX = "next_index"
-        private const val KEY_REF = "reference"
+        /** The topic text every AntStream app broadcast goes out on. */
+        const val TOPIC = "antstream"
 
-        /** The AntStream web player's Swarm reference (examples/antstream-player). */
+        /**
+         * The AntStream web player's feed manifest (examples/antstream-player):
+         * always serves its newest build.
+         */
         const val PLAYER_REF = "b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac42857c35"
+        const val PUBLIC_GATEWAY = "https://api.gateway.ethswarm.org"
 
-        /** What "Share" sends: the channel in the web player, for Freedom and any browser. */
-        fun watchLinks(channel: String): String =
-            "Watch my live stream on Swarm:\n" +
-                "Freedom browser: bzz://$PLAYER_REF/#$channel\n" +
-                "Any browser: https://api.gateway.ethswarm.org/bzz/$PLAYER_REF/#$channel\n" +
-                "Channel: $channel"
+        private val OWNER = Regex("^(?:0[xX])?([0-9a-fA-F]{40})$")
+        private val RAW_TOPIC = Regex("^(?:0[xX])?([0-9a-fA-F]{64})$")
+        private val SWARM_URI = Regex("^swarm://([^/?#]+)/([^/?#]+)", RegexOption.IGNORE_CASE)
+
+        /** The channel `owner` (with or without `0x`) broadcasts on topic text `text`. */
+        fun ofText(owner: String, text: String): ChannelAddress {
+            val o = owner.removePrefix("0x").removePrefix("0X").lowercase()
+            return ChannelAddress(o, text, Keccak.topicFromString(text), rawTopic = false)
+        }
+
+        /**
+         * A channel from what a viewer typed or pasted, read the way the web
+         * player's `parseChannel` reads it: `<owner>/<topic>` (the owner `0x`
+         * + 40 hex, the topic text, URL-encoded or not), Solar Punk's
+         * `swarm://<owner>/<topic>`, or a player link carrying either after
+         * its `#`. A topic of 64 hex digits (`0x` optional) is the raw topic.
+         * An owner alone is that account's AntStream channel (topic
+         * [TOPIC]). `null` for anything else.
+         */
+        fun parse(input: String): ChannelAddress? {
+            var s = input.trim()
+            if (s.isEmpty()) return null
+            val hash = s.indexOf('#')
+            if (hash >= 0) s = s.substring(hash + 1)
+            val owner: String
+            val rest: String
+            val uri = SWARM_URI.find(s)
+            if (uri != null) {
+                owner = uri.groupValues[1]
+                rest = uri.groupValues[2]
+            } else {
+                val slash = s.indexOf('/')
+                owner = if (slash < 0) s else s.substring(0, slash)
+                rest = if (slash < 0) "" else s.substring(slash + 1)
+            }
+            val o = OWNER.matchEntire(owner)?.groupValues?.get(1)?.lowercase() ?: return null
+            val topic = decodeComponent(rest.trimEnd('/')).ifEmpty { TOPIC }
+            val raw = RAW_TOPIC.matchEntire(topic)
+            return if (raw != null) {
+                val hex = raw.groupValues[1].lowercase()
+                ChannelAddress(o, "0x$hex", hex, rawTopic = true)
+            } else {
+                ofText(o, topic)
+            }
+        }
+
+        /** `encodeURIComponent`: what the web player decodes. */
+        fun encodeComponent(text: String): String = buildString {
+            for (b in text.toByteArray(Charsets.UTF_8)) {
+                val c = (b.toInt() and 0xff).toChar()
+                if (c.isLetterOrDigit() && c.code < 0x80 || c in "-_.!~*'()") append(c)
+                else append("%%%02X".format(b.toInt() and 0xff))
+            }
+        }
+
+        /** `decodeURIComponent`, or the text as it is when it isn't valid percent-encoding. */
+        fun decodeComponent(text: String): String {
+            if ('%' !in text) return text
+            val out = java.io.ByteArrayOutputStream()
+            var i = 0
+            while (i < text.length) {
+                val c = text[i]
+                if (c == '%') {
+                    val byte = text.substring(i + 1, minOf(i + 3, text.length)).takeIf { it.length == 2 }
+                        ?.toIntOrNull(16) ?: return text
+                    out.write(byte)
+                    i += 3
+                } else {
+                    out.write(c.toString().toByteArray(Charsets.UTF_8))
+                    i++
+                }
+            }
+            return out.toString(Charsets.UTF_8.name())
+        }
     }
 }

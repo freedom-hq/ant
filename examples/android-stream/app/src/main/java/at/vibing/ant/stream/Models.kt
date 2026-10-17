@@ -260,9 +260,9 @@ data class StoragePlanTier(val id: String, val title: String, val depth: Int, va
 data class PublisherSnapshot(
     val running: Boolean,
     val elapsedS: Double,
-    val channelReference: String,
+    /** The channel this broadcast goes out on (feed owner + topic text). */
+    val channel: ChannelAddress?,
     val playlistReference: String,
-    val feedIndex: Long,
     val segmentsPushed: Long,
     val segmentsPublished: Long,
     val segmentsFailed: Long,
@@ -285,9 +285,8 @@ data class PublisherSnapshot(
             PublisherSnapshot(
                 running = o.optBoolean("running"),
                 elapsedS = o.optDouble("elapsed_s", 0.0),
-                channelReference = o.optString("channel_reference"),
+                channel = channelOf(o),
                 playlistReference = o.optString("playlist_reference"),
-                feedIndex = o.optLong("feed_index"),
                 segmentsPushed = o.optLong("segments_pushed"),
                 segmentsPublished = o.optLong("segments_published"),
                 segmentsFailed = o.optLong("segments_failed"),
@@ -306,8 +305,8 @@ data class PublisherSnapshot(
 }
 
 data class PublisherReport(
-    val channelReference: String,
-    val feedIndex: Long,
+    /** The channel the broadcast went out on (feed owner + topic text). */
+    val channel: ChannelAddress?,
     val durationS: Double,
     val segmentsPushed: Long,
     val segmentsListed: Long,
@@ -325,8 +324,7 @@ data class PublisherReport(
             val o = JSONObject(json)
             val errs = o.optJSONArray("errors")
             PublisherReport(
-                channelReference = o.optString("channel_reference"),
-                feedIndex = o.optLong("feed_index"),
+                channel = channelOf(o),
                 durationS = o.optDouble("duration_s", 0.0),
                 segmentsPushed = o.optLong("segments_pushed"),
                 segmentsListed = o.optLong("segments_listed"),
@@ -341,6 +339,13 @@ data class PublisherReport(
             )
         }.getOrNull()
     }
+}
+
+/** The channel a publisher snapshot or report names: its `owner` and `topic_text`. */
+internal fun channelOf(o: JSONObject): ChannelAddress? {
+    val owner = o.optString("owner")
+    val text = o.optString("topic_text")
+    return if (owner.length >= 40 && text.isNotEmpty()) ChannelAddress.ofText(owner, text) else null
 }
 
 fun formatBytes(bytes: Long): String {

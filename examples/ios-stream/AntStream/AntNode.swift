@@ -87,8 +87,6 @@ final class AntNode: ObservableObject {
         UserDefaults.standard.string(forKey: AntNode.gatewayAddressKey) ?? AntNode.defaultGatewayAddress
     /// The account's permanent channel; `nil` until the account is known.
     @Published private(set) var channel: Channel?
-    /// The channel's shareable reference, once its feed manifest exists.
-    @Published private(set) var channelReference: String?
     /// A broadcast this account was in the middle of when the app was
     /// killed or crashed (#175), read from its recovery entry; `nil` when
     /// there is none, or while this launch is broadcasting.
@@ -114,8 +112,6 @@ final class AntNode: ObservableObject {
     /// Set while ``startGateway()`` walks the port range, so the periodic
     /// retry never runs two binds at once.
     private var gatewayBinding = false
-    /// Set while ``ensureChannelReference()`` is creating the manifest.
-    private var channelCreating = false
 
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
@@ -323,7 +319,6 @@ final class AntNode: ObservableObject {
         recentPayments = []
         validity = nil
         channel = nil
-        channelReference = nil
         await Task.detached(priority: .userInitiated) {
             _ = ant_stop_gateway(h)
             ant_shutdown(h)
@@ -722,15 +717,16 @@ final class AntNode: ObservableObject {
     /// measured 4 as the stable point and 8 as a connection-layer
     /// collapse, so it is not a knob this screen should offer.
     ///
-    /// `topic` and `topicText` come from the account's permanent
-    /// ``Channel``: the same topic every time keeps the channel link
-    /// stable. No `start_index` is passed: the node reads the feed head
-    /// and continues after it (#173), with the media sequence numbered on
+    /// `feed` is ``BroadcastFeed/current`` for every new broadcast: the
+    /// Solar Punk format on the account's `antstream` topic, so the
+    /// channel is the account's address and that topic, the same every
+    /// time. No `start_index` is passed: the node reads the feed head and
+    /// continues after it (#173), with the media sequence numbered on
     /// from the previous broadcast and the recording opening with it, so
     /// an index this app lost track of (a reinstall, another device on
-    /// the same account) can't rewrite earlier broadcasts. A channel with
-    /// a text topic hands the publisher the text (it hashes it to the
-    /// same bytes) so the report names it too.
+    /// the same account) can't rewrite earlier broadcasts. Ending an
+    /// unfinished broadcast passes the feed its recovery entry names
+    /// instead (``finishUnfinishedBroadcast()``).
     ///
     /// Every broadcast keeps a recovery entry (`recovery_path`, #175) in
     /// the account's file under `Application Support/antstream/`, so a
@@ -740,8 +736,7 @@ final class AntNode: ObservableObject {
     /// recording is the feed's head.
     func startPublisher(
         channel: String,
-        topic: String,
-        topicText: String?,
+        feed: BroadcastFeed = .current,
         owner: String,
         batchId: String,
         bitrateKbps: UInt32,
@@ -749,38 +744,19 @@ final class AntNode: ObservableObject {
         notes: String,
         resume: Bool = false
     ) async throws {
-        var config: [String: Any] = [
-            "recovery_path": Self.recoveryURL(owner: owner).path,
-            "resume": resume,
-            "channel": channel,
-            "gateway": "http://\(gatewayAddress)",
-            "batch_id": batchId,
-            "bitrate_kbps": bitrateKbps,
-            "segment_ms": segmentMs,
-            "notes": notes,
-            // The `/bzz` format, not Solar Punk's (#167): see
-            // `broadcastFormat`.
-            "format": Self.broadcastFormat,
-            // A broadcast whose network (or the app) is gone for a whole
-            // minute ends by itself, as Solar Punk's uploader does
-            // (#172); anything shorter is a pause with one seam.
-            // `LiveBroadcast` notices the `reaped` flag and finishes the
-            // stop.
-            "reap_ms": Self.reapMsForThisLaunch,
-            // A ladder time marker every ten seconds (#174), so a viewer
-            // joining hours in reads one marker and then one round of
-            // feed slots from the index it names instead of walking the
-            // feed from 0 (the Watch tab here does). 360 chunks an hour
-            // on the plan. Under "bzz" there is no master playlist: that
-            // is for Solar Punk's players, which read "solar-punk" only.
-            "ladder": Self.broadcastLadder,
-        ]
-        // One or the other: the publisher refuses both at once.
-        if let topicText {
-            config["topic_text"] = topicText
-        } else {
-            config["topic"] = topic
-        }
+        // `LiveBroadcast` notices a reap's `reaped` flag and finishes the
+        // stop.
+        let config = feed.publisherConfig(
+            channel: channel,
+            gateway: "http://\(gatewayAddress)",
+            batchId: batchId,
+            bitrateKbps: bitrateKbps,
+            segmentMs: segmentMs,
+            notes: notes,
+            recoveryPath: Self.recoveryURL(owner: owner).path,
+            resume: resume,
+            reapMs: Self.reapMsForThisLaunch
+        )
         guard let data = try? JSONSerialization.data(withJSONObject: config),
               let json = String(data: data, encoding: .utf8) else {
             throw AntError.op("could not encode the broadcast configuration")
@@ -802,14 +778,6 @@ final class AntNode: ObservableObject {
         if !finalizingUnfinished { unfinishedBroadcast = nil }
     }
 
-    /// The format every broadcast goes out in: `/bzz`, not Solar Punk's
-    /// (#167). The web player the Share links open and the Android Watch
-    /// tab read only `/bzz/<channel>/stream.m3u8`, so a "solar-punk"
-    /// broadcast would be unplayable there. The Watch tab here reads both.
-    static let broadcastFormat = "bzz"
-    /// Every broadcast writes ladder time markers (#174).
-    static let broadcastLadder = true
-
     // MARK: - Storage room for a broadcast (#176)
 
     /// Estimates already worked out for ``capacityCachePlan``, by
@@ -827,7 +795,7 @@ final class AntNode: ObservableObject {
     /// and feed update after each, the ladder markers, the recording)
     /// against the room left in the plan's fullest bucket. `nil` with no
     /// plan. Needs no node; the same format and ladder setting
-    /// ``startPublisher`` sends.
+    /// ``startPublisher`` sends for a new broadcast.
     func capacity(for quality: CaptureEngine.Quality) -> CapacityEstimate? {
         guard let plan, plan.enabled, !plan.batchId.isEmpty else { return nil }
         if capacityCachePlan != plan {
@@ -841,8 +809,8 @@ final class AntNode: ObservableObject {
             "batch_id": plan.batchId,
             "bitrate_kbps": settings.bitrateKbps + CaptureEngine.audioBitrateKbps,
             "segment_ms": Int(settings.segmentSeconds * 1000),
-            "format": Self.broadcastFormat,
-            "ladder": Self.broadcastLadder,
+            "format": BroadcastFeed.current.format,
+            "ladder": BroadcastFeed.ladder,
         ]
         guard let configData = try? JSONSerialization.data(withJSONObject: config),
               let configJSON = String(data: configData, encoding: .utf8),
@@ -909,10 +877,12 @@ final class AntNode: ObservableObject {
             finalizingUnfinished = false
             refreshUnfinishedBroadcast()
         }
+        // The entry's own feed and format: one left by a build from before
+        // the switch to "solar-punk" (#217) is still ended where it went
+        // out, as the node requires.
         try await startPublisher(
             channel: unfinished.channel,
-            topic: channel.topic,
-            topicText: channel.topicText,
+            feed: unfinished.feed,
             owner: channel.owner,
             batchId: batchId,
             bitrateKbps: UInt32(settings.bitrateKbps),
@@ -1047,7 +1017,6 @@ final class AntNode: ObservableObject {
         await refreshAccount()
         refreshUnfinishedBroadcast()
         await refreshSettlement()
-        await ensureChannelReference()
     }
 
     func refreshPlan() async {
@@ -1070,39 +1039,12 @@ final class AntNode: ObservableObject {
         }) {
             let decoded = StreamDecoder.account(from: json)
             if decoded != account { account = decoded }
-            // The channel is scoped to the account address: a restored
-            // account gets its own topic and link.
+            // The channel is the account address (and the `antstream`
+            // topic): a restored account gets its own.
             if let owner = decoded?.ethAddress, !owner.isEmpty, channel?.owner != owner {
-                let c = Channel(owner: owner)
-                channel = c
-                if !screenshotSampleActive { channelReference = c.reference }
+                channel = Channel(owner: owner)
             }
         }
-    }
-
-    // MARK: - Channel
-
-    /// Make sure the permanent channel's feed manifest exists, so its
-    /// link can be shared before the first broadcast. Needs a storage
-    /// plan (the manifest is a stamped upload) and the gateway; until
-    /// both are there this returns `nil`, and the peer poll calls it
-    /// again every 15 s until the reference lands.
-    @discardableResult
-    func ensureChannelReference() async -> String? {
-        guard let channel, !screenshotSampleActive else { return channelReference }
-        if let ref = channel.reference {
-            if channelReference != ref { channelReference = ref }
-            return ref
-        }
-        guard !channelCreating, hasStorage, gatewayUp,
-              let batchId = plan?.batchId, let gateway = gatewayURL else { return nil }
-        channelCreating = true
-        defer { channelCreating = false }
-        guard let ref = try? await channel.createReference(gateway: gateway, batchId: batchId)
-        else { return nil }
-        // The account may have changed while the request was out.
-        if self.channel?.owner == channel.owner { channelReference = ref }
-        return ref
     }
 
     /// Fetch the connected plan's remaining lifetime from chain. Needs a
@@ -1373,17 +1315,16 @@ final class AntNode: ObservableObject {
             savedAt: Date().addingTimeInterval(-20),
             segments: 214,
             seconds: 428,
-            ended: false
+            ended: false,
+            feed: .current
         )
     }
 
-    /// Drive the Broadcast tab to its ready state with a channel link,
-    /// for the "Your channel" card's CI screenshot
-    /// (`-antstream-shot-channel`). The link exists only once a plan has
-    /// stamped the channel's feed manifest, and a fresh runner account
-    /// has no plan, so a sample plan, a deployed chequebook and a sample
-    /// reference are published. Nothing is persisted: the account's real
-    /// channel (topic, index, reference) is left untouched.
+    /// Drive the Broadcast tab to its ready state, for the "Your channel"
+    /// card's CI screenshot (`-antstream-shot-channel`): a fresh runner
+    /// account has no plan, so a sample plan and a deployed chequebook are
+    /// published. The card itself shows the account's real channel (its
+    /// address and the `antstream` topic). Nothing is persisted.
     ///
     /// Sample only, and only ever called behind `-antstream-shot-channel`.
     func installChannelSample() {
@@ -1395,7 +1336,6 @@ final class AntNode: ObservableObject {
             enabled: true,
             chequebook: "0x370e6965000000000000000000000000000000e1"
         )
-        channelReference = Channel.sampleReference
     }
 
     /// Drive the Storage tab's Credit card to the state issue #165 was
@@ -1460,14 +1400,9 @@ final class AntNode: ObservableObject {
                 if self.peerCount != count { self.peerCount = count }
                 tick += 1
                 // A gateway that failed to bind is retried every 10 s,
-                // and a channel link that couldn't be created yet (no
-                // plan, gateway down, network) every 15 s. Both run off
-                // this loop so a slow bind never delays the peer count.
+                // off this loop so a slow bind never delays the peer count.
                 if tick % 10 == 0, !self.gatewayUp {
                     Task { await self.startGateway() }
-                }
-                if tick % 15 == 0, self.channelReference == nil {
-                    Task { await self.ensureChannelReference() }
                 }
                 if tick % 2 == 0 {
                     Task { await self.refreshCredit() }
@@ -1603,134 +1538,41 @@ final class AntNode: ObservableObject {
     }
 }
 
-/// The account's permanent channel: one feed topic kept across
-/// broadcasts, so the channel reference (the feed manifest of owner +
-/// topic) is one link a viewer can bookmark, shared before going live.
-/// Ported from the Android app's `Channel.kt`.
+/// The account's permanent channel: the account's address (the feed
+/// owner) and the topic text ``topicText``, `antstream`, the same for every
+/// broadcast. One channel per account; the owner is what tells channels
+/// apart. Ported from the Android app's `Channel.kt`.
 ///
-/// Every broadcast continues the feed where the last one stopped: the
-/// node reads the feed head at the start of each broadcast and writes
-/// after it (#173), so nothing here tracks the index.
+/// Broadcasts go out in the publisher's `"solar-punk"` format, so a
+/// channel is shown and shared as owner + topic (``ChannelAddress``),
+/// with nothing to create first. Every broadcast continues the feed where
+/// the last one stopped: the node reads the feed head at the start of
+/// each broadcast and writes after it (#173), so nothing here tracks the
+/// index.
 ///
-/// Scoped to the account address: a restored account gets its own
-/// channel. Lives in `UserDefaults` — nothing here is secret, the topic
-/// and owner are public the moment the first feed update lands.
+/// The ``name`` is only a label (the broadcast's notes and the UI), never
+/// part of the topic, so renaming the channel never forks it. Kept in
+/// `UserDefaults` per account.
 struct Channel: Equatable {
     let owner: String
-    /// 32-byte feed topic, hex, created once per account.
-    let topic: String
-    /// The topic's text name (`topic` is `keccak256` of it, bee-js
-    /// `Topic.fromString`): what a Solar Punk catalog entry carries, so
-    /// once the app publishes the "solar-punk" format (see
-    /// ``AntNode/startPublisher``) a broadcast on this channel plays in
-    /// their viewers given only the owner and this text. `nil` for a channel created before text
-    /// topics, whose random topic bytes no text names; it keeps them, so
-    /// its link stays the same.
-    let topicText: String?
+    /// The topic text every broadcast goes out on.
+    static let topicText = ChannelAddress.antstreamTopic
+    /// Where viewers find it.
+    let address: ChannelAddress
 
     private let prefix: String
     private var defaults: UserDefaults { .standard }
 
     init(owner: String) {
-        let prefix = "antstream.channel.\(owner.lowercased())."
-        let key = prefix + "topic"
-        let textKey = prefix + "topicText"
-        let defaults = UserDefaults.standard
-        let topic: String
-        var topicText: String? = nil
-        if let stored = defaults.string(forKey: key), stored.count == 64 {
-            topic = stored
-            topicText = defaults.string(forKey: textKey)
-        } else {
-            let text = "antstream-\(UUID().uuidString.lowercased())"
-            if let hex = Self.topicHex(text) {
-                topic = hex
-                topicText = text
-                // Text first: a topic stored without its text would be
-                // read back as a pre-text-topic channel.
-                defaults.set(text, forKey: textKey)
-            } else {
-                // `SystemRandomNumberGenerator` is the OS CSPRNG on Apple
-                // platforms.
-                let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
-                topic = bytes.map { String(format: "%02x", $0) }.joined()
-            }
-            defaults.set(topic, forKey: key)
-        }
         self.owner = owner
-        self.prefix = prefix
-        self.topic = topic
-        self.topicText = topicText
-    }
-
-    /// `keccak256(utf8(text))` as hex, from the library (the publisher
-    /// hashes `topic_text` the same way).
-    private static func topicHex(_ text: String) -> String? {
-        var errPtr: UnsafeMutablePointer<CChar>? = nil
-        guard let raw = text.withCString({ ant_topic_from_string($0, &errPtr) }) else {
-            if let errPtr { ant_free_string(errPtr) }
-            return nil
-        }
-        defer { ant_free_string(raw) }
-        let hex = String(cString: raw)
-        return hex.count == 64 ? hex : nil
+        self.prefix = "antstream.channel.\(owner.lowercased())."
+        self.address = ChannelAddress(owner: owner, text: Self.topicText)
     }
 
     /// The name the last broadcast used; seeds the live screen's field.
     var name: String? {
         get { defaults.string(forKey: prefix + "name") }
         nonmutating set { defaults.set(newValue, forKey: prefix + "name") }
-    }
-
-    /// The shareable channel reference, once its feed manifest exists.
-    var reference: String? { defaults.string(forKey: prefix + "reference") }
-
-    /// Create the channel's feed manifest (`POST /feeds/{owner}/{topic}`,
-    /// bee-js `createFeedManifest`) on the in-process gateway, and keep
-    /// its reference. Content-addressed, so creating it again yields the
-    /// same reference.
-    func createReference(gateway: URL, batchId: String) async throws -> String {
-        if let reference { return reference }
-        let ownerHex = Self.stripHexPrefix(owner).lowercased()
-        let url = gateway.appending(path: "feeds/\(ownerHex)/\(topic)")
-        var request = URLRequest(url: url, timeoutInterval: 120)
-        request.httpMethod = "POST"
-        request.setValue(Self.stripHexPrefix(batchId), forHTTPHeaderField: "swarm-postage-batch-id")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else {
-            let body = String(data: data.prefix(200), encoding: .utf8) ?? ""
-            throw AntError.op("could not create the channel (\(code)): \(body)")
-        }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ref = obj["reference"] as? String, !ref.isEmpty else {
-            throw AntError.op("could not read the channel reference")
-        }
-        defaults.set(ref, forKey: prefix + "reference")
-        return ref
-    }
-
-    /// The AntStream web player's Swarm reference
-    /// (`examples/antstream-player`). Keep in step with the Android
-    /// app's `Channel.PLAYER_REF`.
-    static let playerReference = "b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac42857c35"
-
-    /// What "Share" sends: the channel in the web player, for Freedom and
-    /// any browser. Same text as the Android app's `Channel.watchLinks`.
-    static func watchLinks(_ channel: String) -> String {
-        "Watch my live stream on Swarm:\n"
-            + "Freedom browser: bzz://\(playerReference)/#\(channel)\n"
-            + "Any browser: https://api.gateway.ethswarm.org/bzz/\(playerReference)/#\(channel)\n"
-            + "Channel: \(channel)"
-    }
-
-    /// A well-formed reference for the channel and Watch screenshots
-    /// (`antstream-visual`). It points at nothing, so the Watch tab shows
-    /// its retry state.
-    static let sampleReference = "5c0a5ef4b41d1b3c2e7a9d8f6e4c3b2a19f8e7d6c5b4a39281706f5e4d3c2b1a"
-
-    private static func stripHexPrefix(_ s: String) -> String {
-        s.hasPrefix("0x") || s.hasPrefix("0X") ? String(s.dropFirst(2)) : s
     }
 }
 
