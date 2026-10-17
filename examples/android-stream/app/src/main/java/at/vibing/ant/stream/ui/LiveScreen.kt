@@ -255,6 +255,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                         style = MaterialTheme.typography.bodySmall,
                     )
                     ChannelField(channel) { channel = it }
+                    StreamInfoCard(node, broadcast, channel.ifBlank { "My channel" })
                     OutlinedButton(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("Close") }
                 }
                 LiveBroadcast.State.Starting -> Text("Starting the broadcast…")
@@ -282,6 +283,7 @@ fun LiveScreen(node: AntNode, broadcast: LiveBroadcast, onClose: () -> Unit, onW
                         colors = ButtonDefaults.buttonColors(containerColor = Red),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Stop") }
+                    StreamInfoCard(node, broadcast, channel.ifBlank { "My channel" })
                 }
                 LiveBroadcast.State.Stopping -> Text("Publishing the last segments…")
             }

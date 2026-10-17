@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
@@ -180,6 +181,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         }
         if (!selfTest) try {
             ch!!.name = channel
+            val info = ch.info.value
             node.startPublisher(
                 channel = channel,
                 batchId = plan!!.batchId,
@@ -187,6 +189,12 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
                 segmentMs = settings.segmentSeconds * 1000,
                 notes = "Android ${Build.VERSION.RELEASE} / ${Build.MANUFACTURER} ${Build.MODEL} / " +
                     "${node.networkLabel.value} / camera",
+                info = info.published(channel),
+                // The selected quality's size, as the announcement uses: the
+                // camera picks the nearest size it supports, which the
+                // publisher starts before.
+                width = if (settings.portrait) settings.quality.height else settings.quality.width,
+                height = if (settings.portrait) settings.quality.width else settings.quality.height,
             )
         } catch (e: Exception) {
             _state.value = State.Failed(e.message ?: "could not start the broadcast")
@@ -204,6 +212,10 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         node.liveBroadcastActive = true
         // Keeps capture and publishing alive when the app leaves the screen.
         BroadcastService.start(context, channel, e.hasAudio)
+        if (!selfTest) {
+            _infoError.value = null
+            thumbnailJob = scope.launch { thumbnailAtStart(ch!!, channel, e) }
+        }
         poll = scope.launch {
             while (isActive && selfTestDir == null) {
                 node.publisherProgress()?.let { _progress.value = it }
@@ -227,6 +239,8 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         _state.value = State.Stopping
         poll?.cancel()
         poll = null
+        thumbnailJob?.cancel()
+        thumbnailJob = null
         engine?.let { e ->
             suspendCancellableCoroutine { cont -> e.stop { cont.resume(Unit) } }
         }
@@ -241,6 +255,7 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         try {
             if (selfTestDir == null) {
                 _report.value = node.stopPublisher()
+                node.channel.value?.updateInfo { it.afterBroadcast() }
             }
         } catch (e: Exception) {
             if (failure == null) {
@@ -252,6 +267,157 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
             BroadcastService.stop(context)
         }
         _state.value = failure?.let { State.Failed(it) } ?: State.Idle
+    }
+
+    // -- stream info (issue #220) -------------------------------------------
+
+    private val _infoError = MutableStateFlow<String?>(null)
+
+    /** Why the last thumbnail upload or info update failed; null after one works. */
+    val infoError: StateFlow<String?> = _infoError.asStateFlow()
+
+    private var thumbnailJob: Job? = null
+
+    private val isLivePublishing get() = state.value == State.Live && selfTestDir == null
+
+    /**
+     * Right after Go live: a picked photo still waiting for its upload
+     * goes up now; with no picked photo, a frame from the camera is taken
+     * a few seconds in ([THUMBNAIL_DELAY_MS], once the exposure settled)
+     * and becomes the thumbnail. Either way the catalog entry gets it
+     * through `ant_publisher_set_info`, and the account remembers it. The
+     * broadcast never waits for any of this.
+     */
+    private suspend fun thumbnailAtStart(ch: Channel, channelName: String, e: CaptureEngine) {
+        val saved = ch.info.value
+        if (saved.thumbnailPicked) {
+            if (saved.thumbnailPending) uploadPendingThumbnail(ch, channelName)
+            return
+        }
+        delay(THUMBNAIL_DELAY_MS)
+        captureThumbnail(ch, channelName, e)
+    }
+
+    private suspend fun captureThumbnail(ch: Channel, channelName: String, e: CaptureEngine) {
+        val frame = withTimeoutOrNull(5_000) {
+            suspendCancellableCoroutine<android.graphics.Bitmap?> { cont -> e.snapshot { if (cont.isActive) cont.resume(it) } }
+        } ?: return
+        val jpeg = withContext(Dispatchers.Default) { Thumbnail.encode(frame).also { frame.recycle() } }
+        try {
+            val ref = node.uploadThumbnail(jpeg)
+            // A photo picked meanwhile wins over the captured frame.
+            if (ch.info.value.thumbnailPicked) return
+            withContext(Dispatchers.IO) { writeThumbnailFile(ch, jpeg) }
+            ch.updateInfo { it.copy(info = it.info.copy(thumbnail = ref)) }
+            pushInfo(ch, channelName)
+        } catch (ex: Exception) {
+            _infoError.value = "Thumbnail: ${ex.message}"
+        }
+    }
+
+    private suspend fun uploadPendingThumbnail(ch: Channel, channelName: String) {
+        try {
+            val jpeg = withContext(Dispatchers.IO) { ch.thumbnailFile.readBytes() }
+            val ref = node.uploadThumbnail(jpeg)
+            ch.updateInfo { it.copy(info = it.info.copy(thumbnail = ref), thumbnailPending = false) }
+            pushInfo(ch, channelName)
+        } catch (ex: Exception) {
+            _infoError.value = "Thumbnail: ${ex.message}"
+        }
+    }
+
+    /** The running broadcast takes the remembered info; nothing when not live. */
+    private suspend fun pushInfo(ch: Channel, channelName: String) {
+        if (!isLivePublishing) return
+        node.setPublisherInfo(ch.info.value.published(channelName))
+        _infoError.value = null
+    }
+
+    private fun writeThumbnailFile(ch: Channel, jpeg: ByteArray) {
+        ch.thumbnailFile.parentFile?.mkdirs()
+        ch.thumbnailFile.writeBytes(jpeg)
+    }
+
+    /**
+     * Save the editor's stream info for this account, before going live or
+     * while live. A [pickedPhoto] (a thumbnail JPEG) goes up at once when
+     * there is a storage plan, at Go live otherwise; [removePhoto] drops the
+     * picked one (a live broadcast then gets a camera frame again). While
+     * live, the broadcast's catalog entry is updated at once. Returns a
+     * message for anything that did not work; the info is saved anyway.
+     */
+    suspend fun saveInfo(
+        channelName: String,
+        title: String,
+        description: String,
+        scheduledStartMs: Long?,
+        pickedPhoto: ByteArray?,
+        removePhoto: Boolean,
+    ): String? {
+        val ch = node.channel.value ?: return "The account is still loading; try again in a moment."
+        var problem: String? = null
+        ch.updateInfo { s ->
+            var next = s.copy(info = s.info.copy(title = title.trim(), description = description.trim(), scheduledStartMs = scheduledStartMs))
+            if (removePhoto && pickedPhoto == null) {
+                next = next.copy(info = next.info.copy(thumbnail = null), thumbnailPicked = false, thumbnailPending = false)
+            }
+            if (pickedPhoto != null) {
+                next = next.copy(info = next.info.copy(thumbnail = null), thumbnailPicked = true, thumbnailPending = true)
+            }
+            next
+        }
+        withContext(Dispatchers.IO) {
+            if (pickedPhoto != null) writeThumbnailFile(ch, pickedPhoto)
+            else if (removePhoto) ch.thumbnailFile.delete()
+        }
+        if (pickedPhoto != null && node.hasStorage) {
+            try {
+                val ref = node.uploadThumbnail(pickedPhoto)
+                ch.updateInfo { it.copy(info = it.info.copy(thumbnail = ref), thumbnailPending = false) }
+            } catch (ex: Exception) {
+                problem = "Saved. The photo goes up at Go live (upload failed: ${ex.message})."
+            }
+        }
+        if (isLivePublishing) {
+            try {
+                pushInfo(ch, channelName)
+            } catch (ex: Exception) {
+                problem = "Saved, but the live broadcast didn't take it: ${ex.message}"
+            }
+            val e = engine
+            if (removePhoto && pickedPhoto == null && e != null) {
+                thumbnailJob?.cancel()
+                thumbnailJob = scope.launch { captureThumbnail(ch, channelName, e) }
+            }
+        }
+        return problem
+    }
+
+    /**
+     * Announce the saved info's scheduled start on the account's catalog
+     * feed (`ant_stream_catalog_publish`), with the rendition the next
+     * broadcast will have. Needs a storage plan; refused while live.
+     * Returns the library's error, or null once announced.
+     */
+    suspend fun announce(channelName: String): String? {
+        if (isBusy) return "Announcing is for an upcoming broadcast; you're live now."
+        val ch = node.channel.value ?: return "The account is still loading; try again in a moment."
+        if (!node.hasStorage) return "Connect a storage plan to announce a broadcast."
+        if (ch.info.value.info.scheduledStartMs == null) return "Pick a start time first."
+        return try {
+            if (ch.info.value.thumbnailPending) {
+                val ref = node.uploadThumbnail(withContext(Dispatchers.IO) { ch.thumbnailFile.readBytes() })
+                ch.updateInfo { it.copy(info = it.info.copy(thumbnail = ref), thumbnailPending = false) }
+            }
+            val saved = ch.info.value
+            val q = settings.quality
+            val (w, h) = if (settings.portrait) q.height to q.width else q.width to q.height
+            node.announceBroadcast(channelName, saved.published(channelName), w, h, q.bitrateKbps)
+            ch.updateInfo { it.copy(announcedStartMs = saved.info.scheduledStartMs) }
+            null
+        } catch (ex: Exception) {
+            ex.message ?: "could not announce the broadcast"
+        }
     }
 
     /**
@@ -285,5 +451,10 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
         if (isBusy) return
         engine?.release()
         engine = null
+    }
+
+    companion object {
+        /** How long after Go live the thumbnail frame is taken. */
+        private const val THUMBNAIL_DELAY_MS = 4_000L
     }
 }

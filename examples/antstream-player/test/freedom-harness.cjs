@@ -6,7 +6,9 @@
 //    corsEnabled, stream);
 //  - `bzz://<player>/<path>` serves this checkout's player files, and
 //    `bzz://<ref>` any other reference's raw bytes (`<gateway>/bytes/<ref>`),
-//    as Freedom's node answers a non-manifest reference;
+//    as Freedom's node answers a non-manifest reference, and an image
+//    request (the poster, a catalog thumbnail) `<gateway>/bzz/<ref>/`, the
+//    one-file manifest's file, as Freedom answers a manifest;
 //  - `window.swarm` (test/swarm-stub-preload.cjs) answers
 //    `swarm_readFeedEntry` and `swarm_readSingleOwnerChunk` from the
 //    gateway's `/feeds` and `/soc` (`swarm-only-root-chunk`), with
@@ -201,7 +203,10 @@ app.whenReady().then(async () => {
     }
     const headers = new Headers();
     for (const [k, v] of request.headers.entries()) if (FORWARDED.has(k.toLowerCase())) headers.set(k, v);
-    const res = await fetch(`${GATEWAY}/bytes/${u.hostname}`, { method: request.method, headers });
+    // `bzz://<ref>` and `bzz://<ref>/` are one URL here (a standard
+    // scheme): an image is the thumbnail's manifest, anything else raw bytes.
+    const image = /^image\//.test(request.headers.get('accept') || '');
+    const res = await fetch(`${GATEWAY}/${image ? 'bzz' : 'bytes'}/${u.hostname}${image ? '/' : ''}`, { method: request.method, headers });
     return new Response(res.body, { status: res.status, headers: res.headers });
   });
   ipcMain.handle('swarm', (_e, method, params) => swarmRead(method, params || {}).catch((err) => fail(-32603, err.message)));
@@ -253,6 +258,13 @@ app.whenReady().then(async () => {
       decodedFrames: v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : null,
       droppedFrames: v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().droppedVideoFrames : null,
       stats: [...document.querySelectorAll('.stats div')].map(d => d.innerText.replace('\\n', ': ')),
+      info: {
+        title: document.getElementById('info-title').hidden ? '' : document.getElementById('info-title').textContent,
+        when: document.getElementById('info-when').hidden ? '' : document.getElementById('info-when').textContent,
+        description: document.getElementById('info-desc').hidden ? '' : document.getElementById('info-desc').textContent,
+        poster: v.getAttribute('poster') || '',
+        documentTitle: document.title,
+      },
       markers: window.antstreamPlayer && window.antstreamPlayer.log
         ? window.antstreamPlayer.log.entries.filter((e) => e.kind === 'marker').map((e) => ((e.at - window.__stalls.t0) / 1000).toFixed(1) + ' ' + e.text)
         : null,

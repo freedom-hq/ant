@@ -107,6 +107,7 @@ fun BroadcastScreen(
             Button(onClick = onGetStarted, modifier = Modifier.fillMaxWidth()) { Text("Get started") }
         }
         Button(onClick = onGoLive, enabled = ready || broadcast.selfTestDir != null, modifier = Modifier.fillMaxWidth()) { Text("Go live") }
+        channel?.let { ch -> StreamInfoCard(node, broadcast, ch.name) }
         channel?.address?.let { address ->
             ChannelCard(address, onWatch)
         }

@@ -59,4 +59,30 @@ object AntNative {
     ): Int
     @JvmStatic external fun nativePublisherProgress(handle: Long): String
     @JvmStatic external fun nativePublisherStop(handle: Long): String
+
+    /**
+     * Replace the running broadcast's stream info (the publisher config's
+     * `"info"` object, issue #220); the catalog entry is rewritten at once.
+     * Non-blocking.
+     */
+    @JvmStatic external fun nativePublisherSetInfo(handle: Long, infoJson: String): Int
+
+    /**
+     * Announce an upcoming broadcast: write the channel's `"scheduled"`
+     * catalog entry. Refused while a broadcast runs. Blocks for a head
+     * read, an upload and a feed update; returns `{"index", "entry"}`.
+     */
+    @JvmStatic external fun nativeStreamCatalogPublish(handle: Long, configJson: String): String
+
+    /**
+     * Upload a stream thumbnail (a downscaled JPEG) with `POST /bzz`;
+     * returns the 64-hex reference for the info's `"thumbnail"`. Blocks
+     * for the upload.
+     */
+    @JvmStatic external fun nativeStreamThumbnailUpload(
+        handle: Long,
+        gateway: String,
+        batchId: String,
+        image: ByteArray,
+    ): String
 }

@@ -1,6 +1,10 @@
 package at.vibing.ant.stream
 
 import android.content.Context
+import java.io.File
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * The account's permanent channel: the account's address (the feed
@@ -18,7 +22,7 @@ import android.content.Context
  * UI, never in the topic, so renaming the channel never forks it.
  */
 class Channel(context: Context, val owner: String) {
-    private val prefs = context.getSharedPreferences("antstream.channel.${owner.lowercase()}", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(prefsName(owner), Context.MODE_PRIVATE)
 
     /** Where viewers find this channel. */
     val address: ChannelAddress = ChannelAddress.ofText(owner, ChannelAddress.TOPIC)
@@ -27,8 +31,44 @@ class Channel(context: Context, val owner: String) {
         get() = prefs.getString(KEY_NAME, null) ?: "My channel"
         set(value) = prefs.edit().putString(KEY_NAME, value).apply()
 
+    private val _info = MutableStateFlow(SavedStreamInfo.fromPrefsJson(prefs.getString(KEY_INFO, null)))
+
+    /**
+     * The stream info the next broadcast goes out with (and the running
+     * one shows), remembered for this account (issue #220).
+     */
+    val info: StateFlow<SavedStreamInfo> = _info.asStateFlow()
+
+    @Synchronized
+    fun saveInfo(value: SavedStreamInfo) {
+        _info.value = value
+        prefs.edit().putString(KEY_INFO, value.toPrefsJson()).apply()
+    }
+
+    /** Change the remembered info in place: [saveInfo] of `change(current)`. */
+    @Synchronized
+    fun updateInfo(change: (SavedStreamInfo) -> SavedStreamInfo) = saveInfo(change(_info.value))
+
+    /**
+     * The thumbnail image on the phone (the photo picked or the frame
+     * captured last, a downscaled JPEG): the editor's preview, and what
+     * goes up at Go live while [SavedStreamInfo.thumbnailPending].
+     */
+    val thumbnailFile: File = File(context.filesDir, "antstream-info/${ownerKey(owner)}/thumbnail.jpg")
+
     companion object {
         private const val KEY_NAME = "name"
+        private const val KEY_INFO = "stream_info"
+
+        /**
+         * The preferences file holding this account's channel state (its
+         * name and stream info): one per account, keyed by the address,
+         * whatever its case.
+         */
+        fun prefsName(owner: String): String = "antstream.channel.${owner.lowercase()}"
+
+        /** The account address as a path segment: 40 lowercase hex, no `0x`. */
+        fun ownerKey(owner: String): String = owner.trim().removePrefix("0x").removePrefix("0X").lowercase()
     }
 }
 

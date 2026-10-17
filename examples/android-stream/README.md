@@ -40,6 +40,7 @@ APK.
 | `LiveBroadcast.kt` | Hands capture segments to `ant_publisher_push_segment` in order, polls progress, drains on stop. |
 | `Channel.kt` | The account's channel (owner + topic `antstream`), link parsing and the links Share sends. `Keccak.kt` hashes topics and feed slot ids in plain Kotlin. |
 | `FeedPlaylist.kt` | Follows a channel's feed for the Watch tab and serves ExoPlayer its playlist. |
+| `StreamInfo.kt` | Stream info (#220): the publisher's `"info"` JSON, what the app remembers per account, and reading a channel's entry from its owner's catalog feed. Plain Kotlin, unit-tested. `Thumbnail.kt` scales a camera frame or a picked photo to a thumbnail JPEG. |
 | `ui/` | Broadcast checklist, onboarding (plan pricing, payment detection, auto-activation), live screen, Watch (ExoPlayer HLS through the local gateway), Storage (plan, key backup / restore). |
 
 ## Going live
@@ -68,6 +69,35 @@ APK.
    `http://127.0.0.1:1633/bytes/<ref>` (the `#EXT-X-MAP` too). A
    finished broadcast's recording plays from the start. Channels in the
    older `"bzz"` format don't play any more.
+
+## Stream info
+
+The **Stream info** card (Broadcast tab, and the live screen before and
+during a broadcast) edits what the channel's catalog entry shows (#220):
+
+- **Title** (required; starts as the channel's name) and an optional
+  **description**.
+- **Thumbnail**: by default a frame read back from the encoder's GL
+  renderer about 4 s after Go live, scaled to 640 px on its long side
+  and JPEG'd at quality 70 (a few tens of KB), uploaded with
+  `ant_stream_thumbnail_upload` and set with `ant_publisher_set_info`.
+  **Pick photo** (the system photo picker) replaces it: uploaded on save
+  when there is a storage plan, at Go live otherwise.
+- **Scheduled start**: a date and time, and **Announce**
+  (`ant_stream_catalog_publish`, needs a storage plan, not while live)
+  lists the upcoming broadcast; the card shows "Starts at …" and whether
+  it was announced. The broadcast that follows replaces the entry, and
+  the announcement is cleared.
+
+The info is remembered per account (in the channel's preferences) for
+the next broadcast; saving while live updates the running broadcast's
+entry at once. The publisher config gets it as `"info"` at Go live.
+
+The Watch tab shows the watched channel's title, description and a
+scheduled start from its owner's catalog feed
+(`GET /feeds/{owner}/{keccak256("antstream-catalog")}`), read beside
+playback and again every minute; a channel without a catalog shows
+nothing extra.
 
 ## Your channel
 

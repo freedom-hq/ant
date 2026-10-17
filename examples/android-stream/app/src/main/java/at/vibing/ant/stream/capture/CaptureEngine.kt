@@ -436,6 +436,17 @@ class CaptureEngine(
         }
     }
 
+    /**
+     * The next frame the encoder gets, upright, as a bitmap (see
+     * [UprightRenderer.snapshot]); [onFrame] runs on the GL thread, with
+     * `null` when capture is not running. A caller should time out: no
+     * frame comes while the camera is switching or stalled.
+     */
+    fun snapshot(onFrame: (android.graphics.Bitmap?) -> Unit) {
+        val r = renderer
+        if (!running || r == null) onFrame(null) else r.snapshot(onFrame)
+    }
+
     /** Free the worker threads of an engine that never started. */
     fun release() {
         if (running) return

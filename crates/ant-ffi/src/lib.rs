@@ -22,7 +22,9 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 pub mod bench;
+
 mod cache;
+pub mod catalog;
 mod chain_transport;
 mod drive;
 mod gateway;
@@ -3765,7 +3767,9 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// head doesn't leave the broadcast unrecorded and the closing window
 /// and recording still get ~70 s of the grace), and the closing window
 /// and recording add up to four
-/// more (an upload and a feed update each), so a slow or wedged uplink can outlive
+/// more (an upload and a feed update each), and the closing catalog entry
+/// (with stream info, issue #220) one or two more after them, so a slow or
+/// wedged uplink can outlive
 /// this grace by minutes. That is deliberate: a drain that slow means
 /// the tail is lost regardless, so the call returns at ~130 s with an
 /// honest report and the loop finishes in the background and releases
@@ -3780,7 +3784,9 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// already on the wire ([`PUBLISHER_SEAL_GRACE`]), and only then reads
 /// the report. Whatever the background loop still uploads after that
 /// gets no feed update (the recording keeps its reference, but the
-/// closing window or the live window before it stays the feed's head).
+/// closing window or the live window before it stays the feed's head),
+/// and no catalog update either: the next broadcast reads the catalog
+/// feed's head and writes after it.
 const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
 
 /// How long [`ant_publisher_stop`] waits, past [`PUBLISHER_STOP_GRACE`],
@@ -4230,6 +4236,173 @@ unsafe fn publisher_call(
     }
 }
 
+/// Replace the running broadcast's **stream info** (issue #220): title,
+/// description, thumbnail reference and scheduled start, a
+/// [`catalog::StreamInfo`] JSON object (`{"title": "...", "description":
+/// "...", "thumbnail": "<64 hex>", "scheduled_start_ms": <unix ms>}`, every
+/// field optional; an empty title is the channel's name). The account's
+/// catalog feed gets the new entry at once once the broadcast is live
+/// (before that, at its first feed update), and the closing entry at stop
+/// carries it; see [`publisher::PublisherConfig::info`]. Non-blocking: the
+/// write runs in the broadcast's background, its outcome in the progress
+/// `catalog_*` fields.
+///
+/// Returns `0`, or `-1` with an error (no broadcast, invalid JSON, a
+/// thumbnail that is not a reference).
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `info_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable `*mut c_char`
+/// slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_set_info(
+    handle: *const AntHandle,
+    info_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        let info = match cstr_to_str(info_json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<catalog::StreamInfo>(raw)
+                    .map_err(|e| format!("ant_publisher_set_info: invalid info: {e}"))
+            }) {
+            Ok(info) => info,
+            Err(msg) => {
+                clear_out_err(out_err);
+                write_out_err(out_err, &msg);
+                return -1;
+            }
+        };
+        let mut refused = None;
+        let code = publisher_call(handle, out_err, "ant_publisher_set_info", |run| {
+            refused = run.set_info(info).err();
+        });
+        if let Some(message) = refused {
+            write_out_err(out_err, &format!("ant_publisher_set_info: {message}"));
+            return -1;
+        }
+        code
+    }
+}
+
+/// Announce an upcoming broadcast (issue #220): write the channel's
+/// `scheduled` catalog entry, with its title, description, thumbnail and
+/// `scheduledStartTime`, as the next update of the account's catalog feed
+/// (topic text [`catalog::CATALOG_TOPIC_TEXT`], owner this node's
+/// account), where Solar Punk's player and the `AntStream` player read
+/// it. `config_json` is a [`catalog::CatalogPublishConfig`]: `gateway`,
+/// `batch_id`, `channel`, `topic_text` (the apps' `antstream`), `info`
+/// (with `scheduled_start_ms` required), and optionally `width`, `height`
+/// and `bitrate_kbps` for the entry's rung. The next broadcast replaces the
+/// entry with its `live` one.
+///
+/// Returns an allocated [`catalog::CatalogPublished`] JSON string
+/// (`{"index": n, "entry": {...}}`, free with [`ant_free_string`]), or
+/// null with an error. Refused while a broadcast is running on this
+/// handle (it owns the catalog then; use [`ant_publisher_set_info`]).
+///
+/// **Blocking**: a feed-head read, an upload and a feed update, each
+/// bounded by the publisher's 60 s per-request deadline, so call it off
+/// the UI thread. Costs a few chunks on the batch.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `config_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable `*mut c_char`
+/// slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_catalog_publish(
+    handle: *const AntHandle,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_stream_catalog_publish", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let raw = cstr_to_str(config_json).map_err(|e| e.to_string())?;
+            let config: catalog::CatalogPublishConfig =
+                serde_json::from_str(raw).map_err(|e| format!("invalid config: {e}"))?;
+            let busy = handle
+                .publisher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|run| !run.is_finished());
+            if busy {
+                return Err(
+                    "a broadcast is running: it writes the catalog (ant_publisher_set_info)"
+                        .to_string(),
+                );
+            }
+            let now_ms = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            let published = handle.runtime.block_on(catalog::publish_scheduled(
+                &config,
+                handle.signing_secret,
+                handle.eth,
+                now_ms,
+            ))?;
+            serde_json::to_string(&published).map_err(|e| format!("serialize: {e}"))
+        })
+    }
+}
+
+/// Upload a stream thumbnail (issue #220): a JPEG (or PNG) image, best a
+/// downscaled one about 640 px on its long side, a few tens of KB. It goes
+/// up as Solar Punk's admin uploads one (`POST /bzz` of the one file
+/// `thumbnail.jpg`), so their player's `/bzz/<ref>/` and the `AntStream`
+/// player both show it. `gateway` is the loopback gateway URL and
+/// `batch_id` the postage batch, as in the publisher config. Returns the
+/// reference (64 hex, an allocated string; free with [`ant_free_string`])
+/// for [`catalog::StreamInfo::thumbnail`], or null with an error.
+///
+/// **Blocking**: one upload, bounded by the publisher's 60 s per-request
+/// deadline; call it off the UI thread.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `gateway` and `batch_id` must be NUL-terminated
+/// UTF-8 strings; `data` must point at `len` readable bytes for the
+/// duration of the call. `out_err`, if non-null, must point at a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_thumbnail_upload(
+    handle: *const AntHandle,
+    gateway: *const c_char,
+    batch_id: *const c_char,
+    data: *const u8,
+    len: usize,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_stream_thumbnail_upload", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let gateway = cstr_to_str(gateway).map_err(|e| e.to_string())?;
+            let batch_id = cstr_to_str(batch_id).map_err(|e| e.to_string())?;
+            if data.is_null() || len == 0 {
+                return Err("empty image".to_string());
+            }
+            let image = std::slice::from_raw_parts(data, len).to_vec();
+            let target = publisher::Target::parse(gateway)?;
+            let batch = publisher::parse_hex32(batch_id).map_err(|e| format!("batch_id {e}"))?;
+            handle
+                .runtime
+                .block_on(catalog::upload_thumbnail(&target, batch, &image))
+                .map_err(|e| format!("upload thumbnail: {e}"))
+        })
+    }
+}
+
 /// Live progress of the broadcast started by [`ant_publisher_start`], as
 /// an allocated [`publisher::PublisherSnapshot`] JSON string (free with
 /// [`ant_free_string`]). Non-blocking — this is what drives the
@@ -4276,8 +4449,9 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// Returns after
 /// [`PUBLISHER_STOP_GRACE`] (~130 s), plus at most
 /// [`PUBLISHER_SEAL_GRACE`] (~65 s) for a feed update already on the
-/// wire then — a worst-case drain, closing window and recording can
-/// still be finishing in the background past that (see the constant) —
+/// wire then — a worst-case drain, closing window, recording and the
+/// closing catalog entry (with stream info) can still be finishing in
+/// the background past that (see the constant) —
 /// so call it off the UI thread. The report's `feed_index` (`null` when
 /// the run ended before its feed head ever answered: no position to hand
 /// on) is final either way: a run that outlives the grace writes no further feed
