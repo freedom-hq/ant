@@ -132,11 +132,13 @@
    * in it, the topic ending at whitespace (and at `?`/`#`/`/` in a
    * `swarm://` URI). A text input drops the Share text's line breaks,
    * gluing each line's link to the next line's label
-   * (`…/#0x<owner>/antstreamAny browser: …`): the same channel further on,
-   * whose topic the first one's starts with, is the one meant (the Share
+   * (`…/#0x<owner>/antstreamAny browser: …`): when the first channel's
+   * topic runs into such a label, the same channel further on whose topic
+   * is the first one's without the label is the one meant (the Share
    * text's last line, `Channel: 0x<owner>/antstream`, is never glued),
-   * unless the text after that one goes on with the first topic's rest:
-   * then it is the same topic cut at a space. Sentence punctuation after a
+   * also when that one is cut at a space and the text after it goes on
+   * with the rest. Without a glued label, a later mention never shortens
+   * the first one's topic. Sentence punctuation after a
    * channel in text (`… 0x<owner>/antstream.`) is not part of its topic,
    * unless another mention of the same channel ends in it too (the Share
    * text of topic `show.`).
@@ -220,27 +222,60 @@
         uri,
         // Where the topic, as kept, ends in the text.
         end: m.index + m[0].length - (token.length - kept.length),
+        // The topic this one has if its token runs into the label of the
+        // Share text's next line (line breaks dropped), else null.
+        unglued: gluedLabelTopic(text, token, m.index + m[0].length),
       });
     }
     if (!found.length) return null;
     const first = found[0];
     let topic = first.topic;
-    // The first one glued to the label after it: the same channel further
-    // on whose topic it starts with. Not a `swarm://` URI's, whose topic
-    // stops at a `/` the topic text can have. A later one only stands for
-    // a shorter topic if the text after it doesn't go on with the first
-    // topic's rest: `0x<owner>/my show` (the Channel line of topic
-    // `my show`) is cut at its space, not a different, shorter channel.
-    for (const f of found.slice(1)) {
-      if (f.owner !== first.owner || f.uri || !f.topic || !topic.startsWith(f.topic)) continue;
-      const rest = first.topic.slice(f.topic.length);
-      const after = text.slice(f.end);
-      let n = 0;
-      while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
-      const meant = f.topic + rest.slice(0, n);
-      if (meant.length < topic.length) topic = meant;
+    // The first one glued to the label after it (`…/antstreamAny browser:
+    // …`): the same channel further on whose topic is the first one's
+    // without that label. Only then: a later mention whose topic merely
+    // starts the first one's (`…/antstream-music and 0x<owner>/antstream`)
+    // is another channel, and the first in the text is the one meant. Not
+    // a `swarm://` URI's, whose topic stops at a `/` the topic text can
+    // have. A later one only stands for a shorter topic if the text after
+    // it doesn't go on with the first topic's rest: `0x<owner>/my show`
+    // (the Channel line of topic `my show`) is cut at its space, not a
+    // different, shorter channel.
+    if (first.unglued !== null) {
+      for (const f of found.slice(1)) {
+        if (f.owner !== first.owner || f.uri || !f.topic || !first.topic.startsWith(f.topic)) continue;
+        const rest = first.topic.slice(f.topic.length);
+        const after = text.slice(f.end);
+        let n = 0;
+        while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
+        const meant = f.topic + rest.slice(0, n);
+        if (meant === first.unglued) {
+          topic = meant;
+          break;
+        }
+      }
     }
     return channelOf(first.owner, topic);
+  }
+
+  // The labels starting the Share text's lines after the first link's
+  // (ChannelAddress.watchLinks in both apps). A text input that drops
+  // line breaks glues each line's link to the next one's label.
+  const SHARE_LABELS = ['Freedom browser:', 'Any browser:', 'Solar Punk players:', 'Channel:'];
+
+  /**
+   * The topic of a channel `token` ending at `end` in `text` when the
+   * token is glued to the start of a Share-text label (`antstreamAny` in
+   * `…antstreamAny browser: …`): the topic without the label's first
+   * word. Null when no label carries on from the token there.
+   */
+  function gluedLabelTopic(text, token, end) {
+    for (const label of SHARE_LABELS) {
+      const word = label.split(' ')[0];
+      if (token.length > word.length && token.endsWith(word) && text.startsWith(label, end - word.length)) {
+        return topicOf(token.slice(0, -word.length));
+      }
+    }
+    return null;
   }
 
   // Punctuation that ends a sentence or closes a quote rather than a

@@ -166,6 +166,21 @@ for (const text of ['my show', 'antstream/my show']) {
   expect(`Share text as spaces, text topic with a space ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
 }
 
+// Only a link glued to the next Share-text line's label stands for a
+// later, shorter mention of its channel: otherwise the first channel in the
+// text is the one meant, even when a later one's topic starts it (R4-M1).
+const music = channel(OWNER, { text: 'antstream-music' });
+expect('first channel, a later one a prefix of it', `My channels: 0x${OWNER}/antstream-music and 0x${OWNER}/antstream`, music);
+expect('player link, a later bare one a prefix of it', `watch https://gw/bzz/ref/#0x${OWNER}/music and also 0x${OWNER}/mus`, channel(OWNER, { text: 'music' }));
+expect('two lines, nothing glued', `0x${OWNER}/antstream/live\n0x${OWNER}/antstream`, channel(OWNER, { text: 'antstream/live' }));
+expect('a topic ending in a label word, not glued', `0x${OWNER}/antstreamAny and 0x${OWNER}/antstream`, channel(OWNER, { text: 'antstreamAny' }));
+for (const text of ['antstream', 'Café☕', 'show.']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text stripped from the Any browser line ${JSON.stringify(text)}`, inputValue(a.watchLinks.split('\n').slice(2).join('\n')), want);
+  expect(`Share text stripped from the Solar Punk line ${JSON.stringify(text)}`, inputValue(a.watchLinks.split('\n').slice(3).join('\n')), want);
+}
+
 // A channel ending a sentence keeps its topic, not the sentence's end.
 expect('channel ending a sentence', `come watch 0x${OWNER}/antstream.`, antWant);
 expect('channel in quotes', `link: "0x${OWNER}/antstream", see you`, antWant);
