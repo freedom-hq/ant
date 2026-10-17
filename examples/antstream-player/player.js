@@ -191,8 +191,12 @@
         owner: (uri ? m[1].replace(/^0x/i, '') : m[3]).toLowerCase(),
         token: uri ? m[2] : m[4] || '',
         // Its topic, decoded, and the text that goes on after it: what a
-        // mention cut short (at a space, at a `/`) still says.
-        reach: topicOf(uri ? m[2] : m[4] || '') + text.slice(m.index + m[0].length),
+        // mention cut short (at a space, at a `/`) still says. Also as
+        // written, undecoded and with its trailing `/`s: the Solar Punk URI
+        // and the Channel line carry the display text, so a topic like
+        // `%2Ay.` or `?/ 2!` reads there as it is, not decoded.
+        reach: [uri ? m[2] : m[4] || ''].flatMap((t) => [topicOf(t), t])
+          .map((t) => t + text.slice(m.index + m[0].length)),
       };
     });
     const found = [];
@@ -213,7 +217,7 @@
       // line is always bare, its links always after a `#`).
       const decoded = topicOf(token);
       const repeated = matches.some(
-        (o) => o.m !== m && o.form !== form && o.owner === owner && o.reach.startsWith(decoded),
+        (o) => o.m !== m && o.form !== form && o.owner === owner && o.reach.some((r) => r.startsWith(decoded)),
       );
       const kept = repeated ? token : trimSentenceEnd(token);
       found.push({

@@ -192,6 +192,17 @@ for (const text of ['antstream', 'Café☕', 'show.']) {
   expect(`Share text stripped from the Solar Punk line ${JSON.stringify(text)}`, inputValue(a.watchLinks.split('\n').slice(3).join('\n')), want);
 }
 
+// The same, for a topic that also ends in sentence punctuation: the
+// Channel line and the URI, as written, still witness its end when the
+// line breaks are kept or turned into spaces (R6-M1).
+for (const text of ['%2Ay.', 'y%2A#)', '?/ 2!', '#:/ )-)', '100%25.']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text, escapes or a slash, ending in punctuation ${JSON.stringify(text)}`, a.watchLinks, want);
+  expect(`Share text stripped, escapes or a slash, ending in punctuation ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
+  expect(`Share text as spaces, escapes or a slash, ending in punctuation ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
+}
+
 // A channel ending a sentence keeps its topic, not the sentence's end.
 expect('channel ending a sentence', `come watch 0x${OWNER}/antstream.`, antWant);
 expect('channel in quotes', `link: "0x${OWNER}/antstream", see you`, antWant);

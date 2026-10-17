@@ -157,7 +157,10 @@ data class ChannelAddress(val owner: String, val topic: String, val topicHex: St
          * does not search free text (the Share text, a message it was pasted
          * into) for a channel: the whole input is the one link, so input
          * over more than one line (pasted Share text) is `null` here. A
-         * topic never has a line break in it.
+         * topic never has a line break in it. That only holds while the
+         * line breaks reach this: a field that turns them into spaces hands
+         * over one line, read as one link whose topic is the rest of the
+         * text.
          */
         fun parse(input: String): ChannelAddress? {
             var s = input.trim(::isSwiftWhitespace)
