@@ -145,8 +145,12 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
      */
     internal val announceFailure: StateFlow<Announcer.Failure?> = announcer.lastFailure
 
-    /** The [Announcer.Failure.seq] the next announcement gets. */
-    val nextAnnounceSeq: Long get() = announcer.nextSeq
+    /** Where the next announcement starts; see [Announcer.nextMark]. */
+    internal fun nextAnnounceMark(): Announcer.Mark = announcer.nextMark()
+
+    /** Whether [failure] ended a run at or after [mark]; see [Announcer.since]. */
+    internal fun announcedSince(failure: Announcer.Failure, mark: Announcer.Mark): Boolean =
+        announcer.since(failure, mark)
 
     /**
      * [failure]'s error if it was about [owner]'s channel and its saved

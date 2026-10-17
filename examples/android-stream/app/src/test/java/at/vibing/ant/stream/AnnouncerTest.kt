@@ -91,20 +91,39 @@ class AnnouncerTest {
     @Test
     fun aFailureIsAboutItsAccountAndStartTime() = runBlocking {
         val announcer = Announcer(CoroutineScope(SupervisorJob() + Dispatchers.Default))
-        val openedBefore = announcer.nextSeq
+        val openedBefore = announcer.nextMark()
         announcer.launch("personal" to 1_900L) { "gateway error" }.await()
         val failure = announcer.lastFailure.value!!
         assertEquals("gateway error", failure.error)
-        assertTrue(failure.seq >= openedBefore)
+        assertTrue(announcer.since(failure, openedBefore))
         assertTrue(failure.isAbout("personal" to 1_900L))
         // The start moved to 20:00: the 19:00 failure isn't about it.
         assertFalse(failure.isAbout("personal" to 2_000L))
         // Another account restored: not about its card either.
         assertFalse(failure.isAbout("other" to 1_900L))
         // A dialog opened now shows only failures from the next run on.
-        val openedAfter = announcer.nextSeq
-        assertTrue(failure.seq < openedAfter)
+        val openedAfter = announcer.nextMark()
+        assertFalse(announcer.since(failure, openedAfter))
         announcer.launch("personal" to 1_900L) { "refused again" }.await()
-        assertTrue(announcer.lastFailure.value!!.seq >= openedAfter)
+        assertTrue(announcer.since(announcer.lastFailure.value!!, openedAfter))
+    }
+
+    /**
+     * A dialog restored after a process death keeps its mark, but run
+     * numbers start again at 1 in the new process: every run there is
+     * still after the mark, so its failure shows.
+     */
+    @Test
+    fun aMarkFromAnEarlierProcessPredatesEveryRun() = runBlocking {
+        val before = Announcer(CoroutineScope(SupervisorJob() + Dispatchers.Default))
+        repeat(3) { before.launch { null }.await() }
+        val saved = before.nextMark()
+        assertEquals(4L, saved.seq)
+        // The process is killed; a new one restores the dialog with `saved`.
+        val restored = Announcer(CoroutineScope(SupervisorJob() + Dispatchers.Default))
+        restored.launch { "gateway error" }.await()
+        val failure = restored.lastFailure.value!!
+        assertEquals(1L, failure.seq)
+        assertTrue(restored.since(failure, saved))
     }
 }

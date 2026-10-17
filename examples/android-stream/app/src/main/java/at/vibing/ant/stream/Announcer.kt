@@ -6,6 +6,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.Serializable
+import java.util.UUID
 
 /**
  * One announcement at a time, run on a scope that outlives the screen
@@ -21,6 +23,9 @@ internal class Announcer(private val scope: CoroutineScope) {
     val running: StateFlow<Boolean> = _running.asStateFlow()
     private var current: Deferred<String?>? = null
     private var runs = 0L
+    // Run numbers restart with the process; this tells a mark taken by an
+    // earlier process (restored from saved state) from one taken by us.
+    private val epoch = UUID.randomUUID().toString()
     private val _lastFailure = MutableStateFlow<Failure?>(null)
 
     /**
@@ -44,8 +49,22 @@ internal class Announcer(private val scope: CoroutineScope) {
      */
     val lastFailure: StateFlow<Failure?> = _lastFailure.asStateFlow()
 
-    /** The [seq] the next run gets; a screen opened now shows only failures from here on. */
-    val nextSeq: Long get() = runs + 1
+    /**
+     * Where the next run will start. A screen saves it when it opens
+     * (saveable, so it survives a rotation and a process death) and shows
+     * only failures [since] it: an older one is not news there.
+     */
+    data class Mark(val epoch: String, val seq: Long) : Serializable
+
+    /** A [Mark] for the next run: a screen opened now shows only failures from here on. */
+    fun nextMark(): Mark = Mark(epoch, runs + 1)
+
+    /**
+     * Whether [failure] ran at or after [mark]. A mark from an earlier
+     * process (the app was killed and restored with the screen open)
+     * predates every run of this one, since run numbers restart at 1.
+     */
+    fun since(failure: Failure, mark: Mark): Boolean = mark.epoch != epoch || failure.seq >= mark.seq
 
     /**
      * Start [block] (the announcement; returns its error, or null) unless
