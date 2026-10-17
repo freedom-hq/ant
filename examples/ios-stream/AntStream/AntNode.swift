@@ -754,7 +754,9 @@ final class AntNode: ObservableObject {
     /// kill or crash leaves what the next launch needs to carry it on
     /// (`resume`) or end it into its recording
     /// (``finishUnfinishedBroadcast()``). The node removes it once the
-    /// recording is the feed's head.
+    /// recording is the feed's head and, with stream info, the closing
+    /// `vod` catalog entry has landed (#220): a stop whose `vod` entry
+    /// failed leaves it, so the card can still close the catalog.
     func startPublisher(
         channel: String,
         feed: BroadcastFeed = .current,

@@ -314,18 +314,28 @@ struct BroadcastView: View {
         do {
             let report = try await node.finishUnfinishedBroadcast()
             // The entry is gone only once the recording is the channel's
-            // head: landed just now, or already before (the update had
-            // landed ahead of the kill, so the node only cleared the
-            // entry and the report carries no new recording). Either way
-            // the card is gone, so the outcome goes in the banner.
+            // head (and, with stream info, the catalog's `vod` entry
+            // landed): landed just now, or already before (the update had
+            // landed ahead of the kill, so the node wrote at most the
+            // catalog entry and the report carries no new recording).
+            // Either way the card is gone, so the outcome goes in the
+            // banner.
             if node.unfinishedBroadcast == nil {
                 let landedNow = !(report.recordingReference ?? "").isEmpty
                 banner.flash(landedNow
                     ? "Broadcast ended: its recording is on the channel"
                     : "Broadcast ended: its recording was already on the channel")
+            } else if let error = report.errors.first {
+                unfinishedOutcome = error
+            } else if let catalog = report.catalogError, !catalog.isEmpty,
+                      report.catalogState != "vod" {
+                // The recording is on the channel, but the account's
+                // catalog still lists it live (#220): the entry is kept
+                // so this can be tried again.
+                unfinishedOutcome = "Its recording is on the channel, but the stream info "
+                    + "still says live (\(catalog)); try again in a moment."
             } else {
-                unfinishedOutcome = report.errors.first
-                    ?? "Its recording did not go up; try again in a moment."
+                unfinishedOutcome = "Its recording did not go up; try again in a moment."
             }
         } catch {
             unfinishedOutcome = error.localizedDescription

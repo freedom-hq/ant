@@ -917,9 +917,16 @@ struct PublisherReport: Codable, Equatable {
     let batchFullRefusals: UInt64?
     let batchUnusableRefusals: UInt64?
     let batchError: String?
+    /// The channel's catalog entry (#220) as the run left it: `"vod"`
+    /// once the closing entry landed, and why the last write failed.
+    /// Optional so a node without them decodes.
+    let catalogState: String?
+    let catalogError: String?
 
     enum CodingKeys: String, CodingKey {
         case channel, topic, owner, notes, errors, reaped
+        case catalogState = "catalog_state"
+        case catalogError = "catalog_error"
         case batchFullRefusals = "batch_full_refusals"
         case batchUnusableRefusals = "batch_unusable_refusals"
         case batchError = "batch_error"
