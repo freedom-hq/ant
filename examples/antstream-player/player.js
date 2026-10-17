@@ -219,6 +219,10 @@
       found.push({
         owner,
         topic: topicOf(kept),
+        // The topic as written, undecoded and with its trailing `/`s: the
+        // Channel line carries the display text, not a URL-encoded one, so
+        // a topic like `100%25` or `news/ today` reads there as it is.
+        written: kept,
         uri,
         // Where the topic, as kept, ends in the text.
         end: m.index + m[0].length - (token.length - kept.length),
@@ -239,18 +243,23 @@
     // have. A later one only stands for a shorter topic if the text after
     // it doesn't go on with the first topic's rest: `0x<owner>/my show`
     // (the Channel line of topic `my show`) is cut at its space, not a
-    // different, shorter channel.
+    // different, shorter channel. The later one is read both decoded (a
+    // link) and as written (the Channel line's display text, where `%25`
+    // is the topic's own `%25` and a `/` before a space is still its own).
     if (first.unglued !== null) {
-      for (const f of found.slice(1)) {
-        if (f.owner !== first.owner || f.uri || !f.topic || !first.topic.startsWith(f.topic)) continue;
-        const rest = first.topic.slice(f.topic.length);
-        const after = text.slice(f.end);
-        let n = 0;
-        while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
-        const meant = f.topic + rest.slice(0, n);
-        if (meant === first.unglued) {
-          topic = meant;
-          break;
+      search: for (const f of found.slice(1)) {
+        if (f.owner !== first.owner || f.uri) continue;
+        for (const start of new Set([f.topic, f.written])) {
+          if (!start || !first.topic.startsWith(start)) continue;
+          const rest = first.topic.slice(start.length);
+          const after = text.slice(f.end);
+          let n = 0;
+          while (n < rest.length && n < after.length && rest[n] === after[n]) n++;
+          const meant = start + rest.slice(0, n);
+          if (meant === first.unglued) {
+            topic = meant;
+            break search;
+          }
         }
       }
     }

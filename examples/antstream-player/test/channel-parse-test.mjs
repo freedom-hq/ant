@@ -166,6 +166,17 @@ for (const text of ['my show', 'antstream/my show']) {
   expect(`Share text as spaces, text topic with a space ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
 }
 
+// The Channel line carries the topic as it is, not URL-encoded: with the
+// line breaks dropped it must still stand for the topic a literal `%XX`
+// escape or a `/ ` in it spells, not that text decoded or cut at its `/`
+// (R5-M1).
+for (const text of ['100%25', 'a%2Fb', '%41', 'news/ today', 'a%20b c']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text stripped, topic as escapes or a slash ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
+  expect(`Share text as spaces, topic as escapes or a slash ${JSON.stringify(text)}`, a.watchLinks.replace(/\n/g, ' '), want);
+}
+
 // Only a link glued to the next Share-text line's label stands for a
 // later, shorter mention of its channel: otherwise the first channel in the
 // text is the one meant, even when a later one's topic starts it (R4-M1).
