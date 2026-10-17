@@ -249,6 +249,13 @@ expect('Markdown link, a topic with brackets of its own', `[0x${OWNER}/a[b](c](h
 expect('Markdown link to the channel', `[watch](${ant.playerLink}) now`, antWant);
 expect('Markdown link alone, the URL somewhere else', `[0x${OWNER}/antstream](https://example.com/live)`, antWant);
 expect('Markdown link alone, to the channel', `[watch](${ant.playerLink})`, antWant);
+// …also in quotes or with sentence punctuation after it (R5-M1).
+const showWant = channel(OWNER, { text: 'show' });
+expect('Markdown link alone, in quotes', `"[0x${OWNER}/show](https://x/#0x${OWNER}/show)"`, showWant);
+expect('Markdown link alone, in curly quotes', `\u201c[0x${OWNER}/show](https://x/#0x${OWNER}/show)\u201d`, showWant);
+expect('Markdown link alone, then a full stop', `[0x${OWNER}/show](#0x${OWNER}/show).`, showWant);
+expect('Markdown link alone, in quotes, then a full stop', `'[0x${OWNER}/show](https://x/#0x${OWNER}/show)'.`, showWant);
+expect('Markdown link alone, to the channel, then a full stop', `[watch](${ant.playerLink}).`, antWant);
 expect('swarm:// twice, both ending a sentence', `swarm://${OWNER}/antstream. Or swarm://${OWNER}/antstream.`, antWant);
 
 // A topic that itself ends in what `encodeURIComponent` leaves unencoded

@@ -149,7 +149,8 @@
    * A Markdown link's text ends at its `](`
    * (`[0x<owner>/antstream](https://…)` is `0x<owner>/antstream`).
    *
-   * One Markdown link and nothing else is read as text.
+   * One Markdown link and nothing else is read as text, also in quotes or
+   * followed by sentence punctuation (`"[…](…)"`, `[…](…).`).
    *
    * One link in quotes and nothing else (`"0x<owner>/antstream"`) is the
    * link: the quotes are dropped, as in text.
@@ -164,8 +165,10 @@
   }
 
   // A whole Markdown link, `[text](url)`: read as text, so its text ends
-  // at the `](` and the URL's `)` is no part of a topic.
-  const MARKDOWN_LINK = /^\[[^\]]*\]\(.*\)$/;
+  // at the `](` and the URL's `)` is no part of a topic. Also in quotes or
+  // with sentence punctuation after it (`"[…](…)"`, `[…](…).`), as text
+  // reads those.
+  const MARKDOWN_LINK = /^["'\u201c\u2018\u00ab<]*\[[^\]]*\]\(.*\)[.,;:!?'"\u2019\u201d\u00bb\u2026>]*$/;
 
   // Quotes around a whole pasted link (a channel never starts with one).
   const QUOTE_OPEN = /^["'\u201c\u2018\u00ab<]+/;
