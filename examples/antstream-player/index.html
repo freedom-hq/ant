@@ -11,7 +11,7 @@
   <header>
     <h1>AntStream <span>Player</span></h1>
     <form id="channel-form" autocomplete="off">
-      <input id="channel-input" placeholder="Channel: 0x… owner/topic, or a swarm:// link" spellcheck="false">
+      <input id="channel-input" placeholder="Channel: 0x… owner/topic, a swarm:// link, or an app’s Share text" spellcheck="false">
       <button type="submit">Watch</button>
     </form>
   </header>
@@ -49,9 +49,11 @@
   </section>
 
   <section id="intro">
-    <p>Paste the channel an AntStream broadcaster shared: their address and the
+    <p>Paste the channel an AntStream broadcaster shared (the whole text the
+      app's Share button sends will do): their address and the
       channel's topic, <code>0x…/&lt;topic&gt;</code> (the topic as text, or as
-      64 hex digits for a channel without a text topic), or a Solar Punk <code>swarm://&lt;owner&gt;/&lt;topic&gt;</code> link. The
+      64 hex digits for a channel without a text topic), their address alone
+      for their app's channel, or a Solar Punk <code>swarm://&lt;owner&gt;/&lt;topic&gt;</code> link. The
       player follows the channel's Swarm feed and keeps you at the live edge; a
       finished broadcast plays back from the start.</p>
     <ul id="recent"></ul>

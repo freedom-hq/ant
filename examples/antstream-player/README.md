@@ -56,13 +56,21 @@ topic URL-encoded. The feed topic is `keccak256(utf8(text))`, bee-js
 `crates/ant-ffi/src/publisher.rs`. The AntStream apps broadcast on the
 topic text `antstream`, one channel per account, so an app channel is
 `#0x<owner>/antstream` (issue #217); the apps' Share buttons send exactly
-these links. The player itself has no default topic, so a link always
-names one. A channel whose topic is raw bytes with no text is named by
+these links. An owner alone (`0x<owner>` or `<owner>`, a trailing `/`
+allowed) is that account's `antstream` channel, as the apps read it; any
+other topic has to be named. A channel whose topic is raw bytes with no text is named by
 the raw topic, 64 hex digits (`#0x<owner>/0x<topic hex>`, `0x`
 optional); a topic of exactly 64 hex digits is always read that way,
 never as text.
-The channel field also takes Solar Punk's `swarm://<owner>/<topic>`
-and any player link.
+The channel field also takes Solar Punk's `swarm://<owner>/<topic>`,
+any player link, and text with a channel in it, such as the whole text
+an app's Share button sends: the first `swarm://<owner>/<topic>`,
+`#0x<owner>/<topic>` or `0x<owner>/<topic>` in it, the topic ending at
+whitespace. The field drops the Share text's line breaks, gluing each
+link to the next line's label (`…/antstreamAny browser: …`); the same
+channel later in the text, whose topic the glued one starts with, is the
+one played. `test/channel-parse-test.mjs` checks this against the apps'
+strings (`node test/channel-parse-test.mjs`, no dependencies).
 
 Every feed update **is** the playlist (a v2 update wrapping the
 playlist's root chunk), and the playlist lists segments and the

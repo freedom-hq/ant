@@ -11,9 +11,10 @@
  * bare 64-hex references to raw bytes. A channel's topic can also be given
  * as the raw 32 topic bytes (64 hex, `0x` optional), for a channel whose
  * random topic no text names (the Android app's, an iOS channel created
- * before text topics). There is no default topic: AntStream channels each
- * have their own (iOS `antstream-<uuid>`, the publisher's own default
- * `antstream/<channel>`, Android random bytes), so a link names it.
+ * before text topics). The iOS and Android apps broadcast on the topic
+ * text `antstream`, one channel per account, so an owner alone names that
+ * account's `antstream` channel; any other topic (the publisher's own
+ * default `antstream/<channel>`, an older app's) has to be in the link.
  *
  * The page runs in two kinds of places:
  *
@@ -50,6 +51,9 @@
   // A topic given as its raw 32 bytes rather than as text.
   const RAW_TOPIC = /^(?:0x)?([0-9a-f]{64})$/i;
   const RECENT_KEY = 'antstream.recent.v2';
+  // The topic text every AntStream app broadcast goes out on (the apps'
+  // `ChannelAddress` `antstreamTopic`/`TOPIC`): an owner alone names it.
+  const ANTSTREAM_TOPIC = 'antstream';
 
   const inBzz = location.protocol === 'bzz:';
   const gatewayRoot = (() => {
@@ -117,12 +121,30 @@
    * `<owner>/<topic>` (the owner `0x` + 40 hex, the topic URL-encoded
    * text), `swarm://<owner>/<topic>` (Solar Punk's form), or a player link
    * carrying either after its `#`. A topic of 64 hex digits (`0x`
-   * optional) is the raw topic itself, not text to hash. An owner without
-   * a topic names no channel: there is no default topic.
+   * optional) is the raw topic itself, not text to hash. An owner alone
+   * (`<owner>` or `<owner>/`, not `swarm://<owner>/`) is that account's
+   * AntStream channel, topic `antstream`, as the apps'
+   * `ChannelAddress.parse` reads it.
+   *
+   * Text with whitespace in it (the apps' Share text, a message it was
+   * pasted into) is searched for the channel instead: the first
+   * `swarm://<owner>/<topic>`, `#0x<owner>/<topic>` or `0x<owner>/<topic>`
+   * in it, the topic ending at whitespace (and at `?`/`#`/`/` in a
+   * `swarm://` URI). A text input drops the Share text's line breaks,
+   * gluing each line's link to the next line's label
+   * (`…/#0x<owner>/antstreamAny browser: …`): the same channel further on,
+   * whose topic the first one's starts with, is the one meant (the Share
+   * text's last line, `Channel: 0x<owner>/antstream`, is never glued).
    */
   function parseChannel(input) {
-    let s = (input || '').trim();
+    const s = (input || '').trim();
     if (!s) return null;
+    return /\s/.test(s) ? findChannel(s) : parseChannelToken(s);
+  }
+
+  /** One channel string, the whole input: the form a link's hash carries. */
+  function parseChannelToken(input) {
+    let s = input;
     const hash = s.indexOf('#');
     if (hash >= 0) s = s.slice(hash + 1);
     let owner;
@@ -131,6 +153,9 @@
     if (uri) {
       // parseSwarmUri: the topic is the piece up to the next `/`.
       [, owner, rest] = uri;
+    } else if (/^swarm:/i.test(s)) {
+      // A truncated `swarm://<owner>/` names no topic, so no channel.
+      return null;
     } else {
       const slash = s.indexOf('/');
       owner = slash < 0 ? s : s.slice(0, slash);
@@ -138,15 +163,53 @@
     }
     const o = OWNER.exec(owner);
     if (!o) return null;
-    let topic = rest;
-    try {
-      topic = decodeURIComponent(rest);
-    } catch (_) {
-      /* not URL-encoded: the text as it is */
+    return channelOf(o[1], topicOf(rest));
+  }
+
+  // A channel inside text, by where it starts: a `swarm://` URI (its topic
+  // ends at `/`, `?` or `#`), or `0x<owner>` not inside a longer word or
+  // hex string, its topic after a `/` (none: the owner alone).
+  const CHANNEL_IN_TEXT = /swarm:\/\/((?:0x)?[0-9a-f]{40})\/([^\s/?#]+)|(?<![0-9a-z])0x([0-9a-f]{40})(?![0-9a-z])(?:\/(\S*))?/gi;
+
+  /** The channel in free text, see `parseChannel`. */
+  function findChannel(text) {
+    const found = [];
+    for (const m of text.matchAll(CHANNEL_IN_TEXT)) {
+      if (m[1]) found.push({ owner: m[1].replace(/^0x/i, '').toLowerCase(), topic: topicOf(m[2]), uri: true });
+      else found.push({ owner: m[3].toLowerCase(), topic: topicOf(m[4] || ''), uri: false });
     }
-    if (!topic) return null;
-    const raw = RAW_TOPIC.exec(topic);
-    return makeChannel(o[1].toLowerCase(), topic, raw ? raw[1].toLowerCase() : null);
+    if (!found.length) return null;
+    const first = found[0];
+    let topic = first.topic;
+    // The first one glued to the label after it: the same channel further
+    // on whose topic it starts with. Not a `swarm://` URI's, whose topic
+    // stops at a `/` the topic text can have.
+    for (const f of found.slice(1)) {
+      if (f.owner === first.owner && !f.uri && f.topic && f.topic.length < topic.length && topic.startsWith(f.topic)) {
+        topic = f.topic;
+      }
+    }
+    return channelOf(first.owner, topic);
+  }
+
+  /**
+   * The topic text a link carries after the owner, URL-encoded or not.
+   * Trailing slashes go, as in the apps: `0x<owner>/` is the owner alone.
+   */
+  function topicOf(rest) {
+    const bare = rest.replace(/\/+$/, '');
+    try {
+      return decodeURIComponent(bare);
+    } catch (_) {
+      return bare; // not URL-encoded: the text as it is
+    }
+  }
+
+  /** `topic`: decoded; empty is the owner alone. */
+  function channelOf(owner, topic) {
+    const text = topic || ANTSTREAM_TOPIC;
+    const raw = RAW_TOPIC.exec(text);
+    return makeChannel(owner.toLowerCase(), text, raw ? raw[1].toLowerCase() : null);
   }
 
   /** `rawHex`: the topic's raw bytes as hex, when `topic` is not text. */
@@ -1782,7 +1845,7 @@
 
   // -- channel selection ----------------------------------------------------
 
-  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, or a swarm:// link';
+  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, 0x<40 hex> alone for its antstream channel, a swarm:// link, or the text an AntStream app shares';
 
   /** Recent channels, by key; entries of the older reference form are dropped. */
   function recent() {
@@ -1822,8 +1885,7 @@
     const ch = parseChannel(raw);
     if (!ch) {
       // A link of the older form (a feed manifest reference, #<64 hex>),
-      // whose channels are not played any more, or an owner without a
-      // topic.
+      // whose channels are not played any more.
       els.input.value = raw;
       els.input.setCustomValidity(`This link names no owner/topic channel. ${ASK}`);
       els.input.reportValidity();

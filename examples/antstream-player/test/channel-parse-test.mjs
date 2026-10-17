@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+// The channel field and the page's hash read the channel the apps copy or
+// share (issue #222).
+//
+//   node test/channel-parse-test.mjs
+//
+// No dependencies, no browser: the test runs player.js's own
+// `parseChannel` (and the helpers and constants it uses, cut out of the
+// file as they are) against the exact strings the iPhone app's
+// `ChannelAddress` builds (examples/ios-stream/AntStream/ChannelAddress.swift,
+// the same text as Android's `ChannelAddress`): `playerLink`, `swarmURI`,
+// `key`/`display`, `watchLinks` (the Share text) with its line breaks and
+// with them dropped, as a text input does on paste, and an owner alone.
+
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+const K = require(join(here, '../keccak.js'));
+const src = readFileSync(join(here, '../player.js'), 'utf8');
+
+/** The source from the line starting with `from` up to (not including) `to`. */
+function cut(from, to) {
+  const a = src.indexOf(from);
+  const b = src.indexOf(to, a);
+  if (a < 0 || b < 0) throw new Error(`player.js: could not find ${JSON.stringify(from)}…${JSON.stringify(to)}`);
+  return src.slice(a, b);
+}
+
+const code = [
+  cut('  const OWNER = ', '\n  const RECENT_KEY'),
+  cut('  const ANTSTREAM_TOPIC = ', '\n') + '\n',
+  cut('  /**\n   * A channel from what the viewer pasted', '  // -- settings and debug log'),
+  'globalThis.parseChannel = parseChannel;',
+].join('\n');
+const ctx = { K };
+vm.createContext(ctx);
+vm.runInContext(code, ctx, { filename: 'player.js (parseChannel)' });
+const { parseChannel } = ctx;
+
+// -- what the iPhone app builds (ChannelAddress.swift) ----------------------
+
+const PLAYER_REF = 'b268072928bd99d637992eb54c2a826b83affa36f61cf495297541ac42857c35';
+const PUBLIC_GATEWAY = 'https://api.gateway.ethswarm.org';
+const OWNER = '9f2c1a7e5b3d4c6a8e0f1b2d3c4e5f6a7b8c9d0e';
+const RAW = '0123456789abcdef'.repeat(4);
+
+/** `ChannelAddress(owner:text:)` / `(owner:rawTopic:)`'s strings. */
+function app(owner, topic) {
+  const raw = topic.raw;
+  const key = raw ? `0x${owner}/0x${raw}` : `0x${owner}/${encodeURIComponent(topic.text)}`;
+  const display = raw ? `0x${owner}/0x${raw}` : `0x${owner}/${topic.text}`;
+  const playerLink = `bzz://${PLAYER_REF}/#${key}`;
+  const gatewayPlayerLink = `${PUBLIC_GATEWAY}/bzz/${PLAYER_REF}/#${key}`;
+  const swarmURI = raw ? null : `swarm://${owner}/${topic.text}`;
+  const lines = [
+    'Watch my live stream on Swarm:',
+    `Freedom browser: ${playerLink}`,
+    `Any browser: ${gatewayPlayerLink}`,
+  ];
+  if (swarmURI) lines.push(`Solar Punk players: ${swarmURI}`);
+  lines.push(`Channel: ${display}`);
+  return { key, display, playerLink, gatewayPlayerLink, swarmURI, watchLinks: lines.join('\n') };
+}
+
+/** What an `<input>` keeps of pasted text: the value with line breaks stripped. */
+const inputValue = (text) => text.replace(/[\r\n]/g, '');
+
+let failures = 0;
+let passed = 0;
+
+function expect(name, input, want) {
+  let got;
+  try {
+    got = parseChannel(input);
+    if (want === null) {
+      assert.equal(got, null);
+    } else {
+      assert.ok(got, 'no channel');
+      assert.equal(`0x${got.owner}/${got.topic}`, want.display);
+      assert.equal(got.key, want.key);
+      assert.equal(got.topicHex, want.topicHex);
+    }
+    passed++;
+    console.log(`ok   ${name}`);
+  } catch (err) {
+    failures++;
+    const shown = got ? `0x${got.owner}/${got.topic} (key ${got.key})` : String(got);
+    console.log(`FAIL ${name}\n     input ${JSON.stringify(input)}\n     got   ${shown}\n     ${err.message.split('\n')[0]}`);
+  }
+}
+
+const channel = (owner, topic) => {
+  const a = app(owner, topic);
+  return {
+    display: a.display,
+    key: a.key,
+    topicHex: topic.raw || K.topicFromString(topic.text),
+  };
+};
+
+// -- the issue's table: every form plays 0x<owner>/antstream --------------
+
+const ant = app(OWNER, { text: 'antstream' });
+const antWant = channel(OWNER, { text: 'antstream' });
+
+expect('web player link (Freedom)', ant.playerLink, antWant);
+expect('web player link (any browser)', ant.gatewayPlayerLink, antWant);
+expect('Solar Punk URI', ant.swarmURI, antWant);
+expect('0x<owner>/antstream', ant.display, antWant);
+expect('Share text, with line breaks', ant.watchLinks, antWant);
+expect('Share text, line breaks stripped by the input', inputValue(ant.watchLinks), antWant);
+expect('Share text, line breaks as spaces', ant.watchLinks.replace(/\n/g, ' '), antWant);
+expect('Share text, CRLF line breaks', ant.watchLinks.replace(/\n/g, '\r\n'), antWant);
+expect('owner alone, 0x<owner>', `0x${OWNER}`, antWant);
+expect('owner alone, <owner>', OWNER, antWant);
+expect('owner alone, 0x<owner>/', `0x${OWNER}/`, antWant);
+expect('owner alone, upper-case', `0X${OWNER.toUpperCase()}`, antWant);
+expect('owner alone, as the hash of a link', `bzz://${PLAYER_REF}/#0x${OWNER}`, antWant);
+expect('owner alone, in text', `my channel: 0x${OWNER} — come watch`, antWant);
+expect('Share text pasted into a message', `hey!\n\n${ant.watchLinks}\n\nsee you there`, antWant);
+expect('only the Any browser line', `Any browser: ${ant.gatewayPlayerLink}`, antWant);
+expect('only the Solar Punk line', `Solar Punk players: ${ant.swarmURI}`, antWant);
+
+// -- a truncated swarm:// URI stays invalid, as in the apps ---------------
+
+expect('truncated swarm://<owner>/', `swarm://${OWNER}/`, null);
+expect('truncated swarm://<owner>', `swarm://${OWNER}`, null);
+expect('truncated swarm://<owner>/ in text', `Solar Punk players: swarm://${OWNER}/`, null);
+expect('owner too short', `0x${OWNER.slice(1)}`, null);
+expect('older manifest link (#<64 hex>)', `bzz://${PLAYER_REF}/#${RAW}`, null);
+expect('text without a channel', 'Watch my live stream on Swarm: soon', null);
+expect('empty', '   ', null);
+expect('a 64-hex reference in text is no owner', `see 0x${RAW} please`, null);
+
+// -- what worked before keeps working --------------------------------------
+
+const textTopics = ['antstream', 'antstream/My Channel', 'Café ☕ live', '50% off', 'a#b?c'];
+for (const text of textTopics) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`hash link, text topic ${JSON.stringify(text)}`, a.key, want);
+  expect(`player link, text topic ${JSON.stringify(text)}`, a.playerLink, want);
+}
+// Every topic whose Share text the field can read: one with no whitespace.
+for (const text of ['antstream-4f1c2b9e', 'Café☕', 'a/b']) {
+  const a = app(OWNER, { text });
+  const want = channel(OWNER, { text });
+  expect(`Share text, text topic ${JSON.stringify(text)}`, a.watchLinks, want);
+  expect(`Share text stripped, text topic ${JSON.stringify(text)}`, inputValue(a.watchLinks), want);
+}
+
+const raw = app(OWNER, { raw: RAW });
+const rawWant = channel(OWNER, { raw: RAW });
+expect('raw topic, hash link', raw.key, rawWant);
+expect('raw topic, player link', raw.playerLink, rawWant);
+expect('raw topic without 0x', `0x${OWNER}/${RAW}`, rawWant);
+expect('raw topic, upper-case', `0x${OWNER.toUpperCase()}/0X${RAW.toUpperCase()}`, rawWant);
+expect('raw topic, Share text', raw.watchLinks, rawWant);
+expect('raw topic, Share text stripped', inputValue(raw.watchLinks), rawWant);
+expect('swarm:// with a 0x owner', `swarm://0x${OWNER}/antstream`, antWant);
+expect('swarm:// stops at ?', `swarm://${OWNER}/antstream?x=1`, antWant);
+expect('owner without 0x and a topic', `${OWNER}/antstream`, antWant);
+expect('not URL-encoded text topic', `0x${OWNER}/50%`, channel(OWNER, { text: '50%' }));
+
+// The recent-channels list stores `key`s and reads them back with parseChannel.
+for (const t of [{ text: 'antstream' }, { text: 'Café ☕ live' }, { raw: RAW }]) {
+  const first = parseChannel(app(OWNER, t).playerLink);
+  expect(`recent list round trip ${JSON.stringify(t)}`, first.key, channel(OWNER, t));
+}
+
+console.log(`\n${passed} passed, ${failures} failed`);
+process.exit(failures ? 1 : 0);
