@@ -73,7 +73,8 @@ fun StreamInfoCard(node: AntNode, broadcast: LiveBroadcast, channelName: String)
     val state by broadcast.state.collectAsState()
     val infoError by broadcast.infoError.collectAsState()
     val announcing by broadcast.announcing.collectAsState()
-    val announceError by broadcast.announceError.collectAsState()
+    val announceFailure by broadcast.announceFailure.collectAsState()
+    val announceError = broadcast.announceErrorFor(announceFailure, ch.owner, saved.info.scheduledStartMs)
     // Saveable: a rotation mid-announcement reopens the dialog, which
     // picks the running write back up from [LiveBroadcast.announcing].
     var editing by rememberSaveable { mutableStateOf(false) }
@@ -167,8 +168,13 @@ private fun StreamInfoDialog(
     val announcing by broadcast.announcing.collectAsState()
     val busy = work ?: if (announcing) "Announcing…" else null
     // A write this dialog no longer awaits (started before a rotation)
-    // still reports how it ended.
-    val announceError by broadcast.announceError.collectAsState()
+    // still reports how it ended. Only one that ends after the dialog
+    // first opened (saveable, so a rotation keeps the mark) and is about
+    // what's saved now: an older failure is the card's to show, not news.
+    val openedAt = rememberSaveable { broadcast.nextAnnounceSeq }
+    val announceFailure by broadcast.announceFailure.collectAsState()
+    val announceError = announceFailure?.takeIf { it.seq >= openedAt }
+        ?.let { broadcast.announceErrorFor(it, ch.owner, saved.info.scheduledStartMs) }
     var message by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     val hasPlan = plan?.enabled == true
 

@@ -137,8 +137,25 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
      */
     val announcing: StateFlow<Boolean> = announcer.running
 
-    /** The last announcement's error (null once one succeeds), for the stream info card. */
-    val announceError: StateFlow<String?> = announcer.lastError
+    /**
+     * The last announcement's failure (null once one succeeds), for the
+     * stream info card and dialog. Kept until the next announcement, so
+     * show it only while [announceErrorFor] says it is about what's on
+     * screen.
+     */
+    internal val announceFailure: StateFlow<Announcer.Failure?> = announcer.lastFailure
+
+    /** The [Announcer.Failure.seq] the next announcement gets. */
+    val nextAnnounceSeq: Long get() = announcer.nextSeq
+
+    /**
+     * [failure]'s error if it was about [owner]'s channel and its saved
+     * [startMs] (what the card shows now), else null: a failure for an
+     * earlier start time, or another account restored since, no longer
+     * says anything about this one.
+     */
+    internal fun announceErrorFor(failure: Announcer.Failure?, owner: String, startMs: Long?): String? =
+        failure?.takeIf { startMs != null && it.isAbout(announceSubject(owner, startMs)) }?.error
     private var engine: CaptureEngine? = null
     private var pushQueue = Executors.newSingleThreadExecutor()
     private var poll: Job? = null
@@ -420,7 +437,14 @@ class LiveBroadcast(private val context: Context, private val node: AntNode) {
      * rotation) must not take the recording of its result with it. One at
      * a time; a call while one is out returns that one.
      */
-    fun announceAsync(channelName: String): Deferred<String?> = announcer.launch { announce(channelName) }
+    fun announceAsync(channelName: String): Deferred<String?> {
+        val ch = node.channel.value
+        val subject = ch?.let { announceSubject(it.owner, it.info.value.info.scheduledStartMs) }
+        return announcer.launch(subject) { announce(channelName) }
+    }
+
+    /** What an announcement is about: the account and the start time it announces. */
+    private fun announceSubject(owner: String, startMs: Long?): Any = owner to startMs
 
     private suspend fun announce(channelName: String): String? {
         if (isBusy) return "Announcing is for an upcoming broadcast; you're live now."

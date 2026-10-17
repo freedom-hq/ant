@@ -73,13 +73,38 @@ class AnnouncerTest {
         caller.cancelAndJoin()
         release.complete(Unit)
         while (announcer.running.value) Thread.yield()
-        assertEquals("gateway error", announcer.lastError.value)
+        assertEquals("gateway error", announcer.lastFailure.value?.error)
         // A new announcement clears it while it runs, and on success.
         val again = CompletableDeferred<Unit>()
         val next = announcer.launch { again.await(); null }
-        assertEquals(null, announcer.lastError.value)
+        assertEquals(null, announcer.lastFailure.value)
         again.complete(Unit)
         assertEquals(null, next.await())
-        assertEquals(null, announcer.lastError.value)
+        assertEquals(null, announcer.lastFailure.value)
+    }
+
+    /**
+     * A failure says what it was about, so a later start time or another
+     * account (restored since) doesn't show it as its own; and which run
+     * it was, so a dialog opened after it doesn't either.
+     */
+    @Test
+    fun aFailureIsAboutItsAccountAndStartTime() = runBlocking {
+        val announcer = Announcer(CoroutineScope(SupervisorJob() + Dispatchers.Default))
+        val openedBefore = announcer.nextSeq
+        announcer.launch("personal" to 1_900L) { "gateway error" }.await()
+        val failure = announcer.lastFailure.value!!
+        assertEquals("gateway error", failure.error)
+        assertTrue(failure.seq >= openedBefore)
+        assertTrue(failure.isAbout("personal" to 1_900L))
+        // The start moved to 20:00: the 19:00 failure isn't about it.
+        assertFalse(failure.isAbout("personal" to 2_000L))
+        // Another account restored: not about its card either.
+        assertFalse(failure.isAbout("other" to 1_900L))
+        // A dialog opened now shows only failures from the next run on.
+        val openedAfter = announcer.nextSeq
+        assertTrue(failure.seq < openedAfter)
+        announcer.launch("personal" to 1_900L) { "refused again" }.await()
+        assertTrue(announcer.lastFailure.value!!.seq >= openedAfter)
     }
 }
