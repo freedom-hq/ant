@@ -71,6 +71,15 @@ struct ChannelAddressTests {
         for input in ["", "   ", "antstream", "0x1234/antstream", "bzz://\(hex)", "swarm://nope/antstream"] {
             expect(ChannelAddress.parse(input), nil, "reject \(input)")
         }
+        // Fullwidth hex (`０`-`９`, `ａ`-`ｆ`) passes `isHexDigit` but is no
+        // owner or topic a gateway reads; Android's `[0-9a-fA-F]` rejects it too.
+        let fullwidth = String(owner.unicodeScalars.map {
+            Character(Unicode.Scalar($0.value + 0xFEE0)!)
+        })
+        expect(ChannelAddress.parse("\(fullwidth)/antstream"), nil, "reject a fullwidth owner")
+        let fullwidthTopic = String(repeating: "ａｂ", count: 32)
+        expect(ChannelAddress.parse("0x\(owner)/\(fullwidthTopic)")?.topic, .text(fullwidthTopic),
+               "a fullwidth 64-char topic is text, not raw")
 
         // Bare references become `<gateway>/bytes/<ref>`.
         let gw = URL(string: "http://127.0.0.1:1633/")!

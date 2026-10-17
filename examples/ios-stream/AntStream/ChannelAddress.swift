@@ -117,12 +117,12 @@ struct ChannelAddress: Equatable, Hashable {
             rest = ""
         }
         if owner.hasPrefix("0x") || owner.hasPrefix("0X") { owner = owner.dropFirst(2) }
-        guard owner.count == 40, owner.allSatisfy(\.isHexDigit) else { return nil }
+        guard owner.count == 40, owner.allSatisfy(\.isASCIIHex) else { return nil }
         while rest.hasSuffix("/") { rest.removeLast() }
         var topic = rest.removingPercentEncoding ?? String(rest)
         if topic.isEmpty { topic = antstreamTopic }
         let bare = topic.hasPrefix("0x") || topic.hasPrefix("0X") ? String(topic.dropFirst(2)) : topic
-        if bare.count == 64, bare.allSatisfy(\.isHexDigit) {
+        if bare.count == 64, bare.allSatisfy(\.isASCIIHex) {
             return ChannelAddress(owner: String(owner), rawTopic: bare)
         }
         return ChannelAddress(owner: String(owner), text: topic)
@@ -241,9 +241,16 @@ enum SolarPunkPlaylist {
     /// reference (64 hex, 128 for an encrypted one).
     private static func absolute(_ text: Substring, _ gateway: URL) -> String? {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard value.count == 64 || value.count == 128, value.allSatisfy(\.isHexDigit) else { return nil }
+        guard value.count == 64 || value.count == 128, value.allSatisfy(\.isASCIIHex) else { return nil }
         var base = gateway.absoluteString
         while base.hasSuffix("/") { base.removeLast() }
         return "\(base)/bytes/\(value.lowercased())"
     }
+}
+
+extension Character {
+    /// `0-9a-fA-F` only. `isHexDigit` also accepts the fullwidth forms
+    /// (`０`, `Ａ`), which `lowercased()` keeps non-ASCII and no gateway
+    /// reads as hex; Android's `[0-9a-fA-F]` and the web player agree on this.
+    var isASCIIHex: Bool { isASCII && isHexDigit }
 }

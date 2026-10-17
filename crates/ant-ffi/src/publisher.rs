@@ -7808,9 +7808,11 @@ mod tests {
         );
     }
 
-    /// A host that names no `format` (the Android app, and any host that
-    /// predates it) gets `"bzz"`: what the web player and the Android
-    /// Watch tab read through `/bzz/<channel>/stream.m3u8`.
+    /// A host that names no `format` (any host that predates the field)
+    /// gets `"bzz"`, the shape it always published, so an older build keeps
+    /// writing what it wrote before. Both example apps now send
+    /// `"solar-punk"` explicitly, which is what the web player and both
+    /// Watch tabs read.
     #[test]
     fn the_format_defaults_to_bzz_and_parses_solar_punk() {
         let parse = |extra: &str| {

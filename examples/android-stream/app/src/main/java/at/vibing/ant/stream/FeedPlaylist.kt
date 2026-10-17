@@ -27,9 +27,9 @@ import org.json.JSONObject
  *   `GET /feeds/{owner}/{topic}` finds the newest update (its
  *   `swarm-feed-index` header names the index).
  * - **Following**, each playlist reload reads the slot after the newest
- *   one read, `GET /soc/{owner}/{keccak256(topic ‖ index_be8)}`, and on
- *   on while slots answer: the update, or a `404` "not written yet", in
- *   which case the playlist read last is served again.
+ *   one read, `GET /soc/{owner}/{keccak256(topic ‖ index_be8)}`, and
+ *   keeps stepping on while slots answer (up to 8 per reload). A `404`
+ *   means "not written yet": the playlist read last is served again.
  * - Bare references become `<gateway>/bytes/<ref>` ([rewrite]), the
  *   rewrite Solar Punk's viewers do.
  *
