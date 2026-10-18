@@ -6,6 +6,15 @@
 # Connect, where it shows up in TestFlight once Apple has processed it
 # (usually 10-30 minutes).
 #
+# The job then waits for that processing (up to 45 minutes) and attaches
+# the build to the app's editable iOS App Store version ("Prepare for
+# Submission", or a rejected one), the step App Store Connect's web UI
+# calls "Add Build"; the app's icon there comes from that build.
+# Nothing is submitted for review. If no version is editable (one is in
+# review), the build stays unattached and the job says so in a notice.
+# The logic lives in .github/scripts/asc-attach-build.py, shared with the
+# other app's TestFlight workflow.
+#
 # Runs on every release tag (`v*`, next to release.yml and
 # release-ios.yml) and by hand from the Actions tab.
 #
@@ -40,7 +49,7 @@ jobs:
   testflight:
     name: archive AntStream + upload to TestFlight
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -125,6 +134,16 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID"
           echo "::notice::AntStream 0.1.${{ github.run_number }} (build ${{ github.run_number }}) uploaded; it appears in TestFlight once Apple has processed it."
+
+      - name: Attach the build to the App Store version
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet 'pyjwt[crypto]'
+          "$RUNNER_TEMP/asc-venv/bin/python" .github/scripts/asc-attach-build.py \
+            --bundle-id baby.freedom.antstream \
+            --version "0.1.${{ github.run_number }}" \
+            --build "${{ github.run_number }}"
 
       - name: Remove the API key
         if: always() && steps.creds.outputs.ok == 'true'

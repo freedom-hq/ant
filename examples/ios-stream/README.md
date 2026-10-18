@@ -195,6 +195,16 @@ archives the app, signs it with Xcode's cloud-managed signing and
 uploads it to App Store Connect on every release tag (`v*`), or by hand
 from the Actions tab. Builds are numbered `0.1.<run>` / `<run>`.
 
+After the upload, the job waits for Apple to process the build (up to
+45 minutes) and attaches it to the app's editable iOS App Store version
+("Prepare for Submission", or one rejected back to you), the same as
+"Add Build" in App Store Connect; the app's icon there comes from that
+build. It never submits anything for review. If no version is editable
+(one is in review), the build is left unattached and the job says so in
+a notice. AntDrive's workflow does the same through the shared
+[`.github/scripts/asc-attach-build.py`](../../.github/scripts/asc-attach-build.py)
+(offline tests: `python3 .github/scripts/test_asc_attach_build.py`).
+
 One-time setup:
 
 1. In App Store Connect, create the app record for
