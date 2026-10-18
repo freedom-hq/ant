@@ -114,6 +114,53 @@ def raw_to_der(raw):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl")
+class NewerBuild(unittest.TestCase):
+    def test_compares_numerically(self):
+        self.assertTrue(asc.is_newer_build("43", "42"))
+        self.assertTrue(asc.is_newer_build("100", "99"))
+        self.assertFalse(asc.is_newer_build("42", "42"))
+        self.assertFalse(asc.is_newer_build("41", "42"))
+        self.assertFalse(asc.is_newer_build(None, "42"))
+        self.assertFalse(asc.is_newer_build("1.0.3", "42"))
+
+
+class MainFlow(unittest.TestCase):
+    """main() against a scripted Client.request: which calls go out."""
+
+    def run_main(self, attached):
+        calls = []
+
+        def request(self_, method, path, params=None, body=None):
+            calls.append((method, path))
+            if path == "/v1/apps":
+                return {"data": [{"id": "A", "attributes": {"bundleId": "b", "name": "N"}}]}
+            if path == "/v1/builds":
+                return {"data": [{"id": "B", "attributes": {"processingState": "VALID"}}]}
+            if path == "/v1/apps/A/appStoreVersions":
+                return {"data": [version("V", "PREPARE_FOR_SUBMISSION")]}
+            if path == "/v1/appStoreVersions/V/build":
+                return {"data": {"id": "X", "attributes": {"version": attached}} if attached else None}
+            if method == "PATCH":
+                return None
+            raise AssertionError(path)
+
+        env = {"ASC_KEY_ID": "k", "ASC_ISSUER_ID": "i", "ASC_KEY_PATH": "/x"}
+        with mock.patch.dict(asc.os.environ, env), mock.patch.object(asc.Client, "request", request):
+            rc = asc.main(["--bundle-id", "b", "--version", "0.1.42", "--build", "42"])
+        return rc, [c for c in calls if c[0] == "PATCH"]
+
+    def test_attaches_over_nothing_or_an_older_build(self):
+        for attached in (None, "41"):
+            rc, patches = self.run_main(attached)
+            self.assertEqual(rc, 0)
+            self.assertEqual(patches, [("PATCH", "/v1/appStoreVersions/V/relationships/build")])
+
+    def test_leaves_a_newer_build_alone(self):
+        rc, patches = self.run_main("43")
+        self.assertEqual(rc, 0)
+        self.assertEqual(patches, [])
+
+
 class Signing(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -234,6 +281,48 @@ class Retry(unittest.TestCase):
         with self.assertRaises(asc.ApiError):
             c.request("GET", "/v1/builds")
         self.assertEqual(self.connections, asc.GET_RETRIES + 1)
+
+    def test_get_retries_when_the_error_body_is_cut(self):
+        # A 503 whose body drops mid-read: e.read() raises IncompleteRead
+        # inside the HTTPError arm, which must still retry.
+        def cut_503(conn):
+            conn.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n"
+                b"Connection: close\r\n\r\n{"
+            )
+
+        c = self.client(self.serve(1, cut_503))
+        self.assertEqual(c.request("GET", "/v1/builds"), {"data": []})
+        self.assertEqual(self.connections, 2)
+
+    def test_cut_error_body_on_a_4xx_is_an_api_error(self):
+        def cut_401(conn):
+            conn.sendall(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\n"
+                b"Connection: close\r\n\r\n{"
+            )
+
+        c = self.client(self.serve(99, cut_401))
+        with self.assertRaisesRegex(asc.ApiError, "HTTP 401"):
+            c.request("GET", "/v1/builds")
+        self.assertEqual(self.connections, 1)
+
+    def test_get_retries_a_non_json_200(self):
+        def html(conn):
+            body = b"<html>proxy</html>"
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+
+        c = self.client(self.serve(1, html))
+        self.assertEqual(c.request("GET", "/v1/builds"), {"data": []})
+        self.assertEqual(self.connections, 2)
+
+        c = self.client(self.serve(99, html))
+        with self.assertRaisesRegex(asc.ApiError, "not JSON"):
+            c.request("GET", "/v1/builds")
 
     def test_patch_is_not_retried_but_still_an_api_error(self):
         c = self.client(self.serve(99, lambda conn: None))

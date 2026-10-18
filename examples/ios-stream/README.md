@@ -206,10 +206,14 @@ a notice. AntDrive's workflow does the same through the shared
 [`.github/scripts/asc-attach-build.py`](../../.github/scripts/asc-attach-build.py)
 (standard library plus the system `openssl`, nothing installed from
 PyPI; offline tests: `python3 .github/scripts/test_asc_attach_build.py`).
-Runs of one workflow are queued, never overlapped, so an older build
-can't overwrite a newer one on the version. A failed attach shows as an
-error annotation but leaves the run green, since the upload itself
-already landed.
+The attach runs as its own job after the upload. Attach jobs of
+overlapping runs are queued, and when several are pending only the
+newest one runs; the script also leaves the version alone if it already
+has a newer build, so an older build never overwrites a newer one.
+Uploads are never queued, so every tag still gets its own TestFlight
+build. A failed attach (revoked key, build `INVALID`, processing timeout,
+refused PATCH) fails the attach job; the uploaded build stays in
+TestFlight either way.
 
 One-time setup:
 

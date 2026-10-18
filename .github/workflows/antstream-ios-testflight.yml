@@ -13,9 +13,12 @@
 # Nothing is submitted for review. If no version is editable (one is in
 # review), the build stays unattached and the job says so in a notice.
 # The logic lives in .github/scripts/asc-attach-build.py, shared with the
-# other app's TestFlight workflow. A failed attach is reported as an
-# error annotation but doesn't fail the run (continue-on-error), since
-# the upload itself already landed.
+# other app's TestFlight workflow, and runs in its own `attach` job after
+# the upload job. A failed attach fails that job (the upload itself has
+# already landed and stays in TestFlight). Attach jobs of overlapping
+# runs queue; when several are pending, only the newest runs, and the
+# version is never moved back to an older build. Uploads never queue, so
+# every tag still gets its own TestFlight build.
 #
 # Runs on every release tag (`v*`, next to release.yml and
 # release-ios.yml) and by hand from the Actions tab.
@@ -44,14 +47,6 @@ on:
 permissions:
   contents: read
 
-# One run at a time (a newer queued run replaces an older pending one,
-# never the other way round): two overlapping runs (a tag and a
-# dispatch) would otherwise race to set the App Store version's build,
-# and the older build could finish processing last and win.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -59,7 +54,9 @@ jobs:
   testflight:
     name: archive AntStream + upload to TestFlight
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 90
+    outputs:
+      uploaded: ${{ steps.upload.outputs.uploaded }}
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -120,6 +117,7 @@ jobs:
             CURRENT_PROJECT_VERSION="${{ github.run_number }}"
 
       - name: Export and upload to App Store Connect
+        id: upload
         if: steps.creds.outputs.ok == 'true'
         run: |
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<'PLIST'
@@ -144,16 +142,54 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID"
           echo "::notice::AntStream 0.1.${{ github.run_number }} (build ${{ github.run_number }}) uploaded; it appears in TestFlight once Apple has processed it."
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the API key
+        if: always() && steps.creds.outputs.ok == 'true'
+        run: rm -f "$ASC_KEY_PATH"
+
+  # A separate job so the queue below holds back only the attach, never
+  # an upload: GitHub keeps one *pending* job per concurrency group and
+  # cancels an older pending one when a newer one queues, so a group on
+  # the upload job would skip a release tag's TestFlight build outright.
+  # Here the cancelled job is only an older build's attach; its build is
+  # still in TestFlight, and the newer build is what the version should
+  # carry anyway. The script also leaves the version alone if it already
+  # has a newer build, so a run that finishes processing last can't
+  # overwrite a newer one either.
+  attach:
+    name: attach the build to the App Store version
+    needs: testflight
+    if: needs.testflight.outputs.uploaded == 'true'
+    runs-on: ubuntu-latest
+    # Up to 45 minutes waiting for Apple's processing, plus retries.
+    timeout-minutes: 60
+    concurrency:
+      group: ${{ github.workflow }}-attach
+      cancel-in-progress: false
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Write the API key
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY"
+          chmod 600 "$KEY"
+          echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
 
       - name: Attach the build to the App Store version
-        if: steps.creds.outputs.ok == 'true'
-        # The upload above already succeeded; until a real run has shown
-        # App Store Connect accepts a 0.1.<run> build on the editable
-        # version, a refusal here shows as an error annotation without
-        # turning the release-tag run red.
-        continue-on-error: true
         # Standard library only (the token is signed by the system
-        # openssl), so nothing from PyPI runs next to the Admin key.
+        # openssl), so nothing from PyPI runs next to the Admin key. A
+        # failure (revoked key, INVALID build, processing timeout, a
+        # refused PATCH) fails the job: Apple accepts 0.1.<run> builds
+        # on the "1.0" version (confirmed 2026-10-19, HTTP 204), so
+        # there is no known-benign refusal to soften.
         run: |
           python3 .github/scripts/asc-attach-build.py \
             --bundle-id baby.freedom.antstream \
@@ -161,5 +197,5 @@ jobs:
             --build "${{ github.run_number }}"
 
       - name: Remove the API key
-        if: always() && steps.creds.outputs.ok == 'true'
+        if: always()
         run: rm -f "$ASC_KEY_PATH"

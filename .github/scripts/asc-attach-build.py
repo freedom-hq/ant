@@ -10,7 +10,8 @@ Called as the last step of the iOS TestFlight workflows
      lists the build and has processed it (`processingState` VALID);
   3. find the app's editable iOS App Store version (Prepare for
      Submission, rejected back to the developer, or Invalid Binary) and
-     set its build.
+     set its build, unless the version already carries a newer build
+     (a later run that finished first).
 
 It never submits anything for review. With no editable version (one is
 waiting for or in review, or none exists) it prints a notice and exits 0.
@@ -170,6 +171,16 @@ def build_status(builds):
     return "processing"
 
 
+def is_newer_build(attached, build):
+    """True when the build already on the version (`attached`, a build
+    number string or None) is numerically newer than `build`, so an
+    older run that finished processing last must leave it alone."""
+    try:
+        return attached is not None and int(attached) > int(build)
+    except ValueError:
+        return False
+
+
 def notice(msg):
     print(f"::notice::{msg}", flush=True)
 
@@ -179,6 +190,15 @@ def error(msg):
 
 
 # --- API client ---------------------------------------------------------
+
+
+class _Failure(Exception):
+    """One failed attempt inside `Client.request`."""
+
+    def __init__(self, transient, detail):
+        super().__init__(detail)
+        self.transient = transient
+        self.detail = detail
 
 
 class Client:
@@ -210,35 +230,48 @@ class Client:
             if data is not None:
                 req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    raw = resp.read()
-                    return json.loads(raw) if raw else None
-            except urllib.error.HTTPError as e:
-                detail = e.read().decode(errors="replace")
-                transient = e.code == 429 or e.code >= 500
-                if transient and attempt + 1 < attempts:
-                    print(f"{method} {path}: HTTP {e.code}, retrying: {detail}", flush=True)
+                return self._send(req)
+            except _Failure as f:
+                if f.transient and attempt + 1 < attempts:
+                    print(f"{method} {path}: {f.detail}, retrying", flush=True)
                     time.sleep(10 * (attempt + 1))
                     continue
-                raise ApiError(f"{method} {path}: HTTP {e.code}: {detail}") from None
-            except urllib.error.URLError as e:
-                if attempt + 1 < attempts:
-                    print(f"{method} {path}: {e.reason}, retrying", flush=True)
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                raise ApiError(f"{method} {path}: {e.reason}") from None
-            except (http.client.HTTPException, OSError) as e:
-                # urllib wraps only errors raised while *sending*; a
-                # connection dropped or timed out while waiting for or
-                # reading the response (RemoteDisconnected,
-                # ConnectionResetError, TimeoutError, IncompleteRead)
-                # comes through raw.
-                if attempt + 1 < attempts:
-                    print(f"{method} {path}: {e!r}, retrying", flush=True)
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                raise ApiError(f"{method} {path}: {e!r}") from None
+                raise ApiError(f"{method} {path}: {f.detail}") from None
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _send(req):
+        """One attempt. Every way it can fail comes out as a `_Failure`,
+        so `request` is the only place that decides retry vs. ApiError."""
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            # Reading the error body can itself drop mid-way; that must
+            # not escape as a raw IncompleteRead from inside this arm.
+            try:
+                detail = e.read().decode(errors="replace")
+            except (http.client.HTTPException, OSError) as read_err:
+                detail = f"(error body unreadable: {read_err!r})"
+            raise _Failure(e.code == 429 or e.code >= 500, f"HTTP {e.code}: {detail}") from None
+        except urllib.error.URLError as e:
+            raise _Failure(True, str(e.reason)) from None
+        except (http.client.HTTPException, OSError) as e:
+            # urllib wraps only errors raised while *sending*; a
+            # connection dropped or timed out while waiting for or
+            # reading the response (RemoteDisconnected,
+            # ConnectionResetError, TimeoutError, IncompleteRead)
+            # comes through raw.
+            raise _Failure(True, repr(e)) from None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            # A 200 that isn't JSON is a proxy/CDN page, not the API:
+            # transient, like a 5xx.
+            snippet = raw[:200].decode(errors="replace")
+            raise _Failure(True, f"response is not JSON: {snippet!r}") from None
 
 
 # --- steps --------------------------------------------------------------
@@ -303,6 +336,17 @@ def app_store_versions(client, app_id):
     return resp.get("data", [])
 
 
+def attached_build_number(client, version_id):
+    """Build number currently set on the version, or None."""
+    resp = client.request(
+        "GET",
+        f"/v1/appStoreVersions/{version_id}/build",
+        {"fields[builds]": "version"},
+    )
+    data = (resp or {}).get("data")
+    return (data.get("attributes") or {}).get("version") if data else None
+
+
 def attach(client, version_id, build_id):
     client.request(
         "PATCH",
@@ -343,6 +387,13 @@ def main(argv=None):
             return 0
 
         vstring = version["attributes"].get("versionString")
+        current = attached_build_number(client, version["id"])
+        if is_newer_build(current, args.build):
+            notice(
+                f"{name}: App Store version {vstring} already has newer build {current}; "
+                f"build {args.version} ({args.build}) was left unattached."
+            )
+            return 0
         attach(client, version["id"], build["id"])
         notice(
             f"{name}: build {args.version} ({args.build}) attached to App Store version "
