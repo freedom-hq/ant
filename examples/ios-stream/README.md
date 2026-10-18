@@ -197,13 +197,19 @@ from the Actions tab. Builds are numbered `0.1.<run>` / `<run>`.
 
 After the upload, the job waits for Apple to process the build (up to
 45 minutes) and attaches it to the app's editable iOS App Store version
-("Prepare for Submission", or one rejected back to you), the same as
+("Prepare for Submission", one rejected back to you, or Invalid
+Binary), the same as
 "Add Build" in App Store Connect; the app's icon there comes from that
 build. It never submits anything for review. If no version is editable
 (one is in review), the build is left unattached and the job says so in
 a notice. AntDrive's workflow does the same through the shared
 [`.github/scripts/asc-attach-build.py`](../../.github/scripts/asc-attach-build.py)
-(offline tests: `python3 .github/scripts/test_asc_attach_build.py`).
+(standard library plus the system `openssl`, nothing installed from
+PyPI; offline tests: `python3 .github/scripts/test_asc_attach_build.py`).
+Runs of one workflow are queued, never overlapped, so an older build
+can't overwrite a newer one on the version. A failed attach shows as an
+error annotation but leaves the run green, since the upload itself
+already landed.
 
 One-time setup:
 

@@ -9,7 +9,8 @@ Called as the last step of the iOS TestFlight workflows
   2. wait (poll every 30 s, give up after 45 min) until App Store Connect
      lists the build and has processed it (`processingState` VALID);
   3. find the app's editable iOS App Store version (Prepare for
-     Submission, or rejected back to the developer) and set its build.
+     Submission, rejected back to the developer, or Invalid Binary) and
+     set its build.
 
 It never submits anything for review. With no editable version (one is
 waiting for or in review, or none exists) it prints a notice and exits 0.
@@ -19,14 +20,18 @@ Usage:
       --version 0.1.42 --build 42
 
 Credentials come from the environment the workflows already set:
-ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file). Signing needs
-PyJWT with its crypto extra (`pip install 'pyjwt[crypto]'`); the pure
-helpers below don't, so test_asc_attach_build.py runs on plain python3.
+ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file). The ES256
+token is signed by the system `openssl` binary, so the script needs
+nothing beyond the standard library: no package is installed from PyPI
+into a step that holds the Admin-role key.
 """
 
 import argparse
+import base64
+import http.client
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -42,7 +47,7 @@ TOKEN_REFRESH_S = 10 * 60
 POLL_INTERVAL_S = 30
 POLL_TIMEOUT_S = 45 * 60
 
-# Transient failures (network, 429, 5xx) on a GET are retried this many
+# Transient failures (network, dropped connections, timeouts, 429, 5xx) on a GET are retried this many
 # times, so one hiccup doesn't throw away a 30-minute processing wait.
 GET_RETRIES = 4
 
@@ -53,6 +58,8 @@ EDITABLE_STATES = {
     "DEVELOPER_REJECTED",
     "REJECTED",
     "METADATA_REJECTED",
+    # Apple refused the uploaded binary; the fix is attaching a new build.
+    "INVALID_BINARY",
 }
 
 
@@ -73,6 +80,59 @@ def token_claims(key_id, issuer_id, now, ttl=TOKEN_TTL_S):
         "aud": "appstoreconnect-v1",
     }
     return headers, payload
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _der_len(der, i):
+    """Read a DER length at `der[i]`; return (length, index after it)."""
+    first = der[i]
+    if first < 0x80:
+        return first, i + 1
+    n = first & 0x7F
+    return int.from_bytes(der[i + 1 : i + 1 + n], "big"), i + 1 + n
+
+
+def der_to_raw_signature(der, size=32):
+    """An ECDSA signature as `openssl dgst -sign` writes it (DER
+    SEQUENCE of two INTEGERs) to the JWS form: r || s, each `size`
+    bytes big-endian."""
+    if der[0] != 0x30:
+        raise ValueError("not a DER sequence")
+    _, i = _der_len(der, 1)
+    out = b""
+    for _ in range(2):
+        if der[i] != 0x02:
+            raise ValueError("not a DER integer")
+        n, i = _der_len(der, i + 1)
+        value = int.from_bytes(der[i : i + n], "big")
+        i += n
+        out += value.to_bytes(size, "big")
+    return out
+
+
+def signing_input(headers, payload):
+    """The `<header>.<payload>` part of a JWS, the bytes that get signed."""
+    enc = lambda d: b64url(json.dumps(d, separators=(",", ":")).encode())
+    return f"{enc(headers)}.{enc(payload)}"
+
+
+def sign_es256(message, key_path):
+    """Sign `message` (str) with the P-256 key at `key_path` through the
+    system openssl; return the JWS signature segment."""
+    try:
+        der = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=message.encode(),
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", b"") or b""
+        raise ApiError(f"signing the API token failed: {e} {detail.decode(errors='replace')}") from None
+    return b64url(der_to_raw_signature(der))
 
 
 def version_state(version):
@@ -125,20 +185,16 @@ class Client:
     def __init__(self, key_id, issuer_id, key_path):
         self.key_id = key_id
         self.issuer_id = issuer_id
-        with open(key_path) as f:
-            self.private_key = f.read()
+        self.key_path = key_path
         self._token = None
         self._minted = 0.0
 
     def token(self):
         now = time.time()
         if self._token is None or now - self._minted > TOKEN_REFRESH_S:
-            import jwt  # PyJWT, installed by the workflow step
-
             headers, payload = token_claims(self.key_id, self.issuer_id, now)
-            self._token = jwt.encode(
-                payload, self.private_key, algorithm="ES256", headers=headers
-            )
+            message = signing_input(headers, payload)
+            self._token = f"{message}.{sign_es256(message, self.key_path)}"
             self._minted = now
         return self._token
 
@@ -171,6 +227,17 @@ class Client:
                     time.sleep(10 * (attempt + 1))
                     continue
                 raise ApiError(f"{method} {path}: {e.reason}") from None
+            except (http.client.HTTPException, OSError) as e:
+                # urllib wraps only errors raised while *sending*; a
+                # connection dropped or timed out while waiting for or
+                # reading the response (RemoteDisconnected,
+                # ConnectionResetError, TimeoutError, IncompleteRead)
+                # comes through raw.
+                if attempt + 1 < attempts:
+                    print(f"{method} {path}: {e!r}, retrying", flush=True)
+                    time.sleep(10 * (attempt + 1))
+                    continue
+                raise ApiError(f"{method} {path}: {e!r}") from None
         raise AssertionError("unreachable")
 
 
