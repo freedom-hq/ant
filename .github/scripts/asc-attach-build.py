@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Attach a freshly uploaded build to the app's editable App Store version.
 
-Called as the last step of the iOS TestFlight workflows
-(antdrive-ios-testflight.yml, antstream-ios-testflight.yml), after
-`xcodebuild -exportArchive` has uploaded the build:
+Run by the `attach` job of the iOS TestFlight workflows
+(antdrive-ios-testflight.yml, antstream-ios-testflight.yml), on
+ubuntu-latest once the macOS `testflight` job has uploaded the build
+(`xcodebuild -exportArchive`) and reported `uploaded=true`. It shares
+nothing with that job but the bundle ID and run number passed on the
+command line:
 
   1. look up the app by bundle ID;
   2. wait (poll every 30 s, give up after 45 min) until App Store Connect
@@ -20,8 +23,9 @@ Usage:
   asc-attach-build.py --bundle-id baby.freedom.antdrive \
       --version 0.1.42 --build 42
 
-Credentials come from the environment the workflows already set:
-ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file). The ES256
+Credentials come from the environment the `attach` job sets up itself:
+ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file it writes from
+the ASC_KEY_P8 secret). The ES256
 token is signed by the system `openssl` binary, so the script needs
 nothing beyond the standard library: no package is installed from PyPI
 into a step that holds the Admin-role key.
