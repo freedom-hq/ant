@@ -214,6 +214,17 @@ opens a channel that never loads, and the stage must go back to 16:9.
 ELECTRON=<path to electron> node test/portrait-test.mjs   # needs ffmpeg, xvfb-run
 ```
 
+The iOS app turns a live broadcast with the phone (#228): its writer
+restarts at the new size, so the stream switches shape behind an
+`#EXT-X-DISCONTINUITY`, under a second `#EXT-X-MAP`. The stage re-shapes
+on the video's `resize` event. `test/turn-test.mjs` plays such a stream
+(portrait, then landscape, looped so it turns back) at both window sizes
+and checks that the stage's box follows each shape within a second.
+
+```sh
+ELECTRON=<path to electron> node test/turn-test.mjs       # needs ffmpeg, xvfb-run
+```
+
 ## Debug panel
 
 The **Debug** button (or `?debug` in the URL) opens a panel with:

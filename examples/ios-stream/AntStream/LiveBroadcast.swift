@@ -14,7 +14,10 @@ import UIKit
 /// The hand-off is a single ordered queue rather than a task per
 /// segment, because the publisher numbers segments by the order the
 /// pushes arrive and that number decides both playlist order and which
-/// `#EXT-X-MAP` each segment is listed under.
+/// `#EXT-X-MAP` each segment is listed under. A turn of the phone (#228)
+/// travels the same queue, between the old writer's last segment and the
+/// new writer's initialization segment, so the publisher hears the new
+/// size before any segment of it.
 ///
 /// It also owns the camera preview the live screen shows before Go live
 /// (#193): ``openPreview()`` starts a ``CaptureEngine`` that only runs
@@ -75,7 +78,13 @@ final class LiveBroadcast: ObservableObject {
     /// queue enqueues into it synchronously and ``pumpTask`` is its only
     /// consumer, so segments reach `ant_publisher_push_segment` in
     /// exactly the order the writer finished them.
-    private var segmentFeed: AsyncStream<CaptureEngine.Segment>.Continuation?
+    private var segmentFeed: AsyncStream<FeedItem>.Continuation?
+    /// What the capture side hands the publisher, in capture order.
+    private enum FeedItem {
+        case segment(CaptureEngine.Segment)
+        /// The recording turned (#228): the new writer's settings.
+        case rendition(CaptureEngine.Settings)
+    }
     private var pumpTask: Task<Void, Never>?
     /// Set by the pump once the feed is closed *and* drained, so ``stop``
     /// knows the last segment has reached the publisher.
@@ -103,11 +112,14 @@ final class LiveBroadcast: ObservableObject {
         return CaptureEngine.Quality(rawValue: stored) ?? .low
     }
 
-    /// The next broadcast is vertical. Follows the way the picture comes
-    /// off the camera (``picturePortrait``) until Go live, then stays as
-    /// it was for the whole broadcast (#193). A resume (#175) takes the
-    /// orientation the unfinished broadcast went out in instead
-    /// (``pinForResume(owner:)``).
+    /// The broadcast is vertical. Before Go live it follows the way the
+    /// picture comes off the camera (``picturePortrait``); a resume (#175)
+    /// takes the orientation the unfinished broadcast last had instead
+    /// (``pinForResume(owner:)``). While live it is the shape the
+    /// recording encodes: the capture engine turns the recording once the
+    /// phone has held a new orientation for
+    /// ``CaptureEngine/orientationHold`` (#228), and the turn reaches here
+    /// through the segment queue.
     @Published private(set) var portrait = true
     /// How the camera turns the picture: the physical device's
     /// orientation (its rotation coordinator's capture angle), which is
@@ -122,19 +134,24 @@ final class LiveBroadcast: ObservableObject {
     var layoutPortrait = true {
         didSet { followOrientation() }
     }
-    /// The orientation of the unfinished broadcast the next go-live
-    /// resumes, which it keeps (one feed, one recording, one shape).
+    /// The orientation the unfinished broadcast the next go-live resumes
+    /// last had, which it starts in (one feed, one recording, carrying on
+    /// where it stopped); once live it follows the phone again (#228).
     @Published private(set) var resumePortrait: Bool?
 
     /// The shape the picture currently has.
-    var picturePortrait: Bool { capturePortrait ?? Self.shotPortrait ?? layoutPortrait }
+    var picturePortrait: Bool { capturePortrait ?? shotPortrait ?? layoutPortrait }
 
     /// `-antstream-shot-portrait` makes the test pattern a portrait
     /// broadcast whatever the layout (#194's CI geometry check), the shape
     /// a phone held upright produces. Only where there is no camera
-    /// reading: ``capturePortrait`` still wins.
-    private static let shotPortrait: Bool? =
+    /// reading: ``capturePortrait`` still wins. `-antstream-shot-turn`
+    /// turns it to landscape ``shotTurnDelay`` into the broadcast, as a
+    /// phone turned while live (#228's CI check).
+    private var shotPortrait: Bool? =
         RootView.shotArgs.contains("-antstream-shot-portrait") ? true : nil
+    private static let shotTurnDelay: UInt64 = 16_000_000_000
+    private var shotTurnTask: Task<Void, Never>?
 
     /// Pin the next broadcast to the orientation the unfinished broadcast
     /// of `owner` went out in (#175), or release it (`nil`).
@@ -143,16 +160,25 @@ final class LiveBroadcast: ObservableObject {
         followOrientation()
     }
 
-    /// Re-derive ``portrait`` while no broadcast runs.
+    /// Re-derive ``portrait`` while no broadcast runs. While one does, the
+    /// recording turns itself (#228): the camera's engine reads the phone
+    /// itself, the test pattern is told the picture's shape.
     private func followOrientation() {
-        guard !state.isActive else { return }
+        guard !state.isActive else {
+            if let engine, engine.source == .testPattern {
+                engine.followPicture(portrait: picturePortrait)
+            }
+            return
+        }
         let next = resumePortrait ?? picturePortrait
         if portrait != next { portrait = next }
     }
 
-    /// The orientation each account's last broadcast went out in, so a
-    /// resume after a kill (#175) keeps it: the recovery entry is the
-    /// node's and doesn't carry it. One per account, as the entry is.
+    /// The orientation each account's broadcast last had, so a resume
+    /// after a kill (#175) continues in it: stored at Go live and again
+    /// at every turn (#228). The recovery entry carries the size too
+    /// (the node's own resume reads it), but the app needs the shape
+    /// before it starts the run. One per account, as the entry is.
     private static func portraitKey(owner: String) -> String {
         "antstream.broadcastPortrait." + owner.lowercased()
             .replacingOccurrences(of: "0x", with: "")
@@ -356,28 +382,58 @@ final class LiveBroadcast: ObservableObject {
         // segment and the new writer's initialization segment must not
         // race. An unbounded buffer keeps the enqueue non-blocking:
         // backpressure stays the node's drop-oldest backlog.
-        let (feed, sink) = AsyncStream<CaptureEngine.Segment>.makeStream(
+        let (feed, sink) = AsyncStream<FeedItem>.makeStream(
             bufferingPolicy: .unbounded
         )
         segmentFeed = sink
         engine.onSegment = { segment in
             // Arrives on the writer's delivery queue; enqueueing is
             // synchronous and FIFO, so the order is settled right here.
-            sink.yield(segment)
+            sink.yield(.segment(segment))
         }
+        engine.onRenditionChange = { turned in
+            // On the capture queue, after the old writer's last segment
+            // was enqueued above and before the new one's init segment.
+            sink.yield(.rendition(turned))
+        }
+        let owner = permanent.owner
         pumpDrained = false
         pumpTask = Task { @MainActor [weak self] in
-            for await segment in feed {
+            for await item in feed {
                 guard let self else { return }
-                self.capturedSegments += 1
-                // Awaited one at a time: the next segment is not handed
-                // over until this one has reached the FFI.
-                await node.pushSegment(segment)
+                switch item {
+                case .segment(let segment):
+                    self.capturedSegments += 1
+                    // Awaited one at a time: the next segment is not
+                    // handed over until this one has reached the FFI.
+                    await node.pushSegment(segment)
+                case .rendition(let turned):
+                    // The phone turned (#228): the shape shown, the
+                    // shape a resume continues in, and the size the
+                    // node names, before the new writer's segments.
+                    self.portrait = turned.portrait
+                    UserDefaults.standard.set(turned.portrait, forKey: Self.portraitKey(owner: owner))
+                    await node.setPublisherRendition(
+                        width: turned.encodedWidth,
+                        height: turned.encodedHeight
+                    )
+                }
             }
             self?.pumpDrained = true
         }
         engine.start(settings: settings)
+        // The test pattern's picture may already have another shape than
+        // the one a resume starts in.
+        if source == .testPattern { engine.followPicture(portrait: picturePortrait) }
         state = .live
+        if source == .testPattern, RootView.shotArgs.contains("-antstream-shot-turn") {
+            shotTurnTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: Self.shotTurnDelay)
+                guard !Task.isCancelled, let self, self.state == .live else { return }
+                self.shotPortrait = false
+                self.followOrientation()
+            }
+        }
         startPolling(node: node)
         captureThumbnail(node: node, engine: engine)
     }
@@ -418,6 +474,8 @@ final class LiveBroadcast: ObservableObject {
         pollTask = nil
         thumbnailTask?.cancel()
         thumbnailTask = nil
+        shotTurnTask?.cancel()
+        shotTurnTask = nil
         // Wait for the writer to emit its final segment *and* for that
         // segment to reach the publisher before closing the publisher's
         // queue — otherwise the last seconds of the broadcast are

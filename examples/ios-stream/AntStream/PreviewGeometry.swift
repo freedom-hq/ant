@@ -38,8 +38,9 @@ enum PreviewGeometry {
     /// - Parameters:
     ///   - broadcastPortrait: the broadcast's encoded frame is portrait
     ///     (``LiveBroadcast/portrait``).
-    ///   - pinned: that shape is fixed (live since Go live, or a resume's
-    ///     shape, #193/#175). When it isn't, it follows the picture, and
+    ///   - pinned: that shape is fixed: a resume's, before Go live (#175).
+    ///     A broadcast follows the phone while live (#228), so live is not
+    ///     pinned. When it isn't, it follows the picture, and
     ///     `broadcastPortrait` is the capture engine's reading from its
     ///     *own* coordinator, which may not have caught up yet: the frame
     ///     then takes the shape the preview shows the picture in, from

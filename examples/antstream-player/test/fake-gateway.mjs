@@ -7,7 +7,11 @@
 //
 // <segments-dir> holds what the Android app's self-test mode writes
 // (`init-1.mp4`, `seg-N.m4s`, `durations.txt`; see
-// examples/android-stream/README.md). The server replays those segments in
+// examples/android-stream/README.md). A `durations.txt` that lists more
+// than one initialization segment (`<n> true 0` lines, each followed by
+// its own media) replays a writer restart there: the next segment is
+// listed under `init-<n>.mp4` as a new `#EXT-X-MAP` behind an
+// `#EXT-X-DISCONTINUITY`, as the iOS app's turned broadcast is (#228). The server replays those segments in
 // real time as a channel shaped like the publisher's `"solar-punk"` format
 // (crates/ant-ffi/src/publisher.rs): a sequence feed of owner OWNER and
 // topic `keccak256(TOPIC)` whose every update is the live playlist itself,
@@ -193,12 +197,15 @@ function writeMarker() {
 
 let records = [];
 if (dir && !upstream) {
-  records = readFileSync(join(dir, 'durations.txt'), 'utf8')
+  // Each media segment under the init segment listed last before it.
+  let init = 'init-1.mp4';
+  for (const [n, isInit, ms] of readFileSync(join(dir, 'durations.txt'), 'utf8')
     .trim()
     .split('\n')
-    .map((l) => l.split(' '))
-    .filter(([, init]) => init === 'false')
-    .map(([n, , ms]) => ({ file: `seg-${n}.m4s`, ms: Number(ms) }));
+    .map((l) => l.split(' '))) {
+    if (isInit === 'true') init = `init-${n}.mp4`;
+    else records.push({ file: `seg-${n}.m4s`, ms: Number(ms), init });
+  }
 }
 const initBytes = dir && !upstream ? readFileSync(join(dir, 'init-1.mp4')) : null;
 
@@ -210,9 +217,9 @@ let ended = false;
 let broadcast = 0;
 let mapRef = null;
 
-function newInit(tag) {
+function newInit(tag, file = 'init-1.mp4') {
   const ref = refOf(`init-${broadcast}-${tag}`);
-  blobs.set(ref, { bytes: initBytes, type: 'video/mp4' });
+  blobs.set(ref, { bytes: file === 'init-1.mp4' ? initBytes : readFileSync(join(dir, file)), type: 'video/mp4' });
   return ref;
 }
 
@@ -258,12 +265,14 @@ function publishNext() {
   // The recording loops: a writer restart, a new init segment behind a
   // discontinuity. A new broadcast opens with one too.
   const loop = seq > 0 && seq % records.length === 0;
+  // A writer restart inside the recording (another init segment).
+  const restart = seq > 0 && !loop && rec.init !== records[(seq - 1) % records.length].init;
   const fresh = seq === 0 && (broadcast > 0 || preUpdates > 0);
-  if (seq === 0 || loop) mapRef = newInit(seq);
+  if (seq === 0 || loop || restart) mapRef = newInit(seq, rec.init);
   const ref = refOf(`${broadcast}-${seq}`);
   const gap = gapEvery > 0 && seq > 0 && seq % gapEvery === 0;
   if (!gap) blobs.set(ref, { bytes: readFileSync(join(dir, rec.file)), type: 'video/iso.segment' });
-  published.push({ seq: mediaSeq, ref, ms: rec.ms, discontinuity: loop || fresh, map: mapRef, gap });
+  published.push({ seq: mediaSeq, ref, ms: rec.ms, discontinuity: loop || restart || fresh, map: mapRef, gap });
   seq += 1;
   mediaSeq += 1;
   writeUpdate(livePlaylist(false));

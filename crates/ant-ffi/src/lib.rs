@@ -4311,6 +4311,47 @@ pub unsafe extern "C" fn ant_publisher_set_info(
     }
 }
 
+/// The running broadcast's frame changed size (issue #228): the phone was
+/// turned while live, and the host's capture restarted its writer at
+/// `width` x `height` (a portrait 360x640 turned into a landscape
+/// 640x360, say). Everything the broadcast writes from now on names the
+/// new size: the catalog entry's rung (rewritten at once), the ladder's
+/// master playlist `RESOLUTION` (rewritten at the next commit) and the
+/// recovery entry, so a resume continues in it. Call it before pushing
+/// the new writer's initialization segment: the segments themselves need
+/// nothing from it, since that segment is its own `#EXT-X-MAP` behind an
+/// `#EXT-X-DISCONTINUITY`, in push order like every segment. The size
+/// the run started with is `width`/`height` in the start config. Only
+/// the iOS app turns a live broadcast today; Android's binding doesn't
+/// expose it. Non-blocking.
+///
+/// Returns `0`, or `-1` with an error (no broadcast, either side `0`).
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_publisher_set_rendition(
+    handle: *const AntHandle,
+    width: u32,
+    height: u32,
+    out_err: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        let mut refused = None;
+        let code = publisher_call(handle, out_err, "ant_publisher_set_rendition", |run| {
+            refused = run.set_rendition(width, height).err();
+        });
+        if let Some(message) = refused {
+            write_out_err(out_err, &format!("ant_publisher_set_rendition: {message}"));
+            return -1;
+        }
+        code
+    }
+}
+
 /// Announce an upcoming broadcast (issue #220): write the channel's
 /// `scheduled` catalog entry, with its title, description, thumbnail and
 /// `scheduledStartTime`, as the next update of the account's catalog feed
