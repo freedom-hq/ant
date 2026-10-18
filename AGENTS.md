@@ -98,7 +98,7 @@
 ## Driving the iOS Drive app on the simulator (idb + log capture)
 
 The example app lives in `examples/ios-drive` (bundle id
-`at.vibing.ant.drive`). The booted simulator we use is UDID
+`baby.freedom.antdrive`). The booted simulator we use is UDID
 `FCDD32E4-137A-45C4-9C7D-BB89340DF6EA` (confirm with `xcrun simctl list
 devices booted` — it can change).
 
@@ -108,7 +108,7 @@ cd examples/ios-drive
 xcodebuild -project AntDrive.xcodeproj -scheme AntDrive -configuration Debug \
   -destination 'platform=iOS Simulator,id=<UDID>' -derivedDataPath build build
 APP=build/Build/Products/Debug-iphonesimulator/AntDrive.app
-xcrun simctl install <UDID> "$APP" && xcrun simctl launch <UDID> at.vibing.ant.drive
+xcrun simctl install <UDID> "$APP" && xcrun simctl launch <UDID> baby.freedom.antdrive
 ```
 The Xcode build phase recompiles the `ant-ffi` Rust slice, so a plain
 `xcodebuild` picks up workspace crate changes.
@@ -118,9 +118,9 @@ The Xcode build phase recompiles the `ant-ffi` Rust slice, so a plain
 (`log stream` / `log show` won't see it). To read logs, relaunch with a
 console attached:
 ```bash
-xcrun simctl terminate <UDID> at.vibing.ant.drive
+xcrun simctl terminate <UDID> baby.freedom.antdrive
 nohup xcrun simctl launch --console-pty --terminate-running-process <UDID> \
-  at.vibing.ant.drive > /tmp/app_console.txt 2>&1 &
+  baby.freedom.antdrive > /tmp/app_console.txt 2>&1 &
 # then: grep -niE "upload completed|post-upload heal" /tmp/app_console.txt
 ```
 Relaunching restarts the embedded node, so wait ~20 s for the bzz

@@ -62,5 +62,18 @@
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
+    <!--
+        iPad multitasking needs all four orientations, or App Store
+        Connect rejects the upload. iPhone stays portrait only.
+    -->
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
 </dict>
 </plist>
