@@ -195,6 +195,26 @@ archives the app, signs it with Xcode's cloud-managed signing and
 uploads it to App Store Connect on every release tag (`v*`), or by hand
 from the Actions tab. Builds are numbered `0.1.<run>` / `<run>`.
 
+After the upload, the job waits for Apple to process the build (up to
+45 minutes) and attaches it to the app's editable iOS App Store version
+("Prepare for Submission", one rejected back to you, or Invalid
+Binary), the same as
+"Add Build" in App Store Connect; the app's icon there comes from that
+build. It never submits anything for review. If no version is editable
+(one is in review), the build is left unattached and the job says so in
+a notice. AntDrive's workflow does the same through the shared
+[`.github/scripts/asc-attach-build.py`](../../.github/scripts/asc-attach-build.py)
+(standard library plus the system `openssl`, nothing installed from
+PyPI; offline tests: `python3 .github/scripts/test_asc_attach_build.py`).
+The attach runs as its own job after the upload. Attach jobs of
+overlapping runs are queued, and when several are pending only the
+newest one runs; the script also leaves the version alone if it already
+has a newer build, so an older build never overwrites a newer one.
+Uploads are never queued, so every tag still gets its own TestFlight
+build. A failed attach (revoked key, build `INVALID`, processing timeout,
+refused PATCH) fails the attach job; the uploaded build stays in
+TestFlight either way.
+
 One-time setup:
 
 1. In App Store Connect, create the app record for
