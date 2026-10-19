@@ -195,6 +195,16 @@ archives the app, signs it with Xcode's cloud-managed signing and
 uploads it to App Store Connect on every release tag (`v*`), or by hand
 from the Actions tab. Builds are numbered `0.1.<run>` / `<run>`.
 
+The archive is built unsigned by the shared
+[`.github/scripts/ios-archive.py`](../../.github/scripts/ios-archive.py)
+(offline tests: `python3 .github/scripts/test_ios_archive.py`), and only
+the export signs it, with the cloud-managed Apple Distribution
+certificate. Archiving with Automatic signing made Xcode create a new
+"Apple Development: Created via API" certificate on every fresh runner
+until the team's certificate cap was full (issue #230). If the app gains
+an entitlements file (`CODE_SIGN_ENTITLEMENTS`), the script re-applies
+it to the archived app with an ad-hoc signature so the export keeps it.
+
 After the upload, the job waits for Apple to process the build (up to
 45 minutes) and attaches it to the app's editable iOS App Store version
 ("Prepare for Submission", one rejected back to you, or Invalid

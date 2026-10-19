@@ -6,6 +6,17 @@
 # Connect, where it shows up in TestFlight once Apple has processed it
 # (usually 10-30 minutes).
 #
+# Signing: the archive is built unsigned (CODE_SIGNING_ALLOWED=NO) by
+# .github/scripts/ios-archive.py, shared with the other app's TestFlight
+# workflow, and only the export signs it, with the cloud-managed Apple
+# Distribution certificate. Archiving with the project's Automatic
+# signing instead made Xcode create a new "Apple Development: Created
+# via API" certificate on every fresh runner, which filled the team's
+# development-certificate cap after a few releases (issue #230). An
+# unsigned archive loses the target's entitlements, so the script
+# re-applies its CODE_SIGN_ENTITLEMENTS file to the archived app with an
+# ad-hoc signature, which the export keeps.
+#
 # The job then waits for that processing (up to 45 minutes) and attaches
 # the build to the app's editable iOS App Store version ("Prepare for
 # Submission", or a rejected one), the step App Store Connect's web UI
@@ -112,20 +123,17 @@ jobs:
           chmod 600 "$KEY"
           echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
 
-      - name: Archive
+      - name: Archive (unsigned)
         if: steps.creds.outputs.ok == 'true'
         working-directory: examples/ios-drive
+        # No -allowProvisioningUpdates and no API key: nothing here may
+        # ask Apple for a certificate. See the header.
         run: |
-          xcodebuild archive \
-            -project AntDrive.xcodeproj -scheme AntDrive -configuration Release \
-            -destination "generic/platform=iOS" \
-            -archivePath "$RUNNER_TEMP/AntDrive.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            MARKETING_VERSION="0.1.${{ github.run_number }}" \
-            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
+          python3 ../../.github/scripts/ios-archive.py \
+            --project AntDrive.xcodeproj --scheme AntDrive \
+            --archive-path "$RUNNER_TEMP/AntDrive.xcarchive" \
+            --version "0.1.${{ github.run_number }}" \
+            --build "${{ github.run_number }}"
 
       - name: Export and upload to App Store Connect
         id: upload
