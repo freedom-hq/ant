@@ -308,15 +308,20 @@ The live screen's interface turns with the device (the rest of the app
 stays portrait on a phone; an `AppDelegate` orientation lock widens it
 while the screen is open), and its controls re-lay out for landscape.
 The broadcast's orientation is picked by holding the phone: portrait
-(360×640, …) or landscape (640×360, …), following the phone until Go
-live and then fixed for the whole broadcast. It follows the camera's
-picture (the device as physically held), not the interface, so it is the
-same with Portrait Orientation Lock on or in a narrow iPad window.
-Either way the frames are encoded upright at that size with no track
-rotation (#194), so no player has to turn or unsqueeze them. Turning the
-phone after that keeps the picture upright, with black bars inside the
-fixed frame. A resumed broadcast (#175) keeps the orientation
-it went out in (one before this choice existed was landscape).
+(360×640, …) or landscape (640×360, …), following the phone before Go
+live and while live (#228). It follows the camera's picture (the device
+as physically held), not the interface, so it is the same with Portrait
+Orientation Lock on or in a narrow iPad window. Either way the frames
+are encoded upright at that size with no track rotation (#194), so no
+player has to turn or unsqueeze them. Turned while live, the broadcast
+switches once the new orientation has held for a second (a brief tilt
+changes nothing, face up or down never does): the writer restarts once
+at the new size, so viewers get a new `#EXT-X-MAP` behind an
+`#EXT-X-DISCONTINUITY`, and `ant_publisher_set_rendition` tells the
+node the new size for the catalog entry, the master playlist and the
+recovery entry. A resumed broadcast (#175) starts in the orientation it
+last had (one before this choice existed was landscape), then follows
+the phone too.
 
 Interruptions (incoming call, backgrounding, camera flip, orientation,
 thermal downshift) finish the current segment cleanly and start a fresh

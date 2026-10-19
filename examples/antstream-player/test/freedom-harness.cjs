@@ -31,6 +31,11 @@
 // reports (`switchWaiting.ok`) that none of the old channel's waiting
 // reads was sent.
 //
+// SAMPLE_MS=<n> reads, every n ms while it waits, the picture's reported
+// size and the stage's box (`state.samples`), for a stream whose frame
+// changes shape mid-stream (test/turn-test.mjs, #228); SAMPLE_SHOTS=<dir>
+// also captures the page 1.5 s after each change of reported size.
+//
 // CHANNEL=<owner>/<topic> picks the channel (the fake gateway's by
 // default), URL= any other page (e.g. the fake gateway's own HTTP page).
 // Prints the player's state as JSON and writes a screenshot to OUT.
@@ -241,7 +246,43 @@ app.whenReady().then(async () => {
       s.since = Date.now();
     });
   })()`);
-  await new Promise((r) => setTimeout(r, WAIT_S * 1000));
+  const samples = [];
+  if (process.env.SAMPLE_MS) {
+    const every = Number(process.env.SAMPLE_MS);
+    const end = Date.now() + WAIT_S * 1000;
+    let lastSize = null;
+    let shot = null;
+    let shots = 0;
+    while (Date.now() < end) {
+      const sample = await win.webContents.executeJavaScript(`(() => {
+        const v = document.getElementById('video');
+        const w = document.querySelector('.video-wrap').getBoundingClientRect();
+        const r = v.getBoundingClientRect();
+        return {
+          t: Date.now(), currentTime: v.currentTime,
+          videoWidth: v.videoWidth, videoHeight: v.videoHeight,
+          wrap: { width: w.width, height: w.height },
+          video: { width: r.width, height: r.height },
+          viewport: { width: innerWidth, height: innerHeight },
+        };
+      })()`);
+      samples.push(sample);
+      const size = sample.videoWidth ? `${sample.videoWidth}x${sample.videoHeight}` : null;
+      if (size && size !== lastSize) {
+        lastSize = size;
+        shots += 1;
+        if (process.env.SAMPLE_SHOTS) shot = { at: Date.now() + 1500, name: `shape-${shots}-${size}.png` };
+      }
+      if (shot && Date.now() >= shot.at) {
+        const img = await win.webContents.capturePage();
+        fs.writeFileSync(path.join(process.env.SAMPLE_SHOTS, shot.name), img.toPNG());
+        shot = null;
+      }
+      await new Promise((r) => setTimeout(r, every));
+    }
+  } else {
+    await new Promise((r) => setTimeout(r, WAIT_S * 1000));
+  }
 
   const state = await win.webContents.executeJavaScript(`(() => {
     const v = document.getElementById('video');
@@ -273,6 +314,7 @@ app.whenReady().then(async () => {
       }),
     };
   })()`);
+  if (samples.length) state.samples = samples;
   if (process.env.PROBE_SLOT) {
     // One slot read by hand through the player's own reader (in Freedom:
     // `swarm_readSingleOwnerChunk`, joining a body longer than one chunk).

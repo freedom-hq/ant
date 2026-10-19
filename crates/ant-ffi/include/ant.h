@@ -1490,7 +1490,7 @@ char *ant_publisher_capacity(const char *config_json,
  *     "notes":           "iPhone 15 Pro / LTE",
  *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default)
  *     "ladder":          true,                       // master playlist + ladder time markers; false (default)
- *     "width":           640,                        // the master's RESOLUTION, left out unless both set
+ *     "width":           640,                        // the starting size (catalog rung, master RESOLUTION); ant_publisher_set_rendition changes it
  *     "height":          360,
  *     "recovery_path":   "<app support>/antstream/broadcast-recovery.json", // crash recovery; "" = none (default)
  *     "resume":          false,                      // continue the broadcast saved there; see below
@@ -1838,6 +1838,25 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
 int ant_publisher_set_info(const AntHandle *handle,
                            const char *info_json,
                            char **out_err);
+
+/*
+ * The running broadcast's frame changed size (issue #228): the phone was
+ * turned while live and the capture restarted its writer at width x
+ * height (a portrait 360x640 turned into a landscape 640x360, say).
+ * Everything written from now on names the new size: the catalog
+ * entry's rung (rewritten at once), the ladder master playlist's
+ * RESOLUTION (rewritten at the next commit) and the recovery entry, so a
+ * resume continues in it. Call it before pushing the new writer's
+ * initialization segment; the segments need nothing from it (that init
+ * segment is its own EXT-X-MAP behind an EXT-X-DISCONTINUITY, in push
+ * order). The starting size is "width"/"height" in the start config.
+ * Only the iOS app calls it today. Non-blocking. Returns 0, or -1 with
+ * an allocated message in *out_err (no broadcast, either side 0).
+ */
+int ant_publisher_set_rendition(const AntHandle *handle,
+                                uint32_t width,
+                                uint32_t height,
+                                char **out_err);
 
 /*
  * Announce an upcoming broadcast (issue #220): write the channel's

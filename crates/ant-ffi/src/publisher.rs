@@ -444,7 +444,9 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub ladder: bool,
     /// Rendition size, for the master playlist's `RESOLUTION`. Left out
-    /// of it unless both are set.
+    /// of it unless both are set. The size the run starts with: a
+    /// broadcast whose frame changes shape while live (the phone turned,
+    /// issue #228) reports each new size with [`LiveRun::set_rendition`].
     #[serde(default)]
     pub width: u32,
     #[serde(default)]
@@ -1452,10 +1454,19 @@ struct PublisherState {
     /// media.
     reaped: bool,
 
+    /// The rendition's size now, width by height: the master playlist's
+    /// `RESOLUTION`, the catalog entry's rung and the recovery entry's.
+    /// [`PublisherConfig::width`]/`height` at go-live, then whatever
+    /// [`LiveRun::set_rendition`] last set (issue #228). `(0, 0)` when
+    /// unknown.
+    rendition: (u32, u32),
     /// The listed segments' measured bitrate, for the master playlist.
     bitrate: BitrateMeter,
     /// `BANDWIDTH` of the last master that landed this run.
     master_advertised_bps: Option<u64>,
+    /// `RESOLUTION` of the last master that landed this run: one that no
+    /// longer matches [`PublisherState::rendition`] is rewritten.
+    master_advertised_size: Option<(u32, u32)>,
     /// The group feed's next index, once its head was read.
     master_next_index: Option<u64>,
     /// No master write is started before this: the last one failed.
@@ -2335,8 +2346,8 @@ impl PublisherState {
             predecessor: self.predecessor.clone(),
             shape,
             info: self.info.clone(),
-            width: run.width,
-            height: run.height,
+            width: self.rendition.0,
+            height: self.rendition.1,
             recorded: false,
             broadcast_saved_ms: Some(broadcast_saved_ms),
         }
@@ -2406,8 +2417,6 @@ struct RunIdentity<'a> {
     topic_text: &'a str,
     format: StreamFormat,
     segment_ms: u32,
-    width: u32,
-    height: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -3241,6 +3250,35 @@ impl LiveRun {
         Ok(())
     }
 
+    /// The rendition's frame changed size (issue #228): the phone was
+    /// turned while live and the host's capture restarted its writer at
+    /// `width` x `height`. Everything written from now on names the new
+    /// size: the catalog entry's rung (rewritten at once while live), the
+    /// master playlist's `RESOLUTION` (rewritten by the next commit, when
+    /// the run writes one) and the recovery entry, so a resume continues
+    /// in it. The media itself needs nothing from this: the new writer's
+    /// initialization segment, pushed after this call, is its own
+    /// `#EXT-X-MAP` behind an `#EXT-X-DISCONTINUITY`, in push order like
+    /// every other segment. Refused when either side is 0. Same size
+    /// again: nothing to do.
+    pub fn set_rendition(&self, width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Err(format!("{width}x{height} is not a frame size"));
+        }
+        {
+            let mut state = lock(&self.state);
+            if state.rendition == (width, height) {
+                return Ok(());
+            }
+            state.rendition = (width, height);
+            // The rung changed: the live entry goes out now, not at the
+            // next refresh.
+            state.catalog_info_changed = true;
+        }
+        self.catalog_notify.notify_one();
+        Ok(())
+    }
+
     /// Ask the loop to stop. Cooperative: already-captured segments are
     /// drained (the last seconds of a broadcast are worth publishing),
     /// the live playlist is closed with `#EXT-X-ENDLIST`, and the whole
@@ -3469,6 +3507,7 @@ pub fn start_with_wall_offset(
     };
     let mut state = state;
     state.info.clone_from(&config.info);
+    state.rendition = (config.width, config.height);
     let state = Arc::new(Mutex::new(state));
     let cancel = Arc::new(AtomicBool::new(finalize_only));
     let push_notify = Arc::new(Notify::new());
@@ -3657,8 +3696,6 @@ impl RunCtx {
             topic_text: &self.topic_text,
             format: self.config.format,
             segment_ms: self.config.segment_ms,
-            width: self.config.width,
-            height: self.config.height,
         }
     }
 
@@ -3707,9 +3744,15 @@ impl RunCtx {
             let Some((peak, _)) = state.bitrate.measured() else {
                 return;
             };
-            if state
-                .master_advertised_bps
-                .is_some_and(|ad| peak * 4 <= ad * 5)
+            // A frame that changed shape (issue #228) is rewritten
+            // whatever the bitrate did.
+            let resized = state
+                .master_advertised_size
+                .is_some_and(|size| size != state.rendition);
+            if !resized
+                && state
+                    .master_advertised_bps
+                    .is_some_and(|ad| peak * 4 <= ad * 5)
             {
                 return;
             }
@@ -5009,12 +5052,13 @@ fn live_entry(ctx: &RunCtx, state: &PublisherState) -> Option<CatalogEntry> {
     ))
 }
 
-/// The entry's rung: the configured size and the measured bitrate (peak,
-/// average), the encoder's target until three segments are measured.
+/// The entry's rung: the rendition's current size (issue #228) and the
+/// measured bitrate (peak, average), the encoder's target until three
+/// segments are measured.
 fn rung_of(ctx: &RunCtx, state: &PublisherState) -> (u32, u32, u64, u64) {
     let target = u64::from(ctx.config.bitrate_kbps) * 1000;
     let (peak, average) = state.bitrate.measured().unwrap_or((target, target));
-    (ctx.config.width, ctx.config.height, peak, average)
+    (state.rendition.0, state.rendition.1, peak, average)
 }
 
 /// Write `entry` as the catalog feed's next update. Refused once the feed
@@ -5318,21 +5362,16 @@ async fn write_marker(
 /// never overwritten, and a failed read writes nothing.
 async fn publish_master(ctx: &RunCtx) {
     let outcome = async {
-        let (body, peak) = {
+        let (body, peak, size) = {
             let state = lock(&ctx.state);
             let (peak, average) = state
                 .bitrate
                 .measured()
                 .ok_or("the bitrate is not measured yet")?;
-            let body = render_master_playlist(
-                &ctx.owner,
-                &ctx.topic_text,
-                peak,
-                average,
-                ctx.config.width,
-                ctx.config.height,
-            );
-            (body, peak)
+            let (width, height) = state.rendition;
+            let body =
+                render_master_playlist(&ctx.owner, &ctx.topic_text, peak, average, width, height);
+            (body, peak, (width, height))
         };
         let group = ctx.group_topic();
         let known = lock(&ctx.state).master_next_index;
@@ -5342,14 +5381,15 @@ async fn publish_master(ctx: &RunCtx) {
         };
         let (reference, root) = upload_v2_payload(ctx, &body, &[]).await?;
         publish_soc(ctx, ant_retrieval::sequence_update_id(&group, index), &root).await?;
-        Ok::<_, String>((index, peak, reference))
+        Ok::<_, String>((index, peak, size, reference))
     }
     .await;
     let mut state = lock(&ctx.state);
     match outcome {
-        Ok((index, peak, reference)) => {
+        Ok((index, peak, size, reference)) => {
             state.master_next_index = Some(index + 1);
             state.master_advertised_bps = Some(peak);
+            state.master_advertised_size = Some(size);
             state.master_reference = Some(reference);
             state.master_retry_at = None;
         }
@@ -8980,6 +9020,58 @@ mod tests {
         );
     }
 
+    /// Issue #228: a broadcast turned while live rewrites its master with
+    /// the new `RESOLUTION` at the next commit, whatever the bitrate did
+    /// (here it barely moves, which alone would rewrite nothing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turned_broadcast_rewrites_its_master_resolution() {
+        const TEXT: &str = "antstream-ladder-turned";
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        config.topic = String::new();
+        config.topic_text = TEXT.into();
+        config.ladder = true;
+        config.width = 360;
+        config.height = 640;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        for i in 0..3u8 {
+            let _ = run.push(SegmentKind::Media, vec![i; 40_000], 2000, false);
+        }
+        wait_for(&run, "the first master", |s| !s.master_reference.is_empty()).await;
+        let first = run.snapshot().master_reference;
+
+        run.set_rendition(640, 360).unwrap();
+        let _ = run.push(SegmentKind::Init, vec![8u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![9u8; 40_000], 2000, true);
+        wait_for(&run, "the turned master", |s| {
+            !s.master_reference.is_empty() && s.master_reference != first
+        })
+        .await;
+        run.cancel();
+        settle(&run).await;
+
+        let masters: Vec<String> = lock(&log)
+            .seen
+            .iter()
+            .filter(|r| r.method_path.ends_with("/bytes"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|text| text.contains("#EXT-X-STREAM-INF:"))
+            .collect();
+        assert_eq!(masters.len(), 2, "{masters:?}");
+        assert!(masters[0].contains(",RESOLUTION=360x640"), "{}", masters[0]);
+        assert!(masters[1].contains(",RESOLUTION=640x360"), "{}", masters[1]);
+    }
+
     /// A ladder write that fails is a shortcut lost, not a broadcast
     /// failure: it counts in `ladder_failures`/`ladder_error` and never
     /// in `errors`/`last_error`/`error_count`, which a host shows as the
@@ -10604,6 +10696,29 @@ mod tests {
         state
     }
 
+    /// Issue #228: the recovery entry saves the rendition's size as it
+    /// is now, so a resume continues in the shape the broadcast last
+    /// had, not the one it went live in.
+    #[test]
+    fn a_recovery_entry_keeps_the_turned_size() {
+        let mut saved = broadcast_to_save();
+        saved.rendition = (360, 640);
+        let (owner, topic) = test_identity();
+        let identity = RunIdentity {
+            channel: "test channel",
+            owner: &owner,
+            topic: &topic,
+            topic_text: "",
+            format: StreamFormat::Bzz,
+            segment_ms: 2000,
+        };
+        let entry = saved.recovery_entry(&identity, 9, PlaylistShape::Live);
+        assert_eq!((entry.width, entry.height), (360, 640));
+        saved.rendition = (640, 360);
+        let entry = saved.recovery_entry(&identity, 10, PlaylistShape::Live);
+        assert_eq!((entry.width, entry.height), (640, 360));
+    }
+
     /// Issue #175: what a recovery entry holds comes back as the same
     /// broadcast. The resumed state renders the very live window and
     /// recording the saved one did, then carries on as one broadcast:
@@ -10622,8 +10737,6 @@ mod tests {
             topic_text: "",
             format: StreamFormat::Bzz,
             segment_ms: 2000,
-            width: 0,
-            height: 0,
         };
         let entry = saved.recovery_entry(&identity, 9, PlaylistShape::Live);
         assert_eq!(entry.feed_index, 9);
@@ -10720,8 +10833,6 @@ mod tests {
             topic_text: "",
             format: StreamFormat::Bzz,
             segment_ms: 2000,
-            width: 0,
-            height: 0,
         };
         let mut entry = saved.recovery_entry(&identity, 0, PlaylistShape::Live);
         // The last listed segment, seq 6, ended at go-live + 14 s.
@@ -11398,6 +11509,98 @@ mod tests {
         assert_eq!(entries[2]["duration"], 3.5);
         assert_eq!(entries[2]["renditions"][0]["index"], recording_index);
         assert_eq!(entries[2]["renditions"][0]["duration"], 3.5);
+    }
+
+    /// Issue #228: the phone turned while live. The host's capture
+    /// restarts its writer at the new size, reports it with
+    /// [`LiveRun::set_rendition`] and pushes the new writer's init segment
+    /// behind a discontinuity. The live catalog entry is rewritten with
+    /// the new rung at once (not at the next refresh), the closing `vod`
+    /// entry names it too, and the playlist lists the turned writer's
+    /// segments under its own `#EXT-X-MAP`, behind an
+    /// `#EXT-X-DISCONTINUITY`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turned_broadcast_names_its_new_size_in_the_catalog() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = catalog_run(&addr, Some(morning_walk()));
+        let _ = run.push(SegmentKind::Init, vec![7u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![1u8; 4096], 2000, false);
+        wait_for(&run, "the live entry", |s| s.catalog_writes == 1).await;
+
+        // Turned to landscape: the portrait 480x640 becomes 640x480.
+        run.set_rendition(640, 480).unwrap();
+        wait_for(&run, "the turned entry", |s| s.catalog_writes == 2).await;
+        // The same size again writes nothing more.
+        run.set_rendition(640, 480).unwrap();
+        let _ = run.push(SegmentKind::Init, vec![8u8; 800], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![2u8; 4096], 2000, true);
+        wait_for(&run, "the turned writer's segment listed", |s| {
+            s.segments_listed == 2
+        })
+        .await;
+        assert_eq!(run.snapshot().catalog_writes, 2);
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert_eq!(report.catalog_writes, 3, "{report:?}");
+        assert_eq!(report.catalog_failures, 0, "{report:?}");
+
+        let payloads = catalog_payloads(&log);
+        let sizes: Vec<(String, u64, u64)> = payloads
+            .iter()
+            .map(|p| {
+                let rung = &p[0]["renditions"][0];
+                (
+                    p[0]["state"].as_str().unwrap().to_string(),
+                    rung["width"].as_u64().unwrap(),
+                    rung["height"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![
+                ("live".to_string(), 480, 640),
+                ("live".to_string(), 640, 480),
+                ("vod".to_string(), 640, 480),
+            ]
+        );
+        assert_eq!(payloads[1][0]["renditions"][0]["name"], "480p");
+
+        // The live window that lists both writers: two maps, the turned
+        // writer's behind the break.
+        let seen = lock(&log).seen.clone();
+        let window = seen
+            .iter()
+            .filter(|r| r.method_path.ends_with("/bytes") && r.body.starts_with(b"#EXTM3U"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|text| {
+                !text.contains("#EXT-X-ENDLIST") && text.matches("#EXT-X-MAP:").count() == 2
+            })
+            .expect("a live window listing both writers");
+        let maps: Vec<usize> = window
+            .match_indices("#EXT-X-MAP:")
+            .map(|(i, _)| i)
+            .collect();
+        let discontinuity = window.find("#EXT-X-DISCONTINUITY\n").expect(&window);
+        assert!(
+            maps[0] < discontinuity && discontinuity < maps[1],
+            "{window}"
+        );
+    }
+
+    /// Issue #228: a refused size changes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rendition_without_a_size_is_refused() {
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::from_millis(2)).await;
+        let run = catalog_run(&addr, None);
+        assert!(run.set_rendition(0, 480).is_err());
+        assert!(run.set_rendition(640, 0).is_err());
+        assert_eq!(lock(&run.state).rendition, (480, 640));
+        run.cancel();
+        settle(&run).await;
     }
 
     /// A catalog feed that already holds entries is continued after its

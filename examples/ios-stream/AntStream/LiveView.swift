@@ -19,8 +19,9 @@ import UIKit
 /// live; the preview is drawn in the broadcast's own frame. The interface
 /// turns with the device (``OrientationLock``) and the controls re-lay
 /// out for landscape; the broadcast's orientation follows the camera's
-/// picture (the device as held, even with rotation lock on) until Go live
-/// and then stays as it was for the whole broadcast.
+/// picture (the device as held, even with rotation lock on), before Go
+/// live and while live (#228): turned for a second, the broadcast turns
+/// with it.
 struct LiveView: View {
     @EnvironmentObject var node: AntNode
     @StateObject private var broadcast = LiveBroadcast()
@@ -267,14 +268,18 @@ struct LiveView: View {
     /// angle as its connection actually has it, and the capture angle
     /// beside it. Only a reading for this session *and* this camera
     /// counts, so a flip can't pair one camera's preview with another's
-    /// capture. Before Go live the broadcast's shape is still
-    /// ``CaptureEngine``'s own reading, from its own coordinator on its
-    /// own queue, so it isn't mixed in at all: the frame is the shape the
-    /// preview's connection shows the picture in. Once pinned (live, or a
-    /// resume's shape), the capture angle is this coordinator's
-    /// horizon-level one, the angle the engine applies too (the video
-    /// data output supports all four), not read back from the engine's
-    /// connection. The decision itself is ``PreviewGeometry/frameTall``.
+    /// capture. The broadcast's shape follows the picture, before Go live
+    /// and while live (#228), and is ``CaptureEngine``'s own reading, from
+    /// its own coordinator on its own queue, so it isn't mixed in at all:
+    /// the frame is the shape the preview's connection shows the picture
+    /// in, which under Portrait Orientation Lock is the shape the
+    /// broadcast takes from the device as held. (Live, a turn reaches
+    /// viewers ``CaptureEngine/orientationHold`` after the frame here
+    /// turned.) Only a resume's shape, before Go live, is pinned: the
+    /// capture angle is then this coordinator's horizon-level one, the
+    /// angle the engine applies too (the video data output supports all
+    /// four), not read back from the engine's connection. The decision
+    /// itself is ``PreviewGeometry/frameTall``.
     private var previewFrameTall: Bool {
         guard let session = broadcast.engine?.previewSession,
               let camera = broadcast.previewCamera,
@@ -284,7 +289,7 @@ struct LiveView: View {
         else { return broadcast.portrait }
         return PreviewGeometry.frameTall(
             broadcastPortrait: broadcast.portrait,
-            pinned: broadcast.state.isActive || broadcast.resumePortrait != nil,
+            pinned: !broadcast.state.isActive && broadcast.resumePortrait != nil,
             previewAngle: reading.rotation.previewAngle,
             captureAngle: reading.rotation.captureAngle
         )
@@ -453,22 +458,6 @@ struct LiveView: View {
                     Label(message, systemImage: "video.slash")
                         .font(.footnote)
                         .foregroundStyle(.orange)
-                }
-                if broadcast.state.isActive || broadcast.resumePortrait != nil,
-                   broadcast.engine?.previewSession != nil,
-                   broadcast.portrait != broadcast.picturePortrait {
-                    // The camera's picture is turned away from the
-                    // broadcast's fixed frame (#193): it went live the
-                    // other way, or the broadcast being resumed did.
-                    Label("\(broadcast.state.isActive ? "Broadcasting" : "Resuming") in "
-                          + "\(orientationName) as \(broadcast.state.isActive ? "you went live" : "it went out"): "
-                          + "turned this way the picture goes out with black bars. "
-                          + "Turn the phone to \(orientationName) to fill the frame.",
-                          systemImage: broadcast.portrait
-                              ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate")
-                        .font(.footnote)
-                        .foregroundStyle(.yellow)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let progress = broadcast.progress, progress.paused == true,
                    broadcast.state.isActive {
@@ -698,13 +687,14 @@ struct LiveView: View {
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
-            // The orientation is picked by holding the phone (#193); a
-            // resume keeps the one its broadcast went out in.
+            // The orientation is picked by holding the phone (#193), and
+            // follows it while live (#228); a resume starts in the one its
+            // broadcast last had.
             Label(broadcast.resumePortrait != nil
-                  ? "\(orientationName.capitalized) broadcast, as it went out before. "
-                    + "Resuming keeps it \(orientationName)."
+                  ? "\(orientationName.capitalized) broadcast, as it was when it stopped. "
+                    + "Resuming starts \(orientationName), then follows the phone."
                   : "\(orientationName.capitalized) broadcast, as the phone is held. "
-                    + "Turn it to switch; it stays \(orientationName) once you go live.",
+                    + "Turn it to switch, also while live.",
                   systemImage: broadcast.portrait ? "rectangle.portrait" : "rectangle")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
@@ -908,10 +898,9 @@ struct LiveView: View {
 /// `AVCaptureVideoPreviewLayer` as a SwiftUI view.
 ///
 /// Shown inside the broadcast's frame, aspect-fit, so the picture is
-/// what viewers get: the whole frame, with the black bars a phone turned
-/// away from the broadcast's orientation puts in (#193). The picture is
-/// kept upright whichever way the interface faces, by the camera's own
-/// rotation coordinator.
+/// what viewers get: the whole frame (#193). The picture is kept upright
+/// whichever way the interface faces, by the camera's own rotation
+/// coordinator.
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     /// The camera the session captures from; `nil` until it is set up.
@@ -1022,9 +1011,9 @@ struct CameraPreview: UIViewRepresentable {
             applyRotation()
             // Both angles: under Portrait Orientation Lock the preview
             // angle stays put and only the capture angle moves. That
-            // turns the frame only once its shape is pinned (live, or a
-            // resume); before Go live `PreviewGeometry.frameTall` uses the
-            // preview angle alone, so a capture-only change re-reports a
+            // turns the frame only while its shape is pinned (a resume,
+            // before Go live); otherwise `PreviewGeometry.frameTall` uses
+            // the preview angle alone, so a capture-only change re-reports a
             // reading that leaves the frame as it is. `applyRotation` reads
             // the *current* coordinator, so a late change from one a flip
             // already replaced only re-reports the new camera.

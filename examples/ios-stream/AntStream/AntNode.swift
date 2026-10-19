@@ -774,7 +774,7 @@ final class AntNode: ObservableObject {
         // stop.
         let config = feed.publisherConfig(
             channel: channel,
-            gateway: "http://\(gatewayAddress)",
+            gateway: Self.publisherGatewayOverride ?? "http://\(gatewayAddress)",
             batchId: batchId,
             bitrateKbps: bitrateKbps,
             segmentMs: segmentMs,
@@ -1228,6 +1228,35 @@ final class AntNode: ObservableObject {
             return 600_000
         }
         return broadcastReapMs
+    }
+
+    /// `-antstreamShotPublisherGateway <url>`: `antstream-visual`'s turn
+    /// check (#228) publishes to a recording stand-in on the runner
+    /// (`ci/record-gateway.py`) instead of the in-process gateway, which
+    /// refuses the sample batch, so the playlists the publisher writes can
+    /// be read back. Only with `-antstream-shot-live`.
+    private static var publisherGatewayOverride: String? {
+        guard RootView.shotArgs.contains("-antstream-shot-live") else { return nil }
+        return UserDefaults.standard.string(forKey: "antstreamShotPublisherGateway")
+    }
+
+    /// The running broadcast turned (#228): its frame is now `width` x
+    /// `height` (`ant_publisher_set_rendition`), for the catalog rung, the
+    /// master's `RESOLUTION` and the recovery entry. Called in segment
+    /// order, before the turned writer's first segment is pushed.
+    /// Non-blocking node-side; a failure only leaves that metadata on the
+    /// old size, so it is logged, not surfaced.
+    func setPublisherRendition(width: Int, height: Int) async {
+        guard let w = UInt32(exactly: width), let h32 = UInt32(exactly: height) else { return }
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_publisher_set_rendition(h, w, h32, &errPtr) != 0, let errPtr {
+                    NSLog("AntStream: %@", String(cString: errPtr))
+                    ant_free_string(errPtr)
+                }
+            }.value
+        }
     }
 
     /// The network went: pause the running broadcast (`ant_publisher_pause`)

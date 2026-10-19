@@ -467,6 +467,41 @@ jobs:
           INIT=$(ls "$SEGS"/init-*.mp4 | sort -V | head -1)
           python3 ci/mp4-geometry.py --expect landscape "$INIT" | tee shots/landscape/geometry.txt
 
+      # --- Turned while live (#228) ---
+      # A broadcast follows the phone while live: turned to landscape, it
+      # switches from 9:16 to 16:9 in one writer restart. The test pattern
+      # goes live in portrait (`-antstream-shot-portrait`) and
+      # `-antstream-shot-turn` turns its picture to landscape 16 s in, as
+      # a phone turned while live; the switch follows once it has held a
+      # second. The runner's sample batch is refused by the in-process
+      # gateway, so the publisher posts to `ci/record-gateway.py`
+      # (`-antstreamShotPublisherGateway`), which keeps every playlist it
+      # writes. `ci/check-turn.py` then wants exactly two init segments in
+      # the app's segment ring, portrait then landscape (`mp4-geometry.py`),
+      # and a playlist listing both under their own `#EXT-X-MAP`, with an
+      # `#EXT-X-DISCONTINUITY` between them. The camera path (the rotation
+      # coordinator, the one-second hold on a real turn) needs a device.
+      - name: Broadcast turned while live
+        working-directory: examples/ios-stream
+        run: |
+          set -euo pipefail
+          SEGS="$(xcrun simctl get_app_container booted baby.freedom.antstream data)/Library/Caches/antstream/segments"
+          mkdir -p shots/turn/playlists
+          python3 ci/record-gateway.py shots/turn/playlists 18633 2> shots/turn/record-gateway.log &
+          GW=$!
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          rm -rf "$SEGS"
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-live -antstream-shot-portrait -antstream-shot-turn \
+            -antstreamShotPublisherGateway http://127.0.0.1:18633
+          # ~20 s to `ant_init` and go live, 16 s portrait, then landscape.
+          sleep 75
+          xcrun simctl io booted screenshot shots/38-live-turned.png
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          kill "$GW" || true
+          cp "$SEGS"/* shots/turn/
+          python3 ci/check-turn.py "$SEGS" shots/turn/playlists | tee shots/turn/check.txt
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -37,12 +37,15 @@ import UniformTypeIdentifiers
 ///   writer to that same running session (the camera is not restarted),
 ///   and ``stopRecording(completion:)`` takes them away again, leaving
 ///   the preview running.
-/// * **The frame's shape is fixed per broadcast.** ``Settings/portrait``
-///   is chosen at Go live and sets the encoded width and height for the
-///   whole stream. Turning the phone afterwards still keeps the picture
-///   upright (the capture rotation follows the device), and the encoder
-///   fits the turned picture into the fixed frame with black bars rather
-///   than switching the stream between landscape and portrait.
+/// * **The frame follows the phone (#228).** ``Settings/portrait`` sets
+///   the encoded width and height. Turning the phone while recording
+///   turns the stream with it: once the new orientation has held for
+///   ``orientationHold``, the capture rotation, the settings and the
+///   writer all switch together, in one restart, so the new writer's
+///   initialization segment already has the new size and no turned frame
+///   is ever fitted into the old one. A shorter tilt changes nothing
+///   (each switch costs a discontinuity and a keyframe). The preview
+///   alone follows at once: it has no writer to restart.
 ///
 /// Segments are also kept in a small on-disk ring buffer. They are
 /// uploaded from memory, so the ring is not on the publish path; it
@@ -67,8 +70,8 @@ final class CaptureEngine: NSObject {
         var ringCapacity = 60
         /// A vertical broadcast: the encoded frame is `height` wide and
         /// `width` tall (the presets are named by their short side, like
-        /// any phone camera's 720p). Chosen at Go live, fixed for the
-        /// broadcast (#193).
+        /// any phone camera's 720p). Chosen at Go live (#193), then
+        /// following the phone while recording (#228).
         var portrait = false
 
         /// The encoded frame's size, after ``portrait``.
@@ -187,8 +190,25 @@ final class CaptureEngine: NSObject {
     /// angle — the *physical* device's orientation, which the encoded
     /// frames follow even when the interface doesn't turn (Portrait
     /// Orientation Lock, a narrow iPad window). The broadcast takes its
-    /// shape from this at Go live (#193).
+    /// shape from this at Go live (#193). While recording it changes only
+    /// with the frame (``onRenditionChange``), after ``orientationHold``.
     var onOrientationChange: (@MainActor (Bool) -> Void)?
+    /// Called on the capture queue, synchronously, when a recording turns
+    /// (#228), with the settings the new writer encodes in: after the old
+    /// writer's last segment went to ``onSegment`` and before the new
+    /// writer's initialization segment does. Enqueue it with the segments
+    /// (as ``onSegment`` is) and that order is kept: the publisher learns
+    /// the new size before it sees a segment of it.
+    var onRenditionChange: ((Settings) -> Void)?
+
+    /// How long a new orientation must hold before a recording turns to
+    /// it (#228). A second: long enough that a phone tilted past the
+    /// diagonal for a moment (picked up, put down, a glance sideways)
+    /// doesn't flap the stream, short enough that a deliberate turn
+    /// follows almost at once. Until then the old orientation goes out
+    /// as it was. Face up and face down never count: the capture angle
+    /// (horizon level) keeps the last upright reading through them.
+    static let orientationHold: TimeInterval = 1.0
 
     private(set) var state: State = .idle {
         didSet {
@@ -212,6 +232,15 @@ final class CaptureEngine: NSObject {
     private var videoDeviceInput: AVCaptureDeviceInput?
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var rotationObservation: NSKeyValueObservation?
+    /// The newest capture angle the coordinator reported. While recording
+    /// it is applied to the connection only once its shape has held
+    /// (``orientationHold``); the connection keeps the recorded one.
+    private var latestAngle: CGFloat?
+    /// The test pattern's shape as the host last reported it
+    /// (``followPicture(portrait:)``): it has no rotation coordinator.
+    private var latestPatternPortrait: Bool?
+    /// A turn waiting out ``orientationHold``.
+    private var pendingTurn: DispatchWorkItem?
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -362,6 +391,9 @@ final class CaptureEngine: NSObject {
                 self.startTestPattern()
             }
             self.state = .running
+            // A resume (#175) starts in the shape its broadcast last had;
+            // held another way, it turns once that has held.
+            self.followTurn()
         }
     }
 
@@ -382,6 +414,11 @@ final class CaptureEngine: NSObject {
             }
             self.finishWriter()
             self.recording = false
+            self.cancelTurn()
+            // The preview follows the phone at once again, from wherever
+            // a turn still waiting left it. Only the rotation: there is no
+            // writer to restart any more.
+            if let angle = self.latestAngle { self.rotate(to: angle) }
             self.detachAudio()
             if !self.session.isRunning { self.session.startRunning() }
             // Still interrupted (a call, another app on the camera): keep
@@ -415,6 +452,7 @@ final class CaptureEngine: NSObject {
         if session.isRunning { session.stopRunning() }
         finishWriter()
         recording = false
+        cancelTurn()
         NotificationCenter.default.removeObserver(self)
         observingSystemEvents = false
         rotationObservation?.invalidate()
@@ -632,10 +670,9 @@ final class CaptureEngine: NSObject {
     }
 
     /// Keep the encoded frames upright as the device turns. A rotation
-    /// changes the shape of the frames the camera delivers, so it also
-    /// restarts the writer — #65's "orientation" interruption case. The
-    /// encoded frame keeps the shape chosen at Go live (#193): the new
-    /// writer fits the turned picture into it (`AVVideoScalingModeKey`).
+    /// changes the shape of the frames the camera delivers, so while
+    /// recording it also restarts the writer — #65's "orientation"
+    /// interruption case — at the new shape (#228, ``turnNow()``).
     private func observeRotation(of device: AVCaptureDevice?) {
         rotationObservation?.invalidate()
         guard let device else { return }
@@ -679,7 +716,26 @@ final class CaptureEngine: NSObject {
         PreviewGeometry.isPortrait(angle: angle)
     }
 
+    /// A new capture angle. Without a recording, or turned within the
+    /// recording's shape (upside down, or the other landscape), it applies
+    /// at once, restarting a running writer as it always did. One that
+    /// changes a recording's shape waits ``orientationHold`` and then
+    /// turns the whole stream (``turnNow()``); turned back before that, it
+    /// is dropped.
     private func applyRotation(_ angle: CGFloat) {
+        latestAngle = angle
+        if recording, videoOutput != nil, Self.isPortrait(captureAngle: angle) != settings.portrait {
+            scheduleTurn()
+            return
+        }
+        cancelTurn()
+        if rotate(to: angle), state.isRunning { restartWriter() }
+    }
+
+    /// Put `angle` on the video connection and report the shape the
+    /// buffers now have. Whether the connection's angle changed.
+    @discardableResult
+    private func rotate(to angle: CGFloat) -> Bool {
         let connection = videoOutput?.connection(with: .video)
         var changed = false
         if let connection, connection.isVideoRotationAngleSupported(angle),
@@ -692,7 +748,78 @@ final class CaptureEngine: NSObject {
         // request (which an unsupported angle leaves unapplied).
         let portrait = Self.isPortrait(captureAngle: connection?.videoRotationAngle ?? angle)
         Task { @MainActor [onOrientationChange] in onOrientationChange?(portrait) }
-        if changed, state.isRunning { restartWriter() }
+        return changed
+    }
+
+    /// The test pattern's picture turned (#228): it has no camera, so the
+    /// host says which shape it now has (the screen's layout, or a CI
+    /// launch argument). Recorded like a camera turn: once it has held
+    /// ``orientationHold``.
+    func followPicture(portrait: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.source == .testPattern else { return }
+            self.latestPatternPortrait = portrait
+            self.followTurn()
+        }
+    }
+
+    /// The shape the picture has now: the newest capture angle's on the
+    /// camera, the host's word on the test pattern. `nil` when unknown.
+    private var pictureShape: Bool? {
+        switch source {
+        case .camera: return latestAngle.map { Self.isPortrait(captureAngle: $0) }
+        case .testPattern: return latestPatternPortrait
+        }
+    }
+
+    /// Wait out a turn when the picture's shape differs from the
+    /// recording's, or drop one waiting when it no longer does.
+    private func followTurn() {
+        guard recording, let shape = pictureShape, shape != settings.portrait else {
+            cancelTurn()
+            return
+        }
+        scheduleTurn()
+    }
+
+    /// Start ``orientationHold`` unless it is already running: a turn on
+    /// to the other landscape (or portrait) keeps the wait it started,
+    /// and ``turnNow()`` takes the newest angle.
+    private func scheduleTurn() {
+        guard pendingTurn == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.turnNow() }
+        pendingTurn = work
+        queue.asyncAfter(deadline: .now() + Self.orientationHold, execute: work)
+    }
+
+    private func cancelTurn() {
+        pendingTurn?.cancel()
+        pendingTurn = nil
+    }
+
+    /// The turn held (#228): switch the recording to the picture's shape
+    /// in one writer restart. The old writer finishes in the old size,
+    /// then the rotation, the settings (``publish(settings:)``: the
+    /// encoded size, the pixel buffer pool) and ``onRenditionChange`` all
+    /// change before the new writer starts, so its initialization segment
+    /// and every frame after it are the new shape and nothing restarts a
+    /// second time. Interrupted (no writer), the recovery's writer starts
+    /// in the new shape.
+    private func turnNow() {
+        pendingTurn = nil
+        guard recording, let shape = pictureShape, shape != settings.portrait else { return }
+        let hadWriter = writer != nil
+        if hadWriter {
+            finishWriter()
+            flagDiscontinuity()
+        }
+        if source == .camera, let angle = latestAngle { rotate(to: angle) }
+        var next = settings
+        next.portrait = shape
+        baseSettings.portrait = shape
+        publish(settings: next)
+        onRenditionChange?(next)
+        if hadWriter { startWriter() }
     }
 
     // MARK: - Writer
@@ -728,9 +855,9 @@ final class CaptureEngine: NSObject {
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: settings.encodedWidth,
                 AVVideoHeightKey: settings.encodedHeight,
-                // A phone turned away from the broadcast's orientation
-                // delivers frames of the other shape: fit them in with
-                // black bars rather than stretch them (#193).
+                // The frame turns with the phone (#228), so frames come
+                // in its shape; should one ever differ, fit it in with
+                // black bars rather than stretch it.
                 AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
                 AVVideoCompressionPropertiesKey: compression,
             ]
