@@ -36,6 +36,18 @@
 // changes shape mid-stream (test/turn-test.mjs, #228); SAMPLE_SHOTS=<dir>
 // also captures the page 1.5 s after each change of reported size.
 //
+// STEPS=<json file> runs a list of steps once the wait is over, with real
+// input events, and reports each `js` step's value (`state.steps`):
+// `{ "js": "<expression>" }` (awaited), `{ "key": "Down" }` (an Electron
+// key code, `"modifiers"` optional), `{ "type": "text" }`,
+// `{ "click": "<selector>" }` (the mouse, at the element's centre, or
+// `"at": [x, y]`), `{ "drag": "<selector>", "by": [dx, dy] }` (the
+// left button pressed at the element's centre, moved by dx, dy in a few
+// steps and released), `{ "load": "<url>" }`, `{ "wait": <ms> }` and
+// `{ "shot": "<file>" }` (relative to STEPS_OUT, default the cwd).
+// test/start-page-test.mjs drives the start page this way,
+// test/debug-panel-test.mjs the debug panel.
+//
 // CHANNEL=<owner>/<topic> picks the channel (the fake gateway's by
 // default), URL= any other page (e.g. the fake gateway's own HTTP page).
 // Prints the player's state as JSON and writes a screenshot to OUT.
@@ -197,6 +209,65 @@ async function measure(win) {
   return box;
 }
 
+// STEPS: see the header.
+async function runSteps(win, steps) {
+  const out = [];
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  win.focus();
+  win.webContents.focus();
+  for (const step of steps) {
+    try {
+      if (step.js !== undefined) {
+        out.push({ js: step.js, value: await win.webContents.executeJavaScript(step.js, true) });
+      } else if (step.key) {
+        const modifiers = step.modifiers || [];
+        win.webContents.sendInputEvent({ type: 'keyDown', keyCode: step.key, modifiers });
+        // A button acts on Enter's character, as a real key press sends it.
+        const char = step.key === 'Enter' ? '\r' : step.key.length === 1 && !modifiers.length ? step.key : null;
+        if (char) win.webContents.sendInputEvent({ type: 'char', keyCode: char, modifiers });
+        win.webContents.sendInputEvent({ type: 'keyUp', keyCode: step.key, modifiers });
+        await pause(80);
+      } else if (step.type !== undefined) {
+        await win.webContents.insertText(step.type);
+        await pause(80);
+      } else if (step.click || step.at) {
+        const [x, y] = step.at || await win.webContents.executeJavaScript(`(() => {
+          const r = document.querySelector(${JSON.stringify(step.click)}).getBoundingClientRect();
+          return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+        })()`);
+        for (const type of ['mouseDown', 'mouseUp']) win.webContents.sendInputEvent({ type, x, y, button: 'left', clickCount: 1 });
+        await pause(120);
+      } else if (step.drag) {
+        const [x, y] = await win.webContents.executeJavaScript(`(() => {
+          const r = document.querySelector(${JSON.stringify(step.drag)}).getBoundingClientRect();
+          return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+        })()`);
+        const [dx, dy] = step.by;
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        for (let i = 1; i <= 8; i++) {
+          win.webContents.sendInputEvent({
+            type: 'mouseMove', x: Math.round(x + (dx * i) / 8), y: Math.round(y + (dy * i) / 8), button: 'left', modifiers: ['leftButtonDown'],
+          });
+          await pause(20);
+        }
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: x + dx, y: y + dy, button: 'left', clickCount: 1 });
+        await pause(120);
+      } else if (step.load) {
+        await win.loadURL(step.load);
+      } else if (step.wait) {
+        await pause(step.wait);
+      } else if (step.shot) {
+        await pause(150);
+        const img = await win.webContents.capturePage();
+        fs.writeFileSync(path.resolve(process.env.STEPS_OUT || '.', step.shot), img.toPNG());
+      }
+    } catch (err) {
+      out.push({ step, error: err.message });
+    }
+  }
+  return out;
+}
+
 app.whenReady().then(async () => {
   protocol.handle('bzz', async (request) => {
     const u = new URL(request.url);
@@ -284,7 +355,11 @@ app.whenReady().then(async () => {
     await new Promise((r) => setTimeout(r, WAIT_S * 1000));
   }
 
+  const stepResults = process.env.STEPS ? await runSteps(win, JSON.parse(fs.readFileSync(process.env.STEPS, 'utf8'))) : null;
+
   const state = await win.webContents.executeJavaScript(`(() => {
+    // A page a STEPS \`load\` opened has no counters of its own.
+    if (!window.__stalls) window.__stalls = { firstPlayingMs: null, count: 0, totalMs: 0, since: null, t0: Date.now() };
     const v = document.getElementById('video');
     const hls = window.antstreamPlayer && window.antstreamPlayer.hls;
     return {
@@ -315,6 +390,7 @@ app.whenReady().then(async () => {
     };
   })()`);
   if (samples.length) state.samples = samples;
+  if (stepResults) state.steps = stepResults;
   if (process.env.PROBE_SLOT) {
     // One slot read by hand through the player's own reader (in Freedom:
     // `swarm_readSingleOwnerChunk`, joining a body longer than one chunk).
@@ -389,8 +465,6 @@ app.whenReady().then(async () => {
   };
   console.log(JSON.stringify(state, null, 2));
   if (process.env.OUT) {
-    // With the debug panel open, show it rather than the video.
-    await win.webContents.executeJavaScript(`(() => { const d = document.getElementById('debug'); if (d && !d.hidden) d.scrollIntoView(); })()`);
     await new Promise((r) => setTimeout(r, 600));
     const img = await win.webContents.capturePage();
     require('fs').writeFileSync(process.env.OUT, img.toPNG());

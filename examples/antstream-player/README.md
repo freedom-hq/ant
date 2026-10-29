@@ -90,6 +90,22 @@ when the link is all that was pasted, in quotes or with a full stop
 after it or not. `test/channel-parse-test.mjs` checks this against the apps'
 strings (`node test/channel-parse-test.mjs`, no dependencies).
 
+The start page keeps to the field and the Watch button; the forms the
+field takes, how a channel plays and where it plays through are in
+Help, behind the menu button at the top right. The channels played
+before drop down under the field (an ARIA combobox: on focus of the
+empty field, narrowed as you type, arrow keys and Enter to watch one,
+Delete or × to remove it). They are kept in localStorage,
+the newest 8: their keys in `antstream.recent.v2` as the plain string
+array older builds read and write too, and the title the owner's
+catalog last gave each one beside them in `antstream.recent-titles.v1`
+(`{ [key]: title }`), so an older build of the player opened from the
+feed history still lists every channel and leaves the titles alone. `node test/recent-test.mjs` (no
+dependencies) checks the list's storage, and
+`ELECTRON=<path to electron> node test/start-page-test.mjs` (needs
+xvfb-run) drives the dropdown, the menu and Help with real key and
+mouse input in the Freedom harness (its `STEPS`), at 1280 and 390 px.
+
 Every feed update **is** the playlist (a v2 update wrapping the
 playlist's root chunk), and the playlist lists segments and the
 `#EXT-X-MAP` as bare 64-hex references to raw bytes.
@@ -227,7 +243,16 @@ ELECTRON=<path to electron> node test/turn-test.mjs       # needs ffmpeg, xvfb-r
 
 ## Debug panel
 
-The **Debug** button (or `?debug` in the URL) opens a panel with:
+The **Debug** button (or `?debug` in the URL) opens a panel docked to
+the bottom of the window, over the page. Drag its top edge (mouse or
+touch, or the arrow keys once the edge has the focus) to make it taller
+or shorter, between 120 px and 80% of the window; the height is kept in
+localStorage (`antstream.debug.height`). While it is open the page gets
+the same amount of padding at the bottom, so all of it still scrolls
+into view, and the panel scrolls on its own. The × or Escape (with the
+focus in the panel) closes it, and so does the Debug button again. It
+shows:
+- the channel: owner and topic, and the feed topic hash it is read at;
 - the buffer ahead now, and over the last two minutes (stalls in red,
   rebuffer holds in amber);
 - medians and p95s of segment and feed-read times;
@@ -243,6 +268,12 @@ The **Debug** button (or `?debug` in the URL) opens a panel with:
 It also has the three knobs above (prefetch depth, overlapping feed
 reads, rebuffer target; 0 turns each off), kept in localStorage. **Copy
 log** and **Download** export everything as JSON for a bug report.
+
+`ELECTRON=<path to electron> node test/debug-panel-test.mjs` (needs
+ffmpeg, xvfb-run) plays a recording through the fake gateway and checks
+the panel's docking, dragging and its bounds, the stored height after a
+reload, the page's bottom padding, the channel line, Escape and the ×,
+at 1280 and 390 px.
 
 ## Waiting and ended broadcasts
 
