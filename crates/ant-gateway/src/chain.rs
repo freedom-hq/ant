@@ -243,8 +243,10 @@ pub enum ChequebookRefusal {
 /// for xBZZ, wei for xDAI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FundingView {
-    pub wallet_bzz: u128,
-    pub wallet_xdai: u128,
+    /// The node wallet's xBZZ, `None` when it couldn't be read.
+    pub wallet_bzz: Option<u128>,
+    /// The node wallet's xDAI, `None` when it couldn't be read.
+    pub wallet_xdai: Option<u128>,
     pub bzz_to_acquire: u128,
     pub swap_input_wei: u128,
     pub gas_reserve_wei: u128,
@@ -278,7 +280,8 @@ pub struct DepositView {
     pub deposited_plur: u128,
     pub target_plur: u128,
     pub shortfall_plur: u128,
-    /// All zero when nothing is missing.
+    /// The wallet's balances, and what a top-up takes: the top-up
+    /// figures are all zero when nothing is missing.
     pub funding: FundingView,
 }
 
@@ -1300,8 +1303,10 @@ fn valid_depth(depth: u8) -> Result<u8, Response> {
 #[serde(rename_all = "camelCase")]
 struct FundingBody {
     wallet_address: String,
-    wallet_bzz_plur: String,
-    wallet_xdai_wei: String,
+    /// `null` when the balance couldn't be read: unknown, not empty.
+    wallet_bzz_plur: Option<String>,
+    /// `null` when the balance couldn't be read: unknown, not empty.
+    wallet_xdai_wei: Option<String>,
     bzz_to_acquire_plur: String,
     swap_input_wei: String,
     gas_reserve_wei: String,
@@ -1314,8 +1319,8 @@ impl FundingBody {
     fn of(wallet: [u8; 20], f: &FundingView) -> Self {
         Self {
             wallet_address: format!("0x{}", hex::encode(wallet)),
-            wallet_bzz_plur: f.wallet_bzz.to_string(),
-            wallet_xdai_wei: f.wallet_xdai.to_string(),
+            wallet_bzz_plur: f.wallet_bzz.map(|v| v.to_string()),
+            wallet_xdai_wei: f.wallet_xdai.map(|v| v.to_string()),
             bzz_to_acquire_plur: f.bzz_to_acquire.to_string(),
             swap_input_wei: f.swap_input_wei.to_string(),
             gas_reserve_wei: f.gas_reserve_wei.to_string(),
