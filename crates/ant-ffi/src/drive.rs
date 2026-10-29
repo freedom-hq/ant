@@ -4338,6 +4338,10 @@ mod chain_tests {
         /// does; `0` serves any range.
         cap: std::sync::atomic::AtomicU64,
         seen: Mutex<Vec<String>>,
+        /// `eth_call`s that are chequebook checks (factory
+        /// `deployedContracts`, `issuer()`), counted apart from the funds
+        /// watch's background reads, whose timing no test controls.
+        checks_seen: std::sync::atomic::AtomicUsize,
     }
 
     impl ChainScript {
@@ -4353,7 +4357,12 @@ mod chain_tests {
                 factory_reads: Mutex::new(0),
                 cap: std::sync::atomic::AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
+                checks_seen: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn seen_checks(&self) -> usize {
+            self.checks_seen.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn seen(&self, method: &str) -> usize {
@@ -4501,6 +4510,21 @@ mod chain_tests {
                             .chequebooks
                             .keys()
                             .any(|cb| to == format!("0x{}", hex::encode(cb)));
+                    let data = call["data"].as_str().unwrap();
+                    let factory = to
+                        == format!(
+                            "0x{}",
+                            hex::encode(ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY)
+                        );
+                    let issuer = is_check
+                        && data.get(2..10)
+                            == Some(
+                                &hex::encode(ant_chain::chequebook::chequebook_issuer_selector())[..],
+                            );
+                    if factory || issuer {
+                        self.checks_seen
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     if self.checks_fail && is_check {
                         return Some(
                             json!({"jsonrpc": "2.0", "id": id,
@@ -5120,7 +5144,9 @@ mod chain_tests {
 
         assert_eq!(got, Some(CANDIDATE));
         assert_eq!(node.lock().unwrap().enabled, vec![CANDIDATE]);
-        assert_eq!(script.seen("eth_call"), 2, "factory + issuer() checks");
+        // Not `seen("eth_call")`: the funds watch `setup_settlement`
+        // starts reads the chequebook in the background, racing this.
+        assert_eq!(script.seen_checks(), 2, "factory + issuer() checks");
         std::fs::remove_dir_all(&dir).ok();
     }
 

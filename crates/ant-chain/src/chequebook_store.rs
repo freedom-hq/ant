@@ -2122,7 +2122,8 @@ mod tests {
     #[cfg(feature = "chain-rpc")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_funds_read_blocks_no_other_publish() {
-        let stalled = withdraw_chain(0xcb, None);
+        // Not 0xcb: that is [`CHEQUEBOOK`], whose funds other tests read.
+        let stalled = withdraw_chain(0xcf, None);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let client = crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(
@@ -2301,7 +2302,8 @@ mod tests {
     #[cfg(feature = "chain-rpc")]
     #[test]
     fn a_deposit_after_a_withdrawal_counts_at_once() {
-        let cb = [0xcc; 20];
+        // Its own: 0xcc withdraws in `a_stalled_funds_read_blocks_no_other_publish`.
+        let cb = [0xd0; 20];
         let now = std::time::Instant::now();
         // 1200, withdraw 700 (500 left), then deposit 500: 1000 now.
         withdrawing_map().insert(
