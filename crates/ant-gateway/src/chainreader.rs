@@ -177,7 +177,13 @@ impl AntChainWriter {
         Ok(meta.depth)
     }
 
-    fn deposit_view(&self, status: Option<&funding::DepositStatus>) -> DepositView {
+    /// `wallet` is the node wallet's balances for when there is no
+    /// chequebook (`status` is `None`); with one, they come from `status`.
+    fn deposit_view(
+        &self,
+        status: Option<&funding::DepositStatus>,
+        wallet: funding::Funding,
+    ) -> DepositView {
         let target = self
             .deposit_target
             .unwrap_or(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR);
@@ -187,7 +193,7 @@ impl AntChainWriter {
             deposited_plur: status.map_or(0, |s| s.deposited_plur),
             target_plur: status.map_or(target, |s| s.target_plur),
             shortfall_plur: status.map_or(0, |s| s.shortfall_plur),
-            funding: status.map_or_else(FundingView::default, |s| funding_view(&s.funding)),
+            funding: funding_view(status.map_or(&wallet, |s| &s.funding)),
         }
     }
 
@@ -455,12 +461,18 @@ impl ChainWriter for AntChainWriter {
 
     async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
         let Some(cb) = self.chequebook.get() else {
-            return Ok(self.deposit_view(None));
+            let wallet = funding::wallet_funding(&self.payer()).await;
+            return Ok(self.deposit_view(None, wallet));
         };
-        let status = funding::deposit_status(&self.payer(), &cb, self.deposit_target_or_default())
-            .await
-            .map_err(failure)?;
-        Ok(self.deposit_view(Some(&status)))
+        let status = funding::deposit_status(
+            &self.payer(),
+            &cb,
+            self.deposit_target_or_default(),
+            funding::WalletRead::Always,
+        )
+        .await
+        .map_err(failure)?;
+        Ok(self.deposit_view(Some(&status), funding::Funding::default()))
     }
 
     async fn fund_deposit_with_xdai(
@@ -484,10 +496,11 @@ impl ChainWriter for AntChainWriter {
             &cb,
             self.deposit_target_or_default(),
             amount,
+            funding::WalletRead::Always,
         )
         .await
         .map_err(failure)?;
-        Ok(self.deposit_view(Some(&status)))
+        Ok(self.deposit_view(Some(&status), funding::Funding::default()))
     }
 }
 

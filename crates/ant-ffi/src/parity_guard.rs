@@ -66,6 +66,14 @@ const FFI_SOURCES: &[&str] = &[
 /// `(helper, the side that uses it, why the other side doesn't)`.
 const ONE_SIDED: &[(&str, Side, &str)] = &[
     (
+        "wallet_funding",
+        Side::Antd,
+        "the gateway's `GET /v0/settlement/deposit` reports the node wallet's balances even \
+         with no chequebook yet (#241); the C API's settlement deposit JSON carries no wallet \
+         balances, so it has nothing to read them for (its deposit reads pass \
+         `WalletRead::WhenShort`)",
+    ),
+    (
         "top_up_batch",
         Side::Antd,
         "bee's `PATCH /stamps/topup` pays from the wallet's xBZZ; the C API only extends with \

@@ -1655,6 +1655,10 @@ fn parse_amount(amount_per_chunk: &str, what: &str) -> Result<u128, DriveError> 
 #[cfg(feature = "chain")]
 fn quote_json(q: &funding::PlanQuote) -> Result<String, DriveError> {
     let f = &q.funding;
+    // The apps' quote JSON carries the balances as plain strings, so an
+    // unread balance stays "0" here, as before; the HTTP routes report
+    // it as `null` (#241).
+    let (wallet_bzz, wallet_xdai) = (f.wallet_bzz.unwrap_or(0), f.wallet_xdai.unwrap_or(0));
     let capacity_bytes = 1u64
         .checked_shl(u32::from(q.depth))
         .map_or(u64::MAX, |chunks| chunks.saturating_mul(BYTES_PER_CHUNK));
@@ -1667,10 +1671,10 @@ fn quote_json(q: &funding::PlanQuote) -> Result<String, DriveError> {
         settlement_deposit_plur: q.deposit_due_plur.to_string(),
         settlement_deposit_bzz: format_bzz(q.deposit_due_plur),
         capacity_bytes,
-        account_bzz: f.wallet_bzz.to_string(),
-        account_bzz_display: format_bzz(f.wallet_bzz),
-        account_xdai: f.wallet_xdai.to_string(),
-        account_xdai_display: format_native(f.wallet_xdai),
+        account_bzz: wallet_bzz.to_string(),
+        account_bzz_display: format_bzz(wallet_bzz),
+        account_xdai: wallet_xdai.to_string(),
+        account_xdai_display: format_native(wallet_xdai),
         needed_bzz: f.bzz_to_acquire.to_string(),
         needed_bzz_display: format_bzz(f.bzz_to_acquire),
         xdai_required: f.xdai_required_wei.to_string(),
@@ -2619,7 +2623,9 @@ async fn settlement_deposit_for(
         return to_json(&SettlementDeposit::none(target));
     }
     let payer = Payer::gnosis(client, wallet);
-    let status = funding::deposit_status(&payer, &cb, target)
+    // The card JSON carries no wallet balances, so a funded chequebook
+    // costs one deposit read, not two more wallet reads.
+    let status = funding::deposit_status(&payer, &cb, target, funding::WalletRead::WhenShort)
         .await
         .map_err(funding_err)?;
     to_json(&SettlementDeposit::of(&status))
@@ -2769,7 +2775,8 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, target, amount).await
+        funding::fund_deposit_with_xdai(&payer, &cb, target, amount, funding::WalletRead::WhenShort)
+            .await
     };
     match funded {
         Ok(status) => {

@@ -607,6 +607,11 @@ struct FundingWriter {
     refuse_deposit: Option<ChequebookRefusal>,
     /// Answer a withdrawal with this instead of a transaction hash.
     refuse_withdraw: Option<FundingFailure>,
+    /// Answer `GET /v0/settlement/deposit` with this instead of the
+    /// default unfunded deposit.
+    deposit: Option<DepositView>,
+    /// Price a new plan with this instead of [`QUOTED_FUNDING`].
+    quote_funding: Option<FundingView>,
 }
 
 impl FundingWriter {
@@ -619,8 +624,8 @@ impl FundingWriter {
 }
 
 const QUOTED_FUNDING: FundingView = FundingView {
-    wallet_bzz: 0,
-    wallet_xdai: 5,
+    wallet_bzz: Some(0),
+    wallet_xdai: Some(5),
     bzz_to_acquire: 11,
     swap_input_wei: 400,
     gas_reserve_wei: 15,
@@ -662,7 +667,7 @@ impl ChainWriter for FundingWriter {
             amount_per_chunk: 1_000,
             plan_cost_plur: 1_000 << depth,
             deposit_due_plur: 10_000_000_000_000,
-            funding: QUOTED_FUNDING,
+            funding: self.quote_funding.unwrap_or(QUOTED_FUNDING),
         })
     }
     async fn quote_extend(
@@ -720,6 +725,9 @@ impl ChainWriter for FundingWriter {
         Ok(new_depth.unwrap_or(20))
     }
     async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+        if let Some(d) = self.deposit {
+            return Ok(d);
+        }
         Ok(DepositView {
             chequebook: Some([0xCB; 20]),
             managed: true,
@@ -961,6 +969,77 @@ async fn v0_settlement_deposit_reports_and_tops_up() {
     assert_eq!(json["needsTopUp"], false);
     assert_eq!(json["xdaiToSendWei"], "0");
     assert_eq!(writer.calls(), ["fund_deposit_with_xdai"]);
+}
+
+/// #241: a deposit at its target still reports what the node wallet
+/// holds, with every top-up figure 0; a balance that couldn't be read is
+/// `null` (unknown), not `"0"` (empty).
+#[tokio::test]
+async fn v0_settlement_deposit_reports_wallet_balances_without_a_shortfall() {
+    let full = |wallet_bzz, wallet_xdai| DepositView {
+        chequebook: Some([0xCB; 20]),
+        managed: true,
+        deposited_plur: 14_948_000_000_000_000,
+        target_plur: 10_000_000_000_000_000,
+        shortfall_plur: 0,
+        funding: FundingView {
+            wallet_bzz,
+            wallet_xdai,
+            ..FundingView::default()
+        },
+    };
+    let deposit_json = |d| async move {
+        let writer = Arc::new(FundingWriter {
+            deposit: Some(d),
+            ..FundingWriter::default()
+        });
+        let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
+        let (status, json) = get(router, "/v0/settlement/deposit").await;
+        assert_eq!(status, StatusCode::OK);
+        json
+    };
+
+    let json = deposit_json(full(
+        Some(165_277_000_000_000_000),
+        Some(18_862_000_000_000_000),
+    ))
+    .await;
+    assert_eq!(json["needsTopUp"], false);
+    assert_eq!(json["walletBzzPlur"], "165277000000000000");
+    assert_eq!(json["walletXdaiWei"], "18862000000000000");
+    for field in [
+        "bzzToAcquirePlur",
+        "swapInputWei",
+        "gasReserveWei",
+        "xdaiRequiredWei",
+        "xdaiToSendWei",
+    ] {
+        assert_eq!(json[field], "0", "{field}");
+    }
+
+    let json = deposit_json(full(None, None)).await;
+    assert!(json["walletBzzPlur"].is_null(), "{json}");
+    assert!(json["walletXdaiWei"].is_null(), "{json}");
+}
+
+/// `GET /v0/storage/quote` reports an unread balance as `null` too,
+/// while a balance read as zero stays `"0"`, and the over-quote it priced
+/// is passed through unchanged.
+#[tokio::test]
+async fn v0_quote_reports_an_unread_balance_as_null() {
+    let writer = Arc::new(FundingWriter {
+        quote_funding: Some(FundingView {
+            wallet_xdai: None,
+            ..QUOTED_FUNDING
+        }),
+        ..FundingWriter::default()
+    });
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
+    let (status, json) = get(router, "/v0/storage/quote?depth=20&days=30").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["walletBzzPlur"], "0");
+    assert!(json["walletXdaiWei"].is_null(), "{json}");
+    assert_eq!(json["xdaiToSendWei"], "410");
 }
 
 /// `?amount=` (Freedom's "add browsing credit") reaches the writer as
