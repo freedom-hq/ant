@@ -11,9 +11,22 @@
   <header>
     <h1>AntStream <span>Player</span></h1>
     <form id="channel-form" autocomplete="off">
-      <input id="channel-input" placeholder="Channel: 0x… owner/topic, a swarm:// link, or an app’s Share text" spellcheck="false">
+      <!-- The recent channels drop down under the field (player.js, "the recent dropdown"). -->
+      <div class="combo">
+        <input id="channel-input" placeholder="Channel link or 0x… address" aria-label="Channel" spellcheck="false"
+          role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="recent-list">
+        <ul id="recent-list" role="listbox" aria-label="Recent channels" hidden></ul>
+      </div>
       <button type="submit">Watch</button>
     </form>
+    <div class="menu">
+      <button id="menu-button" type="button" aria-label="Menu" aria-haspopup="menu" aria-expanded="false" aria-controls="menu">
+        <svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <div id="menu" role="menu" aria-label="Menu" hidden>
+        <button id="help-open" type="button" role="menuitem" tabindex="-1">Help</button>
+      </div>
+    </div>
   </header>
 
   <section id="stage" hidden>
@@ -49,20 +62,34 @@
   </section>
 
   <section id="intro">
-    <p>Paste the channel an AntStream broadcaster shared (the whole text the
-      app's Share button sends will do): their address and the
-      channel's topic, <code>0x…/&lt;topic&gt;</code> (the topic as text, or as
-      64 hex digits for a channel without a text topic), their address alone
-      for their app's channel, or a Solar Punk <code>swarm://&lt;owner&gt;/&lt;topic&gt;</code> link. The
-      player follows the channel's Swarm feed and keeps you at the live edge; a
-      finished broadcast plays back from the start.</p>
-    <ul id="recent"></ul>
+    <p>Paste a channel link to watch.</p>
   </section>
 
-  <footer>Served from Swarm · plays through your browser's own node in
-    <a href="https://freedom.baby">Freedom</a>, or through any bee/ant gateway.
-    <span id="player-version" class="version"></span></footer>
+  <footer>Served from Swarm · <span id="player-version" class="version"></span></footer>
 </main>
+<dialog id="help" aria-labelledby="help-title">
+  <div class="help-body">
+    <h2 id="help-title">Help</h2>
+    <ul>
+      <li>A channel is a broadcaster's address (0x and 40 hex digits) and a
+        topic. The field takes:
+        <ul>
+          <li><code>0x&lt;owner&gt;/&lt;topic text&gt;</code></li>
+          <li><code>0x&lt;owner&gt;/&lt;64-hex topic&gt;</code>, for a channel without a text topic</li>
+          <li><code>0x&lt;owner&gt;</code> alone, for the app's <code>antstream</code> channel</li>
+          <li>a Solar Punk link, <code>swarm://&lt;owner&gt;/&lt;topic&gt;</code></li>
+          <li>the whole text an AntStream app's Share button sends</li>
+        </ul>
+      </li>
+      <li>A live channel starts at the live edge. A finished broadcast plays from the start.</li>
+      <li>Channels you watched drop down under the field. Pick one with a
+        click, or the arrow keys and Enter; × or Delete removes it.</li>
+      <li>The player plays through your browser's own Swarm node in
+        <a href="https://freedom.baby">Freedom</a>, or through any bee/ant gateway.</li>
+    </ul>
+    <form method="dialog"><button autofocus>Close</button></form>
+  </div>
+</dialog>
 <script src="version.js"></script>
 <script src="vendor/hls.light.min.js"></script>
 <script src="keccak.js"></script>

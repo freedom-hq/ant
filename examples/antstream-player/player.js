@@ -76,7 +76,11 @@
     unmute: $('unmute'),
     copy: $('copy-link'),
     channelRef: $('channel-ref'),
-    recent: $('recent'),
+    recentList: $('recent-list'),
+    menuButton: $('menu-button'),
+    menu: $('menu'),
+    helpOpen: $('help-open'),
+    help: $('help'),
     latency: $('stat-latency'),
     buffer: $('stat-buffer'),
     fetch: $('stat-fetch'),
@@ -929,6 +933,7 @@
     if (a.status === 200) {
       const entry = a.text.length > CATALOG_MAX_BYTES ? null : catalogEntry(a.text, ch);
       catalog.entry = entry;
+      if (entry && entry.title) rememberTitle(ch.key, entry.title);
       catalog.last = entry ? `${entry.state || 'no state'}${entry.title ? ` · ${entry.title}` : ''}` : 'no entry for this channel';
       note(row, entry ? `catalog: ${catalog.last}` : 'catalog: no readable entry for this channel');
       renderCatalog();
@@ -2016,39 +2021,295 @@
 
   // -- channel selection ----------------------------------------------------
 
-  const ASK = 'Enter the broadcaster\'s address and the channel\'s topic: 0x<40 hex>/<topic text>, 0x<40 hex>/0x<64 hex topic>, 0x<40 hex> alone for its antstream channel, a swarm:// link, or the text an AntStream app shares';
+  const ASK = 'Paste a channel link or a 0x… address. Menu › Help lists the forms it can take.';
 
-  /** Recent channels, by key; entries of the older reference form are dropped. */
+  // -- recent channels --------------------------------------------------------
+  //
+  // The last channels played, newest first, kept in localStorage as
+  // `{ key, title }`: the channel's key (its hash) and the title its
+  // owner's catalog gave it, when one was read. Older builds stored the
+  // bare key string; those entries still read, without a title.
+
+  const RECENT_MAX = 8;
+
+  /** Recent channels as `{ key, title }`; entries no channel parses from are dropped. */
   function recent() {
+    let list;
     try {
-      const list = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
-      return Array.isArray(list) ? list.filter((k) => parseChannel(k)) : [];
+      list = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
     } catch (_) {
       return [];
     }
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const item of list) {
+      const key = typeof item === 'string' ? item : item && typeof item.key === 'string' ? item.key : '';
+      const title = item && typeof item.title === 'string' ? item.title.trim() : '';
+      if (key && parseChannel(key) && !out.some((r) => r.key === key)) out.push({ key, title });
+    }
+    return out;
   }
 
-  function remember(key) {
+  function storeRecent(list) {
     try {
-      const list = [key, ...recent().filter((c) => c !== key)].slice(0, 8);
-      localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+      localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)));
     } catch (_) {
       /* storage unavailable: not worth failing playback over */
     }
   }
 
-  function renderRecent() {
-    els.recent.textContent = '';
-    for (const key of recent()) {
-      const ch = parseChannel(key);
+  /** Put `key` first; a title already known for it is kept. */
+  function remember(key) {
+    const list = recent();
+    const known = list.find((r) => r.key === key);
+    storeRecent([{ key, title: known ? known.title : '' }, ...list.filter((r) => r.key !== key)]);
+  }
+
+  /** The catalog's title for `key`, kept where `key` already is in the list. */
+  function rememberTitle(key, title) {
+    const t = (title || '').trim();
+    const list = recent();
+    const at = list.findIndex((r) => r.key === key);
+    if (!t || at < 0 || list[at].title === t) return;
+    list[at] = { key, title: t };
+    storeRecent(list);
+  }
+
+  /** Drop `key` from the list. */
+  function forget(key) {
+    storeRecent(recent().filter((r) => r.key !== key));
+  }
+
+  /** `0x1234…abcd`: an owner short enough for a list. */
+  function shortOwner(owner) {
+    return `0x${owner.slice(0, 4)}…${owner.slice(-4)}`;
+  }
+
+  /**
+   * The recent channels that match what is typed (any part of the title,
+   * the key, the owner or the topic, any case), each with its parsed
+   * channel; all of them for an empty field.
+   */
+  function matchRecent(list, text) {
+    const q = (text || '').trim().toLowerCase();
+    const out = [];
+    for (const r of list) {
+      const ch = parseChannel(r.key);
+      if (!ch) continue;
+      const hay = [r.title, r.key, `0x${ch.owner}`, ch.topic].join('\n').toLowerCase();
+      if (!q || hay.includes(q)) out.push({ key: r.key, title: r.title, ch });
+    }
+    return out;
+  }
+
+  // -- the recent dropdown ----------------------------------------------------
+  //
+  // The channel field is a combobox (WAI-ARIA 1.2 "list autocomplete"):
+  // the recent channels open under it when the empty field is focused or
+  // clicked, or with the arrow keys, and narrow as the viewer types. The
+  // arrow keys move through them (aria-activedescendant; focus stays in
+  // the field), Enter watches the highlighted one, Delete removes it,
+  // Escape or Tab closes the list. With no recent channels there is no
+  // list at all.
+
+  const combo = { open: false, items: [], active: -1 };
+
+  /** What the list filters on: the field, or nothing while it still shows the playing channel. */
+  function comboQuery() {
+    const v = els.input.value;
+    return channel && v === channel.key ? '' : v;
+  }
+
+  function renderCombo() {
+    const list = els.recentList;
+    list.textContent = '';
+    combo.items.forEach((item, i) => {
       const li = document.createElement('li');
-      const a = document.createElement('a');
-      a.href = `#${ch.key}`;
-      a.textContent = `0x${ch.owner} / ${ch.topic}`;
-      li.appendChild(a);
-      els.recent.appendChild(li);
+      li.id = `recent-opt-${i}`;
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', String(i === combo.active));
+      if (i === combo.active) li.classList.add('active');
+      li.dataset.key = item.key;
+      const text = document.createElement('span');
+      text.className = 'opt-text';
+      if (item.title) {
+        const t = document.createElement('span');
+        t.className = 'opt-title';
+        t.textContent = item.title;
+        text.appendChild(t);
+      }
+      const addr = document.createElement('span');
+      addr.className = 'opt-addr';
+      addr.textContent = `${shortOwner(item.ch.owner)} / ${item.ch.topic}`;
+      text.appendChild(addr);
+      li.appendChild(text);
+      // Mouse only: from the keyboard, Delete removes the highlighted entry.
+      const x = document.createElement('span');
+      x.className = 'opt-remove';
+      x.setAttribute('aria-hidden', 'true');
+      x.title = 'Remove from the list';
+      x.textContent = '×';
+      li.appendChild(x);
+      list.appendChild(li);
+    });
+    const shown = combo.open && combo.items.length > 0;
+    list.hidden = !shown;
+    els.input.setAttribute('aria-expanded', String(shown));
+    if (shown && combo.active >= 0) {
+      els.input.setAttribute('aria-activedescendant', `recent-opt-${combo.active}`);
+      const el = list.children[combo.active];
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    } else {
+      els.input.removeAttribute('aria-activedescendant');
     }
   }
+
+  /** Open (or refresh) the list for what is typed; nothing to show closes it. */
+  function openCombo() {
+    combo.items = matchRecent(recent(), comboQuery());
+    combo.open = combo.items.length > 0;
+    if (combo.active >= combo.items.length) combo.active = combo.items.length - 1;
+    renderCombo();
+  }
+
+  function closeCombo() {
+    combo.open = false;
+    combo.active = -1;
+    renderCombo();
+  }
+
+  function moveActive(step) {
+    if (!combo.open) {
+      openCombo();
+      if (!combo.open) return;
+      combo.active = step > 0 ? 0 : combo.items.length - 1;
+    } else {
+      const n = combo.items.length;
+      combo.active = combo.active < 0 ? (step > 0 ? 0 : n - 1) : (combo.active + step + n) % n;
+    }
+    renderCombo();
+  }
+
+  /** Watch the channel `key` names, as following its link does. */
+  function pickRecent(key) {
+    const ch = parseChannel(key);
+    closeCombo();
+    if (ch) watch(ch);
+  }
+
+  function removeRecent(key) {
+    forget(key);
+    openCombo();
+  }
+
+  els.input.addEventListener('keydown', (e) => {
+    if (e.altKey && e.key === 'ArrowUp') {
+      closeCombo();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (e.altKey && !combo.open) {
+        openCombo();
+      } else {
+        moveActive(e.key === 'ArrowDown' ? 1 : -1);
+      }
+      e.preventDefault();
+    } else if (e.key === 'Enter' && combo.open && combo.active >= 0) {
+      e.preventDefault();
+      pickRecent(combo.items[combo.active].key);
+    } else if (e.key === 'Escape' && combo.open) {
+      e.preventDefault();
+      closeCombo();
+    } else if (e.key === 'Delete' && combo.open && combo.active >= 0) {
+      e.preventDefault();
+      removeRecent(combo.items[combo.active].key);
+    } else if (e.key === 'Tab') {
+      closeCombo();
+    }
+  });
+  els.input.addEventListener('input', () => {
+    combo.active = -1;
+    openCombo();
+  });
+  els.input.addEventListener('focus', () => {
+    if (!els.input.value) openCombo();
+  });
+  els.input.addEventListener('click', () => {
+    if (!combo.open && !els.input.value) openCombo();
+  });
+  els.input.addEventListener('blur', closeCombo);
+  // Keep the focus in the field while the list is used with the mouse.
+  els.recentList.addEventListener('mousedown', (e) => e.preventDefault());
+  els.recentList.addEventListener('click', (e) => {
+    const li = e.target.closest('li[role="option"]');
+    if (!li) return;
+    if (e.target.closest('.opt-remove')) removeRecent(li.dataset.key);
+    else pickRecent(li.dataset.key);
+  });
+
+  // -- menu and help ----------------------------------------------------------
+
+  function menuItems() {
+    return [...els.menu.querySelectorAll('[role="menuitem"]')];
+  }
+
+  function openMenu() {
+    els.menu.hidden = false;
+    els.menuButton.setAttribute('aria-expanded', 'true');
+    const first = menuItems()[0];
+    if (first) first.focus();
+  }
+
+  function closeMenu(refocus) {
+    if (els.menu.hidden) return;
+    els.menu.hidden = true;
+    els.menuButton.setAttribute('aria-expanded', 'false');
+    if (refocus) els.menuButton.focus();
+  }
+
+  els.menuButton.addEventListener('click', () => {
+    if (els.menu.hidden) openMenu();
+    else closeMenu(true);
+  });
+  els.menuButton.addEventListener('keydown', (e) => {
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && els.menu.hidden) {
+      e.preventDefault();
+      openMenu();
+    }
+  });
+  els.menu.addEventListener('keydown', (e) => {
+    const items = menuItems();
+    const at = items.indexOf(document.activeElement);
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMenu(true);
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const n = items.length;
+      items[(at + (e.key === 'ArrowDown' ? 1 : -1) + n) % n].focus();
+    } else if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      items[e.key === 'Home' ? 0 : items.length - 1].focus();
+    } else if (e.key === 'Tab') {
+      closeMenu(false);
+    }
+  });
+  // A click (or tap) anywhere else closes it; so does focus moving away.
+  document.addEventListener('pointerdown', (e) => {
+    if (!els.menu.hidden && !e.target.closest('.menu')) closeMenu(false);
+  });
+  els.menu.addEventListener('focusout', (e) => {
+    if (!els.menu.hidden && !(e.relatedTarget && e.relatedTarget.closest('.menu'))) closeMenu(false);
+  });
+
+  els.helpOpen.addEventListener('click', () => {
+    closeMenu(false);
+    if (typeof els.help.showModal === 'function') els.help.showModal();
+    else els.help.setAttribute('open', '');
+  });
+  // Escape, the Close button or a click on the backdrop: back to the menu button.
+  els.help.addEventListener('close', () => els.menuButton.focus());
+  els.help.addEventListener('click', (e) => {
+    if (e.target === els.help) els.help.close();
+  });
 
   function fromHash() {
     const raw = location.hash.slice(1);
@@ -2073,14 +2334,19 @@
       els.input.reportValidity();
       return;
     }
-    els.input.setCustomValidity('');
-    if (location.hash.slice(1) === ch.key) play(ch);
-    else location.hash = ch.key;
+    watch(ch);
   });
   els.input.addEventListener('input', () => els.input.setCustomValidity(''));
   window.addEventListener('hashchange', fromHash);
 
-  renderRecent();
+  /** Watch `ch`: through the hash, so the address bar is its link. */
+  function watch(ch) {
+    closeCombo();
+    els.input.setCustomValidity('');
+    if (location.hash.slice(1) === ch.key) play(ch);
+    else location.hash = ch.key;
+  }
+
   fromHash();
 
   // -- build ------------------------------------------------------------------
@@ -2120,6 +2386,7 @@
     feed,
     budget,
     catalog,
+    recent,
     via: VIA,
     // One feed read by hand, e.g. `antstreamPlayer.read.slot(antstreamPlayer.channel, 12)`.
     read: { head: readHead, slot: readSlot, catalog: (ch) => readHead({ owner: ch.owner, topicHex: CATALOG_TOPIC_HEX }) },

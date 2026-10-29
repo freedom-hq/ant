@@ -90,6 +90,20 @@ when the link is all that was pasted, in quotes or with a full stop
 after it or not. `test/channel-parse-test.mjs` checks this against the apps'
 strings (`node test/channel-parse-test.mjs`, no dependencies).
 
+The start page keeps to the field and the Watch button; the forms the
+field takes, how a channel plays and where it plays through are in
+Help, behind the menu button at the top right. The channels played
+before drop down under the field (an ARIA combobox: on focus of the
+empty field, narrowed as you type, arrow keys and Enter to watch one,
+Delete or × to remove it). They are kept in localStorage
+(`antstream.recent.v2`, the newest 8) as `{ key, title }`, the title
+being the one the owner's catalog last gave the channel; the bare key
+strings older builds stored still read. `node test/recent-test.mjs` (no
+dependencies) checks the list's storage, and
+`ELECTRON=<path to electron> node test/start-page-test.mjs` (needs
+xvfb-run) drives the dropdown, the menu and Help with real key and
+mouse input in the Freedom harness (its `STEPS`), at 1280 and 390 px.
+
 Every feed update **is** the playlist (a v2 update wrapping the
 playlist's root chunk), and the playlist lists segments and the
 `#EXT-X-MAP` as bare 64-hex references to raw bytes.
