@@ -144,7 +144,6 @@ video { width: 100%; height: 100%; display: block; background: #000; object-fit:
 dt { color: var(--muted); font-size: 12px; }
 dd { margin: 4px 0 0; font-size: 18px; font-variant-numeric: tabular-nums; }
 
-.channel { color: var(--muted); font-size: 13px; word-break: break-all; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
 
 #intro p { color: var(--muted); max-width: 720px; line-height: 1.5; }
@@ -241,16 +240,50 @@ footer a { color: var(--muted); }
 
 #debug-toggle.on { background: var(--amber); color: #2b1d00; }
 
+/* Docked to the bottom of the window, over the page; debug.js sets its
+   height (dragged on the grip) and the page's matching bottom padding.
+   The head stays put and the body scrolls. */
 .debug[hidden] { display: none; }
 .debug {
-  margin: 14px 0;
-  padding: 12px 14px;
-  border-radius: 12px;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  height: 40vh;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid #2c2c34;
+  border-radius: 12px 12px 0 0;
   background: var(--card);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, .5);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
-.debug .head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.debug.dragging { user-select: none; }
+.debug .grip {
+  flex: none;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+}
+.debug .grip::before { content: ""; width: 44px; height: 4px; border-radius: 2px; background: #4a4a55; }
+.debug .grip:hover::before, .debug .grip:focus-visible::before, .debug.dragging .grip::before { background: var(--amber); }
+.debug .grip:focus-visible { outline: none; }
+.debug .head { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 14px 8px; }
+.debug .head .tools { display: flex; flex-wrap: wrap; gap: 8px; }
+.debug .head .close { order: 10; padding: 2px 9px; font-size: 18px; line-height: 1; }
+/* On a phone the × stays on the first row, the tools go on the next. */
+@media (max-width: 720px) {
+  .debug .head .close { order: 1; }
+  .debug .head .tools { order: 2; flex-basis: 100%; }
+}
+.debug .body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 0 14px 12px; }
+.debug .chan { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-bottom: 10px; }
+.debug .chan code { overflow-wrap: anywhere; }
 .debug .head b { font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--amber); }
 .debug button { padding: 5px 10px; border-radius: 8px; font-size: 12px; }
 .debug button.on { background: var(--amber); color: #2b1d00; }
@@ -288,9 +321,9 @@ footer a { color: var(--muted); }
   font-size: 12px;
 }
 
-.debug .table-wrap { max-height: 360px; overflow: auto; border-top: 1px solid #2c2c34; }
+.debug .table-wrap { overflow-x: auto; border-top: 1px solid #2c2c34; }
 .debug table { width: 100%; border-collapse: collapse; }
-.debug th { position: sticky; top: 0; background: var(--card); text-align: left; color: var(--muted); font-weight: 500; padding: 6px 6px; }
+.debug th { background: var(--card); text-align: left; color: var(--muted); font-weight: 500; padding: 6px 6px; }
 .debug td { padding: 3px 6px; border-top: 1px solid #222229; white-space: nowrap; }
 .debug td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
 .debug td.slow { color: var(--amber); }

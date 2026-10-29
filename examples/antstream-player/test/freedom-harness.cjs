@@ -41,9 +41,12 @@
 // `{ "js": "<expression>" }` (awaited), `{ "key": "Down" }` (an Electron
 // key code, `"modifiers"` optional), `{ "type": "text" }`,
 // `{ "click": "<selector>" }` (the mouse, at the element's centre, or
-// `"at": [x, y]`), `{ "load": "<url>" }`, `{ "wait": <ms> }` and
+// `"at": [x, y]`), `{ "drag": "<selector>", "by": [dx, dy] }` (the
+// left button pressed at the element's centre, moved by dx, dy in a few
+// steps and released), `{ "load": "<url>" }`, `{ "wait": <ms> }` and
 // `{ "shot": "<file>" }` (relative to STEPS_OUT, default the cwd).
-// test/start-page-test.mjs drives the start page this way.
+// test/start-page-test.mjs drives the start page this way,
+// test/debug-panel-test.mjs the debug panel.
 //
 // CHANNEL=<owner>/<topic> picks the channel (the fake gateway's by
 // default), URL= any other page (e.g. the fake gateway's own HTTP page).
@@ -233,6 +236,21 @@ async function runSteps(win, steps) {
           return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
         })()`);
         for (const type of ['mouseDown', 'mouseUp']) win.webContents.sendInputEvent({ type, x, y, button: 'left', clickCount: 1 });
+        await pause(120);
+      } else if (step.drag) {
+        const [x, y] = await win.webContents.executeJavaScript(`(() => {
+          const r = document.querySelector(${JSON.stringify(step.drag)}).getBoundingClientRect();
+          return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+        })()`);
+        const [dx, dy] = step.by;
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        for (let i = 1; i <= 8; i++) {
+          win.webContents.sendInputEvent({
+            type: 'mouseMove', x: Math.round(x + (dx * i) / 8), y: Math.round(y + (dy * i) / 8), button: 'left', modifiers: ['leftButtonDown'],
+          });
+          await pause(20);
+        }
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: x + dx, y: y + dy, button: 'left', clickCount: 1 });
         await pause(120);
       } else if (step.load) {
         await win.loadURL(step.load);
@@ -447,8 +465,6 @@ app.whenReady().then(async () => {
   };
   console.log(JSON.stringify(state, null, 2));
   if (process.env.OUT) {
-    // With the debug panel open, show it rather than the video.
-    await win.webContents.executeJavaScript(`(() => { const d = document.getElementById('debug'); if (d && !d.hidden) d.scrollIntoView(); })()`);
     await new Promise((r) => setTimeout(r, 600));
     const img = await win.webContents.capturePage();
     require('fs').writeFileSync(process.env.OUT, img.toPNG());

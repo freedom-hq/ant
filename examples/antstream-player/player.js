@@ -77,8 +77,6 @@
     status: $('status'),
     goLive: $('go-live'),
     unmute: $('unmute'),
-    copy: $('copy-link'),
-    channelRef: $('channel-ref'),
     recentList: $('recent-list'),
     menuButton: $('menu-button'),
     menu: $('menu'),
@@ -1790,7 +1788,6 @@
     lastFragAt = Date.now();
     els.intro.hidden = true;
     els.stage.hidden = false;
-    els.channelRef.textContent = `0x${ch.owner} / ${ch.topic}`;
     els.input.value = ch.key;
     remember(ch.key);
     setBadge('', 'CONNECTING');
@@ -2012,23 +2009,6 @@
     video.muted = !video.muted;
     updateStats();
   });
-
-  els.copy.addEventListener('click', async () => {
-    const link = shareLink(channel);
-    try {
-      await navigator.clipboard.writeText(link);
-      els.copy.textContent = 'Copied';
-    } catch (_) {
-      window.prompt('Copy this link', link);
-    }
-    setTimeout(() => { els.copy.textContent = 'Copy link'; }, 1500);
-  });
-
-  function shareLink(ch) {
-    const u = new URL(location.href);
-    u.hash = ch.key;
-    return u.toString();
-  }
 
   // -- channel selection ----------------------------------------------------
 
@@ -2305,11 +2285,10 @@
     if (refocus) els.menuButton.focus();
   }
 
-  // Whether the menu was open when the button was pressed. Safari doesn't
-  // focus a button on a click, so pressing it blurs Help with no
-  // relatedTarget and the focusout below has already closed the menu by
-  // the time the click lands: the click must act on the state at the
-  // press, or it would reopen what the press just closed. A click from
+  // Whether the menu was open when the button was pressed. The click acts
+  // on the state at the press, so that nothing that closes the menu
+  // between the press and the click (a browser that moves the focus on
+  // the press) can make it reopen what was open. A click from
   // the keyboard (Enter/Space, `detail` 0) has no press: it reads the menu
   // as it is (and ignores a press that was dragged off and never clicked).
   let menuOpenAtPress = null;
@@ -2349,12 +2328,16 @@
       closeMenu(false);
     }
   });
-  // A click (or tap) anywhere else closes it; so does focus moving away.
+  // A click (or tap) anywhere else closes it; so does focus moving to
+  // something else on the page (Tab, a script). Focus that just goes away
+  // (no relatedTarget) leaves it open: Safari clears the focus on the
+  // press of a button, so closing then would hide Help before the click
+  // on it lands. A press outside is the pointerdown above.
   document.addEventListener('pointerdown', (e) => {
     if (!els.menu.hidden && !e.target.closest('.menu')) closeMenu(false);
   });
   els.menu.addEventListener('focusout', (e) => {
-    if (!els.menu.hidden && !(e.relatedTarget && e.relatedTarget.closest('.menu'))) closeMenu(false);
+    if (!els.menu.hidden && e.relatedTarget && !e.relatedTarget.closest('.menu')) closeMenu(false);
   });
 
   els.helpOpen.addEventListener('click', () => {

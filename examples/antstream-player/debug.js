@@ -7,6 +7,13 @@
  * overlapping feed reads, rebuffer target). Opened with the Debug button;
  * the choice is remembered. The log can be copied or downloaded as JSON to
  * attach to a bug report.
+ *
+ * The panel is docked to the bottom of the window, over the page, and
+ * scrolls on its own. Its top edge drags it taller or shorter (mouse,
+ * pen or touch; the arrow keys when the edge has the focus), between
+ * MIN_HEIGHT and MAX_SHARE of the window, and the height is remembered.
+ * While it is open the page gets as much padding at the bottom as the
+ * panel is tall, so all of the page can still be scrolled into view.
  */
 (function () {
   'use strict';
@@ -16,6 +23,10 @@
   const { log, settings, setSetting, DEFAULTS } = player;
 
   const OPEN_KEY = 'antstream.debug';
+  const HEIGHT_KEY = 'antstream.debug.height';
+  const MIN_HEIGHT = 120;
+  const MAX_SHARE = 0.8;
+  const KEY_STEP = 24;
   const MAX_ROWS = 200;
   const SLOW_MS = 2000;
   const SPARK_W = 600;
@@ -23,6 +34,7 @@
 
   const toggle = document.getElementById('debug-toggle');
   const panel = document.getElementById('debug');
+  const stage = document.getElementById('stage');
   const video = document.getElementById('video');
 
   // -- formatting -----------------------------------------------------------
@@ -88,16 +100,43 @@
   }
   const knobs = {};
 
+  const grip = el('div', {
+    class: 'grip',
+    role: 'separator',
+    tabindex: '0',
+    'aria-orientation': 'horizontal',
+    'aria-label': 'Debug panel height',
+    title: 'Drag to resize',
+  });
+  const closeBtn = el('button', { type: 'button', class: 'close', 'aria-label': 'Close debug', title: 'Close', onclick: () => close() }, '×');
+  // The channel being played: owner and topic as the field shows them,
+  // and the feed topic hash the reads go to.
+  const chanName = el('code', {});
+  const chanTopic = el('code', {});
+  const chanLine = el('div', { class: 'chan' },
+    el('div', {}, el('span', { class: 'muted' }, 'Channel'), ' ', chanName),
+    el('div', {}, el('span', { class: 'muted' }, 'Feed topic'), ' ', chanTopic),
+  );
+  const body = el('div', { class: 'body' });
+
   panel.append(
+    grip,
     el('div', { class: 'head' },
       el('b', {}, 'Debug'),
       el('span', { class: 'muted' }, `${player.buildLabel()} · hls.js ${window.Hls ? Hls.version : '?'}`),
       el('span', { class: 'spacer' }),
-      pauseBtn,
-      copyBtn,
-      el('button', { type: 'button', onclick: downloadLog }, 'Download'),
-      el('button', { type: 'button', onclick: () => { log.entries = []; log.samples = []; log.touch(); } }, 'Clear'),
+      el('span', { class: 'tools' },
+        pauseBtn,
+        copyBtn,
+        el('button', { type: 'button', onclick: downloadLog }, 'Download'),
+        el('button', { type: 'button', onclick: () => { log.entries = []; log.samples = []; log.touch(); } }, 'Clear'),
+      ),
+      closeBtn,
     ),
+    body,
+  );
+  body.append(
+    chanLine,
     el('div', { class: 'buf' },
       bufNum,
       el('div', { class: 'buf-bar' }, bufFill, bufTarget, bufScale),
@@ -128,6 +167,14 @@
   }
 
   // -- rendering ------------------------------------------------------------
+
+  function renderChannel() {
+    const ch = player.channel;
+    const name = ch ? `0x${ch.owner} / ${ch.topic}` : '–';
+    const topic = ch ? ch.topicHex : '–';
+    if (chanName.textContent !== name) chanName.textContent = name;
+    if (chanTopic.textContent !== topic) chanTopic.textContent = topic;
+  }
 
   function renderBuffer() {
     const ahead = player.bufferAhead();
@@ -278,6 +325,7 @@
   let shown = -1;
   function render(force) {
     if (panel.hidden) return;
+    renderChannel();
     renderBuffer();
     if (!force && (paused || shown === log.version)) return;
     shown = log.version;
@@ -336,20 +384,120 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
+  // -- size -----------------------------------------------------------------
+
+  const maxHeight = () => Math.max(MIN_HEIGHT, Math.floor(window.innerHeight * MAX_SHARE));
+  const clampHeight = (h) => Math.round(Math.min(maxHeight(), Math.max(MIN_HEIGHT, h)));
+
+  // The height asked for (dragged, or remembered). It is shown clamped to
+  // the window as it is now, so a smaller window shrinks the panel without
+  // forgetting the height for a bigger one.
+  let height = Math.round(window.innerHeight * 0.4);
+  try {
+    const saved = Number(localStorage.getItem(HEIGHT_KEY));
+    if (Number.isFinite(saved) && saved > 0) height = saved;
+  } catch (_) {
+    /* the default */
+  }
+
+  function layout() {
+    const h = clampHeight(height);
+    panel.style.height = `${h}px`;
+    grip.setAttribute('aria-valuemin', String(MIN_HEIGHT));
+    grip.setAttribute('aria-valuemax', String(maxHeight()));
+    grip.setAttribute('aria-valuenow', String(h));
+    // Room under the page for the panel, so nothing stays hidden behind it.
+    document.body.style.paddingBottom = panel.hidden ? '' : `${h}px`;
+  }
+
+  function setHeight(h, save) {
+    height = clampHeight(h);
+    layout();
+    if (!save) return;
+    try {
+      localStorage.setItem(HEIGHT_KEY, String(height));
+    } catch (_) {
+      /* not remembered */
+    }
+  }
+
+  // Dragging the top edge, with a mouse, pen or finger (the grip has
+  // `touch-action: none`, so a drag on it doesn't scroll the page).
+  let drag = null;
+  grip.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    drag = { id: e.pointerId, y: e.clientY, h: clampHeight(height) };
+    try {
+      grip.setPointerCapture(e.pointerId);
+    } catch (_) {
+      /* moves still reach the grip while over it */
+    }
+    panel.classList.add('dragging');
+  });
+  grip.addEventListener('pointermove', (e) => {
+    if (drag && e.pointerId === drag.id) setHeight(drag.h + (drag.y - e.clientY), false);
+  });
+  const endDrag = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    drag = null;
+    panel.classList.remove('dragging');
+    setHeight(height, true);
+  };
+  grip.addEventListener('pointerup', endDrag);
+  grip.addEventListener('pointercancel', endDrag);
+  grip.addEventListener('keydown', (e) => {
+    const step = e.key === 'ArrowUp' ? KEY_STEP : e.key === 'ArrowDown' ? -KEY_STEP : 0;
+    if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      setHeight(e.key === 'End' ? maxHeight() : MIN_HEIGHT, true);
+    } else if (step) {
+      e.preventDefault();
+      setHeight(clampHeight(height) + step, true);
+    }
+  });
+  window.addEventListener('resize', layout);
+
   // -- open / close ---------------------------------------------------------
 
+  // Open (the Debug button's choice) and shown (open while a channel's
+  // stage is on screen: the start page has no Debug button to close it).
+  let wanted = false;
+  function show() {
+    panel.hidden = !wanted || stage.hidden;
+    toggle.classList.toggle('on', wanted);
+    toggle.setAttribute('aria-expanded', String(wanted));
+    layout();
+    render(true);
+  }
+
   function setOpen(open) {
-    panel.hidden = !open;
-    toggle.classList.toggle('on', open);
+    wanted = open;
     try {
       localStorage.setItem(OPEN_KEY, open ? '1' : '');
     } catch (_) {
       /* not remembered */
     }
-    render(true);
+    show();
   }
 
-  toggle.addEventListener('click', () => setOpen(panel.hidden));
+  // The ×, or Escape inside the panel. The focus goes back to the Debug
+  // button rather than being lost with the hidden panel.
+  function close() {
+    const hadFocus = panel.contains(document.activeElement);
+    setOpen(false);
+    if (hadFocus) toggle.focus();
+  }
+
+  toggle.setAttribute('aria-controls', 'debug');
+  toggle.addEventListener('click', () => setOpen(!wanted));
+  panel.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    }
+  });
+  new MutationObserver(show).observe(stage, { attributes: true, attributeFilter: ['hidden'] });
   let open = false;
   try {
     open = localStorage.getItem(OPEN_KEY) === '1';

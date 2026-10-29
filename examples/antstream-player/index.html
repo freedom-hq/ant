@@ -45,7 +45,6 @@
       <span class="spacer"></span>
       <button id="go-live" type="button" hidden>Jump to live</button>
       <button id="unmute" type="button">Unmute</button>
-      <button id="copy-link" type="button">Copy link</button>
       <button id="debug-toggle" type="button" title="Buffer, feed reads and segment fetches">Debug</button>
     </div>
     <p id="info-desc" class="desc" hidden></p>
@@ -57,8 +56,6 @@
       <div><dt>Segments</dt><dd id="stat-segments">–</dd></div>
       <div><dt>Resolution</dt><dd id="stat-res">–</dd></div>
     </dl>
-    <section id="debug" class="debug" hidden></section>
-    <p class="channel">Channel <code id="channel-ref"></code></p>
   </section>
 
   <section id="intro">
@@ -67,6 +64,8 @@
 
   <footer>Served from Swarm · <span id="player-version" class="version"></span></footer>
 </main>
+<!-- Docked to the bottom of the window, over the page (debug.js). -->
+<section id="debug" class="debug" aria-label="Debug" hidden></section>
 <dialog id="help" aria-labelledby="help-title">
   <div class="help-body">
     <h2 id="help-title">Help</h2>

@@ -23,7 +23,9 @@
 //  - the Menu button opens the menu with the focus on Help, Escape closes
 //    it back onto the button, a click outside closes it, so does the Menu
 //    button itself (also when, as in Safari, the press blurs Help first), Help opens the
-//    help dialog and Escape closes it back onto the Menu button.
+//    help dialog (also when, as in Safari, the press on Help itself
+//    clears the focus before the click) and Escape closes it back onto
+//    the Menu button.
 //
 // At a desktop window (1280×900) and a phone-sized one (390×844), where
 // the list must also stay clear of the Watch button and inside the
@@ -152,7 +154,7 @@ for (const vp of VIEWPORTS) {
   steps.push({ click: '#menu-button' }, { click: '#menu-button' });
   probe('menuToggled');
   // As Safari does it: a press on a button focuses nothing, so Help blurs
-  // with no relatedTarget (and focusout closes the menu) before the click.
+  // with no relatedTarget before the click.
   steps.push({ click: '#menu-button' }, {
     js: `document.getElementById('menu-button').addEventListener('mousedown', (e) => {
       e.preventDefault();
@@ -165,6 +167,17 @@ for (const vp of VIEWPORTS) {
   shot('help');
   steps.push({ key: 'Escape' }, { wait: 200 });
   probe('helpEscaped');
+  // Safari again: the press on Help clears the focus (a focusout with no
+  // relatedTarget) before its click lands. The menu must still be there
+  // for the click, and Help must open.
+  steps.push({ click: '#menu-button' }, {
+    js: `document.getElementById('help-open').addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      document.activeElement.blur();
+    }, { capture: true, once: true })`,
+  }, { click: '#help-open' }, { wait: 200 });
+  probe('helpOpenWebKit');
+  steps.push({ key: 'Escape' }, { wait: 200 });
 
   const stepsFile = join(work, `steps-${vp.name}.json`);
   writeFileSync(stepsFile, JSON.stringify(steps));
@@ -233,6 +246,8 @@ for (const vp of VIEWPORTS) {
     `with Safari's focus on a press, the Menu button reopened its menu: ${JSON.stringify(p.menuToggledWebKit)}`);
   check(p.helpOpen.helpOpen && p.helpOpen.focusInHelp && p.helpOpen.menuHidden, `Help: ${JSON.stringify(p.helpOpen)}`);
   check(!p.helpEscaped.helpOpen && p.helpEscaped.focus === 'menu-button', `Escape on the help: ${JSON.stringify(p.helpEscaped)}`);
+  check(p.helpOpenWebKit.helpOpen && p.helpOpenWebKit.menuHidden,
+    `with Safari's focus cleared on the press, Help did not open: ${JSON.stringify(p.helpOpenWebKit)}`);
   console.log(`${label.padEnd(8)} ${failures.length ? 'see failures' : 'ok'}`);
 }
 
