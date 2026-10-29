@@ -355,15 +355,48 @@ async fn wallet_xdai(payer: &Payer<'_>) -> Option<u128> {
         .ok()
 }
 
+/// Bound on each balance read [`wallet_funding`] makes. Those balances
+/// are only reported, never priced, so a read that stalls rather than
+/// errors is cut off and reported as unknown (`None`) instead of holding
+/// up the deposit status it rides along with: the gateway's whole
+/// deposit read is bounded at 30 s, and before #241 a deposit at its
+/// target never waited on the wallet at all.
+const WALLET_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The node wallet's balances with nothing to acquire: what a deposit
 /// at or above its target reports, so a host still sees what the wallet
-/// holds. Every pricing figure is `0`.
+/// holds. Every pricing figure is `0`. The two reads run concurrently,
+/// each bounded by [`WALLET_REPORT_TIMEOUT`]; one that fails or stalls
+/// is `None`.
 pub async fn wallet_funding(payer: &Payer<'_>) -> Funding {
+    async fn bounded(read: impl std::future::Future<Output = Option<u128>>) -> Option<u128> {
+        tokio::time::timeout(WALLET_REPORT_TIMEOUT, read)
+            .await
+            .ok()
+            .flatten()
+    }
+    let (wallet_bzz, wallet_xdai) =
+        tokio::join!(bounded(wallet_bzz(payer)), bounded(wallet_xdai(payer)));
     Funding {
-        wallet_bzz: wallet_bzz(payer).await,
-        wallet_xdai: wallet_xdai(payer).await,
+        wallet_bzz,
+        wallet_xdai,
         ..Funding::default()
     }
+}
+
+/// Whether a deposit status reads the node wallet's balances when the
+/// deposit is already at its target. With a shortfall they are always
+/// read, since the top-up is priced against them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletRead {
+    /// Always read and report them (the gateway's
+    /// `GET`/`POST /v0/settlement/deposit`, which return
+    /// `walletBzzPlur`/`walletXdaiWei`).
+    Always,
+    /// Only when there is a shortfall to price. At the target the
+    /// balances are `None` and no wallet read is made (the C API's
+    /// settlement deposit JSON, which carries no wallet balances).
+    WhenShort,
 }
 
 async fn storage_price(payer: &Payer<'_>) -> Result<u128, FundingError> {
@@ -758,13 +791,16 @@ fn checked_cost(amount_per_chunk: u128, depth: u8, what: &str) -> Result<u128, F
 
 /// The settlement deposit behind `chequebook`, read from chain, and what
 /// topping it up to `target` would take. No transaction is sent.
+/// `wallet` says whether the wallet's balances are read at the target
+/// too (see [`WalletRead`]).
 pub async fn deposit_status(
     payer: &Payer<'_>,
     chequebook: &[u8; 20],
     target: u128,
+    wallet: WalletRead,
 ) -> Result<DepositStatus, FundingError> {
     let deposited = chequebook_deposit(payer, chequebook).await?;
-    status_for(payer, chequebook, deposited, target).await
+    status_for(payer, chequebook, deposited, target, wallet).await
 }
 
 async fn status_for(
@@ -772,15 +808,23 @@ async fn status_for(
     chequebook: &[u8; 20],
     deposited: u128,
     target: u128,
+    wallet: WalletRead,
 ) -> Result<DepositStatus, FundingError> {
     let shortfall_plur = target.saturating_sub(deposited);
-    // The wallet's balances are reported either way: a deposit at its
-    // target still has a wallet behind it (#241). Only the top-up
-    // figures stay 0 when nothing is missing.
+    // With `WalletRead::Always` the wallet's balances are reported
+    // either way: a deposit at its target still has a wallet behind it
+    // (#241). Only the top-up figures stay 0 when nothing is missing.
     let funding = if shortfall_plur == 0 {
-        wallet_funding(payer).await
+        match wallet {
+            WalletRead::Always => wallet_funding(payer).await,
+            WalletRead::WhenShort => Funding {
+                wallet_bzz: None,
+                wallet_xdai: None,
+                ..Funding::default()
+            },
+        }
     } else {
-        let (bzz, xdai) = (wallet_bzz(payer).await, wallet_xdai(payer).await);
+        let (bzz, xdai) = tokio::join!(wallet_bzz(payer), wallet_xdai(payer));
         let to_acquire = shortfall_plur.saturating_sub(bzz.unwrap_or(0));
         price_funding(payer, to_acquire, bzz, xdai, true).await?
     };
@@ -827,6 +871,7 @@ pub async fn fund_deposit_with_xdai(
     chequebook: &[u8; 20],
     target: u128,
     add: Option<u128>,
+    wallet: WalletRead,
 ) -> Result<DepositStatus, FundingError> {
     let deposited = chequebook_deposit(payer, chequebook).await?;
     let goal = match add {
@@ -842,7 +887,7 @@ pub async fn fund_deposit_with_xdai(
     };
     let short = goal.saturating_sub(deposited);
     if short == 0 {
-        return status_for(payer, chequebook, deposited, target).await;
+        return status_for(payer, chequebook, deposited, target, wallet).await;
     }
     let to_acquire = short.saturating_sub(wallet_bzz_for_spend(payer).await?);
     if to_acquire > 0 {
@@ -873,7 +918,7 @@ pub async fn fund_deposit_with_xdai(
         Err(e) => return Err(FundingError::Deposit(e)),
     }
     // Re-read rather than assume: report what the chain says now.
-    deposit_status(payer, chequebook, target).await
+    deposit_status(payer, chequebook, target, wallet).await
 }
 
 /// The chequebook checks [`top_up_chequebook`] runs before its transfer,
@@ -1030,6 +1075,13 @@ mod tests {
         wallet_bzz_unreadable: bool,
         /// The node wallet's `eth_getBalance` read fails.
         wallet_xdai_unreadable: bool,
+        /// The node wallet's `eth_getBalance` is left to the client's
+        /// fallback RPC URL (a server that never answers): a read that
+        /// stalls rather than errors.
+        wallet_xdai_stalls: bool,
+        /// Wallet balance reads served or refused: `balanceOf` the node
+        /// wallet and `eth_getBalance`.
+        wallet_reads: std::sync::atomic::AtomicUsize,
         sent: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -1043,6 +1095,17 @@ mod tests {
             let word = |v: u128| format!("0x{v:064x}");
             let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
             let id = req["id"].clone();
+            let wallet_bzz_read = req["method"] == "eth_call"
+                && req["params"][0]["data"].as_str().is_some_and(|d| {
+                    d.starts_with("0x70a08231") && d[34..74] != hex::encode(CHEQUEBOOK)
+                });
+            if wallet_bzz_read || req["method"] == "eth_getBalance" {
+                self.wallet_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.wallet_xdai_stalls && req["method"] == "eth_getBalance" {
+                return None;
+            }
             if self.wallet_bzz_unreadable && req["method"] == "eth_call" {
                 let data = req["params"][0]["data"].as_str().unwrap();
                 if data.starts_with("0x70a08231") && data[34..74] != hex::encode(CHEQUEBOOK) {
@@ -1215,7 +1278,8 @@ mod tests {
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
         let payer = Payer::gnosis(&client, &wallet);
-        let result = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, add).await;
+        let result =
+            fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, add, WalletRead::Always).await;
         let sent = chain.sent.lock().unwrap().clone();
         (result, sent)
     }
@@ -1287,12 +1351,92 @@ mod tests {
     }
 
     async fn status_of(chain: ScriptedChain) -> DepositStatus {
-        let client =
-            ChainClient::new("http://127.0.0.1:1").with_transport(Some(std::sync::Arc::new(chain)));
+        status_reading(
+            std::sync::Arc::new(chain),
+            WalletRead::Always,
+            "http://127.0.0.1:1",
+        )
+        .await
+    }
+
+    async fn status_reading(
+        chain: std::sync::Arc<ScriptedChain>,
+        read: WalletRead,
+        fallback_url: &str,
+    ) -> DepositStatus {
+        let client = ChainClient::new(fallback_url).with_transport(Some(chain));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
-        deposit_status(&Payer::gnosis(&client, &wallet), &CHEQUEBOOK, TARGET)
+        deposit_status(&Payer::gnosis(&client, &wallet), &CHEQUEBOOK, TARGET, read)
             .await
             .unwrap()
+    }
+
+    /// The C API's deposit card carries no wallet balances: with
+    /// `WalletRead::WhenShort`, a deposit at its target makes no wallet
+    /// read at all, and a shortfall still reads both to price the top-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_deposit_skips_the_wallet_when_asked() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let chain = |chequebook_bzz| {
+            std::sync::Arc::new(ScriptedChain {
+                chequebook_bzz,
+                wallet_bzz: 165 * TARGET,
+                wallet_xdai: WEI_PER_XDAI,
+                ..ScriptedChain::default()
+            })
+        };
+        let full = chain(TARGET);
+        let status =
+            status_reading(full.clone(), WalletRead::WhenShort, "http://127.0.0.1:1").await;
+        assert!(!status.needs_top_up());
+        assert_eq!(status.funding, Funding::default());
+        assert_eq!(full.wallet_reads.load(SeqCst), 0);
+
+        let short = chain(0);
+        let status =
+            status_reading(short.clone(), WalletRead::WhenShort, "http://127.0.0.1:1").await;
+        assert!(status.needs_top_up());
+        assert_eq!(status.funding.wallet_bzz, Some(165 * TARGET));
+        assert_eq!(status.funding.wallet_xdai, Some(WEI_PER_XDAI));
+        assert_eq!(short.wallet_reads.load(SeqCst), 2);
+
+        let reported = chain(TARGET);
+        status_reading(reported.clone(), WalletRead::Always, "http://127.0.0.1:1").await;
+        assert_eq!(reported.wallet_reads.load(SeqCst), 2);
+    }
+
+    /// A wallet read that stalls (not errors) is cut off at
+    /// [`WALLET_REPORT_TIMEOUT`] and reported as unknown, well inside
+    /// the gateway's 30 s deposit-read bound, instead of holding up a
+    /// deposit status that needs no wallet figure to be priced.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_wallet_read_is_reported_as_unknown() {
+        // Accepts and never answers: the stalled RPC.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                open.push(conn);
+            }
+        });
+        let chain = std::sync::Arc::new(ScriptedChain {
+            chequebook_bzz: TARGET,
+            wallet_bzz: 165 * TARGET,
+            wallet_xdai_stalls: true,
+            ..ScriptedChain::default()
+        });
+        let started = tokio::time::Instant::now();
+        let status = status_reading(chain, WalletRead::Always, &url).await;
+        let took = started.elapsed();
+        held.abort();
+        assert!(!status.needs_top_up());
+        assert_eq!(
+            (status.funding.wallet_bzz, status.funding.wallet_xdai),
+            (Some(165 * TARGET), None)
+        );
+        assert!(took >= WALLET_REPORT_TIMEOUT, "{took:?}");
+        assert!(took < WALLET_REPORT_TIMEOUT * 2, "{took:?}");
     }
 
     /// #241: a deposit above its target still reports the wallet's real
@@ -1434,7 +1578,7 @@ mod tests {
         let c = chain();
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
         let payer = Payer::gnosis(&client, &wallet);
-        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, None).await;
+        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, None, WalletRead::Always).await;
         assert!(
             matches!(r, Err(FundingError::Read { .. })),
             "deposit: {r:?}"

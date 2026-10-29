@@ -2623,7 +2623,9 @@ async fn settlement_deposit_for(
         return to_json(&SettlementDeposit::none(target));
     }
     let payer = Payer::gnosis(client, wallet);
-    let status = funding::deposit_status(&payer, &cb, target)
+    // The card JSON carries no wallet balances, so a funded chequebook
+    // costs one deposit read, not two more wallet reads.
+    let status = funding::deposit_status(&payer, &cb, target, funding::WalletRead::WhenShort)
         .await
         .map_err(funding_err)?;
     to_json(&SettlementDeposit::of(&status))
@@ -2773,7 +2775,8 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, target, amount).await
+        funding::fund_deposit_with_xdai(&payer, &cb, target, amount, funding::WalletRead::WhenShort)
+            .await
     };
     match funded {
         Ok(status) => {

@@ -70,7 +70,8 @@ const ONE_SIDED: &[(&str, Side, &str)] = &[
         Side::Antd,
         "the gateway's `GET /v0/settlement/deposit` reports the node wallet's balances even \
          with no chequebook yet (#241); the C API's settlement deposit JSON carries no wallet \
-         balances, so it has nothing to read them for",
+         balances, so it has nothing to read them for (its deposit reads pass \
+         `WalletRead::WhenShort`)",
     ),
     (
         "top_up_batch",

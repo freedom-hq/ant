@@ -464,9 +464,14 @@ impl ChainWriter for AntChainWriter {
             let wallet = funding::wallet_funding(&self.payer()).await;
             return Ok(self.deposit_view(None, wallet));
         };
-        let status = funding::deposit_status(&self.payer(), &cb, self.deposit_target_or_default())
-            .await
-            .map_err(failure)?;
+        let status = funding::deposit_status(
+            &self.payer(),
+            &cb,
+            self.deposit_target_or_default(),
+            funding::WalletRead::Always,
+        )
+        .await
+        .map_err(failure)?;
         Ok(self.deposit_view(Some(&status), funding::Funding::default()))
     }
 
@@ -491,6 +496,7 @@ impl ChainWriter for AntChainWriter {
             &cb,
             self.deposit_target_or_default(),
             amount,
+            funding::WalletRead::Always,
         )
         .await
         .map_err(failure)?;
