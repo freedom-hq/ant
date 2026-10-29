@@ -95,10 +95,12 @@ field takes, how a channel plays and where it plays through are in
 Help, behind the menu button at the top right. The channels played
 before drop down under the field (an ARIA combobox: on focus of the
 empty field, narrowed as you type, arrow keys and Enter to watch one,
-Delete or × to remove it). They are kept in localStorage
-(`antstream.recent.v2`, the newest 8) as `{ key, title }`, the title
-being the one the owner's catalog last gave the channel; the bare key
-strings older builds stored still read. `node test/recent-test.mjs` (no
+Delete or × to remove it). They are kept in localStorage,
+the newest 8: their keys in `antstream.recent.v2` as the plain string
+array older builds read and write too, and the title the owner's
+catalog last gave each one beside them in `antstream.recent-titles.v1`
+(`{ [key]: title }`), so an older build of the player opened from the
+feed history still lists every channel and leaves the titles alone. `node test/recent-test.mjs` (no
 dependencies) checks the list's storage, and
 `ELECTRON=<path to electron> node test/start-page-test.mjs` (needs
 xvfb-run) drives the dropdown, the menu and Help with real key and

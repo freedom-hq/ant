@@ -44,9 +44,10 @@ const PAGE = `bzz://${'a'.repeat(64)}/`;
 const A = '0xd5572300e441b77b72bdd318bbfa7b97a1f03096/antstream';
 const B = '0x1111111111111111111111111111111111111111/cooking%20show';
 const C = `0x2222222222222222222222222222222222222222/0x${'ab'.repeat(32)}`;
-// Newest first: A with a title (an object entry), B and C as older builds
-// stored them (bare strings).
-const SEED = [{ key: A, title: 'Morning walk' }, B, C];
+// Newest first, as stored: the keys as bare strings (the shape older
+// builds read too), A's catalog title beside them.
+const SEED = [A, B, C];
+const SEED_TITLES = { [A]: 'Morning walk' };
 
 const VIEWPORTS = [
   { name: 'desktop', width: 1280, height: 900 },
@@ -67,6 +68,7 @@ const PROBE = `(() => {
     options: opts.map((o) => o.innerText.replace(/\\s+/g, ' ').trim()),
     focus: document.activeElement && (document.activeElement.id || document.activeElement.tagName),
     stored: JSON.parse(localStorage.getItem('antstream.recent.v2') || '[]'),
+    titles: JSON.parse(localStorage.getItem('antstream.recent-titles.v1') || '{}'),
     hash: decodeURIComponent(location.hash.slice(1)),
     menuHidden: document.getElementById('menu').hidden,
     menuExpanded: document.getElementById('menu-button').getAttribute('aria-expanded'),
@@ -99,12 +101,14 @@ for (const vp of VIEWPORTS) {
   const shot = (name) => steps.push({ shot: `${name}-${vp.name}.png` });
 
   // No recent channels.
-  steps.push({ js: "localStorage.removeItem('antstream.recent.v2')" }, { load: PAGE }, { wait: 300 });
+  steps.push({ js: "localStorage.removeItem('antstream.recent.v2'); localStorage.removeItem('antstream.recent-titles.v1')" }, { load: PAGE }, { wait: 300 });
   steps.push({ click: '#channel-input' });
   probe('empty');
   shot('start-empty');
   // Seeded.
-  steps.push({ js: `localStorage.setItem('antstream.recent.v2', ${JSON.stringify(JSON.stringify(SEED))})` }, { load: PAGE }, { wait: 300 });
+  steps.push({
+    js: `localStorage.setItem('antstream.recent.v2', ${JSON.stringify(JSON.stringify(SEED))}); localStorage.setItem('antstream.recent-titles.v1', ${JSON.stringify(JSON.stringify(SEED_TITLES))})`,
+  }, { load: PAGE }, { wait: 300 });
   steps.push({ click: '#channel-input' });
   probe('opened');
   shot('start-dropdown');
@@ -198,9 +202,9 @@ for (const vp of VIEWPORTS) {
   check(open(p.reopened) && p.reopened.active === 'recent-opt-0', `ArrowDown on the closed list: ${JSON.stringify([p.reopened.expanded, p.reopened.active])}`);
   check(open(p.filtered) && p.filtered.options.length === 1 && p.filtered.options[0].includes('cooking show') && !p.filtered.active,
     `typing "cooking" did not narrow the list to that channel: ${JSON.stringify(p.filtered.options)}`);
-  const keys = (s) => s.stored.map((e) => (typeof e === 'string' ? e : e.key));
+  const keys = (s) => (s.stored.every((e) => typeof e === 'string') ? s.stored : ['(not a string list)', ...s.stored]);
   check(closed(p.deleted) && keys(p.deleted).join() === [A, C].join(), `Delete did not remove the highlighted channel: ${JSON.stringify(p.deleted.stored)}`);
-  check(p.deleted.stored[0].title === 'Morning walk', `removing an entry lost another's title: ${JSON.stringify(p.deleted.stored)}`);
+  check(p.deleted.titles[A] === 'Morning walk', `removing an entry lost another's title: ${JSON.stringify(p.deleted.titles)}`);
   check(open(p.cleared) && p.cleared.options.length === 2, `clearing the field did not show the rest: ${JSON.stringify(p.cleared.options)}`);
   check(open(p.crossed) && keys(p.crossed).join() === A && p.crossed.options.length === 1 && p.crossed.focus === 'channel-input',
     `× did not remove the channel and keep the list: ${JSON.stringify(p.crossed)}`);

@@ -50,7 +50,10 @@
   const REF = /^([0-9a-f]{64}(?:[0-9a-f]{64})?)$/i;
   // A topic given as its raw 32 bytes rather than as text.
   const RAW_TOPIC = /^(?:0x)?([0-9a-f]{64})$/i;
+  // The recent list's keys, a plain string array (older builds read it
+  // too), and the titles kept beside them; see "recent channels".
   const RECENT_KEY = 'antstream.recent.v2';
+  const RECENT_TITLES_KEY = 'antstream.recent-titles.v1';
   // The topic text every AntStream app broadcast goes out on (the apps'
   // `ChannelAddress` `antstreamTopic`/`TOPIC`): an owner alone names it.
   const ANTSTREAM_TOPIC = 'antstream';
@@ -2025,12 +2028,31 @@
 
   // -- recent channels --------------------------------------------------------
   //
-  // The last channels played, newest first, kept in localStorage as
-  // `{ key, title }`: the channel's key (its hash) and the title its
-  // owner's catalog gave it, when one was read. Older builds stored the
-  // bare key string; those entries still read, without a title.
+  // The last channels played, newest first. localStorage keeps them in
+  // two places so that older builds of this page, which share the same
+  // origin's storage, keep working with the list:
+  //
+  //  - `antstream.recent.v2`: the channels' keys (their hash), a plain
+  //    array of strings, the shape every build has read and written;
+  //  - `antstream.recent-titles.v1`: `{ [key]: title }`, the title each
+  //    channel's owner's catalog last gave it, for this build alone.
+  //
+  // An older build reading the key list finds the strings it expects, and
+  // its own remember() rewrites only that list, so the titles survive it
+  // (a title is kept as long as its key is still listed). Entries of the
+  // form `{ key, title }` (a pre-release build of this list) still read.
 
   const RECENT_MAX = 8;
+
+  /** `{ [key]: title }` as stored; anything unreadable reads as none. */
+  function recentTitles() {
+    try {
+      const t = JSON.parse(localStorage.getItem(RECENT_TITLES_KEY) || '{}');
+      return t && typeof t === 'object' && !Array.isArray(t) ? t : {};
+    } catch (_) {
+      return {};
+    }
+  }
 
   /** Recent channels as `{ key, title }`; entries no channel parses from are dropped. */
   function recent() {
@@ -2041,18 +2063,25 @@
       return [];
     }
     if (!Array.isArray(list)) return [];
+    const titles = recentTitles();
     const out = [];
     for (const item of list) {
       const key = typeof item === 'string' ? item : item && typeof item.key === 'string' ? item.key : '';
-      const title = item && typeof item.title === 'string' ? item.title.trim() : '';
-      if (key && parseChannel(key) && !out.some((r) => r.key === key)) out.push({ key, title });
+      if (!key || !parseChannel(key) || out.some((r) => r.key === key)) continue;
+      const own = item && typeof item.title === 'string' ? item.title : '';
+      const kept = Object.prototype.hasOwnProperty.call(titles, key) && typeof titles[key] === 'string' ? titles[key] : '';
+      out.push({ key, title: (kept || own).trim() });
     }
     return out;
   }
 
   function storeRecent(list) {
+    const kept = list.slice(0, RECENT_MAX);
+    const titles = {};
+    for (const r of kept) if (r.title) titles[r.key] = r.title;
     try {
-      localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)));
+      localStorage.setItem(RECENT_KEY, JSON.stringify(kept.map((r) => r.key)));
+      localStorage.setItem(RECENT_TITLES_KEY, JSON.stringify(titles));
     } catch (_) {
       /* storage unavailable: not worth failing playback over */
     }

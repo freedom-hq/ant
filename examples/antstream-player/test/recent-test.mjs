@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // The recent-channel list the start page's dropdown shows, as kept in
-// localStorage (`antstream.recent.v2`).
+// localStorage (`antstream.recent.v2`, the keys as plain strings, and
+// `antstream.recent-titles.v1`, the titles beside them).
 //
 //   node test/recent-test.mjs
 //
@@ -11,6 +12,9 @@
 //
 //  - the bare key strings older builds stored still read, without a title,
 //    and side by side with `{ key, title }` entries;
+//  - the key list stays the string array older builds read and write, so
+//    an older build sharing the origin still lists every channel, and its
+//    own rewrite of the list keeps this build's titles;
 //  - unparseable, duplicate and malformed entries are dropped, and an
 //    unreadable store reads as empty;
 //  - playing a channel puts it first and keeps its known title, a
@@ -44,7 +48,7 @@ const code = [
   cut('  const ANTSTREAM_TOPIC = ', '\n') + '\n',
   cut('  /**\n   * A channel from what the viewer pasted', '  // -- settings and debug log'),
   cut('  // -- recent channels', '  // -- the recent dropdown'),
-  'Object.assign(globalThis, { recent, remember, rememberTitle, forget, matchRecent, shortOwner, RECENT_KEY });',
+  'Object.assign(globalThis, { recent, remember, rememberTitle, forget, matchRecent, shortOwner, RECENT_KEY, RECENT_TITLES_KEY });',
 ].join('\n');
 
 const store = new Map();
@@ -59,8 +63,40 @@ vm.runInContext(code, ctx);
 const P = ctx;
 const KEY = P.RECENT_KEY;
 assert.equal(KEY, 'antstream.recent.v2');
+assert.equal(P.RECENT_TITLES_KEY, 'antstream.recent-titles.v1');
 const set = (v) => store.set(KEY, typeof v === 'string' ? v : JSON.stringify(v));
-const stored = () => JSON.parse(store.get(KEY));
+// What is stored, read back as `{ key, title }` from the two keys.
+const stored = () => {
+  const keys = JSON.parse(store.get(KEY));
+  assert.ok(keys.every((k) => typeof k === 'string'), `the key list holds more than strings: ${store.get(KEY)}`);
+  const titles = JSON.parse(store.get(P.RECENT_TITLES_KEY) || '{}');
+  return keys.map((key) => ({ key, title: titles[key] || '' }));
+};
+
+// The build before this list kept titles (player.js before PR #245), as it
+// read and wrote the same key: it still runs from the feed history.
+const old = {};
+vm.runInContext(
+  `${cut('  const OWNER = ', '\n  const ANTSTREAM_TOPIC')}
+  ${cut('  const ANTSTREAM_TOPIC = ', '\n')}
+  ${cut('  /**\n   * A channel from what the viewer pasted', '  // -- settings and debug log')}
+  function recent() {
+    try {
+      const list = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
+      return Array.isArray(list) ? list.filter((k) => parseChannel(k)) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  function remember(key) {
+    try {
+      const list = [key, ...recent().filter((c) => c !== key)].slice(0, 8);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+    } catch (_) {}
+  }
+  Object.assign(old, { recent, remember });`,
+  vm.createContext({ window: { antstreamKeccak: K }, K, localStorage, old }),
+);
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
 const A = '0xd5572300e441b77b72bdd318bbfa7b97a1f03096/antstream';
@@ -106,6 +142,44 @@ test('an old list is rewritten with its entries kept', () => {
   set([A, B]);
   P.remember(C);
   assert.deepEqual(stored(), [{ key: C, title: '' }, { key: A, title: '' }, { key: B, title: '' }]);
+});
+
+test('an older build still reads the list, and keeps its titles', () => {
+  P.remember(A);
+  P.remember(B);
+  P.rememberTitle(A, 'Morning walk');
+  P.rememberTitle(B, 'Cooking show');
+  // The older build sees every channel, as the strings it expects.
+  assert.deepEqual(plain(old.recent()), [B, A]);
+  // Playing one there rewrites the key list only: nothing is lost.
+  old.remember(C);
+  assert.deepEqual(plain(old.recent()), [C, B, A]);
+  assert.deepEqual(plain(P.recent()), [
+    { key: C, title: '' },
+    { key: B, title: 'Cooking show' },
+    { key: A, title: 'Morning walk' },
+  ]);
+  old.remember(A);
+  assert.deepEqual(plain(P.recent()).map((r) => r.title), ['Morning walk', '', 'Cooking show']);
+});
+
+test('a title goes with its key when the key leaves the list', () => {
+  P.remember(A);
+  P.rememberTitle(A, 'Morning walk');
+  P.forget(A);
+  assert.deepEqual(JSON.parse(store.get(P.RECENT_TITLES_KEY)), {});
+  P.remember(A);
+  assert.deepEqual(stored(), [{ key: A, title: '' }]);
+});
+
+test('an unreadable titles store reads as no titles', () => {
+  set([A]);
+  store.set(P.RECENT_TITLES_KEY, '{not json');
+  assert.deepEqual(plain(P.recent()), [{ key: A, title: '' }]);
+  store.set(P.RECENT_TITLES_KEY, JSON.stringify([A]));
+  assert.deepEqual(plain(P.recent()), [{ key: A, title: '' }]);
+  store.set(P.RECENT_TITLES_KEY, JSON.stringify({ [A]: 7 }));
+  assert.deepEqual(plain(P.recent()), [{ key: A, title: '' }]);
 });
 
 test('the list keeps the newest 8', () => {
