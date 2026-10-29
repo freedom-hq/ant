@@ -824,16 +824,20 @@
    * topic (`Topic.fromString`, as Solar Punk's readers do; a 64-hex topic
    * is text too). Of several, the newest `timestamp` wins, the later one
    * on a tie: the same rule as Android's `Catalog.select` and iOS's
-   * `CatalogEntry.find`. Null when there is none.
+   * `CatalogEntry.find`. Null when there is none. `list` is the parsed
+   * body (see catalogList).
    */
-  function catalogEntry(text, ch) {
-    let list;
+  /** A catalog body parsed: its list of entries, or null if it isn't one. */
+  function catalogList(text) {
     try {
-      list = JSON.parse(text);
+      const list = JSON.parse(text);
+      return Array.isArray(list) ? list : null;
     } catch (_) {
       return null;
     }
-    if (!Array.isArray(list)) return null;
+  }
+
+  function catalogEntry(list, ch) {
     let best = null;
     for (const e of list) {
       if (!e || typeof e !== 'object') continue;
@@ -934,9 +938,13 @@
     if (!wanted()) return;
     catalog.lastAt = Date.now();
     if (a.status === 200) {
-      const entry = a.text.length > CATALOG_MAX_BYTES ? null : catalogEntry(a.text, ch);
+      const read = a.text.length > CATALOG_MAX_BYTES ? null : catalogList(a.text);
+      const entry = read ? catalogEntry(read, ch) : null;
       catalog.entry = entry;
-      if (entry && entry.title) rememberTitle(ch.key, entry.title);
+      // A catalog read in full is the owner's answer: an entry with no
+      // title, or none at all, clears a title kept from an earlier one.
+      // One that couldn't be read says nothing, and keeps it.
+      if (read) rememberTitle(ch.key, entry ? entry.title : '');
       catalog.last = entry ? `${entry.state || 'no state'}${entry.title ? ` · ${entry.title}` : ''}` : 'no entry for this channel';
       note(row, entry ? `catalog: ${catalog.last}` : 'catalog: no readable entry for this channel');
       renderCatalog();
@@ -2094,12 +2102,15 @@
     storeRecent([{ key, title: known ? known.title : '' }, ...list.filter((r) => r.key !== key)]);
   }
 
-  /** The catalog's title for `key`, kept where `key` already is in the list. */
+  /**
+   * The catalog's title for `key`, kept where `key` already is in the
+   * list; an empty one (the catalog has no title for it now) clears it.
+   */
   function rememberTitle(key, title) {
     const t = (title || '').trim();
     const list = recent();
     const at = list.findIndex((r) => r.key === key);
-    if (!t || at < 0 || list[at].title === t) return;
+    if (at < 0 || list[at].title === t) return;
     list[at] = { key, title: t };
     storeRecent(list);
   }
@@ -2294,9 +2305,26 @@
     if (refocus) els.menuButton.focus();
   }
 
-  els.menuButton.addEventListener('click', () => {
-    if (els.menu.hidden) openMenu();
-    else closeMenu(true);
+  // Whether the menu was open when the button was pressed. Safari doesn't
+  // focus a button on a click, so pressing it blurs Help with no
+  // relatedTarget and the focusout below has already closed the menu by
+  // the time the click lands: the click must act on the state at the
+  // press, or it would reopen what the press just closed. A click from
+  // the keyboard (Enter/Space, `detail` 0) has no press: it reads the menu
+  // as it is (and ignores a press that was dragged off and never clicked).
+  let menuOpenAtPress = null;
+  els.menuButton.addEventListener('pointerdown', () => {
+    menuOpenAtPress = !els.menu.hidden;
+  });
+  els.menuButton.addEventListener('click', (e) => {
+    const wasOpen = e.detail > 0 && menuOpenAtPress !== null ? menuOpenAtPress : !els.menu.hidden;
+    menuOpenAtPress = null;
+    if (wasOpen) {
+      closeMenu(false);
+      els.menuButton.focus();
+    } else {
+      openMenu();
+    }
   });
   els.menuButton.addEventListener('keydown', (e) => {
     if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && els.menu.hidden) {

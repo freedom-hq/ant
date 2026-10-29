@@ -21,7 +21,8 @@
 //    key) and closes the list;
 //  - Tab goes field → Watch → Menu;
 //  - the Menu button opens the menu with the focus on Help, Escape closes
-//    it back onto the button, a click outside closes it, Help opens the
+//    it back onto the button, a click outside closes it, so does the Menu
+//    button itself (also when, as in Safari, the press blurs Help first), Help opens the
 //    help dialog and Escape closes it back onto the Menu button.
 //
 // At a desktop window (1280×900) and a phone-sized one (390×844), where
@@ -147,6 +148,18 @@ for (const vp of VIEWPORTS) {
   probe('menuEscaped');
   steps.push({ click: '#menu-button' }, { at: [10, Math.round(vp.height * 0.7)] });
   probe('menuOutside');
+  // The Menu button toggles it shut again.
+  steps.push({ click: '#menu-button' }, { click: '#menu-button' });
+  probe('menuToggled');
+  // As Safari does it: a press on a button focuses nothing, so Help blurs
+  // with no relatedTarget (and focusout closes the menu) before the click.
+  steps.push({ click: '#menu-button' }, {
+    js: `document.getElementById('menu-button').addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      document.activeElement.blur();
+    }, { capture: true, once: true })`,
+  }, { click: '#menu-button' });
+  probe('menuToggledWebKit');
   steps.push({ click: '#menu-button' }, { key: 'Enter' }, { wait: 200 });
   probe('helpOpen');
   shot('help');
@@ -214,6 +227,10 @@ for (const vp of VIEWPORTS) {
   check(!p.menuOpen.menuHidden && p.menuOpen.menuExpanded === 'true' && p.menuOpen.focus === 'help-open', `menu: ${JSON.stringify(p.menuOpen)}`);
   check(p.menuEscaped.menuHidden && p.menuEscaped.menuExpanded === 'false' && p.menuEscaped.focus === 'menu-button', `Escape on the menu: ${JSON.stringify(p.menuEscaped)}`);
   check(p.menuOutside.menuHidden, 'a click outside left the menu open');
+  check(p.menuToggled.menuHidden && p.menuToggled.menuExpanded === 'false' && p.menuToggled.focus === 'menu-button',
+    `the Menu button did not close its open menu: ${JSON.stringify(p.menuToggled)}`);
+  check(p.menuToggledWebKit.menuHidden && p.menuToggledWebKit.menuExpanded === 'false',
+    `with Safari's focus on a press, the Menu button reopened its menu: ${JSON.stringify(p.menuToggledWebKit)}`);
   check(p.helpOpen.helpOpen && p.helpOpen.focusInHelp && p.helpOpen.menuHidden, `Help: ${JSON.stringify(p.helpOpen)}`);
   check(!p.helpEscaped.helpOpen && p.helpEscaped.focus === 'menu-button', `Escape on the help: ${JSON.stringify(p.helpEscaped)}`);
   console.log(`${label.padEnd(8)} ${failures.length ? 'see failures' : 'ok'}`);

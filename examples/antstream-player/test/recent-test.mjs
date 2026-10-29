@@ -194,10 +194,14 @@ test('a catalog title is stored next to its key', () => {
   set([A, B]);
   P.rememberTitle(B, '  Cooking show  ');
   assert.deepEqual(stored(), [{ key: A, title: '' }, { key: B, title: 'Cooking show' }]);
-  // A newer title replaces it; an empty one keeps it.
+  // A newer title replaces it.
   P.rememberTitle(B, 'Cooking show, part 2');
-  P.rememberTitle(B, '');
   assert.equal(stored()[1].title, 'Cooking show, part 2');
+  // An empty one (the catalog's entry has no title now, or there is no
+  // entry) clears it, from the titles store too.
+  P.rememberTitle(B, '   ');
+  assert.deepEqual(stored(), [{ key: A, title: '' }, { key: B, title: '' }]);
+  assert.deepEqual(JSON.parse(store.get(P.RECENT_TITLES_KEY)), {});
   // Only for a channel that is in the list, and the order stays.
   P.rememberTitle(C, 'Not listed');
   assert.deepEqual(stored().map((e) => e.key), [A, B]);
