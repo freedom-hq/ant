@@ -817,16 +817,6 @@
 
   const str = (v) => (typeof v === 'string' ? v : '');
 
-  /**
-   * This channel's entry in a catalog body, every field checked (the
-   * catalog is the owner's own JSON, and may be anything): the entry whose
-   * owner is the channel's and whose topic text hashes to the channel's
-   * topic (`Topic.fromString`, as Solar Punk's readers do; a 64-hex topic
-   * is text too). Of several, the newest `timestamp` wins, the later one
-   * on a tie: the same rule as Android's `Catalog.select` and iOS's
-   * `CatalogEntry.find`. Null when there is none. `list` is the parsed
-   * body (see catalogList).
-   */
   /** A catalog body parsed: its list of entries, or null if it isn't one. */
   function catalogList(text) {
     try {
@@ -837,6 +827,16 @@
     }
   }
 
+  /**
+   * This channel's entry in a catalog body, every field checked (the
+   * catalog is the owner's own JSON, and may be anything): the entry whose
+   * owner is the channel's and whose topic text hashes to the channel's
+   * topic (`Topic.fromString`, as Solar Punk's readers do; a 64-hex topic
+   * is text too). Of several, the newest `timestamp` wins, the later one
+   * on a tie: the same rule as Android's `Catalog.select` and iOS's
+   * `CatalogEntry.find`. Null when there is none. `list` is the parsed
+   * body (see catalogList).
+   */
   function catalogEntry(list, ch) {
     let best = null;
     for (const e of list) {
