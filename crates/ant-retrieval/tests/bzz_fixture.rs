@@ -143,7 +143,9 @@ async fn replays_mainnet_bzz_fixture() {
 
     // The live root chunk's span carries a redundancy level byte; the
     // joiner decodes it on every path. `allow_degraded_redundancy` is a
-    // legacy no-op, set here only to mirror what the CLI sends.
+    // legacy no-op (antctl only sends `true` when a user passes the
+    // deprecated `--allow-degraded-redundancy` flag; it defaults to
+    // `false`), so the join must succeed with it set too.
     let opts = JoinOptions {
         allow_degraded_redundancy: true,
     };

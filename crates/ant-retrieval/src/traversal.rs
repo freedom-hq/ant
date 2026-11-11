@@ -95,8 +95,10 @@ pub async fn traverse_chunk_addresses(
     Ok(out)
 }
 
-/// Little-endian span with the redundancy-level byte masked off, the way
-/// the joiner reads root spans.
+/// Little-endian span with the top (redundancy-level) byte always
+/// zeroed. Looser than the joiner's `rs::decode_span`, which clears that
+/// byte only when it carries a level (> 128): a top byte of 1..=128 is
+/// rejected by the joiner as too large but read here as a smaller span.
 fn masked_span(wire: &[u8]) -> Result<u64, TraversalError> {
     let mut span: [u8; SPAN_SIZE] = wire
         .get(..SPAN_SIZE)
