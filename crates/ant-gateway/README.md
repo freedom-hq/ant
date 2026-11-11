@@ -147,11 +147,15 @@ the stub responses for `/wallet`, `/chequebook/{address,balance}`,
 and `/stamps` need to flip to real values *and* `/node` flips to
 `beeMode: "light"` — that's a single coordinated change.
 
-**One real read-path gap:** Reed-Solomon erasure decoding (drop-in
-#8). Files uploaded with `--swarm-redundancy={1,2,3}` need RS
-decoding when individual data chunks are unreachable. Today every
-data chunk must be reachable; clients can opt in via the daemon's
-`--allow-degraded-redundancy` flag.
+**Reed-Solomon recovery is on by default** (drop-in #8). Files
+uploaded with a redundancy level (`Swarm-Redundancy-Level` 1-4) are
+read with parity-aware geometry, and a data chunk that can't be
+fetched is recovered from its siblings and parities (bee's `DATA`
+strategy with recovery fallback). An unreachable root chunk falls
+back to its dispersed replicas. `Swarm-Redundancy-Strategy` and
+`Swarm-Redundancy-Fallback-Mode` are accepted and ignored. Nothing
+needs to be switched on: `antctl get --allow-degraded-redundancy`
+is a no-op, kept only so existing callers keep working.
 
 ### Other intentional non-features
 

@@ -756,7 +756,7 @@ pub async fn list_manifest_paths(
     collect_entries(
         fetcher,
         root_node,
-        String::new(),
+        Vec::new(),
         &mut entries,
         &mut visited,
         0,
@@ -1413,6 +1413,15 @@ fn walk<'a>(
     })
 }
 
+/// A listing entry's path: the root's own entry lists as `/`.
+fn entry_path(path: &[u8]) -> String {
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        String::from_utf8_lossy(path).into_owned()
+    }
+}
+
 fn metadata_to_btree(metadata: HashMap<String, String>) -> BTreeMap<String, String> {
     metadata.into_iter().collect()
 }
@@ -1420,7 +1429,7 @@ fn metadata_to_btree(metadata: HashMap<String, String>) -> BTreeMap<String, Stri
 fn collect_entries<'a>(
     fetcher: &'a dyn ChunkFetcher,
     node: Node,
-    path: String,
+    path: Vec<u8>,
     entries: &'a mut Vec<ManifestEntry>,
     visited: &'a mut HashSet<Vec<u8>>,
     depth: usize,
@@ -1437,22 +1446,14 @@ fn collect_entries<'a>(
         if node_has_value {
             let reference = node.entry.clone();
             entries.push(ManifestEntry {
-                path: if path.is_empty() {
-                    "/".to_string()
-                } else {
-                    path.clone()
-                },
+                path: entry_path(&path),
                 reference: Some(reference),
                 metadata: metadata_to_btree(node_metadata),
                 size: None,
             });
         } else if !node_metadata.is_empty() {
             entries.push(ManifestEntry {
-                path: if path.is_empty() {
-                    "/".to_string()
-                } else {
-                    path.clone()
-                },
+                path: entry_path(&path),
                 reference: None,
                 metadata: metadata_to_btree(node_metadata),
                 size: None,
@@ -1470,15 +1471,15 @@ fn collect_entries<'a>(
                 break;
             }
 
-            let fork_path = format!("{path}{}", String::from_utf8_lossy(&fork.prefix));
+            // Concatenate raw bytes and decode only the whole path: a
+            // fork boundary can fall inside a UTF-8 sequence (`é.txt` and
+            // `è.txt` share the lead byte 0xc3), so decoding per prefix
+            // would mangle both names.
+            let fork_path = [path.as_slice(), &fork.prefix].concat();
             if fork.child_ref.iter().all(|&b| b == 0) {
                 if !fork.metadata.is_empty() {
                     entries.push(ManifestEntry {
-                        path: if fork_path.is_empty() {
-                            "/".to_string()
-                        } else {
-                            fork_path
-                        },
+                        path: entry_path(&fork_path),
                         reference: None,
                         metadata: metadata_to_btree(fork.metadata),
                         size: None,
@@ -1489,11 +1490,7 @@ fn collect_entries<'a>(
 
             if !visited.insert(fork.child_ref.clone()) {
                 entries.push(ManifestEntry {
-                    path: if fork_path.is_empty() {
-                        "/".to_string()
-                    } else {
-                        fork_path
-                    },
+                    path: entry_path(&fork_path),
                     reference: Some(fork.child_ref),
                     metadata: metadata_to_btree(fork.metadata),
                     size: None,
@@ -1527,11 +1524,7 @@ fn collect_entries<'a>(
                 }
                 Err(_) => {
                     entries.push(ManifestEntry {
-                        path: if fork_path.is_empty() {
-                            "/".to_string()
-                        } else {
-                            fork_path
-                        },
+                        path: entry_path(&fork_path),
                         reference: Some(fork.child_ref),
                         metadata: metadata_to_btree(fork.metadata),
                         size: None,

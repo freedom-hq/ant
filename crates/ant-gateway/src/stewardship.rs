@@ -10,6 +10,11 @@
 //! * `GET /stewardship/{address}` (`bee/pkg/api/stewardship.go`):
 //!   traverse the content tree and report
 //!   `{"isRetrievable": true|false}`.
+//! * `GET /stewardship/{address}/stamps` (proposed for bee in
+//!   ethersphere/bee#5682): walk the tree like the `GET` above and
+//!   report, from this node's own stamp-issuer records, how many of its
+//!   chunks each of the node's batches stamps and how many none does:
+//!   `{"chunks","batches":[{"batchID","chunks"}],"unstamped"}`.
 //! * `PUT /stewardship/{address}`: re-upload the tree — fetch every
 //!   chunk, stamp against the batch header, pushsync. `200` with bee's
 //!   `jsonhttp.OK(w, nil)` body: `{"code":200,"message":"OK"}`.
@@ -188,6 +193,100 @@ pub async fn stewardship_get(
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
         }
     }
+}
+
+/// `GET /stewardship/{address}/stamps` — `200 {"chunks": N, "batches":
+/// [{"batchID", "chunks"}], "unstamped": M}`. `batches` lists every batch
+/// this node issues stamps from, sorted by id and including those that
+/// stamp none of the tree; a chunk stamped by two of them counts in
+/// both; `unstamped` counts the chunks none of them stamped. The walk
+/// fetches only interior and manifest nodes (leaves are listed from
+/// their parents), so the counts say nothing about whether the leaves
+/// are retrievable — that is the plain `GET`'s question. A walk that
+/// can't complete is an error, never partial counts; so is a batch whose
+/// records are unavailable (`500`) or a node with no stamp issuers yet
+/// (`503`). Read-only and open on the same terms as `/stamps`.
+///
+/// The counts are this data dir's records, with the limits
+/// `stamps::stamp_chunk` lists: stamps issued by an older Ant,
+/// by bee, or into a lost data dir count as unstamped; a counted chunk
+/// was stamped, not necessarily delivered (a failed or partial
+/// `PUT /stewardship` still leaves the chunks it stamped counted on the
+/// new batch); and on a mutable batch whose bucket wrapped a counted
+/// chunk may have lost its slot.
+pub async fn stewardship_stamps(
+    State(handle): State<GatewayHandle>,
+    Path(addr): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let reference = match parse_reference(&addr) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Chunk, "stewardship-stamps".to_string());
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::StewardshipStamps {
+        reference,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("stamps check timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    match ack {
+        ControlAck::StewardshipStamps(view) => {
+            guard.update(1, 1, 0, 0);
+            json_response(StatusCode::OK, &stewardship_stamps_body(&view))
+        }
+        ControlAck::Error { message } => {
+            warn!(target: "ant_gateway", %message, "stewardship stamps check failed");
+            if message.starts_with("uploads not configured") {
+                json_error(StatusCode::SERVICE_UNAVAILABLE, message)
+            } else {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("stamps check failed: {message}"),
+                )
+            }
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from StewardshipStamps");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
+        }
+    }
+}
+
+/// JSON body of `GET /stewardship/{address}/stamps`.
+fn stewardship_stamps_body(view: &ant_control::StewardshipStampsView) -> serde_json::Value {
+    serde_json::json!({
+        "chunks": view.chunks,
+        "batches": view
+            .batches
+            .iter()
+            .map(|b| serde_json::json!({
+                "batchID": hex::encode(b.batch_id),
+                "chunks": b.chunks,
+            }))
+            .collect::<Vec<_>>(),
+        "unstamped": view.unstamped,
+    })
 }
 
 /// `PUT /stewardship/{address}` — bee parses the path first, then the

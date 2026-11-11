@@ -724,6 +724,36 @@ pub enum ControlCommand {
         batch_id: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Gateway `GET /stamps/{id}/chunks/{address}` (proposed for bee in
+    /// ethersphere/bee#5682): whether this node stamped `address` with
+    /// `batch_id`, read from the batch issuer's own per-chunk stamp
+    /// records (the `.stamps` sidecar). One lookup, no network. Ack is
+    /// [`ControlAck::StampedChunk`] (`stamp: None` when the issuer has
+    /// no record of the chunk), or `Error` containing `issuer does not
+    /// exist` for an unregistered batch, starting `uploads not
+    /// configured` when the node has no upload runtime yet, or
+    /// containing `stamp records unavailable` when the issuer's sidecar
+    /// can't be safely used (see
+    /// `ant_postage::StampIssuer::stamp_records_unavailable`; a miss
+    /// then can't be told apart from a lost record).
+    StampedChunk {
+        batch_id: [u8; 32],
+        address: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `GET /stewardship/{reference}/stamps` (proposed for bee in
+    /// ethersphere/bee#5682): walk the content tree at `reference` the
+    /// way [`ControlCommand::StewardshipGet`] does, then count, for each
+    /// batch this node issues stamps from, how many of the tree's chunks
+    /// its records say it stamped, and how many chunks no batch stamped.
+    /// Ack is [`ControlAck::StewardshipStamps`]; `Error` when the walk
+    /// fails (no partial counts), when the node has no upload runtime
+    /// (`uploads not configured`), or when any issuer's records are
+    /// unavailable (`stamp records unavailable`).
+    StewardshipStamps {
+        reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Gateway read-only settlement/balance endpoints (`GET /balances`,
     /// `/consumed`, `/settlements`, `/timesettlements`,
     /// `/chequebook/cheque` and their `/{peer}` variants): snapshot the
@@ -900,6 +930,14 @@ pub enum ControlAck {
     },
     /// Terminal ack on `PostageBuckets`.
     PostageBuckets(PostageBucketsView),
+    /// Terminal ack on `StampedChunk`: the full 113-byte stamp
+    /// (`batch_id(32) ‖ index(8) ‖ timestamp(8) ‖ sig(65)`) the issuer
+    /// recorded for the chunk, or `None` when it has no record of it.
+    StampedChunk {
+        stamp: Option<[u8; 113]>,
+    },
+    /// Terminal ack on `StewardshipStamps`.
+    StewardshipStamps(StewardshipStampsView),
     /// Successful feed resolution: the reference the latest update points
     /// at, the sequence index it lived at, the SOC signature of that
     /// update chunk, and whether it resolved as v2 (the wrapped CAC is
@@ -1007,6 +1045,27 @@ pub struct PostageBucketsView {
     /// `2^(depth - bucket_depth)` — max collisions per bucket.
     pub bucket_upper_bound: u32,
     pub collisions: Vec<u32>,
+}
+
+/// Per-batch stamp coverage of a content tree, answering
+/// `GET /stewardship/{reference}/stamps`. `chunks` is the number of
+/// distinct chunks in the tree; `batches` lists every batch this node
+/// issues stamps from (sorted by id, zero counts included) with how many
+/// of those chunks its records say it stamped; `unstamped` is how many
+/// chunks no listed batch stamped. A chunk stamped by two batches counts
+/// once in each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StewardshipStampsView {
+    pub chunks: u64,
+    pub batches: Vec<BatchChunkCount>,
+    pub unstamped: u64,
+}
+
+/// One row of [`StewardshipStampsView::batches`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchChunkCount {
+    pub batch_id: [u8; 32],
+    pub chunks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

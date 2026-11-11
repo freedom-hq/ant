@@ -5,16 +5,21 @@
 //! it via `tower::ServiceExt::oneshot` — no socket, no port binding,
 //! no flaky timing.
 
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{DefaultBodyLimit, Request};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, on, patch, post, put, MethodFilter, MethodRouter};
 use axum::Router;
+use hyper::body::{Frame, SizeHint};
 
-use tracing::Instrument;
+use tracing::{Instrument, Level, Span};
 
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
@@ -73,6 +78,9 @@ pub fn build(handle: GatewayHandle) -> Router {
         // Per-bucket collision counters of a registered batch (bee
         // `postageGetStampBucketsHandler`).
         .route("/stamps/{id}/buckets", get(stamps::stamp_buckets))
+        // Whether this node stamped a chunk with one of its batches, from
+        // the issuer's own records (proposed for bee, ethersphere/bee#5682).
+        .route("/stamps/{id}/chunks/{address}", get(stamps::stamp_chunk))
         // Network batch listing / lookup (bee `postageGetAllBatchesHandler`
         // / `postageGetBatchHandler`). Ant has no postage event sync, so
         // the global list is honestly empty and the single-batch lookup
@@ -178,6 +186,12 @@ pub fn build(handle: GatewayHandle) -> Router {
             "/stewardship/{address}",
             get(stewardship::stewardship_get).put(stewardship::stewardship_put),
         )
+        // Per-batch stamp coverage of a tree, from this node's issuer
+        // records (proposed for bee, ethersphere/bee#5682).
+        .route(
+            "/stewardship/{address}/stamps",
+            get(stewardship::stewardship_stamps),
+        )
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
         // PSS: wrap+mine+stamp+push a trojan chunk to a target
         // neighborhood (bee `pss.go`). Light-node send.
@@ -255,25 +269,59 @@ pub fn build(handle: GatewayHandle) -> Router {
         .with_state(handle)
 }
 
-/// Wrap every request in a tracing span carrying the method and target
-/// path, and tag the response with the elapsed time once the handler
-/// returns. The span keeps each request's logs from interleaving
-/// across concurrent connections; the elapsed log gives ops a one-line
-/// "did this work?" trace without enabling debug-level on the joiner.
+/// Source of the per-request id carried in the `http` span (`req=N`),
+/// so every gateway log line for one request, including the line the
+/// response body writes when it finishes, can be tied together. Process-
+/// local and monotonic; one relaxed atomic add per request.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Wrap every request in a tracing span carrying a request id, the
+/// method and target path, and tag the response with the elapsed time
+/// once the handler returns. The span keeps each request's logs from
+/// interleaving across concurrent connections; the elapsed log gives ops
+/// a one-line "did this work?" trace without enabling debug-level on the
+/// joiner.
+///
+/// The request id is allocated at every level (one relaxed atomic add),
+/// so `warn` lines inside the span carry `req=N` too. At `debug` the
+/// request is also logged on arrival (with its `Range` header), and the
+/// response body is wrapped in [`LoggedBody`], which logs once the body
+/// is finished: bytes handed to hyper against the announced
+/// `Content-Length`, duration from request start, and whether (and why)
+/// the body ended early. Headers go out long before a streamed body is
+/// done, so the handler-return line alone can't show a body that is cut
+/// short (issue #82). Below `debug` the body isn't wrapped and neither
+/// debug line is built.
 async fn request_span(req: Request, next: Next) -> Response {
+    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let span = tracing::info_span!(
         target: "ant_gateway",
         "http",
+        req = id,
         %method,
         %path,
     );
+    let debug = tracing::enabled!(target: "ant_gateway", Level::DEBUG);
+    if debug {
+        let range = req
+            .headers()
+            .get(header::RANGE)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        span.in_scope(|| {
+            tracing::debug!(
+                target: "ant_gateway",
+                range = range.as_deref().unwrap_or("-"),
+                "request received"
+            );
+        });
+    }
     let started = Instant::now();
     let mut resp = next.run(req).instrument(span.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let status = resp.status().as_u16();
-    let _entered = span.enter();
+    let entered = span.enter();
     resp.headers_mut().insert(
         axum::http::header::SERVER,
         HeaderValue::from_static(SERVER_HEADER),
@@ -308,7 +356,151 @@ async fn request_span(req: Request, next: Next) -> Response {
     } else {
         tracing::debug!(target: "ant_gateway", %status, %method, %path, elapsed_ms, "request");
     }
+    drop(entered);
+    // `HEAD` answers carry the would-be `Content-Length` over an empty
+    // body by design; comparing the two would flag every one as cut.
+    if debug && method != Method::HEAD {
+        // Handlers that set no header (every `Json` answer) still get a
+        // `Content-Length` on the wire: hyper writes the body's exact
+        // size hint.
+        let content_length = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| resp.body().size_hint().exact());
+        resp = resp.map(|body| {
+            Body::new(LoggedBody {
+                inner: body,
+                span,
+                status,
+                content_length,
+                started,
+                sent: 0,
+                end: None,
+            })
+        });
+    }
     resp
+}
+
+/// How a [`LoggedBody`] stopped producing frames.
+#[derive(Debug)]
+enum BodyEnd {
+    /// The inner body reported its end of stream.
+    Complete,
+    /// The inner body yielded an error; hyper aborts the connection
+    /// (that is how a streamed body that fails after the headers shows
+    /// up to a client: a short read).
+    Error(String),
+}
+
+/// Response body wrapper installed by [`request_span`] at `debug` level.
+/// Counts the data bytes handed to hyper (not what the client
+/// acknowledged) and, when dropped, logs one `response body finished`
+/// line inside the request's span. `end` tells apart a node/stream error
+/// (`error`, with its message), a body that ended cleanly (`complete`,
+/// `ended_early` if short of `Content-Length`), and one dropped before
+/// its end (`aborted`: the client went away or a write failed; hyper
+/// drops the body the same way in both cases, so the body can't tell
+/// them apart). Size hint and end-of-stream are forwarded unchanged, so
+/// the response's framing (`Content-Length` vs chunked) is identical to
+/// the unwrapped body.
+struct LoggedBody {
+    inner: Body,
+    span: Span,
+    status: u16,
+    content_length: Option<u64>,
+    started: Instant,
+    sent: u64,
+    end: Option<BodyEnd>,
+}
+
+impl HttpBody for LoggedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        // Enter the request span while the body is polled, so log lines
+        // the streaming body emits (stall, unexpected ack) carry `req=N`.
+        let _entered = this.span.enter();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.sent += data.len() as u64;
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                if this.end.is_none() {
+                    this.end = Some(BodyEnd::Error(e.to_string()));
+                }
+            }
+            Poll::Ready(None) => {
+                if this.end.is_none() {
+                    this.end = Some(BodyEnd::Complete);
+                }
+            }
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl LoggedBody {
+    /// `(end, ended_early, error)` for the finish line.
+    ///
+    /// hyper stops polling a body as soon as it has written the
+    /// announced `Content-Length` and drops it without ever seeing its
+    /// end of stream, so a body dropped with every announced byte sent
+    /// is complete. So is one hyper never had to poll because it was
+    /// empty from the start (`204`, `304`, an empty JSON answer). Any
+    /// other body dropped before its end is `aborted`: the client went
+    /// away, a write failed, or the connection was torn down.
+    fn outcome(&self) -> (&'static str, bool, Option<&str>) {
+        let short = self.content_length.is_some_and(|n| self.sent < n);
+        match &self.end {
+            Some(BodyEnd::Error(e)) => ("error", true, Some(e.as_str())),
+            Some(BodyEnd::Complete) => ("complete", short, None),
+            None if self.inner.is_end_stream() => ("complete", short, None),
+            None if self.content_length.is_some() && !short => ("complete", false, None),
+            None => ("aborted", true, None),
+        }
+    }
+}
+
+impl Drop for LoggedBody {
+    fn drop(&mut self) {
+        let (end, ended_early, error) = self.outcome();
+        let content_length = self
+            .content_length
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let _entered = self.span.enter();
+        tracing::debug!(
+            target: "ant_gateway",
+            status = self.status,
+            bytes_sent = self.sent,
+            content_length = %content_length,
+            elapsed_ms,
+            end,
+            ended_early,
+            error = error.unwrap_or("-"),
+            "response body finished"
+        );
+    }
 }
 
 /// Same handler for both `GET` and `HEAD`. Each retrieval handler
