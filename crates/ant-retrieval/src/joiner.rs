@@ -120,7 +120,10 @@ const SUBTREE_RETRY_ATTEMPTS: usize = 32;
 /// and sweeps collect a fraction of their shards (issue #114). The
 /// content is fine; it just has to wait for credit. Once bytes have
 /// gone out the response can't restart, so this is retried in place,
-/// like [`SUBTREE_RETRY_ATTEMPTS`] does for plain fetch misses.
+/// like [`SUBTREE_RETRY_ATTEMPTS`] does for plain fetch misses. The same
+/// goes for shards peers answered "not found" until those answers have
+/// held for [`crate::rs::MISS_CONFIRM_AFTER`] (10 s, issue #79): only
+/// then does a shortfall of them become permanent and end the retries.
 ///
 /// The bound is wall-clock: no new sweep starts once
 /// [`RECOVERY_RETRY_BUDGET`] has passed since this child's first fetch
@@ -210,8 +213,10 @@ pub enum JoinError {
     /// of that node are unreachable, or the reconstruction output
     /// failed CAC validation). Terminal: a recovery that fell short only
     /// for want of reachable peers has already been retried in place
-    /// with back-off before this is returned (issue #114), and one that
-    /// failed on confirmed-missing shards or a bad decode can't improve.
+    /// with back-off before this is returned (issue #114), as has one
+    /// whose shards peers answered "not found" for less than
+    /// [`crate::rs::MISS_CONFIRM_AFTER`] (issue #79); one that failed on
+    /// shards denied for that long or a bad decode can't improve.
     #[error("erasure recovery failed: {detail}")]
     Recovery { detail: String },
     /// Encrypted chunks (64-byte refs) aren't supported. Only triggered
@@ -1561,8 +1566,8 @@ mod tests {
         async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
             // Worded like `RoutingFetcher`'s give-up after peers answered
             // bee's `storage: not found`, so the RS decoder reads an
-            // absent chunk as confirmed missing (permanent), not as a
-            // peer-pool shortage it should retry.
+            // absent chunk as denied (permanent once denied for
+            // `rs::MISS_CONFIRM_AFTER`), not as a peer-pool shortage.
             self.chunks
                 .get(&addr)
                 .cloned()
@@ -1917,9 +1922,10 @@ mod tests {
     }
 
     /// Losing more data chunks than the node has parities fails with a
-    /// terminal `Recovery` error — promptly, because recovery errors
-    /// are not retried.
-    #[tokio::test]
+    /// terminal `Recovery` error once peers have kept denying the lost
+    /// shards for [`crate::rs::MISS_CONFIRM_AFTER`], well inside the
+    /// recovery retry budget. Paused clock: the back-offs auto-advance.
+    #[tokio::test(start_paused = true)]
     async fn over_loss_fails_cleanly() {
         let mut fetcher = MapFetcher::new();
         let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut fetcher, 6, 100);
@@ -1928,7 +1934,7 @@ mod tests {
             fetcher.chunks.remove(addr);
         }
         let err = tokio::time::timeout(
-            Duration::from_secs(10),
+            RECOVERY_RETRY_BUDGET,
             join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES),
         )
         .await
@@ -2070,6 +2076,101 @@ mod tests {
         let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
             .await
             .expect("buffered join must recover once the pool refills");
+        assert_eq!(out, expected);
+    }
+
+    /// A cold node's "not found" (issue #79): chunks in `flaky` answer
+    /// like peers denied them (`storage: not found`, an unstarved pool)
+    /// on their first `misses` fetches, and serve normally after.
+    struct DeniedThenServedFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        flaky: HashSet<[u8; 32]>,
+        misses: usize,
+        calls: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChunkFetcher for DeniedThenServedFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if self.flaky.contains(&addr) {
+                let mut calls = self.calls.lock().unwrap();
+                let n = calls.entry(addr).or_insert(0);
+                *n += 1;
+                if *n <= self.misses {
+                    return Err(Box::new(crate::fetcher::FetchExhausted {
+                        message: format!(
+                            "all peers failed for chunk {} after 33 attempts \
+                             (last: remote: retrieve chunk: storage: not found)",
+                            hex::encode(addr)
+                        ),
+                        pool_starved: false,
+                        last_not_found: true,
+                        not_found_answers: 32,
+                    }));
+                }
+            }
+            self.chunks
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "absent".into() })
+        }
+    }
+
+    /// Issue #79: on a cold node, more shards of a redundant node than it
+    /// has parities can come back "not found" from every peer asked and
+    /// still be served a fetch or two later. That shortfall is transient
+    /// until the misses have held for `MISS_CONFIRM_AFTER`, so the node
+    /// sweeps again and the join completes — streaming (what `/bytes` and
+    /// `/bzz` serve), a range of it, and buffered. Pre-fix the first
+    /// sweep's answer was final and the stream ended after one leaf.
+    #[tokio::test(start_paused = true)]
+    async fn denied_shards_served_on_a_later_sweep_complete_the_join() {
+        let mut map = MapFetcher::new();
+        let (root_wire, leaf_addrs, expected) = build_redundant_fixture(&mut map, 6, 100);
+        // 5 of 6 data shards denied; the node has only 4 parities.
+        let flaky: HashSet<[u8; 32]> = leaf_addrs.iter().skip(1).copied().collect();
+        let fetcher = || DeniedThenServedFetcher {
+            chunks: map.chunks.clone(),
+            flaky: flaky.clone(),
+            misses: 2,
+            calls: std::sync::Mutex::default(),
+        };
+
+        let fetcher_full = fetcher();
+        let (tx, mut rx) = mpsc::channel(256);
+        let (res, body) = tokio::join!(
+            join_to_sender(
+                &fetcher_full,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                tx
+            ),
+            drain(&mut rx)
+        );
+        res.expect("streaming join must sweep again for denied shards");
+        assert_eq!(body, expected);
+
+        let fetcher_range = fetcher();
+        let range = ByteRange::clamp(4096 + 10, 3 * 4096 + 99, expected.len() as u64).unwrap();
+        let (tx, mut rx) = mpsc::channel(256);
+        let (res, body) = tokio::join!(
+            join_to_sender_range(
+                &fetcher_range,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(range),
+                tx
+            ),
+            drain(&mut rx)
+        );
+        res.expect("range join must sweep again for denied shards");
+        assert_eq!(body, expected[4096 + 10..3 * 4096 + 100]);
+
+        let out = join(&fetcher(), &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("buffered join must sweep again for denied shards");
         assert_eq!(out, expected);
     }
 
@@ -2267,11 +2368,13 @@ mod tests {
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), SUBTREE_RETRY_ATTEMPTS);
     }
 
-    /// Real data loss stays terminal: more shards confirmed missing than
-    /// the node has parities fails on the first sweep, with no retry
-    /// back-off, even though other shards were also starved of peers.
-    #[tokio::test]
-    async fn confirmed_shard_loss_fails_without_retrying() {
+    /// Real data loss stays terminal: more shards denied than the node
+    /// has parities fails once peers have kept denying them for
+    /// [`crate::rs::MISS_CONFIRM_AFTER`] (issue #79), not after the whole
+    /// recovery budget, even though other shards were also starved of
+    /// peers. Paused clock: the back-offs auto-advance.
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_shard_loss_fails_once_the_misses_are_confirmed() {
         let mut map = MapFetcher::new();
         let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut map, 6, 100);
         // 5 of 10 shards confirmed missing; 4 parities can't cover it.
@@ -2282,15 +2385,19 @@ mod tests {
         let mut fetcher = ColdPoolFetcher::new(map, 1);
         fetcher.starved = starved;
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let err = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
             .await
             .unwrap_err();
         assert!(matches!(err, JoinError::Recovery { .. }), "got {err:?}");
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < RECOVERY_RETRY_BACKOFF,
-            "permanent loss must not wait out a retry back-off ({:?})",
-            started.elapsed()
+            elapsed >= crate::rs::MISS_CONFIRM_AFTER,
+            "a miss must be confirmed before it is final ({elapsed:?})",
+        );
+        assert!(
+            elapsed < crate::rs::MISS_CONFIRM_AFTER + RECOVERY_RETRY_BACKOFF_MAX,
+            "permanent loss must fail once confirmed, not wait out the budget ({elapsed:?})",
         );
     }
 

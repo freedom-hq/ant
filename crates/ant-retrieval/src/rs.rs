@@ -444,8 +444,9 @@ fn recovered_wire_len(shard: &[u8]) -> Option<usize> {
 /// recovered chunks are served from memory and real data loss fails
 /// every sibling at once. A *transient* failure — too few shards
 /// arrived, but enough of the misses were the fetcher never reaching a
-/// peer (`no BZZ peers available`, timeouts) rather than peers
-/// answering "not found" — is not cached: it is handed to the callers
+/// peer (`no BZZ peers available`, timeouts), or peers answering "not
+/// found" for less than [`MISS_CONFIRM_AFTER`] (issue #79) —
+/// is not cached: it is handed to the callers
 /// that were waiting on that sweep, and the next call sweeps afresh
 /// (issue #114). Shards the failed sweep did fetch sit in the
 /// fetcher's caches, so a re-sweep only goes to the network for the
@@ -471,6 +472,33 @@ pub struct RsDecoder {
     /// Outcome of the latest recovery sweep; see [`SweepState`].
     recovered: Mutex<SweepState>,
 }
+
+/// How long peers must keep answering "not found" for a shard, from
+/// the first sweep that heard it, before the shard counts as missing
+/// (issue #79). On a cold node a fetch that runs out of peers on
+/// `storage: not found` / `no peer found` answers is not the network's
+/// last word: forwarders without credit or a route answer that for
+/// chunks that exist. On a fresh mainnet node, of 20 chunks whose fetch
+/// had exhausted all 32 peers on such answers, 11 were served within
+/// 8.5 s of that first exhausted fetch (one to four fetches later), 2
+/// only minutes later and 7 not at all. A plain child retries that miss
+/// in place ([`crate::joiner`]'s subtree retries); a redundant node used
+/// to end the join on the first sweep's answer, cutting the body short
+/// a few chunks in. Until this long has passed, such a shortfall is
+/// transient and the caller's recovery retries sweep again.
+///
+/// 10 s covers the 8.5 s above (each re-sweep starts after the caller's
+/// back-off, 0.5 s growing to 4 s), and still fails real loss well
+/// inside the caller's 60 s recovery budget, and sooner than a lost
+/// chunk of a plain tree, which the gateway only gives up on after its
+/// 90 s stall timeout. Wall-clock, not a sweep count: sibling children
+/// of one node retry on their own schedules, so several sweeps can run
+/// back to back within milliseconds and would confirm a miss before
+/// anything had a chance to change. The window covers one episode of
+/// denials: a shard no sweep has denied for this long starts a fresh
+/// one, so a miss that a later direct fetch got past can't make a new
+/// miss of the same node final on its first sweep.
+pub const MISS_CONFIRM_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A failed [`RsDecoder`] recovery. `transient` says whether the
 /// failure could clear on a later sweep (see
@@ -509,6 +537,10 @@ struct SweepState {
     /// a transient error is only kept to answer the callers that were
     /// waiting on that sweep.
     outcome: Option<Result<Vec<Vec<u8>>, RecoveryError>>,
+    /// Per shard index (data and parity), when sweeps first and last
+    /// heard peers deny that shard ("not found") in its current episode
+    /// of denials ([`MISS_CONFIRM_AFTER`]). Empty until the first sweep.
+    denied: Vec<Option<Denied>>,
     /// Whether the latest sweep ran at the head of a streaming join's
     /// window ([`crate::priority`], issue #46). The sweep runs under the
     /// rank of the caller that triggered it; a look-ahead-ranked sweep
@@ -516,6 +548,32 @@ struct SweepState {
     /// permits, so its transient shortfall is no answer for a head
     /// caller, which sweeps again at its own rank instead.
     head_ranked: bool,
+}
+
+/// One shard's current episode of "not found" answers.
+#[derive(Clone, Copy)]
+struct Denied {
+    first: tokio::time::Instant,
+    last: tokio::time::Instant,
+}
+
+impl Denied {
+    /// Record a denial heard at `now`; whether the shard has now been
+    /// denied for [`MISS_CONFIRM_AFTER`]. A denial after a gap longer
+    /// than that starts a new episode.
+    fn confirm(slot: &mut Option<Self>, now: tokio::time::Instant) -> bool {
+        let d = match slot {
+            Some(d) if now.duration_since(d.last) <= MISS_CONFIRM_AFTER => {
+                d.last = now;
+                *d
+            }
+            _ => *slot.insert(Self {
+                first: now,
+                last: now,
+            }),
+        };
+        now.duration_since(d.first) >= MISS_CONFIRM_AFTER
+    }
 }
 
 impl SweepState {
@@ -567,12 +625,13 @@ impl RsDecoder {
     ///
     /// A recovery that came up short is `transient` when the shards that
     /// failed for want of a reachable peer (anything but peers
-    /// confirming the chunk missing, see [`shard_confirmed_missing`]) would
-    /// have been enough to decode: a later call may succeed, so the
-    /// caller should back off and call again. It is permanent when the
-    /// shards peers confirmed missing already exceed the parity count,
-    /// or when the shards were all there but reconstruction or CAC
-    /// validation failed.
+    /// confirming the chunk missing, see [`shard_confirmed_missing`]),
+    /// plus those peers have denied for less than [`MISS_CONFIRM_AFTER`]
+    /// across this decoder's sweeps, would have been enough to decode: a
+    /// later call may succeed, so the caller should back off and call
+    /// again. It is permanent when the shards denied for that long
+    /// already exceed the parity count, or when the shards were all
+    /// there but reconstruction or CAC validation failed.
     ///
     /// The direct fetch waits up to `credit_budget` for peer credit
     /// ([`ChunkFetcher::fetch_waiting_for_credit`]); the recovery sweep
@@ -630,7 +689,9 @@ impl RsDecoder {
                 return outcome.clone();
             }
         }
-        let outcome = self.recover_inner(fetcher, trigger).await;
+        let outcome = self
+            .recover_inner(fetcher, trigger, &mut state.denied)
+            .await;
         state.sweeps += 1;
         state.outcome = Some(outcome.clone());
         // The rank only ever rises (the read head only moves on), so a
@@ -643,8 +704,10 @@ impl RsDecoder {
         &self,
         fetcher: &dyn ChunkFetcher,
         trigger: &str,
+        denied: &mut Vec<Option<Denied>>,
     ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let total = self.addrs.len();
+        denied.resize(total, None);
         let parity_cnt = total - self.shard_cnt;
         tracing::debug!(
             target: "ant_retrieval::rs",
@@ -677,25 +740,39 @@ impl RsDecoder {
         .await;
         let mut not_found = 0usize;
         let mut unreached = 0usize;
+        // Denied ("not found") in this sweep, but for less than
+        // `MISS_CONFIRM_AFTER` so far: not yet the network's answer, so
+        // it counts towards a transient shortfall.
+        let mut unconfirmed = 0usize;
+        let now = tokio::time::Instant::now();
         for (i, wire) in fetched {
             match wire {
                 Ok(w) if w.len() <= CHUNK_WITH_SPAN_SIZE => wires[i] = Some(w),
                 // An oversized wire is not a shard of this node; no
                 // retry changes that.
-                Ok(_) | Err(true) => not_found += 1,
+                Ok(_) => not_found += 1,
+                Err(true) => {
+                    if Denied::confirm(&mut denied[i], now) {
+                        not_found += 1;
+                    } else {
+                        unconfirmed += 1;
+                    }
+                }
                 Err(false) => unreached += 1,
             }
         }
 
         let present = wires.iter().filter(|w| w.is_some()).count();
         if present < self.shard_cnt {
-            // Transient when the shards we never reached would make up
-            // the shortfall: the peer pool, not the content, is short.
-            let transient = present + unreached >= self.shard_cnt;
+            // Transient when the shards we never reached, or that peers
+            // have denied for too short a while to trust, would make up the
+            // shortfall: the peer pool, not the content, is short.
+            let transient = present + unreached + unconfirmed >= self.shard_cnt;
             tracing::debug!(
                 target: "ant_retrieval::rs",
                 present,
                 not_found,
+                unconfirmed,
                 unreached,
                 need = self.shard_cnt,
                 transient,
@@ -705,8 +782,11 @@ impl RsDecoder {
                 detail: format!(
                     "erasure recovery impossible: {present} of {total} shards retrievable, \
                      need {} ({} data + {parity_cnt} parity refs; {not_found} confirmed \
-                     missing, {unreached} unreached); trigger: {trigger}",
-                    self.shard_cnt, self.shard_cnt,
+                     missing, {unconfirmed} denied for less than {}s, {unreached} \
+                     unreached); trigger: {trigger}",
+                    self.shard_cnt,
+                    self.shard_cnt,
+                    MISS_CONFIRM_AFTER.as_secs(),
                 ),
                 transient,
             });
@@ -784,7 +864,9 @@ impl RsDecoder {
 }
 
 /// Did a sweep's shard fetch fail because peers confirmed the chunk
-/// missing (`storage: not found` / `no peer found`)? For the fetcher's
+/// missing (`storage: not found` / `no peer found`)? In a sweep that is
+/// one denial: the shard only counts as missing once such answers have
+/// held for [`MISS_CONFIRM_AFTER`] (issue #79). For the fetcher's
 /// own error this is the typed
 /// [`crate::fetcher::FetchExhausted::confirmed_missing`]: not when its
 /// peer pool was starved, since on a cold node one peer can answer "not
@@ -1082,6 +1164,70 @@ mod tests {
             total,
             "the head shard's own sweep runs at head rank: {ranks:?}",
         );
+    }
+
+    /// Every fetch is denied: peers answer `storage: not found`.
+    struct DeniedFetcher;
+
+    #[async_trait::async_trait]
+    impl ChunkFetcher for DeniedFetcher {
+        async fn fetch(
+            &self,
+            _addr: [u8; 32],
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+            Err("remote: retrieve chunk: storage: not found".into())
+        }
+    }
+
+    /// Issue #79: a shortfall of denied shards is transient until the
+    /// denials have held for `MISS_CONFIRM_AFTER`, then final. A denial
+    /// after a longer gap starts a new episode, so an old episode can't
+    /// make a later miss of the same node final on its first sweep.
+    #[tokio::test(start_paused = true)]
+    async fn denied_shards_are_confirmed_missing_per_episode() {
+        let addrs: Vec<[u8; 32]> = (0u8..5).map(|i| [i; 32]).collect();
+        let dec = RsDecoder::new(addrs, 3);
+        let sweep = || dec.fetch_data_shard(&DeniedFetcher, 0, std::time::Duration::ZERO);
+        let step = std::time::Duration::from_secs(4);
+
+        // First episode, then a gap longer than the window: the next
+        // miss is a new episode and starts out transient again.
+        let r = sweep().await;
+        assert!(r.as_ref().is_err_and(|e| e.transient), "{r:?}");
+        tokio::time::sleep(MISS_CONFIRM_AFTER * 3).await;
+        let started = tokio::time::Instant::now();
+        let r = sweep().await;
+        assert!(r.as_ref().is_err_and(|e| e.transient), "{r:?}");
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.detail.contains("5 denied for less than 10s")),
+            "{r:?}",
+        );
+
+        // Denials that keep coming confirm the loss once they have held
+        // for the window, and the outcome is then final.
+        loop {
+            tokio::time::sleep(step).await;
+            let r = sweep().await;
+            let e = r.expect_err("every shard is denied");
+            if !e.transient {
+                assert!(
+                    started.elapsed() >= MISS_CONFIRM_AFTER,
+                    "{:?}",
+                    started.elapsed()
+                );
+                assert!(
+                    started.elapsed() < MISS_CONFIRM_AFTER + step,
+                    "{:?}",
+                    started.elapsed()
+                );
+                assert!(e.detail.contains("5 confirmed missing"), "{}", e.detail);
+                assert!(!e.detail.contains("not found;"), "{}", e.detail);
+                break;
+            }
+        }
+        let r = sweep().await;
+        assert!(r.is_err_and(|e| !e.transient), "a final outcome is cached");
     }
 
     /// A shard counts as confirmed missing only when peers said so and
