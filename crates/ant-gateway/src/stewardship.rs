@@ -209,8 +209,11 @@ pub async fn stewardship_get(
 ///
 /// The counts are this data dir's records, with the limits
 /// `stamps::stamp_chunk` lists: stamps issued by an older Ant,
-/// by bee, or into a lost data dir count as unstamped, and on a mutable
-/// batch whose bucket wrapped a counted chunk may have lost its slot.
+/// by bee, or into a lost data dir count as unstamped; a counted chunk
+/// was stamped, not necessarily delivered (a failed or partial
+/// `PUT /stewardship` still leaves the chunks it stamped counted on the
+/// new batch); and on a mutable batch whose bucket wrapped a counted
+/// chunk may have lost its slot.
 pub async fn stewardship_stamps(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,

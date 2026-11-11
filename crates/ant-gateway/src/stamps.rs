@@ -547,9 +547,13 @@ pub async fn stamp_buckets(
 /// the `.stamps` sidecar: stamps issued by an older Ant, by bee (counters
 /// recovered from its store), or into a data dir since lost or replaced
 /// read as not stamped. And a record says this node *issued* the stamp,
-/// not that the network still stores the chunk under it: on a mutable
-/// batch whose bucket wrapped, the slot may since have been re-issued to
-/// another chunk (bee's issuer keeps its `StampItem` the same way).
+/// not that a push carrying it landed or that the network still stores
+/// the chunk under it: a `PUT /stewardship` or upload that failed part
+/// way leaves records for the chunks it stamped before it stopped, and
+/// on a mutable batch whose bucket wrapped, the slot may since have been
+/// re-issued to another chunk (bee's issuer keeps its `StampItem` the
+/// same way). Confirm delivery with a successful `PUT /stewardship` (or
+/// upload) on the batch, not with these records.
 pub async fn stamp_chunk(
     State(handle): State<GatewayHandle>,
     Path((id, address)): Path<(String, String)>,
@@ -613,11 +617,18 @@ pub async fn stamp_chunk(
                 json_error(StatusCode::NOT_FOUND, "issuer does not exist")
             } else if message.starts_with("uploads not configured") {
                 json_error(StatusCode::SERVICE_UNAVAILABLE, message)
-            } else {
-                // `stamp records unavailable …`: the issuer's sidecar
-                // couldn't be read back, so a missing record proves
-                // nothing — surface why instead of a 404.
+            } else if message.contains("stamp records unavailable") {
+                // The issuer's sidecar can't be safely used, so a
+                // missing record proves nothing: surface why instead of
+                // a 404.
                 json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+            } else {
+                // Any other node-side failure: not a statement about the
+                // chunk either way.
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("stamp lookup failed: {message}"),
+                )
             }
         }
         other => json_error(

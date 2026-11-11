@@ -633,13 +633,15 @@ impl StampIssuer {
 
     /// Remember the stamp issued for a **new** `addr` and, for persistent
     /// issuers, append its checksummed record to the `.stamps` sidecar
-    /// (append + fsync) so a restart recovers it. `O(1)`.
+    /// (append + fsync) so a restart recovers it. `O(1)`. The in-memory
+    /// record is only taken once the append succeeded: on an error the
+    /// stamp is never returned to a caller, so `seen` must not claim it
+    /// was issued (see [`Self::append_and_maybe_compact`]).
     fn record_stamp(
         &mut self,
         addr: [u8; 32],
         stamp: [u8; STAMP_SIZE],
     ) -> Result<(), PostageError> {
-        self.seen.insert(addr, stamp);
         self.append_and_maybe_compact(addr, stamp)
     }
 
@@ -656,7 +658,6 @@ impl StampIssuer {
         addr: [u8; 32],
         stamp: [u8; STAMP_SIZE],
     ) -> Result<(), PostageError> {
-        self.seen.insert(addr, stamp);
         self.append_and_maybe_compact(addr, stamp)
     }
 
@@ -671,8 +672,17 @@ impl StampIssuer {
         stamp: [u8; STAMP_SIZE],
     ) -> Result<(), PostageError> {
         let Some(path) = self.stamps_path.clone() else {
-            return Ok(()); // in-memory issuer
+            self.seen.insert(addr, stamp); // in-memory issuer
+            return Ok(());
         };
+        // Append first, remember second. A failed append returns `Err`,
+        // so the caller never hands this stamp out; recording it in
+        // `seen` anyway would make `cached_stamp` (and the stamp-record
+        // endpoints built on it) report a stamp that was never issued
+        // and that a restart doesn't reload. A refresh keeps the
+        // address's previous stamp, which is also what the sidecar still
+        // holds (a rolled-back or torn append leaves the old record as
+        // the last valid one).
         if let Err(e) = append_stamp_record(&path, &self.batch_id, &addr, &stamp) {
             if !e.rolled_back {
                 // A torn frame is stuck at EOF and a later successful
@@ -687,6 +697,7 @@ impl StampIssuer {
             }
             return Err(PostageError::Persist(e.msg));
         }
+        self.seen.insert(addr, stamp);
         self.stamp_record_count += 1;
         if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
             rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
@@ -701,19 +712,25 @@ impl StampIssuer {
         &mut self,
         records: &[([u8; 32], [u8; STAMP_SIZE])],
     ) -> Result<(), PostageError> {
+        // Same order as `append_and_maybe_compact`: only a durable
+        // append makes the stamps part of `seen`. On an error the whole
+        // batch is failed and none of these stamps leaves the process.
+        let path = self.stamps_path.clone();
+        if let Some(path) = &path {
+            if let Err(e) = append_stamp_records(path, &self.batch_id, records) {
+                if !e.rolled_back {
+                    self.stamp_persistence_failed =
+                        Some("torn sidecar append could not be rolled back");
+                }
+                return Err(PostageError::Persist(e.msg));
+            }
+        }
         for (addr, stamp) in records {
             self.seen.insert(*addr, *stamp);
         }
-        let Some(path) = self.stamps_path.clone() else {
+        let Some(path) = path else {
             return Ok(()); // in-memory issuer
         };
-        if let Err(e) = append_stamp_records(&path, &self.batch_id, records) {
-            if !e.rolled_back {
-                self.stamp_persistence_failed =
-                    Some("torn sidecar append could not be rolled back");
-            }
-            return Err(PostageError::Persist(e.msg));
-        }
         self.stamp_record_count += records.len();
         if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
             rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
@@ -1743,6 +1760,60 @@ mod tests {
 
     fn addr(i: u32) -> [u8; 32] {
         ant_crypto::keccak256(&i.to_be_bytes())
+    }
+
+    /// A sidecar append that fails and is rolled back returns `Err`, so
+    /// the stamp never leaves the process; the in-memory records must
+    /// not claim it either (they back `cached_stamp` and the stamp-record
+    /// endpoints), and must agree with what a reopen loads. Covers a new
+    /// stamp, a refresh of a known one, and a batch.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sidecar_append_records_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let secret = random_secp256k1_secret();
+        let batch = [0x6bu8; 32];
+        let dir = tmpdir();
+        let path = dir.join("b.bin");
+        let sidecar = stamps_sidecar_path(&path);
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 20, 16, false).unwrap();
+        let known = sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap();
+
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&sidecar)
+            .is_ok()
+        {
+            // Running as root: permissions don't bite, nothing to test.
+            eprintln!("skipped: sidecar stayed writable (root?)");
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        assert!(sign_stamp_bytes(&secret, &mut issuer, &addr(8)).is_err());
+        assert!(sign_stamp_bytes(&secret, &mut issuer, &addr(7)).is_err());
+        let batch_res = sign_stamps_batch(&secret, &mut issuer, &[addr(9), addr(10), addr(7)]);
+        assert!(batch_res.iter().all(Result::is_err));
+        // A cleanly rolled-back failure doesn't poison the issuer…
+        assert_eq!(issuer.stamp_records_unavailable(), None);
+        // …so the records have to be right on their own.
+        for a in [8, 9, 10] {
+            assert_eq!(issuer.cached_stamp(&addr(a)), None, "chunk {a}");
+        }
+        assert_eq!(
+            issuer.cached_stamp(&addr(7)),
+            Some(known),
+            "refresh kept the old stamp"
+        );
+
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(issuer);
+        let reopened = StampIssuer::open_existing(path).unwrap();
+        for a in [8, 9, 10] {
+            assert_eq!(reopened.cached_stamp(&addr(a)), None, "chunk {a}");
+        }
+        assert_eq!(reopened.cached_stamp(&addr(7)), Some(known));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A batch reserves exactly the indices one-by-one stamping would,

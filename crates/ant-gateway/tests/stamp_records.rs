@@ -51,6 +51,10 @@ fn one_batch_router() -> axum::Router {
                         message: "stamp records unavailable for batch 0xba..: unreadable sidecar"
                             .into(),
                     }
+                } else if address == [0xdd; 32] {
+                    ControlAck::Error {
+                        message: "node loop hiccup".into(),
+                    }
                 } else {
                     ControlAck::StampedChunk { stamp: None }
                 };
@@ -156,6 +160,24 @@ async fn unavailable_records_are_not_a_404() {
         .as_str()
         .unwrap()
         .contains("stamp records unavailable"));
+}
+
+/// Any other node error is a 500 that names a failed lookup, not the
+/// records-unavailable case and never a 404.
+#[tokio::test]
+async fn other_node_errors_are_a_plain_500() {
+    let resp = send(
+        one_batch_router(),
+        get(format!(
+            "/stamps/{}/chunks/{}",
+            hex::encode(BATCH),
+            hex::encode([0xdd; 32])
+        )),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["message"], "stamp lookup failed: node loop hiccup");
 }
 
 #[tokio::test]
