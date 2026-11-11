@@ -577,7 +577,7 @@ Active hardening tracks carried alongside M2 and M3:
 
 - Retrieval / accounting polish: F.7 follow-ups (persist pseudosettle budget across restarts, per-peer chunks-per-connection counter, investigate ~30 ms peer churn pattern). Low-impact, untouched.
 - §6.2 disk-cache asymmetries: bee ~2× faster on cold populate and 1.5–3× faster at K ≤ 4 single-threaded reads; ant wins from K ≥ 8 upward. Worth a targeted pragma / prepared-statement pass.
-- Appendix E Phase 5 (CLI streaming) and Phase 8 (Reed-Solomon recovery) remain the two read-path gaps.
+- Appendix E Phase 5 (CLI streaming) remains the read-path gap. Phase 8 (Reed-Solomon recovery) shipped in `8042bdaf`: missing data chunks are recovered from parities and a missing root from its dispersed replicas, always on.
 - M3 Phase 7 polish: re-run the `cheque_smoke` mainnet binary with the fixed EIP-712 digest (rung B). The other two items from this list have since landed: the upload-side settlement trigger shipped as Phases 7b/7d (cheque emission + pushsync-side pseudosettle), and `antctl chequebook deploy` / `verify` shipped as Phase 7c (0.3.13). Tier-1 cash-self interop is done — see `antctl chequebook cash-self`.
 
 Detailed post-facto engineering write-ups of the retrieval/accounting work live in Appendices E (gateway streaming), F (pseudosettle), G (cancel-tolerant hedging + moving window) and H (admission-control mirror). The phase descriptions below remain the original plan — consult the appendices and the per-phase "Landed as" notes for what actually shipped and how.
@@ -670,7 +670,7 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 
 **Landed so far (desktop / server):** Tier-A `ant-gateway` is live on `127.0.0.1:1633` inside `antd` (`--api-addr`, `--no-http-api`) per Appendix D. `beeMode = "ultra-light"`, stub wallet / stamps / chequebook. `bee-js` / `curl` / browser smoke passes against it. Released binary runs on `vibing.at/ant` serving mainnet-hosted sites and media with HEAD + single-range support.
 
-**Still outstanding:** mobile `.xcframework` / `.aar` artefact (the hand-written `ant-ffi` C/JNI surface exists and is exercised by the example apps; the UniFFI packaging does not), CI size budget, suspend/resume handling, OSLog / logcat bridges, and internal beta. An interim, pre-UniFFI `AntFFI.xcframework` release of the existing hand-written C surface is planned as a separate packaging track — see § "Interim releasable iOS artifact — `AntFFI.xcframework` (pre-UniFFI)" under the iOS smoke-test section; it de-risks the distribution mechanics (xtask packaging, SPM `binaryTarget`, release CI) without changing the Phase 4 UniFFI commitment. `antctl get` streaming (Appendix E Phase 5) and Reed-Solomon recovery (Appendix E Phase 8) are the last two read-path hardening items before this phase closes.
+**Still outstanding:** mobile `.xcframework` / `.aar` artefact (the hand-written `ant-ffi` C/JNI surface exists and is exercised by the example apps; the UniFFI packaging does not), CI size budget, suspend/resume handling, OSLog / logcat bridges, and internal beta. An interim, pre-UniFFI `AntFFI.xcframework` release of the existing hand-written C surface is planned as a separate packaging track — see § "Interim releasable iOS artifact — `AntFFI.xcframework` (pre-UniFFI)" under the iOS smoke-test section; it de-risks the distribution mechanics (xtask packaging, SPM `binaryTarget`, release CI) without changing the Phase 4 UniFFI commitment. `antctl get` streaming (Appendix E Phase 5) is the last read-path hardening item before this phase closes; Reed-Solomon recovery (Appendix E Phase 8) has shipped.
 
 ---
 
@@ -1732,8 +1732,8 @@ still needed for `antd` to be a literal **drop-in replacement** for
 browser-uploader client. The libp2p protocol surface and the
 on-chain plumbing are at parity (or near it). What's missing is the
 long tail of HTTP endpoints bee-js touches, plus one real protocol
-gap (auto-settlement) and one real read-path gap (Reed-Solomon
-recovery).
+gap (auto-settlement). The read-path gap this list used to carry,
+Reed-Solomon recovery, has shipped (row 8).
 
 This is the working order to close it, fastest-payoff first:
 
@@ -1746,7 +1746,7 @@ This is the working order to close it, fastest-payoff first:
 | 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd` | ~½ day | ✅ shipped | On first light start with a funded node wallet and no chequebook configured/persisted, `antd` auto-deploys a factory-registered chequebook (issuer = node EOA), funds it with xBZZ, and persists it to `<data-dir>/chequebook.json` (deploy-once, reuse-forever). Manual `--chequebook`/`CHEQUEBOOK_ADDRESS` still wins; `--no-auto-chequebook` opts out. See "Open: chequebook auto-bootstrap" below. |
 | 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST | ~2-3 d | ✅ shipped | `/feeds` GET/POST + `/soc/{owner}/{id}` GET/POST routed. GET dereferences to content with bee-shaped headers (`swarm-feed-index{,-next}`, `swarm-soc-signature`, `swarm-feed-resolved-version`); honors `Swarm-Only-Root-Chunk`. Resolves **v1** (`ts‖ref`) and **v2** (wrapped CAC is the content root), disambiguating v1-length payloads by probing the v1 ref like bee's `resolveFeed`. Encrypted (64-byte ref) payloads still unsupported (no chunk decryption). |
 | 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST | ~½-1 d | ⬜ open | Not routed yet → 501. |
-| 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop) | ~2-3 d | ⬜ open | Read-path protocol work; not started. |
+| 8 | Reed-Solomon erasure decoding (`Swarm-Redundancy-Level` 1-4 interop) | ~2-3 d | ✅ shipped | `8042bdaf`: the joiner decodes the level per node and its buffered, streaming and range walkers recover a missing data chunk from its siblings + parities (`ant_retrieval::rs::RsDecoder`, CAC-validated, byte-identical to bee); a missing root falls back to its dispersed replicas (`fetch_root_with_replicas`). Always on; `--allow-degraded-redundancy` is a no-op kept for compatibility. |
 | 9 | `/topology` known/visible-peer population (kademlia "known" set) | ~1 day | ✅ shipped | Bounded `KnownPeers` book (deduped by overlay, per-bin cap + TTL) fed by hive gossip + handshakes; `GET /topology` reports per-bin `population` from the known book, `connected` from the live table, and a real saturation `depth`. Live-verified: `connected≈100` while visible `population` climbs into the thousands (`depth=5`). See "Open: visible-peers" below. |
 
 #### Open: chequebook auto-bootstrap (bee-parity) — row 5
@@ -3379,6 +3379,10 @@ Improve completion rate without overwhelming Bee peers, local queues, or Ant's o
 - Throughput improves or stays stable compared with the current implementation.
 
 ### E.16 Phase 8 — Reed-Solomon / redundancy recovery
+
+**Status: ✅ shipped in `8042bdaf`.** Recovery is always on; the old
+degraded mode (`--allow-degraded-redundancy`) is a no-op kept for
+compatibility, not a fallback. The plan below is kept as written.
 
 #### E.16.1 Goal
 

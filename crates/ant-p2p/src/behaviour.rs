@@ -3011,6 +3011,78 @@ fn handle_control_command(
                 let _ = ack.send(ControlAck::Retrievable { retrievable });
             });
         }
+        ControlCommand::StampedChunk {
+            batch_id,
+            address,
+            ack,
+        } => {
+            // ethersphere/bee#5682 (1): one lookup in the batch issuer's
+            // per-chunk stamp records. No network, no slot consumed.
+            let reply = match upload {
+                // No upload runtime yet (antd before late chain init):
+                // not "this batch didn't stamp it" — the gateway maps
+                // the `uploads not configured` prefix to 503.
+                None => ControlAck::Error {
+                    message: "uploads not configured: node has no stamp issuers (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
+                },
+                Some(ref upload) => {
+                    let issuers = match upload.issuers.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    stamped_chunk_reply(&issuers, batch_id, &address)
+                }
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::StewardshipStamps { reference, ack } => {
+            // ethersphere/bee#5682 (2): walk the tree like
+            // `StewardshipGet`, then count each batch's records. Without
+            // an upload runtime there are no issuers to ask yet (antd
+            // before late chain init); say so instead of reporting every
+            // chunk as unstamped.
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "uploads not configured: node has no stamp issuers (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
+                });
+                return;
+            };
+            let peers_rx = state.peers_watch.subscribe();
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
+            let control = control.clone();
+            tokio::spawn(async move {
+                let mut fetcher =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    fetcher = fetcher.with_disk_cache(disk);
+                }
+                // Only interior and manifest nodes are fetched; data
+                // leaves are listed from their parents, so the counts
+                // don't prove the leaves retrievable (that is
+                // `GET /stewardship/{reference}`'s job).
+                let reply = match ant_retrieval::traverse_chunk_addresses(
+                    &fetcher,
+                    reference,
+                    STEWARDSHIP_MAX_FILE_BYTES,
+                )
+                .await
+                {
+                    Ok(addrs) => {
+                        match count_tree_stamps_sliced(&upload.issuers, &addrs, STAMP_COUNT_SLICE)
+                            .await
+                        {
+                            Ok(view) => ControlAck::StewardshipStamps(view),
+                            Err(message) => ControlAck::Error { message },
+                        }
+                    }
+                    Err(e) => ControlAck::Error {
+                        message: format!("stamps check traversal failed: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
+        }
         ControlCommand::StewardshipPut {
             reference,
             batch_id,
@@ -3667,14 +3739,20 @@ fn handle_control_command(
         ControlCommand::ListBzz {
             reference,
             bypass_cache,
+            page,
             ack,
         } => {
             let peers_rx = state.peers_watch.subscribe();
             if peers_rx.borrow().is_empty() {
+                let message = "no peers available; wait for handshakes to complete".to_string();
+                // The paged listing types this as a 503; the legacy one
+                // keeps the `Error` whose text `ant_list_bzz` retries on.
                 send_terminal_ack(
                     &ack,
-                    ControlAck::Error {
-                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    if page.is_some() {
+                        ControlAck::NotReady { message }
+                    } else {
+                        ControlAck::Error { message }
                     },
                 );
                 return;
@@ -3699,6 +3777,7 @@ fn handle_control_command(
                     accounting,
                     counters,
                     reference,
+                    page,
                 )
                 .await;
                 let _ = ack.send(reply).await;
@@ -5588,6 +5667,171 @@ async fn stewardship_is_retrievable(
         .await
 }
 
+/// Answer `StampedChunk` from the registered issuers: the stamp the
+/// batch's issuer recorded for `address`, `None` when it has no record,
+/// an error for an unregistered batch or an issuer whose records could
+/// not be read back (where a missing record proves nothing).
+fn stamped_chunk_reply(
+    issuers: &HashMap<[u8; 32], ant_postage::StampIssuer>,
+    batch_id: [u8; 32],
+    address: &[u8; 32],
+) -> ControlAck {
+    let Some(issuer) = issuers.get(&batch_id) else {
+        return ControlAck::Error {
+            message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
+        };
+    };
+    if let Some(stamp) = issuer.cached_stamp(address) {
+        // A record found is a record, even if later records were lost.
+        return ControlAck::StampedChunk { stamp: Some(stamp) };
+    }
+    if let Some(reason) = issuer.stamp_records_unavailable() {
+        return ControlAck::Error {
+            message: format!(
+                "stamp records unavailable for batch 0x{}: {reason}",
+                hex::encode(batch_id)
+            ),
+        };
+    }
+    ControlAck::StampedChunk { stamp: None }
+}
+
+/// Addresses counted per hold of the issuer lock in
+/// [`count_tree_stamps_sliced`]. The lock is the one every stamping path
+/// takes (uploads, `Envelope`, `PostageBuckets` on the node loop
+/// itself), so one hold is kept to `16_384 × batches` hash lookups
+/// (about a millisecond per batch) instead of the whole tree's: a
+/// 16 GiB file is ~4.2 M chunks.
+const STAMP_COUNT_SLICE: usize = 16_384;
+
+/// How many times [`count_tree_stamps_sliced`] starts over because the
+/// set of registered batches changed between two of its slices before it
+/// gives up. Batches are registered or dropped on a buy, a chain sync or
+/// an expiry, minutes apart, so one restart nearly always suffices.
+const STAMP_COUNT_RESTARTS: usize = 3;
+
+/// [`count_tree_stamps`] over `addrs` in slices of `slice`, releasing the
+/// issuer lock and yielding between slices so stamping isn't held up by a
+/// large tree. Every slice must see the same set of batches as the
+/// first: a batch registered or dropped between slices would otherwise
+/// be counted for only part of the tree (and its chunks read as
+/// `unstamped` in the slices before it appeared), with no error. On such
+/// a change the count starts over, up to [`STAMP_COUNT_RESTARTS`] times,
+/// then fails rather than return a mixed view. Stamps issued between
+/// slices on an unchanged batch set are counted where their slice sees
+/// them, as with any read racing a concurrent upload.
+async fn count_tree_stamps_sliced(
+    issuers: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+    addrs: &[[u8; 32]],
+    slice: usize,
+) -> Result<ant_control::StewardshipStampsView, String> {
+    for _ in 0..=STAMP_COUNT_RESTARTS {
+        if let Some(view) = count_tree_stamps_sliced_once(issuers, addrs, slice).await? {
+            return Ok(view);
+        }
+    }
+    Err(format!(
+        "the set of postage batches kept changing during the count \
+         ({} attempts); retry",
+        STAMP_COUNT_RESTARTS + 1
+    ))
+}
+
+/// One pass of [`count_tree_stamps_sliced`]: `Ok(None)` when the batch
+/// set changed between slices.
+async fn count_tree_stamps_sliced_once(
+    issuers: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+    addrs: &[[u8; 32]],
+    slice: usize,
+) -> Result<Option<ant_control::StewardshipStampsView>, String> {
+    let mut total: Option<ant_control::StewardshipStampsView> = None;
+    let mut parts = addrs.chunks(slice.max(1)).peekable();
+    // An empty tree still lists the batches.
+    let empty: [[u8; 32]; 0] = [];
+    loop {
+        let part = parts.next().unwrap_or(&empty);
+        let view = {
+            let guard = match issuers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            count_tree_stamps(&guard, part)?
+        };
+        match &mut total {
+            None => total = Some(view),
+            Some(total) => {
+                // Both lists are sorted by id, so equal ids pair up.
+                if total.batches.len() != view.batches.len()
+                    || total
+                        .batches
+                        .iter()
+                        .zip(&view.batches)
+                        .any(|(a, b)| a.batch_id != b.batch_id)
+                {
+                    return Ok(None);
+                }
+                total.chunks += view.chunks;
+                total.unstamped += view.unstamped;
+                for (a, b) in total.batches.iter_mut().zip(view.batches) {
+                    a.chunks += b.chunks;
+                }
+            }
+        }
+        if parts.peek().is_none() {
+            return Ok(total);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Count, for every registered batch, how many of `addrs` its issuer's
+/// records say it stamped, and how many no batch stamped. Batches come
+/// out sorted by id, zero counts included, so the caller sees every
+/// batch it could be relying on. Refuses (rather than undercounting)
+/// when any issuer's records could not be read back.
+fn count_tree_stamps(
+    issuers: &HashMap<[u8; 32], ant_postage::StampIssuer>,
+    addrs: &[[u8; 32]],
+) -> Result<ant_control::StewardshipStampsView, String> {
+    let mut ids: Vec<&[u8; 32]> = issuers.keys().collect();
+    ids.sort();
+    if let Some((id, reason)) = ids.iter().find_map(|id| {
+        issuers[*id]
+            .stamp_records_unavailable()
+            .map(|reason| (*id, reason))
+    }) {
+        return Err(format!(
+            "stamp records unavailable for batch 0x{}: {reason}",
+            hex::encode(id)
+        ));
+    }
+    let mut batches: Vec<ant_control::BatchChunkCount> = ids
+        .iter()
+        .map(|id| ant_control::BatchChunkCount {
+            batch_id: **id,
+            chunks: 0,
+        })
+        .collect();
+    let mut unstamped = 0u64;
+    for addr in addrs {
+        let mut any = false;
+        for row in &mut batches {
+            if issuers[&row.batch_id].has_stamp(addr) {
+                row.chunks += 1;
+                any = true;
+            }
+        }
+        if !any {
+            unstamped += 1;
+        }
+    }
+    Ok(ant_control::StewardshipStampsView {
+        chunks: addrs.len() as u64,
+        batches,
+        unstamped,
+    })
+}
+
 /// Traverse the content tree at `reference`, then fetch + stamp +
 /// pushsync every chunk (bee's `steward.Reupload`). Fails on the first
 /// chunk that can't be fetched or pushed.
@@ -6922,10 +7166,14 @@ async fn run_list_bzz(
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     counters: Arc<RetrievalCounters>,
     reference: [u8; 32],
+    page: Option<ant_control::ManifestListQuery>,
 ) -> ControlAck {
     if peers_rx.borrow().is_empty() {
-        return ControlAck::Error {
-            message: "no peers available; wait for handshakes to complete".to_string(),
+        let message = "no peers available; wait for handshakes to complete".to_string();
+        return if page.is_some() {
+            ControlAck::NotReady { message }
+        } else {
+            ControlAck::Error { message }
         };
     }
 
@@ -6946,6 +7194,13 @@ async fn run_list_bzz(
     }
     let fetcher = builder;
 
+    if let Some(query) = page {
+        let sweeps = ant_retrieval::ReplicaSweeps::for_listing();
+        let query = manifest_page_query(query);
+        let result = ant_retrieval::list_manifest_page(&fetcher, &reference, &query, &sweeps).await;
+        return manifest_page_ack(&reference, result, &sweeps);
+    }
+
     match ant_retrieval::list_manifest(&fetcher, &reference).await {
         Ok(entries) => ControlAck::Manifest {
             entries: entries
@@ -6961,6 +7216,92 @@ async fn run_list_bzz(
         Err(e) => ControlAck::Error {
             message: format!("list manifest {}: {e}", hex::encode(reference)),
         },
+    }
+}
+
+fn manifest_page_query(q: ant_control::ManifestListQuery) -> ant_retrieval::ManifestPageQuery {
+    ant_retrieval::ManifestPageQuery {
+        prefix: q.prefix,
+        delimiter: q.delimiter,
+        after: q.after,
+        limit: q.limit,
+        sizes: q.sizes,
+    }
+}
+
+/// Terminal ack for one page of a manifest listing
+/// ([`ControlCommand::ListBzz`] with `page: Some(..)`, issue #61), typed
+/// off the [`ant_retrieval::ManifestError`] rather than its message:
+///
+/// - a page → [`ControlAck::ManifestPage`], `immutable` unless the
+///   reference was a feed manifest, a size asked for couldn't be read,
+///   or the walk ran out of time ([`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`])
+///   and ended `truncated` early, or the page ended `truncated` on a
+///   failed lookahead load ([`ant_retrieval::ManifestPage::lookahead_failed`]);
+/// - the prefix names nothing, or the reference (or a trie node) is not
+///   a decodable manifest → [`ControlAck::NotFound`], bee#5537's 404;
+/// - a path on the page is not valid UTF-8 (it can't be returned as a
+///   JSON string and passed back as `after` without paging wrongly) →
+///   [`ControlAck::NotFound`]: a property of the content, which a retry
+///   would only repeat;
+/// - the walk ran out of time before finding a single item →
+///   [`ControlAck::NotReady`]: the nodes it loaded are cached, so a
+///   retry gets further;
+/// - a trie node that couldn't be fetched → [`ControlAck::NotFound`] if
+///   peers confirmed it missing, [`ControlAck::NotReady`] if the miss
+///   came from a starved pool or the node's replica sweep failed only
+///   transiently (`sweeps`; the same split as `/bzz`'s
+///   [`bzz_lookup_failure_ack`]), else [`ControlAck::Error`]. A listing
+///   is never answered with a subtree silently left out.
+///
+/// Public so the gateway's test node loop answers with this exact
+/// mapping instead of a copy of it.
+#[must_use]
+pub fn manifest_page_ack(
+    reference: &[u8],
+    result: Result<ant_retrieval::ManifestPage, ant_retrieval::ManifestError>,
+    sweeps: &ant_retrieval::ReplicaSweeps,
+) -> ControlAck {
+    use ant_retrieval::ManifestError as E;
+    match result {
+        Ok(page) => ControlAck::ManifestPage(ant_control::ManifestListPage {
+            immutable: !page.feed
+                && !page.sizes_incomplete
+                && !page.timed_out
+                && !page.lookahead_failed,
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| ant_control::ManifestEntryInfo {
+                    path: entry.path,
+                    reference: entry.reference.map(hex::encode),
+                    metadata: entry.metadata,
+                    size: entry.size,
+                })
+                .collect(),
+            common_prefixes: page.common_prefixes,
+            truncated: page.truncated,
+            next_marker: page.next_marker,
+        }),
+        Err(
+            e @ (E::NotFound { .. }
+            | E::NotAManifest
+            | E::TooShort(_)
+            | E::UnsupportedVersion(_)
+            | E::InvalidRefLength(_)
+            | E::InvalidMetadata(_)
+            | E::ListNonUtf8Path { .. }),
+        ) => ControlAck::NotFound {
+            message: format!("list manifest {}: {e}", hex::encode(reference)),
+        },
+        Err(e @ E::ListTimedOut) => ControlAck::NotReady {
+            message: format!("list manifest {}: {e}", hex::encode(reference)),
+        },
+        Err(e) => bzz_lookup_failure_ack(
+            format!("list manifest {}: {e}", hex::encode(reference)),
+            &e,
+            sweeps.swept_transiently(&e),
+        ),
     }
 }
 
@@ -11320,6 +11661,57 @@ mod tests {
         }
     }
 
+    /// A listing page's own outcomes (PR #260, R1-F1/R1-M1): out of time
+    /// before any item is a 503 (a warm retry gets further), a page cut
+    /// short by the clock is not cached immutably, and a non-UTF-8 path
+    /// is a 404 (the content's answer, not the network's).
+    #[test]
+    fn manifest_page_ack_types_time_and_utf8_outcomes() {
+        use ant_retrieval::{ManifestError, ManifestPage, ReplicaSweeps};
+        let sweeps = ReplicaSweeps::for_listing();
+        let ack = manifest_page_ack(&[0; 32], Err(ManifestError::ListTimedOut), &sweeps);
+        assert!(matches!(ack, ControlAck::NotReady { .. }), "{ack:?}");
+        let ack = manifest_page_ack(
+            &[0; 32],
+            Err(ManifestError::ListNonUtf8Path {
+                path_lossy: "caf\u{FFFD}".into(),
+            }),
+            &sweeps,
+        );
+        assert!(matches!(ack, ControlAck::NotFound { .. }), "{ack:?}");
+        let ack = manifest_page_ack(&[0; 32], Err(ManifestError::ListBudgetExceeded), &sweeps);
+        assert!(matches!(ack, ControlAck::Error { .. }), "{ack:?}");
+        let page = |timed_out| ManifestPage {
+            truncated: true,
+            next_marker: Some("a".into()),
+            timed_out,
+            ..ManifestPage::default()
+        };
+        let ControlAck::ManifestPage(full) = manifest_page_ack(&[0; 32], Ok(page(false)), &sweeps)
+        else {
+            panic!("not a page");
+        };
+        assert!(full.immutable);
+        let ControlAck::ManifestPage(cut) = manifest_page_ack(&[0; 32], Ok(page(true)), &sweeps)
+        else {
+            panic!("not a page");
+        };
+        assert!(!cut.immutable);
+        assert!(cut.truncated);
+        let ControlAck::ManifestPage(blind) = manifest_page_ack(
+            &[0; 32],
+            Ok(ManifestPage {
+                lookahead_failed: true,
+                ..page(false)
+            }),
+            &sweeps,
+        ) else {
+            panic!("not a page");
+        };
+        assert!(!blind.immutable);
+        assert!(blind.truncated);
+    }
+
     /// Issue #123: a `/bytes` or `/bzz` root that peers confirmed missing
     /// ends in a typed `NotFound` (the gateway's 404) for *both* of bee's
     /// miss tails, `storage: not found` and `no peer found` — the latter
@@ -12860,5 +13252,234 @@ mod tests {
         drop(ack_rx);
         let step = next_push_step(push.as_mut(), stored, &mut ack, true, &hunts).await;
         assert!(matches!(step, PushStep::Abandoned));
+    }
+
+    fn persistent_issuer(dir: &std::path::Path, id: [u8; 32]) -> ant_postage::StampIssuer {
+        ant_postage::StampIssuer::open_or_new(
+            dir.join(format!("{}.bin", hex::encode(id))),
+            id,
+            20,
+            16,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// `GET /stamps/{id}/chunks/{address}` answers from the issuer's
+    /// records, and those records survive a restart (the `.stamps`
+    /// sidecar), not just the in-memory map of the process that stamped.
+    #[test]
+    fn stamped_chunk_reads_the_persisted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [0x0cu8; 32];
+        let key = [1u8; SECP256K1_SECRET_LEN];
+        let issued = {
+            let mut issuer = persistent_issuer(dir.path(), id);
+            ant_postage::sign_stamp_bytes(&key, &mut issuer, &[7u8; 32]).unwrap()
+        };
+        let issuers = HashMap::from([(id, persistent_issuer(dir.path(), id))]);
+        match stamped_chunk_reply(&issuers, id, &[7u8; 32]) {
+            ControlAck::StampedChunk { stamp: Some(s) } => assert_eq!(s, issued),
+            other => panic!("expected the issued stamp, got {other:?}"),
+        }
+        assert!(matches!(
+            stamped_chunk_reply(&issuers, id, &[8u8; 32]),
+            ControlAck::StampedChunk { stamp: None }
+        ));
+        match stamped_chunk_reply(&issuers, [0x0du8; 32], &[7u8; 32]) {
+            ControlAck::Error { message } => assert!(message.contains("issuer does not exist")),
+            other => panic!("expected unknown issuer, got {other:?}"),
+        }
+    }
+
+    /// An issuer whose sidecar can't be read back has incomplete records:
+    /// a missing record must surface as an error, never as "not stamped"
+    /// or as an unstamped count.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_records_refuse_instead_of_reading_as_unstamped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let id = [0x0cu8; 32];
+        let key = [1u8; SECP256K1_SECRET_LEN];
+        {
+            let mut issuer = persistent_issuer(dir.path(), id);
+            ant_postage::sign_stamp_bytes(&key, &mut issuer, &[7u8; 32]).unwrap();
+        }
+        let sidecar = dir.path().join(format!("{}.stamps", hex::encode(id)));
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let issuer = persistent_issuer(dir.path(), id);
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if issuer.stamp_records_unavailable().is_none() {
+            // Running as root: permissions don't bite, nothing to test.
+            eprintln!("skipped: sidecar stayed readable (root?)");
+            return;
+        }
+        let issuers = HashMap::from([(id, issuer)]);
+        // Chunk 7 really was stamped; its record is what got lost.
+        for addr in [[7u8; 32], [8u8; 32]] {
+            match stamped_chunk_reply(&issuers, id, &addr) {
+                ControlAck::Error { message } => {
+                    assert!(message.contains("stamp records unavailable"), "{message}");
+                }
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+        let err = count_tree_stamps(&issuers, &[[7u8; 32], [8u8; 32]]).unwrap_err();
+        assert!(err.contains("stamp records unavailable"), "{err}");
+    }
+
+    /// Every registered batch is listed (sorted, zero counts kept), a
+    /// chunk stamped by two batches counts in each, and `unstamped`
+    /// counts only chunks no batch stamped.
+    #[test]
+    fn count_tree_stamps_counts_per_batch_and_unstamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [1u8; SECP256K1_SECRET_LEN];
+        let (old, new, idle) = ([0x0bu8; 32], [0x0au8; 32], [0x0fu8; 32]);
+        let mut issuers = HashMap::new();
+        for id in [old, new, idle] {
+            issuers.insert(id, persistent_issuer(dir.path(), id));
+        }
+        // Tree of chunks 1..=4: 1 and 2 on the old batch, 2 and 3 moved
+        // to the new one, 4 on neither. Chunk 9 (not in the tree) is on
+        // the idle batch.
+        for (id, addrs) in [(old, vec![1u8, 2]), (new, vec![2, 3]), (idle, vec![9])] {
+            let issuer = issuers.get_mut(&id).unwrap();
+            for a in addrs {
+                ant_postage::sign_stamp_bytes(&key, issuer, &[a; 32]).unwrap();
+            }
+        }
+        let tree: Vec<[u8; 32]> = (1u8..=4).map(|a| [a; 32]).collect();
+        let view = count_tree_stamps(&issuers, &tree).unwrap();
+        assert_eq!(view.chunks, 4);
+        assert_eq!(view.unstamped, 1);
+        assert_eq!(
+            view.batches,
+            vec![
+                ant_control::BatchChunkCount {
+                    batch_id: new,
+                    chunks: 2
+                },
+                ant_control::BatchChunkCount {
+                    batch_id: old,
+                    chunks: 2
+                },
+                ant_control::BatchChunkCount {
+                    batch_id: idle,
+                    chunks: 0
+                },
+            ]
+        );
+        // No batches at all: everything is unstamped, nothing listed.
+        let none = count_tree_stamps(&HashMap::new(), &tree).unwrap();
+        assert_eq!((none.chunks, none.unstamped, none.batches.len()), (4, 4, 0));
+
+        // Counting in slices (lock released between them) adds up to
+        // the same view, for every slice size including an empty tree.
+        let locked = std::sync::Mutex::new(issuers);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for slice in [1, 2, 3, 4, 100] {
+            let sliced = rt
+                .block_on(count_tree_stamps_sliced(&locked, &tree, slice))
+                .unwrap();
+            assert_eq!(sliced, view, "slice {slice}");
+        }
+        let empty = rt
+            .block_on(count_tree_stamps_sliced(&locked, &[], 2))
+            .unwrap();
+        assert_eq!(
+            (empty.chunks, empty.unstamped, empty.batches.len()),
+            (0, 0, 3)
+        );
+    }
+
+    /// A batch registered or dropped between two slices of a count must
+    /// not show up in only some of them: the count starts over and the
+    /// view is the one a single pass over the new set gives.
+    #[test]
+    fn sliced_count_restarts_when_the_batch_set_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [1u8; SECP256K1_SECRET_LEN];
+        let (old, new) = ([0x0bu8; 32], [0x0au8; 32]);
+        let mut old_issuer = persistent_issuer(dir.path(), old);
+        let mut new_issuer = persistent_issuer(dir.path(), new);
+        for a in 1u8..=4 {
+            ant_postage::sign_stamp_bytes(&key, &mut old_issuer, &[a; 32]).unwrap();
+            ant_postage::sign_stamp_bytes(&key, &mut new_issuer, &[a; 32]).unwrap();
+        }
+        let tree: Vec<[u8; 32]> = (1u8..=4).map(|a| [a; 32]).collect();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // `biased` polls the count first every round, so `change` runs
+        // exactly once per slice the count yields after, deterministically.
+        async fn racing(
+            locked: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+            tree: &[[u8; 32]],
+            change: impl std::future::Future<Output = ()>,
+        ) -> Result<ant_control::StewardshipStampsView, String> {
+            let change = async {
+                change.await;
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                biased;
+                r = count_tree_stamps_sliced(locked, tree, 1) => r,
+                () = change => unreachable!(),
+            }
+        }
+
+        // Registered after the first of four slices.
+        let locked = std::sync::Mutex::new(HashMap::from([(old, old_issuer)]));
+        let view = rt
+            .block_on(racing(&locked, &tree, async {
+                locked.lock().unwrap().insert(new, new_issuer);
+            }))
+            .unwrap();
+        assert_eq!((view.chunks, view.unstamped), (4, 0));
+        assert_eq!(
+            view.batches,
+            vec![
+                ant_control::BatchChunkCount {
+                    batch_id: new,
+                    chunks: 4
+                },
+                ant_control::BatchChunkCount {
+                    batch_id: old,
+                    chunks: 4
+                },
+            ]
+        );
+
+        // Dropped after the first slice: not listed with a partial count.
+        let view = rt
+            .block_on(racing(&locked, &tree, async {
+                locked.lock().unwrap().remove(&new);
+            }))
+            .unwrap();
+        assert_eq!((view.chunks, view.unstamped), (4, 0));
+        assert_eq!(
+            view.batches,
+            vec![ant_control::BatchChunkCount {
+                batch_id: old,
+                chunks: 4
+            }]
+        );
+
+        // A set that changes on every slice ends in an error, never in
+        // a mixed view.
+        let res = rt.block_on(racing(&locked, &tree, async {
+            for i in 0..=STAMP_COUNT_RESTARTS as u8 {
+                let id = [0x40 + i; 32];
+                let issuer = persistent_issuer(dir.path(), id);
+                locked.lock().unwrap().insert(id, issuer);
+                tokio::task::yield_now().await;
+            }
+        }));
+        assert!(res.unwrap_err().contains("kept changing"));
     }
 }

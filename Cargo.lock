@@ -214,6 +214,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -283,6 +284,7 @@ dependencies = [
  "serde",
  "sha3 0.10.9",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

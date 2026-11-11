@@ -526,7 +526,7 @@ fn ack_to_response(ack: ControlAck) -> Response {
             content_type,
             filename,
         },
-        ControlAck::Manifest { .. } => Response::Error {
+        ControlAck::Manifest { .. } | ControlAck::ManifestPage(_) => Response::Error {
             message: "manifest listing is only supported by ant-gateway".to_string(),
         },
         ControlAck::Progress(p) => Response::Progress(p),
@@ -578,8 +578,12 @@ fn ack_to_response(ack: ControlAck) -> Response {
         | ControlAck::PinPresent { .. }
         | ControlAck::PinList { .. }
         | ControlAck::PinCheck { .. }
-        | ControlAck::PostageBuckets(_) => Response::Error {
-            message: "pin / postage-bucket queries are only supported by ant-gateway".to_string(),
+        | ControlAck::PostageBuckets(_)
+        | ControlAck::StampedChunk { .. }
+        | ControlAck::StewardshipStamps(_) => Response::Error {
+            message:
+                "pin / postage-bucket / stamp-record queries are only supported by ant-gateway"
+                    .to_string(),
         },
         // The Unix-socket protocol used by `antctl` doesn't expose feed
         // reads today; the control surface is just for renderers and

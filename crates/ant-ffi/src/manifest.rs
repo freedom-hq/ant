@@ -54,6 +54,8 @@ pub(crate) fn list_to_json(
             let cmd = ControlCommand::ListBzz {
                 reference,
                 bypass_cache: false,
+                // The iOS player's listing: whole manifest with sizes.
+                page: None,
                 ack: ack_tx,
             };
             cmd_tx

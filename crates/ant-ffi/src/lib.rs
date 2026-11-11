@@ -1339,6 +1339,7 @@ async fn attempt_download(
             Ok(Some(
                 ControlAck::Ok { .. }
                 | ControlAck::Manifest { .. }
+                | ControlAck::ManifestPage(_)
                 | ControlAck::BytesStreamStart { .. }
                 | ControlAck::BzzStreamStart { .. }
                 | ControlAck::BytesChunk { .. }
@@ -1361,6 +1362,8 @@ async fn attempt_download(
                 | ControlAck::PinList { .. }
                 | ControlAck::PinCheck { .. }
                 | ControlAck::PostageBuckets(_)
+                | ControlAck::StampedChunk { .. }
+                | ControlAck::StewardshipStamps(_)
                 | ControlAck::PullsyncProbe(_)
                 | ControlAck::LurkerMessage { .. }
                 | ControlAck::NotReady { .. },
