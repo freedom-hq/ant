@@ -146,17 +146,21 @@ impl ChunkFetcher for MapFetcher {
 /// joiner production uses. Returns the router and the file bytes.
 fn router_with_chunked_file(data: Vec<u8>) -> (axum::Router, [u8; 32]) {
     let (root_addr, store) = split_file(&data);
-    let fetcher = Arc::new(MapFetcher { chunks: store });
-    let router = router_with_dispatcher(move |cmd| {
+    let fetcher: Arc<dyn ChunkFetcher> = Arc::new(MapFetcher { chunks: store });
+    (router_with_fetcher(fetcher), root_addr)
+}
+
+/// Router whose fake node answers `StreamBytes` through `fetcher`.
+fn router_with_fetcher(fetcher: Arc<dyn ChunkFetcher>) -> axum::Router {
+    router_with_dispatcher(move |cmd| {
         let fetcher = fetcher.clone();
         async move {
             handle_stream_command(fetcher, cmd).await;
         }
-    });
-    (router, root_addr)
+    })
 }
 
-async fn handle_stream_command(fetcher: Arc<MapFetcher>, cmd: ControlCommand) {
+async fn handle_stream_command(fetcher: Arc<dyn ChunkFetcher>, cmd: ControlCommand) {
     match cmd {
         ControlCommand::StreamBytes {
             reference,
@@ -166,7 +170,15 @@ async fn handle_stream_command(fetcher: Arc<MapFetcher>, cmd: ControlCommand) {
             ack,
             ..
         } => {
-            stream_via_fetcher(&fetcher, reference, max_bytes, range, head_only, ack).await;
+            stream_via_fetcher(
+                fetcher.as_ref(),
+                reference,
+                max_bytes,
+                range,
+                head_only,
+                ack,
+            )
+            .await;
         }
         ControlCommand::GetChunkRaw { reference, ack, .. } => {
             let reply = match fetcher.fetch(reference).await {
@@ -182,7 +194,7 @@ async fn handle_stream_command(fetcher: Arc<MapFetcher>, cmd: ControlCommand) {
 }
 
 async fn stream_via_fetcher(
-    fetcher: &MapFetcher,
+    fetcher: &dyn ChunkFetcher,
     reference: [u8; 32],
     max_bytes: Option<u64>,
     range: Option<StreamRange>,
@@ -500,4 +512,177 @@ async fn ten_mib_prefix_range_within_one_leaf() {
         .to_vec();
     assert_eq!(body.len(), 1024);
     assert_eq!(sha256_hex(&body), want_sha);
+}
+
+/// How one chunk of a [`ColdFetcher`] behaves.
+#[derive(Clone, Copy, Default)]
+struct ColdChunk {
+    /// Network latency of every fetch of this chunk.
+    delay: Duration,
+    /// Answer "not found" this many times before delivering.
+    misses: usize,
+    /// Answer "not found" until this long after the fetcher was built.
+    absent_for: Duration,
+}
+
+/// A cold node (issue #79): every chunk comes from the network, some
+/// slowly, some only after peers answered `storage: not found` a few
+/// times, some only after a long while.
+struct ColdFetcher {
+    chunks: HashMap<[u8; 32], Vec<u8>>,
+    plan: HashMap<[u8; 32], ColdChunk>,
+    fetches: std::sync::Mutex<HashMap<[u8; 32], usize>>,
+    born: tokio::time::Instant,
+}
+
+impl ColdFetcher {
+    /// Serve `chunks`, leaf `i` of `data` behaving as `plan(i)`.
+    fn new(
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        data: &[u8],
+        plan: impl Fn(usize) -> ColdChunk,
+    ) -> Self {
+        let plan = data
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(i, leaf)| (cac_new(leaf).expect("cac_new leaf").0, plan(i)))
+            .collect();
+        Self {
+            chunks,
+            plan,
+            fetches: std::sync::Mutex::default(),
+            born: tokio::time::Instant::now(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChunkFetcher for ColdFetcher {
+    async fn fetch(
+        &self,
+        addr: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let plan = self.plan.get(&addr).copied().unwrap_or_default();
+        tokio::time::sleep(plan.delay).await;
+        let missed = {
+            let mut fetches = self.fetches.lock().unwrap();
+            let n = fetches.entry(addr).or_default();
+            *n += 1;
+            *n <= plan.misses
+        };
+        if missed || self.born.elapsed() < plan.absent_for {
+            return Err(format!(
+                "all peers failed for chunk {} after 33 attempts \
+                 (last: remote: retrieve chunk: storage: not found)",
+                hex::encode(addr)
+            )
+            .into());
+        }
+        self.chunks
+            .get(&addr)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> { "missing chunk".into() })
+    }
+}
+
+/// `GET uri` (with `range`, if any) and drain the body, returning the
+/// status, the `Content-Range` header and the bytes the client got. A
+/// body error (the gateway tearing the response down mid-stream) ends
+/// the drain like a client seeing the connection close: the test then
+/// sees a short body.
+async fn get_all(
+    router: axum::Router,
+    uri: &str,
+    range: Option<&str>,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    use futures::StreamExt;
+    let mut req = Request::builder().method(Method::GET).uri(uri);
+    if let Some(r) = range {
+        req = req.header(header::RANGE, r);
+    }
+    let resp = send(router, req.body(Body::empty()).unwrap()).await;
+    let status = resp.status();
+    let content_range = resp
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let mut body = resp.into_body().into_data_stream();
+    let mut out = Vec::new();
+    while let Some(Ok(frame)) = body.next().await {
+        out.extend_from_slice(&frame);
+    }
+    (status, content_range, out)
+}
+
+/// Fetch `data` from `router` as `/bytes/<root>`, whole and as one
+/// `Range: bytes=start-end` window, and assert every byte arrives.
+async fn assert_streams_in_full(
+    router: axum::Router,
+    root: [u8; 32],
+    data: &[u8],
+    start: usize,
+    end: usize,
+) {
+    let uri = format!("/bytes/{}", hex::encode(root));
+    let (status, _, body) = get_all(router.clone(), &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), data.len(), "plain GET body cut short");
+    assert!(body == data, "plain GET body differs");
+
+    let (status, content_range, body) =
+        get_all(router, &uri, Some(&format!("bytes={start}-{end}"))).await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        content_range.as_deref(),
+        Some(format!("bytes {start}-{end}/{}", data.len()).as_str()),
+    );
+    assert_eq!(body.len(), end - start + 1, "range body cut short");
+    assert!(body == data[start..=end], "range body differs");
+}
+
+/// Issue #79, plain tree: a cold fetch where every leaf takes 0.2-2 s,
+/// every fifth answers "not found" three times before it is served, and
+/// one is unretrievable for its first 40 s still delivers the whole
+/// body, plain and ranged. Paused clock: the latencies and retry
+/// back-offs auto-advance.
+#[tokio::test(start_paused = true)]
+async fn cold_slow_and_late_chunks_stream_in_full() {
+    let data = deterministic_bytes(TEN_MIB);
+    let (root, chunks) = split_file(&data);
+    let fetcher = ColdFetcher::new(chunks, &data, |i| ColdChunk {
+        delay: Duration::from_millis(200 + (i as u64 * 7919) % 1800),
+        misses: if i % 5 == 0 { 3 } else { 0 },
+        absent_for: if i == 600 {
+            Duration::from_secs(40)
+        } else {
+            Duration::ZERO
+        },
+    });
+    let router = router_with_fetcher(Arc::new(fetcher));
+    assert_streams_in_full(router, root, &data, 2_000_000, 3_000_000).await;
+}
+
+/// Issue #79, redundant tree (`swarm-redundancy-level: 1`, like the
+/// issue's 1.5 GiB file): a quarter of the leaves answer "not found"
+/// twice before they are served — more than each node's 9 parities.
+/// Pre-fix the first recovery sweep took those answers as final, and
+/// the gateway's `200` body ended after one 4 KiB leaf (a `206` window
+/// after a few); the node has to sweep again and deliver every byte.
+#[tokio::test(start_paused = true)]
+async fn cold_redundant_file_with_denied_shards_streams_in_full() {
+    let data = deterministic_bytes(1024 * 1024);
+    let split = ant_retrieval::rs_encode::split_bytes_with_redundancy(&data, 1);
+    let chunks = split
+        .chunks
+        .iter()
+        .map(|c| (c.address, c.wire.clone()))
+        .collect();
+    let fetcher = ColdFetcher::new(chunks, &data, |i| ColdChunk {
+        delay: Duration::from_millis(300),
+        misses: if i % 4 == 1 { 2 } else { 0 },
+        ..ColdChunk::default()
+    });
+    let router = router_with_fetcher(Arc::new(fetcher));
+    assert_streams_in_full(router, split.root, &data, 300_000, 700_000).await;
 }
