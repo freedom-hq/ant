@@ -613,12 +613,19 @@ impl StampIssuer {
         self.seen.contains_key(addr)
     }
 
-    /// `Some(reason)` when this issuer's `.stamps` sidecar exists but
-    /// could not be read back safely, so the per-chunk stamp records
-    /// ([`Self::cached_stamp`]) are incomplete: a chunk this node did
-    /// stamp may be missing from them. Readers that report "not
-    /// stamped" from the records must check this first and refuse,
-    /// rather than read the gap as a confirmed absence.
+    /// `Some(reason)` when this persistent issuer's `.stamps` sidecar
+    /// can't be safely written (the same state in which
+    /// [`sign_stamp_bytes`] refuses to issue). In most of those states
+    /// it also couldn't be fully read back — an unreadable file loads
+    /// no records at all — so the per-chunk records
+    /// ([`Self::cached_stamp`]) may be missing chunks this node did
+    /// stamp. Readers that report "not stamped" from the records treat
+    /// `Some` as "records may be incomplete" and refuse rather than
+    /// read a miss as a confirmed absence. `None` does not prove the
+    /// records cover every stamp the batch ever carried: stamps issued
+    /// before the sidecar existed, by another node (counters seeded
+    /// from bee), or into a data dir since lost or replaced, were never
+    /// recorded here.
     #[must_use]
     pub fn stamp_records_unavailable(&self) -> Option<&'static str> {
         self.stamp_persistence_failed

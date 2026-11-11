@@ -537,12 +537,19 @@ pub async fn stamp_buckets(
 /// with `index`/`timestamp` hex-encoded like `POST /envelope`; `404
 /// "chunk not stamped by this batch"` when the issuer has no record of
 /// it; bee's `404 "issuer does not exist"` for a batch this node doesn't
-/// issue from. Read-only, local, and open on the same terms as `/stamps`.
+/// issue from; `503` while the node has no stamp issuers at all (antd
+/// before its chain init); `500 "stamp records unavailable …"` when the
+/// issuer's sidecar can't be safely used, rather than a 404 a lost
+/// record would make untrue. Read-only, local, and open on the same
+/// terms as `/stamps`.
 ///
-/// The record says this node *issued* the stamp, not that the network
-/// still stores the chunk under it: on a mutable batch whose bucket
-/// wrapped, the slot may since have been re-issued to another chunk
-/// (bee's issuer keeps its `StampItem` the same way).
+/// The records cover the stamps *this data dir* issued since it gained
+/// the `.stamps` sidecar: stamps issued by an older Ant, by bee (counters
+/// recovered from its store), or into a data dir since lost or replaced
+/// read as not stamped. And a record says this node *issued* the stamp,
+/// not that the network still stores the chunk under it: on a mutable
+/// batch whose bucket wrapped, the slot may since have been re-issued to
+/// another chunk (bee's issuer keeps its `StampItem` the same way).
 pub async fn stamp_chunk(
     State(handle): State<GatewayHandle>,
     Path((id, address)): Path<(String, String)>,
@@ -604,6 +611,8 @@ pub async fn stamp_chunk(
         ControlAck::Error { message } => {
             if message.contains("issuer does not exist") {
                 json_error(StatusCode::NOT_FOUND, "issuer does not exist")
+            } else if message.starts_with("uploads not configured") {
+                json_error(StatusCode::SERVICE_UNAVAILABLE, message)
             } else {
                 // `stamp records unavailable …`: the issuer's sidecar
                 // couldn't be read back, so a missing record proves

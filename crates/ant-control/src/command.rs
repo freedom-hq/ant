@@ -713,10 +713,12 @@ pub enum ControlCommand {
     /// records (the `.stamps` sidecar). One lookup, no network. Ack is
     /// [`ControlAck::StampedChunk`] (`stamp: None` when the issuer has
     /// no record of the chunk), or `Error` containing `issuer does not
-    /// exist` for an unregistered batch, or `stamp records unavailable`
-    /// when the issuer's sidecar could not be read back (the records
-    /// are then incomplete and "not stamped" can't be told apart from
-    /// "lost").
+    /// exist` for an unregistered batch, starting `uploads not
+    /// configured` when the node has no upload runtime yet, or
+    /// containing `stamp records unavailable` when the issuer's sidecar
+    /// can't be safely used (see
+    /// `ant_postage::StampIssuer::stamp_records_unavailable`; a miss
+    /// then can't be told apart from a lost record).
     StampedChunk {
         batch_id: [u8; 32],
         address: [u8; 32],

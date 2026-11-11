@@ -3019,8 +3019,11 @@ fn handle_control_command(
             // ethersphere/bee#5682 (1): one lookup in the batch issuer's
             // per-chunk stamp records. No network, no slot consumed.
             let reply = match upload {
+                // No upload runtime yet (antd before late chain init):
+                // not "this batch didn't stamp it" — the gateway maps
+                // the `uploads not configured` prefix to 503.
                 None => ControlAck::Error {
-                    message: "issuer does not exist (uploads not configured)".into(),
+                    message: "uploads not configured: node has no stamp issuers (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
                 },
                 Some(ref upload) => {
                     let issuers = match upload.issuers.lock() {
@@ -3066,13 +3069,9 @@ fn handle_control_command(
                 .await
                 {
                     Ok(addrs) => {
-                        // Traverse first, then take the issuer lock once
-                        // for the whole count; nothing awaits under it.
-                        let issuers = match upload.issuers.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        match count_tree_stamps(&issuers, &addrs) {
+                        match count_tree_stamps_sliced(&upload.issuers, &addrs, STAMP_COUNT_SLICE)
+                            .await
+                        {
                             Ok(view) => ControlAck::StewardshipStamps(view),
                             Err(message) => ControlAck::Error { message },
                         }
@@ -5688,6 +5687,60 @@ fn stamped_chunk_reply(
         };
     }
     ControlAck::StampedChunk { stamp: None }
+}
+
+/// Addresses counted per hold of the issuer lock in
+/// [`count_tree_stamps_sliced`]. The lock is the one every stamping path
+/// takes (uploads, `Envelope`, `PostageBuckets` on the node loop
+/// itself), so one hold is kept to `16_384 × batches` hash lookups
+/// (about a millisecond per batch) instead of the whole tree's: a
+/// 16 GiB file is ~4.2 M chunks.
+const STAMP_COUNT_SLICE: usize = 16_384;
+
+/// [`count_tree_stamps`] over `addrs` in slices of `slice`, releasing the
+/// issuer lock and yielding between slices so stamping isn't held up by a
+/// large tree. Rows are merged by batch id; a batch registered mid-count
+/// is counted from the slice it first appears in (a newly bought batch
+/// has no records, so it reads 0 either way).
+async fn count_tree_stamps_sliced(
+    issuers: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+    addrs: &[[u8; 32]],
+    slice: usize,
+) -> Result<ant_control::StewardshipStampsView, String> {
+    let mut chunks = 0u64;
+    let mut unstamped = 0u64;
+    let mut per_batch = std::collections::BTreeMap::<[u8; 32], u64>::new();
+    let mut parts = addrs.chunks(slice.max(1)).peekable();
+    // An empty tree still lists the batches.
+    let empty: [[u8; 32]; 0] = [];
+    let mut first = true;
+    while first || parts.peek().is_some() {
+        let part = parts.next().unwrap_or(&empty);
+        first = false;
+        let view = {
+            let guard = match issuers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            count_tree_stamps(&guard, part)?
+        };
+        chunks += view.chunks;
+        unstamped += view.unstamped;
+        for row in view.batches {
+            *per_batch.entry(row.batch_id).or_default() += row.chunks;
+        }
+        if parts.peek().is_some() {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(ant_control::StewardshipStampsView {
+        chunks,
+        batches: per_batch
+            .into_iter()
+            .map(|(batch_id, chunks)| ant_control::BatchChunkCount { batch_id, chunks })
+            .collect(),
+        unstamped,
+    })
 }
 
 /// Count, for every registered batch, how many of `addrs` its issuer's
@@ -13074,11 +13127,14 @@ mod tests {
             return;
         }
         let issuers = HashMap::from([(id, issuer)]);
-        match stamped_chunk_reply(&issuers, id, &[8u8; 32]) {
-            ControlAck::Error { message } => {
-                assert!(message.contains("stamp records unavailable"), "{message}");
+        // Chunk 7 really was stamped; its record is what got lost.
+        for addr in [[7u8; 32], [8u8; 32]] {
+            match stamped_chunk_reply(&issuers, id, &addr) {
+                ControlAck::Error { message } => {
+                    assert!(message.contains("stamp records unavailable"), "{message}");
+                }
+                other => panic!("expected an error, got {other:?}"),
             }
-            other => panic!("expected an error, got {other:?}"),
         }
         let err = count_tree_stamps(&issuers, &[[7u8; 32], [8u8; 32]]).unwrap_err();
         assert!(err.contains("stamp records unavailable"), "{err}");
@@ -13129,5 +13185,25 @@ mod tests {
         // No batches at all: everything is unstamped, nothing listed.
         let none = count_tree_stamps(&HashMap::new(), &tree).unwrap();
         assert_eq!((none.chunks, none.unstamped, none.batches.len()), (4, 4, 0));
+
+        // Counting in slices (lock released between them) adds up to
+        // the same view, for every slice size including an empty tree.
+        let locked = std::sync::Mutex::new(issuers);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for slice in [1, 2, 3, 4, 100] {
+            let sliced = rt
+                .block_on(count_tree_stamps_sliced(&locked, &tree, slice))
+                .unwrap();
+            assert_eq!(sliced, view, "slice {slice}");
+        }
+        let empty = rt
+            .block_on(count_tree_stamps_sliced(&locked, &[], 2))
+            .unwrap();
+        assert_eq!(
+            (empty.chunks, empty.unstamped, empty.batches.len()),
+            (0, 0, 3)
+        );
     }
 }

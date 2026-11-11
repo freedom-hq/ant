@@ -203,8 +203,14 @@ pub async fn stewardship_get(
 /// fetches only interior and manifest nodes (leaves are listed from
 /// their parents), so the counts say nothing about whether the leaves
 /// are retrievable — that is the plain `GET`'s question. A walk that
-/// can't complete is an error, never partial counts. Read-only and open
-/// on the same terms as `/stamps`.
+/// can't complete is an error, never partial counts; so is a batch whose
+/// records are unavailable (`500`) or a node with no stamp issuers yet
+/// (`503`). Read-only and open on the same terms as `/stamps`.
+///
+/// The counts are this data dir's records, with the limits
+/// `stamps::stamp_chunk` lists: stamps issued by an older Ant,
+/// by bee, or into a lost data dir count as unstamped, and on a mutable
+/// batch whose bucket wrapped a counted chunk may have lost its slot.
 pub async fn stewardship_stamps(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,

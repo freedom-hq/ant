@@ -32,7 +32,11 @@ fn one_batch_router() -> axum::Router {
                 address,
                 ack,
             } => {
-                let reply = if batch_id != BATCH {
+                let reply = if batch_id == [0x00; 32] {
+                    ControlAck::Error {
+                        message: "uploads not configured: node has no stamp issuers".into(),
+                    }
+                } else if batch_id != BATCH {
                     ControlAck::Error {
                         message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
                     }
@@ -220,4 +224,19 @@ async fn neighbouring_routes_still_resolve() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["message"], "issuer does not exist");
+}
+
+/// No upload runtime yet (antd before chain init) is not "not stamped".
+#[tokio::test]
+async fn stamped_chunk_without_issuers_is_503_not_404() {
+    let resp = send(
+        one_batch_router(),
+        get(format!(
+            "/stamps/{}/chunks/{}",
+            hex::encode([0x00; 32]),
+            hex::encode(CHUNK)
+        )),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
