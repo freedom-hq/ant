@@ -352,9 +352,12 @@ To sweep the peer target on a phone as well, `NodeConfig::target_peers`
 has to reach the FFI first: `init_inner` currently always takes
 `ant_p2p::DEFAULT_TARGET_PEERS` (100), and there is no
 `ant_init_with_options` field for it. That is a small, well-scoped
-follow-up — but note that at 100 peers the phone starts a factor below
-the desktop's 400-peer optimum, so the first device numbers should be
-read as a *floor*, not the phone's ceiling.
+follow-up. Don't read the 100-peer device numbers against PLAN.md
+Phase 7g's desktop 400-peer figure: that run was unfunded and drew on
+per-peer free-tier credit, so more peers bought more unpaid headroom,
+not a higher network ceiling (issue #81). Compare phone and desktop on
+a funded chequebook, where peer count is a connectivity setting, not a
+throughput lever.
 
 ## Reading a report
 
