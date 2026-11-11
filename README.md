@@ -13,7 +13,7 @@ Mantaray manifests for multi-file uploads, and speaks the
 management (create / top-up / dilute) is exposed through `antctl
 postage`. The **mobile artefact** and a handful of M3 polish items
 (automatic SWAP settlement triggers, live-mainnet outbound-cheque
-interop, Reed-Solomon recovery) are still outstanding. Wire formats,
+interop) are still outstanding. Wire formats,
 CLI flags, and on-disk files may still change.
 
 See [`PLAN.md`](PLAN.md) for the full design; §9.0 "Current status" tracks
@@ -45,6 +45,12 @@ the still-open items.
 - **Ordered streaming joiner** with single-range (`Range: bytes=a-b`,
   suffix, open-ended) and `HEAD` support — bodies don't materialise in
   memory.
+- **Reed-Solomon recovery.** Files uploaded with a redundancy level
+  (1-4) are read with parity-aware geometry, and a data chunk that
+  can't be fetched is recovered from its siblings and parities; an
+  unreachable root falls back to its dispersed replicas. This is on by
+  default and byte-compatible with bee. `--allow-degraded-redundancy`
+  is a no-op, kept only for compatibility.
 - **Bee-shaped HTTP gateway.** `127.0.0.1:1633` by default, so
   unmodified `bee-js` / `curl` / browser proxies work. Tier-A read
   endpoints **and** the Tier-B upload endpoints (`POST /chunks`,
@@ -159,9 +165,6 @@ the still-open items.
   provision the chequebook out of band (factory deploy from `bee` or
   directly from a wallet). `cash` shipped as `antctl chequebook
   cash-self` (see above).
-- **Reed-Solomon recovery.** Files uploaded with redundancy can be
-  read today only via `--allow-degraded-redundancy`, and only if every
-  data chunk is reachable.
 - **Streaming `antctl get`.** `antctl get` streams *progress* but the
   body still arrives as one terminal response over the control
   socket; browsers hitting the HTTP gateway get true byte streaming
