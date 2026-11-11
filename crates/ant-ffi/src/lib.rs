@@ -4655,7 +4655,21 @@ fn load_or_create_identity(
     let decoded = decode_identity(&id)?;
     let pretty = serde_json::to_string_pretty(&id)
         .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
-    std::fs::write(id_path, pretty)
+    // Owner-only (it holds the account key) and `create_new`, so an
+    // identity.json that appeared since the check above is never replaced.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(id_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(pretty.as_bytes())?;
+            f.sync_all()
+        })
         .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
     Ok(decoded)
 }
@@ -5225,6 +5239,12 @@ mod tests {
 
         let (first, nonce, _) = load_or_create_identity(&id_path).expect("create");
         assert!(id_path.exists(), "first call must persist identity.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&id_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "identity.json holds the account key");
+        }
         let (second, nonce2, _) = load_or_create_identity(&id_path).expect("reload");
         assert_eq!(first, second, "reload must return the same account key");
         assert_eq!(nonce, nonce2);
