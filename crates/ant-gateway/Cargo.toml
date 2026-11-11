@@ -47,6 +47,9 @@ sha2 = "0.11.0"
 # WebSocket client for the /gsoc/subscribe // /pss/subscribe tests —
 # same version axum's `ws` feature already pulls into the lockfile.
 tokio-tungstenite = "0.29.0"
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the
+# slow / late cold-chunk streaming tests (issue #79).
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 # `request_log`: capture the gateway's debug request/response lines.
 tracing-subscriber.workspace = true

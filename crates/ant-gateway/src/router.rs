@@ -78,6 +78,9 @@ pub fn build(handle: GatewayHandle) -> Router {
         // Per-bucket collision counters of a registered batch (bee
         // `postageGetStampBucketsHandler`).
         .route("/stamps/{id}/buckets", get(stamps::stamp_buckets))
+        // Whether this node stamped a chunk with one of its batches, from
+        // the issuer's own records (proposed for bee, ethersphere/bee#5682).
+        .route("/stamps/{id}/chunks/{address}", get(stamps::stamp_chunk))
         // Network batch listing / lookup (bee `postageGetAllBatchesHandler`
         // / `postageGetBatchHandler`). Ant has no postage event sync, so
         // the global list is honestly empty and the single-batch lookup
@@ -182,6 +185,12 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route(
             "/stewardship/{address}",
             get(stewardship::stewardship_get).put(stewardship::stewardship_put),
+        )
+        // Per-batch stamp coverage of a tree, from this node's issuer
+        // records (proposed for bee, ethersphere/bee#5682).
+        .route(
+            "/stewardship/{address}/stamps",
+            get(stewardship::stewardship_stamps),
         )
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
         // PSS: wrap+mine+stamp+push a trojan chunk to a target
