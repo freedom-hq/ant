@@ -4642,13 +4642,42 @@ unsafe fn write_out_err(out_err: *mut *mut c_char, msg: &str) {
     }
 }
 
+/// identity.json holds the account key, but data dirs from before it was
+/// written 0600 have it world-readable: clear the group/other bits on
+/// load. Best effort; a failure is logged, not fatal.
+fn restrict_identity_to_owner(id_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(id_path) else {
+            return;
+        };
+        let mode = meta.permissions().mode() & 0o7777;
+        let tight = mode & !0o077;
+        if tight == mode {
+            return;
+        }
+        if let Err(e) = std::fs::set_permissions(id_path, std::fs::Permissions::from_mode(tight)) {
+            tracing::warn!(
+                target: "ant-ffi",
+                path = %id_path.display(),
+                "identity.json is mode {mode:o}; could not restrict it to the owner: {e}",
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = id_path;
+}
+
 fn load_or_create_identity(
     id_path: &Path,
 ) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
     if id_path.exists() {
         let raw = std::fs::read_to_string(id_path)
             .map_err(|e| FfiError::Io(format!("read {}: {e}", id_path.display())))?;
-        return decode_identity_json(&raw);
+        let decoded = decode_identity_json(&raw)?;
+        restrict_identity_to_owner(id_path);
+        return Ok(decoded);
     }
 
     let id = new_identity()?;
@@ -5245,8 +5274,20 @@ mod tests {
             let mode = std::fs::metadata(&id_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "identity.json holds the account key");
         }
+        #[cfg(unix)]
+        {
+            // A data dir from before the 0600 write: tightened on load.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let (second, nonce2, _) = load_or_create_identity(&id_path).expect("reload");
         assert_eq!(first, second, "reload must return the same account key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&id_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "a loose identity.json is tightened");
+        }
         assert_eq!(nonce, nonce2);
 
         let _ = std::fs::remove_dir_all(&dir);

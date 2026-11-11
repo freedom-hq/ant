@@ -79,14 +79,17 @@ struct Opt {
     log_level: String,
 
     /// Path to the node's secp256k1 signing key: one line of 64 hex
-    /// characters (an optional `0x` prefix is accepted). Defaults to
-    /// `<data-dir>/signing.key`. An existing file is never overwritten. On
-    /// a fresh data dir (no `identity.json`) it is read and becomes the
-    /// node's key; if it is missing there, a random key is generated and
-    /// written to it (mode 0600). If `identity.json` already exists and the
-    /// file holds a different key, antd refuses to start. When a bee
-    /// keystore (`keys/swarm.key`) is present it holds the node's key, and a
-    /// `--key-file` naming a different key is refused.
+    /// characters (an optional `0x` prefix is accepted; a raw 32-byte
+    /// binary key is not). Defaults to `<data-dir>/signing.key`; a leading
+    /// `~/` is expanded. An existing file is never overwritten. On a fresh
+    /// data dir (no `identity.json`) it is read and becomes the node's key;
+    /// if it is missing there, a random key is generated and written to it
+    /// (mode 0600). If `identity.json` already exists and the file holds a
+    /// different key, antd refuses to start. When a bee keystore
+    /// (`keys/swarm.key`) is present it holds the node's key, and a
+    /// `--key-file` naming a different key is refused. A key file you pass
+    /// that other users can read gets a warning; the default
+    /// `signing.key` and `identity.json` are tightened to owner-only.
     #[arg(long)]
     key_file: Option<PathBuf>,
 
@@ -474,35 +477,11 @@ async fn main() -> Result<()> {
     // Under the instance lock, before the node opens the ledger.
     confirm_cheque_liabilities(&data_dir, &opt.confirm_cheque_liability)?;
 
-    let id_path = data_dir.join("identity.json");
-    let key_path = opt
-        .key_file
-        .clone()
-        .unwrap_or_else(|| data_dir.join("signing.key"));
-
-    // A bee-managed Web3 v3 keystore at `<data-dir>/keys/swarm.key`
-    // (Freedom's injected identity) takes precedence over our own
-    // `identity.json` (PLAN.md J.5.E3); only fall back to generate /
-    // load our native identity when no keystore is present.
-    let swarm_key_path = data_dir.join("keys").join("swarm.key");
-    let (signing_secret, overlay_nonce, libp2p_keypair) = if swarm_key_path.exists() {
-        let loaded = load_identity_from_keystore(&swarm_key_path, resolved_password.as_deref())?;
-        // The keystore wins, but an explicit `--key-file` naming a
-        // different key is refused rather than silently ignored. The
-        // default `<data-dir>/signing.key` may be a stale leftover from
-        // before the keystore and isn't checked.
-        if opt.key_file.is_some() {
-            check_key_file_matches(
-                &key_path,
-                read_key_file(&key_path)?.as_ref(),
-                &loaded.0,
-                &swarm_key_path,
-            )?;
-        }
-        loaded
-    } else {
-        load_or_create_identity(&id_path, &key_path)?
-    };
+    let (signing_secret, overlay_nonce, libp2p_keypair) = load_node_identity(
+        &data_dir,
+        opt.key_file.as_deref(),
+        resolved_password.as_deref(),
+    )?;
 
     let vk = *(SigningKey::from_bytes((&signing_secret).into())
         .context("invalid signing key")?
@@ -1627,26 +1606,108 @@ fn load_identity_from_keystore(
     Ok((signing_secret, overlay_nonce, kp))
 }
 
-/// Read the signing key at `key_path` (`--key-file`, or
-/// `<data-dir>/signing.key`). `Ok(None)` only when the file genuinely does
-/// not exist; any other read failure, or contents that aren't one 64-hex
-/// secp256k1 secret (an optional `0x` prefix and trailing whitespace are
-/// tolerated), is an error — never a reason to fall back to a random key.
-fn read_key_file(key_path: &Path) -> Result<Option<[u8; SECP256K1_SECRET_LEN]>> {
-    let raw = match std::fs::read_to_string(key_path) {
+/// The node's signing key, nonce and libp2p keypair, from wherever this
+/// data dir keeps them.
+///
+/// A bee-managed Web3 v3 keystore at `<data-dir>/keys/swarm.key`
+/// (Freedom's injected identity) takes precedence over our own
+/// `identity.json` (PLAN.md J.5.E3); only fall back to generate / load our
+/// native identity when no keystore is present. `key_file` is the
+/// `--key-file` flag as given (`~/` is expanded here, like every other
+/// path flag); without it the key file is `<data-dir>/signing.key`.
+fn load_node_identity(
+    data_dir: &Path,
+    key_file: Option<&Path>,
+    password: Option<&str>,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; 32], Keypair)> {
+    let id_path = data_dir.join("identity.json");
+    let key_path = key_file_path(data_dir, key_file);
+    let swarm_key_path = data_dir.join("keys").join("swarm.key");
+    if !swarm_key_path.exists() {
+        return load_or_create_identity(&id_path, &key_path, key_file.is_some());
+    }
+    let loaded = load_identity_from_keystore(&swarm_key_path, password)?;
+    // The keystore wins, but an explicit `--key-file` naming a different
+    // key is refused rather than silently ignored. The default
+    // `<data-dir>/signing.key` may be a stale leftover from before the
+    // keystore and isn't checked.
+    if key_file.is_some() {
+        check_key_file_matches(
+            &key_path,
+            read_key_file(&key_path)?.as_ref(),
+            &loaded.0,
+            &swarm_key_path,
+        )?;
+    }
+    Ok(loaded)
+}
+
+/// `--key-file` with `~/` expanded, or `<data-dir>/signing.key`.
+fn key_file_path(data_dir: &Path, key_file: Option<&Path>) -> PathBuf {
+    key_file.map_or_else(|| data_dir.join("signing.key"), expand_tilde)
+}
+
+/// What a key file on disk holds.
+enum KeyFileContents {
+    /// The file does not exist.
+    Missing,
+    /// One valid secp256k1 secret.
+    Key([u8; SECP256K1_SECRET_LEN]),
+    /// The file exists but doesn't hold one valid secret. `raw` is kept
+    /// so a caller can recognise a truncated copy (never printed: it may
+    /// be most of a key).
+    Malformed { raw: Vec<u8>, err: anyhow::Error },
+}
+
+/// Read the key file at `key_path` (`--key-file`, or
+/// `<data-dir>/signing.key`). Only a genuinely missing file is
+/// [`KeyFileContents::Missing`]; any other read failure is an error, and
+/// contents that aren't one 64-hex secp256k1 secret (an optional `0x`
+/// prefix and trailing whitespace are tolerated) are
+/// [`KeyFileContents::Malformed`]. Neither is ever a reason to fall back
+/// to a random key.
+fn read_key_file_contents(key_path: &Path) -> Result<KeyFileContents> {
+    let raw = match std::fs::read(key_path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(KeyFileContents::Missing),
         Err(e) => return Err(e).with_context(|| format!("read key file {}", key_path.display())),
     };
-    let trimmed = raw.trim_end();
-    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    if body.len() != 2 * SECP256K1_SECRET_LEN || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+    Ok(match parse_key_file(key_path, &raw) {
+        Ok(k) => KeyFileContents::Key(k),
+        Err(err) => KeyFileContents::Malformed { raw, err },
+    })
+}
+
+/// [`read_key_file_contents`], with malformed contents as an error.
+fn read_key_file(key_path: &Path) -> Result<Option<[u8; SECP256K1_SECRET_LEN]>> {
+    match read_key_file_contents(key_path)? {
+        KeyFileContents::Missing => Ok(None),
+        KeyFileContents::Key(k) => Ok(Some(k)),
+        KeyFileContents::Malformed { err, .. } => Err(err),
+    }
+}
+
+fn parse_key_file(key_path: &Path, raw: &[u8]) -> Result<[u8; SECP256K1_SECRET_LEN]> {
+    let body = std::str::from_utf8(raw).ok().map(|text| {
+        let trimmed = text.trim_end();
+        trimmed.strip_prefix("0x").unwrap_or(trimmed)
+    });
+    let Some(body) = body.filter(|b| {
+        b.len() == 2 * SECP256K1_SECRET_LEN && b.bytes().all(|c| c.is_ascii_hexdigit())
+    }) else {
+        // The old help text said "32 raw bytes hex", which reads either way.
+        let raw_hint = if raw.len() == SECP256K1_SECRET_LEN {
+            " This file is 32 bytes long: if it holds the key as raw binary, \
+             hex-encode it first (e.g. `xxd -p -c 32 FILE`)."
+        } else {
+            ""
+        };
         return Err(anyhow!(
             "key file {} must hold one secp256k1 secret as 64 hex characters \
-             (optionally 0x-prefixed, trailing whitespace allowed)",
+             (optionally 0x-prefixed, trailing whitespace allowed).{raw_hint}",
             key_path.display(),
         ));
-    }
+    };
     let mut secret = [0u8; SECP256K1_SECRET_LEN];
     hex::decode_to_slice(body, &mut secret)
         .with_context(|| format!("decode key file {}", key_path.display()))?;
@@ -1656,7 +1717,7 @@ fn read_key_file(key_path: &Path) -> Result<Option<[u8; SECP256K1_SECRET_LEN]>> 
             key_path.display()
         )
     })?;
-    Ok(Some(secret))
+    Ok(secret)
 }
 
 /// `0x`-prefixed Ethereum address of a signing secret, for error messages.
@@ -1671,7 +1732,8 @@ fn eth_address_hex(secret: &[u8; SECP256K1_SECRET_LEN]) -> String {
 }
 
 /// Create `path` with `contents`, readable only by the owner (0600 on
-/// Unix). Fails if the file already exists, so a key is never overwritten.
+/// Unix). Fails with `AlreadyExists` if the file already exists, so a key
+/// is never overwritten.
 fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -1683,6 +1745,88 @@ fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut f = opts.open(path)?;
     f.write_all(contents)?;
     f.sync_all()
+}
+
+/// [`create_secret_file`], but `path` only ever appears complete: the
+/// contents go to a private temp file next to it, which is then
+/// hard-linked into place (a link never replaces an existing file). So a
+/// second antd that loses the race to create a shared `--key-file` reads
+/// the winner's whole key, never an empty or half-written file. Falls
+/// back to a direct [`create_secret_file`] on a filesystem without hard
+/// links.
+fn publish_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        hex::encode(&random_overlay_nonce()[..8]),
+    ));
+    create_secret_file(&tmp, contents)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => create_secret_file(path, contents),
+    }
+}
+
+/// Clear the group/other permission bits of a file that holds a key, for
+/// data dirs created before antd wrote them owner-only. Best effort: a
+/// failure is logged, not fatal.
+fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = meta.permissions().mode() & 0o7777;
+        let tight = mode & !0o077;
+        if tight == mode {
+            return;
+        }
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(tight)) {
+            Ok(()) => tracing::info!(
+                target: "antd",
+                path = %path.display(),
+                "it holds the node's key: tightened mode {mode:o} → {tight:o}",
+            ),
+            Err(e) => tracing::warn!(
+                target: "antd",
+                path = %path.display(),
+                "it holds the node's key but is mode {mode:o}; could not restrict it to the owner: {e}",
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Warn (without changing it) when an operator-supplied key file is
+/// readable by others: its permissions are the operator's call.
+fn warn_if_shared(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & !0o077 != mode {
+                tracing::warn!(
+                    target: "antd",
+                    key_file = %path.display(),
+                    "key file is mode {mode:o}, readable by other users; consider `chmod 600`",
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Refuse to start when an existing key file names a different key
@@ -1711,16 +1855,34 @@ fn check_key_file_matches(
 /// Load the node's native identity, or create it on a fresh data dir.
 ///
 /// - `identity.json` present: load it; if the key file exists too it must
-///   hold the same key, or startup is refused.
+///   hold the same key, or startup is refused. The one exception is a
+///   key file that is a strict prefix of `identity.json`'s key (empty
+///   included): the truncated copy older antd's best-effort write could
+///   leave on a full disk. It is ignored with a warning, not rewritten.
 /// - `identity.json` absent: the key comes from the key file when it
-///   exists (it is read, never rewritten), else a fresh random key is
-///   generated and the key file is created with it. `identity.json` and a
-///   newly created key file are written 0600 and never overwritten.
+///   exists (it is read, never rewritten). Else a fresh random key is
+///   generated and the key file is created with it *before*
+///   `identity.json`; if another antd created the same key file first,
+///   its key is adopted instead, so two fresh data dirs started at once
+///   on one key file agree.
+///
+/// `identity.json` and a newly created key file are written 0600 and
+/// never overwritten. An existing `identity.json` and default
+/// `signing.key` (`key_file_explicit == false`) readable by others are
+/// tightened to owner-only; an operator-supplied `--key-file` only gets
+/// a warning.
 fn load_or_create_identity(
     id_path: &Path,
     key_path: &Path,
+    key_file_explicit: bool,
 ) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; 32], Keypair)> {
-    let key_from_file = read_key_file(key_path)?;
+    let secure_key_file = |key_path: &Path| {
+        if key_file_explicit {
+            warn_if_shared(key_path);
+        } else {
+            restrict_to_owner(key_path);
+        }
+    };
 
     if id_path.exists() {
         let raw = std::fs::read_to_string(id_path)
@@ -1728,7 +1890,33 @@ fn load_or_create_identity(
         let id: IdentityFile = serde_json::from_str(&raw).context("parse identity.json")?;
         let mut signing_secret = [0u8; SECP256K1_SECRET_LEN];
         hex::decode_to_slice(&id.signing_key, &mut signing_secret).context("decode signing_key")?;
+        let key_from_file = match read_key_file_contents(key_path)? {
+            KeyFileContents::Missing => None,
+            KeyFileContents::Key(k) => Some(k),
+            KeyFileContents::Malformed { raw, err } => {
+                let full = hex::encode(signing_secret);
+                if raw.len() < full.len() && full.as_bytes().starts_with(&raw) {
+                    tracing::warn!(
+                        target: "antd",
+                        key_file = %key_path.display(),
+                        "key file is a truncated copy of identity.json's key ({} of {} \
+                         characters), likely from an interrupted write by an older antd; \
+                         ignoring it (identity.json holds the node's key). Delete it to \
+                         silence this warning",
+                        raw.len(),
+                        full.len(),
+                    );
+                    None
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         check_key_file_matches(key_path, key_from_file.as_ref(), &signing_secret, id_path)?;
+        restrict_to_owner(id_path);
+        if key_from_file.is_some() {
+            secure_key_file(key_path);
+        }
         let mut overlay_nonce = [0u8; 32];
         hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
             .context("decode overlay_nonce")?;
@@ -1741,9 +1929,46 @@ fn load_or_create_identity(
         return Ok((signing_secret, overlay_nonce, kp));
     }
 
-    let (signing_secret, key_file_existed) = match key_from_file {
-        Some(k) => (k, true),
-        None => (random_secp256k1_secret(), false),
+    let signing_secret = if let Some(k) = read_key_file(key_path)? {
+        secure_key_file(key_path);
+        tracing::info!(
+            target: "antd",
+            key_file = %key_path.display(),
+            "creating identity.json from the existing key file",
+        );
+        k
+    } else {
+        let fresh = random_secp256k1_secret();
+        match publish_secret_file(key_path, hex::encode(fresh).as_bytes()) {
+            Ok(()) => fresh,
+            // Another antd (a second fresh data dir on the same
+            // `--key-file`) created it since we looked: that key is
+            // the one the file names, so it is the one we use.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let k = read_key_file(key_path)?.ok_or_else(|| {
+                    anyhow!(
+                        "key file {} appeared and vanished while antd was creating it",
+                        key_path.display(),
+                    )
+                })?;
+                tracing::info!(
+                    target: "antd",
+                    key_file = %key_path.display(),
+                    "key file was created concurrently by another process; using its key",
+                );
+                k
+            }
+            Err(e) => {
+                // A copy of the key for tooling; identity.json below is
+                // the node's own record, so a failure here is not fatal.
+                tracing::warn!(
+                    target: "antd",
+                    key_file = %key_path.display(),
+                    "could not write the key file: {e}",
+                );
+                fresh
+            }
+        }
     };
     let overlay_nonce = random_overlay_nonce();
     let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
@@ -1754,24 +1979,8 @@ fn load_or_create_identity(
         libp2p_keypair: Some(hex::encode(kp.to_protobuf_encoding()?)),
     };
     let json = serde_json::to_string_pretty(&id).context("serialize identity")?;
-    create_secret_file(id_path, json.as_bytes())
+    publish_secret_file(id_path, json.as_bytes())
         .with_context(|| format!("write {}", id_path.display()))?;
-
-    if key_file_existed {
-        tracing::info!(
-            target: "antd",
-            key_file = %key_path.display(),
-            "created identity.json from the existing key file",
-        );
-    } else if let Err(e) = create_secret_file(key_path, hex::encode(signing_secret).as_bytes()) {
-        // A copy of the key for tooling; identity.json above is the
-        // node's own record, so a failure here is not fatal.
-        tracing::warn!(
-            target: "antd",
-            key_file = %key_path.display(),
-            "could not write the key file: {e}",
-        );
-    }
 
     Ok((signing_secret, overlay_nonce, kp))
 }
@@ -4000,13 +4209,14 @@ mod identity_tests {
             let key_path = dir.path().join("key.hex");
             std::fs::write(&key_path, &contents).unwrap();
 
-            let (secret, nonce, _) = load_or_create_identity(&id_path, &key_path).unwrap();
+            let (secret, nonce, _) = load_or_create_identity(&id_path, &key_path, true).unwrap();
             assert_eq!(secret, test_key(), "{contents:?}");
             assert_eq!(std::fs::read_to_string(&key_path).unwrap(), contents);
             #[cfg(unix)]
             assert_eq!(mode_of(&id_path), 0o600);
 
-            let (again, nonce_again, _) = load_or_create_identity(&id_path, &key_path).unwrap();
+            let (again, nonce_again, _) =
+                load_or_create_identity(&id_path, &key_path, true).unwrap();
             assert_eq!(again, test_key());
             assert_eq!(nonce_again, nonce);
             assert_eq!(std::fs::read_to_string(&key_path).unwrap(), contents);
@@ -4032,7 +4242,7 @@ mod identity_tests {
             let id_path = dir.path().join("identity.json");
             let key_path = dir.path().join("key.hex");
             std::fs::write(&key_path, &contents).unwrap();
-            let err = load_or_create_identity(&id_path, &key_path).unwrap_err();
+            let err = load_or_create_identity(&id_path, &key_path, true).unwrap_err();
             assert!(err.to_string().contains("key file"), "{contents:?}: {err}");
             assert!(!id_path.exists(), "{contents:?}");
             assert_eq!(std::fs::read_to_string(&key_path).unwrap(), contents);
@@ -4046,7 +4256,7 @@ mod identity_tests {
         let dir = tempfile::tempdir().unwrap();
         let id_path = dir.path().join("identity.json");
         let key_path = dir.path().join("signing.key");
-        let (secret, _, _) = load_or_create_identity(&id_path, &key_path).unwrap();
+        let (secret, _, _) = load_or_create_identity(&id_path, &key_path, true).unwrap();
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap(),
             hex::encode(secret)
@@ -4056,7 +4266,7 @@ mod identity_tests {
             assert_eq!(mode_of(&key_path), 0o600);
             assert_eq!(mode_of(&id_path), 0o600);
         }
-        let (again, _, _) = load_or_create_identity(&id_path, &key_path).unwrap();
+        let (again, _, _) = load_or_create_identity(&id_path, &key_path, true).unwrap();
         assert_eq!(again, secret);
     }
 
@@ -4067,12 +4277,12 @@ mod identity_tests {
         let dir = tempfile::tempdir().unwrap();
         let id_path = dir.path().join("identity.json");
         let other_key = dir.path().join("other.key");
-        let (id_secret, _, _) = load_or_create_identity(&id_path, &other_key).unwrap();
+        let (id_secret, _, _) = load_or_create_identity(&id_path, &other_key, true).unwrap();
         let id_before = std::fs::read(&id_path).unwrap();
 
         let key_path = dir.path().join("key.hex");
         std::fs::write(&key_path, TEST_KEY_HEX).unwrap();
-        let err = load_or_create_identity(&id_path, &key_path)
+        let err = load_or_create_identity(&id_path, &key_path, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&eth_address_hex(&test_key())), "{err}");
@@ -4082,7 +4292,206 @@ mod identity_tests {
 
         // The matching key file is accepted.
         std::fs::write(&key_path, hex::encode(id_secret)).unwrap();
-        let (secret, _, _) = load_or_create_identity(&id_path, &key_path).unwrap();
+        let (secret, _, _) = load_or_create_identity(&id_path, &key_path, true).unwrap();
         assert_eq!(secret, id_secret);
+    }
+
+    /// `--key-file=~/key.hex` reaches antd unexpanded (no shell, systemd,
+    /// bash's `=` form) and must resolve under the home dir, like
+    /// `--data-dir`, not as a relative `./~/key.hex`.
+    #[test]
+    fn key_file_path_expands_tilde() {
+        let data_dir = Path::new("/data");
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            key_file_path(data_dir, Some(Path::new("~/key.hex"))),
+            home.join("key.hex")
+        );
+        assert_eq!(
+            key_file_path(data_dir, Some(Path::new("/k/key.hex"))),
+            PathBuf::from("/k/key.hex")
+        );
+        assert_eq!(key_file_path(data_dir, None), data_dir.join("signing.key"));
+    }
+
+    /// Several fresh data dirs started at once on one not-yet-existing
+    /// key file: whoever creates it first wins, and every other node
+    /// adopts that key instead of running on its own random one (which
+    /// would then be refused as a mismatch on its next restart). No
+    /// node may ever read a half-written key file.
+    #[test]
+    fn concurrent_creators_of_one_key_file_agree() {
+        const NODES: usize = 8;
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = Arc::new(dir.path().join("shared.key"));
+            let barrier = Arc::new(std::sync::Barrier::new(NODES));
+            let handles: Vec<_> = (0..NODES)
+                .map(|i| {
+                    let node_dir = dir.path().join(format!("node{i}"));
+                    std::fs::create_dir(&node_dir).unwrap();
+                    let key_path = Arc::clone(&key_path);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let id_path = node_dir.join("identity.json");
+                        barrier.wait();
+                        load_or_create_identity(&id_path, &key_path, true)
+                            .map(|(secret, _, _)| (id_path, secret))
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect();
+            let file_key = read_key_file(&key_path).unwrap().unwrap();
+            for (id_path, secret) in results {
+                assert_eq!(secret, file_key, "round {round}");
+                // ...and so is each restart: identity.json agrees with the file.
+                let (again, _, _) = load_or_create_identity(&id_path, &key_path, true).unwrap();
+                assert_eq!(again, file_key, "round {round}");
+            }
+            #[cfg(unix)]
+            assert_eq!(mode_of(&key_path), 0o600);
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n.to_string_lossy().contains(".tmp-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
+    /// Data dirs from before this change hold a world-readable
+    /// identity.json and signing.key. Loading tightens both to owner-only
+    /// (keeping the owner bits), but leaves an operator's own
+    /// `--key-file` alone.
+    #[cfg(unix)]
+    #[test]
+    fn loose_existing_key_files_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("identity.json");
+        let key_path = dir.path().join("signing.key");
+        let (secret, _, _) = load_or_create_identity(&id_path, &key_path, false).unwrap();
+
+        chmod(&id_path, 0o644);
+        chmod(&key_path, 0o644);
+        let (again, _, _) = load_or_create_identity(&id_path, &key_path, false).unwrap();
+        assert_eq!(again, secret);
+        assert_eq!(mode_of(&id_path), 0o600);
+        assert_eq!(mode_of(&key_path), 0o600);
+
+        // A stricter mode is kept as is, not loosened to 0600.
+        chmod(&id_path, 0o400);
+        load_or_create_identity(&id_path, &key_path, false).unwrap();
+        assert_eq!(mode_of(&id_path), 0o400);
+        chmod(&id_path, 0o600);
+
+        // An explicit --key-file: identity.json is still tightened, the
+        // operator's file only warned about.
+        chmod(&id_path, 0o644);
+        chmod(&key_path, 0o644);
+        load_or_create_identity(&id_path, &key_path, true).unwrap();
+        assert_eq!(mode_of(&id_path), 0o600);
+        assert_eq!(mode_of(&key_path), 0o644);
+    }
+
+    /// Older antd wrote signing.key best-effort after identity.json, so a
+    /// full disk could leave it empty or cut short. Such a strict prefix
+    /// of identity.json's key is ignored (and left alone); anything else
+    /// that isn't a key is still refused.
+    #[test]
+    fn truncated_key_file_copy_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("identity.json");
+        let key_path = dir.path().join("signing.key");
+        let (secret, _, _) = load_or_create_identity(&id_path, &key_path, false).unwrap();
+        let full = hex::encode(secret);
+        for cut in [0, 1, 10, 63] {
+            std::fs::write(&key_path, &full[..cut]).unwrap();
+            let (again, _, _) = load_or_create_identity(&id_path, &key_path, false).unwrap();
+            assert_eq!(again, secret, "cut at {cut}");
+            assert_eq!(std::fs::read_to_string(&key_path).unwrap(), &full[..cut]);
+        }
+        // Not a prefix of identity.json's key: a real problem, refused.
+        let other = if full.starts_with('0') { "1" } else { "0" };
+        std::fs::write(&key_path, other).unwrap();
+        let err = load_or_create_identity(&id_path, &key_path, false).unwrap_err();
+        assert!(err.to_string().contains("key file"), "{err}");
+        // On a fresh data dir a truncated file can't be told apart from
+        // a bad one, so it is refused there too.
+        std::fs::remove_file(&id_path).unwrap();
+        std::fs::write(&key_path, &full[..10]).unwrap();
+        assert!(load_or_create_identity(&id_path, &key_path, false).is_err());
+        assert!(!id_path.exists());
+    }
+
+    /// A key stored as 32 raw bytes (one reading of the old "32 raw bytes
+    /// hex" help) gets the format error with a hint, not a bare UTF-8
+    /// read error.
+    #[test]
+    fn raw_binary_key_file_gets_a_format_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("identity.json");
+        let key_path = dir.path().join("raw.bin");
+        std::fs::write(&key_path, test_key()).unwrap();
+        let err = load_or_create_identity(&id_path, &key_path, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64 hex characters"), "{err}");
+        assert!(err.contains("raw binary"), "{err}");
+        assert!(!id_path.exists());
+        assert_eq!(std::fs::read(&key_path).unwrap(), test_key());
+    }
+
+    /// With a bee keystore in the data dir, the keystore is the node's
+    /// key. An explicit `--key-file` naming a different key is refused,
+    /// a matching one accepted, a missing one not created, and a stale
+    /// default `signing.key` ignored. Drives `load_node_identity`, the
+    /// function `main` calls.
+    #[test]
+    fn keystore_mode_checks_only_an_explicit_key_file() {
+        use keystore::tests::{EXPECTED_KEY, PBKDF2_KEYSTORE};
+        let mut keystore_key = [0u8; SECP256K1_SECRET_LEN];
+        hex::decode_to_slice(EXPECTED_KEY, &mut keystore_key).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        std::fs::create_dir(data_dir.join("keys")).unwrap();
+        std::fs::write(data_dir.join("keys").join("swarm.key"), PBKDF2_KEYSTORE).unwrap();
+        let load = |key_file: Option<&Path>| {
+            load_node_identity(data_dir, key_file, Some("testpassword")).map(|(k, _, _)| k)
+        };
+
+        // Mismatching explicit key file: refused, naming both addresses.
+        let other = data_dir.join("other.hex");
+        std::fs::write(&other, TEST_KEY_HEX).unwrap();
+        let err = load(Some(&other)).unwrap_err().to_string();
+        assert!(err.contains(&eth_address_hex(&test_key())), "{err}");
+        assert!(err.contains(&eth_address_hex(&keystore_key)), "{err}");
+
+        // Malformed explicit key file: refused.
+        let bad = data_dir.join("bad.hex");
+        std::fs::write(&bad, "nope").unwrap();
+        assert!(load(Some(&bad)).is_err());
+
+        // Matching explicit key file: accepted.
+        let matching = data_dir.join("match.hex");
+        std::fs::write(&matching, format!("0x{EXPECTED_KEY}\n")).unwrap();
+        assert_eq!(load(Some(&matching)).unwrap(), keystore_key);
+
+        // Missing explicit key file: not created.
+        let missing = data_dir.join("missing.hex");
+        assert_eq!(load(Some(&missing)).unwrap(), keystore_key);
+        assert!(!missing.exists());
+
+        // Stale default signing.key, no --key-file: ignored as before.
+        std::fs::write(data_dir.join("signing.key"), TEST_KEY_HEX).unwrap();
+        assert_eq!(load(None).unwrap(), keystore_key);
+        assert!(!data_dir.join("identity.json").exists());
     }
 }

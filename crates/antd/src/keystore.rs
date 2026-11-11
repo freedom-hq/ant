@@ -176,7 +176,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Canonical Web3 Secret Storage pbkdf2 test vector (password
@@ -184,9 +184,10 @@ mod tests {
     // canonical vector uses `r=1`, which violates RustCrypto's strict
     // scrypt spec bound (`N < 2^(128·r/8)`); real bee keystores use
     // `r=8`, so scrypt is covered by the spec-valid round-trip instead.
-    const EXPECTED_KEY: &str = "7a28b5ba57c53603b0b07b56bba752f7784bf506fa95edc395f5cf6c7514fe9d";
+    pub(crate) const EXPECTED_KEY: &str =
+        "7a28b5ba57c53603b0b07b56bba752f7784bf506fa95edc395f5cf6c7514fe9d";
 
-    const PBKDF2_KEYSTORE: &str = r#"{
+    pub(crate) const PBKDF2_KEYSTORE: &str = r#"{
         "crypto": {
             "cipher": "aes-128-ctr",
             "cipherparams": { "iv": "6087dab2f9fdbbfaddc31a909735c1e6" },
