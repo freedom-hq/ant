@@ -108,6 +108,7 @@ impl ChunkFetcher for CommandFetcher {
         let cmd = ControlCommand::GetChunkRaw {
             reference: addr,
             fast_miss: false,
+            bypass_cache: false,
             ack: ack_tx,
         };
         self.commands
@@ -954,6 +955,7 @@ mod tests {
                     reference,
                     fast_miss,
                     ack,
+                    ..
                 }) => {
                     assert_eq!(reference, [7u8; 32]);
                     assert!(!fast_miss, "ACT reads must not use fast-miss mode");

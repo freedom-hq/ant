@@ -63,10 +63,11 @@ pub enum Request {
     /// [`Response::Bytes`] carrying the verified chunk payload (without
     /// the span prefix).
     ///
-    /// `bypass_cache` skips the daemon's shared in-memory chunk cache
-    /// for this request only: the daemon mints a fresh per-request
-    /// cache so intra-request retries still benefit from caching, but
-    /// no chunk hits or writes touch the long-lived cache. Useful for
+    /// `bypass_cache` skips the daemon's shared in-memory and disk
+    /// chunk caches for this request only: the daemon mints a fresh
+    /// per-request in-memory cache so intra-request retries still
+    /// benefit from caching, but no chunk hits or writes touch the
+    /// long-lived caches. Useful for
     /// timing the cold path or reproducing a transient retrieval.
     /// `progress` opts the request into streaming
     /// [`Response::Progress`] updates emitted at a regular cadence

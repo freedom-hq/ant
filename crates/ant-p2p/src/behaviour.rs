@@ -3159,6 +3159,7 @@ fn handle_control_command(
         ControlCommand::GetChunkRaw {
             reference,
             fast_miss,
+            bypass_cache,
             ack,
         } => {
             // Same cache-then-network fetch path as `GetChunk`, but the ack
@@ -3178,9 +3179,13 @@ fn handle_control_command(
             // `ControlAck::NotFound` so the gateway answers 404 whichever
             // tail (`storage: not found` or `no peer found`) the last
             // answer had.
+            //
+            // `bypass_cache` (`/chunks` with `swarm-cache: false`, issue
+            // #80) gives up that read-after-own-write: the lookup neither
+            // reads nor writes the shared caches and always asks peers.
             let peers_rx = state.peers_watch.subscribe();
-            let cache = state.cache_for_request(false);
-            let disk_cache = state.disk_cache_for_request(false);
+            let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let control = control.clone();
             tokio::spawn(async move {
                 let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
@@ -12077,6 +12082,7 @@ mod tests {
             ControlCommand::GetChunkRaw {
                 reference: addr,
                 fast_miss: true,
+                bypass_cache: false,
                 ack: ack_tx,
             },
         );
@@ -12086,6 +12092,79 @@ mod tests {
             }
             other => panic!("expected cached wire bytes, got {other:?}"),
         }
+    }
+
+    /// `swarm-cache: false` on `/chunks` (issue #80): with `bypass_cache`
+    /// the lookup must not be answered from the local caches. The chunk
+    /// sits in both the shared memory and the disk cache, there are no
+    /// peers, so a bypassed read can only fail; the same read without
+    /// the flag is served locally.
+    #[tokio::test]
+    async fn get_chunk_raw_bypass_cache_skips_local_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let (addr, wire) = ant_crypto::cac_new(b"swarm-cache false").unwrap();
+        disk.put(addr, wire.clone()).await.unwrap();
+        let mut state = state_with_disk_cache(disk);
+        state
+            .chunk_cache
+            .as_ref()
+            .expect("shared memory cache")
+            .put(addr, wire.clone());
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+
+        for (bypass_cache, served) in [(true, false), (false, true)] {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            handle_control_command(
+                &mut state,
+                &mut peerstore,
+                &control,
+                None,
+                0,
+                ControlCommand::GetChunkRaw {
+                    reference: addr,
+                    fast_miss: true,
+                    bypass_cache,
+                    ack: ack_tx,
+                },
+            );
+            let ack = tokio::time::timeout(Duration::from_secs(30), ack_rx)
+                .await
+                .expect("lookup with no peers must end")
+                .unwrap();
+            match ack {
+                ControlAck::Bytes { data } => {
+                    assert!(served, "bypass_cache read was served locally");
+                    assert_eq!(data, wire);
+                }
+                other => assert!(!served, "expected a cache hit, got {other:?}"),
+            }
+        }
+    }
+
+    /// The per-request cache routing behind every `bypass_cache` flag:
+    /// bypassed requests get a private memory cache and no disk cache,
+    /// so nothing they fetch is read from or written to the shared
+    /// tiers; other requests share the daemon's caches.
+    #[test]
+    fn bypass_cache_routes_requests_away_from_shared_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let state = state_with_disk_cache(disk.clone());
+        let shared = state.chunk_cache.clone().expect("shared memory cache");
+
+        assert!(Arc::ptr_eq(&state.cache_for_request(false), &shared));
+        assert!(Arc::ptr_eq(
+            &state.disk_cache_for_request(false).expect("disk cache"),
+            &disk
+        ));
+        assert!(!Arc::ptr_eq(&state.cache_for_request(true), &shared));
+        assert!(state.disk_cache_for_request(true).is_none());
     }
 
     /// Read-after-own-write for `GetChunk`: the same local-cache hit, but

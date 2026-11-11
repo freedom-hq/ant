@@ -3579,3 +3579,147 @@ async fn manifest_listing_with_unread_size_is_not_immutable() {
     let (_, cc, _) = get_listing(router, &format!("/v0/manifest/{root}")).await;
     assert!(cc.unwrap().contains("immutable"));
 }
+
+/// `swarm-cache: false` (issue #80) must reach the node as
+/// `bypass_cache: true` on every download dispatch behind `/bytes`
+/// (plain, ranged and encrypted), `/bzz` (plain and ranged) and
+/// `/chunks`, GET and HEAD alike; absent or `true` keeps the caches.
+/// Go `strconv.ParseBool` spellings, like the other bee bool headers.
+#[tokio::test]
+async fn swarm_cache_header_sets_bypass_cache() {
+    let seen: Arc<Mutex<Vec<(&'static str, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_dispatch = seen.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let seen = seen_for_dispatch.clone();
+        async move {
+            match cmd {
+                ControlCommand::StreamBytes {
+                    bypass_cache, ack, ..
+                } => {
+                    seen.lock().await.push(("bytes", bypass_cache));
+                    let _ = ack
+                        .send(ControlAck::BytesStreamStart { total_bytes: 8 })
+                        .await;
+                    let _ = ack
+                        .send(ControlAck::BytesChunk {
+                            data: b"stubstub".to_vec(),
+                        })
+                        .await;
+                    let _ = ack.send(ControlAck::StreamDone).await;
+                }
+                ControlCommand::StreamBzz {
+                    bypass_cache, ack, ..
+                } => {
+                    seen.lock().await.push(("bzz", bypass_cache));
+                    let _ = ack
+                        .send(ControlAck::BzzStreamStart {
+                            total_bytes: 8,
+                            reference: vec![0u8; 32],
+                            content_type: Some("text/plain".to_string()),
+                            filename: None,
+                            feed: None,
+                        })
+                        .await;
+                    let _ = ack
+                        .send(ControlAck::BytesChunk {
+                            data: b"stubstub".to_vec(),
+                        })
+                        .await;
+                    let _ = ack.send(ControlAck::StreamDone).await;
+                }
+                ControlCommand::GetBytesEncrypted {
+                    bypass_cache, ack, ..
+                } => {
+                    seen.lock().await.push(("bytes-encrypted", bypass_cache));
+                    let _ = ack
+                        .send(ControlAck::Bytes {
+                            data: b"stubstub".to_vec(),
+                        })
+                        .await;
+                }
+                ControlCommand::GetChunkRaw {
+                    bypass_cache, ack, ..
+                } => {
+                    seen.lock().await.push(("chunks", bypass_cache));
+                    let mut wire = 8u64.to_le_bytes().to_vec();
+                    wire.extend_from_slice(b"stubstub");
+                    let _ = ack.send(ControlAck::Bytes { data: wire });
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+    });
+
+    let encrypted = format!("{DATA_REF}{DATA_REF}");
+    let paths: [(&str, String, &[&'static str]); 6] = [
+        ("GET", format!("/bytes/{DATA_REF}"), &["bytes"]),
+        ("HEAD", format!("/bytes/{DATA_REF}"), &["bytes"]),
+        ("GET", format!("/bytes/{encrypted}"), &["bytes-encrypted"]),
+        ("GET", format!("/bzz/{MANIFEST_ROOT}/a.txt"), &["bzz"]),
+        ("HEAD", format!("/bzz/{MANIFEST_ROOT}/a.txt"), &["bzz"]),
+        ("GET", format!("/chunks/{DATA_REF}"), &["chunks"]),
+    ];
+    // (header value, expected bypass_cache); `None` = header absent.
+    let values: [(Option<&str>, bool); 7] = [
+        (None, false),
+        (Some("true"), false),
+        (Some("1"), false),
+        (Some("false"), true),
+        (Some("False"), true),
+        (Some("0"), true),
+        (Some(" f "), true),
+    ];
+    for (value, want) in values {
+        for (method, uri, kinds) in &paths {
+            // Plain request, then (for the streamed GETs) a single Range,
+            // which re-dispatches a range-scoped stream after the first.
+            let ranged = *method == "GET" && (kinds[0] == "bytes" || kinds[0] == "bzz");
+            for range in [None, Some("bytes=2-3")]
+                .into_iter()
+                .take(1 + usize::from(ranged))
+            {
+                seen.lock().await.clear();
+                let mut req = Request::builder().method(*method).uri(uri);
+                if let Some(v) = value {
+                    req = req.header("swarm-cache", v);
+                }
+                if let Some(r) = range {
+                    req = req.header(header::RANGE, r);
+                }
+                let resp = send(router.clone(), req.body(Body::empty()).unwrap()).await;
+                let label = format!("{method} {uri} swarm-cache={value:?} range={range:?}");
+                assert!(resp.status().is_success(), "{label}: {}", resp.status());
+                let _ = body_bytes(resp).await;
+                let got = seen.lock().await.clone();
+                let dispatches = if range.is_some() { 2 } else { 1 };
+                assert_eq!(got.len(), dispatches, "{label}: {got:?}");
+                for (kind, bypass) in got {
+                    assert_eq!(kind, kinds[0], "{label}");
+                    assert_eq!(bypass, want, "{label}: bypass_cache");
+                }
+            }
+        }
+    }
+
+    // Anything else is bee's 400 for a bad bool header, before any
+    // retrieval is dispatched.
+    for (method, uri, _) in &paths {
+        seen.lock().await.clear();
+        let resp = send(
+            router.clone(),
+            Request::builder()
+                .method(*method)
+                .uri(uri)
+                .header("swarm-cache", "nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        if *method == "GET" {
+            let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(json["reasons"][0]["field"], "Swarm-Cache", "{uri}: {json}");
+        }
+        assert!(seen.lock().await.is_empty(), "{method} {uri} dispatched");
+    }
+}
