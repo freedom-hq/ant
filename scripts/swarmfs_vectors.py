@@ -60,14 +60,24 @@ OUT_MANTARAY = ROOT / "crates/ant-retrieval/tests/swarmfs_mantaray.jsonl"
 
 
 def pattern(n: int) -> bytes:
-    """Deterministic content of length ``n``: byte i is ``(i * 7 + i // 4096) % 251``.
+    """Deterministic content of length ``n``: byte i is
+    ``((i * 7 + k) % 251) ^ ((k // 251) & 0xff)`` with ``k = i // 4096``,
+    the chunk index.
 
     The Rust tests rebuild the same bytes from the formula, so large file
     vectors carry only their size, not their content. 251 is prime, so the
     pattern never lines up with the 32-byte segment or 4096-byte chunk
-    grid, and the ``i // 4096`` term makes every chunk distinct.
+    grid. The ``+ k`` term alone repeats every 251 chunks (chunk k is the
+    row ``7j + 59k mod 251``), so the XOR with ``k // 251`` tells those
+    periods apart: every chunk of a file up to 251 * 256 chunks (~251 MiB)
+    is distinct, so a splitter that reorders or mixes leaves cannot land on
+    the same root by accident. For the first 251 chunks (files below
+    ~1 MiB) the XOR term is 0.
     """
-    return bytes((i * 7 + i // CHUNK_PAYLOAD_SIZE) % 251 for i in range(n))
+    return bytes(
+        ((i * 7 + i // CHUNK_PAYLOAD_SIZE) % 251) ^ ((i // CHUNK_PAYLOAD_SIZE // 251) & 0xFF)
+        for i in range(n)
+    )
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:

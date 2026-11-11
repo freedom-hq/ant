@@ -54,9 +54,16 @@ fn lines(raw: &str) -> impl Iterator<Item = Value> + '_ {
         .map(|l| serde_json::from_str(l).unwrap())
 }
 
-/// The generator's `pattern(n)`: byte `i` is `(i * 7 + i / 4096) % 251`.
+/// The generator's `pattern(n)`: with `k = i / 4096` (the chunk index),
+/// byte `i` is `((i * 7 + k) % 251) ^ ((k / 251) & 0xff)`. The XOR term
+/// keeps every chunk distinct past the 251-chunk period of the first.
 fn pattern(n: usize) -> Vec<u8> {
-    (0..n).map(|i| ((i * 7 + i / 4096) % 251) as u8).collect()
+    (0..n)
+        .map(|i| {
+            let k = i / 4096;
+            (((i * 7 + k) % 251) ^ ((k / 251) & 0xff)) as u8
+        })
+        .collect()
 }
 
 /// File vectors where ant's plain splitters are known to disagree with
@@ -337,17 +344,20 @@ async fn mantaray_manifests_match_swarmfs() {
                 );
             }
         }
-        // ...and the listing is exactly the entry set
-        let listed: BTreeMap<String, Vec<u8>> = list_manifest_paths(&fetcher, &root)
+        // ...and the listing is exactly the entry set, each entry once:
+        // compared as sorted lists, not maps, so a path listed twice fails
+        let mut listed: Vec<(String, Vec<u8>)> = list_manifest_paths(&fetcher, &root)
             .await
             .unwrap_or_else(|e| panic!("list failed on {case}: {e}"))
             .into_iter()
             .filter_map(|e| e.reference.map(|r| (e.path, r)))
             .collect();
-        let want: BTreeMap<String, Vec<u8>> = entries
+        listed.sort();
+        let mut want: Vec<(String, Vec<u8>)> = entries
             .iter()
             .map(|(p, r, _)| (p.clone(), r.clone()))
             .collect();
+        want.sort();
         assert_eq!(listed, want, "listing mismatch on {case}");
 
         // write: ant's manifest writer only emits the zero obfuscation key;
