@@ -190,8 +190,14 @@ pub const GATEWAY_MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// so revisiting the same URL is provably safe to serve from the
 /// browser's HTTP cache forever. Except where the answer can still
 /// change: a `/bzz` or `/v0/manifest` reference that resolved through a
-/// feed, or a `/v0/manifest?sizes=true` page with a size it couldn't
-/// read, gets [`MUTABLE_CACHE_CONTROL`] instead.
+/// feed, a `/v0/manifest?sizes=true` page with a size it couldn't read,
+/// a `/v0/manifest` page cut short by the walk's wall-clock budget
+/// (`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`), or one that ended
+/// `truncated` on a failed lookahead load past a full page
+/// (`ant_retrieval::ManifestPage::lookahead_failed`) gets
+/// [`MUTABLE_CACHE_CONTROL`] instead: a later request for either of the
+/// last two can return more items or `truncated: false`. The listing
+/// cases are exactly the ones `ManifestListPage::immutable` excludes.
 ///
 /// This matches what bee's gateway has historically returned (cf.
 /// `ethersphere/swarm` issue #2213, where bee shipped `max-age=
