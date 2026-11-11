@@ -1,4 +1,6 @@
-//! Postage-stamp read surface: `GET /stamps` and `GET /stamps/{id}`.
+//! Postage-stamp read surface: `GET /stamps` and `GET /stamps/{id}`,
+//! plus the issuer-side `GET /stamps/{id}/buckets` and
+//! `GET /stamps/{id}/chunks/{address}`.
 //!
 //! Freedom's publish pre-flight (`checkSwarmPreFlight`) refuses to
 //! publish unless `GET /stamps` lists at least one **usable** batch
@@ -524,6 +526,94 @@ pub async fn stamp_buckets(
         other => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("unexpected node ack for postage buckets: {other:?}"),
+        ),
+    }
+}
+
+/// `GET /stamps/{id}/chunks/{address}` (proposed for bee in
+/// ethersphere/bee#5682): whether this node stamped `address` with the
+/// batch, from the batch issuer's own per-chunk stamp records (the
+/// `.stamps` sidecar). `200 {batchID, chunkAddress, index, timestamp}`
+/// with `index`/`timestamp` hex-encoded like `POST /envelope`; `404
+/// "chunk not stamped by this batch"` when the issuer has no record of
+/// it; bee's `404 "issuer does not exist"` for a batch this node doesn't
+/// issue from. Read-only, local, and open on the same terms as `/stamps`.
+///
+/// The record says this node *issued* the stamp, not that the network
+/// still stores the chunk under it: on a mutable batch whose bucket
+/// wrapped, the slot may since have been re-issued to another chunk
+/// (bee's issuer keeps its `StampItem` the same way).
+pub async fn stamp_chunk(
+    State(handle): State<GatewayHandle>,
+    Path((id, address)): Path<(String, String)>,
+) -> Response {
+    let mut reasons = Vec::new();
+    let batch_id = crate::error::parse_hex_param::<32>("batch_id", &id, &mut reasons);
+    let address = crate::error::parse_hex_param::<32>("address", &address, &mut reasons);
+    let (Some(batch_id), Some(address)) = (batch_id, address) else {
+        return crate::error::params_error(crate::error::ParamKind::Path, reasons);
+    };
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    if handle
+        .commands
+        .send(ControlCommand::StampedChunk {
+            batch_id,
+            address,
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node loop is no longer accepting commands",
+        );
+    }
+    let ack = match tokio::time::timeout(POSTAGE_STATUS_TIMEOUT, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node loop dropped the stamp lookup",
+            )
+        }
+        Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "stamp lookup timed out"),
+    };
+    match ack {
+        ControlAck::StampedChunk { stamp: Some(stamp) } => {
+            #[derive(Serialize)]
+            struct Body {
+                #[serde(rename = "batchID")]
+                batch_id: String,
+                #[serde(rename = "chunkAddress")]
+                chunk_address: String,
+                index: String,
+                timestamp: String,
+            }
+            json_ok(&Body {
+                batch_id: hex::encode(&stamp[0..32]),
+                chunk_address: hex::encode(address),
+                index: hex::encode(&stamp[32..40]),
+                timestamp: hex::encode(&stamp[40..48]),
+            })
+        }
+        ControlAck::StampedChunk { stamp: None } => {
+            json_error(StatusCode::NOT_FOUND, "chunk not stamped by this batch")
+        }
+        ControlAck::Error { message } => {
+            if message.contains("issuer does not exist") {
+                json_error(StatusCode::NOT_FOUND, "issuer does not exist")
+            } else {
+                // `stamp records unavailable …`: the issuer's sidecar
+                // couldn't be read back, so a missing record proves
+                // nothing — surface why instead of a 404.
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        }
+        other => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected node ack for stamp lookup: {other:?}"),
         ),
     }
 }

@@ -613,6 +613,17 @@ impl StampIssuer {
         self.seen.contains_key(addr)
     }
 
+    /// `Some(reason)` when this issuer's `.stamps` sidecar exists but
+    /// could not be read back safely, so the per-chunk stamp records
+    /// ([`Self::cached_stamp`]) are incomplete: a chunk this node did
+    /// stamp may be missing from them. Readers that report "not
+    /// stamped" from the records must check this first and refuse,
+    /// rather than read the gap as a confirmed absence.
+    #[must_use]
+    pub fn stamp_records_unavailable(&self) -> Option<&'static str> {
+        self.stamp_persistence_failed
+    }
+
     /// Remember the stamp issued for a **new** `addr` and, for persistent
     /// issuers, append its checksummed record to the `.stamps` sidecar
     /// (append + fsync) so a restart recovers it. `O(1)`.
