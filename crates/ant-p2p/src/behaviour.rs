@@ -5697,26 +5697,52 @@ fn stamped_chunk_reply(
 /// 16 GiB file is ~4.2 M chunks.
 const STAMP_COUNT_SLICE: usize = 16_384;
 
+/// How many times [`count_tree_stamps_sliced`] starts over because the
+/// set of registered batches changed between two of its slices before it
+/// gives up. Batches are registered or dropped on a buy, a chain sync or
+/// an expiry, minutes apart, so one restart nearly always suffices.
+const STAMP_COUNT_RESTARTS: usize = 3;
+
 /// [`count_tree_stamps`] over `addrs` in slices of `slice`, releasing the
 /// issuer lock and yielding between slices so stamping isn't held up by a
-/// large tree. Rows are merged by batch id; a batch registered mid-count
-/// is counted from the slice it first appears in (a newly bought batch
-/// has no records, so it reads 0 either way).
+/// large tree. Every slice must see the same set of batches as the
+/// first: a batch registered or dropped between slices would otherwise
+/// be counted for only part of the tree (and its chunks read as
+/// `unstamped` in the slices before it appeared), with no error. On such
+/// a change the count starts over, up to [`STAMP_COUNT_RESTARTS`] times,
+/// then fails rather than return a mixed view. Stamps issued between
+/// slices on an unchanged batch set are counted where their slice sees
+/// them, as with any read racing a concurrent upload.
 async fn count_tree_stamps_sliced(
     issuers: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
     addrs: &[[u8; 32]],
     slice: usize,
 ) -> Result<ant_control::StewardshipStampsView, String> {
-    let mut chunks = 0u64;
-    let mut unstamped = 0u64;
-    let mut per_batch = std::collections::BTreeMap::<[u8; 32], u64>::new();
+    for _ in 0..=STAMP_COUNT_RESTARTS {
+        if let Some(view) = count_tree_stamps_sliced_once(issuers, addrs, slice).await? {
+            return Ok(view);
+        }
+    }
+    Err(format!(
+        "the set of postage batches kept changing during the count \
+         ({} attempts); retry",
+        STAMP_COUNT_RESTARTS + 1
+    ))
+}
+
+/// One pass of [`count_tree_stamps_sliced`]: `Ok(None)` when the batch
+/// set changed between slices.
+async fn count_tree_stamps_sliced_once(
+    issuers: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+    addrs: &[[u8; 32]],
+    slice: usize,
+) -> Result<Option<ant_control::StewardshipStampsView>, String> {
+    let mut total: Option<ant_control::StewardshipStampsView> = None;
     let mut parts = addrs.chunks(slice.max(1)).peekable();
     // An empty tree still lists the batches.
     let empty: [[u8; 32]; 0] = [];
-    let mut first = true;
-    while first || parts.peek().is_some() {
+    loop {
         let part = parts.next().unwrap_or(&empty);
-        first = false;
         let view = {
             let guard = match issuers.lock() {
                 Ok(g) => g,
@@ -5724,23 +5750,31 @@ async fn count_tree_stamps_sliced(
             };
             count_tree_stamps(&guard, part)?
         };
-        chunks += view.chunks;
-        unstamped += view.unstamped;
-        for row in view.batches {
-            *per_batch.entry(row.batch_id).or_default() += row.chunks;
+        match &mut total {
+            None => total = Some(view),
+            Some(total) => {
+                // Both lists are sorted by id, so equal ids pair up.
+                if total.batches.len() != view.batches.len()
+                    || total
+                        .batches
+                        .iter()
+                        .zip(&view.batches)
+                        .any(|(a, b)| a.batch_id != b.batch_id)
+                {
+                    return Ok(None);
+                }
+                total.chunks += view.chunks;
+                total.unstamped += view.unstamped;
+                for (a, b) in total.batches.iter_mut().zip(view.batches) {
+                    a.chunks += b.chunks;
+                }
+            }
         }
-        if parts.peek().is_some() {
-            tokio::task::yield_now().await;
+        if parts.peek().is_none() {
+            return Ok(total);
         }
+        tokio::task::yield_now().await;
     }
-    Ok(ant_control::StewardshipStampsView {
-        chunks,
-        batches: per_batch
-            .into_iter()
-            .map(|(batch_id, chunks)| ant_control::BatchChunkCount { batch_id, chunks })
-            .collect(),
-        unstamped,
-    })
 }
 
 /// Count, for every registered batch, how many of `addrs` its issuer's
@@ -13205,5 +13239,92 @@ mod tests {
             (empty.chunks, empty.unstamped, empty.batches.len()),
             (0, 0, 3)
         );
+    }
+
+    /// A batch registered or dropped between two slices of a count must
+    /// not show up in only some of them: the count starts over and the
+    /// view is the one a single pass over the new set gives.
+    #[test]
+    fn sliced_count_restarts_when_the_batch_set_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [1u8; SECP256K1_SECRET_LEN];
+        let (old, new) = ([0x0bu8; 32], [0x0au8; 32]);
+        let mut old_issuer = persistent_issuer(dir.path(), old);
+        let mut new_issuer = persistent_issuer(dir.path(), new);
+        for a in 1u8..=4 {
+            ant_postage::sign_stamp_bytes(&key, &mut old_issuer, &[a; 32]).unwrap();
+            ant_postage::sign_stamp_bytes(&key, &mut new_issuer, &[a; 32]).unwrap();
+        }
+        let tree: Vec<[u8; 32]> = (1u8..=4).map(|a| [a; 32]).collect();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // `biased` polls the count first every round, so `change` runs
+        // exactly once per slice the count yields after, deterministically.
+        async fn racing(
+            locked: &std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+            tree: &[[u8; 32]],
+            change: impl std::future::Future<Output = ()>,
+        ) -> Result<ant_control::StewardshipStampsView, String> {
+            let change = async {
+                change.await;
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                biased;
+                r = count_tree_stamps_sliced(locked, tree, 1) => r,
+                () = change => unreachable!(),
+            }
+        }
+
+        // Registered after the first of four slices.
+        let locked = std::sync::Mutex::new(HashMap::from([(old, old_issuer)]));
+        let view = rt
+            .block_on(racing(&locked, &tree, async {
+                locked.lock().unwrap().insert(new, new_issuer);
+            }))
+            .unwrap();
+        assert_eq!((view.chunks, view.unstamped), (4, 0));
+        assert_eq!(
+            view.batches,
+            vec![
+                ant_control::BatchChunkCount {
+                    batch_id: new,
+                    chunks: 4
+                },
+                ant_control::BatchChunkCount {
+                    batch_id: old,
+                    chunks: 4
+                },
+            ]
+        );
+
+        // Dropped after the first slice: not listed with a partial count.
+        let view = rt
+            .block_on(racing(&locked, &tree, async {
+                locked.lock().unwrap().remove(&new);
+            }))
+            .unwrap();
+        assert_eq!((view.chunks, view.unstamped), (4, 0));
+        assert_eq!(
+            view.batches,
+            vec![ant_control::BatchChunkCount {
+                batch_id: old,
+                chunks: 4
+            }]
+        );
+
+        // A set that changes on every slice ends in an error, never in
+        // a mixed view.
+        let res = rt.block_on(racing(&locked, &tree, async {
+            for i in 0..=STAMP_COUNT_RESTARTS as u8 {
+                let id = [0x40 + i; 32];
+                let issuer = persistent_issuer(dir.path(), id);
+                locked.lock().unwrap().insert(id, issuer);
+                tokio::task::yield_now().await;
+            }
+        }));
+        assert!(res.unwrap_err().contains("kept changing"));
     }
 }

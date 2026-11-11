@@ -120,6 +120,13 @@ pub struct StampIssuer {
     /// when re-stamps have appended newer copies not yet compacted away).
     /// Drives the compaction trigger. `0` for in-memory issuers.
     stamp_record_count: usize,
+    /// After a failed compaction, the physical record count at which the
+    /// next attempt is made (`0`: no back-off). Compaction is
+    /// housekeeping on a file that is already valid and appendable, so a
+    /// failure (disk full, say) must not fail the stamp whose append
+    /// already landed — and must not be re-attempted, a full-file
+    /// rewrite, on every following stamp either.
+    compact_retry_at: usize,
     /// Sidecar path the issued stamps are written to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
     stamps_path: Option<PathBuf>,
@@ -275,6 +282,7 @@ impl StampIssuer {
                 persist_path: Some(path),
                 seen: HashMap::new(),
                 stamp_record_count: 0,
+                compact_retry_at: 0,
                 stamps_path: None,
                 stamp_persistence_failed: None,
                 _store_lock: Some(store_lock),
@@ -346,6 +354,7 @@ impl StampIssuer {
             persist_path: Some(path),
             seen: HashMap::new(),
             stamp_record_count: 0,
+            compact_retry_at: 0,
             stamps_path: None,
             stamp_persistence_failed: None,
             _store_lock: Some(store_lock),
@@ -419,6 +428,7 @@ impl StampIssuer {
             persist_path,
             seen: HashMap::new(),
             stamp_record_count: 0,
+            compact_retry_at: 0,
             stamps_path: None,
             stamp_persistence_failed: None,
             _store_lock: store_lock,
@@ -699,11 +709,35 @@ impl StampIssuer {
         }
         self.seen.insert(addr, stamp);
         self.stamp_record_count += 1;
-        if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
-            rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
-            self.stamp_record_count = self.seen.len();
-        }
+        self.maybe_compact(&path);
         Ok(())
+    }
+
+    /// Compact the sidecar once its physical record count has grown past
+    /// `live × STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR`. Best-effort:
+    /// it only runs after the record that triggered it was durably
+    /// appended (and is already in `seen`), and a failed rewrite leaves
+    /// the old, valid, appendable file in place (temp + rename), the
+    /// same state [`load_stamp_store`] keeps appending to when its own
+    /// compaction fails. So the failure is not the stamp's: returning
+    /// `Err` here would refuse a stamp that is recorded in memory and on
+    /// disk, and the stamp-record readers would then report a stamp the
+    /// caller was told never happened. Instead the next attempt is put
+    /// off until another `max(live, STAMP_COMPACT_FLOOR)` records have
+    /// been appended, so a persistent failure costs one rewrite attempt
+    /// per that many stamps rather than one per stamp.
+    fn maybe_compact(&mut self, path: &Path) {
+        let threshold = self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR;
+        if self.stamp_record_count <= threshold || self.stamp_record_count < self.compact_retry_at {
+            return;
+        }
+        if rewrite_sidecar(path, &self.batch_id, &self.seen).is_ok() {
+            self.stamp_record_count = self.seen.len();
+            self.compact_retry_at = 0;
+        } else {
+            self.compact_retry_at =
+                self.stamp_record_count + self.seen.len().max(STAMP_COMPACT_FLOOR);
+        }
     }
 
     /// [`Self::record_stamp`] for a batch: one sidecar append, one
@@ -732,10 +766,7 @@ impl StampIssuer {
             return Ok(()); // in-memory issuer
         };
         self.stamp_record_count += records.len();
-        if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
-            rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
-            self.stamp_record_count = self.seen.len();
-        }
+        self.maybe_compact(&path);
         Ok(())
     }
 
@@ -1813,6 +1844,61 @@ mod tests {
             assert_eq!(reopened.cached_stamp(&addr(a)), None, "chunk {a}");
         }
         assert_eq!(reopened.cached_stamp(&addr(7)), Some(known));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction that fails after the triggering record was durably
+    /// appended doesn't fail that stamp: the record is in memory and on
+    /// disk, so refusing it would make the records claim a stamp the
+    /// caller was told never happened. The failed rewrite is retried
+    /// only after a back-off, and runs again once the disk recovers.
+    #[test]
+    fn a_failed_compaction_does_not_fail_the_stamp() {
+        let secret = random_secp256k1_secret();
+        let batch = [0x6cu8; 32];
+        let dir = tmpdir();
+        let path = dir.join("b.bin");
+        let sidecar = stamps_sidecar_path(&path);
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 20, 16, false).unwrap();
+        sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap();
+        // A directory where the rewrite's temp file goes blocks every
+        // compaction (as root too), while appends keep working.
+        let tmp = sidecar.with_extension("stamps.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        // Refreshes of one address pile up records until the count
+        // passes `1 × FACTOR + FLOOR` and compaction is attempted.
+        let mut last = None;
+        for i in 0..(STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR + 4) {
+            let s = sign_stamp_bytes(&secret, &mut issuer, &addr(7))
+                .unwrap_or_else(|e| panic!("refresh {i} refused: {e}"));
+            last = Some(s);
+        }
+        let new: Vec<[u8; 32]> = (20..23).map(addr).collect();
+        let batch_out: Vec<_> = sign_stamps_batch(&secret, &mut issuer, &new)
+            .into_iter()
+            .map(|r| r.expect("batch stamp after a failed compaction"))
+            .collect();
+        assert!(issuer.compact_retry_at > 0, "compaction backed off");
+        assert!(
+            issuer.stamp_record_count > issuer.seen.len(),
+            "not compacted"
+        );
+        assert_eq!(issuer.stamp_records_unavailable(), None);
+        assert_eq!(issuer.cached_stamp(&addr(7)), last);
+
+        // Disk recovers: the next attempt after the back-off compacts.
+        std::fs::remove_dir(&tmp).unwrap();
+        while issuer.compact_retry_at != 0 {
+            last = Some(sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap());
+        }
+        assert_eq!(issuer.stamp_record_count, issuer.seen.len(), "compacted");
+
+        drop(issuer);
+        let reopened = StampIssuer::open_existing(path).unwrap();
+        assert_eq!(reopened.cached_stamp(&addr(7)), last);
+        for (a, s) in new.iter().zip(&batch_out) {
+            assert_eq!(reopened.cached_stamp(a), Some(*s));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
