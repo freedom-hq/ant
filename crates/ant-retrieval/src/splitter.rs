@@ -107,6 +107,14 @@ pub fn split_bytes(payload: &[u8]) -> SplitResult {
     while level.len() > 1 {
         let mut next: Vec<(ChunkAddr, u64)> = Vec::with_capacity(level.len().div_ceil(BRANCHES));
         for group in level.chunks(BRANCHES) {
+            // A lone trailing reference is carried up unchanged, never
+            // wrapped in a 1-child intermediate: bee's hashtrie `Sum`
+            // does the same, and a wrapper whose span fits one leaf
+            // would read back as that leaf (issue #234).
+            if let [only] = group {
+                next.push(*only);
+                continue;
+            }
             let mut intermediate_payload = Vec::with_capacity(group.len() * 32);
             let mut subtree_span: u64 = 0;
             for (child_addr, child_span) in group {
@@ -274,7 +282,9 @@ impl StreamingSplitter {
         }
     }
 
-    /// Drain partial intermediate levels into the file root. Returns
+    /// Drain partial intermediate levels into the file root. A partial
+    /// level holding a single reference is carried up as it is, not
+    /// wrapped (bee hashtrie `Sum`). Returns
     /// `(root_addr, total_bytes, tail_chunks)` where `tail_chunks` is
     /// any intermediates produced by the drain (the root is the last
     /// entry, except in the single-leaf case where the leaf was
@@ -332,13 +342,24 @@ impl StreamingSplitter {
                 level += 1;
                 continue;
             }
-            let (addr, span, chunk) = flush_level(&mut self.levels[level]);
-            emitted.push(chunk);
+            // A lone reference is carried up unchanged rather than
+            // wrapped in a 1-child intermediate, like bee's hashtrie
+            // `Sum` (and `RedundantSplitter::finish`). A wrapper would
+            // give a non-bee reference, and one whose span fits a
+            // single leaf reads back as that leaf, so the file's tail
+            // comes back wrong (issue #234).
+            let entry = if n == 1 {
+                self.levels[level].pop().expect("len checked")
+            } else {
+                let (addr, span, chunk) = flush_level(&mut self.levels[level]);
+                emitted.push(chunk);
+                (addr, span)
+            };
             // Bubble into the next level up; create one if necessary.
             if self.levels.len() <= level + 1 {
                 self.levels.push(Vec::new());
             }
-            self.levels[level + 1].push((addr, span));
+            self.levels[level + 1].push(entry);
             level += 1;
         }
     }
@@ -591,8 +612,9 @@ mod tests {
     }
 
     /// Three-level fan-out: BRANCHES * BRANCHES + 5 leaves so the L3
-    /// root has exactly 2 L2 children, the second L2 has exactly 1
-    /// L1 child carrying 5 leaves. Exercises the recursive bubble-up
+    /// root has exactly 2 children: the first, full L2 chunk, and the
+    /// lone L1 chunk over the last 5 leaves, carried up unwrapped
+    /// (bee's hashtrie `Sum`, #234). Exercises the recursive bubble-up
     /// across three intermediate levels and matches the shape of a
     /// multi-GiB upload at small scale.
     ///
@@ -607,6 +629,111 @@ mod tests {
         let len = CHUNK_SIZE * (BRANCHES * BRANCHES + 5);
         let p: Vec<u8> = (0..len).map(|i| ((i * 23) % 251) as u8).collect();
         assert_streaming_matches(&p);
+    }
+
+    /// Content of the cross-implementation file vectors (swarmfs, issue
+    /// #62): with `k = i / 4096`, byte `i` is
+    /// `((i * 7 + k) % 251) ^ ((k / 251) & 0xff)`.
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                let k = i / 4096;
+                (((i * 7 + k) % 251) ^ ((k / 251) & 0xff)) as u8
+            })
+            .collect()
+    }
+
+    /// Both splitters give `want_root` for `pattern(size)`, and the
+    /// tree joins back to the exact bytes (via
+    /// [`assert_streaming_matches`]).
+    fn assert_pattern_root(size: usize, want_root: &str) {
+        let payload = pattern(size);
+        assert_eq!(
+            hex::encode(split_bytes(&payload).root),
+            want_root,
+            "split_bytes root for {size} bytes",
+        );
+        assert_streaming_matches(&payload);
+    }
+
+    /// Issue #234: 129 leaves, the last one 1 byte. Level 1 ends with a
+    /// lone leaf, which bee's hashtrie `Sum` carries up unwrapped: the
+    /// root holds two references, the level-1 chunk over the first 128
+    /// leaves and the 1-byte leaf itself. Ant used to wrap that leaf in
+    /// a 1-ref intermediate of span 1, which a joiner reads as the leaf,
+    /// so the file's last byte came back as the first byte of the leaf's
+    /// address. Root is bee's (and swarmfs's) for this content.
+    #[test]
+    fn lone_trailing_leaf_is_carried_up_like_bee() {
+        let size = CHUNK_SIZE * BRANCHES + 1;
+        assert_pattern_root(
+            size,
+            "95cefbc8d063b2ba7ffaa05cf0fb07fdb2df148acb12fc0ea50e3a825035eb03",
+        );
+
+        let payload = pattern(size);
+        let result = split_bytes(&payload);
+        let root = result
+            .chunks
+            .iter()
+            .find(|c| c.address == result.root)
+            .expect("root chunk emitted");
+        let last_leaf = cac_new(&payload[CHUNK_SIZE * BRANCHES..]).unwrap().0;
+        assert_eq!(root.wire.len(), SPAN_SIZE + 2 * 32, "root has two refs");
+        assert_eq!(
+            &root.wire[SPAN_SIZE + 32..],
+            &last_leaf,
+            "second ref is the leaf"
+        );
+        // 129 leaves + the level-1 chunk + the root; no wrapper.
+        assert_eq!(result.chunks.len(), BRANCHES + 1 + 2);
+    }
+
+    /// Every last-leaf size up to the reference size (32 bytes), where a
+    /// wrapper read as a leaf corrupted the tail, round-trips exactly.
+    #[test]
+    fn short_lone_trailing_leaf_round_trips() {
+        for tail in [1usize, 2, 31, 32, 33] {
+            assert_streaming_matches(&pattern(CHUNK_SIZE * BRANCHES + tail));
+        }
+    }
+
+    /// Issue #234, one level up: 16,386 leaves leave a lone level-1
+    /// chunk at the end of level 2, carried up to the root unwrapped.
+    /// Root is bee's (and swarmfs's). `#[ignore]` for the same reason
+    /// as `streaming_matches_split_bytes_three_levels` (64 MiB); run
+    /// with `cargo test --release -p ant-retrieval -- --include-ignored
+    /// lone_trailing_intermediate`.
+    #[test]
+    #[ignore = "slow in debug; run with --release --include-ignored"]
+    fn lone_trailing_intermediate_is_carried_up_like_bee() {
+        assert_pattern_root(
+            67_112_961,
+            "3b62c8ee52bd5eebf3136917e0ef5be7b7c3d33522720235b74214b8c92da6fc",
+        );
+    }
+
+    /// Sizes with no lone reference at any level are unchanged by the
+    /// #234 fix (roots as before it; 4,097 and 8,193 are also
+    /// swarmfs's).
+    #[test]
+    fn trees_without_a_lone_reference_are_unchanged() {
+        for (size, root) in [
+            (
+                4_097,
+                "137cdd31a6f36bc5d2d1cd404cae073ffb02ba2b807f7e5bd76870abc77ced93",
+            ),
+            (
+                8_193,
+                "c35513aae4ed2df7794e79367f70a6530a3c9dcb9dcbf053d9e5c0e30de34a5a",
+            ),
+            (
+                528_385,
+                "04518821b08b169754b62bd34d438e63b06e7a25fa365209e8c48c1c157b4e20",
+            ),
+        ] {
+            assert_pattern_root(size, root);
+        }
     }
 
     /// Boundary that bee's splitter explicitly tests: 524288 bytes (128

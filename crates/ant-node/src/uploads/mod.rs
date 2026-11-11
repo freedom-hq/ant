@@ -20,8 +20,13 @@
 //!   ⇒ same chunk addresses), so on resume we re-mmap, re-stream
 //!   from byte 0, recompute every address, and skip pushsync for
 //!   the first `chunks_pushed` chunks. No per-chunk receipts on
-//!   disk, no double-stamping (the postage issuer is only consulted
-//!   when we actually dispatch a `PushChunk`).
+//!   disk, and the postage issuer is only consulted when we
+//!   actually dispatch a `PushChunk`, so skipped data chunks are
+//!   never stamped twice. The exception is the splitter's tail and
+//!   the manifest chunks, which are re-dispatched (and so stamped
+//!   again) on every resume; see `run_job`'s tail loop. That is a
+//!   handful of chunks, and the issuer reuses the slot it already
+//!   recorded for an address, so no bucket capacity is lost.
 //!
 //! - **Pause / cancel.** A driver checks
 //!   [`JobHandle::pause_requested`] / [`JobHandle::cancel_requested`]
@@ -2205,14 +2210,21 @@ impl UploadManager {
         // (root + partial intermediates) remains — a handful of
         // chunks (one partial intermediate per tree level), well
         // under MAX_PUSH_CONCURRENCY, so dispatch them all at once.
+        //
+        // The tail and the manifest chunks are pushed even below
+        // `resume_cursor`: they are a handful of chunks, and their
+        // shape is not stable across builds. #234 dropped the 1-child
+        // wrapper from the tail, so a job that failed or was killed
+        // mid-tail under an older build would otherwise resume with
+        // its cursor past the index of the new data root and finish
+        // without ever pushing it. Re-pushing an already-stored chunk
+        // is harmless; `AckLog::record` ignores indices below the
+        // cursor.
         let (data_root, _total_bytes, tail) = splitter.finish();
         for chunk in tail {
             let i = next_index;
             next_index += 1;
             note_heal_addr(&mut heal_addrs, &mut heal_overflow, chunk.address);
-            if i < resume_cursor {
-                continue;
-            }
             in_flight.push(self.dispatch_push_once(i, chunk, 0, batch_id, 1));
         }
         // Drain the tail (with the same re-queue + tail-hedging
@@ -2254,9 +2266,7 @@ impl UploadManager {
                 let i = next_index;
                 next_index += 1;
                 note_heal_addr(&mut heal_addrs, &mut heal_overflow, chunk.address);
-                if i < resume_cursor {
-                    continue;
-                }
+                // Never skipped on resume; see the tail loop above.
                 in_flight.push(self.dispatch_push_once(i, chunk.clone(), 0, batch_id, 1));
             }
             self.drain_with_requeue(
@@ -3747,8 +3757,9 @@ impl<'a> Iterator for LeafIter<'a> {
 ///
 /// On resume the cursor starts at `resume_cursor`; the driver
 /// re-derives indices `0..resume_cursor` from the splitter and
-/// skips dispatching them, so the first observed completion is
-/// always at index `resume_cursor`.
+/// skips dispatching them, except the splitter tail and manifest
+/// chunks, which are always re-pushed; their completions below the
+/// cursor are ignored by [`AckLog::record`].
 struct AckLog {
     resume_cursor: u64,
     cursor: u64,
@@ -3831,8 +3842,15 @@ pub const fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
     let mut total: u64 = leaves;
     let mut level = leaves;
     while level > 1 {
-        level = level.div_ceil(ant_retrieval::BRANCHES as u64);
-        total += level;
+        // A lone trailing reference is carried up unwrapped (bee's
+        // hashtrie `Sum`, issue #234), so it adds no chunk.
+        let next = level.div_ceil(ant_retrieval::BRANCHES as u64);
+        total += if level % ant_retrieval::BRANCHES as u64 == 1 {
+            next - 1
+        } else {
+            next
+        };
+        level = next;
     }
     if raw {
         total
@@ -3980,6 +3998,32 @@ mod tests {
     use std::io::Write as _;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// The raw estimate is exact: it equals the number of chunks the
+    /// streaming splitter emits, including trees whose levels end in a
+    /// lone reference that is carried up unwrapped (#234).
+    #[test]
+    fn raw_estimate_matches_streaming_splitter() {
+        for len in [
+            0usize,
+            1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            CHUNK_SIZE * 128,
+            CHUNK_SIZE * 128 + 1,
+            CHUNK_SIZE * 129 + 1,
+            CHUNK_SIZE * 257 + 1,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut splitter = StreamingSplitter::new();
+            let mut n = 0u64;
+            for leaf in payload.chunks(CHUNK_SIZE) {
+                n += splitter.push_leaf(leaf).len() as u64;
+            }
+            n += splitter.finish().2.len() as u64;
+            assert_eq!(estimate_chunk_count(len as u64, true), n, "len {len}");
+        }
+    }
 
     /// Counts of pushes a fake node loop has accepted.
     #[derive(Default)]
@@ -5084,6 +5128,83 @@ mod tests {
             pushed2_count,
             total_chunks - (total_chunks / 2),
             "resume should push exactly the chunks past the cursor",
+        );
+    }
+
+    /// A resume whose cursor already reaches past the splitter tail
+    /// (a job that failed or was killed while pushing its tail or
+    /// manifest under a build whose tail had a different shape, e.g.
+    /// the 1-child wrapper #234 removed) still pushes the data root
+    /// and the manifest, instead of skipping them by index.
+    #[tokio::test]
+    async fn resume_always_pushes_tail_and_manifest() {
+        // 129 leaves, the last one 1 byte: a lone trailing leaf.
+        let len = CHUNK_SIZE * 128 + 1;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 13) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let (tx1, _stats1) = spawn_fake_pushsync();
+        let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1, None).expect("manager");
+        let id = mgr1
+            .start(f.path().to_path_buf(), None, None, None, false)
+            .expect("start");
+        let mut rx = mgr1.subscribe(&id).expect("subscribe");
+        let final_snap = loop {
+            let snap = rx.borrow().clone();
+            if snap.status.is_terminal() {
+                break snap;
+            }
+            rx.changed().await.expect("watch");
+        };
+        let total_chunks = final_snap.chunks_pushed;
+        let reference = final_snap.reference.clone().expect("reference");
+        drop(mgr1);
+
+        // An older tail had one more chunk, so its cursor can sit
+        // past every index this build assigns to the tail.
+        let manifest_path = state_dir.path().join(format!("{id}.json"));
+        let mut info = UploadJobInfo::load(&manifest_path).expect("load");
+        info.chunks_pushed = total_chunks;
+        info.status = UploadStatus::Running;
+        info.reference = None;
+        info.save(&manifest_path).expect("save rewound");
+
+        let (tx2, stats2) = spawn_fake_pushsync();
+        let mgr2 = UploadManager::new(state_dir.path().to_path_buf(), tx2, None).expect("manager");
+        assert_eq!(mgr2.rehydrate_from_disk(true).expect("rehydrate"), 1);
+        let mut rx2 = mgr2.subscribe(&id).expect("subscribe");
+        let snap = loop {
+            let snap = rx2.borrow().clone();
+            if snap.status.is_terminal() {
+                break snap;
+            }
+            rx2.changed().await.expect("watch");
+        };
+        assert_eq!(snap.status, UploadStatus::Completed);
+        assert_eq!(snap.reference.as_deref(), Some(reference.as_str()));
+
+        let mut splitter = StreamingSplitter::new();
+        for leaf in payload.chunks(CHUNK_SIZE) {
+            let _ = splitter.push_leaf(leaf);
+        }
+        let (data_root, _, tail) = splitter.finish();
+        let s = stats2.lock().expect("stats");
+        assert!(
+            s.unique_addresses.contains(&data_root),
+            "resumed run must push the data root",
+        );
+        let manifest_root = hex::decode(reference.trim_start_matches("0x")).expect("hex");
+        assert!(
+            s.unique_addresses
+                .iter()
+                .any(|a| a[..] == manifest_root[..]),
+            "resumed run must push the manifest root",
+        );
+        assert!(
+            s.total_dispatches > tail.len() as u64,
+            "tail + manifest re-pushed, got {}",
+            s.total_dispatches,
         );
     }
 

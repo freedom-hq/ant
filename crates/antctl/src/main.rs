@@ -2059,8 +2059,15 @@ const fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
     let mut total = leaves;
     let mut level = leaves;
     while level > 1 {
-        level = level.div_ceil(BRANCHES);
-        total += level;
+        // A lone trailing reference is carried up unwrapped (bee's
+        // hashtrie `Sum`, issue #234), so it adds no chunk.
+        let next = level.div_ceil(BRANCHES);
+        total += if level % BRANCHES == 1 {
+            next - 1
+        } else {
+            next
+        };
+        level = next;
     }
     if raw {
         total
@@ -2092,6 +2099,10 @@ mod estimate_chunk_count_tests {
         // adds 1.
         assert_eq!(estimate_chunk_count(8192, false), 4);
         assert_eq!(estimate_chunk_count(8192, true), 3);
+
+        // 129 leaves: the lone 129th is carried up unwrapped (#234), so
+        // one level-1 chunk + the root.
+        assert_eq!(estimate_chunk_count(524_289, true), 129 + 1 + 1);
 
         // 7 GiB: 1 835 008 leaves, 14 336 + 112 + 1 intermediates,
         // + 1 manifest = 1 849 458; raw drops the manifest.
