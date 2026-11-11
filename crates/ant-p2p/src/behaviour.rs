@@ -6997,9 +6997,18 @@ fn manifest_page_query(q: ant_control::ManifestListQuery) -> ant_retrieval::Mani
 /// off the [`ant_retrieval::ManifestError`] rather than its message:
 ///
 /// - a page → [`ControlAck::ManifestPage`], `immutable` unless the
-///   reference was a feed manifest or a size asked for couldn't be read;
+///   reference was a feed manifest, a size asked for couldn't be read,
+///   or the walk ran out of time ([`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`])
+///   and ended `truncated` early;
 /// - the prefix names nothing, or the reference (or a trie node) is not
 ///   a decodable manifest → [`ControlAck::NotFound`], bee#5537's 404;
+/// - a path on the page is not valid UTF-8 (it can't be returned as a
+///   JSON string and passed back as `after` without paging wrongly) →
+///   [`ControlAck::NotFound`]: a property of the content, which a retry
+///   would only repeat;
+/// - the walk ran out of time before finding a single item →
+///   [`ControlAck::NotReady`]: the nodes it loaded are cached, so a
+///   retry gets further;
 /// - a trie node that couldn't be fetched → [`ControlAck::NotFound`] if
 ///   peers confirmed it missing, [`ControlAck::NotReady`] if the miss
 ///   came from a starved pool or the node's replica sweep failed only
@@ -7018,7 +7027,7 @@ pub fn manifest_page_ack(
     use ant_retrieval::ManifestError as E;
     match result {
         Ok(page) => ControlAck::ManifestPage(ant_control::ManifestListPage {
-            immutable: !page.feed && !page.sizes_incomplete,
+            immutable: !page.feed && !page.sizes_incomplete && !page.timed_out,
             entries: page
                 .entries
                 .into_iter()
@@ -7039,8 +7048,12 @@ pub fn manifest_page_ack(
             | E::TooShort(_)
             | E::UnsupportedVersion(_)
             | E::InvalidRefLength(_)
-            | E::InvalidMetadata(_)),
+            | E::InvalidMetadata(_)
+            | E::ListNonUtf8Path { .. }),
         ) => ControlAck::NotFound {
+            message: format!("list manifest {}: {e}", hex::encode(reference)),
+        },
+        Err(e @ E::ListTimedOut) => ControlAck::NotReady {
             message: format!("list manifest {}: {e}", hex::encode(reference)),
         },
         Err(e) => bzz_lookup_failure_ack(
@@ -11405,6 +11418,45 @@ mod tests {
         ] {
             assert!(!is_bytes_root_transient(err(miss).as_ref()), "{miss}");
         }
+    }
+
+    /// A listing page's own outcomes (PR #260, R1-F1/R1-M1): out of time
+    /// before any item is a 503 (a warm retry gets further), a page cut
+    /// short by the clock is not cached immutably, and a non-UTF-8 path
+    /// is a 404 (the content's answer, not the network's).
+    #[test]
+    fn manifest_page_ack_types_time_and_utf8_outcomes() {
+        use ant_retrieval::{ManifestError, ManifestPage, ReplicaSweeps};
+        let sweeps = ReplicaSweeps::for_listing();
+        let ack = manifest_page_ack(&[0; 32], Err(ManifestError::ListTimedOut), &sweeps);
+        assert!(matches!(ack, ControlAck::NotReady { .. }), "{ack:?}");
+        let ack = manifest_page_ack(
+            &[0; 32],
+            Err(ManifestError::ListNonUtf8Path {
+                path_lossy: "caf\u{FFFD}".into(),
+            }),
+            &sweeps,
+        );
+        assert!(matches!(ack, ControlAck::NotFound { .. }), "{ack:?}");
+        let ack = manifest_page_ack(&[0; 32], Err(ManifestError::ListBudgetExceeded), &sweeps);
+        assert!(matches!(ack, ControlAck::Error { .. }), "{ack:?}");
+        let page = |timed_out| ManifestPage {
+            truncated: true,
+            next_marker: Some("a".into()),
+            timed_out,
+            ..ManifestPage::default()
+        };
+        let ControlAck::ManifestPage(full) = manifest_page_ack(&[0; 32], Ok(page(false)), &sweeps)
+        else {
+            panic!("not a page");
+        };
+        assert!(full.immutable);
+        let ControlAck::ManifestPage(cut) = manifest_page_ack(&[0; 32], Ok(page(true)), &sweeps)
+        else {
+            panic!("not a page");
+        };
+        assert!(!cut.immutable);
+        assert!(cut.truncated);
     }
 
     /// Issue #123: a `/bytes` or `/bzz` root that peers confirmed missing

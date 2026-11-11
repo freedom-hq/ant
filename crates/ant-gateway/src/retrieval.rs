@@ -2820,13 +2820,25 @@ pub async fn bzz_with_path(
 ///
 /// `prefix` is any byte prefix (bee#5537 only takes one ending on a
 /// trie node); one that no path starts with is a `404`. A trie node that
-/// can't be retrieved fails the request (`404` if peers confirmed it
-/// missing, `503` if the pool was starved) instead of returning a
-/// listing with that subtree silently missing.
+/// can't be retrieved fails the request instead of returning a listing
+/// with that subtree silently missing: `404` if peers confirmed it
+/// missing (and its replica sweep missed for good), `503` if the pool
+/// was starved or the replica sweep failed only transiently, `502` for
+/// any other fetch failure. Also `503` with no peers connected yet, or
+/// when the walk's wall-clock budget
+/// ([`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`]) ran out before a
+/// single item; `404` for a page path that is not valid UTF-8 (it
+/// could not be passed back as `after` exactly); `502` for a trie too
+/// deep or too sparse for one page.
+///
+/// A page that runs out of that budget after at least one item ends
+/// early, `truncated` with fewer than `limit` items; continue from
+/// `nextMarker` as usual.
 ///
 /// The answer for a content-addressed root never changes, so it is
 /// cached immutably, except when the root is a feed manifest (listed at
-/// its current update) or a requested size could not be read.
+/// its current update), a requested size could not be read, or the
+/// page was cut short by the wall-clock budget.
 pub async fn manifest(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,

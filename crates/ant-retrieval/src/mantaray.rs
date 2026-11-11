@@ -263,11 +263,23 @@ pub enum ManifestError {
     /// the declared owner, or the metadata was malformed.
     #[error("dereference feed: {0}")]
     Feed(#[from] FeedError),
-    /// A manifest listing page loaded its whole node budget
-    /// ([`MANIFEST_PAGE_NODE_SLACK`]) without finding a single item:
+    /// A manifest listing page loaded its whole node budget (`2 * limit
+    /// +` [`MANIFEST_PAGE_NODE_SLACK`]) without finding a single item:
     /// a trie of value-less nodes, not a listing that fits in a page.
     #[error("manifest listing exceeded its node budget before finding an entry")]
     ListBudgetExceeded,
+    /// A manifest listing page spent its wall-clock budget
+    /// ([`MANIFEST_PAGE_WALK_BUDGET`]) loading trie nodes without finding
+    /// a single item. Transient: the nodes it did load are cached, so a
+    /// retry gets further.
+    #[error("manifest listing ran out of time before finding an entry")]
+    ListTimedOut,
+    /// A manifest listing page would return a path (or common prefix)
+    /// that is not valid UTF-8. Paths travel as JSON strings and come
+    /// back as `after`, so a lossily-decoded path would page wrongly
+    /// (skip or repeat items); the page fails instead.
+    #[error("manifest path is not valid UTF-8: {path_lossy:?}")]
+    ListNonUtf8Path { path_lossy: String },
     /// A manifest listing page reached a trie node deeper than
     /// [`MANIFEST_PAGE_MAX_DEPTH`] levels.
     #[error("manifest is deeper than {MANIFEST_PAGE_MAX_DEPTH} trie levels")]
@@ -764,10 +776,37 @@ pub const MANIFEST_PAGE_DEFAULT_LIMIT: usize = 1000;
 /// is answered, so this bounds one request; total enumeration is still
 /// unbounded through `after`/`next_marker`. Inside the 1,000-10,000
 /// range bee#5535 suggests for a node-enforced cap, and far below
-/// #5537's 1,000,000: the walk loads nodes one after another, ~85 ms
-/// each on a cold mainnet node, so a cold 5,000-item page takes about
-/// 7 minutes, inside the gateway's 10-minute request timeout.
+/// #5537's 1,000,000.
+///
+/// `limit` bounds items, not time: the walk loads nodes one after
+/// another (~85 ms each on a cold mainnet node), and a manifest of long
+/// hashed names costs a few loads per entry, so a cold full-size page
+/// can need well over 10 minutes. Time is bounded separately by
+/// [`MANIFEST_PAGE_WALK_BUDGET`] and [`MANIFEST_PAGE_SIZES_BUDGET`]: a
+/// page that runs out of time ends `truncated` with fewer than `limit`
+/// items (S3 allows that), and the client continues from `next_marker`.
 pub const MANIFEST_PAGE_MAX_LIMIT: usize = 5_000;
+
+/// Wall-clock time, from the start of [`list_manifest_page`] (feed
+/// resolution and the root load included), after which the walk starts
+/// no further node load. A page that hits it after at least one item
+/// ends `truncated` (and is not cacheable: a warm retry gets further);
+/// one that hits it before any item fails with
+/// [`ManifestError::ListTimedOut`]. The check is before each load, so a
+/// load already in flight still finishes: one node load (each peer
+/// attempt capped at 30 s, plus at most one replica sweep) overruns
+/// it by well under the 6 minutes left before the gateway's 10-minute
+/// request timeout. Bounds the walk a timed-out request leaves running
+/// detached, too.
+pub const MANIFEST_PAGE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_mins(4);
+
+/// Wall-clock time, from the start of [`list_manifest_page`], after
+/// which `sizes` starts no further span read; an entry not read by
+/// then has no `size` and the page is marked `sizes_incomplete`. With
+/// the walk ending by [`MANIFEST_PAGE_WALK_BUDGET`] this leaves span
+/// reads (16 at a time) at least 2 minutes, and in-flight reads 4
+/// minutes of margin before the gateway's 10-minute request timeout.
+pub const MANIFEST_PAGE_SIZES_BUDGET: std::time::Duration = std::time::Duration::from_mins(6);
 
 /// Trie levels a manifest listing page descends before failing with
 /// [`ManifestError::ListTooDeep`]. Every level consumes at least one
@@ -785,7 +824,9 @@ pub const MANIFEST_PAGE_MAX_DEPTH: usize = 256;
 /// runs out of it after returning at least one item ends early with
 /// `truncated` set (the next page resumes from `next_marker`), and one
 /// that runs out before any item fails with
-/// [`ManifestError::ListBudgetExceeded`].
+/// [`ManifestError::ListBudgetExceeded`]. This bounds loads, not time:
+/// at limit 5,000 it allows 11,024 loads, ~15 minutes cold, so wall
+/// time is bounded separately by [`MANIFEST_PAGE_WALK_BUDGET`].
 pub const MANIFEST_PAGE_NODE_SLACK: usize = 1024;
 
 /// One page request for [`list_manifest_page`], with bee#5535's
@@ -823,12 +864,18 @@ pub struct ManifestPage {
     /// Common prefixes on this page (only with a `delimiter`), in order.
     pub common_prefixes: Vec<String>,
     /// More items may follow: ask again with `after = next_marker`.
+    /// Set when the page is full, or when the walk ran out of its node
+    /// budget or of [`MANIFEST_PAGE_WALK_BUDGET`] after at least one
+    /// item (then with fewer than `limit` items).
     pub truncated: bool,
     /// The last item on this page, set iff `truncated`.
     pub next_marker: Option<String>,
     /// The reference was a feed manifest, listed at its current update:
     /// the same request can answer differently later.
     pub feed: bool,
+    /// The page ended early on [`MANIFEST_PAGE_WALK_BUDGET`]: the same
+    /// request, once the nodes are cached, returns more items.
+    pub timed_out: bool,
     /// `sizes` was asked for and at least one entry's span could not be
     /// read, so the same request can answer differently later.
     pub sizes_incomplete: bool,
@@ -844,8 +891,14 @@ pub struct ManifestPage {
 /// Unlike [`list_manifest`] the result is never silently partial: a trie
 /// node that can't be loaded fails the page (bee#5535: "listings that
 /// silently omit subtrees are dangerous"), `truncated` is the only way a
-/// page ends short, and a trie deeper than [`MANIFEST_PAGE_MAX_DEPTH`]
-/// is an error ([`ManifestError::ListTooDeep`]), not a cut-off.
+/// page ends short (full, or out of node or time budget), a trie deeper
+/// than [`MANIFEST_PAGE_MAX_DEPTH`] is an error
+/// ([`ManifestError::ListTooDeep`]), not a cut-off, and a path that is
+/// not valid UTF-8 fails the page ([`ManifestError::ListNonUtf8Path`])
+/// rather than being returned in a lossy form that pages wrongly.
+///
+/// Wall-clock time is bounded by [`MANIFEST_PAGE_WALK_BUDGET`] for the
+/// walk and [`MANIFEST_PAGE_SIZES_BUDGET`] for `sizes`.
 ///
 /// `sweeps` should be a fresh [`ReplicaSweeps::for_listing`]; after an
 /// error, its [`ReplicaSweeps::swept_transiently`] tells whether a retry
@@ -859,6 +912,7 @@ pub async fn list_manifest_page(
     query: &ManifestPageQuery,
     sweeps: &ReplicaSweeps,
 ) -> Result<ManifestPage, ManifestError> {
+    let started = tokio::time::Instant::now();
     let (effective_root, feed) =
         resolve_feed_root_with_credit(fetcher, root_ref, None, sweeps, None).await?;
     let root_node = load_node_ref_with_credit(fetcher, &effective_root, None, sweeps).await?;
@@ -878,10 +932,12 @@ pub async fn list_manifest_page(
         loads_left: limit
             .saturating_mul(2)
             .saturating_add(MANIFEST_PAGE_NODE_SLACK),
+        deadline: started + MANIFEST_PAGE_WALK_BUDGET,
         items: Vec::new(),
         prefix_seen: query.prefix.is_empty(),
         done: false,
         truncated: false,
+        timed_out: false,
     };
     if walk.start.is_some() {
         walk.visit(root_node.clone(), Vec::new(), 0).await?;
@@ -898,25 +954,27 @@ pub async fn list_manifest_page(
     let mut page = ManifestPage {
         feed: feed.is_some(),
         truncated: walk.truncated,
+        timed_out: walk.timed_out,
         ..ManifestPage::default()
     };
+    // `push` only keeps valid UTF-8 paths, so these conversions are
+    // lossless and `next_marker` round-trips exactly as `after`.
     if walk.truncated {
         page.next_marker = walk
             .items
             .last()
-            .map(|item| String::from_utf8_lossy(item.path()).into_owned());
+            .map(|item| utf8_path(item.path().to_vec()))
+            .transpose()?;
     }
     for item in walk.items {
         match item {
-            PageItem::Prefix(p) => page
-                .common_prefixes
-                .push(String::from_utf8_lossy(&p).into_owned()),
+            PageItem::Prefix(p) => page.common_prefixes.push(utf8_path(p)?),
             PageItem::Entry {
                 path,
                 reference,
                 metadata,
             } => page.entries.push(ManifestEntry {
-                path: String::from_utf8_lossy(&path).into_owned(),
+                path: utf8_path(path)?,
                 reference: Some(reference),
                 metadata: metadata_to_btree(metadata),
                 size: None,
@@ -924,10 +982,22 @@ pub async fn list_manifest_page(
         }
     }
     if query.sizes {
-        populate_sizes(fetcher, &mut page.entries).await;
+        populate_sizes_until(
+            fetcher,
+            &mut page.entries,
+            Some(started + MANIFEST_PAGE_SIZES_BUDGET),
+        )
+        .await;
         page.sizes_incomplete = page.entries.iter().any(|e| e.size.is_none());
     }
     Ok(page)
+}
+
+/// A page item's path as a `String`, or [`ManifestError::ListNonUtf8Path`].
+fn utf8_path(bytes: Vec<u8>) -> Result<String, ManifestError> {
+    String::from_utf8(bytes).map_err(|e| ManifestError::ListNonUtf8Path {
+        path_lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 /// The first path a page may visit, or `None` when nothing can sort
@@ -995,34 +1065,46 @@ struct PageWalk<'a> {
     start: Option<Vec<u8>>,
     limit: usize,
     loads_left: usize,
+    /// [`MANIFEST_PAGE_WALK_BUDGET`] after the page started.
+    deadline: tokio::time::Instant,
     items: Vec<PageItem>,
     /// Some fork reached a path starting with `prefix`.
     prefix_seen: bool,
     done: bool,
     truncated: bool,
+    /// The walk stopped on `deadline`, not on a full page.
+    timed_out: bool,
 }
 
 impl PageWalk<'_> {
     /// Add one item, or end the page (`truncated`) when it is already
     /// full: the lookahead means an exactly-full last page reports
-    /// `truncated: false`, as in bee#5537.
-    fn push(&mut self, item: PageItem) {
+    /// `truncated: false`, as in bee#5537. An item that is kept must
+    /// have a UTF-8 path ([`ManifestError::ListNonUtf8Path`]); the
+    /// lookahead is not returned, so it is not checked.
+    fn push(&mut self, item: PageItem) -> Result<(), ManifestError> {
         if item.path() <= self.after && !self.after.is_empty() {
-            return;
+            return Ok(());
         }
         if self
             .items
             .last()
             .is_some_and(|last| last.path() == item.path())
         {
-            return;
+            return Ok(());
         }
         if self.items.len() >= self.limit {
             self.truncated = true;
             self.done = true;
-            return;
+            return Ok(());
+        }
+        if std::str::from_utf8(item.path()).is_err() {
+            return Err(ManifestError::ListNonUtf8Path {
+                path_lossy: String::from_utf8_lossy(item.path()).into_owned(),
+            });
         }
         self.items.push(item);
+        Ok(())
     }
 
     fn before_start(&self, path: &[u8]) -> bool {
@@ -1051,7 +1133,7 @@ impl PageWalk<'_> {
                         .any(|f| f.child_ref.iter().any(|&b| b != 0));
                     if has_value || live_forks {
                         let end = self.prefix.len() + i + self.delimiter.len();
-                        self.push(PageItem::Prefix(path[..end].to_vec()));
+                        self.push(PageItem::Prefix(path[..end].to_vec()))?;
                     }
                     return Ok(());
                 }
@@ -1063,7 +1145,7 @@ impl PageWalk<'_> {
                         path: path.clone(),
                         reference: node.entry.clone(),
                         metadata: node.metadata.clone(),
-                    });
+                    })?;
                     if self.done {
                         return Ok(());
                     }
@@ -1107,6 +1189,17 @@ impl PageWalk<'_> {
                     self.done = true;
                     return Ok(());
                 }
+                // Checked before a load, never during one: a load in
+                // flight finishes (see `MANIFEST_PAGE_WALK_BUDGET`).
+                if tokio::time::Instant::now() >= self.deadline {
+                    if self.items.is_empty() {
+                        return Err(ManifestError::ListTimedOut);
+                    }
+                    self.truncated = true;
+                    self.timed_out = true;
+                    self.done = true;
+                    return Ok(());
+                }
                 self.loads_left -= 1;
                 let mut child =
                     load_node_ref_with_credit(self.fetcher, &fork.child_ref, None, self.sweeps)
@@ -1127,6 +1220,17 @@ impl PageWalk<'_> {
 /// without failing the listing. Skips entries with no `reference`
 /// (metadata-only forks like `website-index-document`).
 async fn populate_sizes(fetcher: &dyn ChunkFetcher, entries: &mut [ManifestEntry]) {
+    populate_sizes_until(fetcher, entries, None).await;
+}
+
+/// [`populate_sizes`], starting no read at or after `deadline`: an
+/// entry not read by then keeps `size: None`. Reads already in flight
+/// finish.
+async fn populate_sizes_until(
+    fetcher: &dyn ChunkFetcher,
+    entries: &mut [ManifestEntry],
+    deadline: Option<tokio::time::Instant>,
+) {
     let to_fetch: Vec<(usize, Vec<u8>)> = entries
         .iter()
         .enumerate()
@@ -1134,7 +1238,12 @@ async fn populate_sizes(fetcher: &dyn ChunkFetcher, entries: &mut [ManifestEntry
         .collect();
 
     let results: Vec<(usize, Option<u64>)> = stream::iter(to_fetch)
-        .map(|(idx, reference)| async move { (idx, reference_span(fetcher, &reference).await) })
+        .map(|(idx, reference)| async move {
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                return (idx, None);
+            }
+            (idx, reference_span(fetcher, &reference).await)
+        })
         .buffer_unordered(MANIFEST_SIZE_FANOUT)
         .collect()
         .await;
@@ -3788,6 +3897,195 @@ mod tests {
         let (fetcher, root) = page_fixture(&past_cap, false);
         let err = list_page(&fetcher, &root, &q).await.unwrap_err();
         assert!(matches!(err, ManifestError::ListTooDeep), "got {err:?}");
+    }
+
+    /// Sleeps `delay` per fetch, `missing_delay` for a chunk the map
+    /// doesn't hold (a data root `sizes` reads), on tokio's clock.
+    struct SlowFetcher {
+        inner: MapFetcher,
+        delay: std::time::Duration,
+        missing_delay: std::time::Duration,
+        missing_fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowFetcher {
+        fn new(inner: MapFetcher, delay: std::time::Duration) -> Self {
+            Self {
+                inner,
+                delay,
+                missing_delay: delay,
+                missing_fetches: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChunkFetcher for SlowFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if self.inner.chunks.contains_key(&addr) {
+                tokio::time::sleep(self.delay).await;
+            } else {
+                self.missing_fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(self.missing_delay).await;
+            }
+            self.inner.fetch(addr).await
+        }
+    }
+
+    /// R1-F1 on PR #260: a cold `limit=5000` page of hashed asset names
+    /// costs a few node loads per entry (here 3,000 names, well over 10
+    /// minutes of loads at 85 ms), past the gateway's 10-minute timeout,
+    /// although the node budget allows it. The walk stops starting loads at
+    /// `MANIFEST_PAGE_WALK_BUDGET` and ends `truncated` (not
+    /// cacheable), and following `next_marker` still yields every path
+    /// once, in order.
+    #[tokio::test(start_paused = true)]
+    async fn manifest_page_ends_on_its_time_budget() {
+        let mut paths: Vec<String> = (0..3000u32)
+            .map(|i| {
+                let h = crate::splitter::split_bytes(&i.to_le_bytes()).root;
+                format!("assets/{}.js", hex::encode(h))
+            })
+            .collect();
+        let (inner, root) = page_fixture(&paths, false);
+        paths.sort();
+        let fetcher = SlowFetcher::new(inner, std::time::Duration::from_millis(85));
+        let mut listed: Vec<String> = Vec::new();
+        let mut after = String::new();
+        let mut pages = 0;
+        loop {
+            let started = tokio::time::Instant::now();
+            let page = list_page(
+                &fetcher,
+                &root,
+                &ManifestPageQuery {
+                    after: after.clone(),
+                    limit: MANIFEST_PAGE_MAX_LIMIT,
+                    ..ManifestPageQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+            let took = started.elapsed();
+            assert!(
+                took <= MANIFEST_PAGE_WALK_BUDGET + std::time::Duration::from_millis(85),
+                "page {pages} took {took:?}",
+            );
+            pages += 1;
+            listed.extend(page.entries.iter().map(|e| e.path.clone()));
+            if !page.truncated {
+                assert!(!page.timed_out);
+                break;
+            }
+            assert!(page.timed_out, "page {pages} truncated by the clock");
+            assert!(page.entries.len() < MANIFEST_PAGE_MAX_LIMIT);
+            after = page.next_marker.unwrap();
+            assert_eq!(after, *listed.last().unwrap());
+        }
+        assert!(
+            pages > 2,
+            "a cold 3000-entry listing fit in {pages} page(s)"
+        );
+        assert_eq!(listed, paths);
+    }
+
+    /// A page that runs out of time before its first item fails as a
+    /// retryable `ListTimedOut`, not an empty or partial listing.
+    #[tokio::test(start_paused = true)]
+    async fn manifest_page_times_out_before_its_first_item() {
+        let paths: Vec<String> = vec!["a/b/c".into(), "a/b/d".into()];
+        let (inner, root) = page_fixture(&paths, false);
+        let fetcher = SlowFetcher::new(inner, MANIFEST_PAGE_WALK_BUDGET);
+        let err = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                limit: 10,
+                ..ManifestPageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::ListTimedOut), "got {err:?}");
+    }
+
+    /// `sizes` starts no span read after `MANIFEST_PAGE_SIZES_BUDGET`:
+    /// the entries left over have no size and mark the page incomplete.
+    #[tokio::test(start_paused = true)]
+    async fn manifest_page_sizes_stop_at_their_deadline() {
+        let paths: Vec<String> = (0..20).map(|i| format!("f{i:02}")).collect();
+        let (inner, root) = page_fixture(&paths, false);
+        let mut fetcher = SlowFetcher::new(inner, std::time::Duration::from_millis(1));
+        fetcher.missing_delay = MANIFEST_PAGE_SIZES_BUDGET;
+        let started = tokio::time::Instant::now();
+        let page = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                limit: 100,
+                sizes: true,
+                ..ManifestPageQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.entries.len(), 20);
+        assert!(page.sizes_incomplete);
+        assert_eq!(
+            fetcher
+                .missing_fetches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            MANIFEST_SIZE_FANOUT,
+            "only the first wave of span reads started before the deadline",
+        );
+        assert!(started.elapsed() < 2 * MANIFEST_PAGE_SIZES_BUDGET);
+    }
+
+    /// R1-M1 on PR #260: a path that is not valid UTF-8 would come back
+    /// lossily (`caf\xE9` as `caf\u{FFFD}`), and as `after` that marker
+    /// skips or repeats real paths. A page that would return one fails;
+    /// one that only looks at it (the lookahead past a full page) does
+    /// not.
+    #[tokio::test]
+    async fn manifest_page_refuses_a_non_utf8_path() {
+        let paths: Vec<String> = vec!["a".into(), "cafX".into(), "z".into()];
+        let (mut inner, root) = page_fixture(&paths, false);
+        // Patch the root node's `cafX` fork prefix to `caf\xE9` and
+        // re-address the root chunk.
+        let wire = inner.chunks.remove(&root).unwrap();
+        let at = wire.windows(4).position(|w| w == b"cafX").unwrap();
+        let mut payload = wire[8..].to_vec();
+        payload[at - 8 + 3] = 0xE9;
+        let patched = crate::splitter::split_bytes(&payload);
+        assert_eq!(patched.chunks.len(), 1);
+        let root = patched.root;
+        inner.insert(root, patched.chunks[0].wire.clone());
+
+        let q = |after: &str, limit| ManifestPageQuery {
+            after: after.into(),
+            limit,
+            ..ManifestPageQuery::default()
+        };
+        let first = list_page(&inner, &root, &q("", 1)).await.unwrap();
+        assert_eq!(first.entries[0].path, "a");
+        assert_eq!(first.next_marker.as_deref(), Some("a"));
+        let err = list_page(&inner, &root, &q("a", 1)).await.unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::ListNonUtf8Path { path_lossy } if path_lossy == "caf\u{FFFD}"),
+            "got {err:?}",
+        );
+        let err = list_page(&inner, &root, &q("", 10)).await.unwrap_err();
+        assert!(
+            matches!(err, ManifestError::ListNonUtf8Path { .. }),
+            "got {err:?}"
+        );
+        // Past it (U+10FFFF is F4 8F BF BF, after \xE9), the listing
+        // still works.
+        let last = list_page(&inner, &root, &q("caf\u{10FFFF}", 10))
+            .await
+            .unwrap();
+        assert_eq!(last.entries[0].path, "z");
     }
 
     #[test]

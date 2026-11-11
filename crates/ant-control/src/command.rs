@@ -178,10 +178,14 @@ pub enum ControlCommand {
     /// `page: Some(query)` is one page of the bee#5535-shaped listing
     /// behind `GET /v0/manifest/{addr}/{prefix}` (issue #61). Ends in
     /// [`ControlAck::ManifestPage`], [`ControlAck::NotFound`] (the
-    /// reference is not a manifest, the prefix names nothing in it, or
-    /// peers confirmed a trie node missing), [`ControlAck::NotReady`]
-    /// (no peers, or a miss from a starved peer pool) or
-    /// [`ControlAck::Error`].
+    /// reference is not a manifest, the prefix names nothing in it, a
+    /// path on the page is not valid UTF-8, or peers confirmed a trie
+    /// node missing and its replica sweep missed for good),
+    /// [`ControlAck::NotReady`] (no peers; a miss from a starved peer
+    /// pool; a corroborated miss whose replica sweep failed only
+    /// transiently; or the walk's wall-clock budget ran out before any
+    /// item) or [`ControlAck::Error`] (any other fetch failure, or a
+    /// trie too deep or too sparse for one page).
     ListBzz {
         reference: [u8; 32],
         bypass_cache: bool,
@@ -945,9 +949,11 @@ pub enum ControlAck {
     /// `404 "no update found"` (issue #173). An `exact` `GetFeed` also
     /// sends it for a head whose next slot isn't confirmed empty
     /// (`FeedError::EndUnconfirmed`). A paged [`ControlCommand::ListBzz`]
-    /// sends it when no peers are connected yet, and for a trie node
+    /// sends it when no peers are connected yet, for a trie node
     /// missed by a starved pool or whose replica sweep failed only
-    /// transiently, the same split as `StreamBzz` (issue #61).
+    /// transiently, the same split as `StreamBzz` (issue #61), and when
+    /// the walk ran out of its wall-clock budget before finding a single
+    /// item (`ManifestError::ListTimedOut`; a warm retry gets further).
     /// Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for
@@ -965,9 +971,10 @@ pub enum ControlAck {
     /// whole answer to a single-chunk [`ControlCommand::GetChunkRaw`]
     /// (issue #146). A paged [`ControlCommand::ListBzz`] (issue #61) also
     /// sends it when the reference or a trie node is not a decodable
-    /// manifest or the listing's prefix names nothing in it: answers
-    /// about the manifest, not the network, but bee#5537's 404 all the
-    /// same.
+    /// manifest, the listing's prefix names nothing in it, or a path on
+    /// the page is not valid UTF-8 (`ManifestError::ListNonUtf8Path`):
+    /// answers about the manifest, not the network, but bee#5537's 404
+    /// all the same.
     NotFound {
         message: String,
     },
