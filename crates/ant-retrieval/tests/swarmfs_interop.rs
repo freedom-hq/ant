@@ -13,7 +13,7 @@
 //! production — a wrong address, not an error — so every check compares
 //! bytes, in both directions where ant has a writer:
 //!
-//! - files: ant's splitter reproduces swarmfs's root reference;
+//! - files: both of ant's splitters reproduce swarmfs's root reference;
 //! - SOC: ant derives the same feed id, SOC address and owner, accepts
 //!   every swarmfs-signed chunk, and its own SOC builder emits the same
 //!   bytes (signature included: both sign with RFC 6979 nonces);
@@ -25,11 +25,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 
 use ant_crypto::gsoc::{build_gsoc_chunk, identifier_from_string, soc_address};
-use ant_crypto::{ethereum_address_from_public_key, soc_valid, SOC_HEADER_SIZE, SPAN_SIZE};
+use ant_crypto::{
+    ethereum_address_from_public_key, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE,
+};
 use ant_retrieval::mantaray::list_manifest_paths;
 use ant_retrieval::{
     build_entries_manifest, lookup_path, sequence_update_address, sequence_update_id, split_bytes,
-    ChunkFetcher, Feed, FeedType, RawManifestEntry,
+    ChunkFetcher, Feed, FeedType, RawManifestEntry, SplitChunk, StreamingSplitter,
 };
 use async_trait::async_trait;
 use k256::ecdsa::SigningKey;
@@ -57,9 +59,11 @@ fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| ((i * 7 + i / 4096) % 251) as u8).collect()
 }
 
-/// File vectors where ant's plain splitter is known to disagree with
+/// File vectors where ant's plain splitters are known to disagree with
 /// swarmfs *and* bee, each with its tracking issue. Each one is checked
-/// to still disagree, so the entry has to go when the fix lands.
+/// to still disagree, so the entry has to go when the fix lands — all
+/// of an issue's entries together: the 64 MiB one only runs under
+/// `--ignored`, so a fix trips the 512 KiB one in a plain run first.
 const KNOWN_SPLIT_DIVERGENCES: &[(&str, &str)] = &[
     (
         // 129 leaves: level 1 ends with one lone leaf. bee's hashtrie
@@ -72,7 +76,8 @@ const KNOWN_SPLIT_DIVERGENCES: &[(&str, &str)] = &[
     (
         // 16,386 leaves: level 2 ends with one lone intermediate. Same
         // wrap, but its span is > 4096, so the content still reads back
-        // right; only the reference differs from bee's.
+        // right (checked with ant's joiner); only the reference differs
+        // from bee's.
         "split pattern size=67112961",
         "https://github.com/freedom-hq/ant/issues/234",
     ),
@@ -115,30 +120,45 @@ fn check_split_roots(wanted: impl Fn(u64) -> bool) -> usize {
              (fix the content, this is not a splitter divergence)",
         );
 
-        let split = split_bytes(&data);
-        if let Some((_, issue)) = KNOWN_SPLIT_DIVERGENCES.iter().find(|(c, _)| *c == case) {
-            assert_ne!(
-                hex::encode(split.root),
-                v["root_hex"].as_str().unwrap(),
-                "{case} now matches swarmfs: {issue} is fixed, drop it from \
-                 KNOWN_SPLIT_DIVERGENCES",
-            );
-            n += 1;
-            continue;
+        // `split_bytes` (gateway, ACT) and `StreamingSplitter` (node
+        // uploads, `antctl pin`) are separate implementations of the
+        // same tree; both must give swarmfs's root.
+        let plain = split_bytes(&data);
+        let mut streaming = StreamingSplitter::new();
+        let mut streamed: Vec<SplitChunk> = Vec::new();
+        for leaf in data.chunks(CHUNK_SIZE) {
+            streamed.extend(streaming.push_leaf(leaf));
         }
-        assert_eq!(
-            hex::encode(split.root),
-            v["root_hex"].as_str().unwrap(),
-            "root reference mismatch on {case}",
-        );
-        assert_eq!(split.total_bytes, size as u64, "span mismatch on {case}");
-        let want_chunks = usize::try_from(v["chunk_count"].as_u64().unwrap()).unwrap();
-        let distinct: HashSet<_> = split.chunks.iter().map(|c| c.address).collect();
-        assert_eq!(
-            distinct.len(),
-            want_chunks,
-            "chunk count mismatch on {case}"
-        );
+        let (stream_root, stream_total, tail) = streaming.finish();
+        streamed.extend(tail);
+
+        for (splitter, root, total, chunks) in [
+            ("split_bytes", plain.root, plain.total_bytes, &plain.chunks),
+            ("StreamingSplitter", stream_root, stream_total, &streamed),
+        ] {
+            if let Some((_, issue)) = KNOWN_SPLIT_DIVERGENCES.iter().find(|(c, _)| *c == case) {
+                assert_ne!(
+                    hex::encode(root),
+                    v["root_hex"].as_str().unwrap(),
+                    "{splitter}: {case} now matches swarmfs: if {issue} is \
+                     fixed, drop every entry for it from KNOWN_SPLIT_DIVERGENCES",
+                );
+                continue;
+            }
+            assert_eq!(
+                hex::encode(root),
+                v["root_hex"].as_str().unwrap(),
+                "{splitter}: root reference mismatch on {case}",
+            );
+            assert_eq!(total, size as u64, "{splitter}: span mismatch on {case}");
+            let want_chunks = usize::try_from(v["chunk_count"].as_u64().unwrap()).unwrap();
+            let distinct: HashSet<_> = chunks.iter().map(|c| c.address).collect();
+            assert_eq!(
+                distinct.len(),
+                want_chunks,
+                "{splitter}: chunk count mismatch on {case}"
+            );
+        }
         n += 1;
     }
     n
