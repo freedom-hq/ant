@@ -1313,6 +1313,11 @@ PLUR, the network-wide chunk-acceptance budget settles at
    without changing topology. Would need an audit of yamux /
    tcp connection budgets and the routing watch's churn
    handling. Plausible Phase 8 work.
+   **Superseded (2026-11, issue #81):** this lever multiplies
+   *unpaid* pseudosettle credit by opening more connections; it
+   is not a recommended way to get throughput (see the note on
+   Phase 7f below). The supported path is SWAP settlement from a
+   funded chequebook (issue #73, PR #75).
 3. **Lower per-chunk price** on the wire — but that's the
    neighbourhood-proximity-based price bee enforces; we can't
    unilaterally change it.
