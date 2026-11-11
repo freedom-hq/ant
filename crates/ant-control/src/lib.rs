@@ -21,7 +21,8 @@ pub use activity::{ActiveRequestGuard, GatewayActivity, GatewayActivityHandle};
 // is gated.
 pub use command::{
     streaming_ack_channel, BatchChunkCount, BzzFeed, ControlAck, ControlCommand, LurkerMessageKind,
-    ManifestEntryInfo, PinCheckStat, PostageBucketsView, StewardshipStampsView, StreamRange,
+    ManifestEntryInfo, ManifestListPage, ManifestListQuery, PinCheckStat, PostageBucketsView,
+    StewardshipStampsView, StreamRange,
 };
 pub use protocol::{
     AccountingSnapshotView, CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo,

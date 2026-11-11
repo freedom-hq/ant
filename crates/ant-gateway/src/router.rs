@@ -233,7 +233,17 @@ pub fn build(handle: GatewayHandle) -> Router {
         // a mantaray manifest. Namespaced under `/v0/` so the bee compat
         // surface stays clean and the demo UI at `vibing.at/ant/` can
         // still introspect manifests.
+        // Shaped like the pending bee listing API (bee#5535/#5537,
+        // issue #61): `{prefix}` tail plus `delimiter`/`limit`/`after`/
+        // `sizes`. Bee 308s the bare form to the trailing slash; ant
+        // serves it directly so existing callers keep working. `{*prefix}`
+        // needs at least one character, hence the explicit `/` route.
         .route("/v0/manifest/{addr}", get(retrieval::manifest))
+        .route("/v0/manifest/{addr}/", get(retrieval::manifest))
+        .route(
+            "/v0/manifest/{addr}/{*prefix}",
+            get(retrieval::manifest_prefix),
+        )
         .route("/bzz/{addr}", get_or_head(retrieval::bzz_root))
         // Trailing-slash root: bee treats `/bzz/<addr>/` as equivalent to
         // `/bzz/<addr>` (both resolve to the manifest's
