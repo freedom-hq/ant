@@ -172,9 +172,14 @@ bee. `/soc` and `/feeds` ignore the header.
 
 ### Other intentional non-features
 
-- Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2. Operators
-  with an existing bee keystore have to convert to `signing.key`
-  (32 raw hex bytes) by hand for now.
+- Writing or migrating to a Web3 v3 keystore (`keys/swarm.key`):
+  PLAN.md D.3.2. `antd` *reads* an existing bee keystore directly
+  (with `password` / `password-file` from `--config`, or
+  `--password`), so operators coming from bee need no conversion; it
+  never creates one. Without a keystore the node's key lives in
+  `identity.json`, and `--key-file` (default `<data-dir>/signing.key`,
+  64 hex characters) seeds a fresh data dir and must match an
+  existing one.
 - ENS resolution (`/bzz/<ens>/...`) — currently treated as a literal
   reference; bee-js's reachability checks accept the resulting `400`.
 - bee-style YAML config, `antd init`, `antd start` subcommand
