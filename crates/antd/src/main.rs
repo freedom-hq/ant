@@ -85,9 +85,11 @@ struct Opt {
     /// data dir (no `identity.json`) it is read and becomes the node's key;
     /// if it is missing there, a random key is generated and written to it
     /// (mode 0600). If `identity.json` already exists and the file holds a
-    /// different key, antd refuses to start. When a bee keystore
-    /// (`keys/swarm.key`) is present it holds the node's key, and a
-    /// `--key-file` naming a different key is refused. A key file you pass
+    /// different key, antd refuses to start (so data dirs that older antd
+    /// pointed at one shared `--key-file`, each overwriting it with its own
+    /// random key, all refuse except the one that wrote it last). When a
+    /// bee keystore (`keys/swarm.key`) is present it holds the node's key,
+    /// and a `--key-file` naming a different key is refused. A key file you pass
     /// that other users can read gets a warning; the default
     /// `signing.key` and `identity.json` are tightened to owner-only.
     #[arg(long)]
@@ -1751,10 +1753,30 @@ fn create_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// contents go to a private temp file next to it, which is then
 /// hard-linked into place (a link never replaces an existing file). So a
 /// second antd that loses the race to create a shared `--key-file` reads
-/// the winner's whole key, never an empty or half-written file. Falls
-/// back to a direct [`create_secret_file`] on a filesystem without hard
-/// links.
+/// the winner's whole key, never an empty or half-written file.
+///
+/// A `path` that is a dangling symlink (`key.hex -> secrets/key.hex`,
+/// target not there yet) is created at the link's target, as a plain
+/// write through the link would: linking onto the symlink's own name
+/// would fail with `AlreadyExists` although nothing can be read there.
+///
+/// On a filesystem without hard links this falls back to a direct
+/// [`create_secret_file`], which is *not* atomic: a concurrent reader
+/// can see the file empty or partly written for a moment, so a caller
+/// that loses the race must read it with [`read_key_file_settled`].
 fn publish_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    publish_secret_file_with(path, contents, |src, dst| std::fs::hard_link(src, dst))
+}
+
+/// [`publish_secret_file`] with the link step injectable, so tests can
+/// exercise the no-hard-link fallback.
+fn publish_secret_file_with(
+    path: &Path,
+    contents: &[u8],
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let target = resolve_dangling_symlink(path);
+    let path = target.as_path();
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1767,12 +1789,62 @@ fn publish_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         hex::encode(&random_overlay_nonce()[..8]),
     ));
     create_secret_file(&tmp, contents)?;
-    let linked = std::fs::hard_link(&tmp, path);
+    let linked = link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
         Err(_) => create_secret_file(path, contents),
+    }
+}
+
+/// Where a write to `path` would land: `path` itself unless it is a
+/// symlink chain ending in a missing file, then that missing file.
+/// Anything else (a regular file, a live link, an unreadable link, a
+/// loop) returns `path` unchanged and is left to the caller's own I/O.
+fn resolve_dangling_symlink(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    // Linux's own limit on symlink hops (ELOOP past 40).
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let Ok(next) = std::fs::read_link(&cur) else {
+                    return path.to_path_buf();
+                };
+                cur = match cur.parent() {
+                    Some(parent) if next.is_relative() => parent.join(next),
+                    _ => next,
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && cur != path => return cur,
+            _ => return path.to_path_buf(),
+        }
+    }
+    path.to_path_buf()
+}
+
+/// How long [`read_key_file_settled`] waits for a concurrently created
+/// key file to finish being written.
+const KEY_FILE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read a key file another process has just created (we lost the
+/// `create_new` race to it). With hard links it is already complete; on
+/// [`publish_secret_file`]'s no-hard-link fallback it may still be empty
+/// or partly written, so malformed contents are re-read for up to
+/// [`KEY_FILE_SETTLE`] before they count as an error.
+fn read_key_file_settled(key_path: &Path) -> Result<Option<[u8; SECP256K1_SECRET_LEN]>> {
+    let deadline = Instant::now() + KEY_FILE_SETTLE;
+    loop {
+        match read_key_file_contents(key_path)? {
+            KeyFileContents::Missing => return Ok(None),
+            KeyFileContents::Key(k) => return Ok(Some(k)),
+            KeyFileContents::Malformed { err, .. } => {
+                if Instant::now() >= deadline {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }
 
@@ -1850,6 +1922,47 @@ fn check_key_file_matches(
         )),
         _ => Ok(()),
     }
+}
+
+/// The fresh-data-dir, no-key-file step of [`load_or_create_identity`]:
+/// generate a random key and create the key file with it via `publish`
+/// ([`publish_secret_file`]). If another antd (a second fresh data dir
+/// on the same `--key-file`) created the file first, adopt its key.
+fn create_or_adopt_key_file(
+    key_path: &Path,
+    publish: impl Fn(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<[u8; SECP256K1_SECRET_LEN]> {
+    let fresh = random_secp256k1_secret();
+    Ok(match publish(key_path, hex::encode(fresh).as_bytes()) {
+        Ok(()) => fresh,
+        // Another antd (a second fresh data dir on the same
+        // `--key-file`) created it since we looked: that key is
+        // the one the file names, so it is the one we use.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let k = read_key_file_settled(key_path)?.ok_or_else(|| {
+                anyhow!(
+                    "key file {} appeared and vanished while antd was creating it",
+                    key_path.display(),
+                )
+            })?;
+            tracing::info!(
+                target: "antd",
+                key_file = %key_path.display(),
+                "key file was created concurrently by another process; using its key",
+            );
+            k
+        }
+        Err(e) => {
+            // A copy of the key for tooling; identity.json below is
+            // the node's own record, so a failure here is not fatal.
+            tracing::warn!(
+                target: "antd",
+                key_file = %key_path.display(),
+                "could not write the key file: {e}",
+            );
+            fresh
+        }
+    })
 }
 
 /// Load the node's native identity, or create it on a fresh data dir.
@@ -1938,37 +2051,7 @@ fn load_or_create_identity(
         );
         k
     } else {
-        let fresh = random_secp256k1_secret();
-        match publish_secret_file(key_path, hex::encode(fresh).as_bytes()) {
-            Ok(()) => fresh,
-            // Another antd (a second fresh data dir on the same
-            // `--key-file`) created it since we looked: that key is
-            // the one the file names, so it is the one we use.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let k = read_key_file(key_path)?.ok_or_else(|| {
-                    anyhow!(
-                        "key file {} appeared and vanished while antd was creating it",
-                        key_path.display(),
-                    )
-                })?;
-                tracing::info!(
-                    target: "antd",
-                    key_file = %key_path.display(),
-                    "key file was created concurrently by another process; using its key",
-                );
-                k
-            }
-            Err(e) => {
-                // A copy of the key for tooling; identity.json below is
-                // the node's own record, so a failure here is not fatal.
-                tracing::warn!(
-                    target: "antd",
-                    key_file = %key_path.display(),
-                    "could not write the key file: {e}",
-                );
-                fresh
-            }
-        }
+        create_or_adopt_key_file(key_path, publish_secret_file)?
     };
     let overlay_nonce = random_overlay_nonce();
     let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
@@ -4359,6 +4442,120 @@ mod identity_tests {
                 .filter(|n| n.to_string_lossy().contains(".tmp-"))
                 .collect();
             assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
+    /// R2-M1: a `--key-file` that is a dangling symlink
+    /// (`key.hex -> secrets/key.hex`, target absent) on a fresh data dir
+    /// gets the generated key written at the link's target, as a plain
+    /// write through the link would, instead of failing as "appeared and
+    /// vanished". The link itself stays a link, and a second data dir on
+    /// the same link adopts the key. Chained and absolute links resolve
+    /// the same way.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_key_file_is_created_at_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        let target = dir.path().join("secrets/key.hex");
+        let link = dir.path().join("key.hex");
+        std::os::unix::fs::symlink("secrets/key.hex", &link).unwrap();
+        let chained = dir.path().join("chained.hex");
+        std::os::unix::fs::symlink(&link, &chained).unwrap();
+
+        let id1 = dir.path().join("identity1.json");
+        let (secret, _, _) = load_or_create_identity(&id1, &chained, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            hex::encode(secret)
+        );
+        assert_eq!(mode_of(&target), 0o600);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&chained)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("secrets"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let id2 = dir.path().join("identity2.json");
+        let (again, _, _) = load_or_create_identity(&id2, &link, true).unwrap();
+        assert_eq!(again, secret);
+    }
+
+    /// R2-M3: on a filesystem without hard links the key file is created
+    /// with a plain `create_new` + write, so a node that loses the race
+    /// can briefly see it empty. It must wait for the winner's key, not
+    /// fail on the empty file.
+    #[test]
+    fn losing_creator_waits_for_a_partly_written_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("shared.key");
+        // The winner has created the file but not written it yet.
+        std::fs::File::create(&key_path).unwrap();
+        let writer = {
+            let key_path = key_path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&key_path, TEST_KEY_HEX).unwrap();
+            })
+        };
+        let lost = |_: &Path, _: &[u8]| -> std::io::Result<()> {
+            Err(std::io::ErrorKind::AlreadyExists.into())
+        };
+        let k = create_or_adopt_key_file(&key_path, lost).unwrap();
+        writer.join().unwrap();
+        assert_eq!(k, test_key());
+
+        // Still malformed past the settle window: an error, not a key.
+        std::fs::write(&key_path, "not a key").unwrap();
+        let err = create_or_adopt_key_file(&key_path, lost).unwrap_err();
+        assert!(err.to_string().contains("key file"), "{err}");
+    }
+
+    /// R2-M3: the race of `concurrent_creators_of_one_key_file_agree`,
+    /// with hard links unavailable so every creator takes the non-atomic
+    /// fallback. Every node still ends on the file's key.
+    #[test]
+    fn concurrent_creators_agree_without_hard_links() {
+        const NODES: usize = 8;
+        let no_links = |path: &Path, contents: &[u8]| {
+            publish_secret_file_with(path, contents, |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no hard links here",
+                ))
+            })
+        };
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = Arc::new(dir.path().join("shared.key"));
+            let barrier = Arc::new(std::sync::Barrier::new(NODES));
+            let handles: Vec<_> = (0..NODES)
+                .map(|_| {
+                    let key_path = Arc::clone(&key_path);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        create_or_adopt_key_file(&key_path, no_links)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect();
+            let file_key = read_key_file(&key_path).unwrap().unwrap();
+            for secret in results {
+                assert_eq!(secret, file_key, "round {round}");
+            }
         }
     }
 
