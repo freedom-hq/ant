@@ -171,8 +171,15 @@ pub fn estimate_total_chunks(span_bytes: u64) -> u64 {
     let mut total = leaves;
     let mut level = leaves;
     while level > 1 {
-        level = level.div_ceil(BRANCHING);
-        total += level;
+        // A lone trailing reference is carried up unwrapped (bee's
+        // hashtrie `Sum`, #234), so it adds no chunk.
+        let next = level.div_ceil(BRANCHING);
+        total += if level % BRANCHING == 1 {
+            next - 1
+        } else {
+            next
+        };
+        level = next;
     }
     total
 }
@@ -190,12 +197,12 @@ mod tests {
         assert_eq!(estimate_total_chunks(4097), 3);
         // 128 leaves + 1 root.
         assert_eq!(estimate_total_chunks(128 * 4096), 129);
-        // 129 leaves require an extra intermediate level.
-        assert_eq!(
-            estimate_total_chunks(129 * 4096),
-            // 129 leaves + 2 intermediates (covering 128 + 1) + 1 root.
-            129 + 2 + 1
-        );
+        // 129 leaves: one intermediate over the first 128, the lone
+        // 129th leaf carried up unwrapped (#234), and the root over
+        // both.
+        assert_eq!(estimate_total_chunks(129 * 4096), 129 + 1 + 1);
+        // 130 leaves: two intermediates (128 + 2) + the root.
+        assert_eq!(estimate_total_chunks(130 * 4096), 130 + 2 + 1);
     }
 
     #[test]

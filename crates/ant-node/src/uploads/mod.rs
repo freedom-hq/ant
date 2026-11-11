@@ -3830,8 +3830,15 @@ pub const fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
     let mut total: u64 = leaves;
     let mut level = leaves;
     while level > 1 {
-        level = level.div_ceil(ant_retrieval::BRANCHES as u64);
-        total += level;
+        // A lone trailing reference is carried up unwrapped (bee's
+        // hashtrie `Sum`, issue #234), so it adds no chunk.
+        let next = level.div_ceil(ant_retrieval::BRANCHES as u64);
+        total += if level % ant_retrieval::BRANCHES as u64 == 1 {
+            next - 1
+        } else {
+            next
+        };
+        level = next;
     }
     if raw {
         total
@@ -3979,6 +3986,32 @@ mod tests {
     use std::io::Write as _;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// The raw estimate is exact: it equals the number of chunks the
+    /// streaming splitter emits, including trees whose levels end in a
+    /// lone reference that is carried up unwrapped (#234).
+    #[test]
+    fn raw_estimate_matches_streaming_splitter() {
+        for len in [
+            0usize,
+            1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            CHUNK_SIZE * 128,
+            CHUNK_SIZE * 128 + 1,
+            CHUNK_SIZE * 129 + 1,
+            CHUNK_SIZE * 257 + 1,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut splitter = StreamingSplitter::new();
+            let mut n = 0u64;
+            for leaf in payload.chunks(CHUNK_SIZE) {
+                n += splitter.push_leaf(leaf).len() as u64;
+            }
+            n += splitter.finish().2.len() as u64;
+            assert_eq!(estimate_chunk_count(len as u64, true), n, "len {len}");
+        }
+    }
 
     /// Counts of pushes a fake node loop has accepted.
     #[derive(Default)]
