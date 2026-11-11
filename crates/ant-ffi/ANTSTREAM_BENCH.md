@@ -356,8 +356,9 @@ follow-up. Don't read the 100-peer device numbers against PLAN.md
 Phase 7g's desktop 400-peer figure: that run was unfunded and drew on
 per-peer free-tier credit, so more peers bought more unpaid headroom,
 not a higher network ceiling (issue #81). Compare phone and desktop on
-a funded chequebook, where peer count is a connectivity setting, not a
-throughput lever.
+a funded chequebook, where what a larger peer set buys (connectivity,
+redundancy, parallelism the node pays for) is exactly what the sweep in
+step 4 measures, rather than how much free-tier credit it draws.
 
 ## Reading a report
 
