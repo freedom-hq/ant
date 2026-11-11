@@ -51,6 +51,8 @@ tokio-tungstenite = "0.29.0"
 # slow / late cold-chunk streaming tests (issue #79).
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
+# `request_log`: capture the gateway's debug request/response lines.
+tracing-subscriber.workspace = true
 
 # Bee-shaped HTTP gateway in front of `antd`. The crate is feature-gated so
 # embedders that don't need the HTTP surface (most importantly `ant-ffi` for
