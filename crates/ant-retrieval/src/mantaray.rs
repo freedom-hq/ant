@@ -922,6 +922,8 @@ pub struct ManifestPage {
 /// `truncated`: its failure ends the page `truncated`
 /// ([`ManifestPage::lookahead_failed`]) instead of discarding the items
 /// already collected, and the next page, which needs the node, fails.
+/// A full page whose lookahead would pass [`MANIFEST_PAGE_MAX_DEPTH`]
+/// likewise ends `truncated`, and the next page is the one that fails.
 pub async fn list_manifest_page(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
@@ -1199,6 +1201,14 @@ impl PageWalk<'_> {
                     }
                 }
                 if depth >= MANIFEST_PAGE_MAX_DEPTH {
+                    // Past a full page this descent would only decide
+                    // `truncated`: end the page there, as below for a
+                    // failed load; the next page reports the depth.
+                    if self.items.len() >= self.limit {
+                        self.truncated = true;
+                        self.done = true;
+                        return Ok(());
+                    }
                     return Err(ManifestError::ListTooDeep);
                 }
                 if self.loads_left == 0 {
@@ -3991,6 +4001,29 @@ mod tests {
             .collect();
         let (fetcher, root) = page_fixture(&past_cap, false);
         let err = list_page(&fetcher, &root, &q).await.unwrap_err();
+        assert!(matches!(err, ManifestError::ListTooDeep), "got {err:?}");
+
+        // A page that fills up just above the cap keeps its items and
+        // ends `truncated`; the next page is the one that is too deep.
+        let full = ManifestPageQuery {
+            limit: MANIFEST_PAGE_MAX_DEPTH,
+            ..ManifestPageQuery::default()
+        };
+        let page = list_page(&fetcher, &root, &full).await.unwrap();
+        assert_eq!(page.entries.len(), MANIFEST_PAGE_MAX_DEPTH);
+        assert!(page.truncated);
+        let marker = "a".repeat(MANIFEST_PAGE_MAX_DEPTH);
+        assert_eq!(page.next_marker.as_deref(), Some(marker.as_str()));
+        let err = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                after: marker,
+                ..full
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ManifestError::ListTooDeep), "got {err:?}");
     }
 
