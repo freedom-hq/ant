@@ -1361,6 +1361,8 @@ async fn attempt_download(
                 | ControlAck::PinList { .. }
                 | ControlAck::PinCheck { .. }
                 | ControlAck::PostageBuckets(_)
+                | ControlAck::StampedChunk { .. }
+                | ControlAck::StewardshipStamps(_)
                 | ControlAck::PullsyncProbe(_)
                 | ControlAck::LurkerMessage { .. }
                 | ControlAck::NotReady { .. },

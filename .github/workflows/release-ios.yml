@@ -44,7 +44,7 @@ env:
 jobs:
   build:
     name: build AntFFI.xcframework
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
