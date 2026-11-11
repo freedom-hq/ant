@@ -1313,6 +1313,11 @@ PLUR, the network-wide chunk-acceptance budget settles at
    without changing topology. Would need an audit of yamux /
    tcp connection budgets and the routing watch's churn
    handling. Plausible Phase 8 work.
+   **Superseded (2026-11, issue #81):** this lever multiplies
+   *unpaid* pseudosettle credit by opening more connections; it
+   is not a recommended way to get throughput (see the note on
+   Phase 7f below). The supported path is SWAP settlement from a
+   funded chequebook (issue #73, PR #75).
 3. **Lower per-chunk price** on the wire — but that's the
    neighbourhood-proximity-based price bee enforces; we can't
    unilaterally change it.
@@ -1325,6 +1330,17 @@ with at least 30 minutes between runs) and the network-shape
 expansion above to be worth the engineering cost.
 
 #### Phase 7f — Configurable target-peers (antd 0.3.16, 2026-05-09)
+
+> **Note (2026-11, issue #81):** Phases 7f/7g below are a historical
+> record of an unfunded-era measurement. They show that pseudosettle's
+> free-tier allowance is granted per peer, so a larger peer set draws
+> more unpaid bandwidth in total. That is an observation about bee's
+> incentive design, not a recommended way to buy throughput: it scales
+> consumption without paying for it. `--target-peers` is kept for
+> connectivity, redundancy and parallelism on a node that pays its way;
+> the supported fix for the free-tier wall is SWAP settlement from a
+> funded chequebook (issue #73; PR #75 funds the chequebook the
+> app-side buy flow deploys).
 
 **Status:** delivered. Cheapest of the Phase 7e follow-up levers
 (option #2 in the negative-result writeup): widen the per-second

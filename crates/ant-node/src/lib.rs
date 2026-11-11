@@ -45,11 +45,14 @@ pub struct NodeConfig {
     /// Peer-set target — how many BZZ-handshake-complete peers the swarm
     /// loop tries to keep online. `None` falls back to
     /// `ant_p2p::DEFAULT_TARGET_PEERS` (100), which is the right size
-    /// for cheap-CPU light-mode operation. Override (e.g. 200) to widen
-    /// the network-wide credit budget for long uploads — bee grants each
-    /// peer ~5 K PLUR/sec of pseudosettle credit, so doubling peers
-    /// roughly doubles per-second debit headroom. Mostly a knob for
-    /// upload throughput experiments.
+    /// for cheap-CPU light-mode operation. Raise it for wider
+    /// connectivity and routing-table coverage, redundancy, or more
+    /// parallelism on a node that settles over SWAP with a funded
+    /// chequebook. Each bee peer extends its own small pseudosettle
+    /// (free-tier) allowance, so a larger peer set also draws more unpaid
+    /// bandwidth in total; that allowance is for light use, not a
+    /// throughput lever — a node hitting the free-tier wall should pay
+    /// (fund its chequebook) rather than add peers.
     pub target_peers: Option<usize>,
     /// Baseline for `PeerInfo` cold-start timings (`antop` milestones).
     pub process_start: Instant,

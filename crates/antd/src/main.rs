@@ -149,11 +149,14 @@ struct Opt {
     /// Override the peer-set target — how many BZZ-handshake-complete peers
     /// the swarm loop tries to keep online. Default (`None`) leaves
     /// `ant-p2p`'s baked-in `DEFAULT_TARGET_PEERS` (100), which is the
-    /// right size for cheap-CPU light-mode operation. Override (e.g. 200)
-    /// to widen the network-wide credit budget for long uploads — bee
-    /// grants each peer ~5 K PLUR/sec of pseudosettle credit, so doubling
-    /// the peer set roughly doubles per-second debit headroom and shaves
-    /// the throughput-throttling wall.
+    /// right size for cheap-CPU light-mode operation. Raise it for wider
+    /// connectivity and routing-table coverage, more redundancy when
+    /// peers drop, or more parallelism on a node that pays its way with
+    /// a funded chequebook (SWAP). Each connected bee peer extends its
+    /// own small pseudosettle (free-tier) allowance, so a larger peer set
+    /// also draws more unpaid bandwidth in total; that allowance exists
+    /// for light use, not as throughput to scale up. If uploads or
+    /// downloads hit the free-tier wall, fund the chequebook instead.
     #[arg(long)]
     target_peers: Option<usize>,
 
