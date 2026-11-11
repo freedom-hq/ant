@@ -142,9 +142,8 @@ async fn replays_mainnet_bzz_fixture() {
         .expect("fetch data root from fixture");
 
     // The live root chunk's span carries a redundancy level byte; the
-    // daemon strips it via `--allow-degraded-redundancy`. Mirror that
-    // here so the integration test exercises the same join path the
-    // CLI takes for this URL.
+    // joiner decodes it on every path. `allow_degraded_redundancy` is a
+    // legacy no-op, set here only to mirror what the CLI sends.
     let opts = JoinOptions {
         allow_degraded_redundancy: true,
     };

@@ -95,8 +95,8 @@ pub async fn traverse_chunk_addresses(
     Ok(out)
 }
 
-/// Little-endian span with the redundancy-level byte masked off, like
-/// `JoinOptions { allow_degraded_redundancy: true }` treats root spans.
+/// Little-endian span with the redundancy-level byte masked off, the way
+/// the joiner reads root spans.
 fn masked_span(wire: &[u8]) -> Result<u64, TraversalError> {
     let mut span: [u8; SPAN_SIZE] = wire
         .get(..SPAN_SIZE)
