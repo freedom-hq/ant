@@ -19,11 +19,14 @@
 //! - **Resume.** [`StreamingSplitter`] is deterministic (same input
 //!   ⇒ same chunk addresses), so on resume we re-mmap, re-stream
 //!   from byte 0, recompute every address, and skip pushsync for
-//!   the first `chunks_pushed` chunks (except the splitter's tail
-//!   and the manifest chunks, always re-pushed; see `run_job`'s
-//!   tail loop). No per-chunk receipts on
-//!   disk, no double-stamping (the postage issuer is only consulted
-//!   when we actually dispatch a `PushChunk`).
+//!   the first `chunks_pushed` chunks. No per-chunk receipts on
+//!   disk, and the postage issuer is only consulted when we
+//!   actually dispatch a `PushChunk`, so skipped data chunks are
+//!   never stamped twice. The exception is the splitter's tail and
+//!   the manifest chunks, which are re-dispatched (and so stamped
+//!   again) on every resume; see `run_job`'s tail loop. That is a
+//!   handful of chunks, and the issuer reuses the slot it already
+//!   recorded for an address, so no bucket capacity is lost.
 //!
 //! - **Pause / cancel.** A driver checks
 //!   [`JobHandle::pause_requested`] / [`JobHandle::cancel_requested`]

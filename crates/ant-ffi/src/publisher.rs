@@ -180,7 +180,9 @@ const BRANCHES: u64 = 128;
 pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Number of chunks a `payload_bytes`-long body splits into: the data
-/// leaves plus every intermediate level of the Swarm chunk tree.
+/// leaves plus every intermediate level of the Swarm chunk tree, with a
+/// level's lone trailing reference carried up unwrapped exactly as
+/// [`ant_retrieval::split_bytes`] does (#234).
 ///
 /// Excludes the 1–2 mantaray manifest chunks a `POST /bzz` (the bench's
 /// upload) adds on top (< 0.5 % at segment sizes, and they are the same
@@ -196,8 +198,15 @@ pub const fn data_chunk_count(payload_bytes: u64) -> u64 {
     let mut level = payload_bytes.div_ceil(CHUNK_SIZE);
     let mut total = level;
     while level > 1 {
-        level = level.div_ceil(BRANCHES);
-        total += level;
+        // A lone trailing reference is carried up unwrapped (bee's
+        // hashtrie `Sum`, #234), so it adds no chunk at the next level.
+        let next = level.div_ceil(BRANCHES);
+        total += if level % BRANCHES == 1 {
+            next - 1
+        } else {
+            next
+        };
+        level = next;
     }
     total
 }
@@ -5832,6 +5841,36 @@ mod tests {
         assert_eq!(data_chunk_count(4097), 3);
         // 850 000 B → 208 leaves → 2 intermediates → 1 root.
         assert_eq!(data_chunk_count(850_000), 208 + 2 + 1);
+        // 129 leaves: one intermediate over the first 128, the lone
+        // 129th leaf carried up unwrapped (#234), and the root.
+        assert_eq!(data_chunk_count(524_289), 129 + 1 + 1);
+    }
+
+    /// `data_chunk_count` agrees with the real splitter, including the
+    /// sizes where a level ends in a lone reference (#234).
+    #[test]
+    fn chunk_count_matches_split_bytes() {
+        let leaf = CHUNK_SIZE as usize;
+        let b = BRANCHES as usize;
+        for size in [
+            1,
+            leaf,
+            leaf + 1,
+            b * leaf,
+            b * leaf + 1,
+            b * leaf + 33,
+            (b + 1) * leaf,
+            (b + 1) * leaf + 1,
+            (2 * b) * leaf + 1,
+            850_000,
+        ] {
+            let split = ant_retrieval::split_bytes(&vec![0x5a; size]);
+            assert_eq!(
+                data_chunk_count(size as u64),
+                split.chunks.len() as u64,
+                "chunk count for {size} bytes",
+            );
+        }
     }
 
     #[test]
