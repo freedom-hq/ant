@@ -263,13 +263,16 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// a one-line "did this work?" trace without enabling debug-level on the
 /// joiner.
 ///
-/// At `debug` (only) the request is also logged on arrival (with its
-/// `Range` header), and the response body is wrapped in [`LoggedBody`],
-/// which logs once the body is finished: bytes actually sent against the
-/// announced `Content-Length`, total duration, and whether (and why) the
-/// body ended early. Headers go out long before a streamed body is done,
-/// so the handler-return line alone can't show a body that is cut short
-/// (issue #82). Below `debug` nothing is wrapped and nothing extra runs.
+/// The request id is allocated at every level (one relaxed atomic add),
+/// so `warn` lines inside the span carry `req=N` too. At `debug` the
+/// request is also logged on arrival (with its `Range` header), and the
+/// response body is wrapped in [`LoggedBody`], which logs once the body
+/// is finished: bytes handed to hyper against the announced
+/// `Content-Length`, duration from request start, and whether (and why)
+/// the body ended early. Headers go out long before a streamed body is
+/// done, so the handler-return line alone can't show a body that is cut
+/// short (issue #82). Below `debug` the body isn't wrapped and neither
+/// debug line is built.
 async fn request_span(req: Request, next: Next) -> Response {
     let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
@@ -338,11 +341,15 @@ async fn request_span(req: Request, next: Next) -> Response {
     // `HEAD` answers carry the would-be `Content-Length` over an empty
     // body by design; comparing the two would flag every one as cut.
     if debug && method != Method::HEAD {
+        // Handlers that set no header (every `Json` answer) still get a
+        // `Content-Length` on the wire: hyper writes the body's exact
+        // size hint.
         let content_length = resp
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| resp.body().size_hint().exact());
         resp = resp.map(|body| {
             Body::new(LoggedBody {
                 inner: body,
@@ -370,10 +377,13 @@ enum BodyEnd {
 }
 
 /// Response body wrapper installed by [`request_span`] at `debug` level.
-/// Counts the data bytes handed to hyper and, when dropped (body done,
-/// errored, or abandoned because the client went away or the write
-/// failed), logs one `response body finished` line inside the request's
-/// span. Size hint and end-of-stream are forwarded unchanged, so the
+/// Counts the data bytes handed to hyper (not what the client
+/// acknowledged) and, when dropped, logs one `response body finished`
+/// line inside the request's span. `end` tells apart a node/stream error
+/// (`error`, with its message), a body that ended cleanly (`complete`,
+/// `ended_early` if short of `Content-Length`), and one dropped before
+/// its end (`aborted`: the client went away or a write failed, which
+/// hyper doesn't tell the body apart). Size hint and end-of-stream are forwarded unchanged, so the
 /// response's framing (`Content-Length` vs chunked) is identical to the
 /// unwrapped body.
 struct LoggedBody {

@@ -297,3 +297,28 @@ async fn complete_body_over_real_connection_is_not_aborted() {
         assert!(finished.contains(want), "{want} missing: {finished}");
     }
 }
+
+/// A `Json` answer sets no `Content-Length` header itself (hyper writes
+/// one from the body's exact size); the finish line still reports it.
+#[tokio::test]
+async fn json_answer_reports_its_length() {
+    let (out, _g) = capture("ant_gateway=debug");
+    let resp = send(
+        router(4, b"stub", None),
+        Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let log = out.text();
+    let finished = line(&log, "response body finished");
+    for want in [
+        format!("bytes_sent={}", body.len()),
+        format!("content_length={}", body.len()),
+        "ended_early=false".to_string(),
+    ] {
+        assert!(finished.contains(&want), "{want} missing: {finished}");
+    }
+}
