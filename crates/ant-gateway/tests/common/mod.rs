@@ -790,10 +790,18 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             });
         }
         // The fixture models a node with no registered postage batches:
-        // bee's 404 "issuer does not exist" shape.
-        ControlCommand::PostageBuckets { batch_id, ack } => {
+        // bee's 404 "issuer does not exist" shape, for the bucket
+        // counters and the per-chunk stamp lookup alike.
+        ControlCommand::PostageBuckets { batch_id, ack }
+        | ControlCommand::StampedChunk { batch_id, ack, .. } => {
             let _ = ack.send(ControlAck::Error {
                 message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
+            });
+        }
+        // No upload runtime either, for the per-tree stamp count.
+        ControlCommand::StewardshipStamps { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "uploads not configured: node has no stamp issuers (test fixture)".into(),
             });
         }
         ControlCommand::GetChunkRaw { reference, ack, .. } => {
