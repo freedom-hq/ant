@@ -382,10 +382,11 @@ enum BodyEnd {
 /// line inside the request's span. `end` tells apart a node/stream error
 /// (`error`, with its message), a body that ended cleanly (`complete`,
 /// `ended_early` if short of `Content-Length`), and one dropped before
-/// its end (`aborted`: the client went away or a write failed, which
-/// hyper doesn't tell the body apart). Size hint and end-of-stream are forwarded unchanged, so the
-/// response's framing (`Content-Length` vs chunked) is identical to the
-/// unwrapped body.
+/// its end (`aborted`: the client went away or a write failed; hyper
+/// drops the body the same way in both cases, so the body can't tell
+/// them apart). Size hint and end-of-stream are forwarded unchanged, so
+/// the response's framing (`Content-Length` vs chunked) is identical to
+/// the unwrapped body.
 struct LoggedBody {
     inner: Body,
     span: Span,
