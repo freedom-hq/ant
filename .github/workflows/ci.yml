@@ -169,7 +169,7 @@ jobs:
   # iOS SDK through xcrun.
   msrv-ios:
     name: build with the declared rust-version (aarch64-apple-ios)
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
 
@@ -275,7 +275,7 @@ jobs:
   # -------------------------------------------------------------------
   ios-smoke:
     name: cross-compile aarch64-apple-ios-sim
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
 
@@ -310,7 +310,7 @@ jobs:
           test -f "$AR"
           ls -lh "$AR"
           # Use rustc's bundled llvm-nm — see the toolchain step's
-          # comment for why Xcode's `nm` is unusable on macos-14
+          # comment for why Xcode's `nm` is unusable on the macOS
           # runners. Path resolution stays portable across Intel /
           # Apple-Silicon hosts via `rustc -vV`.
           HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
