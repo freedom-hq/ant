@@ -46,14 +46,15 @@ jobs:
             apt: gcc-aarch64-linux-gnu
           - asset: darwin-amd64
             # Cross-compile the Intel slice on an Apple-Silicon runner:
-            # macos-14 schedules promptly where macos-13 (Intel) can sit
+            # macos-26 schedules promptly where the Intel images could sit
             # unscheduled for 15+ min, and the Xcode toolchain links
-            # x86_64-apple-darwin natively.
-            runner: macos-14
+            # x86_64-apple-darwin natively. (macos-14 was retired on
+            # 2026-11-02, actions/runner-images#13518.)
+            runner: macos-26
             target: x86_64-apple-darwin
             archive: tar
           - asset: darwin-arm64
-            runner: macos-14
+            runner: macos-26
             target: aarch64-apple-darwin
             archive: tar
           - asset: windows-amd64
