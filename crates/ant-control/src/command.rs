@@ -168,11 +168,28 @@ pub enum ControlCommand {
         max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
-    /// List the paths and metadata in a mantaray manifest. Gateway-only
-    /// helper for the `/manifest/{addr}` inspection endpoint.
+    /// List the paths and metadata in a mantaray manifest.
+    ///
+    /// `page: None` is the original whole-manifest listing the FFI
+    /// (`ant_list_bzz`) still uses: every entry's size, metadata-only
+    /// nodes included, capped at 512 entries / 6 trie levels, ends in
+    /// [`ControlAck::Manifest`] or [`ControlAck::Error`].
+    ///
+    /// `page: Some(query)` is one page of the bee#5535-shaped listing
+    /// behind `GET /v0/manifest/{addr}/{prefix}` (issue #61). Ends in
+    /// [`ControlAck::ManifestPage`], [`ControlAck::NotFound`] (the
+    /// reference is not a manifest, the prefix names nothing in it, a
+    /// path on the page is not valid UTF-8, or peers confirmed a trie
+    /// node missing and its replica sweep missed for good),
+    /// [`ControlAck::NotReady`] (no peers; a miss from a starved peer
+    /// pool; a corroborated miss whose replica sweep failed only
+    /// transiently; or the walk's wall-clock budget ran out before any
+    /// item) or [`ControlAck::Error`] (any other fetch failure, or a
+    /// trie too deep or too sparse for one page).
     ListBzz {
         reference: [u8; 32],
         bypass_cache: bool,
+        page: Option<ManifestListQuery>,
         ack: mpsc::Sender<ControlAck>,
     },
     /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
@@ -799,6 +816,8 @@ pub enum ControlAck {
     Manifest {
         entries: Vec<ManifestEntryInfo>,
     },
+    /// One page of a [`ControlCommand::ListBzz`] with `page: Some(..)`.
+    ManifestPage(ManifestListPage),
     /// Streaming progress sample for a `GetBytes` / `GetBzz` request.
     /// Producer can fire as many of these as it likes; the dispatcher
     /// keeps writing them until a terminal variant arrives or the
@@ -967,7 +986,12 @@ pub enum ControlAck {
     /// not proof the feed is empty, so a 503 rather than bee's
     /// `404 "no update found"` (issue #173). An `exact` `GetFeed` also
     /// sends it for a head whose next slot isn't confirmed empty
-    /// (`FeedError::EndUnconfirmed`).
+    /// (`FeedError::EndUnconfirmed`). A paged [`ControlCommand::ListBzz`]
+    /// sends it when no peers are connected yet, for a trie node
+    /// missed by a starved pool or whose replica sweep failed only
+    /// transiently, the same split as `StreamBzz` (issue #61), and when
+    /// the walk ran out of its wall-clock budget before finding a single
+    /// item (`ManifestError::ListTimedOut`; a warm retry gets further).
     /// Terminal, like [`Self::Error`]. Distinct from
     /// [`Self::Error`] so the gateway can map it to `503 Service
     /// Unavailable` rather than the `502 Bad Gateway` it returns for
@@ -983,7 +1007,12 @@ pub enum ControlAck {
     /// substring-matching the message, whichever of the two tails it
     /// ends in (issue #123). Only sent before a stream starts, or as the
     /// whole answer to a single-chunk [`ControlCommand::GetChunkRaw`]
-    /// (issue #146).
+    /// (issue #146). A paged [`ControlCommand::ListBzz`] (issue #61) also
+    /// sends it when the reference or a trie node is not a decodable
+    /// manifest, the listing's prefix names nothing in it, or a path on
+    /// the page is not valid UTF-8 (`ManifestError::ListNonUtf8Path`):
+    /// answers about the manifest, not the network, but bee#5537's 404
+    /// all the same.
     NotFound {
         message: String,
     },
@@ -1053,6 +1082,43 @@ pub struct ManifestEntryInfo {
     /// clients keep deserializing newer responses unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+/// One page request of a manifest listing, bee#5535's query parameters
+/// (`GET /v0/manifest/{addr}/{prefix}?delimiter=&after=&limit=&sizes=`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestListQuery {
+    /// Only paths starting with this (any byte prefix) are listed.
+    pub prefix: String,
+    /// Empty: recursive. Otherwise a shallow listing that folds deeper
+    /// paths into `common_prefixes`.
+    pub delimiter: String,
+    /// Continuation: only items sorting strictly after this.
+    pub after: String,
+    /// Items (entries plus common prefixes) per page, already validated.
+    pub limit: usize,
+    /// Read each entry's size from its data root chunk's span.
+    pub sizes: bool,
+}
+
+/// One page of a manifest listing ([`ControlAck::ManifestPage`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestListPage {
+    /// Value entries, in path order; `reference` is always set and
+    /// `size` only when asked for and readable.
+    pub entries: Vec<ManifestEntryInfo>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    /// Set iff `truncated`: pass it back as the next page's `after`.
+    pub next_marker: Option<String>,
+    /// The same request always answers the same: the reference was not
+    /// a feed manifest, every size asked for was read, and the page was
+    /// not cut short by the walk's wall-clock budget
+    /// (`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`) or by a failed
+    /// lookahead load past a full page
+    /// (`ant_retrieval::ManifestPage::lookahead_failed`). Gates the gateway's
+    /// immutable `Cache-Control`.
+    pub immutable: bool,
 }
 
 impl ControlAck {

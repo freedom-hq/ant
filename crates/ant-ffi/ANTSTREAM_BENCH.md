@@ -29,9 +29,11 @@ lives in `crates/ant-ffi/src/bench.rs` and not in a throwaway script.
    720p (3.4) and 1080p (6 Mbit/s).
 3. **If LTE can't sustain a usable rendition**, #68 (relay fallback)
    escalates to the critical path.
-4. Alongside the throughput figure: **peer-target sweep** (the desktop
-   optimum is 400 peers at ~105 chunks/s ≈ 3.4 Mbit/s — find the phone
-   optimum) and **battery/thermal** over the run.
+4. Alongside the throughput figure: **peer-target sweep** (find the
+   phone's optimum, on a funded chequebook) and **battery/thermal** over
+   the run. PLAN.md Phase 7g's desktop figure (400 peers at ~105
+   chunks/s) was measured unfunded, drawing on per-peer free-tier
+   credit, and is not a target to reproduce (issue #81).
 
 A run "keeps up" when it measured something at all, every segment
 published, *and* the final measured segment was still within three
@@ -82,10 +84,13 @@ What the measured rows do establish:
   720p target. Chunking + stamping is not the bottleneck on
   desktop-class hardware, and the same run on a phone (Broadcast → Run
   bench, "Publish to Swarm" off) tells us whether it is one there.
-* 3.4 Mbit/s **is** 105 chunks/s, so the desktop `--target-peers`
-  sweep in PLAN.md (Phase 7g: 105.3 chunks/s at 400 peers) and this
-  issue's 3.4 Mbit/s target are the same number in different units —
-  a desktop node with 400 peers sits exactly at 720p.
+* 3.4 Mbit/s **is** 105 chunks/s, the same order as the unfunded
+  `--target-peers` sweep in PLAN.md (Phase 7g: 105.3 chunks/s at 400
+  peers). That figure came from drawing more unpaid pseudosettle credit
+  across a bigger peer set, which PLAN.md's issue #81 note says is not
+  a recommended way to get throughput, so it is not evidence that 400
+  peers buys 720p. Paid throughput comes from a funded chequebook; see
+  the paid mainnet rows below.
 * The publish path is wired correctly end-to-end against a real
   `ant-gateway`: the `publish` row is a real `POST /bzz` reaching the
   real batch check, failing only for want of a funded batch.
@@ -282,7 +287,9 @@ gate a CI job directly.
 
 The desktop node already has the peer-target knob (`antd
 --target-peers N`, PLAN.md Phase 7f/7g), so sweeping it needs no code:
-restart `antd` at each value and re-run the bench against it.
+restart `antd` at each value and re-run the bench against it. Run the
+sweep with a funded chequebook (SWAP on); unfunded, a bigger peer set
+only measures how much free-tier credit it draws (issue #81).
 
 ```bash
 for peers in 100 200 300 400; do
@@ -345,9 +352,13 @@ To sweep the peer target on a phone as well, `NodeConfig::target_peers`
 has to reach the FFI first: `init_inner` currently always takes
 `ant_p2p::DEFAULT_TARGET_PEERS` (100), and there is no
 `ant_init_with_options` field for it. That is a small, well-scoped
-follow-up — but note that at 100 peers the phone starts a factor below
-the desktop's 400-peer optimum, so the first device numbers should be
-read as a *floor*, not the phone's ceiling.
+follow-up. Don't read the 100-peer device numbers against PLAN.md
+Phase 7g's desktop 400-peer figure: that run was unfunded and drew on
+per-peer free-tier credit, so more peers bought more unpaid headroom,
+not a higher network ceiling (issue #81). Compare phone and desktop on
+a funded chequebook, where what a larger peer set buys (connectivity,
+redundancy, parallelism the node pays for) is exactly what the sweep in
+step 4 measures, rather than how much free-tier credit it draws.
 
 ## Reading a report
 

@@ -1166,7 +1166,8 @@ pub enum GatewayRequestKind {
     Soc,
     /// `GET /feeds/{owner}/{topic}` — sequence-feed resolution.
     Feed,
-    /// `GET /v0/manifest/{addr}` — Ant-specific manifest enumeration.
+    /// `GET /v0/manifest/{addr}[/{prefix}]` — Ant-specific manifest
+    /// listing (bee#5535 shape).
     Manifest,
 }
 

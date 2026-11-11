@@ -1116,12 +1116,15 @@ async fn content_addressed_endpoints_emit_immutable_cache_control() {
     );
     let _ = body_bytes(resp).await;
 
-    // The Ant-specific manifest listing is content-addressed too.
+    // The Ant-specific manifest listing is content-addressed too. The
+    // fixture only holds the nodes on the way to one tile, so list
+    // under that path (a whole-manifest listing fails on the first
+    // missing node rather than leaving the rest out, issue #61).
     let resp = send(
         router,
         Request::builder()
             .method(Method::GET)
-            .uri(format!("/v0/manifest/{MANIFEST_ROOT}"))
+            .uri(format!("/v0/manifest/{MANIFEST_ROOT}/13/4358/2645.png"))
             .body(Body::empty())
             .unwrap(),
     )
@@ -3353,4 +3356,226 @@ async fn bzz_ranged_feed_headers_follow_the_serving_dispatch() {
         format!("\"{}\"", hex::encode([6u8; 32])).as_str(),
     );
     assert_eq!(body_bytes(resp).await, b"06");
+}
+
+/// A collection manifest (bee-uploader shape: `website-index-document`
+/// on a zero-entry `/` node) served by the fake node, for the
+/// `/v0/manifest` listing tests (issue #61).
+fn listing_site(paths: &[&str]) -> ([u8; 32], Arc<common::DirFetcher>) {
+    use ant_retrieval::{build_collection_manifest, split_bytes, IndexAnchor, ManifestFile};
+    let mut chunks = std::collections::HashMap::new();
+    let mut files = Vec::new();
+    for path in paths {
+        let split = split_bytes(path.as_bytes());
+        chunks.extend(split.chunks.into_iter().map(|c| (c.address, c.wire)));
+        files.push(ManifestFile {
+            path: (*path).to_string(),
+            content_type: Some("text/plain".to_string()),
+            data_ref: split.root.to_vec(),
+        });
+    }
+    let manifest =
+        build_collection_manifest(&files, Some("index.html"), IndexAnchor::ZeroEntry).unwrap();
+    chunks.extend(manifest.chunks.into_iter().map(|c| (c.address, c.wire)));
+    (
+        manifest.root,
+        Arc::new(common::DirFetcher::from_chunks(chunks)),
+    )
+}
+
+async fn get_listing(
+    router: axum::Router,
+    uri: &str,
+) -> (StatusCode, Option<String>, serde_json::Value) {
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let status = resp.status();
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = body_bytes(resp).await;
+    let json = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("{uri}: {e}: {}", String::from_utf8_lossy(&body)));
+    (status, cc, json)
+}
+
+fn listed_paths(json: &serde_json::Value) -> Vec<String> {
+    json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Issue #61: `/v0/manifest` answers in the bee#5535/#5537 shape. A
+/// plain GET (what existing callers send) is a recursive first page with
+/// `entries`, `truncated: false` and no `size`; `delimiter`, a `{prefix}`
+/// path tail, `limit`/`after` paging and `sizes` behave as in bee#5537.
+#[tokio::test]
+async fn manifest_listing_follows_bee_listing_shape() {
+    let (root, fetcher) = listing_site(&[
+        "index.html",
+        "data/2025/a.csv",
+        "data/2025/b.csv",
+        "data/2026/c.csv",
+        "data/readme.txt",
+    ]);
+    let root = hex::encode(root);
+    let router = common::handle_with_node(fetcher);
+
+    // Plain GET: recursive, no sizes, the root `/` metadata node is not
+    // an entry, immutable.
+    let (status, cc, json) = get_listing(router.clone(), &format!("/v0/manifest/{root}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cc.unwrap().contains("immutable"));
+    assert_eq!(
+        listed_paths(&json),
+        [
+            "data/2025/a.csv",
+            "data/2025/b.csv",
+            "data/2026/c.csv",
+            "data/readme.txt",
+            "index.html"
+        ],
+    );
+    assert_eq!(json["truncated"], false);
+    assert!(json.get("nextMarker").is_none() && json.get("commonPrefixes").is_none());
+    let first = &json["entries"][0];
+    assert_eq!(first["reference"].as_str().unwrap().len(), 64);
+    assert_eq!(first["metadata"]["Content-Type"], "text/plain");
+    assert!(first.get("size").is_none(), "sizes are opt-in: {first}");
+
+    // Trailing slash is the same listing.
+    let (status, _, slash) = get_listing(router.clone(), &format!("/v0/manifest/{root}/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(slash, json);
+
+    // Shallow listing at the root and under a prefix.
+    let (_, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}/?delimiter=/")).await;
+    assert_eq!(listed_paths(&json), ["index.html"]);
+    assert_eq!(json["commonPrefixes"], serde_json::json!(["data/"]));
+    let (_, _, json) = get_listing(
+        router.clone(),
+        &format!("/v0/manifest/{root}/data/?delimiter=/"),
+    )
+    .await;
+    assert_eq!(listed_paths(&json), ["data/readme.txt"]);
+    assert_eq!(
+        json["commonPrefixes"],
+        serde_json::json!(["data/2025/", "data/2026/"])
+    );
+
+    // Paging: limit counts entries and common prefixes together, and
+    // nextMarker resumes past a common prefix.
+    let (_, _, json) = get_listing(
+        router.clone(),
+        &format!("/v0/manifest/{root}/data/?delimiter=/&limit=2"),
+    )
+    .await;
+    assert_eq!(json["truncated"], true);
+    assert_eq!(json["nextMarker"], "data/2026/");
+    assert_eq!(listed_paths(&json), Vec::<String>::new());
+    let (_, _, json) = get_listing(
+        router.clone(),
+        &format!("/v0/manifest/{root}/data/?delimiter=/&limit=2&after=data/2026/"),
+    )
+    .await;
+    assert_eq!(listed_paths(&json), ["data/readme.txt"]);
+    assert_eq!(
+        json["truncated"], false,
+        "an exactly-full last page is not truncated"
+    );
+    assert!(json.get("commonPrefixes").is_none());
+
+    // Sizes on request: one span read per entry.
+    let (status, cc, json) = get_listing(
+        router.clone(),
+        &format!("/v0/manifest/{root}/data/2025/?sizes=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cc.unwrap().contains("immutable"));
+    assert_eq!(json["entries"][0]["path"], "data/2025/a.csv");
+    assert_eq!(json["entries"][0]["size"], "data/2025/a.csv".len());
+}
+
+/// Issue #61: bee#5537's validation and errors. A prefix that names
+/// nothing and a reference that isn't a manifest are 404s; an over-cap
+/// or malformed `limit` and a malformed `sizes` are 400s; a
+/// non-positive `limit` falls back to the default.
+#[tokio::test]
+async fn manifest_listing_validates_like_bee() {
+    let (root, fetcher) = listing_site(&["index.html", "a/b.txt"]);
+    let root = hex::encode(root);
+    let router = common::handle_with_node(fetcher);
+
+    let (status, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}/nope/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+
+    let (status, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}?limit=5001")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["message"], "limit exceeds maximum of 5000");
+
+    let (status, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}?limit=x")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["message"], "invalid query params");
+    assert_eq!(json["reasons"][0]["field"], "limit");
+
+    let (status, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}?sizes=yes")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["reasons"][0]["field"], "sizes");
+
+    let (status, _, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}?limit=0")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_paths(&json), ["a/b.txt", "index.html"]);
+
+    // A raw-bytes reference is not a manifest.
+    let data = hex::encode(ant_retrieval::split_bytes(b"index.html").root);
+    let (status, _, _) = get_listing(router, &format!("/v0/manifest/{data}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issue #61: a listing is immutable only when it can't change. A size
+/// that couldn't be read is left out of the entry (best-effort, as in
+/// bee#5537) and the page is not cached as final.
+#[tokio::test]
+async fn manifest_listing_with_unread_size_is_not_immutable() {
+    use ant_retrieval::{build_collection_manifest, IndexAnchor, ManifestFile};
+    let files = [ManifestFile {
+        path: "gone.bin".to_string(),
+        content_type: None,
+        data_ref: [7u8; 32].to_vec(),
+    }];
+    let manifest = build_collection_manifest(&files, None, IndexAnchor::ZeroEntry).unwrap();
+    let root = hex::encode(manifest.root);
+    let chunks = manifest
+        .chunks
+        .into_iter()
+        .map(|c| (c.address, c.wire))
+        .collect();
+    let router = common::handle_with_node(Arc::new(common::DirFetcher::from_chunks(chunks)));
+
+    let (status, cc, json) =
+        get_listing(router.clone(), &format!("/v0/manifest/{root}?sizes=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["entries"][0].get("size").is_none());
+    assert!(!cc.unwrap().contains("immutable"));
+
+    let (_, cc, _) = get_listing(router, &format!("/v0/manifest/{root}")).await;
+    assert!(cc.unwrap().contains("immutable"));
 }

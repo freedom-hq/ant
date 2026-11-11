@@ -101,9 +101,10 @@ const CHUNK_SIZE: usize = 4096;
 /// chunk acceptance at ~30-50 chunks/s regardless of how many
 /// streams we open. Pushing harder just causes bee to RST our
 /// streams. So we keep 32 — it saturates the network path without
-/// upsetting bee. Future throughput gains will come from emitting
-/// cheques pre-emptively (see below) or expanding the active peer
-/// set, not from raising this constant.
+/// upsetting bee. Future throughput gains should come from paying
+/// for the bandwidth (SWAP cheques from a funded chequebook), not
+/// from raising this constant or from widening the peer set to
+/// collect more unpaid per-peer allowance.
 const MAX_PUSH_CONCURRENCY: usize = 32;
 
 /// Effective in-flight push width: [`MAX_PUSH_CONCURRENCY`] unless the

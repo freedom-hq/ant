@@ -1339,6 +1339,7 @@ async fn attempt_download(
             Ok(Some(
                 ControlAck::Ok { .. }
                 | ControlAck::Manifest { .. }
+                | ControlAck::ManifestPage(_)
                 | ControlAck::BytesStreamStart { .. }
                 | ControlAck::BzzStreamStart { .. }
                 | ControlAck::BytesChunk { .. }
