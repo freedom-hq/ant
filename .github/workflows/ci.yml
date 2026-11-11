@@ -92,6 +92,14 @@ jobs:
         # we'll add when the bee Docker image stops drifting.
         run: cargo test --workspace --lib
 
+      - name: cargo test (swarmfs interop vectors)
+        # Offline, seconds: BMT/SOC/Mantaray/splitter vectors from an
+        # independent (non-bee) implementation, issue #62. Integration
+        # tests, so the `--lib` run above never reaches them.
+        run: |
+          cargo test -p ant-crypto --test swarmfs_bmt_interop
+          cargo test -p ant-retrieval --test swarmfs_interop
+
       - name: cargo test (ant-ffi with chain feature, lib only)
         # The workspace test run above never enables `ant-ffi`'s
         # default-off `chain` feature, so its chain-gated unit tests
