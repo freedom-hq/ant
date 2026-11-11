@@ -1053,8 +1053,10 @@ pub struct ManifestListPage {
     /// Set iff `truncated`: pass it back as the next page's `after`.
     pub next_marker: Option<String>,
     /// The same request always answers the same: the reference was not
-    /// a feed manifest and every size asked for was read. Gates the
-    /// gateway's immutable `Cache-Control`.
+    /// a feed manifest, every size asked for was read, and the page was
+    /// not cut short by the walk's wall-clock budget
+    /// (`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`). Gates the gateway's
+    /// immutable `Cache-Control`.
     pub immutable: bool,
 }
 

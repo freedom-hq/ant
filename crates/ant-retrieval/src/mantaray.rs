@@ -792,20 +792,24 @@ pub const MANIFEST_PAGE_MAX_LIMIT: usize = 5_000;
 /// no further node load. A page that hits it after at least one item
 /// ends `truncated` (and is not cacheable: a warm retry gets further);
 /// one that hits it before any item fails with
-/// [`ManifestError::ListTimedOut`]. The check is before each load, so a
-/// load already in flight still finishes: one node load (each peer
-/// attempt capped at 30 s, plus at most one replica sweep) overruns
-/// it by well under the 6 minutes left before the gateway's 10-minute
-/// request timeout. Bounds the walk a timed-out request leaves running
-/// detached, too.
+/// [`ManifestError::ListTimedOut`]. It bounds when loads *start*: the
+/// check is before each load, so a load already in flight still
+/// finishes, and the page overruns the budget by that one load's time.
+/// That is ~85 ms for a cold load that succeeds; a load that fails runs
+/// until the fetcher gives up (its peer attempts are each capped at 30 s
+/// and hedged, plus at most one replica sweep), with no hard bound
+/// promised here. The 6 minutes left before the gateway's 10-minute
+/// request timeout cover any ordinary give-up. Bounds the walk a
+/// timed-out request leaves running detached, too.
 pub const MANIFEST_PAGE_WALK_BUDGET: std::time::Duration = std::time::Duration::from_mins(4);
 
 /// Wall-clock time, from the start of [`list_manifest_page`], after
 /// which `sizes` starts no further span read; an entry not read by
-/// then has no `size` and the page is marked `sizes_incomplete`. With
-/// the walk ending by [`MANIFEST_PAGE_WALK_BUDGET`] this leaves span
-/// reads (16 at a time) at least 2 minutes, and in-flight reads 4
-/// minutes of margin before the gateway's 10-minute request timeout.
+/// then has no `size` and the page is marked `sizes_incomplete`. Like
+/// [`MANIFEST_PAGE_WALK_BUDGET`] it bounds when reads start; reads in
+/// flight (16 at a time) finish. A walk that ends by its own budget
+/// leaves span reads at least 2 minutes, and in-flight reads 4 minutes
+/// before the gateway's 10-minute request timeout.
 pub const MANIFEST_PAGE_SIZES_BUDGET: std::time::Duration = std::time::Duration::from_mins(6);
 
 /// Trie levels a manifest listing page descends before failing with
