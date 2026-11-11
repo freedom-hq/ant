@@ -2401,6 +2401,65 @@ mod tests {
         );
     }
 
+    /// Every absent chunk is denied only after `delay`, like a mainnet
+    /// fetch that walks its peers before they all answer "not found".
+    struct SlowDeniedFetcher {
+        map: MapFetcher,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChunkFetcher for SlowDeniedFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if !self.map.chunks.contains_key(&addr) {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.map.fetch(addr).await
+        }
+    }
+
+    /// Issue #79: slow denials (several seconds a fetch, as on mainnet)
+    /// keep one episode of denials going across the retry loop's sweeps,
+    /// so real loss is still confirmed about `MISS_CONFIRM_AFTER` in,
+    /// not left transient until the 60 s recovery budget runs out.
+    #[tokio::test(start_paused = true)]
+    async fn slowly_denied_shard_loss_is_confirmed_too() {
+        for secs in [0u64, 2, 5, 8] {
+            let delay = Duration::from_secs(secs);
+            let mut map = MapFetcher::new();
+            let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut map, 6, 100);
+            // 5 of 10 shards gone; 4 parities can't cover it.
+            for addr in leaf_addrs.iter().take(5) {
+                map.chunks.remove(addr);
+            }
+            let fetcher = SlowDeniedFetcher { map, delay };
+
+            let started = tokio::time::Instant::now();
+            let err = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+                .await
+                .unwrap_err();
+            let elapsed = started.elapsed();
+            let JoinError::Recovery { detail } = &err else {
+                panic!("{secs}s denials: got {err:?}");
+            };
+            assert!(
+                detail.contains("5 confirmed missing, 0 denied for less than"),
+                "{secs}s denials: {detail}",
+            );
+            // Confirmed on the first sweep that ends a window after the
+            // first denial: at most one back-off, direct fetch and sweep
+            // past it.
+            assert!(
+                elapsed
+                    <= delay
+                        + crate::rs::MISS_CONFIRM_AFTER
+                        + RECOVERY_RETRY_BACKOFF_MAX
+                        + delay * 2,
+                "{secs}s denials: final only after {elapsed:?}",
+            );
+        }
+    }
+
     /// A decode that fails after every shard arrived (here: a corrupted
     /// parity makes the reconstructed chunk fail CAC validation) is
     /// permanent too: one sweep, no retry.

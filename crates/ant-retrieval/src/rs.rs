@@ -495,9 +495,15 @@ pub struct RsDecoder {
 /// of one node retry on their own schedules, so several sweeps can run
 /// back to back within milliseconds and would confirm a miss before
 /// anything had a chance to change. The window covers one episode of
-/// denials: a shard no sweep has denied for this long starts a fresh
-/// one, so a miss that a later direct fetch got past can't make a new
-/// miss of the same node final on its first sweep.
+/// denials: a shard a sweep serves starts over, and so does one whose
+/// last denial is more than this long before the caller of the next
+/// denying sweep asked for its shard, so a miss that a later direct
+/// fetch got past can't make a new miss of the same node final on its
+/// first sweep. The gap is measured to when the caller asked, not to
+/// when its sweep ended: a retry loop asks again one back-off (≤ 4 s)
+/// after its last sweep, however long its direct fetch and sweep then
+/// take, so slow denials (several seconds a fetch on mainnet) keep one
+/// episode going instead of restarting it every sweep.
 pub const MISS_CONFIRM_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A failed [`RsDecoder`] recovery. `transient` says whether the
@@ -558,12 +564,17 @@ struct Denied {
 }
 
 impl Denied {
-    /// Record a denial heard at `now`; whether the shard has now been
-    /// denied for [`MISS_CONFIRM_AFTER`]. A denial after a gap longer
-    /// than that starts a new episode.
-    fn confirm(slot: &mut Option<Self>, now: tokio::time::Instant) -> bool {
+    /// Record a denial heard at `now` by a sweep whose caller asked for
+    /// its shard at `asked`; whether the shard has now been denied for
+    /// [`MISS_CONFIRM_AFTER`]. A previous denial more than that long
+    /// before `asked` ends the episode and this one starts a new one.
+    fn confirm(
+        slot: &mut Option<Self>,
+        asked: tokio::time::Instant,
+        now: tokio::time::Instant,
+    ) -> bool {
         let d = match slot {
-            Some(d) if now.duration_since(d.last) <= MISS_CONFIRM_AFTER => {
+            Some(d) if asked.saturating_duration_since(d.last) <= MISS_CONFIRM_AFTER => {
                 d.last = now;
                 *d
             }
@@ -644,6 +655,10 @@ impl RsDecoder {
         index: usize,
         credit_budget: std::time::Duration,
     ) -> Result<Vec<u8>, RecoveryError> {
+        // When this caller asked: the start of its gap since the last
+        // denial ([`Denied::confirm`]), before the lock and the direct
+        // fetch, whose time doesn't count as a gap in the denials.
+        let asked = tokio::time::Instant::now();
         let seen = {
             let state = self.recovered.lock().await;
             if let Some(outcome) = state.final_outcome() {
@@ -660,7 +675,9 @@ impl RsDecoder {
         {
             Ok(wire) => Ok(wire),
             Err(fetch_err) => {
-                let shards = self.recover(fetcher, &fetch_err.to_string(), seen).await?;
+                let shards = self
+                    .recover(fetcher, &fetch_err.to_string(), seen, asked)
+                    .await?;
                 Ok(shards[index].clone())
             }
         }
@@ -669,11 +686,13 @@ impl RsDecoder {
     /// Run (or join) a recovery sweep and return every data shard.
     /// `seen` is the sweep count the caller read before its direct
     /// fetch: if a sweep finished since, its outcome is the answer.
+    /// `asked` is when the caller asked for its shard.
     async fn recover(
         &self,
         fetcher: &dyn ChunkFetcher,
         trigger: &str,
         seen: u64,
+        asked: tokio::time::Instant,
     ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let mut state = self.recovered.lock().await;
         if let Some(outcome) = state.final_outcome() {
@@ -690,7 +709,7 @@ impl RsDecoder {
             }
         }
         let outcome = self
-            .recover_inner(fetcher, trigger, &mut state.denied)
+            .recover_inner(fetcher, trigger, asked, &mut state.denied)
             .await;
         state.sweeps += 1;
         state.outcome = Some(outcome.clone());
@@ -704,6 +723,7 @@ impl RsDecoder {
         &self,
         fetcher: &dyn ChunkFetcher,
         trigger: &str,
+        asked: tokio::time::Instant,
         denied: &mut Vec<Option<Denied>>,
     ) -> Result<Vec<Vec<u8>>, RecoveryError> {
         let total = self.addrs.len();
@@ -747,12 +767,17 @@ impl RsDecoder {
         let now = tokio::time::Instant::now();
         for (i, wire) in fetched {
             match wire {
-                Ok(w) if w.len() <= CHUNK_WITH_SPAN_SIZE => wires[i] = Some(w),
+                Ok(w) if w.len() <= CHUNK_WITH_SPAN_SIZE => {
+                    // Served: any denials of it so far were not the
+                    // network's answer, and a later one starts over.
+                    denied[i] = None;
+                    wires[i] = Some(w);
+                }
                 // An oversized wire is not a shard of this node; no
                 // retry changes that.
                 Ok(_) => not_found += 1,
                 Err(true) => {
-                    if Denied::confirm(&mut denied[i], now) {
+                    if Denied::confirm(&mut denied[i], asked, now) {
                         not_found += 1;
                     } else {
                         unconfirmed += 1;
