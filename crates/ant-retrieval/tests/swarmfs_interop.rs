@@ -71,24 +71,7 @@ fn pattern(n: usize) -> Vec<u8> {
 /// to still disagree, so the entry has to go when the fix lands — all
 /// of an issue's entries together: the 64 MiB one only runs under
 /// `--ignored`, so a fix trips the 512 KiB one in a plain run first.
-const KNOWN_SPLIT_DIVERGENCES: &[(&str, &str)] = &[
-    (
-        // 129 leaves: level 1 ends with one lone leaf. bee's hashtrie
-        // `Sum` (and swarmfs) carry it up unwrapped; ant wraps it in a
-        // 1-ref intermediate whose span (1) reads back as a leaf, so the
-        // file's last byte comes back wrong.
-        "split pattern size=524289",
-        "https://github.com/freedom-hq/ant/issues/234",
-    ),
-    (
-        // 16,386 leaves: level 2 ends with one lone intermediate. Same
-        // wrap, but its span is > 4096, so the content still reads back
-        // right (checked with ant's joiner); only the reference differs
-        // from bee's.
-        "split pattern size=67112961",
-        "https://github.com/freedom-hq/ant/issues/234",
-    ),
-];
+const KNOWN_SPLIT_DIVERGENCES: &[(&str, &str)] = &[];
 
 /// File vectors above this size (the three-level tree, 64 MiB) take
 /// tens of seconds in a debug build, so they run in the ignored test.
