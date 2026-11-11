@@ -127,6 +127,13 @@ pub struct StampIssuer {
     /// already landed — and must not be re-attempted, a full-file
     /// rewrite, on every following stamp either.
     compact_retry_at: usize,
+    /// The error of the most recent failed sidecar compaction (at load or
+    /// after an append), `None` once a compaction succeeds. Compaction
+    /// failing never fails a stamp, so without this a persistently
+    /// failing rewrite (ENOSPC) would let the sidecar grow by one record
+    /// per re-stamp with nothing telling the operator why — see
+    /// [`Self::stamp_compaction_error`]. Each failure is also logged.
+    compaction_error: Option<String>,
     /// Sidecar path the issued stamps are written to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
     stamps_path: Option<PathBuf>,
@@ -283,6 +290,7 @@ impl StampIssuer {
                 seen: HashMap::new(),
                 stamp_record_count: 0,
                 compact_retry_at: 0,
+                compaction_error: None,
                 stamps_path: None,
                 stamp_persistence_failed: None,
                 _store_lock: Some(store_lock),
@@ -355,6 +363,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             compact_retry_at: 0,
+            compaction_error: None,
             stamps_path: None,
             stamp_persistence_failed: None,
             _store_lock: Some(store_lock),
@@ -429,6 +438,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             compact_retry_at: 0,
+            compaction_error: None,
             stamps_path: None,
             stamp_persistence_failed: None,
             _store_lock: store_lock,
@@ -468,6 +478,7 @@ impl StampIssuer {
             match loaded.unusable_reason {
                 None => {
                     self.stamp_record_count = loaded.physical_count;
+                    self.compaction_error = loaded.compaction_error;
                     self.stamps_path = Some(sidecar);
                 }
                 Some(reason) => {
@@ -641,6 +652,18 @@ impl StampIssuer {
         self.stamp_persistence_failed
     }
 
+    /// `Some(error)` while the `.stamps` sidecar's compaction keeps
+    /// failing (the last attempt's error), `None` when it has never
+    /// failed or the latest attempt succeeded. Unlike
+    /// [`Self::stamp_records_unavailable`] this does not stop issuance —
+    /// appends still land and the records stay complete — but the file
+    /// grows by one record per re-stamp until a rewrite succeeds, and on
+    /// a full disk the appends themselves fail next.
+    #[must_use]
+    pub fn stamp_compaction_error(&self) -> Option<&str> {
+        self.compaction_error.as_deref()
+    }
+
     /// Remember the stamp issued for a **new** `addr` and, for persistent
     /// issuers, append its checksummed record to the `.stamps` sidecar
     /// (append + fsync) so a restart recovers it. `O(1)`. The in-memory
@@ -731,12 +754,33 @@ impl StampIssuer {
         if self.stamp_record_count <= threshold || self.stamp_record_count < self.compact_retry_at {
             return;
         }
-        if rewrite_sidecar(path, &self.batch_id, &self.seen).is_ok() {
-            self.stamp_record_count = self.seen.len();
-            self.compact_retry_at = 0;
-        } else {
-            self.compact_retry_at =
-                self.stamp_record_count + self.seen.len().max(STAMP_COMPACT_FLOOR);
+        match rewrite_sidecar(path, &self.batch_id, &self.seen) {
+            Ok(()) => {
+                if self.compaction_error.take().is_some() {
+                    tracing::info!(
+                        target: "ant_postage::stamps",
+                        sidecar = %path.display(),
+                        live = self.seen.len(),
+                        "stamp sidecar compaction recovered",
+                    );
+                }
+                self.stamp_record_count = self.seen.len();
+                self.compact_retry_at = 0;
+            }
+            Err(e) => {
+                self.compact_retry_at =
+                    self.stamp_record_count + self.seen.len().max(STAMP_COMPACT_FLOOR);
+                tracing::warn!(
+                    target: "ant_postage::stamps",
+                    sidecar = %path.display(),
+                    records = self.stamp_record_count,
+                    live = self.seen.len(),
+                    retry_at = self.compact_retry_at,
+                    error = %e,
+                    "stamp sidecar compaction failed; stamps still recorded, file keeps growing until a retry succeeds",
+                );
+                self.compaction_error = Some(e.to_string());
+            }
         }
     }
 
@@ -1312,6 +1356,9 @@ struct LoadedSidecar {
     /// "migration"). `map` still carries whatever valid records we
     /// parsed, for reads.
     unusable_reason: Option<&'static str>,
+    /// The error of a load-time v2 compaction that failed (the file
+    /// stays appendable); seeds [`StampIssuer::compaction_error`].
+    compaction_error: Option<String>,
 }
 
 impl LoadedSidecar {
@@ -1322,6 +1369,7 @@ impl LoadedSidecar {
             map: HashMap::new(),
             physical_count: 0,
             unusable_reason: None,
+            compaction_error: None,
         }
     }
 
@@ -1332,6 +1380,7 @@ impl LoadedSidecar {
             map,
             physical_count: 0,
             unusable_reason: Some(reason),
+            compaction_error: None,
         }
     }
 
@@ -1468,13 +1517,16 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
     // compaction fails is still safe to append to (same format), so it
     // stays appendable.
     let over_threshold = physical_frames > map.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR;
+    let mut compaction_error = None;
     if !has_checksum || over_threshold {
-        if rewrite_sidecar(path, batch_id, &map).is_ok() {
+        let rewritten = rewrite_sidecar(path, batch_id, &map);
+        if rewritten.is_ok() {
             let live = map.len();
             return LoadedSidecar {
                 map,
                 physical_count: live,
                 unusable_reason: None,
+                compaction_error: None,
             };
         }
         if !has_checksum {
@@ -1482,7 +1534,19 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
             // mismatch), but keep the parsed records for reads.
             return LoadedSidecar::broken(map, "v1→v2 migration failed");
         }
-        // v2 compaction failed: keep appending (same format is fine).
+        // v2 compaction failed: keep appending (same format is fine),
+        // but say so — the file keeps growing until a retry succeeds.
+        if let Err(e) = rewritten {
+            tracing::warn!(
+                target: "ant_postage::stamps",
+                sidecar = %path.display(),
+                records = physical_frames,
+                live = map.len(),
+                error = %e,
+                "stamp sidecar compaction failed at load; still appendable",
+            );
+            compaction_error = Some(e.to_string());
+        }
     }
     // Truncate a trailing partial record so the next append is aligned.
     // If the truncation itself fails, the next append would write at the
@@ -1502,6 +1566,7 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
         map,
         physical_count: physical_frames,
         unusable_reason: None,
+        compaction_error,
     }
 }
 
@@ -1879,6 +1944,11 @@ mod tests {
             .map(|r| r.expect("batch stamp after a failed compaction"))
             .collect();
         assert!(issuer.compact_retry_at > 0, "compaction backed off");
+        let err = issuer
+            .stamp_compaction_error()
+            .expect("a failed compaction is surfaced")
+            .to_owned();
+        assert!(err.contains("stamps"), "names the sidecar: {err}");
         assert!(
             issuer.stamp_record_count > issuer.seen.len(),
             "not compacted"
@@ -1892,6 +1962,7 @@ mod tests {
             last = Some(sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap());
         }
         assert_eq!(issuer.stamp_record_count, issuer.seen.len(), "compacted");
+        assert_eq!(issuer.stamp_compaction_error(), None, "cleared on success");
 
         drop(issuer);
         let reopened = StampIssuer::open_existing(path).unwrap();
@@ -1899,6 +1970,48 @@ mod tests {
         for (a, s) in new.iter().zip(&batch_out) {
             assert_eq!(reopened.cached_stamp(a), Some(*s));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction that fails while *loading* an oversized sidecar is
+    /// surfaced the same way (the file stays appendable), and a reopen
+    /// whose compaction succeeds reports nothing.
+    #[test]
+    fn a_failed_load_time_compaction_is_surfaced() {
+        let secret = random_secp256k1_secret();
+        let batch = [0x6du8; 32];
+        let dir = tmpdir();
+        let path = dir.join("b.bin");
+        let sidecar = stamps_sidecar_path(&path);
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 20, 16, false).unwrap();
+        let tmp = sidecar.with_extension("stamps.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        for _ in 0..(STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR + 4) {
+            sign_stamp_bytes(&secret, &mut issuer, &addr(7)).unwrap();
+        }
+        drop(issuer);
+
+        let mut reopened = StampIssuer::open_existing(path.clone()).unwrap();
+        assert!(
+            reopened.stamp_compaction_error().is_some(),
+            "load-time failure surfaced"
+        );
+        assert_eq!(
+            reopened.stamp_records_unavailable(),
+            None,
+            "still appendable"
+        );
+        sign_stamp_bytes(&secret, &mut reopened, &addr(8)).expect("append still works");
+        drop(reopened);
+
+        std::fs::remove_dir(&tmp).unwrap();
+        let healed = StampIssuer::open_existing(path).unwrap();
+        assert_eq!(healed.stamp_compaction_error(), None);
+        assert_eq!(
+            healed.stamp_record_count,
+            healed.seen.len(),
+            "compacted at load"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
