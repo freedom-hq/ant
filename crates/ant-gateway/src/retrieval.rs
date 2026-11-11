@@ -34,6 +34,7 @@
 //! `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB) where `antctl get`
 //! is the only caller.
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use ant_control::{
@@ -187,7 +188,10 @@ pub const GATEWAY_MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// (`/chunks`, `/bytes`, `/bzz`, `/v0/manifest`). All four endpoints
 /// take a 32-byte content hash in the URL — the asset *is* its hash,
 /// so revisiting the same URL is provably safe to serve from the
-/// browser's HTTP cache forever.
+/// browser's HTTP cache forever. Except where the answer can still
+/// change: a `/bzz` or `/v0/manifest` reference that resolved through a
+/// feed, or a `/v0/manifest?sizes=true` page with a size it couldn't
+/// read, gets [`MUTABLE_CACHE_CONTROL`] instead.
 ///
 /// This matches what bee's gateway has historically returned (cf.
 /// `ethersphere/swarm` issue #2213, where bee shipped `max-age=
@@ -2794,14 +2798,64 @@ pub async fn bzz_with_path(
     bzz_inner(handle, addr, path, query, method, headers).await
 }
 
-/// `GET /v0/manifest/{addr}`. Lists the paths and metadata currently
-/// discoverable in a mantaray manifest. This is an Ant-specific
-/// extension — bee does not expose manifest enumeration on its public
-/// HTTP API — and is namespaced under `/v0/` to keep the bee Tier-A
-/// surface byte-for-byte compatible.
-pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<String>) -> Response {
+/// `GET /v0/manifest/{addr}[/{prefix}]`: one page of a mantaray
+/// manifest's listing, in the shape of the pending bee listing API
+/// (ethersphere/bee#5535, read path in #5537: `GET
+/// /manifest/{address}/{prefix}`), issue #61. An Ant extension
+/// namespaced under `/v0/` so the bee Tier-A surface stays
+/// byte-for-byte compatible until bee ships its own.
+///
+/// Query parameters, validated like bee's `mapStructure`:
+///
+/// - `delimiter` (none): set (typically `/`) for a shallow listing, the
+///   entries directly under `prefix` plus `commonPrefixes` for deeper
+///   paths, whose subtrees are not walked;
+/// - `limit` (1000): items (entries plus common prefixes) per page.
+///   Above [`ant_retrieval::MANIFEST_PAGE_MAX_LIMIT`] is a `400`, not a
+///   silent clamp; zero or negative falls back to the default;
+/// - `after` (none): continuation, only items sorting strictly after
+///   it; pass the previous page's `nextMarker`. The walk seeks to it;
+/// - `sizes` (false): read each entry's byte length from its data root
+///   chunk's span, one extra chunk read per entry on the page.
+///
+/// `prefix` is any byte prefix (bee#5537 only takes one ending on a
+/// trie node); one that no path starts with is a `404`. A trie node that
+/// can't be retrieved fails the request (`404` if peers confirmed it
+/// missing, `503` if the pool was starved) instead of returning a
+/// listing with that subtree silently missing.
+///
+/// The answer for a content-addressed root never changes, so it is
+/// cached immutably, except when the root is a feed manifest (listed at
+/// its current update) or a requested size could not be read.
+pub async fn manifest(
+    State(handle): State<GatewayHandle>,
+    Path(addr): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    manifest_inner(handle, addr, String::new(), query).await
+}
+
+/// [`manifest`] with a `{prefix}` path tail.
+pub async fn manifest_prefix(
+    State(handle): State<GatewayHandle>,
+    Path((addr, prefix)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    manifest_inner(handle, addr, prefix, query).await
+}
+
+async fn manifest_inner(
+    handle: GatewayHandle,
+    addr: String,
+    prefix: String,
+    query: HashMap<String, String>,
+) -> Response {
     let reference = match parse_reference(&addr) {
         Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let page = match manifest_list_query(prefix, &query) {
+        Ok(q) => q,
         Err(resp) => return resp,
     };
 
@@ -2809,18 +2863,66 @@ pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<Stri
         .activity
         .begin(GatewayRequestKind::Manifest, short_reference(&addr));
 
-    match dispatch_list_bzz(&handle, reference, DEFAULT_REQUEST_TIMEOUT).await {
-        Ok(entries) => {
-            // Manifest listing keys off the same content-addressed
-            // root the user passed in, so the listing itself is
-            // immutable. Cache it like a `/bzz` payload to avoid
-            // re-walking the manifest on every page navigation.
-            let mut resp = json_response(StatusCode::OK, &ManifestListing { entries });
-            set_immutable_cache_headers(&mut resp);
+    match dispatch_list_bzz(&handle, reference, page, DEFAULT_REQUEST_TIMEOUT).await {
+        Ok(page) => {
+            let immutable = page.immutable;
+            let mut resp = json_response(StatusCode::OK, &ManifestListing::from(page));
+            if immutable {
+                set_immutable_cache_headers(&mut resp);
+            } else {
+                set_mutable_cache_headers(&mut resp);
+            }
             resp
         }
         Err(e) => e,
     }
+}
+
+/// Validate `/v0/manifest`'s query parameters the way bee#5537's
+/// `manifestListHandler` does: `limit` and `sizes` must parse (`400
+/// invalid query params` with Go's strconv reason), an over-cap `limit`
+/// is `400 "limit exceeds maximum of N"`, and `limit <= 0` means the
+/// default.
+#[allow(clippy::result_large_err)]
+fn manifest_list_query(
+    prefix: String,
+    query: &HashMap<String, String>,
+) -> Result<ant_control::ManifestListQuery, Response> {
+    let mut reasons: Vec<Reason> = Vec::new();
+    let mut limit = ant_retrieval::MANIFEST_PAGE_DEFAULT_LIMIT;
+    if let Some(raw) = query.get("limit") {
+        match raw.parse::<i64>() {
+            Ok(n) if n <= 0 => {}
+            Ok(n) => limit = usize::try_from(n).unwrap_or(usize::MAX),
+            Err(e) => reasons.push(Reason::new("limit", strconv_error_text(&e))),
+        }
+    }
+    let mut sizes = false;
+    if let Some(raw) = query.get("sizes") {
+        match go_parse_bool(raw) {
+            Some(v) => sizes = v,
+            None => reasons.push(Reason::new("sizes", "invalid syntax")),
+        }
+    }
+    if !reasons.is_empty() {
+        return Err(params_error(ParamKind::Query, reasons));
+    }
+    if limit > ant_retrieval::MANIFEST_PAGE_MAX_LIMIT {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "limit exceeds maximum of {}",
+                ant_retrieval::MANIFEST_PAGE_MAX_LIMIT
+            ),
+        ));
+    }
+    Ok(ant_control::ManifestListQuery {
+        prefix,
+        delimiter: query.get("delimiter").cloned().unwrap_or_default(),
+        after: query.get("after").cloned().unwrap_or_default(),
+        limit,
+        sizes,
+    })
 }
 
 async fn bzz_inner(
@@ -3020,9 +3122,48 @@ async fn bzz_inner(
     resp
 }
 
+/// `/v0/manifest`'s body, bee#5537's `ManifestListResponse`:
+/// `entries` is always an array, the rest is omitted when empty.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ManifestListing {
-    entries: Vec<ant_control::ManifestEntryInfo>,
+    entries: Vec<ManifestListingEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    common_prefixes: Vec<String>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_marker: Option<String>,
+}
+
+/// bee#5537's `ManifestListEntry`.
+#[derive(Debug, Serialize)]
+struct ManifestListingEntry {
+    path: String,
+    reference: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    metadata: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+}
+
+impl From<ant_control::ManifestListPage> for ManifestListing {
+    fn from(page: ant_control::ManifestListPage) -> Self {
+        Self {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|e| ManifestListingEntry {
+                    path: e.path,
+                    reference: e.reference.unwrap_or_default(),
+                    metadata: e.metadata,
+                    size: e.size,
+                })
+                .collect(),
+            common_prefixes: page.common_prefixes,
+            truncated: page.truncated,
+            next_marker: page.next_marker,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3544,12 +3685,14 @@ fn map_retrieval_error(message: String) -> Response {
 async fn dispatch_list_bzz(
     handle: &GatewayHandle,
     reference: [u8; 32],
+    page: ant_control::ManifestListQuery,
     timeout: Duration,
-) -> Result<Vec<ant_control::ManifestEntryInfo>, Response> {
+) -> Result<ant_control::ManifestListPage, Response> {
     let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
     let cmd = ControlCommand::ListBzz {
         reference,
         bypass_cache: false,
+        page: Some(page),
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -3558,8 +3701,12 @@ async fn dispatch_list_bzz(
     drain_terminal(&mut ack_rx, timeout)
         .await
         .and_then(|ack| match ack {
-            ControlAck::Manifest { entries } => Ok(entries),
-            ControlAck::Error { message } => Err(json_error(StatusCode::NOT_FOUND, message)),
+            ControlAck::ManifestPage(page) => Ok(page),
+            ControlAck::NotFound { message } => Err(json_error(StatusCode::NOT_FOUND, message)),
+            ControlAck::NotReady { message } => {
+                Err(json_error(StatusCode::SERVICE_UNAVAILABLE, message))
+            }
+            ControlAck::Error { message } => Err(json_error(StatusCode::BAD_GATEWAY, message)),
             other => {
                 warn!(target: "ant_gateway", ?other, "unexpected ack from ListBzz");
                 Err(json_error(

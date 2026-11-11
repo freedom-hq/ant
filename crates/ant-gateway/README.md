@@ -36,7 +36,7 @@ and the work breakdown is in [PLAN.md Appendix D][appx-d].
 | `/bzz`                       | POST       | B    | Single-file (`?name=…`) or tar-collection upload → Mantaray ref.     |
 | `/bzz/{addr}`                | GET / HEAD | A    | Manifest root — resolves `website-index-document` if present.        |
 | `/bzz/{addr}/{*path}`        | GET / HEAD | A    | Walks the manifest, joins data; `Content-Type` from manifest meta.   |
-| `/v0/manifest/{addr}`        | GET        | A+   | Ant extension: JSON listing of mantaray paths + metadata (no body).  |
+| `/v0/manifest/{addr}[/{*prefix}]` | GET   | A+   | Ant extension: paged JSON listing of a manifest in the shape of the pending bee API ([bee#5535](https://github.com/ethersphere/bee/issues/5535)): `?delimiter=&limit=&after=&sizes=` → `entries`, `commonPrefixes`, `truncated`, `nextMarker`. |
 | _everything else_            | _any_      | —    | `501 {code:501, message:"not implemented in ant"}`.                  |
 
 ### Streaming, HEAD, and ranges

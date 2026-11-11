@@ -99,9 +99,11 @@ pub use manifest_writer::{
     RawManifestEntry, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
-    list_manifest, lookup_path, lookup_path_with_credit, lookup_path_with_hints, resolve_feed_root,
-    LookupResult, ManifestEntry, ManifestError, ReplicaSweeps, ResolvedFeed,
-    MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
+    list_manifest, list_manifest_page, lookup_path, lookup_path_with_credit,
+    lookup_path_with_hints, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,
+    ManifestPage, ManifestPageQuery, ReplicaSweeps, ResolvedFeed, MANIFEST_PAGE_DEFAULT_LIMIT,
+    MANIFEST_PAGE_MAX_DEPTH, MANIFEST_PAGE_MAX_LIMIT, MANTARAY_CONTENT_TYPE_KEY,
+    MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_load::{PushLoadGuard, PushLoadTracker};

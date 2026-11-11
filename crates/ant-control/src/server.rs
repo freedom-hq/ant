@@ -526,7 +526,7 @@ fn ack_to_response(ack: ControlAck) -> Response {
             content_type,
             filename,
         },
-        ControlAck::Manifest { .. } => Response::Error {
+        ControlAck::Manifest { .. } | ControlAck::ManifestPage(_) => Response::Error {
             message: "manifest listing is only supported by ant-gateway".to_string(),
         },
         ControlAck::Progress(p) => Response::Progress(p),

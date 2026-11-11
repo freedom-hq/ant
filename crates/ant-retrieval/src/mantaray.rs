@@ -89,10 +89,11 @@ const MANIFEST_LIST_MAX_ENTRIES: usize = 512;
 /// root (always the first node loaded, so it always gets one). A sweep
 /// only happens after a node's direct fetch failed, and each costs up to
 /// ~30 replica probes (~13-21 s on mainnet for a node that isn't there).
-/// Without a cap a listing with dozens of unreachable children would run
-/// one sweep per child, sequentially, and outlast the gateway's request
-/// timeout instead of returning the partial listing (unexpanded children
-/// listed by reference) it always has.
+/// Without a cap a [`list_manifest`] with dozens of unreachable children
+/// would run one sweep per child, sequentially, and outlast its timeout
+/// instead of returning the partial listing (unexpanded children listed
+/// by reference) it always has. A [`list_manifest_page`] fails at its
+/// first unreachable node, so it runs at most this many sweeps too.
 const MANIFEST_LIST_REPLICA_SWEEPS: usize = 4;
 
 /// Per-request memo of the dispersed-replica sweeps a manifest node load
@@ -136,6 +137,13 @@ impl ReplicaSweeps {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The memo for one manifest listing (page): at most
+    /// `MANIFEST_LIST_REPLICA_SWEEPS` (4) sweeps.
+    #[must_use]
+    pub fn for_listing() -> Self {
+        Self::capped(MANIFEST_LIST_REPLICA_SWEEPS)
     }
 
     /// At most `max` sweeps in total, and at most one per distinct node.
@@ -255,6 +263,15 @@ pub enum ManifestError {
     /// the declared owner, or the metadata was malformed.
     #[error("dereference feed: {0}")]
     Feed(#[from] FeedError),
+    /// A manifest listing page loaded its whole node budget
+    /// ([`MANIFEST_PAGE_NODE_SLACK`]) without finding a single item:
+    /// a trie of value-less nodes, not a listing that fits in a page.
+    #[error("manifest listing exceeded its node budget before finding an entry")]
+    ListBudgetExceeded,
+    /// A manifest listing page reached a trie node deeper than
+    /// [`MANIFEST_PAGE_MAX_DEPTH`] levels.
+    #[error("manifest is deeper than {MANIFEST_PAGE_MAX_DEPTH} trie levels")]
+    ListTooDeep,
 }
 
 /// One match in the manifest trie.
@@ -686,7 +703,13 @@ const MANIFEST_SIZE_FANOUT: usize = 16;
 /// If `root_addr` is a feed manifest, the listing transparently
 /// dereferences it first and lists the *resolved* content root — this
 /// matches the behaviour callers expect from a "show me what's at this
-/// reference" API and what the gateway exposes at `/v0/manifest/<addr>`.
+/// reference" API.
+///
+/// This is the original whole-manifest listing, kept for `ant_list_bzz`
+/// (the iOS player): it stops silently at 512 entries or 6 trie levels
+/// and lists an unreachable child by its node reference. The gateway's
+/// `/v0/manifest` uses the paged [`list_manifest_page`] instead, which
+/// does neither.
 ///
 /// Sizes are best-effort: a chunk that can't be fetched (peer 404,
 /// timeout, ...) leaves `size` as `None` rather than failing the whole
@@ -730,6 +753,372 @@ pub async fn list_manifest_paths(
     .await?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Default page size of [`list_manifest_page`], bee's
+/// `manifestListDefaultLimit` (ethersphere/bee#5537).
+pub const MANIFEST_PAGE_DEFAULT_LIMIT: usize = 1000;
+
+/// Largest page [`list_manifest_page`] serves. A whole page is buffered
+/// (and, with `sizes`, costs one extra chunk read per entry) before it
+/// is answered, so this bounds one request; total enumeration is still
+/// unbounded through `after`/`next_marker`. Inside the 1,000-10,000
+/// range bee#5535 suggests for a node-enforced cap, and far below
+/// #5537's 1,000,000: the walk loads nodes one after another, ~85 ms
+/// each on a cold mainnet node, so a cold 5,000-item page takes about
+/// 7 minutes, inside the gateway's 10-minute request timeout.
+pub const MANIFEST_PAGE_MAX_LIMIT: usize = 5_000;
+
+/// Trie levels a manifest listing page descends before failing with
+/// [`ManifestError::ListTooDeep`]. Every level consumes at least one
+/// path byte and a long name chains 30-byte forks, so a real manifest
+/// stays far below this (a 7 KiB name is ~240 levels); the bound exists
+/// because the walk recurses once per level, and an adversarial
+/// one-byte-fork chain otherwise grows it without limit.
+pub const MANIFEST_PAGE_MAX_DEPTH: usize = 256;
+
+/// Trie nodes one page may load on top of one per item it returns.
+/// `limit` bounds items, not node loads: chained forks (a long name is
+/// split into 30-byte forks, one node each), metadata-only nodes and
+/// value-less inner nodes all cost a load without yielding an item.
+/// The budget is `2 * limit + MANIFEST_PAGE_NODE_SLACK`; a page that
+/// runs out of it after returning at least one item ends early with
+/// `truncated` set (the next page resumes from `next_marker`), and one
+/// that runs out before any item fails with
+/// [`ManifestError::ListBudgetExceeded`].
+pub const MANIFEST_PAGE_NODE_SLACK: usize = 1024;
+
+/// One page request for [`list_manifest_page`], with bee#5535's
+/// `ListObjectsV2`-style semantics. Paths compare as raw bytes.
+#[derive(Debug, Clone, Default)]
+pub struct ManifestPageQuery {
+    /// Only paths starting with this are listed. Any byte prefix, not
+    /// only a directory boundary (bee#5537 requires the prefix to end
+    /// on a trie node); a prefix no path in the manifest starts with is
+    /// [`ManifestError::NotFound`].
+    pub prefix: String,
+    /// Empty: list recursively. Otherwise every path whose remainder
+    /// after `prefix` contains the delimiter is folded into one
+    /// `common_prefixes` item (`prefix` + remainder up to and including
+    /// the first delimiter) and its subtree is not walked.
+    pub delimiter: String,
+    /// Only items (paths or common prefixes) sorting strictly after this
+    /// are returned. Entries under a common prefix that sorts at or
+    /// before `after` are skipped with it. Empty: from the start.
+    pub after: String,
+    /// Items per page, `1..=MANIFEST_PAGE_MAX_LIMIT`; callers validate.
+    pub limit: usize,
+    /// Read each returned entry's size from its data root chunk's span.
+    pub sizes: bool,
+}
+
+/// One page of a manifest listing ([`list_manifest_page`]).
+#[derive(Debug, Clone, Default)]
+pub struct ManifestPage {
+    /// Value entries on this page, in path order. `reference` is always
+    /// set; metadata-only nodes (bee's root `/` website metadata) are
+    /// not entries. `size` is set only when `sizes` was asked for and
+    /// the span could be read.
+    pub entries: Vec<ManifestEntry>,
+    /// Common prefixes on this page (only with a `delimiter`), in order.
+    pub common_prefixes: Vec<String>,
+    /// More items may follow: ask again with `after = next_marker`.
+    pub truncated: bool,
+    /// The last item on this page, set iff `truncated`.
+    pub next_marker: Option<String>,
+    /// The reference was a feed manifest, listed at its current update:
+    /// the same request can answer differently later.
+    pub feed: bool,
+    /// `sizes` was asked for and at least one entry's span could not be
+    /// read, so the same request can answer differently later.
+    pub sizes_incomplete: bool,
+}
+
+/// List one page of a mantaray manifest, walking it in path order and
+/// loading only the nodes the page needs: forks outside `prefix`, forks
+/// whose paths all sort at or before `after`, and the subtree behind a
+/// common prefix are never loaded. A page costs the trie depth plus its
+/// own items, wherever it starts (bee#5535's seek, not a re-walk).
+///
+/// Feed manifests are dereferenced first, as in [`list_manifest`].
+/// Unlike [`list_manifest`] the result is never silently partial: a trie
+/// node that can't be loaded fails the page (bee#5535: "listings that
+/// silently omit subtrees are dangerous"), `truncated` is the only way a
+/// page ends short, and a trie deeper than [`MANIFEST_PAGE_MAX_DEPTH`]
+/// is an error ([`ManifestError::ListTooDeep`]), not a cut-off.
+///
+/// `sweeps` should be a fresh [`ReplicaSweeps::for_listing`]; after an
+/// error, its [`ReplicaSweeps::swept_transiently`] tells whether a retry
+/// could still recover the node that failed (a 503, not a 404).
+///
+/// There is no retry or credit wait inside: one failed node load fails
+/// the page, and the client retries the page.
+pub async fn list_manifest_page(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: &[u8],
+    query: &ManifestPageQuery,
+    sweeps: &ReplicaSweeps,
+) -> Result<ManifestPage, ManifestError> {
+    let (effective_root, feed) =
+        resolve_feed_root_with_credit(fetcher, root_ref, None, sweeps, None).await?;
+    let root_node = load_node_ref_with_credit(fetcher, &effective_root, None, sweeps).await?;
+    let limit = query.limit.clamp(1, MANIFEST_PAGE_MAX_LIMIT);
+    let mut walk = PageWalk {
+        fetcher,
+        sweeps,
+        prefix: query.prefix.as_bytes(),
+        delimiter: query.delimiter.as_bytes(),
+        after: query.after.as_bytes(),
+        start: page_walk_start(
+            query.prefix.as_bytes(),
+            query.delimiter.as_bytes(),
+            query.after.as_bytes(),
+        ),
+        limit,
+        loads_left: limit
+            .saturating_mul(2)
+            .saturating_add(MANIFEST_PAGE_NODE_SLACK),
+        items: Vec::new(),
+        prefix_seen: query.prefix.is_empty(),
+        done: false,
+        truncated: false,
+    };
+    if walk.start.is_some() {
+        walk.visit(root_node.clone(), Vec::new(), 0).await?;
+    }
+    if walk.items.is_empty()
+        && !walk.prefix_seen
+        && !has_prefix(fetcher, &root_node, query.prefix.as_bytes(), None, sweeps).await?
+    {
+        return Err(ManifestError::NotFound {
+            path: query.prefix.clone(),
+        });
+    }
+
+    let mut page = ManifestPage {
+        feed: feed.is_some(),
+        truncated: walk.truncated,
+        ..ManifestPage::default()
+    };
+    if walk.truncated {
+        page.next_marker = walk
+            .items
+            .last()
+            .map(|item| String::from_utf8_lossy(item.path()).into_owned());
+    }
+    for item in walk.items {
+        match item {
+            PageItem::Prefix(p) => page
+                .common_prefixes
+                .push(String::from_utf8_lossy(&p).into_owned()),
+            PageItem::Entry {
+                path,
+                reference,
+                metadata,
+            } => page.entries.push(ManifestEntry {
+                path: String::from_utf8_lossy(&path).into_owned(),
+                reference: Some(reference),
+                metadata: metadata_to_btree(metadata),
+                size: None,
+            }),
+        }
+    }
+    if query.sizes {
+        populate_sizes(fetcher, &mut page.entries).await;
+        page.sizes_incomplete = page.entries.iter().any(|e| e.size.is_none());
+    }
+    Ok(page)
+}
+
+/// The first path a page may visit, or `None` when nothing can sort
+/// after `after` (bee#5537's `walkStart`). Without a delimiter, or when
+/// `after` is not below a common prefix, that is `after ‖ 0x00`, the
+/// smallest path sorting after it. When `after` is a common prefix or a
+/// path below one, the whole common prefix sorts at or before it and
+/// stands for every path below it, so the walk starts at the first path
+/// not beginning with it.
+fn page_walk_start(prefix: &[u8], delimiter: &[u8], after: &[u8]) -> Option<Vec<u8>> {
+    if after.is_empty() {
+        return Some(Vec::new());
+    }
+    let folded = (!delimiter.is_empty())
+        .then(|| after.strip_prefix(prefix))
+        .flatten()
+        .and_then(|rest| find_subslice(rest, delimiter))
+        .map(|i| prefix.len() + i + delimiter.len());
+    let Some(end) = folded else {
+        let mut start = after.to_vec();
+        start.push(0);
+        return Some(start);
+    };
+    let mut start = after[..end].to_vec();
+    while let Some(last) = start.pop() {
+        if last < 0xff {
+            start.push(last + 1);
+            return Some(start);
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+enum PageItem {
+    Entry {
+        path: Vec<u8>,
+        reference: Vec<u8>,
+        metadata: HashMap<String, String>,
+    },
+    Prefix(Vec<u8>),
+}
+
+impl PageItem {
+    fn path(&self) -> &[u8] {
+        match self {
+            Self::Entry { path, .. } | Self::Prefix(path) => path,
+        }
+    }
+}
+
+struct PageWalk<'a> {
+    fetcher: &'a dyn ChunkFetcher,
+    sweeps: &'a ReplicaSweeps,
+    prefix: &'a [u8],
+    delimiter: &'a [u8],
+    after: &'a [u8],
+    /// From [`page_walk_start`]; `Some(empty)` when there is no `after`.
+    start: Option<Vec<u8>>,
+    limit: usize,
+    loads_left: usize,
+    items: Vec<PageItem>,
+    /// Some fork reached a path starting with `prefix`.
+    prefix_seen: bool,
+    done: bool,
+    truncated: bool,
+}
+
+impl PageWalk<'_> {
+    /// Add one item, or end the page (`truncated`) when it is already
+    /// full: the lookahead means an exactly-full last page reports
+    /// `truncated: false`, as in bee#5537.
+    fn push(&mut self, item: PageItem) {
+        if item.path() <= self.after && !self.after.is_empty() {
+            return;
+        }
+        if self
+            .items
+            .last()
+            .is_some_and(|last| last.path() == item.path())
+        {
+            return;
+        }
+        if self.items.len() >= self.limit {
+            self.truncated = true;
+            self.done = true;
+            return;
+        }
+        self.items.push(item);
+    }
+
+    fn before_start(&self, path: &[u8]) -> bool {
+        self.start.as_deref().is_some_and(|s| path < s)
+    }
+
+    fn visit<'s>(
+        &'s mut self,
+        node: Node,
+        path: Vec<u8>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ManifestError>> + Send + 's>>
+    {
+        Box::pin(async move {
+            let has_value = (node.entry.len() == 32 || node.entry.len() == ENCRYPTED_REF_SIZE)
+                && node.entry.iter().any(|&b| b != 0);
+            if path.starts_with(self.prefix) && !self.before_start(&path) {
+                let rest = &path[self.prefix.len()..];
+                if let Some(i) = find_subslice(rest, self.delimiter) {
+                    // Every path below shares this common prefix: report
+                    // it once and skip the subtree. A metadata-only leaf
+                    // (bee's root `/` node) has no path below it at all.
+                    let live_forks = node
+                        .forks
+                        .values()
+                        .any(|f| f.child_ref.iter().any(|&b| b != 0));
+                    if has_value || live_forks {
+                        let end = self.prefix.len() + i + self.delimiter.len();
+                        self.push(PageItem::Prefix(path[..end].to_vec()));
+                    }
+                    return Ok(());
+                }
+                // A value on the root itself has the empty path: as an
+                // item it would sort before everything and, as a
+                // `next_marker`, read as "start over". Not listed.
+                if has_value && !path.is_empty() {
+                    self.push(PageItem::Entry {
+                        path: path.clone(),
+                        reference: node.entry.clone(),
+                        metadata: node.metadata.clone(),
+                    });
+                    if self.done {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mut forks: Vec<Fork> = node.forks.into_values().collect();
+            forks.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+            for fork in forks {
+                if self.done {
+                    return Ok(());
+                }
+                if fork.child_ref.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                let mut next = path.clone();
+                next.extend_from_slice(&fork.prefix);
+                // Outside `prefix`: neither on the way down to it nor
+                // below it.
+                if !(next.starts_with(self.prefix) || self.prefix.starts_with(&next)) {
+                    continue;
+                }
+                if next.starts_with(self.prefix) {
+                    self.prefix_seen = true;
+                }
+                // Every path below `next` sorts before `start`.
+                if let Some(start) = self.start.as_deref() {
+                    let common = next.len().min(start.len());
+                    if next[..common] < start[..common] {
+                        continue;
+                    }
+                }
+                if depth >= MANIFEST_PAGE_MAX_DEPTH {
+                    return Err(ManifestError::ListTooDeep);
+                }
+                if self.loads_left == 0 {
+                    if self.items.is_empty() {
+                        return Err(ManifestError::ListBudgetExceeded);
+                    }
+                    self.truncated = true;
+                    self.done = true;
+                    return Ok(());
+                }
+                self.loads_left -= 1;
+                let mut child =
+                    load_node_ref_with_credit(self.fetcher, &fork.child_ref, None, self.sweeps)
+                        .await?;
+                for (k, v) in fork.metadata {
+                    child.metadata.entry(k).or_insert(v);
+                }
+                self.visit(child, next, depth + 1).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Fetch every entry's data root chunk in parallel (capped at
@@ -2990,5 +3379,430 @@ mod tests {
         assert!(capped.begin(&a));
         assert!(capped.begin(&b));
         assert!(!capped.begin(&c), "cap used up");
+    }
+
+    // ---- list_manifest_page (issue #61, bee#5535 listing shape) ----
+
+    async fn list_page(
+        fetcher: &dyn ChunkFetcher,
+        root: &[u8],
+        q: &ManifestPageQuery,
+    ) -> Result<ManifestPage, ManifestError> {
+        list_manifest_page(fetcher, root, q, &ReplicaSweeps::for_listing()).await
+    }
+
+    /// Collection manifest over `paths` with distinct data refs (no data
+    /// chunks stored: listings never read file bodies, only with `sizes`).
+    fn page_fixture(paths: &[String], index: bool) -> (MapFetcher, [u8; 32]) {
+        use crate::manifest_writer::{build_collection_manifest, IndexAnchor, ManifestFile};
+        let files: Vec<ManifestFile> = paths
+            .iter()
+            .map(|p| ManifestFile {
+                path: p.clone(),
+                content_type: Some("text/plain".to_string()),
+                data_ref: crate::splitter::split_bytes(p.as_bytes()).root.to_vec(),
+            })
+            .collect();
+        let manifest = build_collection_manifest(
+            &files,
+            index.then_some("index.html"),
+            IndexAnchor::ZeroEntry,
+        )
+        .unwrap();
+        let mut fetcher = MapFetcher::new();
+        for c in &manifest.chunks {
+            fetcher.insert(c.address, c.wire.clone());
+        }
+        (fetcher, manifest.root)
+    }
+
+    /// The listing `query` must produce, computed the naive way: every
+    /// path under the prefix, folded at the delimiter, deduplicated,
+    /// strictly after `after`, cut at `limit`. Items are `(is_prefix,
+    /// path)`; `None` when the prefix names nothing in the manifest.
+    fn page_reference(
+        paths: &[String],
+        index: bool,
+        q: &ManifestPageQuery,
+    ) -> Option<(Vec<(bool, String)>, bool)> {
+        let mut sorted: Vec<&[u8]> = paths.iter().map(String::as_bytes).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let (prefix, delim, after) = (
+            q.prefix.as_bytes(),
+            q.delimiter.as_bytes(),
+            q.after.as_bytes(),
+        );
+        let exists = prefix.is_empty()
+            || sorted.iter().any(|p| p.starts_with(prefix))
+            || (index && prefix == b"/");
+        if !exists {
+            return None;
+        }
+        let mut items: Vec<(bool, Vec<u8>)> = Vec::new();
+        for p in sorted.into_iter().filter(|p| p.starts_with(prefix)) {
+            let rest = &p[prefix.len()..];
+            let item = match find_subslice(rest, delim) {
+                Some(i) => (true, p[..prefix.len() + i + delim.len()].to_vec()),
+                None => (false, p.to_vec()),
+            };
+            if items.last() != Some(&item) {
+                items.push(item);
+            }
+        }
+        items.retain(|(_, p)| after.is_empty() || p.as_slice() > after);
+        let truncated = items.len() > q.limit;
+        items.truncate(q.limit);
+        Some((
+            items
+                .into_iter()
+                .map(|(d, p)| (d, String::from_utf8(p).unwrap()))
+                .collect(),
+            truncated,
+        ))
+    }
+
+    fn page_items(page: &ManifestPage) -> Vec<(bool, String)> {
+        let mut items: Vec<(bool, String)> = page
+            .entries
+            .iter()
+            .map(|e| (false, e.path.clone()))
+            .chain(page.common_prefixes.iter().map(|p| (true, p.clone())))
+            .collect();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        items
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn word(&mut self, alphabet: &[u8], max: usize) -> String {
+            let len = 1 + self.below(max);
+            (0..len)
+                .map(|_| alphabet[self.below(alphabet.len())] as char)
+                .collect()
+        }
+    }
+
+    /// Differential test: random manifests (short alphabet so paths
+    /// share prefixes, fork mid-segment and nest; some names long
+    /// enough to chain 30-byte forks) against [`page_reference`] for
+    /// random prefix / delimiter / after / limit combinations, plus a
+    /// `limit = 1` pagination run whose pages must add up to the full
+    /// listing with nothing repeated or lost.
+    #[tokio::test]
+    async fn manifest_page_matches_naive_listing() {
+        let mut rng = Lcg(0x5eed_0061);
+        let alphabet = b"ab/.";
+        for round in 0..24 {
+            let index = round % 3 == 0;
+            let mut paths: Vec<String> = (0..=rng.below(24))
+                .map(|_| {
+                    let mut p = rng.word(alphabet, 7);
+                    if rng.below(8) == 0 {
+                        p.push_str(&"x".repeat(31 + rng.below(40)));
+                    }
+                    p
+                })
+                .filter(|p| !p.starts_with('/'))
+                .collect();
+            if paths.is_empty() {
+                paths.push("a".into());
+            }
+            if index {
+                paths.push("index.html".into());
+            }
+            let (fetcher, root) = page_fixture(&paths, index);
+
+            for _ in 0..30 {
+                let pick = |rng: &mut Lcg| -> String {
+                    match rng.below(4) {
+                        0 => String::new(),
+                        1 => paths[rng.below(paths.len())].clone(),
+                        2 => {
+                            let p = &paths[rng.below(paths.len())];
+                            p[..rng.below(p.len() + 1)].to_string()
+                        }
+                        _ => rng.word(alphabet, 4),
+                    }
+                };
+                let prefix = if rng.below(2) == 0 {
+                    String::new()
+                } else {
+                    pick(&mut rng)
+                };
+                let q = ManifestPageQuery {
+                    prefix,
+                    delimiter: ["", "/", "/", "a/", "ab", "."][rng.below(6)].to_string(),
+                    after: pick(&mut rng),
+                    limit: [1, 2, 3, 5, 1000][rng.below(5)],
+                    sizes: false,
+                };
+                let got = list_page(&fetcher, &root, &q).await;
+                match page_reference(&paths, index, &q) {
+                    None => assert!(
+                        matches!(got, Err(ManifestError::NotFound { .. })),
+                        "{q:?} over {paths:?}: want NotFound, got {got:?}",
+                    ),
+                    Some((want, truncated)) => {
+                        let page = got.unwrap_or_else(|e| panic!("{q:?} over {paths:?}: {e}"));
+                        assert_eq!(page_items(&page), want, "{q:?} over {paths:?}");
+                        assert_eq!(page.truncated, truncated, "{q:?} over {paths:?}");
+                        assert_eq!(
+                            page.next_marker,
+                            truncated.then(|| want.last().unwrap().1.clone()),
+                            "{q:?} over {paths:?}",
+                        );
+                        assert!(page.entries.iter().all(|e| e.reference.is_some()));
+                    }
+                }
+
+                // Paging one item at a time from the same start must
+                // reassemble the whole listing.
+                let Some((full, _)) = page_reference(
+                    &paths,
+                    index,
+                    &ManifestPageQuery {
+                        limit: usize::MAX,
+                        ..q.clone()
+                    },
+                ) else {
+                    continue;
+                };
+                let mut paged = Vec::new();
+                let mut after = q.after.clone();
+                for _ in 0..=full.len() {
+                    let page = list_page(
+                        &fetcher,
+                        &root,
+                        &ManifestPageQuery {
+                            after: after.clone(),
+                            limit: 1,
+                            ..q.clone()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    paged.extend(page_items(&page));
+                    match page.next_marker {
+                        Some(m) => after = m,
+                        None => break,
+                    }
+                }
+                assert_eq!(paged, full, "limit=1 pages of {q:?} over {paths:?}");
+            }
+        }
+    }
+
+    /// Bee's uploader keeps website metadata on a zero-entry `/` node:
+    /// it is neither an entry nor a `/` common prefix (bee#5537 found
+    /// it leaking as a `/` entry against a live node).
+    #[tokio::test]
+    async fn manifest_page_skips_root_metadata_node() {
+        let paths: Vec<String> = ["index.html", "css/site.css"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (fetcher, root) = page_fixture(&paths, true);
+        for delimiter in ["", "/"] {
+            let page = list_page(
+                &fetcher,
+                &root,
+                &ManifestPageQuery {
+                    delimiter: delimiter.into(),
+                    limit: 10,
+                    ..ManifestPageQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+            let entries: Vec<&str> = page.entries.iter().map(|e| e.path.as_str()).collect();
+            if delimiter.is_empty() {
+                assert_eq!(entries, ["css/site.css", "index.html"]);
+                assert_eq!(page.common_prefixes, Vec::<String>::new());
+            } else {
+                assert_eq!(entries, ["index.html"]);
+                assert_eq!(page.common_prefixes, ["css/"]);
+            }
+            assert_eq!(
+                page.entries[entries.len() - 1].metadata.get("Content-Type"),
+                Some(&"text/plain".to_string()),
+            );
+        }
+    }
+
+    /// The seek and the delimiter fold never load what they skip: a
+    /// page deep into a big directory, or a shallow listing next to
+    /// one, costs a handful of node loads, not the directory.
+    #[tokio::test]
+    async fn manifest_page_loads_only_what_it_lists() {
+        let mut paths: Vec<String> = (0..300).map(|i| format!("big/f{i:04}.bin")).collect();
+        paths.push("readme.txt".into());
+        let (inner, root) = page_fixture(&paths, false);
+        let fetcher = CountingFetcher {
+            inner,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let loads = |q: ManifestPageQuery| {
+            let fetcher = &fetcher;
+            async move {
+                fetcher
+                    .fetches
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                let page = list_page(fetcher, &root, &q).await.unwrap();
+                (
+                    page,
+                    fetcher.fetches.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            }
+        };
+
+        let (full, full_loads) = loads(ManifestPageQuery {
+            limit: 1000,
+            ..ManifestPageQuery::default()
+        })
+        .await;
+        assert_eq!(full.entries.len(), 301);
+        assert!(!full.truncated);
+
+        let (deep, deep_loads) = loads(ManifestPageQuery {
+            after: "big/f0250.bin".into(),
+            limit: 2,
+            ..ManifestPageQuery::default()
+        })
+        .await;
+        let deep_paths: Vec<&str> = deep.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(deep_paths, ["big/f0251.bin", "big/f0252.bin"]);
+        assert_eq!(deep.next_marker.as_deref(), Some("big/f0252.bin"));
+        assert!(
+            deep_loads <= 12,
+            "a 2-entry page 250 entries in loaded {deep_loads} nodes (full walk: {full_loads})",
+        );
+
+        let (shallow, shallow_loads) = loads(ManifestPageQuery {
+            delimiter: "/".into(),
+            limit: 1000,
+            ..ManifestPageQuery::default()
+        })
+        .await;
+        assert_eq!(shallow.common_prefixes, ["big/"]);
+        assert_eq!(shallow.entries.len(), 1);
+        assert!(
+            shallow_loads <= 4,
+            "a shallow root listing loaded {shallow_loads} nodes (full walk: {full_loads})",
+        );
+    }
+
+    /// A trie node that can't be loaded fails the page instead of being
+    /// listed by its node reference (the legacy `list_manifest`
+    /// fallback): a listing that silently omits a subtree is wrong.
+    #[tokio::test]
+    async fn manifest_page_fails_on_unreachable_node() {
+        let names: Vec<String> = ["a.html", "b.html"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let paths: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (fetcher, root) = site_with_dead_children(&paths);
+        let err = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                limit: 10,
+                ..ManifestPageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::Fetch(_)), "got {err:?}");
+    }
+
+    /// `sizes` reads spans for the entries on the page only, and flags a
+    /// page whose span read failed so it isn't cached as final.
+    #[tokio::test]
+    async fn manifest_page_sizes_are_opt_in() {
+        let (fetcher, root, _) = website_fetcher(&["a.html", "b.html", "c.html"]);
+        let q = ManifestPageQuery {
+            limit: 2,
+            ..ManifestPageQuery::default()
+        };
+        let plain = list_page(&fetcher, &root, &q).await.unwrap();
+        assert!(plain.entries.iter().all(|e| e.size.is_none()));
+        assert!(!plain.sizes_incomplete);
+
+        let sized = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                sizes: true,
+                ..q.clone()
+            },
+        )
+        .await
+        .unwrap();
+        let sizes: Vec<Option<u64>> = sized.entries.iter().map(|e| e.size).collect();
+        assert_eq!(
+            sizes,
+            [Some(19), Some(19)],
+            "<html>a.html</html> is 19 bytes"
+        );
+        assert!(!sized.sizes_incomplete);
+
+        let (fetcher, root) = page_fixture(&["a".to_string()], false);
+        let missing = list_page(&fetcher, &root, &ManifestPageQuery { sizes: true, ..q })
+            .await
+            .unwrap();
+        assert_eq!(missing.entries[0].size, None);
+        assert!(missing.sizes_incomplete);
+    }
+
+    /// A trie deeper than `MANIFEST_PAGE_MAX_DEPTH` (a chain of one-byte
+    /// forks, `a`, `aa`, `aaa`, ...) fails the page with `ListTooDeep`
+    /// rather than recursing without bound or listing it cut short; one
+    /// at exactly the cap lists in full.
+    #[tokio::test]
+    async fn manifest_page_rejects_a_trie_past_the_depth_cap() {
+        let q = ManifestPageQuery {
+            limit: MANIFEST_PAGE_MAX_LIMIT,
+            ..ManifestPageQuery::default()
+        };
+        let at_cap: Vec<String> = (1..=MANIFEST_PAGE_MAX_DEPTH)
+            .map(|n| "a".repeat(n))
+            .collect();
+        let (fetcher, root) = page_fixture(&at_cap, false);
+        let page = list_page(&fetcher, &root, &q).await.unwrap();
+        assert_eq!(page.entries.len(), MANIFEST_PAGE_MAX_DEPTH);
+
+        let past_cap: Vec<String> = (1..=MANIFEST_PAGE_MAX_DEPTH + 1)
+            .map(|n| "a".repeat(n))
+            .collect();
+        let (fetcher, root) = page_fixture(&past_cap, false);
+        let err = list_page(&fetcher, &root, &q).await.unwrap_err();
+        assert!(matches!(err, ManifestError::ListTooDeep), "got {err:?}");
+    }
+
+    #[test]
+    fn page_walk_start_skips_a_folded_after() {
+        assert_eq!(page_walk_start(b"", b"/", b""), Some(Vec::new()));
+        assert_eq!(page_walk_start(b"", b"", b"a/b"), Some(b"a/b\0".to_vec()));
+        assert_eq!(page_walk_start(b"", b"/", b"a/b"), Some(b"a0".to_vec()));
+        assert_eq!(
+            page_walk_start(b"a/", b"/", b"a/b/c"),
+            Some(b"a/b0".to_vec())
+        );
+        assert_eq!(
+            page_walk_start(b"", b"/", b"\xff/"),
+            Some(b"\xff0".to_vec())
+        );
+        assert_eq!(page_walk_start(b"x", b"/", b"a/b"), Some(b"a/b\0".to_vec()));
     }
 }

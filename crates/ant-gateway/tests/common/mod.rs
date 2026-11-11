@@ -1019,6 +1019,27 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         ControlCommand::ListBzz {
             reference,
             bypass_cache: _,
+            page: Some(q),
+            ack,
+        } => {
+            let query = ant_retrieval::ManifestPageQuery {
+                prefix: q.prefix,
+                delimiter: q.delimiter,
+                after: q.after,
+                limit: q.limit,
+                sizes: q.sizes,
+            };
+            let sweeps = ant_retrieval::ReplicaSweeps::for_listing();
+            let result =
+                ant_retrieval::list_manifest_page(fetcher, &reference, &query, &sweeps).await;
+            let _ = ack
+                .send(ant_p2p::manifest_page_ack(&reference, result, &sweeps))
+                .await;
+        }
+        ControlCommand::ListBzz {
+            reference,
+            bypass_cache: _,
+            page: None,
             ack,
         } => {
             let reply = match list_manifest(fetcher, &reference).await {

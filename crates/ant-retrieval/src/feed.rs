@@ -2650,6 +2650,35 @@ mod tests {
         (fetcher, manifest.root, by_data_ref)
     }
 
+    /// Issue #61: a manifest listing of a feed manifest lists the
+    /// update it currently resolves to, and says so (`feed`), so the
+    /// gateway doesn't cache that answer as immutable.
+    #[tokio::test]
+    async fn manifest_page_of_a_feed_manifest_is_marked_feed() {
+        let secret: [u8; 32] = [61u8; 32];
+        let topic = keccak256(b"listing/feed");
+        let (fetcher, root, _) = bzz_feed_fixture(&secret, &topic, &[0, 1], &[]);
+        let page = crate::mantaray::list_manifest_page(
+            &fetcher,
+            &root,
+            &crate::mantaray::ManifestPageQuery {
+                limit: 10,
+                ..Default::default()
+            },
+            &crate::mantaray::ReplicaSweeps::for_listing(),
+        )
+        .await
+        .unwrap();
+        assert!(page.feed);
+        let paths: Vec<&str> = page.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["feed.txt"]);
+        assert_eq!(
+            page.entries[0].reference.as_deref(),
+            Some(bzz_feed_body_ref(1).as_slice()),
+            "lists the head update",
+        );
+    }
+
     fn bzz_feed_body_ref(index: u64) -> [u8; 32] {
         cac_new(format!("update {index}").as_bytes()).unwrap().0
     }
