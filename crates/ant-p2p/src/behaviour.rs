@@ -6999,7 +6999,8 @@ fn manifest_page_query(q: ant_control::ManifestListQuery) -> ant_retrieval::Mani
 /// - a page → [`ControlAck::ManifestPage`], `immutable` unless the
 ///   reference was a feed manifest, a size asked for couldn't be read,
 ///   or the walk ran out of time ([`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`])
-///   and ended `truncated` early;
+///   and ended `truncated` early, or the page ended `truncated` on a
+///   failed lookahead load ([`ant_retrieval::ManifestPage::lookahead_failed`]);
 /// - the prefix names nothing, or the reference (or a trie node) is not
 ///   a decodable manifest → [`ControlAck::NotFound`], bee#5537's 404;
 /// - a path on the page is not valid UTF-8 (it can't be returned as a
@@ -7027,7 +7028,10 @@ pub fn manifest_page_ack(
     use ant_retrieval::ManifestError as E;
     match result {
         Ok(page) => ControlAck::ManifestPage(ant_control::ManifestListPage {
-            immutable: !page.feed && !page.sizes_incomplete && !page.timed_out,
+            immutable: !page.feed
+                && !page.sizes_incomplete
+                && !page.timed_out
+                && !page.lookahead_failed,
             entries: page
                 .entries
                 .into_iter()
@@ -11457,6 +11461,18 @@ mod tests {
         };
         assert!(!cut.immutable);
         assert!(cut.truncated);
+        let ControlAck::ManifestPage(blind) = manifest_page_ack(
+            &[0; 32],
+            Ok(ManifestPage {
+                lookahead_failed: true,
+                ..page(false)
+            }),
+            &sweeps,
+        ) else {
+            panic!("not a page");
+        };
+        assert!(!blind.immutable);
+        assert!(blind.truncated);
     }
 
     /// Issue #123: a `/bytes` or `/bzz` root that peers confirmed missing

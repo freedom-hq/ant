@@ -870,7 +870,9 @@ pub struct ManifestPage {
     /// More items may follow: ask again with `after = next_marker`.
     /// Set when the page is full, or when the walk ran out of its node
     /// budget or of [`MANIFEST_PAGE_WALK_BUDGET`] after at least one
-    /// item (then with fewer than `limit` items).
+    /// item (then with fewer than `limit` items). A full page is also
+    /// `truncated` when the load that would tell whether more follows
+    /// failed ([`Self::lookahead_failed`]).
     pub truncated: bool,
     /// The last item on this page, set iff `truncated`.
     pub next_marker: Option<String>,
@@ -880,6 +882,12 @@ pub struct ManifestPage {
     /// The page ended early on [`MANIFEST_PAGE_WALK_BUDGET`]: the same
     /// request, once the nodes are cached, returns more items.
     pub timed_out: bool,
+    /// The page is full and the node loaded only to look for one more
+    /// item (to decide `truncated`) could not be fetched, so the page
+    /// ends `truncated` without knowing whether anything follows. The
+    /// same request may later answer `truncated: false`; the next page
+    /// (`after = next_marker`) needs that node and fails on it.
+    pub lookahead_failed: bool,
     /// `sizes` was asked for and at least one entry's span could not be
     /// read, so the same request can answer differently later.
     pub sizes_incomplete: bool,
@@ -909,7 +917,11 @@ pub struct ManifestPage {
 /// could still recover the node that failed (a 503, not a 404).
 ///
 /// There is no retry or credit wait inside: one failed node load fails
-/// the page, and the client retries the page.
+/// the page, and the client retries the page. The one exception is a
+/// load past a page that is already full, made only to decide
+/// `truncated`: its failure ends the page `truncated`
+/// ([`ManifestPage::lookahead_failed`]) instead of discarding the items
+/// already collected, and the next page, which needs the node, fails.
 pub async fn list_manifest_page(
     fetcher: &dyn ChunkFetcher,
     root_ref: &[u8],
@@ -942,6 +954,7 @@ pub async fn list_manifest_page(
         done: false,
         truncated: false,
         timed_out: false,
+        lookahead_failed: false,
     };
     if walk.start.is_some() {
         walk.visit(root_node.clone(), Vec::new(), 0).await?;
@@ -959,6 +972,7 @@ pub async fn list_manifest_page(
         feed: feed.is_some(),
         truncated: walk.truncated,
         timed_out: walk.timed_out,
+        lookahead_failed: walk.lookahead_failed,
         ..ManifestPage::default()
     };
     // `push` only keeps valid UTF-8 paths, so these conversions are
@@ -1078,6 +1092,8 @@ struct PageWalk<'a> {
     truncated: bool,
     /// The walk stopped on `deadline`, not on a full page.
     timed_out: bool,
+    /// See [`ManifestPage::lookahead_failed`].
+    lookahead_failed: bool,
 }
 
 impl PageWalk<'_> {
@@ -1205,9 +1221,28 @@ impl PageWalk<'_> {
                     return Ok(());
                 }
                 self.loads_left -= 1;
-                let mut child =
-                    load_node_ref_with_credit(self.fetcher, &fork.child_ref, None, self.sweeps)
-                        .await?;
+                let mut child = match load_node_ref_with_credit(
+                    self.fetcher,
+                    &fork.child_ref,
+                    None,
+                    self.sweeps,
+                )
+                .await
+                {
+                    Ok(child) => child,
+                    // The page is already full: this load only looks
+                    // for one more item to decide `truncated`. Its
+                    // failure ends the page `truncated`, as running
+                    // out of node or time budget here would; the next
+                    // page, which needs this node, reports it.
+                    Err(_) if self.items.len() >= self.limit => {
+                        self.truncated = true;
+                        self.lookahead_failed = true;
+                        self.done = true;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
                 for (k, v) in fork.metadata {
                     child.metadata.entry(k).or_insert(v);
                 }
@@ -3837,6 +3872,62 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ManifestError::Fetch(_)), "got {err:?}");
+    }
+
+    /// R3-M1: a node that is only loaded to look past a full page (to
+    /// decide `truncated`) does not fail that page when it is
+    /// unreachable: the page ends `truncated` with the items it has, and
+    /// the next page, which needs the node, fails on it.
+    #[tokio::test]
+    async fn manifest_page_full_page_survives_an_unreachable_lookahead() {
+        let paths: Vec<String> = vec!["a.html".into(), "b.html".into()];
+        let (mut fetcher, root) = page_fixture(&paths, false);
+        let root_node =
+            load_node_ref_with_credit(&fetcher, &root, None, &ReplicaSweeps::for_listing())
+                .await
+                .unwrap();
+        let dead = root_node
+            .forks
+            .values()
+            .find(|f| f.prefix.starts_with(b"b"))
+            .expect("fork for b.html")
+            .child_ref
+            .clone();
+        let dead: [u8; 32] = dead[..32].try_into().unwrap();
+        assert!(fetcher.chunks.remove(&dead).is_some());
+
+        let page = list_page(
+            &fetcher,
+            &root,
+            &ManifestPageQuery {
+                limit: 1,
+                ..ManifestPageQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        let entries: Vec<&str> = page.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(entries, ["a.html"]);
+        assert!(page.truncated);
+        assert!(!page.timed_out);
+        assert!(page.lookahead_failed);
+        assert_eq!(page.next_marker.as_deref(), Some("a.html"));
+
+        // A page that needs the dead node still fails on it.
+        for q in [
+            ManifestPageQuery {
+                after: "a.html".into(),
+                limit: 1,
+                ..ManifestPageQuery::default()
+            },
+            ManifestPageQuery {
+                limit: 2,
+                ..ManifestPageQuery::default()
+            },
+        ] {
+            let err = list_page(&fetcher, &root, &q).await.unwrap_err();
+            assert!(matches!(err, ManifestError::Fetch(_)), "got {err:?}");
+        }
     }
 
     /// `sizes` reads spans for the entries on the page only, and flags a

@@ -2833,12 +2833,15 @@ pub async fn bzz_with_path(
 ///
 /// A page that runs out of that budget after at least one item ends
 /// early, `truncated` with fewer than `limit` items; continue from
-/// `nextMarker` as usual.
+/// `nextMarker` as usual. A full page whose one extra node load (made
+/// only to tell whether more follows) fails is returned `truncated`
+/// too; the next page needs that node and gets the error.
 ///
 /// The answer for a content-addressed root never changes, so it is
 /// cached immutably, except when the root is a feed manifest (listed at
-/// its current update), a requested size could not be read, or the
-/// page was cut short by the wall-clock budget.
+/// its current update), a requested size could not be read, the page
+/// was cut short by the wall-clock budget, or the page ended on such a
+/// failed extra load.
 pub async fn manifest(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,

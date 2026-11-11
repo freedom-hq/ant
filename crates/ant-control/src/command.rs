@@ -1055,7 +1055,9 @@ pub struct ManifestListPage {
     /// The same request always answers the same: the reference was not
     /// a feed manifest, every size asked for was read, and the page was
     /// not cut short by the walk's wall-clock budget
-    /// (`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`). Gates the gateway's
+    /// (`ant_retrieval::MANIFEST_PAGE_WALK_BUDGET`) or by a failed
+    /// lookahead load past a full page
+    /// (`ant_retrieval::ManifestPage::lookahead_failed`). Gates the gateway's
     /// immutable `Cache-Control`.
     pub immutable: bool,
 }
