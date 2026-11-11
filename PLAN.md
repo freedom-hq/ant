@@ -2517,6 +2517,7 @@ When acting as the bee-shaped server, `ant-gateway` recognizes:
 | `Swarm-Chunk-Retrieval-Timeout` | request | Per-chunk fetch timeout cap for this request. |
 | `Swarm-Redundancy-Strategy` | request | Plumbed to `ant-retrieval` redundancy selection. |
 | `Swarm-Redundancy-Fallback-Mode` | request | As above. |
+| `Swarm-Cache` | request | `false` on `/bytes`, `/bzz`, `/chunks/<addr>` downloads skips the node's chunk caches for that request: no cached reads, no write-back. Stricter than bee, which still serves locally stored chunks and only skips caching what it retrieves (#80). |
 | `Swarm-Encrypt` | request (M3) | Encrypted upload toggle (deferred per §16; rejected with 501 until v1.1). |
 | `Swarm-Pin` | request (M3) | Pin uploaded references locally. |
 | `Swarm-Tag` | request (M3) | Attach upload to existing tag. |

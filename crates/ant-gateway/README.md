@@ -157,6 +157,19 @@ back to its dispersed replicas. `Swarm-Redundancy-Strategy` and
 needs to be switched on: `antctl get --allow-degraded-redundancy`
 is a no-op, kept only so existing callers keep working.
 
+**`Swarm-Cache: false` reads from the network** (issue #80). On
+`GET`/`HEAD` `/bytes`, `/bzz` and `/chunks/{addr}` it runs the
+request without the node's chunk caches: nothing is read from the
+memory or disk cache and nothing retrieved is written back, so a
+repeat download is as cold as the first. Bee only does the second
+half (`storer.Download(false)` still serves a chunk it already holds
+locally); ant also skips the read on purpose, since the header's users
+(benchmarks, retrievability probes) want the network path measured,
+not the local disk. Pinned and just-uploaded chunks live in the same
+disk cache, so they are fetched from the network too under this
+header. A value other than a Go `ParseBool` spelling is a `400`, like
+bee. `/soc` and `/feeds` ignore the header.
+
 ### Other intentional non-features
 
 - Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2. Operators

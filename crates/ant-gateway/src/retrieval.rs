@@ -109,6 +109,12 @@ const SWARM_ENCRYPT: HeaderName = HeaderName::from_static("swarm-encrypt");
 /// Bee's `Swarm-Pin` upload header: also pin the uploaded content
 /// locally alongside the upload.
 const SWARM_PIN: HeaderName = HeaderName::from_static("swarm-pin");
+
+/// Bee's `Swarm-Cache` download header (`/bytes`, `/bzz`, `/chunks`;
+/// absent = `true`). `false` runs the request with the node's
+/// `bypass_cache`: see [`parse_cache_header`] for what that means and
+/// where it differs from bee.
+const SWARM_CACHE: HeaderName = HeaderName::from_static("swarm-cache");
 /// Bee request header: name of the manifest entry that should resolve
 /// when the user requests `bzz://<root>/` (no path). Mirrored on the
 /// root manifest's `/` fork as `website-index-document` metadata.
@@ -341,6 +347,10 @@ pub async fn chunk(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let bypass_cache = match parse_cache_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     // ACT resolution (bee wraps `chunkGetHandler` in its
     // `actDecryptionHandler`): a 32-byte ACT-encrypted address
     // decrypts to the stored chunk's address.
@@ -366,6 +376,7 @@ pub async fn chunk(
     let cmd = ControlCommand::GetChunkRaw {
         reference,
         fast_miss: true,
+        bypass_cache,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -474,6 +485,7 @@ pub async fn download_soc(
     let cmd = ControlCommand::GetChunkRaw {
         reference,
         fast_miss: true,
+        bypass_cache: false,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -558,13 +570,20 @@ pub async fn download_soc(
     }
 
     let stream_timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
-    let started =
-        match dispatch_stream_bytes(&handle, wrapped_addr, stream_timeout, None, head_only, None)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
+    let started = match dispatch_stream_bytes(
+        &handle,
+        wrapped_addr,
+        stream_timeout,
+        None,
+        head_only,
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let total = started.total_bytes;
     let mut resp = streaming_response(
         head_only,
@@ -2479,6 +2498,10 @@ pub async fn bytes(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let bypass_cache = match parse_cache_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     // ACT resolution (bee's `actDecryptionHandler` middleware): with
     // the publisher + history headers present, the path address is an
     // ACT-encrypted reference — decrypt it and serve what it points at.
@@ -2516,6 +2539,7 @@ pub async fn bytes(
             head_only,
             raw_range.as_deref(),
             timeout,
+            bypass_cache,
         )
         .await;
     }
@@ -2526,13 +2550,20 @@ pub async fn bytes(
 
     // Phase 1: dispatch with head_only=true if the caller is HEAD;
     // for GET we go straight to the streaming dispatcher.
-    let mut started =
-        match dispatch_stream_bytes(&handle, reference, timeout, None, head_only, activity_guard)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
+    let mut started = match dispatch_stream_bytes(
+        &handle,
+        reference,
+        timeout,
+        None,
+        head_only,
+        bypass_cache,
+        activity_guard,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     let total = started.total_bytes;
     // Range semantics are Go's `http.ServeContent` (bee serves through
@@ -2622,6 +2653,7 @@ pub async fn bytes(
         timeout,
         Some(stream_range),
         head_only,
+        bypass_cache,
         carry_guard,
     )
     .await
@@ -2670,6 +2702,7 @@ async fn serve_encrypted_bytes(
     head_only: bool,
     raw_range: Option<&str>,
     timeout: Duration,
+    bypass_cache: bool,
 ) -> Response {
     let reference: [u8; 32] = enc_ref[..32].try_into().expect("64-byte ref");
     let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
@@ -2678,7 +2711,7 @@ async fn serve_encrypted_bytes(
     let cmd = ControlCommand::GetBytesEncrypted {
         reference,
         key,
-        bypass_cache: false,
+        bypass_cache,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
         ack: ack_tx,
     };
@@ -2960,6 +2993,10 @@ async fn bzz_inner(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let bypass_cache = match parse_cache_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     // ACT resolution (bee wraps `bzzDownloadHandler`/`bzzHeadHandler`
     // in its `actDecryptionHandler`).
     let reference = match crate::act::act_maybe_resolve(&handle, &headers, reference).await {
@@ -2993,6 +3030,7 @@ async fn bzz_inner(
         timeout,
         None,
         head_only,
+        bypass_cache,
         activity_guard,
     )
     .await
@@ -3109,6 +3147,7 @@ async fn bzz_inner(
         timeout,
         Some(stream_range),
         head_only,
+        bypass_cache,
         carry_guard,
     )
     .await
@@ -3438,12 +3477,13 @@ async fn dispatch_stream_bytes(
     timeout: Duration,
     range: Option<StreamRange>,
     head_only: bool,
+    bypass_cache: bool,
     activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
     let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
     let cmd = ControlCommand::StreamBytes {
         reference,
-        bypass_cache: false,
+        bypass_cache,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
         range,
         head_only,
@@ -3455,7 +3495,7 @@ async fn dispatch_stream_bytes(
     consume_stream_prologue(ack_rx, timeout, false, head_only, activity_guard).await
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn dispatch_stream_bzz(
     handle: &GatewayHandle,
     reference: Vec<u8>,
@@ -3463,6 +3503,7 @@ async fn dispatch_stream_bzz(
     timeout: Duration,
     range: Option<StreamRange>,
     head_only: bool,
+    bypass_cache: bool,
     activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
     let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
@@ -3474,7 +3515,7 @@ async fn dispatch_stream_bzz(
         // strips it and serves anyway. We follow that — the joiner
         // still fails fast if a data chunk is actually missing.
         allow_degraded_redundancy: true,
-        bypass_cache: false,
+        bypass_cache,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
         range,
         head_only,
@@ -3828,6 +3869,42 @@ fn parse_pin_header(headers: &HeaderMap) -> Result<bool, Response> {
             ParamKind::Header,
             vec![Reason {
                 field: "Swarm-Pin".to_string(),
+                error: "invalid syntax".to_string(),
+            }],
+        )),
+    }
+}
+
+/// Parse bee's `Swarm-Cache` download header into a `bypass_cache`
+/// flag: absent or true → `false` (use the node's chunk caches),
+/// false → `true`. Same Go `strconv.ParseBool` spellings as
+/// `Swarm-Pin`; anything else is bee's 400 `invalid header params`
+/// (bee's `mapStructure` rejects it the same way).
+///
+/// Bee's `swarm-cache: false` (`storer.Download(false)`,
+/// `pkg/storer/netstore.go`) only stops chunks retrieved from the
+/// network being *written* to its cache; a chunk already stored locally
+/// is still served from there. Ant deliberately goes further and also
+/// skips the *read*: the request neither reads from nor writes to the
+/// shared memory and disk chunk caches, so every chunk comes from the
+/// network (issue #80: clients use the header for network-path reads —
+/// benchmarks, retrievability probes — and a warm cache answering them
+/// silently measures the local disk). The disk cache also holds pinned
+/// chunks and recently uploaded ones, so with `swarm-cache: false`
+/// those are fetched from the network too, where bee would serve them
+/// locally.
+#[allow(clippy::result_large_err)]
+fn parse_cache_header(headers: &HeaderMap) -> Result<bool, Response> {
+    let Some(raw) = headers.get(&SWARM_CACHE) else {
+        return Ok(false);
+    };
+    match raw.to_str().map(str::trim) {
+        Ok("1" | "t" | "T" | "true" | "TRUE" | "True") => Ok(false),
+        Ok("0" | "f" | "F" | "false" | "FALSE" | "False") => Ok(true),
+        _ => Err(params_error(
+            ParamKind::Header,
+            vec![Reason {
+                field: "Swarm-Cache".to_string(),
                 error: "invalid syntax".to_string(),
             }],
         )),
@@ -4827,6 +4904,7 @@ pub async fn download_feed(
         let cmd = ControlCommand::GetChunkRaw {
             reference,
             fast_miss: false,
+            bypass_cache: false,
             ack: ack_tx,
         };
         if handle.commands.send(cmd).await.is_err() {
@@ -4891,6 +4969,7 @@ pub async fn download_feed(
         stream_timeout,
         None,
         head_only,
+        false,
         Some(guard),
     )
     .await
@@ -4967,6 +5046,7 @@ pub async fn download_feed(
         stream_timeout,
         Some(stream_range),
         head_only,
+        false,
         carry_guard,
     )
     .await

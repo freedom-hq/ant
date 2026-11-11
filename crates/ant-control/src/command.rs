@@ -95,6 +95,13 @@ pub enum ControlCommand {
         /// root chunk), where the extra in-flight peers would mostly buy
         /// duplicate, separately-charged deliveries.
         fast_miss: bool,
+        /// Skip the daemon's shared memory and disk chunk caches for
+        /// this lookup: no cached hit (so no read-after-own-write and no
+        /// locally pinned copy either), and the fetched chunk is not
+        /// written back. Set by `GET /chunks/{addr}` with
+        /// `swarm-cache: false` (issue #80); every other caller leaves it
+        /// off.
+        bypass_cache: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Run a bounded pullsync probe against the closest connected peer to
@@ -151,8 +158,9 @@ pub enum ControlCommand {
     /// legacy no-op (RS-aware decoding with parity recovery is always
     /// on), retained for protocol compatibility.
     /// `bypass_cache` swaps the daemon's shared chunk cache for a
-    /// fresh per-request one (intra-request retries still benefit
-    /// from caching). `progress` opts the request into streaming
+    /// fresh per-request one and skips the disk cache entirely (no
+    /// reads, no writes; intra-request retries still benefit from the
+    /// per-request cache). `progress` opts the request into streaming
     /// [`ControlAck::Progress`] emissions. `max_bytes` overrides the
     /// joiner's per-request size cap; `None` means "use the joiner's
     /// `DEFAULT_MAX_FILE_BYTES` (32 MiB)" — appropriate for `antctl get`
@@ -236,6 +244,11 @@ pub enum ControlCommand {
     /// daemon emits a `BytesStreamStart` with the file size and goes
     /// straight to `StreamDone`. This is what backs `HEAD /bytes/{addr}`
     /// without joining the chunk tree.
+    ///
+    /// `bypass_cache` runs the request without the daemon's shared
+    /// memory and disk chunk caches (see [`ControlCommand::GetBzz`]):
+    /// every chunk comes from the network and none is written back. The
+    /// gateway sets it for `swarm-cache: false` (issue #80).
     StreamBytes {
         reference: [u8; 32],
         bypass_cache: bool,
@@ -257,7 +270,8 @@ pub enum ControlCommand {
     /// transiently, even when its direct miss is corroborated); both are
     /// terminal.
     ///
-    /// `range` and `head_only` behave identically to `StreamBytes`.
+    /// `range`, `head_only` and `bypass_cache` behave identically to
+    /// `StreamBytes`.
     /// `head_only` is what backs `HEAD /bzz/{ref}/{path}`: the daemon
     /// resolves the manifest, fetches the data root chunk to learn
     /// the size, returns metadata + total span, and never joins.
