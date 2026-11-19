@@ -406,8 +406,7 @@ impl PeerStore {
                     bzz_timestamp: e.bzz_timestamp,
                     chequebook: e
                         .chequebook
-                        .map(|c| format!("0x{}", hex::encode(c)))
-                        .unwrap_or_default(),
+                        .map_or_default(|c| format!("0x{}", hex::encode(c))),
                     bootnode: e.bootnode,
                 })
                 .collect(),

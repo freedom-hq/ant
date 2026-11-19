@@ -90,11 +90,24 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-#[derive(NetworkBehaviour)]
-struct B {
-    stream: StreamBehaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+use derived::{BEvent, B};
+
+// `unreachable_code`, scoped to just the derived behaviour: libp2p-stream's
+// handler uses `Infallible` events, so the code `#[derive(NetworkBehaviour)]`
+// generates to forward them makes calls with an uninhabited argument, which
+// rustc flags as unreachable since 1.100. The allow sits on a module because
+// the derived impl is a sibling of the struct, out of reach of an attribute
+// on the struct itself. See `AntBehaviour` in `src/behaviour.rs`.
+#[allow(unreachable_code)]
+mod derived {
+    use super::{identify, ping, NetworkBehaviour, StreamBehaviour};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct B {
+        pub(super) stream: StreamBehaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
 }
 
 const HANDSHAKE_IDENTIFY_WAIT: Duration = Duration::from_secs(5);

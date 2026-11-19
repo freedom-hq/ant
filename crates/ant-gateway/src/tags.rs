@@ -79,7 +79,7 @@ impl Tag {
             stored: self.stored,
             sent: self.sent,
             synced: self.synced,
-            address: self.address.map(hex::encode).unwrap_or_default(),
+            address: self.address.map_or_default(hex::encode),
             started_at: self.started_at.clone(),
         }
     }

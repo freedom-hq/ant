@@ -670,8 +670,7 @@ pub async fn run_driver(
                 // What the mirror says is owed, per peer, right now.
                 let debts = accounting
                     .as_ref()
-                    .map(|acc| acc.refresh_due())
-                    .unwrap_or_default();
+                    .map_or_default(|acc| acc.refresh_due());
                 for peer in debts.keys() {
                     touch(&mut state, *peer, now);
                 }

@@ -3222,8 +3222,7 @@ impl LiveRun {
             catalog_state: state
                 .catalog_last
                 .as_ref()
-                .map(|e| e.state.as_str().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|e| e.state.as_str().to_string()),
             catalog_index: state.catalog_index,
             timings: state.stages.timings(&state.publish_ms),
         }
@@ -3430,8 +3429,7 @@ impl LiveRun {
             catalog_state: state
                 .catalog_last
                 .as_ref()
-                .map(|e| e.state.as_str().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|e| e.state.as_str().to_string()),
             catalog_index: state.catalog_index,
             timings: state.stages.timings(&state.publish_ms),
         }
