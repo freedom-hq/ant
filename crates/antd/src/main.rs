@@ -1557,8 +1557,7 @@ fn apply_config_file(
     }
     let ignored_keys: Vec<String> = cfg
         .as_ref()
-        .map(|c| c.extra.keys().cloned().collect())
-        .unwrap_or_default();
+        .map_or_default(|c| c.extra.keys().cloned().collect());
 
     // Resolve the password: CLI flag wins, then CLI password-file, then
     // the config file's `password` / `password-file`.

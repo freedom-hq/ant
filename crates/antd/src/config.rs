@@ -172,8 +172,7 @@ impl BeeConfig {
     pub fn cors_origins_vec(&self) -> Vec<String> {
         self.cors_allowed_origins
             .clone()
-            .map(CorsOrigins::into_vec)
-            .unwrap_or_default()
+            .map_or_default(CorsOrigins::into_vec)
     }
 }
 

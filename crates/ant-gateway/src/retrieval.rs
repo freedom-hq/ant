@@ -3679,8 +3679,7 @@ async fn consume_stream_prologue(
     };
     let first_bytes = first_chunk
         .as_ref()
-        .map(|b| b[..b.len().min(512)].to_vec())
-        .unwrap_or_default();
+        .map_or_default(|b| b[..b.len().min(512)].to_vec());
 
     Ok(Started {
         total_bytes,

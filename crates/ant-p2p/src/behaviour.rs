@@ -297,22 +297,38 @@ pub struct SwapConfig {
     pub events_tx: Option<mpsc::Sender<crate::swap::InboundCheque>>,
 }
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-#[behaviour(prelude = "libp2p_swarm::derive_prelude")]
-pub struct AntBehaviour {
-    stream: libp2p_stream::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    /// UPnP/IGD-based external-port discovery. Watches `NewListenAddr`
-    /// events, talks to the local home router via SSDP, and (on success)
-    /// emits [`libp2p::upnp::Event::NewExternalAddr`] with our public
-    /// `/ip4/<wan>/tcp/<port>` multiaddr. Treated as opportunistic: on
-    /// hosts without an IGD-capable router (cloud VMs, corporate NAT,
-    /// CGNAT) the behaviour just emits `GatewayNotFound` /
-    /// `NonRoutableGateway` and stays quiet, so leaving it always-on is
-    /// safe — handlers in `apply_event` only ever *add* addresses, never
-    /// reject existing ones.
-    upnp: libp2p::upnp::tokio::Behaviour,
+pub use derived::{AntBehaviour, AntBehaviourEvent};
+
+/// Holds only [`AntBehaviour`] so the lint allow below covers the code
+/// `#[derive(NetworkBehaviour)]` generates and nothing else: the derived
+/// `impl NetworkBehaviour` is a sibling item, so an attribute on the struct
+/// itself would not reach it.
+// `unreachable_code`: some of these sub-behaviours use `Infallible` as a
+// handler event type (libp2p-stream's handler, for one), so the code the
+// derive generates to forward those events makes calls with an uninhabited
+// argument, which rustc flags as unreachable since 1.100. The code is
+// libp2p-swarm-derive's, not ours, and is correct as generated.
+#[allow(unreachable_code)]
+mod derived {
+    use super::{identify, ping};
+
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
+    pub struct AntBehaviour {
+        pub(super) stream: libp2p_stream::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        /// UPnP/IGD-based external-port discovery. Watches `NewListenAddr`
+        /// events, talks to the local home router via SSDP, and (on success)
+        /// emits [`libp2p::upnp::Event::NewExternalAddr`] with our public
+        /// `/ip4/<wan>/tcp/<port>` multiaddr. Treated as opportunistic: on
+        /// hosts without an IGD-capable router (cloud VMs, corporate NAT,
+        /// CGNAT) the behaviour just emits `GatewayNotFound` /
+        /// `NonRoutableGateway` and stays quiet, so leaving it always-on is
+        /// safe — handlers in `apply_event` only ever *add* addresses, never
+        /// reject existing ones.
+        pub(super) upnp: libp2p::upnp::tokio::Behaviour,
+    }
 }
 
 /// How often the swarm loop runs its connection liveness pass
@@ -1735,8 +1751,7 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
     let gateway_requests = state
         .gateway_activity
         .as_ref()
-        .map(|a| a.snapshot())
-        .unwrap_or_default();
+        .map_or_default(|a| a.snapshot());
     // Disk cache snapshot. When the daemon was started with
     // `--no-disk-cache` (or no disk cache at all),
     // `state.disk_cache` is `None` and `enabled` stays false so
@@ -4372,16 +4387,12 @@ async fn pin_check(
 /// that are *not* connected right now are omitted: without the peer's
 /// handshake we no longer know which overlay/EOA they belong to.
 fn build_accounting_snapshot(state: &SwarmState) -> AccountingSnapshotView {
-    let balances: HashMap<PeerId, (u64, u64)> = state
-        .accounting
-        .as_ref()
-        .map(|a| {
-            a.settlement_snapshot()
-                .into_iter()
-                .map(|(peer, balance, time_settled)| (peer, (balance, time_settled)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let balances: HashMap<PeerId, (u64, u64)> = state.accounting.as_ref().map_or_default(|a| {
+        a.settlement_snapshot()
+            .into_iter()
+            .map(|(peer, balance, time_settled)| (peer, (balance, time_settled)))
+            .collect()
+    });
     let credits = state
         .credit_ledger
         .as_ref()
@@ -9240,7 +9251,7 @@ fn handle_drive_outcome(
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive
             // gossip on the next start instead.
-            let addrs = dialed_addr.map(|a| vec![a]).unwrap_or_default();
+            let addrs = dialed_addr.map_or_default(|a| vec![a]);
             // Pass the V15 fields through to the peerstore so peers.json
             // carries the signed timestamp + chequebook forward across
             // restarts. `record_success` won't downgrade V15 → V14 on a
