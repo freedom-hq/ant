@@ -19,6 +19,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # main's merge queue tests each queued PR on top of main plus the PRs
+  # ahead of it; its required checks are this workflow's jobs.
+  merge_group:
 
 # Latest pushed commit on a PR cancels still-running CI for older
 # pushes on the same branch. Keeps the queue snappy when an author
