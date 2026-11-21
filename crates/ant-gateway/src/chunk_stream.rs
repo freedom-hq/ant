@@ -20,8 +20,13 @@
 //!   connection default and `CacheOption` overrides it per request,
 //!   with ant's `swarm-cache: false` meaning (no cache read *and* no
 //!   write-back, <https://github.com/freedom-hq/ant/issues/80>). A
-//!   miss is `NOT_FOUND`, a `NotReady` ack (`GET /chunks`' 503) is
-//!   `UNAVAILABLE`, a timeout or other failure `ERROR`.
+//!   miss is `NOT_FOUND`, a timeout or other failure `ERROR`. A
+//!   `NotReady` ack (`GET /chunks`' 503) would be `UNAVAILABLE`, but
+//!   `GetChunkRaw`'s fetcher has no accounting attached, so its pool is
+//!   never reported starved and the node doesn't send one for a Get
+//!   today (see `pre_stream_failure_ack` in ant-p2p): a thin miss comes
+//!   back `NOT_FOUND` (or `ERROR` with no peer to ask). The arm is kept so the mapping matches
+//!   `GET /chunks` if that changes.
 //! * Put rebuilds the chunk from `Data` and takes it only if it
 //!   produces the requested address as a CAC or as a validly signed
 //!   SOC; the address settles which. It is then pushed through the
@@ -456,16 +461,21 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
     let mut writer_done = false;
     loop {
         let msg = tokio::select! {
+            // Biased so that a client frame already waiting wins over an
+            // idle deadline that ran out while this reader was blocked on
+            // a busy reply (below): that frame, often a pong, is the
+            // client's proof it is alive.
+            biased;
             // The writer only ends on a failed or timed-out write.
             _ = &mut writer => {
                 writer_done = true;
                 break;
             }
+            msg = stream.next() => msg,
             () = &mut idle => {
                 debug!(target: "ant_gateway", "chunk stream: read timeout");
                 break;
             }
-            msg = stream.next() => msg,
         };
         // Any client frame, pongs and pings included, extends it.
         idle.as_mut()
@@ -518,12 +528,21 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
         };
         // The busy reply waits for the socket like any other, so a
         // client that stops reading eventually stops this reader too.
+        // The idle deadline is not raced here: while this reader is
+        // blocked, the client's pongs sit unread, so it can't count as
+        // silent. A client that stopped reading altogether is ended by
+        // the writer's write timeout instead, which drops the receiver
+        // and fails this send; one that reads but sends nothing meets
+        // the (by then elapsed) deadline right after the send.
         if let Some(busy) = busy {
-            if out_tx
-                .send(Outgoing::Reply(busy.encode_to_vec()))
-                .await
-                .is_err()
-            {
+            let sent = tokio::select! {
+                sent = out_tx.send(Outgoing::Reply(busy.encode_to_vec())) => sent.is_ok(),
+                _ = &mut writer => {
+                    writer_done = true;
+                    break;
+                }
+            };
+            if !sent {
                 break;
             }
         }
@@ -602,7 +621,10 @@ async fn write_replies(
     let _ = sink.close().await;
 }
 
-/// Answer a Get. Mirrors `GET /chunks/{addr}`'s outcome mapping.
+/// Answer a Get. Mirrors `GET /chunks/{addr}`'s outcome mapping,
+/// including its `NotReady` → `UNAVAILABLE` arm, which the node doesn't
+/// reach for `GetChunkRaw` today (no accounting on its fetcher, so no
+/// starved pool).
 async fn handle_get(conn: &V1Conn, req: pb::GetRequest) -> pb::Response {
     let Ok(reference) = <[u8; 32]>::try_from(&req.address[..]) else {
         return pb::get_response(
@@ -1106,7 +1128,8 @@ mod tests {
     const BATCH_REJECTED: [u8; 32] = [0xcc; 32];
     /// Never registered.
     const BATCH_UNKNOWN: [u8; 32] = [0xdd; 32];
-    /// `GetChunkRaw` answers `NotReady` (a starved pool).
+    /// `GetChunkRaw` answers `NotReady`. The real node doesn't send this
+    /// for `GetChunkRaw`; the fake does, to pin the mapping.
     const NOT_READY: [u8; 32] = [0xee; 32];
     /// `GetChunkRaw` answers late.
     const SLOW: [u8; 32] = [0x51; 32];
@@ -2173,6 +2196,88 @@ mod tests {
         // And the socket still serves requests.
         send(&mut ws, &get(&addr, pb::CacheOption::Default)).await;
         assert_eq!(get_reply(&mut ws).await.status, Status::Ok as i32);
+    }
+
+    /// A client over the Get queue limit gets `BUSY`, and the reader
+    /// blocks on that reply behind a full reply queue for longer than
+    /// the read timeout, while the client reads slowly and answers every
+    /// ping. Its pongs are waiting when the send completes, so the
+    /// elapsed deadline must not drop it.
+    #[tokio::test]
+    async fn a_reader_blocked_on_busy_keeps_a_ponging_client() {
+        // Enough to fill the workers, the Get queue and the reply queue,
+        // and then some that can only be answered `BUSY`.
+        const GETS: usize = STREAM_WORKERS + STREAM_QUEUE + REPLY_QUEUE + 300;
+        let (addr, wire) = cac(&[5u8; 4096]);
+        let (base, _, mut done) = serve_timed(
+            HashMap::from([(addr, wire)]),
+            V1Timing {
+                read_timeout: Duration::from_millis(250),
+                write_timeout: Duration::from_secs(30),
+                ping_period: Duration::from_millis(20),
+            },
+            Some(16 * 1024),
+        );
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(8 * 1024).unwrap();
+        let tcp = tcp
+            .connect(base.trim_start_matches("ws://").parse().unwrap())
+            .await
+            .unwrap();
+        let mut req = format!("{base}/chunks/stream")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("bee-chunk-stream-v1"),
+        );
+        let (ws, _) = tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(tcp))
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = ws.split();
+        let frame = get(&addr, pb::CacheOption::Default).encode_to_vec();
+        let sender = tokio::spawn(async move {
+            for _ in 0..GETS {
+                if tx.send(WsMsg::Binary(frame.clone().into())).await.is_err() {
+                    break;
+                }
+            }
+            tx
+        });
+        // Let the backlog build until the reader is stuck on a busy reply.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Read slowly: each reply frees one reply-queue slot, and the
+        // reader's busy send waits behind the workers' sends for it, so
+        // it stays blocked for several reads, past the read timeout.
+        // The client library answers each ping as it reads it.
+        let (mut ok, mut busy) = (0, 0);
+        let started = tokio::time::Instant::now();
+        while ok + busy < GETS {
+            let body = tokio::time::timeout(Duration::from_secs(10), reply(&mut rx))
+                .await
+                .unwrap_or_else(|_| panic!("reply {} never came", ok + busy));
+            match body {
+                response::Body::Get(g) if g.status == Status::Ok as i32 => ok += 1,
+                response::Body::Get(g) if g.status == Status::Busy as i32 => busy += 1,
+                other => panic!("unexpected reply {other:?}"),
+            }
+            if started.elapsed() < Duration::from_secs(3) {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+        assert!(busy > 0, "no request was answered BUSY");
+        assert!(done.try_recv().is_err(), "the stream was dropped");
+        let mut tx = sender.await.unwrap();
+        tx.send(WsMsg::Binary(
+            get(&addr, pb::CacheOption::Default).encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(5), reply(&mut rx))
+            .await
+            .expect("the socket stopped serving");
+        assert!(matches!(body, response::Body::Get(g) if g.status == Status::Ok as i32));
     }
 
     /// A reply write that times out (a client that stopped reading) ends

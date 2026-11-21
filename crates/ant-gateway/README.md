@@ -117,7 +117,11 @@ One WebSocket path, two protocols, picked by the
   `UNAVAILABLE`). A failed request does not close the socket. Gets go
   through the `GET /chunks/{addr}` lookup, so `Swarm-Cache` /
   `?cache=` / the per-request `CacheOption` mean what `swarm-cache`
-  means there (see above: `false` skips the cache read too).
+  means there (see above: `false` skips the cache read too). A Get
+  that misses is `NOT_FOUND` (or `ERROR` with no peer to ask), even
+  on a cold node, never `UNAVAILABLE`: `UNAVAILABLE` maps
+  the same `NotReady` that `GET /chunks` answers 503, which the
+  node's single-chunk lookup doesn't produce today.
   Puts are accepted only if the data rebuilds to the requested address
   as a CAC or a validly signed SOC. They are then pushed like
   `POST /chunks` / `POST /soc`, and `OK` means pushed. Stamp
