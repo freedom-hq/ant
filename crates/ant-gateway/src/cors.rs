@@ -48,12 +48,15 @@ const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS";
 /// doesn't enumerate its own `Access-Control-Request-Headers`. Includes
 /// the bee upload-control headers (`Swarm-*`) plus the usual content /
 /// auth set so bee-js never trips the browser's preflight check.
+/// `Swarm-Cache` (cache bypass on `/bytes`, `/bzz` and `/chunks` downloads)
+/// and `Swarm-Postage-Stamp` (pre-signed stamp on uploads) match bee's list
+/// (<https://github.com/ethersphere/bee/pull/5698>).
 const DEFAULT_ALLOW_HEADERS: &str = "Origin, Accept, Authorization, Content-Type, \
 X-Requested-With, Range, \
 Swarm-Tag, Swarm-Pin, Swarm-Encrypt, Swarm-Collection, Swarm-Index-Document, \
-Swarm-Error-Document, Swarm-Postage-Batch-Id, Swarm-Deferred-Upload, \
+Swarm-Error-Document, Swarm-Postage-Batch-Id, Swarm-Postage-Stamp, Swarm-Deferred-Upload, \
 Swarm-Redundancy-Level, Swarm-Redundancy-Strategy, Swarm-Redundancy-Fallback-Mode, \
-Swarm-Chunk-Retrieval-Timeout, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
+Swarm-Chunk-Retrieval-Timeout, Swarm-Cache, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
 Swarm-Soc-Signature, Swarm-Act, Swarm-Act-Publisher, Swarm-Act-History-Address, \
 Gas-Price, Gas-Limit";
 
