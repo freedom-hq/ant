@@ -41,6 +41,8 @@
 //!   frame that carries no code). 15 minutes
 //!   without any client frame drops the connection; the node pings
 //!   every 60 s so a client only waiting for replies stays connected.
+//!   A ping is written ahead of queued replies, so this holds for a
+//!   client slowly draining a full reply queue too.
 //! * Backpressure: Gets and Puts each have a 1024-deep queue served by
 //!   8 workers; a full queue is answered `BUSY`. Replies go through a
 //!   bounded channel to one writer, so a client that stops reading
@@ -390,10 +392,9 @@ impl V1Timing {
     };
 }
 
-/// What the writer sends.
+/// What the writer sends besides its own pings.
 enum Outgoing {
     Reply(Vec<u8>),
-    Ping,
     Close(u16, &'static str),
 }
 
@@ -405,7 +406,7 @@ enum Outgoing {
 async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
     let (sink, mut stream) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(REPLY_QUEUE);
-    let mut writer = tokio::spawn(write_replies(sink, out_rx, conn.timing.write_timeout));
+    let mut writer = tokio::spawn(write_replies(sink, out_rx, conn.timing));
 
     let (get_tx, get_rx) = mpsc::channel::<pb::GetRequest>(STREAM_QUEUE);
     let (put_tx, put_rx) = mpsc::channel::<pb::PutRequest>(STREAM_QUEUE);
@@ -448,10 +449,6 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
     }
 
     let timing = conn.timing;
-    let mut ping = tokio::time::interval_at(
-        tokio::time::Instant::now() + timing.ping_period,
-        timing.ping_period,
-    );
     // One deadline for the whole loop, moved only by a client frame:
     // the node's own pings must not keep a silent client alive.
     let idle = tokio::time::sleep(timing.read_timeout);
@@ -467,13 +464,6 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
             () = &mut idle => {
                 debug!(target: "ant_gateway", "chunk stream: read timeout");
                 break;
-            }
-            _ = ping.tick() => {
-                // Best effort: a full reply queue already keeps the
-                // writer busy, and the pong would only extend a
-                // deadline the client's own frames extend too.
-                let _ = out_tx.try_send(Outgoing::Ping);
-                continue;
             }
             msg = stream.next() => msg,
         };
@@ -565,18 +555,38 @@ async fn send_close(out: &mpsc::Sender<Outgoing>, code: u16, reason: &'static st
     .await;
 }
 
-/// The single writer of a v1 connection. Returns on a failed or
-/// timed-out write, after a close frame, or once every sender is gone.
+/// The single writer of a v1 connection, and its pinger. Returns on a
+/// failed or timed-out write, after a close frame, or once every sender
+/// is gone.
+///
+/// Pings don't go through the reply queue: a due ping is written before
+/// the next queued reply, the way bee's `WriteControl` ping goes out
+/// whatever is queued. A client draining a long backlog slowly keeps the
+/// queue full, and its pongs are what keep it inside the read timeout.
 async fn write_replies(
     mut sink: futures::stream::SplitSink<WebSocket, Message>,
     mut out: mpsc::Receiver<Outgoing>,
-    write_timeout: Duration,
+    timing: V1Timing,
 ) {
-    while let Some(item) = out.recv().await {
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + timing.ping_period,
+        timing.ping_period,
+    );
+    // Ticks missed during a slow write collapse into one ping.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = ping.tick() => None,
+            item = out.recv() => match item {
+                Some(item) => Some(item),
+                None => break,
+            },
+        };
         let (msg, last) = match item {
-            Outgoing::Reply(bytes) => (Message::Binary(bytes.into()), false),
-            Outgoing::Ping => (Message::Ping(Vec::new().into()), false),
-            Outgoing::Close(code, reason) => (
+            None => (Message::Ping(Vec::new().into()), false),
+            Some(Outgoing::Reply(bytes)) => (Message::Binary(bytes.into()), false),
+            Some(Outgoing::Close(code, reason)) => (
                 Message::Close(Some(CloseFrame {
                     code,
                     reason: reason.into(),
@@ -584,7 +594,7 @@ async fn write_replies(
                 true,
             ),
         };
-        match tokio::time::timeout(write_timeout, sink.send(msg)).await {
+        match tokio::time::timeout(timing.write_timeout, sink.send(msg)).await {
             Ok(Ok(())) if !last => {}
             _ => return,
         }
@@ -1290,10 +1300,12 @@ mod tests {
 
     /// Serve [`run_v1`] directly with shortened `timing`, reporting
     /// through the returned receiver whether the connection's task
-    /// ended without a panic.
-    async fn serve_timed(
+    /// ended without a panic. `send_buffer` caps the accepted sockets'
+    /// kernel send buffer, which loopback otherwise grows to megabytes.
+    fn serve_timed(
         chunks: HashMap<[u8; 32], Vec<u8>>,
         timing: V1Timing,
+        send_buffer: Option<u32>,
     ) -> (String, Arc<Node>, mpsc::Receiver<bool>) {
         let (handle, node) = fake_node(chunks);
         let (done_tx, done_rx) = mpsc::channel(4);
@@ -1316,7 +1328,16 @@ mod tests {
                 }
             }),
         );
-        (listen(router).await, node, done_rx)
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if let Some(size) = send_buffer {
+            // Accepted sockets inherit it from the listener.
+            socket.set_send_buffer_size(size).unwrap();
+        }
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(64).unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("ws://{addr}"), node, done_rx)
     }
 
     /// Open `/chunks/stream{query}`, offering v1 when `v1`.
@@ -2081,14 +2102,77 @@ mod tests {
                 write_timeout: Duration::from_secs(5),
                 ping_period: Duration::from_millis(50),
             },
-        )
-        .await;
+            None,
+        );
         // Not reading means not answering the node's pings either.
         let (_ws, _) = connect(&base, "", &[], true).await.unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(3), done.recv())
             .await
             .expect("the stream outlived its read timeout");
         assert_eq!(ended, Some(true));
+    }
+
+    /// A client that sent a burst of Gets and then only reads, slower
+    /// than the node answers, keeps the reply queue full the whole time.
+    /// It must still get pings (and so send pongs), or the idle deadline
+    /// drops it with replies still pending, which bee never does.
+    #[tokio::test]
+    async fn a_slow_reader_with_a_full_reply_queue_is_kept_alive() {
+        const GETS: usize = 1000;
+        let (addr, wire) = cac(&[9u8; 4096]);
+        let (base, node, mut done) = serve_timed(
+            HashMap::from([(addr, wire)]),
+            V1Timing {
+                read_timeout: Duration::from_millis(600),
+                write_timeout: Duration::from_secs(30),
+                ping_period: Duration::from_millis(50),
+            },
+            Some(16 * 1024),
+        );
+        // Small socket buffers keep loopback from buffering the whole
+        // backlog in the kernel, where a ping would queue behind it on
+        // bee too: the backlog has to sit in the node's reply queue.
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(8 * 1024).unwrap();
+        let tcp = tcp
+            .connect(base.trim_start_matches("ws://").parse().unwrap())
+            .await
+            .unwrap();
+        let mut req = format!("{base}/chunks/stream")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("bee-chunk-stream-v1"),
+        );
+        let (mut ws, _) = tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(tcp))
+            .await
+            .unwrap();
+        for _ in 0..GETS {
+            send(&mut ws, &get(&addr, pb::CacheOption::Default)).await;
+        }
+        // Let the workers fill the socket buffers and the reply queue.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            node.gets() < GETS / 2,
+            "the kernel buffered the backlog: {}",
+            node.gets()
+        );
+        // Drain several read timeouts' worth slower than replies arrive,
+        // sending nothing but the pongs the client library answers with.
+        let started = tokio::time::Instant::now();
+        for i in 0..GETS {
+            let reply = tokio::time::timeout(Duration::from_secs(5), get_reply(&mut ws))
+                .await
+                .unwrap_or_else(|_| panic!("reply {i} never came"));
+            assert_eq!(reply.status, Status::Ok as i32, "reply {i}");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert!(started.elapsed() > Duration::from_millis(1800));
+        assert!(done.try_recv().is_err(), "the stream was dropped");
+        // And the socket still serves requests.
+        send(&mut ws, &get(&addr, pb::CacheOption::Default)).await;
+        assert_eq!(get_reply(&mut ws).await.status, Status::Ok as i32);
     }
 
     /// A reply write that times out (a client that stopped reading) ends
@@ -2103,8 +2187,8 @@ mod tests {
                 write_timeout: Duration::from_millis(300),
                 ping_period: Duration::from_secs(60),
             },
-        )
-        .await;
+            None,
+        );
         let (mut ws, _) = connect(&base, "", &[], true).await.unwrap();
         // More replies than the socket buffers hold, but few enough to
         // queue, so the reader is idle when the writer gives up.
