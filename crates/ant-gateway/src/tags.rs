@@ -154,8 +154,9 @@ impl TagRegistry {
     }
 
     /// Add `n` fully-processed chunks to an existing tag's cumulative
-    /// counters without touching its address. Used by the
-    /// `/chunks/stream` WebSocket upload, where chunks arrive one at a
+    /// counters without touching its address. Used by the legacy
+    /// upload-only `/chunks/stream` framing (`bee-chunk-stream-v1`
+    /// rejects a tag at the handshake), where chunks arrive one at a
     /// time and each is pushsynced synchronously before the ack, so
     /// split/stored/sent/synced advance in lock-step (bee's deferred
     /// pipeline splits these; ant's synchronous path doesn't). No-op

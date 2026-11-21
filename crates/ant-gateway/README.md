@@ -101,6 +101,64 @@ when forwarders accept our pushes (see Phase 7 polish in PLAN.md
 generate, but a sustained 1 GB+ upload would eventually trip
 their disconnect threshold.
 
+### `GET /chunks/stream`
+
+One WebSocket path, two protocols, picked by the
+`Sec-WebSocket-Protocol` the client offers:
+
+- **`bee-chunk-stream-v1`** (offered by the client, selected by the
+  node): bee's two-way chunk stream from
+  https://github.com/ethersphere/bee/pull/5618 (bee API 9.0.0), on
+  the wire exactly as bee speaks it. Each binary message is one
+  protobuf `Request` (`pkg/api/pb/chunkstream.proto`): a `GetRequest`
+  or a `PutRequest`. Each request gets one `GetResponse` /
+  `PutResponse` keyed by the chunk address, in completion order, with
+  a status (`OK`, `NOT_FOUND`, `ERROR`, `BAD_REQUEST`, `BUSY`,
+  `UNAVAILABLE`). A failed request does not close the socket. Gets go
+  through the `GET /chunks/{addr}` lookup, so `Swarm-Cache` /
+  `?cache=` / the per-request `CacheOption` mean what `swarm-cache`
+  means there (see above: `false` skips the cache read too). A Get
+  that misses is `NOT_FOUND` (or `ERROR` with no peer to ask), even
+  on a cold node, never `UNAVAILABLE`: `UNAVAILABLE` maps
+  the same `NotReady` that `GET /chunks` answers 503, which the
+  node's single-chunk lookup doesn't produce today.
+  Puts are accepted only if the data rebuilds to the requested address
+  as a CAC or a validly signed SOC. They are then pushed like
+  `POST /chunks` / `POST /soc`, and `OK` means pushed. Stamp
+  precedence: the request's pre-signed `Stamp`, its `BatchId`, then
+  the connection's `Swarm-Postage-Batch-Id`, which pins every upload
+  to that batch. `Swarm-Tag` is a `400` at the handshake. A bad
+  connection batch is a `404` / `422` / `500` there. Close codes are
+  bee's: `1003` for a non-binary, undecodable or body-less message,
+  `1009` above 8 KiB (above 64 KiB the WebSocket layer itself closes
+  the socket, with no code). 8 Get and 8 Put workers serve 1024-deep queues;
+  a full queue answers `BUSY`, and a client that stops reading
+  replies stalls the node's reads of its requests.
+- **Anything else** (no subprotocol offered): the upload-only stream
+  bee served before that PR, unchanged. Each binary message is a raw
+  `span ‖ payload` chunk (behind a 113-byte stamp without
+  `swarm-postage-batch-id`), and an empty binary message acks it.
+  `swarm-tag` works, and errors close the socket. **This differs
+  from bee**, which dropped this framing and closes a raw chunk with
+  `1003`: ant keeps serving it because its own clients and older
+  tooling still send raw chunks. A client that wants the new protocol
+  must offer `bee-chunk-stream-v1` and check that it was selected,
+  which is what bee asks of its clients too.
+
+Differences from bee on the v1 protocol:
+
+- A pre-signed stamp is checked the way `POST /chunks` checks one: its
+  signature must recover over the chunk address, and its batch must
+  match a pinned connection batch. Bee's `Stamp.Valid` also checks the
+  batch owner, bucket and index, which a light node has no batch store
+  to read per chunk.
+- A node shutting down drops the socket instead of sending bee's
+  `1001`.
+- A node-stamped chunk's batch is looked up in the node's own postage
+  list on every chunk: `batch with id not found` when the node holds
+  no issuer for it, `batch not usable yet or does not exist` once
+  storers have rejected it.
+
 ### Bee-API drop-in gap
 
 The HTTP surface above gets bee-js's read path working unchanged.

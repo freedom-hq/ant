@@ -22,6 +22,10 @@ hyper = { workspace = true, optional = true }
 # `swarm-act-publisher` parsing and grantee-list keys.
 k256 = { workspace = true, optional = true }
 primitive-types = { version = "0.14.0", default-features = false, optional = true }
+# Protobuf messages of the `/chunks/stream` `bee-chunk-stream-v1`
+# protocol (bee `pkg/api/pb/chunkstream.proto`), hand-derived like
+# ant-p2p's wire messages.
+prost = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 # Tar reader for `POST /bzz` collection uploads. Pure-Rust, no compression
@@ -67,6 +71,7 @@ http-api = [
   "dep:tower",
   "dep:ant-crypto",
   "dep:ant-postage",
+  "dep:prost",
 ]
 chain = ["http-api", "dep:ant-chain", "dep:anyhow", "dep:primitive-types"]
 

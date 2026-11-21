@@ -270,7 +270,8 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 /// multi-chunk envelope.
 pub(crate) const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default cap on a single-chunk *push* (`POST /chunks`, `/soc`,
-/// `/feeds`, `/pss/send`'s push, each `/chunks/stream` chunk). Longer
+/// `/feeds`, `/pss/send`'s push, each legacy-framing `/chunks/stream`
+/// chunk; a `bee-chunk-stream-v1` Put waits untimed, like bee). Longer
 /// than [`CHUNK_REQUEST_TIMEOUT`]: right after a buy, the node waits
 /// for the storers to sync the new batch instead of failing the push
 /// (`BATCH_PROPAGATION` + `PROPAGATION_REJECTION_GRACE` in `ant-p2p`,
@@ -370,18 +371,6 @@ pub async fn chunk(
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
-    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
-    // A miss is an answer here (a feed slot not written yet): fast-miss
-    // lookup (issue #146).
-    let cmd = ControlCommand::GetChunkRaw {
-        reference,
-        fast_miss: true,
-        bypass_cache,
-        ack: ack_tx,
-    };
-    if handle.commands.send(cmd).await.is_err() {
-        return node_unavailable();
-    }
     // Single-chunk fetches go through `GetChunkRaw`, which doesn't
     // emit `Progress` acks — we just record the in-flight count
     // until the bytes come back. The body materialises in one
@@ -389,46 +378,102 @@ pub async fn chunk(
     // beyond this handler frame.
     guard.update(0, 1, 1, 0);
 
-    let ack = match tokio::time::timeout(timeout, ack_rx).await {
-        Ok(Ok(ack)) => ack,
-        Ok(Err(_)) => return node_unavailable(),
-        Err(_) => {
+    let bytes = match fetch_raw_chunk(&handle, reference, bypass_cache, timeout).await {
+        RawChunk::Data(data) => data,
+        RawChunk::NodeGone => return node_unavailable(),
+        RawChunk::Timeout => {
             return json_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("retrieval timed out after {}s", timeout.as_secs()),
             );
         }
-    };
-
-    let bytes = match ack {
-        ControlAck::Bytes { data } => data,
-        ControlAck::NotReady { message } => {
+        RawChunk::NotReady(message) => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
-        // Peers confirmed the chunk missing, typed by the node (issue
-        // #146): bee's 404 even when the last answer was `no peer found`,
-        // which the substring check below would have turned into a 502.
-        ControlAck::NotFound { message } => {
-            debug!(target: "ant_gateway", %message, "chunk not found");
-            return json_error(StatusCode::NOT_FOUND, "chunk not found");
-        }
-        ControlAck::Error { message } => {
-            // Bee: a miss is `404 "chunk not found"`; anything else is
-            // its generic `"read chunk failed"`. Detail goes to the log.
-            debug!(target: "ant_gateway", %message, "chunk fetch failed");
-            if message.contains("not found") {
-                return json_error(StatusCode::NOT_FOUND, "chunk not found");
-            }
-            return json_error(StatusCode::BAD_GATEWAY, "read chunk failed");
-        }
-        other => {
-            warn!(target: "ant_gateway", ?other, "unexpected ack from GetChunkRaw");
+        RawChunk::NotFound => return json_error(StatusCode::NOT_FOUND, "chunk not found"),
+        RawChunk::Failed => return json_error(StatusCode::BAD_GATEWAY, "read chunk failed"),
+        RawChunk::Unexpected => {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
         }
     };
     let len = bytes.len() as u64;
     guard.update(1, 1, 0, len);
     chunk_response(method, bytes)
+}
+
+/// Outcome of one [`fetch_raw_chunk`] lookup, already classified the
+/// way `GET /chunks/{addr}` answers it. Shared with the
+/// `/chunks/stream` Get path so both read a miss, a starved pool and a
+/// failure the same way.
+pub(crate) enum RawChunk {
+    /// The chunk's wire bytes (`span ‖ payload`, or a SOC's
+    /// `id ‖ sig ‖ span ‖ payload`).
+    Data(Vec<u8>),
+    /// The node loop is gone (command channel or ack dropped).
+    NodeGone,
+    /// No answer within the caller's timeout.
+    Timeout,
+    /// `ControlAck::NotReady`: `GET /chunks`' 503.
+    NotReady(String),
+    /// Confirmed miss: `GET /chunks`' 404 `"chunk not found"`.
+    NotFound,
+    /// Any other retrieval failure: `GET /chunks`' 502
+    /// `"read chunk failed"`.
+    Failed,
+    /// An ack `GetChunkRaw` never sends.
+    Unexpected,
+}
+
+/// Fetch one chunk by address through the node's `GetChunkRaw`, the
+/// lookup `GET /chunks/{addr}` uses: fast-miss mode (a miss is an
+/// answer here, issue #146) and `bypass_cache` for `swarm-cache: false`
+/// (issue #80).
+pub(crate) async fn fetch_raw_chunk(
+    handle: &GatewayHandle,
+    reference: [u8; 32],
+    bypass_cache: bool,
+    timeout: Duration,
+) -> RawChunk {
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::GetChunkRaw {
+        reference,
+        fast_miss: true,
+        bypass_cache,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return RawChunk::NodeGone;
+    }
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return RawChunk::NodeGone,
+        Err(_) => return RawChunk::Timeout,
+    };
+    match ack {
+        ControlAck::Bytes { data } => RawChunk::Data(data),
+        ControlAck::NotReady { message } => RawChunk::NotReady(message),
+        // Peers confirmed the chunk missing, typed by the node (issue
+        // #146): bee's 404 even when the last answer was `no peer found`,
+        // which the substring check below would have turned into a 502.
+        ControlAck::NotFound { message } => {
+            debug!(target: "ant_gateway", %message, "chunk not found");
+            RawChunk::NotFound
+        }
+        ControlAck::Error { message } => {
+            // Bee: a miss is `404 "chunk not found"`; anything else is
+            // its generic `"read chunk failed"`. Detail goes to the log.
+            debug!(target: "ant_gateway", %message, "chunk fetch failed");
+            if message.contains("not found") {
+                RawChunk::NotFound
+            } else {
+                RawChunk::Failed
+            }
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from GetChunkRaw");
+            RawChunk::Unexpected
+        }
+    }
 }
 
 /// `GET /soc/{owner}/{id}` and `HEAD /soc/{owner}/{id}` — fetch a
@@ -772,7 +817,7 @@ fn parse_stamp_or_batch(headers: &HeaderMap) -> Result<(Option<[u8; 113]>, [u8; 
 /// stamp cannot have been signed over this chunk by anyone. Bee runs
 /// the equivalent check (plus an on-chain owner comparison a light
 /// node can't make) inside `postage.NewPresignedStamper` at Put time.
-fn presigned_stamp_covers(stamp: &[u8; 113], addr: &[u8; 32]) -> bool {
+pub(crate) fn presigned_stamp_covers(stamp: &[u8; 113], addr: &[u8; 32]) -> bool {
     let batch: &[u8; 32] = stamp[0..32].try_into().expect("stamp slice");
     let index: &[u8; 8] = stamp[32..40].try_into().expect("stamp slice");
     let ts: &[u8; 8] = stamp[40..48].try_into().expect("stamp slice");
@@ -835,17 +880,13 @@ pub async fn upload_chunk(
         .begin(GatewayRequestKind::Chunk, "upload".to_string());
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
-    let cmd = ControlCommand::PushChunk {
-        wire: body.to_vec(),
+    let cmd = bee_push_command(
+        None,
+        body.to_vec(),
         batch_id,
-        stamp: stamp.map(|s| s.to_vec()),
-        // Bee-parity: accept a shallow receipt after the deeper-storer
-        // hunt, exactly like bee's own pusher (strict receipts are the
-        // upload-job manager's policy, not the HTTP API's).
-        require_deep: false,
-        ack_when_stored: false,
-        ack: ack_tx,
-    };
+        stamp.map(|s| s.to_vec()),
+        ack_tx,
+    );
     if handle.commands.send(cmd).await.is_err() {
         return node_unavailable();
     }
@@ -1174,6 +1215,99 @@ pub async fn upload_pss(
     }
 }
 
+/// The push a bee-parity upload endpoint (`POST /chunks`, `POST /soc`,
+/// a `/chunks/stream` Put) sends for one chunk: `PushSoc` when the
+/// chunk is a SOC (`soc_address`), `PushChunk` for a CAC. Both accept a
+/// shallow receipt after the deeper-storer hunt, exactly like bee's own
+/// pusher (strict receipts are the upload-job manager's policy, not the
+/// HTTP API's), and answer once the push is done.
+pub(crate) fn bee_push_command(
+    soc_address: Option<[u8; 32]>,
+    wire: Vec<u8>,
+    batch_id: [u8; 32],
+    stamp: Option<Vec<u8>>,
+    ack: oneshot::Sender<ControlAck>,
+) -> ControlCommand {
+    match soc_address {
+        Some(address) => ControlCommand::PushSoc {
+            address,
+            wire,
+            batch_id,
+            stamp,
+            ack_when_stored: false,
+            ack,
+        },
+        None => ControlCommand::PushChunk {
+            wire,
+            batch_id,
+            stamp,
+            require_deep: false,
+            ack_when_stored: false,
+            ack,
+        },
+    }
+}
+
+/// Whether the node can stamp with a batch, as `PushChunk` sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchUse {
+    /// Registered and usable, or just bought and still propagating
+    /// (which `PushChunk` accepts and waits out).
+    Usable,
+    /// Registered, but storers rejected its stamps as not on chain.
+    Unusable,
+    /// Not a batch this node holds an issuer for.
+    Unknown,
+}
+
+/// Why [`batch_use`] could not answer: a failed lookup, not an unknown
+/// batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchLookupError {
+    /// The node loop dropped or didn't answer the request.
+    NodeGone,
+    /// The node answered with something other than a postage list.
+    UnexpectedAck,
+}
+
+/// Look a batch up in the node's postage list.
+pub(crate) async fn batch_use(
+    handle: &GatewayHandle,
+    batch_id: &[u8; 32],
+) -> Result<BatchUse, BatchLookupError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if handle
+        .commands
+        .send(ControlCommand::PostageList { ack: ack_tx })
+        .await
+        .is_err()
+    {
+        return Err(BatchLookupError::NodeGone);
+    }
+    let views = match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(ControlAck::PostageList(views))) => views,
+        Ok(Ok(other)) => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack for postage list");
+            return Err(BatchLookupError::UnexpectedAck);
+        }
+        _ => return Err(BatchLookupError::NodeGone),
+    };
+    let id_hex = hex::encode(batch_id);
+    let Some(view) = views.iter().find(|v| {
+        v.enabled
+            && v.batch_id
+                .trim_start_matches("0x")
+                .eq_ignore_ascii_case(&id_hex)
+    }) else {
+        return Ok(BatchUse::Unknown);
+    };
+    Ok(if view.usable || view.propagating {
+        BatchUse::Usable
+    } else {
+        BatchUse::Unusable
+    })
+}
+
 /// Pre-flight for `/pss/send`: the batch must be a **registered, usable
 /// issuer** on this node — the same bar (and the same "not usable"
 /// wording, so status mapping stays uniform) that `PushChunk` applies,
@@ -1182,41 +1316,17 @@ pub async fn upload_pss(
 /// for `PushChunk`, which waits the propagation out.
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if handle
-        .commands
-        .send(ControlCommand::PostageList { ack: ack_tx })
-        .await
-        .is_err()
-    {
-        return Err(node_unavailable());
-    }
-    let views = match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
-        Ok(Ok(ControlAck::PostageList(views))) => views,
-        Ok(Ok(other)) => {
-            warn!(target: "ant_gateway", ?other, "unexpected ack for postage list");
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unexpected node ack",
-            ));
-        }
-        _ => return Err(node_unavailable()),
-    };
-    let id_hex = hex::encode(batch_id);
-    let usable = views.iter().any(|v| {
-        v.enabled
-            && (v.usable || v.propagating)
-            && v.batch_id
-                .trim_start_matches("0x")
-                .eq_ignore_ascii_case(&id_hex)
-    });
-    if usable {
-        Ok(())
-    } else {
-        Err(json_error(
+    match batch_use(handle, batch_id).await {
+        Err(BatchLookupError::NodeGone) => Err(node_unavailable()),
+        Err(BatchLookupError::UnexpectedAck) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected node ack",
+        )),
+        Ok(BatchUse::Usable) => Ok(()),
+        Ok(BatchUse::Unusable | BatchUse::Unknown) => Err(json_error(
             StatusCode::BAD_REQUEST,
-            format!("batch 0x{id_hex} not usable"),
-        ))
+            format!("batch 0x{} not usable", hex::encode(batch_id)),
+        )),
     }
 }
 
@@ -1341,14 +1451,13 @@ pub async fn upload_soc(
     );
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
-    let cmd = ControlCommand::PushSoc {
-        address,
+    let cmd = bee_push_command(
+        Some(address),
         wire,
         batch_id,
-        stamp: stamp.map(|s| s.to_vec()),
-        ack_when_stored: false,
-        ack: ack_tx,
-    };
+        stamp.map(|s| s.to_vec()),
+        ack_tx,
+    );
     if handle.commands.send(cmd).await.is_err() {
         return node_unavailable();
     }
@@ -3893,7 +4002,7 @@ fn parse_pin_header(headers: &HeaderMap) -> Result<bool, Response> {
 /// those are fetched from the network too, where bee would serve them
 /// locally.
 #[allow(clippy::result_large_err)]
-fn parse_cache_header(headers: &HeaderMap) -> Result<bool, Response> {
+pub(crate) fn parse_cache_header(headers: &HeaderMap) -> Result<bool, Response> {
     let Some(raw) = headers.get(&SWARM_CACHE) else {
         return Ok(false);
     };
