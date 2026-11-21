@@ -98,7 +98,9 @@ pub fn build(handle: GatewayHandle) -> Router {
                 .post(pins::pin_post)
                 .delete(pins::pin_delete),
         )
-        // WebSocket chunk-upload stream (bee `chunk_stream.go`).
+        // WebSocket chunk stream (bee `chunk_stream.go`):
+        // `bee-chunk-stream-v1` Get/Put when the client offers the
+        // subprotocol, the legacy upload-only framing otherwise.
         .route("/chunks/stream", get(chunk_stream::chunk_stream))
         // On-chain postage mutation (PLAN.md J.5 B2/B3): buy / topup /
         // dilute. `501` when no funded wallet key is configured.
