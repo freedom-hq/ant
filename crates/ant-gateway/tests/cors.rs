@@ -54,6 +54,41 @@ async fn preflight_from_null_origin_is_allowed() {
         .contains("origin"));
 }
 
+/// A preflight that lists no `Access-Control-Request-Headers` gets the
+/// default allow-header set, which must carry `Swarm-Cache` and
+/// `Swarm-Postage-Stamp` (bee parity,
+/// <https://github.com/freedom-hq/ant/issues/273>,
+/// <https://github.com/ethersphere/bee/pull/5698>).
+#[tokio::test]
+async fn preflight_default_allow_headers_include_swarm_cache_and_postage_stamp() {
+    let resp = send(
+        null_cors_router(),
+        Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/chunks")
+            .header("origin", "null")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let h = resp.headers();
+    assert_eq!(h.get("access-control-allow-origin").unwrap(), "null");
+    let allow: Vec<String> = h
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    for name in ["swarm-cache", "swarm-postage-stamp"] {
+        assert!(allow.iter().any(|a| a == name), "{name} missing: {allow:?}");
+    }
+}
+
 /// An actual (non-preflight) request from an allowed origin gets the
 /// allow-origin echo plus the expose-headers list bee-js needs to read
 /// `Swarm-Tag-Uid` etc.
