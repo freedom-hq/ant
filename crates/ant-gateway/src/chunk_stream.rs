@@ -36,7 +36,9 @@
 //!   always direct); a bad connection batch is `404` (unknown), `422`
 //!   (not usable) or `500` (lookup failed).
 //! * Closing: `1003` for a non-binary message, an undecodable request
-//!   or one without a body, `1009` for a message over 8 KiB. 15 minutes
+//!   or one without a body, `1009` for a message over 8 KiB (one over
+//!   64 KiB is refused by the WebSocket layer itself, with a close
+//!   frame that carries no code). 15 minutes
 //!   without any client frame drops the connection; the node pings
 //!   every 60 s so a client only waiting for replies stays connected.
 //! * Backpressure: Gets and Puts each have a 1024-deep queue served by
@@ -52,6 +54,8 @@
 //! node has no batch store to read those from per chunk. A node-stamped
 //! batch that storers rejected answers `batch not usable yet or does
 //! not exist`, one the node does not hold `batch with id not found`.
+//! A node shutting down drops the socket instead of sending bee's
+//! `1001 "node shutting down"`.
 //!
 //! # Legacy upload-only framing
 //!
@@ -285,7 +289,7 @@ async fn v1_handshake(
             Ok(BatchUse::Unknown) => {
                 return json_error(StatusCode::NOT_FOUND, "batch with id not found");
             }
-            Err(()) => {
+            Err(_) => {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot get batch");
             }
         },
@@ -308,6 +312,7 @@ async fn v1_handshake(
         handle,
         default_batch,
         default_cache,
+        timing: V1Timing::BEE,
     });
     ws.protocols([CHUNK_STREAM_SUBPROTOCOL])
         .max_message_size(MAX_WS_MESSAGE)
@@ -363,6 +368,26 @@ struct V1Conn {
     default_batch: Option<[u8; 32]>,
     /// Cache retrieved chunks unless a request says otherwise.
     default_cache: bool,
+    timing: V1Timing,
+}
+
+/// A v1 connection's keepalive and write bounds (shortened by tests).
+#[derive(Clone, Copy)]
+struct V1Timing {
+    /// No client frame (request, ping or pong) for this long ends the
+    /// stream.
+    read_timeout: Duration,
+    /// One reply or ping write.
+    write_timeout: Duration,
+    ping_period: Duration,
+}
+
+impl V1Timing {
+    const BEE: Self = Self {
+        read_timeout: STREAM_READ_TIMEOUT,
+        write_timeout: STREAM_WRITE_TIMEOUT,
+        ping_period: STREAM_PING_PERIOD,
+    };
 }
 
 /// What the writer sends.
@@ -380,7 +405,7 @@ enum Outgoing {
 async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
     let (sink, mut stream) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(REPLY_QUEUE);
-    let mut writer = tokio::spawn(write_replies(sink, out_rx));
+    let mut writer = tokio::spawn(write_replies(sink, out_rx, conn.timing.write_timeout));
 
     let (get_tx, get_rx) = mpsc::channel::<pb::GetRequest>(STREAM_QUEUE);
     let (put_tx, put_rx) = mpsc::channel::<pb::PutRequest>(STREAM_QUEUE);
@@ -422,14 +447,27 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
         });
     }
 
+    let timing = conn.timing;
     let mut ping = tokio::time::interval_at(
-        tokio::time::Instant::now() + STREAM_PING_PERIOD,
-        STREAM_PING_PERIOD,
+        tokio::time::Instant::now() + timing.ping_period,
+        timing.ping_period,
     );
+    // One deadline for the whole loop, moved only by a client frame:
+    // the node's own pings must not keep a silent client alive.
+    let idle = tokio::time::sleep(timing.read_timeout);
+    tokio::pin!(idle);
+    let mut writer_done = false;
     loop {
         let msg = tokio::select! {
             // The writer only ends on a failed or timed-out write.
-            _ = &mut writer => break,
+            _ = &mut writer => {
+                writer_done = true;
+                break;
+            }
+            () = &mut idle => {
+                debug!(target: "ant_gateway", "chunk stream: read timeout");
+                break;
+            }
             _ = ping.tick() => {
                 // Best effort: a full reply queue already keeps the
                 // writer busy, and the pong would only extend a
@@ -437,21 +475,20 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
                 let _ = out_tx.try_send(Outgoing::Ping);
                 continue;
             }
-            msg = tokio::time::timeout(STREAM_READ_TIMEOUT, stream.next()) => msg,
+            msg = stream.next() => msg,
         };
+        // Any client frame, pongs and pings included, extends it.
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + timing.read_timeout);
         let data = match msg {
-            Err(_) => {
-                debug!(target: "ant_gateway", "chunk stream: read timeout");
-                break;
-            }
-            Ok(None | Some(Err(_) | Ok(Message::Close(_)))) => break,
-            // axum answers pings itself; any frame extends the deadline.
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
-            Ok(Some(Ok(Message::Text(_)))) => {
+            None | Some(Err(_) | Ok(Message::Close(_))) => break,
+            // axum answers pings itself.
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Text(_))) => {
                 send_close(&out_tx, CLOSE_UNSUPPORTED, "invalid message type").await;
                 break;
             }
-            Ok(Some(Ok(Message::Binary(data)))) => data,
+            Some(Ok(Message::Binary(data))) => data,
         };
         if data.len() > MAX_STREAM_FRAME {
             // gorilla's read limit: close 1009 with no reason text.
@@ -507,10 +544,12 @@ async fn run_v1(conn: Arc<V1Conn>, socket: WebSocket) {
     workers.abort_all();
     drop(out_tx);
     // Let the writer flush a close frame (or finish a reply), but never
-    // wait on a client that stopped reading.
-    if tokio::time::timeout(Duration::from_secs(1), &mut writer)
-        .await
-        .is_err()
+    // wait on a client that stopped reading. A writer that already
+    // ended must not be polled again.
+    if !writer_done
+        && tokio::time::timeout(Duration::from_secs(1), &mut writer)
+            .await
+            .is_err()
     {
         writer.abort();
     }
@@ -531,6 +570,7 @@ async fn send_close(out: &mpsc::Sender<Outgoing>, code: u16, reason: &'static st
 async fn write_replies(
     mut sink: futures::stream::SplitSink<WebSocket, Message>,
     mut out: mpsc::Receiver<Outgoing>,
+    write_timeout: Duration,
 ) {
     while let Some(item) = out.recv().await {
         let (msg, last) = match item {
@@ -544,7 +584,7 @@ async fn write_replies(
                 true,
             ),
         };
-        match tokio::time::timeout(STREAM_WRITE_TIMEOUT, sink.send(msg)).await {
+        match tokio::time::timeout(write_timeout, sink.send(msg)).await {
             Ok(Ok(())) if !last => {}
             _ => return,
         }
@@ -632,10 +672,11 @@ async fn handle_put(conn: &V1Conn, req: pb::PutRequest) -> pb::Response {
     if conn.handle.commands.send(cmd).await.is_err() {
         return reply(pb::Status::Error, "chunk write error");
     }
-    // Like bee, the reply waits for the push with no time limit of its
-    // own (the node's push has its own deadlines): a gateway timeout
-    // could answer a retry of a still-running push before it is done.
-    // The wait ends with the stream, which aborts this worker.
+    // Like bee, the reply waits for the node's push with no time limit
+    // of its own; it comes when the push is done or has given up (bee's
+    // reason: a timeout here lets a client retry a chunk whose first
+    // push is still running). The wait ends with the stream, which
+    // aborts this worker.
     let Ok(ack) = ack_rx.await else {
         return reply(pb::Status::Error, "chunk push failed");
     };
@@ -712,7 +753,7 @@ async fn stamp_for(
         Ok(BatchUse::Usable) => Ok((batch, None)),
         Ok(BatchUse::Unusable) => Err(bad("batch not usable yet or does not exist")),
         Ok(BatchUse::Unknown) => Err(bad("batch with id not found")),
-        Err(()) => Err((pb::Status::Error, "failed to stamp chunk")),
+        Err(_) => Err((pb::Status::Error, "failed to stamp chunk")),
     }
 }
 
@@ -1059,6 +1100,8 @@ mod tests {
     const NOT_READY: [u8; 32] = [0xee; 32];
     /// `GetChunkRaw` answers late.
     const SLOW: [u8; 32] = [0x51; 32];
+    /// `GetChunkRaw` never answers a reference starting with this byte.
+    const HANG: u8 = 0x99;
     const SECRET: [u8; 32] = [0x11; 32];
 
     /// What the fake node was asked to do.
@@ -1122,6 +1165,9 @@ mod tests {
                 if reference == SLOW {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
+                if reference[0] == HANG {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
                 let reply = if reference == NOT_READY {
                     ControlAck::NotReady {
                         message: "no peer left to ask".into(),
@@ -1183,8 +1229,8 @@ mod tests {
         }
     }
 
-    /// Serve the real router over a fake node holding `chunks`.
-    async fn serve(chunks: HashMap<[u8; 32], Vec<u8>>) -> (String, Arc<Node>, axum::Router) {
+    /// A gateway handle over a fake node holding `chunks`.
+    fn fake_node(chunks: HashMap<[u8; 32], Vec<u8>>) -> (GatewayHandle, Arc<Node>) {
         let node = Arc::new(Node {
             chunks,
             seen: StdMutex::new(Vec::new()),
@@ -1224,12 +1270,53 @@ mod tests {
             on_chequebook_refused: None,
             cache: None,
         };
-        let router = crate::router::build(handle);
+        (handle, node)
+    }
+
+    async fn listen(router: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let r = router.clone();
-        tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
-        (format!("ws://{addr}"), node, router)
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("ws://{addr}")
+    }
+
+    /// Serve the real router over a fake node holding `chunks`.
+    async fn serve(chunks: HashMap<[u8; 32], Vec<u8>>) -> (String, Arc<Node>, axum::Router) {
+        let (handle, node) = fake_node(chunks);
+        let router = crate::router::build(handle);
+        let base = listen(router.clone()).await;
+        (base, node, router)
+    }
+
+    /// Serve [`run_v1`] directly with shortened `timing`, reporting
+    /// through the returned receiver whether the connection's task
+    /// ended without a panic.
+    async fn serve_timed(
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        timing: V1Timing,
+    ) -> (String, Arc<Node>, mpsc::Receiver<bool>) {
+        let (handle, node) = fake_node(chunks);
+        let (done_tx, done_rx) = mpsc::channel(4);
+        let router = axum::Router::new().route(
+            "/chunks/stream",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let conn = Arc::new(V1Conn {
+                    handle: handle.clone(),
+                    default_batch: None,
+                    default_cache: true,
+                    timing,
+                });
+                let done = done_tx.clone();
+                async move {
+                    ws.protocols([CHUNK_STREAM_SUBPROTOCOL])
+                        .on_upgrade(move |socket| async move {
+                            let ended = tokio::spawn(run_v1(conn, socket)).await;
+                            let _ = done.send(ended.is_ok()).await;
+                        })
+                }
+            }),
+        );
+        (listen(router).await, node, done_rx)
     }
 
     /// Open `/chunks/stream{query}`, offering v1 when `v1`.
@@ -1891,5 +1978,143 @@ mod tests {
             }
             other => panic!("expected the legacy tag 404, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// The messages' bytes, worked out by hand from bee's
+    /// `chunkstream.proto` field numbers and wire types, so a wrong tag
+    /// can't pass by being wrong on both ends.
+    #[test]
+    fn wire_format_matches_bees_proto() {
+        // Request{Get=1{Address=1: 32x01, Cache=2: DISABLE(1)}}
+        let mut want = vec![0x0a, 0x24, 0x0a, 0x20];
+        want.extend([1u8; 32]);
+        want.extend([0x10, 0x01]);
+        assert_eq!(
+            get(&[1u8; 32], pb::CacheOption::Disable).encode_to_vec(),
+            want
+        );
+
+        // Request{Put=2{Address=1, Data=2: dead, BatchId=4}}, no Stamp.
+        let mut want = vec![0x12, 0x48, 0x0a, 0x20];
+        want.extend([2u8; 32]);
+        want.extend([0x12, 0x02, 0xde, 0xad, 0x22, 0x20]);
+        want.extend([3u8; 32]);
+        assert_eq!(
+            put(&[2u8; 32], &[0xde, 0xad], &[], &[3u8; 32]).encode_to_vec(),
+            want
+        );
+        // Stamp is field 3.
+        let with_stamp = put(&[2u8; 32], &[], &[0x55], &[]).encode_to_vec();
+        assert_eq!(&with_stamp[36..], &[0x1a, 0x01, 0x55]);
+
+        // Response{Get=1{Address=1, Status=2: OK(1), Data=3: ab}}
+        let mut want = vec![0x0a, 0x27, 0x0a, 0x20];
+        want.extend([1u8; 32]);
+        want.extend([0x10, 0x01, 0x1a, 0x01, 0xab]);
+        assert_eq!(
+            pb::get_response(vec![1u8; 32], Status::Ok, vec![0xab], "").encode_to_vec(),
+            want
+        );
+        // Response{Put=2{Address=1, Status=2: BAD_REQUEST(4), Error=3: "x"}}
+        let mut want = vec![0x12, 0x27, 0x0a, 0x20];
+        want.extend([2u8; 32]);
+        want.extend([0x10, 0x04, 0x1a, 0x01, b'x']);
+        assert_eq!(
+            pb::put_response(vec![2u8; 32], Status::BadRequest, "x").encode_to_vec(),
+            want
+        );
+        // The rest of the status numbering.
+        assert_eq!(
+            [
+                Status::NotFound,
+                Status::Error,
+                Status::Busy,
+                Status::Unavailable
+            ]
+            .map(|s| s as i32),
+            [2, 3, 5, 6]
+        );
+        assert_eq!(pb::CacheOption::Enable as i32, 2);
+    }
+
+    /// With every Get worker busy and the queue full, the next Get is
+    /// answered `BUSY`, echoing its address.
+    #[tokio::test]
+    async fn a_full_queue_answers_busy() {
+        let (base, node, _) = serve(HashMap::new()).await;
+        let (mut ws, _) = connect(&base, "", &[], true).await.unwrap();
+        let hang = |i: u16| {
+            let mut a = [HANG; 32];
+            a[1..3].copy_from_slice(&i.to_be_bytes());
+            a
+        };
+        for i in 0..STREAM_WORKERS as u16 {
+            send(&mut ws, &get(&hang(i), pb::CacheOption::Default)).await;
+        }
+        while node.gets() < STREAM_WORKERS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for i in 0..STREAM_QUEUE as u16 {
+            send(&mut ws, &get(&hang(1000 + i), pb::CacheOption::Default)).await;
+        }
+        let last = hang(9999);
+        send(&mut ws, &get(&last, pb::CacheOption::Default)).await;
+        let g = get_reply(&mut ws).await;
+        assert_eq!(
+            (g.address.as_slice(), g.status, g.error.as_str()),
+            (&last[..], Status::Busy as i32, "request queue full")
+        );
+        // A full Get queue doesn't hold up Puts.
+        let (addr, wire) = cac(b"not blocked");
+        send(&mut ws, &put(&addr, &wire, &[], &BATCH_A)).await;
+        assert_eq!(put_reply(&mut ws).await.status, Status::Ok as i32);
+    }
+
+    /// A client that sends nothing, not even a pong, is dropped once the
+    /// read timeout passes, although the node keeps pinging it.
+    #[tokio::test]
+    async fn a_silent_client_is_dropped() {
+        let (base, _, mut done) = serve_timed(
+            HashMap::new(),
+            V1Timing {
+                read_timeout: Duration::from_millis(300),
+                write_timeout: Duration::from_secs(5),
+                ping_period: Duration::from_millis(50),
+            },
+        )
+        .await;
+        // Not reading means not answering the node's pings either.
+        let (_ws, _) = connect(&base, "", &[], true).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(3), done.recv())
+            .await
+            .expect("the stream outlived its read timeout");
+        assert_eq!(ended, Some(true));
+    }
+
+    /// A reply write that times out (a client that stopped reading) ends
+    /// the stream cleanly.
+    #[tokio::test]
+    async fn a_reply_write_timeout_ends_the_stream() {
+        let (addr, wire) = cac(&[7u8; 4096]);
+        let (base, node, mut done) = serve_timed(
+            HashMap::from([(addr, wire)]),
+            V1Timing {
+                read_timeout: Duration::from_secs(60),
+                write_timeout: Duration::from_millis(300),
+                ping_period: Duration::from_secs(60),
+            },
+        )
+        .await;
+        let (mut ws, _) = connect(&base, "", &[], true).await.unwrap();
+        // More replies than the socket buffers hold, but few enough to
+        // queue, so the reader is idle when the writer gives up.
+        for _ in 0..1000 {
+            send(&mut ws, &get(&addr, pb::CacheOption::Default)).await;
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(10), done.recv())
+            .await
+            .expect("the stream outlived its write timeout");
+        assert_eq!(ended, Some(true), "the connection task panicked");
+        assert!(node.gets() < 1000, "every reply was written");
     }
 }

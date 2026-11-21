@@ -1260,10 +1260,21 @@ pub(crate) enum BatchUse {
     Unknown,
 }
 
-/// Look a batch up in the node's postage list. `Err` when the node
-/// could not answer at all (dropped, timed out, unexpected ack): a
-/// failed lookup, not an unknown batch.
-pub(crate) async fn batch_use(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<BatchUse, ()> {
+/// Why [`batch_use`] could not answer: a failed lookup, not an unknown
+/// batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchLookupError {
+    /// The node loop dropped or didn't answer the request.
+    NodeGone,
+    /// The node answered with something other than a postage list.
+    UnexpectedAck,
+}
+
+/// Look a batch up in the node's postage list.
+pub(crate) async fn batch_use(
+    handle: &GatewayHandle,
+    batch_id: &[u8; 32],
+) -> Result<BatchUse, BatchLookupError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     if handle
         .commands
@@ -1271,15 +1282,15 @@ pub(crate) async fn batch_use(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Re
         .await
         .is_err()
     {
-        return Err(());
+        return Err(BatchLookupError::NodeGone);
     }
     let views = match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
         Ok(Ok(ControlAck::PostageList(views))) => views,
         Ok(Ok(other)) => {
             warn!(target: "ant_gateway", ?other, "unexpected ack for postage list");
-            return Err(());
+            return Err(BatchLookupError::UnexpectedAck);
         }
-        _ => return Err(()),
+        _ => return Err(BatchLookupError::NodeGone),
     };
     let id_hex = hex::encode(batch_id);
     let Some(view) = views.iter().find(|v| {
@@ -1306,7 +1317,11 @@ pub(crate) async fn batch_use(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Re
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
     match batch_use(handle, batch_id).await {
-        Err(()) => Err(node_unavailable()),
+        Err(BatchLookupError::NodeGone) => Err(node_unavailable()),
+        Err(BatchLookupError::UnexpectedAck) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected node ack",
+        )),
         Ok(BatchUse::Usable) => Ok(()),
         Ok(BatchUse::Unusable | BatchUse::Unknown) => Err(json_error(
             StatusCode::BAD_REQUEST,

@@ -126,7 +126,8 @@ One WebSocket path, two protocols, picked by the
   to that batch. `Swarm-Tag` is a `400` at the handshake. A bad
   connection batch is a `404` / `422` / `500` there. Close codes are
   bee's: `1003` for a non-binary, undecodable or body-less message,
-  `1009` above 8 KiB. 8 Get and 8 Put workers serve 1024-deep queues;
+  `1009` above 8 KiB (above 64 KiB the WebSocket layer itself closes
+  the socket, with no code). 8 Get and 8 Put workers serve 1024-deep queues;
   a full queue answers `BUSY`, and a client that stops reading
   replies stalls the node's reads of its requests.
 - **Anything else** (no subprotocol offered): the upload-only stream
@@ -140,13 +141,15 @@ One WebSocket path, two protocols, picked by the
   must offer `bee-chunk-stream-v1` and check that it was selected,
   which is what bee asks of its clients too.
 
-Two differences from bee on the v1 protocol, both because a light node
-has no batch store:
+Differences from bee on the v1 protocol:
 
 - A pre-signed stamp is checked the way `POST /chunks` checks one: its
   signature must recover over the chunk address, and its batch must
   match a pinned connection batch. Bee's `Stamp.Valid` also checks the
-  batch owner, bucket and index.
+  batch owner, bucket and index, which a light node has no batch store
+  to read per chunk.
+- A node shutting down drops the socket instead of sending bee's
+  `1001`.
 - A node-stamped chunk's batch is looked up in the node's own postage
   list on every chunk: `batch with id not found` when the node holds
   no issuer for it, `batch not usable yet or does not exist` once
