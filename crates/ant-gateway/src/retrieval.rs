@@ -21,11 +21,14 @@
 //!   `StreamRange`. The daemon's range-aware joiner walks only the
 //!   chunks that overlap the requested byte interval; the gateway emits
 //!   `206 Partial Content` with `Content-Range` and the slice length.
+//! - **GET, several Ranges**: `206 multipart/byteranges`, sliced from
+//!   the body collected in memory (the joiner produces one ordered byte
+//!   stream, not a seekable reader). Only resources up to
+//!   `MULTI_RANGE_MAX_BUFFER_BYTES` (32 MiB) get that; above it the
+//!   Range header is ignored and the full body streams as a `200`.
 //!
-//! Multi-range requests are still rejected with `416` — the joiner
-//! produces one ordered byte stream, multipart `byteranges` would
-//! demand framing logic the plan explicitly defers (PLAN.md E.20).
-//! Body payloads do not materialise in memory: `Body::from_stream`
+//! Other than that bounded multi-range case, body payloads do not
+//! materialise in memory: `Body::from_stream`
 //! pumps `BytesChunk` acks into hyper as they arrive.
 //!
 //! `GATEWAY_MAX_FILE_BYTES` keeps the joiner's per-request size cap
@@ -2221,30 +2224,22 @@ fn assemble_collection(
             continue;
         }
 
-        // The header's size field is untrusted: a base-256 size can
-        // claim up to 2^63 bytes in a 1.5 KiB archive, and pre-sizing
-        // from it aborts the process on the allocation. Bound it by the
-        // bytes actually left in the body, and reject an entry that
-        // claims more than that (the tar reader would otherwise hand
-        // back a silently truncated file).
+        // The entry's size (header field, or a pax `size` record) is
+        // untrusted: a base-256 size can claim up to 2^63 bytes in a
+        // 1.5 KiB archive, and pre-sizing from it aborts the process on
+        // the allocation. Bound it by the bytes actually left in the
+        // body, and reject an entry that claims more than that (the tar
+        // reader would otherwise hand back a silently truncated file).
         let left = (body.len() as u64).saturating_sub(entry.raw_file_position());
-        let declared = match entry.header().size() {
-            Ok(n) if n <= left => n,
-            Ok(n) => {
-                return Err(json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "tar entry {path_str}: declared size {n} exceeds the {left} bytes left in the archive"
-                    ),
-                ));
-            }
-            Err(e) => {
-                return Err(json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("tar entry {path_str}: bad size field: {e}"),
-                ));
-            }
-        };
+        let declared = entry.size();
+        if declared > left {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tar entry {path_str}: declared size {declared} exceeds the {left} bytes left in the archive"
+                ),
+            ));
+        }
         let mut buf = Vec::with_capacity(declared as usize);
         if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut buf) {
             return Err(json_error(
@@ -4106,6 +4101,8 @@ fn parse_owner_pair(
     }
 }
 
+/// The client's `Swarm-Chunk-Retrieval-Timeout`, or `default`, capped
+/// at [`MAX_REQUEST_TIMEOUT`] so callers can add it to an `Instant`.
 pub(crate) fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
     headers
         .get(&SWARM_CHUNK_RETRIEVAL_TIMEOUT)
@@ -4468,7 +4465,9 @@ fn content_type_from_extension(filename: &str) -> Option<&'static str> {
 /// * only past-the-end ranges → **416** with `Content-Range:
 ///   bytes */{total}` and the body `invalid range: failed to overlap`;
 /// * exactly one satisfiable range → **206** with `Content-Range`;
-/// * several satisfiable ranges → **206** `multipart/byteranges`.
+/// * several satisfiable ranges → **206** `multipart/byteranges`
+///   (streamed handlers call [`parse_go_ranges_streamed`], which turns
+///   this into a full 200 above `MULTI_RANGE_MAX_BUFFER_BYTES`).
 #[derive(Debug, PartialEq, Eq)]
 enum GoRanges {
     Full,
