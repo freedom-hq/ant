@@ -38,6 +38,7 @@ use libp2p::swarm::{DialError, SwarmEvent};
 use libp2p::{dns, noise, tcp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use libp2p_stream::Control;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -164,10 +165,36 @@ pub struct RunConfig {
     /// full of Docker/Kubernetes pod addresses, and dialing them from a
     /// hosted server trips provider netscan detection (issue #88). Only
     /// for dev/test networks that live entirely on one private network or
-    /// on loopback. Same-LAN private peers are dialed regardless. Also
+    /// on loopback. Same-LAN private peers are dialed regardless, unless
+    /// [`Self::public_dials_only`] is set, which overrides this flag. Also
     /// keeps gossiped DNS-named underlays (`/dns4/…`), dropped by default
     /// since a peer-chosen name can resolve to any of the above (#301).
     pub allow_private_dials: bool,
+    /// Dial globally routable underlays only: no private underlay, not
+    /// even one inside this host's own subnets (the same-LAN exception of
+    /// the underlay filter), no DNS underlay (`/dns`, `/dns4`, `/dns6`,
+    /// `/dnsaddr` are resolved at dial time and could name loopback or a
+    /// LAN host), and the host's interfaces are never read for it. Hive
+    /// gossip is signed only by the peer it describes, so any peer can
+    /// name a private address on this host's LAN and have the node open
+    /// TCP connections there, on a port the peer picks. For an
+    /// embedder that has no use for a bee node on its LAN (a wallet reading
+    /// a few chunks). `false` (the default) keeps the same-LAN exception.
+    /// Stricter than [`Self::allow_private_dials`], and wins over it. It
+    /// also turns off identify's peer address cache, so libp2p's implicit
+    /// dials (`open_stream` to a disconnected peer) can't fall back to
+    /// unfiltered addresses a peer reported about itself; turns off `UPnP`
+    /// (no SSDP or HTTP to the LAN gateway, no port mapping on it); and
+    /// drops underlays naming one of this node's own public IPs (its
+    /// configured and listener external addresses, and an identify-observed
+    /// address once two distinct remote networks (IPv4 /24, IPv6 /48) have
+    /// reported the same IP, so one peer or one operator's address block
+    /// can neither fake nor crowd it out), since behind a NAT that
+    /// is the router's WAN address, which hairpin NAT answers from the LAN
+    /// side. An IPv6 underlay that a dial turns into a packet toward an
+    /// embedded IPv4 (NAT64 `64:ff9b::/96`, 6to4, IPv4-compatible or
+    /// -mapped) is compared by that IPv4.
+    pub public_dials_only: bool,
     /// Outbound-only node: no listener, no `UPnP` port mapping, and no
     /// external address of ours registered for identify, whether from
     /// the operator, a listener, `UPnP` or a peer's `observed_addr`. For
@@ -349,7 +376,11 @@ mod derived {
         /// CGNAT) the behaviour just emits `GatewayNotFound` /
         /// `NonRoutableGateway` and stays quiet — handlers in `apply_event`
         /// only ever *add* addresses, never reject existing ones. Disabled
-        /// on an outbound-only node ([`super::RunConfig::outbound_only`]).
+        /// on an outbound-only node ([`super::RunConfig::outbound_only`])
+        /// and with [`super::RunConfig::public_dials_only`]: `UPnP` talks to
+        /// the LAN gateway (SSDP multicast, then HTTP to the router) and
+        /// maps a port on it, which a fetch-only embedder that keeps off the
+        /// LAN has no use for.
         pub(super) upnp: libp2p::swarm::behaviour::toggle::Toggle<libp2p::upnp::tokio::Behaviour>,
     }
 }
@@ -575,6 +606,9 @@ fn record_external_address(
     addr: Multiaddr,
     source: ExternalAddrSource,
 ) {
+    if state.public_dials_only && source != ExternalAddrSource::Observed {
+        state.own_public_ips.note_trusted(&addr);
+    }
     if let Some((sources, _)) = state.external_addresses.get_mut(&addr) {
         if !sources.contains(&source) {
             debug!(
@@ -600,6 +634,177 @@ fn record_external_address(
         .insert(addr.clone(), (vec![source], added_at_unix));
     state.external_addresses_order.push(addr);
     sync_external_addresses_status(status, state);
+}
+
+/// Upper bound on [`OwnPublicIps::trusted`]: a node records a handful of
+/// external addresses of its own over its life (one per network it joins).
+const OWN_PUBLIC_IPS_CAP: usize = 64;
+
+/// Upper bound on [`OwnPublicIps::reports`]: one entry per reporting
+/// network ([`reporter_net`]), so a node holds at most roughly one per live
+/// connection plus the recently closed.
+const OWN_IP_REPORTERS_CAP: usize = 64;
+
+/// Distinct reporting networks ([`reporter_net`]: an IPv4 /24 or IPv6 /48)
+/// that must name the same `observed_addr` IP before it counts as ours.
+/// One network (whatever number of hosts, peer IDs or identify pushes it
+/// sends) can then neither put an IP in the set nor crowd ours out of it.
+const OWN_IP_CORROBORATION: usize = 2;
+
+/// The IP literals in `addr`.
+fn multiaddr_ips(addr: &Multiaddr) -> impl Iterator<Item = IpAddr> + '_ {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().filter_map(|p| match p {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
+}
+
+/// Who reported an `observed_addr`: the remote network of the connection
+/// it came in on (see [`reporter_net`]), or the peer itself when that
+/// connection's address carries no IP literal (a DNS-dialed bootnode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum IpReporter {
+    Net(IpAddr),
+    Peer(PeerId),
+}
+
+/// Leading bytes of an IPv6 reporter's address that [`reporter_net`]
+/// takes one operator to hold: /48, the usual per-site allocation (RFC
+/// 6177). Coarser than #300's observer grouping (`observed_addr`'s /56):
+/// two networks are enough here to put an IP in the own-IP set, so a
+/// site or hosting customer holding a /48 must not count as 256 /56s.
+const REPORTER_IPV6_PREFIX_BYTES: usize = 6;
+
+/// The network a reporting host's `ip` belongs to, as one operator holds
+/// it, judged by the address a connection to it reaches
+/// ([`crate::underlay::dial_target_ip`]): its IPv4 /24, or its IPv6
+/// prefix of [`REPORTER_IPV6_PREFIX_BYTES`] (/48). Keying reporters by
+/// the full address would let one IPv6 host count as any number of
+/// "hosts" (a single /64 alone is 2^64 of them), so it could corroborate
+/// a junk IP on its own and crowd honest reporters out of the cap. An
+/// IPv4-mapped, NAT64, IPv4-compatible or 6to4 address counts as the
+/// IPv4 address it embeds, so one IPv4 /24 behind 6to4 is one network
+/// (not one per `2002:aabb:ccdd::/48`), and NAT64 reporters in
+/// `64:ff9b::/96` stay as many networks as the IPv4 hosts behind them.
+fn reporter_net(ip: IpAddr) -> IpAddr {
+    match crate::underlay::dial_target_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & 0xffff_ff00)),
+        IpAddr::V6(v6) => {
+            let mut o = [0u8; 16];
+            o[..REPORTER_IPV6_PREFIX_BYTES]
+                .copy_from_slice(&v6.octets()[..REPORTER_IPV6_PREFIX_BYTES]);
+            IpAddr::V6(std::net::Ipv6Addr::from(o))
+        }
+    }
+}
+
+/// The globally routable IPs this node is reachable or observed at, for
+/// [`RunConfig::public_dials_only`]'s hairpin-NAT check (see
+/// [`SwarmState::own_public_ips`]). Only fed while that option is on.
+#[derive(Default)]
+struct OwnPublicIps {
+    /// Global IPs of external addresses that came from this host or its
+    /// operator (configured, a listener, `UPnP`): ours without further
+    /// evidence. Never pruned, capped at [`OWN_PUBLIC_IPS_CAP`].
+    trusted: HashSet<IpAddr>,
+    /// Each reporting network's ([`reporter_net`]) latest global
+    /// `observed_addr` IP and when it said so. A later report replaces the
+    /// earlier one (a non-global one removes it), so a network holds one
+    /// entry however many hosts, peer IDs or reports it sends.
+    /// Capped at [`OWN_IP_REPORTERS_CAP`]; a new reporter evicts one
+    /// with no live connection first (oldest first), so reporters that
+    /// connected and left can't push out the ones still connected.
+    reports: HashMap<IpReporter, (IpAddr, Instant)>,
+    /// The reporter behind each live connection.
+    conns: HashMap<libp2p::swarm::ConnectionId, IpReporter>,
+}
+
+impl OwnPublicIps {
+    /// `ip` is ours: a trusted external address, or the `observed_addr`
+    /// of at least [`OWN_IP_CORROBORATION`] distinct reporting networks.
+    /// Compared by the address a dial to `ip` reaches
+    /// ([`crate::underlay::dial_target_ip`]), so a NAT64, 6to4,
+    /// IPv4-compatible or IPv4-mapped IPv6 form of our WAN IPv4 matches it.
+    fn contains(&self, ip: IpAddr) -> bool {
+        let ip = crate::underlay::dial_target_ip(ip);
+        self.trusted.contains(&ip)
+            || self.reports.values().filter(|(r, _)| *r == ip).count() >= OWN_IP_CORROBORATION
+    }
+
+    fn is_empty(&self) -> bool {
+        self.trusted.is_empty() && self.reports.is_empty()
+    }
+
+    /// An external address from a trusted source (not an observation).
+    fn note_trusted(&mut self, addr: &Multiaddr) {
+        for ip in multiaddr_ips(addr) {
+            if self.trusted.len() >= OWN_PUBLIC_IPS_CAP {
+                return;
+            }
+            if crate::underlay::is_globally_routable_ip(ip) {
+                self.trusted.insert(crate::underlay::dial_target_ip(ip));
+            }
+        }
+    }
+
+    fn on_established(
+        &mut self,
+        conn: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        endpoint: &ConnectedPoint,
+    ) {
+        let remote = match endpoint {
+            ConnectedPoint::Dialer { address, .. } => address,
+            ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+        };
+        let reporter = multiaddr_ips(remote)
+            .next()
+            .map_or(IpReporter::Peer(peer), |ip| {
+                IpReporter::Net(reporter_net(ip))
+            });
+        self.conns.insert(conn, reporter);
+    }
+
+    fn on_closed(&mut self, conn: libp2p::swarm::ConnectionId) {
+        self.conns.remove(&conn);
+    }
+
+    /// A peer's identify (`observed_addr`) on connection `conn`.
+    fn on_observed(
+        &mut self,
+        conn: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        observed: &Multiaddr,
+    ) {
+        let reporter = self
+            .conns
+            .get(&conn)
+            .copied()
+            .unwrap_or(IpReporter::Peer(peer));
+        let Some(ip) =
+            multiaddr_ips(observed).find(|ip| crate::underlay::is_globally_routable_ip(*ip))
+        else {
+            self.reports.remove(&reporter);
+            return;
+        };
+        if !self.reports.contains_key(&reporter) && self.reports.len() >= OWN_IP_REPORTERS_CAP {
+            let live: HashSet<IpReporter> = self.conns.values().copied().collect();
+            let victim = self
+                .reports
+                .iter()
+                .min_by_key(|(r, (_, at))| (live.contains(r), *at))
+                .map(|(r, _)| *r);
+            if let Some(victim) = victim {
+                self.reports.remove(&victim);
+            }
+        }
+        self.reports.insert(
+            reporter,
+            (crate::underlay::dial_target_ip(ip), Instant::now()),
+        );
+    }
 }
 
 /// Centralized remove: withdraws `source`'s claim on `addr`. Once no
@@ -743,12 +948,29 @@ fn our_identify_useful_for_bee(swarm: &Swarm<AntBehaviour>) -> bool {
 /// period rather than warning eagerly because `UPnP`'s SSDP search and
 /// listener auto-promotion both happen asynchronously after `run` starts
 /// — an eager check would always fire on home networks where things work
-/// out a moment later.
-fn maybe_warn_no_external_address(swarm: &Swarm<AntBehaviour>, configured: &[Multiaddr]) {
+/// out a moment later. With [`RunConfig::public_dials_only`] `UPnP` never
+/// ran, so the warning names that option as the cause, not a missing
+/// gateway.
+fn maybe_warn_no_external_address(
+    swarm: &Swarm<AntBehaviour>,
+    configured: &[Multiaddr],
+    public_dials_only: bool,
+) {
     if our_identify_useful_for_bee(swarm) {
         return;
     }
-    if configured.is_empty() {
+    if configured.is_empty() && public_dials_only {
+        warn!(
+            target: "ant_p2p",
+            "no globally-routable external address after \
+             {EXTERNAL_ADDRESS_CHECK_DELAY:?}: UPnP is off (public_dials_only) \
+             and no listener auto-promoted. If this node is behind NAT, bee \
+             bootnodes will stall the BZZ handshake by ~10 s waiting for \
+             our public multiaddr via libp2p-identify. Set \
+             RunConfig::external_addrs to a dialable public multiaddr if \
+             that delay matters.",
+        );
+    } else if configured.is_empty() {
         warn!(
             target: "ant_p2p",
             "no globally-routable external address after \
@@ -1002,8 +1224,13 @@ struct SwarmState {
     /// FIFO of hints waiting to be dialed, at most [`KNOWN_DIALABLE_CAP`]
     /// long (the oldest is evicted).
     hint_queue: VecDeque<sinks::PeerHint>,
-    /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
+    /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter
+    /// (ignored when `public_dials_only` is set).
     allow_private_dials: bool,
+    /// [`RunConfig::public_dials_only`]: global IP literals only, no
+    /// same-LAN exception, no DNS underlays; wins over
+    /// `allow_private_dials`.
+    public_dials_only: bool,
     /// [`RunConfig::outbound_only`]: never register an external address.
     outbound_only: bool,
     /// Cached snapshot of this host's subnets for the same-LAN exception
@@ -1123,6 +1350,18 @@ struct SwarmState {
     /// order is tracked separately in [`Self::external_addresses_order`]
     /// so the on-wire snapshot stays deterministic.
     external_addresses: HashMap<Multiaddr, (Vec<ExternalAddrSource>, u64)>,
+    /// This node's own public IPs: its configured, listener and `UPnP`
+    /// external addresses, plus an identify `observed_addr` IP once
+    /// [`OWN_IP_CORROBORATION`] distinct remote networks report it (one
+    /// peer, or one /24 or /48 of hosts, can't add an IP, or crowd ours
+    /// out, alone); see [`OwnPublicIps`].
+    /// Fed only with `public_dials_only`. With it, an underlay naming one
+    /// of them is dropped: from
+    /// behind a NAT it is our own router's WAN address, which many routers
+    /// answer from the LAN side (hairpin NAT: their admin UI, or a port
+    /// forward to a LAN host), so a gossiped `/ip4/<our WAN IP>/tcp/80`
+    /// would reach the LAN after all.
+    own_public_ips: OwnPublicIps,
     /// Insertion order for `external_addresses` so renders are stable.
     /// Wide enough to keep one slot per address ever advertised in this
     /// process; `UPnP` / listener churn keeps this very small in practice.
@@ -1307,6 +1546,7 @@ impl SwarmState {
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             allow_private_dials: false,
+            public_dials_only: false,
             outbound_only: false,
             local_subnets: None,
             dial_backoff: HashMap::new(),
@@ -1327,6 +1567,7 @@ impl SwarmState {
             bee_peerstore_stall_warning_emitted: false,
             external_addresses: HashMap::new(),
             external_addresses_order: Vec::new(),
+            own_public_ips: OwnPublicIps::default(),
             peer_eth,
             pushsync_swap: None,
             retired_outbound: None,
@@ -1447,6 +1688,25 @@ impl SwarmState {
     /// `/dns4/…` bootnode stored in the peerstore still warm-dials instead
     /// of being dropped for being a DNS name.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+        if self.public_dials_only {
+            // Global IP literals only: no private underlay passes, and no
+            // DNS name either (it is resolved at dial time, past any check).
+            // Nor our own WAN address (hairpin NAT, see `own_public_ips`).
+            // A configured bootnode address is the operator's own choice
+            // and is dialed as such at every start anyway, so it is kept
+            // as written, the same as without this option.
+            return addrs
+                .iter()
+                .filter(|a| {
+                    self.bootnode_addrs.contains(*a)
+                        || (!crate::underlay::filter_public_underlays(std::slice::from_ref(*a))
+                            .is_empty()
+                            && (self.own_public_ips.is_empty()
+                                || !multiaddr_ips(a).any(|ip| self.own_public_ips.contains(ip))))
+                })
+                .cloned()
+                .collect();
+        }
         if self.allow_private_dials {
             return addrs.to_vec();
         }
@@ -2359,6 +2619,13 @@ fn local_overlay_from_secret(
     overlay_from_ethereum_address(&eth, network_id, overlay_nonce)
 }
 
+/// Whether the swarm runs `UPnP`: off on an outbound-only node (no
+/// listener to map a port for) and with `public_dials_only` (no SSDP or
+/// HTTP to the LAN gateway), on otherwise.
+const fn upnp_wanted(outbound_only: bool, public_dials_only: bool) -> bool {
+    !outbound_only && !public_dials_only
+}
+
 /// An outbound-only node advertises no address, so external addresses
 /// given for one are refused rather than silently dropped.
 fn check_outbound_only(outbound_only: bool, external_addrs: &[Multiaddr]) -> Result<(), RunError> {
@@ -2383,7 +2650,8 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut swarm = build_swarm(
         cfg.libp2p_keypair.clone(),
         &LivenessConfig::DEFAULT,
-        !cfg.outbound_only,
+        cfg.public_dials_only,
+        upnp_wanted(cfg.outbound_only, cfg.public_dials_only),
     )?;
     let mut commands = cfg.commands.take();
     if cfg.outbound_only {
@@ -2462,6 +2730,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     state.credit_ledger = credit_ledger;
     state.handshake_gate = handshake_gate;
     state.allow_private_dials = cfg.allow_private_dials;
+    state.public_dials_only = cfg.public_dials_only;
     state.outbound_only = cfg.outbound_only;
     state.swap_enabled = cfg.swap_enabled;
     state.status = cfg.status.clone();
@@ -2709,7 +2978,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         }
         if let Some(deadline) = external_address_check_deadline {
             if Instant::now() >= deadline {
-                maybe_warn_no_external_address(&swarm, &cfg.external_addrs);
+                maybe_warn_no_external_address(&swarm, &cfg.external_addrs, cfg.public_dials_only);
                 external_address_check_deadline = None;
             }
         }
@@ -9369,13 +9638,27 @@ fn handle_swarm_event(
         // address that is already advertised; reconciling on every report
         // (identify re-runs every 5 min) also restores an address the
         // churn of its first observers retracted while others still see it.
+        //
         // Never on an outbound-only node, which announces no address: its
-        // observers' reports are not counted at all.
+        // observers' reports are not counted toward advertising at all.
+        //
+        // With `public_dials_only`, the same report is also one vote for
+        // our own public IP in the hairpin-NAT check, see `OwnPublicIps`,
+        // outbound-only or not: an outbound-only node behind a NAT still
+        // has a WAN address that hairpin NAT answers from the LAN side.
         SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Received {
             connection_id,
+            peer_id,
             info,
-            ..
-        })) if !state.outbound_only => {
+        })) => {
+            if state.public_dials_only {
+                state
+                    .own_public_ips
+                    .on_observed(connection_id, peer_id, &info.observed_addr);
+            }
+            if state.outbound_only {
+                return;
+            }
             let listeners: Vec<Multiaddr> = swarm.listeners().cloned().collect();
             state.observed_addrs.on_identified(
                 connection_id,
@@ -9395,6 +9678,11 @@ fn handle_swarm_event(
             state
                 .liveness
                 .on_established(connection_id, peer_id, Instant::now());
+            if state.public_dials_only {
+                state
+                    .own_public_ips
+                    .on_established(connection_id, peer_id, &endpoint);
+            }
             state.observed_addrs.on_connection(
                 connection_id,
                 peer_id,
@@ -9501,6 +9789,7 @@ fn handle_swarm_event(
             ..
         } => {
             state.liveness.on_closed(connection_id);
+            state.own_public_ips.on_closed(connection_id);
             state.observed_addrs.on_closed(connection_id);
             if num_established > 0 {
                 // Another connection to this peer is still open (a dial
@@ -10396,14 +10685,22 @@ fn connection_limits() -> libp2p::connection_limits::ConnectionLimits {
 fn build_swarm(
     keypair: Keypair,
     liveness: &LivenessConfig,
+    public_dials_only: bool,
     upnp: bool,
 ) -> Result<Swarm<AntBehaviour>, RunError> {
-    build_swarm_with_limits(keypair, liveness, connection_limits(), upnp)
+    build_swarm_with_limits(
+        keypair,
+        liveness,
+        public_dials_only,
+        connection_limits(),
+        upnp,
+    )
 }
 
 fn build_swarm_with_limits(
     keypair: Keypair,
     liveness: &LivenessConfig,
+    public_dials_only: bool,
     limits: libp2p::connection_limits::ConnectionLimits,
     upnp: bool,
 ) -> Result<Swarm<AntBehaviour>, RunError> {
@@ -10416,6 +10713,24 @@ fn build_swarm_with_limits(
     let id_cfg = identify::Config::new(AGENT.to_string(), keypair.public())
         .with_agent_version(AGENT.to_string())
         .with_push_listen_addr_updates(true);
+    // Identify caches every listen address a peer reports (100 by default)
+    // and hands them to the swarm from `handle_pending_outbound_connection`.
+    // The swarm only uses them for a dial whose `DialOpts` extend addresses
+    // through the behaviour: the address-less `DialOpts::peer_id(peer)` dial
+    // `open_stream` makes for a disconnected peer. Our own hint/bootnode
+    // dials pass explicit addresses (`.addresses(..)`), and libp2p-swarm
+    // 0.47 discards behaviour addresses for those
+    // (`extend_addresses_through_behaviour` is false), so they never see
+    // the cache. The implicit dial's addresses never pass
+    // `dialable_underlays`, so a peer could report `/ip4/192.168.1.1/tcp/22`
+    // and get it dialed. With `public_dials_only` the cache is off, the
+    // implicit dial has no address to try, and every address we dial is
+    // one we filtered.
+    let id_cfg = if public_dials_only {
+        id_cfg.with_cache_size(0)
+    } else {
+        id_cfg
+    };
     let behaviour = AntBehaviour {
         limits: libp2p::connection_limits::Behaviour::new(limits),
         stream: libp2p_stream::Behaviour::default(),
@@ -10653,7 +10968,7 @@ mod tests {
         let cfg = FAST_LIVENESS;
         let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
         // Remote: a plain node of ours on loopback, frozen on demand.
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10686,7 +11001,7 @@ mod tests {
         // forwarding but keeps both sockets open. Nothing reaches either
         // side any more and nobody sees a FIN or RST: a half-open link.
         let (proxy_addr, freeze) = freezable_tcp_relay(&remote_addr).await;
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         let mut state = test_state();
         state.liveness = Liveness::new(cfg, Instant::now());
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
@@ -10807,8 +11122,13 @@ mod tests {
     /// visible as the cleared hint dedup), once per cooldown window.
     #[tokio::test]
     async fn link_failure_streak_triggers_one_self_heal_per_window() {
-        let mut swarm =
-            build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT, true).unwrap();
+        let mut swarm = build_swarm(
+            Keypair::generate_ed25519(),
+            &LivenessConfig::DEFAULT,
+            false,
+            true,
+        )
+        .unwrap();
         let mut state = test_state();
         let (dial_tx, _dial_rx) = mpsc::channel::<Multiaddr>(8);
         let (mut backoff, mut last_boot, mut last_top_up) =
@@ -10871,8 +11191,13 @@ mod tests {
         // Globally routable (documentation ranges are not, so not 198.51.100.0/24).
         let public_observed: Multiaddr = "/ip4/93.184.216.34/tcp/40312".parse().unwrap();
         for outbound_only in [true, false] {
-            let mut ours =
-                build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, !outbound_only).unwrap();
+            let mut ours = build_swarm(
+                Keypair::generate_ed25519(),
+                &FAST_LIVENESS,
+                false,
+                upnp_wanted(outbound_only, false),
+            )
+            .unwrap();
             assert_eq!(ours.behaviour().upnp.is_enabled(), !outbound_only);
             let mut state = test_state();
             state.outbound_only = outbound_only;
@@ -10963,7 +11288,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_one_of_two_connections_keeps_the_peer() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10978,7 +11303,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         let mut state = test_state();
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
         let mut control = ours.behaviour().stream.new_control();
@@ -11055,7 +11380,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn duplicate_dialer_connection_clears_dial_start_markers() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -11070,7 +11395,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
         let mut state = test_state();
         let mut control = ours.behaviour().stream.new_control();
         let hs = HandshakeParams {
@@ -12137,6 +12462,474 @@ mod tests {
         hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
         state.enqueue_hint(hint, local);
         assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// `public_dials_only` also covers libp2p's own dials: a peer reports a
+    /// private address (here a loopback sentinel) in identify, drops the
+    /// connection, and the next `open_stream` to it makes the swarm dial
+    /// `DialOpts::peer_id(peer)` with no addresses of ours. With the option
+    /// off, identify's address cache supplies the sentinel and it is
+    /// connected to; with it on, the cache is off and nothing is dialed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_dials_only_ignores_identify_reported_addresses() {
+        assert!(sentinel_dialed_after_identify(false).await);
+        assert!(!sentinel_dialed_after_identify(true).await);
+    }
+
+    async fn sentinel_dialed_after_identify(public_dials_only: bool) -> bool {
+        let cfg = FAST_LIVENESS;
+        let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
+        let sentinel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sentinel_addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            sentinel.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false, true).unwrap();
+        remote
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let remote_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.select_next_some().await {
+                break address;
+            }
+        };
+        // Reported to us in identify's `listen_addrs`.
+        remote.add_external_address(sentinel_addr);
+        let remote_task = tokio::spawn(async move {
+            loop {
+                remote.select_next_some().await;
+            }
+        });
+
+        let mut ours = build_swarm(
+            Keypair::generate_ed25519(),
+            &cfg,
+            public_dials_only,
+            upnp_wanted(false, public_dials_only),
+        )
+        .unwrap();
+        let mut control = ours.behaviour().stream.new_control();
+        ours.dial(remote_addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let peer = loop {
+            assert!(Instant::now() < deadline, "identify never arrived");
+            if let SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                ..
+            })) = ours.select_next_some().await
+            {
+                break peer_id;
+            }
+        };
+        ours.disconnect_peer_id(peer).unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "connection never closed");
+            if let SwarmEvent::ConnectionClosed { .. } = ours.select_next_some().await {
+                break;
+            }
+        }
+
+        let open = tokio::spawn(async move { control.open_stream(peer, proto).await });
+        let driven = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                ours.select_next_some().await;
+            }
+        });
+        let accepted = tokio::select! {
+            r = sentinel.accept() => r.is_ok(),
+            _ = driven => false,
+        };
+        open.abort();
+        remote_task.abort();
+        accepted
+    }
+
+    /// `public_dials_only`: a same-LAN private underlay is dropped like any
+    /// other private one, on enqueue and again at dial time, even with
+    /// `allow_private_dials` set, and the host's interfaces are never read
+    /// for it (no subnet snapshot is taken).
+    #[tokio::test]
+    async fn public_dials_only_drops_same_lan_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.public_dials_only = true;
+        let local = PeerId::random();
+        let lan: Multiaddr = "/ip4/192.168.1.20/tcp/1634".parse().unwrap();
+        let public: Multiaddr = "/ip4/1.2.3.4/tcp/1634".parse().unwrap();
+
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x80, 1);
+        hint.addrs = vec![lan.clone(), public.clone()];
+        state.enqueue_hint(hint, local);
+        let lan_only = PeerId::random();
+        let mut hint = hint_in_bin(lan_only, 0x40, 2);
+        hint.addrs = vec![lan.clone()];
+        state.enqueue_hint(hint, local);
+
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].peer_id, mixed);
+        assert_eq!(state.hint_queue[0].addrs, vec![public.clone()]);
+        assert!(!state.known_dialable.contains_key(&lan_only));
+        assert!(
+            state.local_subnets.is_none(),
+            "the host's interfaces were read"
+        );
+
+        // The host *is* on that LAN, and the escape hatch is on too: still
+        // nothing private, at dial time either.
+        state.local_subnets = Some((
+            Instant::now(),
+            crate::underlay::LocalSubnets::from_nets(vec![("192.168.1.7".parse().unwrap(), 24)]),
+        ));
+        state.allow_private_dials = true;
+        let mut cached = hint_in_bin(lan_only, 0x40, 2);
+        cached.addrs = vec![lan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        cached.addrs = vec![lan, public.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+
+        // A DNS underlay is resolved at dial time, past every IP check: a
+        // gossiped name for loopback or a LAN host is never dialed.
+        let dns_loopback: Multiaddr = "/dns4/localhost/tcp/22".parse().unwrap();
+        let dns_lan: Multiaddr = "/dns/192-168-1-1.nip.io/tcp/80".parse().unwrap();
+        let dns_only = PeerId::random();
+        let mut hint = hint_in_bin(dns_only, 0x20, 3);
+        hint.addrs = vec![dns_loopback.clone(), dns_lan.clone()];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.iter().all(|h| h.peer_id != dns_only));
+        assert!(!state.known_dialable.contains_key(&dns_only));
+        cached.addrs = vec![dns_loopback.clone(), dns_lan];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        cached.addrs = vec![dns_loopback, public.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+
+        // Our own WAN address, once two networks reported it (identify's
+        // observed address), is the router's: hairpin NAT answers it from
+        // the LAN side. Dropped on enqueue and at dial time; a non-global
+        // candidate (behind CGNAT) adds nothing, nor does a single host.
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/80".parse().unwrap();
+        let observed_wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip4/5.0.3.1/tcp/1634", &observed_wan);
+        let cgnat: Multiaddr = "/ip4/100.64.0.9/tcp/1634".parse().unwrap();
+        report_on_conn(&mut state, 2, "/ip4/5.0.5.2/tcp/1634", &cgnat);
+        assert!(!state.own_public_ips.contains("100.64.0.9".parse().unwrap()));
+        cached.addrs = vec![wan.clone(), public.clone()];
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec![wan.clone(), public.clone()])
+        );
+        report_on_conn(&mut state, 3, "/ip4/5.0.4.3/tcp/1634", &observed_wan);
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+        cached.addrs = vec![wan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        let wan_only = PeerId::random();
+        let mut hint = hint_in_bin(wan_only, 0x10, 4);
+        hint.addrs = vec![wan.clone()];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.iter().all(|h| h.peer_id != wan_only));
+
+        // A configured bootnode address is the operator's choice: kept as
+        // written (the warm-start re-queue of a `/dns4/…` bootnode, #301),
+        // while a gossiped DNS name beside it is still dropped.
+        let boot: Multiaddr = "/dns4/boot.example.org/tcp/1634".parse().unwrap();
+        state.bootnode_addrs.insert(boot.clone());
+        cached.addrs = vec![boot.clone(), "/dns4/localhost/tcp/1634".parse().unwrap()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![boot]));
+
+        // Only with `public_dials_only`: a node that serves keeps dialing it.
+        state.public_dials_only = false;
+        state.allow_private_dials = false;
+        cached.addrs = vec![wan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![wan]));
+    }
+
+    /// A connection `n` from `remote` (an inbound one, `remote` being the
+    /// peer's address) whose identify reports `observed` as our address.
+    fn report_on_conn(state: &mut SwarmState, n: usize, remote: &str, observed: &Multiaddr) {
+        let conn = libp2p::swarm::ConnectionId::new_unchecked(n);
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: "/ip4/0.0.0.0/tcp/1634".parse().unwrap(),
+            send_back_addr: remote.parse().unwrap(),
+        };
+        let peer = PeerId::random();
+        state.own_public_ips.on_established(conn, peer, &endpoint);
+        state.own_public_ips.on_observed(conn, peer, observed);
+    }
+
+    /// The hairpin check compares by the address a dial reaches: a NAT64,
+    /// IPv4-compatible, 6to4 or IPv4-mapped IPv6 form of our WAN IPv4 is
+    /// our WAN all the same (on a NAT64 network or a `sit0`/6to4 host the
+    /// dial goes there), while one embedding another global IPv4 stays.
+    #[test]
+    fn public_dials_only_drops_embedded_own_wan() {
+        let mut state = test_state();
+        state.public_dials_only = true;
+        let observed_wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip4/5.0.3.1/tcp/1634", &observed_wan);
+        report_on_conn(&mut state, 2, "/ip4/5.0.4.3/tcp/1634", &observed_wan);
+        let addrs: Vec<Multiaddr> = [
+            "/ip4/81.2.69.77/tcp/80",
+            "/ip6/64:ff9b::5102:454d/tcp/80",
+            "/ip6/::5102:454d/tcp/80",
+            "/ip6/2002:5102:454d::1/tcp/80",
+            "/ip6/::ffff:81.2.69.77/tcp/80",
+            "/ip6/64:ff9b::808:808/tcp/80",
+            "/ip6/2002:808:808::1/tcp/80",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(
+            state.dialable_underlays(&addrs),
+            vec![addrs[5].clone(), addrs[6].clone()]
+        );
+
+        // A trusted own address given in an IPv6 form matches the plain
+        // IPv4 underlay too.
+        let mut state = test_state();
+        state.public_dials_only = true;
+        state
+            .own_public_ips
+            .note_trusted(&"/ip6/64:ff9b::5102:454e/tcp/1634".parse().unwrap());
+        let plain: Multiaddr = "/ip4/81.2.69.78/tcp/80".parse().unwrap();
+        assert_eq!(state.dialable_underlays(&[plain]), Vec::<Multiaddr>::new());
+    }
+
+    /// `reporter_net` groups an IPv6 reporter by its own /48
+    /// ([`REPORTER_IPV6_PREFIX_BYTES`]), deliberately coarser than #300's
+    /// /56 observer grouping in `observed_addr` (the two are tuned
+    /// separately), and an embedded-IPv4 form by the IPv4 /24 it dials.
+    #[test]
+    fn reporter_net_groups_by_operator_and_dial_target() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        // IPv6: one /48 together, a different /48 apart.
+        let a = ip("2a01:4f8:1:2::1");
+        assert_eq!(reporter_net(a), reporter_net(ip("2a01:4f8:1:ffff::9")));
+        assert_ne!(reporter_net(a), reporter_net(ip("2a01:4f8:2::1")));
+        // 6to4: one IPv4 /24 is one network, however many /48s it spans.
+        assert_eq!(
+            reporter_net(ip("2002:503:301::1")),
+            reporter_net(ip("2002:503:302::1"))
+        );
+        assert_eq!(
+            reporter_net(ip("2002:503:301::1")),
+            reporter_net(ip("5.3.3.200"))
+        );
+        // NAT64 / IPv4-compatible / IPv4-mapped: the embedded IPv4's /24.
+        assert_ne!(
+            reporter_net(ip("64:ff9b::503:301")),
+            reporter_net(ip("64:ff9b::909:909"))
+        );
+        assert_eq!(
+            reporter_net(ip("64:ff9b::503:301")),
+            reporter_net(ip("5.3.3.1"))
+        );
+        assert_eq!(reporter_net(ip("::909:909")), reporter_net(ip("9.9.9.1")));
+        assert_eq!(
+            reporter_net(ip("::ffff:9.9.9.9")),
+            reporter_net(ip("9.9.9.1"))
+        );
+    }
+
+    /// 6to4 reporters from one IPv4 /24 can't corroborate a junk IP
+    /// between them, and NAT64 reporters for two unrelated IPv4 networks
+    /// can corroborate our WAN.
+    #[test]
+    fn own_public_ips_group_embedded_ipv4_reporters() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        // 5.3.3.1 and 5.3.3.2 over 6to4: one IPv4 /24, two /48s.
+        let junk: Multiaddr = "/ip4/8.8.4.4/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip6/2002:503:301::1/tcp/1", &junk);
+        report_on_conn(&mut state, 2, "/ip6/2002:503:302::1/tcp/1", &junk);
+        assert!(!state.own_public_ips.contains(ip("8.8.4.4")));
+
+        // 5.3.3.1 and 9.9.9.9 over NAT64: two networks in one /48.
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 3, "/ip6/64:ff9b::503:301/tcp/1", &wan);
+        report_on_conn(&mut state, 4, "/ip6/64:ff9b::909:909/tcp/1", &wan);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+    }
+
+    /// `public_dials_only`'s own-IP set takes an `observed_addr` only when
+    /// two distinct hosts agree on it: one peer flooding identify pushes
+    /// (or several peer IDs on one host) can neither fill the set, so our
+    /// real WAN IP still gets in, nor blacklist an honest peer's IP; and
+    /// reporters that disconnected can't crowd out connected ones.
+    #[test]
+    fn own_public_ips_need_two_reporting_hosts() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut own = OwnPublicIps::default();
+        let attacker = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let attacker_peer = PeerId::random();
+        own.on_established(
+            attacker,
+            attacker_peer,
+            &ConnectedPoint::Listener {
+                local_addr: "/ip4/0.0.0.0/tcp/1634".parse().unwrap(),
+                send_back_addr: "/ip4/6.6.6.6/tcp/9".parse().unwrap(),
+            },
+        );
+        for i in 0..200u32 {
+            let [a, b, c, d] = (0x0500_0000 + i).to_be_bytes();
+            let observed: Multiaddr = format!("/ip4/{a}.{b}.{c}.{d}/tcp/1").parse().unwrap();
+            own.on_observed(attacker, attacker_peer, &observed);
+        }
+        assert_eq!(own.reports.len(), 1, "one host holds one entry");
+        // A second peer ID on the same host is the same reporter.
+        let sybil = libp2p::swarm::ConnectionId::new_unchecked(2);
+        let sybil_peer = PeerId::random();
+        own.on_established(
+            sybil,
+            sybil_peer,
+            &ConnectedPoint::Listener {
+                local_addr: "/ip4/0.0.0.0/tcp/1634".parse().unwrap(),
+                send_back_addr: "/ip4/6.6.6.6/tcp/10".parse().unwrap(),
+            },
+        );
+        own.on_observed(sybil, sybil_peer, &"/ip4/5.0.3.1/tcp/1".parse().unwrap());
+        own.on_observed(
+            attacker,
+            attacker_peer,
+            &"/ip4/5.0.3.1/tcp/1".parse().unwrap(),
+        );
+        assert!(
+            !own.contains(ip("5.0.3.1")),
+            "an honest peer's IP blacklisted"
+        );
+
+        // Our real WAN IP, reported by two honest hosts, gets in.
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.own_public_ips = own;
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 10, "/ip4/7.0.0.1/tcp/1634", &wan);
+        assert!(!state.own_public_ips.contains(ip("81.2.69.77")));
+        report_on_conn(&mut state, 11, "/ip4/7.1.0.2/tcp/1634", &wan);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+
+        // A crowd of hosts that connect, report junk and leave evicts each
+        // other, not the connected reporters of our WAN IP.
+        for i in 0..(2 * OWN_IP_REPORTERS_CAP) {
+            let conn = 100 + i;
+            let host = std::net::Ipv4Addr::from(0x0800_0000 + ((conn as u32) << 8));
+            let [_, hi, lo, _] = host.octets();
+            let junk: Multiaddr = format!("/ip4/9.9.{hi}.{lo}/tcp/1").parse().unwrap();
+            report_on_conn(&mut state, conn, &format!("/ip4/{host}/tcp/1"), &junk);
+            state
+                .own_public_ips
+                .on_closed(libp2p::swarm::ConnectionId::new_unchecked(conn));
+        }
+        assert!(state.own_public_ips.reports.len() <= OWN_IP_REPORTERS_CAP);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+
+        // After a network change, the new WAN IP takes over once two networks
+        // report it from the new network.
+        let new_wan: Multiaddr = "/ip4/81.2.70.1/tcp/5000".parse().unwrap();
+        report_on_conn(&mut state, 500, "/ip4/7.2.0.1/tcp/1634", &new_wan);
+        report_on_conn(&mut state, 501, "/ip4/7.3.0.1/tcp/1634", &new_wan);
+        assert!(state.own_public_ips.contains(ip("81.2.70.1")));
+
+        // A trusted (listener / configured) external address counts at once.
+        state
+            .own_public_ips
+            .note_trusted(&"/ip4/203.0.114.5/tcp/1634".parse().unwrap());
+        assert!(state.own_public_ips.contains(ip("203.0.114.5")));
+    }
+
+    /// One IPv6 operator holds whole prefixes (a single /64 is 2^64
+    /// addresses), so reporters count per /48 (and IPv4 per /24): hosts
+    /// across one block can neither corroborate a junk IP between them
+    /// nor, with any number of live connections, evict the live reporters
+    /// of our WAN IP.
+    #[test]
+    fn own_public_ips_count_reporters_per_network() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip4/7.0.0.1/tcp/1634", &wan);
+        report_on_conn(&mut state, 2, "/ip6/2001:db9::1/tcp/1634", &wan);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+
+        // Two hosts in one /64, one /48, one /24: not corroboration.
+        let junk: Multiaddr = "/ip4/5.0.3.1/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 10, "/ip6/2a01:4f8:1:2::1/tcp/1", &junk);
+        report_on_conn(&mut state, 11, "/ip6/2a01:4f8:1:2::2/tcp/1", &junk);
+        report_on_conn(&mut state, 12, "/ip6/2a01:4f8:1:ffff::9/tcp/1", &junk);
+        assert!(!state.own_public_ips.contains(ip("5.0.3.1")));
+        let junk4: Multiaddr = "/ip4/5.0.3.2/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 13, "/ip4/6.6.6.1/tcp/1", &junk4);
+        report_on_conn(&mut state, 14, "/ip4/6.6.6.200/tcp/1", &junk4);
+        report_on_conn(&mut state, 15, "/ip6/::ffff:6.6.6.7/tcp/1", &junk4);
+        assert!(!state.own_public_ips.contains(ip("5.0.3.2")));
+
+        // Many live connections from one /48 stay one reporter: the cap
+        // never fills, our WAN IP's reporters stay.
+        for i in 0..(4 * OWN_IP_REPORTERS_CAP) {
+            let host = format!("/ip6/2a01:4f8:1:{:x}::{:x}/tcp/1", i % 7, i + 1);
+            let junk: Multiaddr = format!("/ip4/9.9.{}.{}/tcp/1", i / 256, i % 256)
+                .parse()
+                .unwrap();
+            report_on_conn(&mut state, 100 + i, &host, &junk);
+        }
+        assert!(state.own_public_ips.reports.len() <= 4);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+    }
+
+    /// `public_dials_only` turns `UPnP` off: no SSDP search or HTTP to the
+    /// LAN gateway, no port mapping. Off by default it stays on, unless the
+    /// node is outbound-only, which turns it off on its own.
+    #[tokio::test]
+    async fn public_dials_only_disables_upnp() {
+        let cfg = LivenessConfig::DEFAULT;
+        for (outbound_only, public_dials_only, want) in [
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
+            assert_eq!(upnp_wanted(outbound_only, public_dials_only), want);
+            let swarm = build_swarm(
+                Keypair::generate_ed25519(),
+                &cfg,
+                public_dials_only,
+                upnp_wanted(outbound_only, public_dials_only),
+            )
+            .unwrap();
+            assert_eq!(swarm.behaviour().upnp.is_enabled(), want);
+        }
     }
 
     /// Issue #301: a gossiped `/dns4/localhost` (or any DNS-named
@@ -15019,13 +15812,18 @@ mod tests {
     async fn inbound_connection_over_the_cap_is_refused() {
         let limits = libp2p::connection_limits::ConnectionLimits::default()
             .with_max_established_incoming(Some(1));
-        let mut listener =
-            build_swarm_with_limits(Keypair::generate_ed25519(), &FAST_LIVENESS, limits, true)
-                .unwrap();
+        let mut listener = build_swarm_with_limits(
+            Keypair::generate_ed25519(),
+            &FAST_LIVENESS,
+            false,
+            limits,
+            true,
+        )
+        .unwrap();
         let addr = listening(&mut listener).await;
         for _ in 0..2 {
             let mut dialer =
-                build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+                build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
             dialer.dial(addr.clone()).unwrap();
             drive(dialer);
         }
@@ -15060,11 +15858,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn production_limits_cap_connections_per_peer() {
         const { assert!(MAX_CONNECTIONS_PER_PEER >= 2) };
-        let mut listener = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut listener =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let addr = listening(&mut listener).await;
         let mut dialer = build_swarm_with_limits(
             Keypair::generate_ed25519(),
             &FAST_LIVENESS,
+            false,
             libp2p::connection_limits::ConnectionLimits::default(),
             true,
         )
@@ -15101,7 +15901,8 @@ mod tests {
     /// `dialing`, so it can be dialed again) without backing the peer off.
     #[tokio::test]
     async fn denied_dial_is_cleared_but_not_charged() {
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut state = test_state();
         // Connectivity up, so an ordinary failure would be charged.
         state.bzz_peers.insert(pid());
@@ -15150,7 +15951,8 @@ mod tests {
         before_open: impl FnOnce(PeerId) + Send + 'static,
     ) -> bool {
         use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-        let mut node = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut node =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut control = node.behaviour().stream.new_control();
         let (hint_tx, _hint_rx) = mpsc::channel(8);
         sinks::spawn(sinks::register(&mut control, hint_tx, gate, 1), None);
@@ -15158,7 +15960,8 @@ mod tests {
         let node_peer = *node.local_peer_id();
         drive(node);
 
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut remote =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let remote_peer = *remote.local_peer_id();
         let mut remote_control = remote.behaviour().stream.new_control();
         remote.dial(addr).unwrap();
@@ -15281,7 +16084,8 @@ mod tests {
     /// connections it reports it on; enough distinct observers make it so.
     #[tokio::test]
     async fn one_peers_observed_address_is_not_advertised() {
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut state = test_state();
         let addr: Multiaddr = "/ip4/203.0.113.9/tcp/1634".parse().unwrap();
         let liar = pid();
@@ -15314,7 +16118,8 @@ mod tests {
     #[tokio::test]
     async fn external_address_set_stays_at_or_below_its_cap() {
         use crate::observed_addr::{MAX_OBSERVED_EXTERNAL, OBSERVED_ADDR_QUORUM};
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut state = test_state();
         let manual: Multiaddr = "/ip4/203.0.113.1/tcp/1634".parse().unwrap();
         record_external_address(
@@ -15360,7 +16165,8 @@ mod tests {
     #[tokio::test]
     async fn advertised_observed_address_survives_its_first_observers_leaving() {
         use crate::observed_addr::OBSERVED_ADDR_QUORUM;
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut state = test_state();
         let addr: Multiaddr = "/ip4/203.0.113.9/tcp/1634".parse().unwrap();
         for n in 1..=50 {
@@ -15389,7 +16195,8 @@ mod tests {
     /// observers keep the address advertised when the first three go.
     #[tokio::test]
     async fn identify_reports_alone_keep_an_observed_address_advertised() {
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
         let mut state = test_state();
         let mut control = swarm.behaviour().stream.new_control();
         let hs = HandshakeParams {
@@ -15484,7 +16291,8 @@ mod tests {
         let in_swarm =
             |swarm: &Swarm<AntBehaviour>| swarm.external_addresses().cloned().collect::<Vec<_>>();
         for observed_first in [true, false] {
-            let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, true).unwrap();
+            let mut swarm =
+                build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, false, true).unwrap();
             let mut state = test_state();
             let (first, second) = if observed_first {
                 (ExternalAddrSource::Observed, ExternalAddrSource::Upnp)

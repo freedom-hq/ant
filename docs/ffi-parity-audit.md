@@ -239,6 +239,7 @@ An embedded host can set only:
 | `--external-address` | `antd:125`, `654` | — | not settable (n/a behind NAT) |
 | — (`NodeConfig::outbound_only`, issue #269: no listener, no UPnP, no external address advertised) | not set (antd serves) | not set | embedder option only (`ant_node::run_node`) |
 | `--allow-private-dials` | `antd:135`, `655` | — (default `false`) | not settable |
+| — (`NodeConfig::public_dials_only`: no private underlay dialed, not even a same-LAN one, no DNS underlay, none naming our own public IP, and no UPnP) | not set (default `false`) | not set | embedder option only (`ant_node::run_node`) |
 | `--peers-file`, `--no-peerstore`, `--reset-peerstore` | `antd:141-164` | fixed path; no reset | not settable |
 | `--target-peers` | `antd:157`, `658` | — (100) | not settable (Low: battery tuning) |
 | `--per-request-chunk-cache`, `--record-chunks` | `antd:172-183` | — | not settable (debug) |

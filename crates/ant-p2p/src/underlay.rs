@@ -174,15 +174,58 @@ pub(crate) enum IpScope {
     Local,
 }
 
-/// Classify `ip`. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is classified as the
-/// embedded IPv4 address.
+/// The address a dial to `ip` actually reaches: `ip` itself, or for an
+/// IPv6 form that a dial turns into a packet toward an embedded IPv4
+/// address, that IPv4 address. Covers IPv4-mapped (`::ffff:a.b.c.d`), the
+/// deprecated IPv4-compatible `::a.b.c.d` (`::/96`, RFC 4291 2.5.5.1),
+/// NAT64 well-known-prefix (`64:ff9b::a.b.c.d`) and 6to4
+/// (`2002:aabb:ccdd::/48`, RFC 3056). [`ip_scope`] classifies through it,
+/// and anything comparing a dial target against known IPs (the
+/// `public_dials_only` own-WAN check) should too.
+pub(crate) fn dial_target_ip(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let seg = v6.segments();
+    let v4 = |hi: u16, lo: u16| {
+        let [a, b] = hi.to_be_bytes();
+        let [c, d] = lo.to_be_bytes();
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    };
+    // 64:ff9b::/96 NAT64 well-known prefix (RFC 6052): the dial is
+    // translated to the embedded IPv4, so it is that address that gets
+    // reached. RFC 6052 forbids embedding a non-global IPv4 here, but a
+    // translator that doesn't enforce it would connect to e.g.
+    // 192.168.1.1 for 64:ff9b::c0a8:101.
+    if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return v4(seg[6], seg[7]);
+    }
+    // ::/96 IPv4-compatible (RFC 4291, deprecated): a host with an
+    // automatic tunnel (Linux `sit0`) sends it as IPv4 to the embedded
+    // address. Also covers `::` (0.0.0.0) and `::1` (0.0.0.1), both Local
+    // either way.
+    if seg[..6] == [0, 0, 0, 0, 0, 0] {
+        return v4(seg[6], seg[7]);
+    }
+    // 2002::/16 6to4 (RFC 3056): a host with a 6to4 interface
+    // encapsulates it in IPv4 toward the address in bits 16..48, so
+    // `2002:c0a8:101::1` is tunneled to 192.168.1.1.
+    if seg[0] == 0x2002 {
+        return v4(seg[1], seg[2]);
+    }
+    ip
+}
+
+/// Classify `ip`, by the address a dial to it reaches
+/// ([`dial_target_ip`]): an IPv6 form embedding an IPv4 address is
+/// classified as that IPv4 address.
 pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
-    match ip {
+    match dial_target_ip(ip) {
         IpAddr::V4(v4) => ipv4_scope(v4),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return ipv4_scope(v4);
-            }
             let seg = v6.segments();
             if v6.is_loopback()
                 || v6.is_unspecified()
@@ -516,6 +559,40 @@ pub(crate) fn filter_dialable_underlays(
         .collect()
 }
 
+/// Keep only the peer underlays that name a globally routable IP literal:
+/// the filter behind `RunConfig::public_dials_only`.
+///
+/// Stricter than [`filter_dialable_underlays`] with an empty
+/// [`LocalSubnets`] in one more way: an address must carry at least one IP
+/// component, and none of `/dns`, `/dns4`, `/dns6` or `/dnsaddr`. The
+/// transport resolves those at dial time, so a gossiped
+/// `/dns4/localhost/…` or a name the peer points at `192.168.1.1` would
+/// otherwise reach loopback or the LAN with no IP check ever seeing it.
+pub(crate) fn filter_public_underlays(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    addrs
+        .iter()
+        .filter(|addr| {
+            let mut has_ip = false;
+            let ok = addr.iter().all(|p| match p {
+                Protocol::Ip4(ip) => {
+                    has_ip = true;
+                    ip_scope(IpAddr::V4(ip)) == IpScope::Global
+                }
+                Protocol::Ip6(ip) => {
+                    has_ip = true;
+                    ip_scope(IpAddr::V6(ip)) == IpScope::Global
+                }
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                    false
+                }
+                _ => true,
+            });
+            ok && has_ip
+        })
+        .cloned()
+        .collect()
+}
+
 /// Does `addr` carry an IP component in [`IpScope::Private`] space? Such an
 /// address was only admitted by [`filter_dialable_underlays`] because it
 /// matched the host's subnets *at the time*; it has to be re-checked (or
@@ -637,8 +714,51 @@ mod tests {
     }
 
     #[test]
+    fn public_underlays_need_a_global_ip_literal() {
+        let addrs = vec![
+            ma("/ip4/1.2.3.4/tcp/1634"),
+            ma("/ip6/2a01:4f8::1/tcp/1634"),
+            ma("/ip4/192.168.1.20/tcp/1634"),
+            ma("/ip4/127.0.0.1/tcp/1634"),
+            ma("/dns4/localhost/tcp/22"),
+            ma("/dns/192-168-1-1.nip.io/tcp/80"),
+            ma("/dns6/example.com/tcp/1634"),
+            ma("/dnsaddr/example.com"),
+            ma("/ip4/1.2.3.4/tcp/1634/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA"),
+            // NAT64 well-known prefix embedding 192.168.1.1 / 127.0.0.1.
+            ma("/ip6/64:ff9b::c0a8:101/tcp/80"),
+            ma("/ip6/64:ff9b::7f00:1/tcp/80"),
+            // IPv4-compatible and 6to4 embedding 192.168.1.1: tunneled to
+            // the LAN host on a host with `sit0` / a 6to4 interface.
+            ma("/ip6/::c0a8:101/tcp/80"),
+            ma("/ip6/2002:c0a8:101::1/tcp/80"),
+            ma("/ip6/2002:a00:1::1/tcp/80"),
+            // 6to4 embedding a global IPv4 stays dialable.
+            ma("/ip6/2002:102:304::1/tcp/1634"),
+        ];
+        let kept = filter_public_underlays(&addrs);
+        assert_eq!(
+            kept,
+            vec![
+                addrs[0].clone(),
+                addrs[1].clone(),
+                addrs[8].clone(),
+                addrs[14].clone()
+            ]
+        );
+    }
+
+    #[test]
     fn ip_scope_classifies_unroutable_ranges() {
-        for g in ["1.2.3.4", "8.8.8.8", "2a01:4f8::1", "::ffff:1.2.3.4"] {
+        for g in [
+            "1.2.3.4",
+            "8.8.8.8",
+            "2a01:4f8::1",
+            "::ffff:1.2.3.4",
+            "64:ff9b::808:808",
+            "::1.2.3.4",
+            "2002:102:304::1",
+        ] {
             assert_eq!(ip_scope(ip(g)), IpScope::Global, "{g}");
         }
         for p in [
@@ -654,6 +774,13 @@ mod tests {
             "feff::1",
             "64:ff9b:1::1",
             "64:ff9b:1:ffff::1",
+            "64:ff9b::c0a8:101",
+            "64:ff9b::10.0.0.1",
+            "::c0a8:101",
+            "::10.0.0.1",
+            "2002:c0a8:101::1",
+            "2002:a00:1::",
+            "2002:6440:1::1",
         ] {
             assert_eq!(ip_scope(ip(p)), IpScope::Private, "{p}");
         }
@@ -668,6 +795,10 @@ mod tests {
             "::",
             "fe80::1",
             "febf::1",
+            "64:ff9b::7f00:1",
+            "::127.0.0.1",
+            "2002:7f00:1::1",
+            "2002::1",
             "ff02::1",
             "2001:db8::1",
             "3fff::1",

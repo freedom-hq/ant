@@ -33,8 +33,18 @@ pub struct NodeConfig {
     pub external_addrs: Vec<Multiaddr>,
     /// Forwarded to `ant_p2p::RunConfig::allow_private_dials`: dial peers'
     /// private/loopback underlays even off-LAN, and gossiped DNS-named
-    /// underlays. Dev/test networks only.
+    /// underlays. Dev/test networks only. Ignored when
+    /// [`Self::public_dials_only`] is set.
     pub allow_private_dials: bool,
+    /// Forwarded to `ant_p2p::RunConfig::public_dials_only`: dial globally
+    /// routable IP underlays only, never a private one (not even on this
+    /// host's own LAN) and never a DNS one (resolved at dial time, it could
+    /// name loopback or a LAN host). It also turns off `UPnP` (no traffic to
+    /// the LAN gateway, no port mapping) and drops underlays naming this
+    /// node's own public IP (behind a NAT, the router's WAN address, which
+    /// hairpin NAT answers from the LAN side). For embedders that only
+    /// fetch. `false` (the default) keeps the same-LAN exception.
+    pub public_dials_only: bool,
     /// Forwarded to `ant_p2p::RunConfig::outbound_only`: no listener, no
     /// `UPnP`, no external address advertised. For embedders that only
     /// fetch. `false` (the default) keeps the full node behaviour; with
@@ -159,6 +169,7 @@ impl NodeConfig {
             libp2p_keypair,
             external_addrs: Vec::new(),
             allow_private_dials: false,
+            public_dials_only: false,
             outbound_only: false,
             status: None,
             peerstore_path: None,
@@ -203,6 +214,13 @@ impl NodeConfig {
     #[must_use]
     pub const fn with_allow_private_dials(mut self, allow: bool) -> Self {
         self.allow_private_dials = allow;
+        self
+    }
+
+    /// See [`Self::public_dials_only`].
+    #[must_use]
+    pub const fn with_public_dials_only(mut self, public_only: bool) -> Self {
+        self.public_dials_only = public_only;
         self
     }
 
@@ -341,6 +359,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         libp2p_keypair: cfg.libp2p_keypair,
         external_addrs: cfg.external_addrs,
         allow_private_dials: cfg.allow_private_dials,
+        public_dials_only: cfg.public_dials_only,
         outbound_only: cfg.outbound_only,
         status: cfg.status,
         // `None` → 0 → `ant_p2p` falls back to `DEFAULT_TARGET_PEERS = 100`.
