@@ -19,7 +19,6 @@ async-trait.workspace = true
 futures = "0.3.31"
 hex.workspace = true
 libp2p.workspace = true
-memmap2 = "0.9.10"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

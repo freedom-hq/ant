@@ -231,7 +231,7 @@ struct FilesView: View {
         }
     }
 
-    /// The Rust uploader streams the source via mmap on its own schedule,
+    /// The Rust uploader re-reads the source on its own schedule,
     /// so copy the security-scoped picked file into our sandbox first to
     /// give it a stable, always-readable path.
     private func copyIntoSandbox(_ url: URL) throws -> URL {

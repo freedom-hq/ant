@@ -11,13 +11,16 @@
 //!
 //! ## Key design points
 //!
-//! - **Streaming.** The source is mmap'd via [`memmap2::Mmap`] so a
-//!   7 GiB file doesn't double-allocate; the kernel pages it in/out
-//!   as we walk it. Resident memory is `levels × BRANCHES × 32 B +
-//!   in-flight push window` ≈ tens of KB for any file size.
+//! - **Streaming.** The source is read leaf by leaf through a
+//!   buffered reader ([`LeafReader`]) so a 7 GiB file is never held in
+//!   memory. Resident memory is `levels × BRANCHES × 32 B +
+//!   read buffer + in-flight push window` ≈ hundreds of KB for any file
+//!   size. Not mmap: a file that shrinks under a mapping faults the process
+//!   (SIGBUS) instead of returning an error; a short read here fails
+//!   the job with [`UploadError::SourceChanged`].
 //!
 //! - **Resume.** [`StreamingSplitter`] is deterministic (same input
-//!   ⇒ same chunk addresses), so on resume we re-mmap, re-stream
+//!   ⇒ same chunk addresses), so on resume we re-open, re-stream
 //!   from byte 0, recompute every address, and skip pushsync for
 //!   the first `chunks_pushed` chunks. No per-chunk receipts on
 //!   disk, and the postage issuer is only consulted when we
@@ -65,8 +68,8 @@ use ant_retrieval::{
     build_single_file_manifest, ManifestWriteError, SplitChunk, StreamingSplitter,
 };
 // `ManifestWriteError` is re-exported from `ant-retrieval`'s root.
+use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::stream::{FuturesUnordered, StreamExt};
-use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -797,6 +800,17 @@ pub enum UploadError {
     BadState(UploadStatus),
 }
 
+impl UploadError {
+    /// For `io::Result` callers: unwrap an I/O error, wrap anything
+    /// else (e.g. `SourceChanged`) with its message intact.
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Io(e) => e,
+            other => std::io::Error::other(other),
+        }
+    }
+}
+
 /// Owned, daemon-resident job state plus its driver controls.
 struct JobHandle {
     info: Mutex<UploadJobInfo>,
@@ -813,17 +827,43 @@ struct JobHandle {
     /// resume path uses it; the driver itself calls `notified()`
     /// inside its run loop after observing `pause_requested`.
     notify: Notify,
-    /// The live driver task, kept so [`UploadManager::suspend_all`] can
+    /// The latest driver task, kept so [`UploadManager::suspend_all`] can
     /// await (bounded) the drain-and-checkpoint that `pause` triggers —
     /// the driver's final act before exiting is a state save, so a
     /// completed join means the resume cursor is durably on disk.
-    /// Replaced by every `spawn_driver`; `None` when no driver runs.
-    driver: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shared (cloneable) so `suspend_all` can wait on it without taking
+    /// it out of the slot: the next `spawn_driver` must still find it and
+    /// wait for it, so a resume landing while the old driver drains never
+    /// runs two drivers on one job. Replaced by every `spawn_driver`;
+    /// `None` until the first one.
+    driver: Mutex<Option<Driver>>,
+    /// How many driver tasks `spawn_driver` has started for this job.
+    /// Diagnostic; lets tests assert that a resume didn't add a second
+    /// driver.
+    driver_spawns: AtomicU64,
+}
+
+/// A spawned driver task.
+struct Driver {
+    /// Its completion, awaitable from several places at once.
+    done: Shared<BoxFuture<'static, ()>>,
+    /// Whether it has exited (`done` only reports that once some clone
+    /// of it was polled to the end).
+    task: tokio::task::AbortHandle,
 }
 
 impl JobHandle {
     fn snapshot(&self) -> UploadJobInfo {
         self.info.lock().expect("upload mutex poisoned").clone()
+    }
+
+    /// Whether the latest driver task is still running.
+    fn driver_alive(&self) -> bool {
+        self.driver
+            .lock()
+            .expect("driver mutex poisoned")
+            .as_ref()
+            .is_some_and(|d| !d.task.is_finished())
     }
 }
 
@@ -1083,6 +1123,7 @@ impl UploadManager {
             cancel_requested: AtomicBool::new(false),
             notify: Notify::new(),
             driver: Mutex::new(None),
+            driver_spawns: AtomicU64::new(0),
         });
         self.inner
             .jobs
@@ -1173,13 +1214,24 @@ impl UploadManager {
             }
         };
         let _ = handle.progress.send(snap.clone());
-        snap.save(&UploadJobInfo::manifest_path(&self.inner.state_dir, id))?;
+        // Under the job's full id, never the prefix the caller typed:
+        // a `<prefix>.json` would load as a second copy of this job.
+        snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ))?;
         Ok(snap)
     }
 
     /// Bring a `Paused` (or `Failed`) job back to `Running`. Spawns
-    /// a fresh driver task; the previous driver has already
-    /// exited. A `Completed` job instead triggers a background self-heal
+    /// a fresh driver task, which first waits for the previous driver
+    /// to finish (a quick pause → resume can land while it still drains
+    /// its in-flight pushes), so one job never has two drivers. A
+    /// `Running`/`Pending` job whose driver is still alive is left
+    /// alone. Returns at once either way; the new driver starts once
+    /// the old one has drained, which takes about [`PUSH_TIMEOUT`]
+    /// (2 min) at worst: its in-flight pushes drain concurrently, each
+    /// a single attempt under that timeout. A `Completed` job instead triggers a background self-heal
     /// that re-pushes only its missing chunks on the same job (see body);
     /// other terminal states error with `BadState`.
     pub fn resume(&self, id: &str) -> Result<UploadJobInfo, UploadError> {
@@ -1231,12 +1283,24 @@ impl UploadManager {
                     info.last_update_unix = unix_seconds();
                     info.clone()
                 }
-                UploadStatus::Running | UploadStatus::Pending => info.clone(),
+                UploadStatus::Running | UploadStatus::Pending => {
+                    // Already driven: a second driver would stamp and
+                    // checkpoint the same chunks concurrently. Only a
+                    // driver that died without settling the status
+                    // (a panic) is replaced.
+                    if handle.driver_alive() {
+                        return Ok(info.clone());
+                    }
+                    info.clone()
+                }
                 other => return Err(UploadError::BadState(other)),
             }
         };
         let _ = handle.progress.send(snap.clone());
-        snap.save(&UploadJobInfo::manifest_path(&self.inner.state_dir, id))?;
+        snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ))?;
         self.spawn_driver(handle);
         Ok(snap)
     }
@@ -1258,7 +1322,12 @@ impl UploadManager {
             info.clone()
         };
         let _ = handle.progress.send(snap.clone());
-        snap.save(&UploadJobInfo::manifest_path(&self.inner.state_dir, id))?;
+        // Under the job's full id, never the prefix the caller typed:
+        // a `<prefix>.json` would load as a second copy of this job.
+        snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ))?;
         Ok(snap)
     }
 
@@ -1326,6 +1395,7 @@ impl UploadManager {
                 cancel_requested: AtomicBool::new(false),
                 notify: Notify::new(),
                 driver: Mutex::new(None),
+                driver_spawns: AtomicU64::new(0),
             });
             self.inner
                 .jobs
@@ -1509,8 +1579,16 @@ impl UploadManager {
                 &self.inner.state_dir,
                 &snap.job_id,
             ));
-            if let Some(task) = handle.driver.lock().expect("driver mutex poisoned").take() {
-                drivers.push(task);
+            // Cloned, not taken: a `wake_all` → `resume` that lands
+            // while this driver still drains must find it in the slot
+            // and wait for it before its own driver runs.
+            if let Some(d) = handle
+                .driver
+                .lock()
+                .expect("driver mutex poisoned")
+                .as_ref()
+            {
+                drivers.push(d.done.clone());
             }
         }
         // The driver's last act before exiting on pause is the
@@ -1932,10 +2010,24 @@ impl UploadManager {
         format!("{raw:016x}")
     }
 
+    /// Start a driver task for `handle`. If an earlier driver is still
+    /// in the slot, the new task waits for it to exit first, so two
+    /// drivers never stamp and checkpoint the same job at once — and
+    /// skips running if the earlier one left the job terminal (it
+    /// finished the upload, failed, or was cancelled meanwhile).
     fn spawn_driver(&self, handle: Arc<JobHandle>) {
         let mgr = self.clone();
         let task_handle = handle.clone();
+        let mut slot = handle.driver.lock().expect("driver mutex poisoned");
+        let previous = slot.take();
+        handle.driver_spawns.fetch_add(1, Ordering::SeqCst);
         let task = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                previous.done.await;
+                if task_handle.snapshot().status.is_terminal() {
+                    return;
+                }
+            }
             if let Err(e) = mgr.run_job(task_handle.clone()).await {
                 warn!(
                     target: "ant_node::uploads",
@@ -1949,8 +2041,12 @@ impl UploadManager {
             }
         });
         // Keep the task joinable so `suspend_all` can await the
-        // drain-and-checkpoint a pause triggers.
-        *handle.driver.lock().expect("driver mutex poisoned") = Some(task);
+        // drain-and-checkpoint a pause triggers, and the next
+        // `spawn_driver` can wait for it.
+        *slot = Some(Driver {
+            task: task.abort_handle(),
+            done: task.map(|_| ()).boxed().shared(),
+        });
     }
 
     /// Move `info.status` to `Failed` and persist. Called on
@@ -2040,20 +2136,12 @@ impl UploadManager {
             .unwrap_or_else(|| estimate_chunk_count(snap.source_size, snap.raw));
         self.capacity_preflight(&batch_id, est_chunks).await;
 
-        // mmap (zero-copy). Empty files are a special case: mmap
-        // on a 0-byte file is undefined on some platforms, so we
-        // produce the empty leaf via the streaming splitter's
-        // `finish` path without ever feeding a leaf.
-        let file = std::fs::File::open(&source_path)?;
-        let body: Option<Mmap> = if snap.source_size == 0 {
-            None
-        } else {
-            // SAFETY: `body` is immutable for the upload's life; we
-            // refuse to resume on mtime change, so the OS will not
-            // relocate the file under us. macOS/Linux page faults
-            // are tolerated by walking the bytes in 4 KiB strides.
-            Some(unsafe { Mmap::map(&file)? })
-        };
+        // Buffered reads, bounded by the size recorded at start. A
+        // file that shrinks after the check above (or mid-walk) ends in
+        // a short read → `SourceChanged`, never a panic or a SIGBUS.
+        // An empty file feeds no leaf; the splitter's `finish` emits
+        // the canonical empty leaf.
+        let mut leaf_iter = LeafReader::open(&source_path, snap.source_size)?;
 
         let resume_cursor = snap.chunks_pushed;
         let mut splitter = StreamingSplitter::new();
@@ -2065,7 +2153,6 @@ impl UploadManager {
         let mut in_flight: FuturesUnordered<PushFuture> = FuturesUnordered::new();
 
         let mut bytes_emitted: u64 = 0;
-        let mut leaf_iter = LeafIter::new(body.as_deref(), snap.source_size);
 
         // Every chunk address this file produces (data leaves,
         // intermediates, manifest), regardless of the resume cursor —
@@ -2151,7 +2238,7 @@ impl UploadManager {
             // and the splitter is exhausted — break to the finish
             // step.
             if in_flight.len() < max_push_concurrency() {
-                if let Some(leaf) = leaf_iter.next() {
+                if let Some(leaf) = leaf_iter.next_leaf()? {
                     bytes_emitted += leaf.len() as u64;
                     let chunks = splitter.push_leaf(leaf);
                     for chunk in chunks {
@@ -3513,18 +3600,9 @@ impl UploadManager {
 
         // --- Pass 2: re-derive remaining chunks from the source file. ---
         if !remaining.is_empty() {
-            match std::fs::File::open(source_path) {
-                Ok(file) => {
-                    let body: Option<Mmap> = if source_size == 0 {
-                        None
-                    } else {
-                        // SAFETY: same contract as the upload path — the
-                        // file is immutable for the duration; resume
-                        // already refused on mtime change before here.
-                        Some(unsafe { Mmap::map(&file)? })
-                    };
+            match LeafReader::open(source_path, source_size) {
+                Ok(mut leaf_iter) => {
                     let mut splitter = StreamingSplitter::new();
-                    let leaf_iter = LeafIter::new(body.as_deref(), source_size);
 
                     // Dispatch `chunk` if still needed, holding the
                     // in-flight window at `MAX_PUSH_CONCURRENCY`.
@@ -3551,7 +3629,9 @@ impl UploadManager {
                         }};
                     }
 
-                    for leaf in leaf_iter {
+                    // A short read (the source shrank) fails the pass
+                    // with `SourceChanged` rather than faulting.
+                    while let Some(leaf) = leaf_iter.next_leaf()? {
                         for chunk in splitter.push_leaf(leaf) {
                             maybe_push!(chunk);
                         }
@@ -3650,20 +3730,13 @@ fn collect_heal_addrs(
     name: Option<&str>,
     content_type: Option<&str>,
 ) -> std::io::Result<Option<Vec<[u8; 32]>>> {
-    let file = std::fs::File::open(source_path)?;
-    let body: Option<Mmap> = if source_size == 0 {
-        None
-    } else {
-        // SAFETY: same contract as the upload/repush paths — the file is
-        // immutable for the duration; the caller re-validates mtime first.
-        Some(unsafe { Mmap::map(&file)? })
-    };
+    let mut leaves = LeafReader::open(source_path, source_size)?;
 
     let mut addrs: Vec<[u8; 32]> = Vec::new();
     let mut overflow = false;
 
     let mut splitter = StreamingSplitter::new();
-    for leaf in LeafIter::new(body.as_deref(), source_size) {
+    while let Some(leaf) = leaves.next_leaf().map_err(UploadError::into_io)? {
         for chunk in splitter.push_leaf(leaf) {
             note_heal_addr(&mut addrs, &mut overflow, chunk.address);
         }
@@ -3707,46 +3780,70 @@ fn parse_missing(message: &str) -> Option<Vec<[u8; 32]>> {
     Some(out)
 }
 
-/// Iterator over the source file in `CHUNK_SIZE`-byte windows. The
-/// last window may be shorter; an empty source produces zero leaves
-/// (the splitter's `finish` will emit the canonical empty leaf).
-struct LeafIter<'a> {
-    body: Option<&'a [u8]>,
-    cursor: usize,
-    total: usize,
-    done: bool,
+/// Reads the source file in `CHUNK_SIZE`-byte leaves, up to the
+/// `total` bytes recorded when the job was created. The last leaf may
+/// be shorter; an empty source produces zero leaves (the splitter's
+/// `finish` emits the canonical empty leaf).
+///
+/// Plain buffered reads, not mmap: a file that shrinks while it is
+/// mapped faults the process (SIGBUS, or an out-of-bounds slice before
+/// the map), killing antd or the app hosting the node. Here a file
+/// that ends before `total` is a short read, reported as
+/// [`UploadError::SourceChanged`]. A file that grows is read only up
+/// to `total`.
+struct LeafReader {
+    reader: std::io::BufReader<std::fs::File>,
+    buf: Box<[u8]>,
+    cursor: u64,
+    total: u64,
 }
 
-impl<'a> LeafIter<'a> {
-    const fn new(body: Option<&'a [u8]>, total: u64) -> Self {
-        Self {
-            body,
+/// Read-ahead buffer for [`LeafReader`]: 64 leaves per `read` syscall.
+const LEAF_READ_BUFFER: usize = 64 * CHUNK_SIZE;
+
+impl LeafReader {
+    fn open(path: &Path, total: u64) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Ok(Self {
+            reader: std::io::BufReader::with_capacity(LEAF_READ_BUFFER, file),
+            buf: vec![0u8; CHUNK_SIZE].into_boxed_slice(),
             cursor: 0,
-            total: total as usize,
-            done: total == 0,
-        }
+            total,
+        })
     }
 
     const fn is_done(&self) -> bool {
-        self.done
+        self.cursor >= self.total
     }
-}
 
-impl<'a> Iterator for LeafIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
+    /// The next leaf, `Ok(None)` once `total` bytes have been read, or
+    /// `Err(SourceChanged)` if the file ends early.
+    fn next_leaf(&mut self) -> Result<Option<&[u8]>, UploadError> {
+        use std::io::Read as _;
+        if self.is_done() {
+            return Ok(None);
         }
-        let body = self.body?;
-        let end = (self.cursor + CHUNK_SIZE).min(self.total);
-        let leaf = &body[self.cursor..end];
-        self.cursor = end;
-        if self.cursor >= self.total {
-            self.done = true;
+        let n = (self.total - self.cursor).min(CHUNK_SIZE as u64) as usize;
+        match self.reader.read_exact(&mut self.buf[..n]) {
+            Ok(()) => {
+                self.cursor += n as u64;
+                Ok(Some(&self.buf[..n]))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Report the file's size now; if that can't be read,
+                // what we know it holds at least.
+                let actual_size = self
+                    .reader
+                    .get_ref()
+                    .metadata()
+                    .map_or(self.cursor, |m| m.len());
+                Err(UploadError::SourceChanged {
+                    expected_size: self.total,
+                    actual_size,
+                })
+            }
+            Err(e) => Err(e.into()),
         }
-        Some(leaf)
     }
 }
 
@@ -5224,6 +5321,306 @@ mod tests {
         // inside the 120 s outer PUSH_TIMEOUT wall, leaves room
         // for the 45 s single-attempt pushsync envelope.
         assert!((15_000..=25_000).contains(&total), "total={total}");
+    }
+
+    /// A fake node loop like [`spawn_fake_pushsync`], except every
+    /// `PushChunk` ack is held until `gate` is set to `true`, so a job
+    /// stays `Running` with a full in-flight window for as long as the
+    /// test needs. Counts dispatches per chunk address.
+    #[allow(clippy::type_complexity)]
+    fn spawn_gated_pushsync() -> (
+        mpsc::Sender<ControlCommand>,
+        Arc<Mutex<HashMap<[u8; 32], u32>>>,
+        watch::Sender<bool>,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let pushed: Arc<Mutex<HashMap<[u8; 32], u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pushed_for_task = pushed.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        *pushed_for_task
+                            .lock()
+                            .expect("pushed mutex")
+                            .entry(addr)
+                            .or_default() += 1;
+                        let mut gate = gate_rx.clone();
+                        tokio::spawn(async move {
+                            let _ = gate.wait_for(|open| *open).await;
+                            let _ = ack.send(ControlAck::ChunkUploaded {
+                                reference: format!("0x{}", hex::encode(addr)),
+                            });
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        // Everything pushed is present: heal no-ops.
+                        let present = pushed_for_task.lock().expect("pushed mutex");
+                        let missing: Vec<String> = addresses
+                            .iter()
+                            .filter(|a| !present.contains_key(*a))
+                            .map(|a| format!("0x{}", hex::encode(a)))
+                            .collect();
+                        drop(present);
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in upload tests: {other:?}"),
+                }
+            }
+        });
+        (tx, pushed, gate_tx)
+    }
+
+    /// `leaves` leaves whose content all differ (the leaf index leads
+    /// each one), so no two data chunks share an address and a chunk
+    /// pushed twice shows up as a count of 2.
+    fn distinct_leaves(leaves: usize) -> Vec<u8> {
+        let mut out = vec![0x5Au8; leaves * CHUNK_SIZE];
+        for (i, leaf) in out.chunks_mut(CHUNK_SIZE).enumerate() {
+            leaf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        }
+        out
+    }
+
+    async fn wait_for_dispatches(pushed: &Mutex<HashMap<[u8; 32], u32>>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pushed.lock().expect("pushed mutex").is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("driver dispatched nothing");
+    }
+
+    async fn wait_terminal(mgr: &UploadManager, id: &str) -> UploadJobInfo {
+        let mut rx = mgr.subscribe(id).expect("subscribe");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let snap = rx.borrow().clone();
+                if snap.status.is_terminal() {
+                    return snap;
+                }
+                rx.changed().await.expect("watch");
+            }
+        })
+        .await
+        .expect("job never reached a terminal state")
+    }
+
+    /// NODE-01: a source that shrinks after the size check (here,
+    /// between opening the reader and reading) ends in
+    /// `SourceChanged`, not an out-of-bounds slice panic or a SIGBUS.
+    #[test]
+    fn leaf_reader_errors_when_source_shrinks() {
+        let full = 3 * CHUNK_SIZE + 5;
+        let f = write_temp_file(&vec![0x11; full]);
+        let shrink = |len: usize| {
+            std::fs::File::options()
+                .write(true)
+                .open(f.path())
+                .expect("open")
+                .set_len(len as u64)
+                .expect("truncate");
+        };
+
+        // Intact: three full leaves and a 5-byte tail.
+        let mut r = LeafReader::open(f.path(), full as u64).expect("open");
+        let mut lens = Vec::new();
+        while let Some(leaf) = r.next_leaf().expect("read") {
+            lens.push(leaf.len());
+        }
+        assert_eq!(lens, vec![CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE, 5]);
+
+        // Shrunk after the metadata check, before the first read.
+        let mut r = LeafReader::open(f.path(), full as u64).expect("open");
+        shrink(CHUNK_SIZE + 10);
+        assert_eq!(
+            r.next_leaf().expect("first leaf").map(<[u8]>::len),
+            Some(CHUNK_SIZE)
+        );
+        match r.next_leaf() {
+            Err(UploadError::SourceChanged {
+                expected_size,
+                actual_size,
+            }) => {
+                assert_eq!(expected_size, full as u64);
+                assert_eq!(actual_size, CHUNK_SIZE as u64 + 10);
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+
+        // The heal path's address walk reports it as an error too.
+        let err = collect_heal_addrs(f.path(), full as u64, false, None, None)
+            .expect_err("shrunk source");
+        assert!(err.to_string().contains("source file changed"), "{err}");
+    }
+
+    /// NODE-01, end to end: truncating the source while its upload runs
+    /// fails the job with `SourceChanged` (under mmap this faulted the
+    /// whole process).
+    #[tokio::test]
+    async fn source_shrinking_mid_upload_fails_job() {
+        let payload = distinct_leaves(1024);
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, pushed, gate) = spawn_gated_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+        wait_for_dispatches(&pushed).await;
+
+        // The driver is parked on a full window, well short of 2 MiB.
+        std::fs::File::options()
+            .write(true)
+            .open(f.path())
+            .expect("open")
+            .set_len(512 * CHUNK_SIZE as u64)
+            .expect("truncate");
+        gate.send(true).expect("open gate");
+
+        let snap = wait_terminal(&mgr, &id).await;
+        assert_eq!(snap.status, UploadStatus::Failed);
+        let err = snap.last_error.unwrap_or_default();
+        assert!(err.contains("source file changed"), "{err}");
+    }
+
+    /// NODE-02: pause / resume / cancel addressed by a short id prefix
+    /// persist under the job's full id only — no stray `<prefix>.json`
+    /// that a restart would load as a second copy of the job.
+    #[tokio::test]
+    async fn prefix_commands_write_only_full_id_manifest() {
+        let f = write_temp_file(&distinct_leaves(512));
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, pushed, _gate) = spawn_gated_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+        wait_for_dispatches(&pushed).await;
+        let prefix = &id[..8];
+
+        let manifests = || {
+            let mut names: Vec<String> = std::fs::read_dir(state_dir.path())
+                .expect("read_dir")
+                .map(|e| e.expect("entry").path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+                .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let only_full = vec![format!("{id}.json")];
+
+        assert_eq!(
+            mgr.pause(prefix).expect("pause").status,
+            UploadStatus::Paused
+        );
+        assert_eq!(manifests(), only_full, "after pause");
+        mgr.resume(prefix).expect("resume");
+        assert_eq!(manifests(), only_full, "after resume");
+        assert_eq!(
+            mgr.cancel(prefix).expect("cancel").status,
+            UploadStatus::Cancelled
+        );
+        assert_eq!(manifests(), only_full, "after cancel");
+    }
+
+    /// NODE-02: resuming a job that is already `Running` doesn't start
+    /// a second driver, and a pause followed at once by resume (the old
+    /// driver still draining its in-flight pushes) doesn't run two
+    /// drivers side by side: no chunk is ever dispatched twice.
+    #[tokio::test]
+    async fn double_resume_keeps_one_driver() {
+        let f = write_temp_file(&distinct_leaves(600));
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, pushed, gate) = spawn_gated_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+        wait_for_dispatches(&pushed).await;
+        let handle = mgr.resolve(&id).expect("handle");
+
+        // Running, driver alive: resume is a no-op, twice over.
+        for _ in 0..2 {
+            assert_eq!(
+                mgr.resume(&id).expect("resume").status,
+                UploadStatus::Running
+            );
+        }
+        assert_eq!(handle.driver_spawns.load(Ordering::SeqCst), 1);
+
+        // The driver is still alive while the gate holds its pushes.
+        assert!(handle.driver_alive());
+
+        // Pause, then resume before the old driver could drain (its
+        // pushes are all held by the gate).
+        mgr.pause(&id).expect("pause");
+        mgr.resume(&id).expect("resume");
+        gate.send(true).expect("open gate");
+
+        let snap = wait_terminal(&mgr, &id).await;
+        assert_eq!(snap.status, UploadStatus::Completed);
+        let pushed = pushed.lock().expect("pushed mutex");
+        let twice: Vec<_> = pushed.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            twice.is_empty(),
+            "{} chunk(s) dispatched more than once: two drivers ran",
+            twice.len(),
+        );
+    }
+
+    /// A job left `Running` with no live driver (its task died without
+    /// settling the status) is recovered by `resume`, which spawns one.
+    #[tokio::test]
+    async fn resume_respawns_dead_driver_of_running_job() {
+        let f = write_temp_file(&distinct_leaves(8));
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+        assert_eq!(
+            wait_terminal(&mgr, &id).await.status,
+            UploadStatus::Completed
+        );
+        let handle = mgr.resolve(&id).expect("handle");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.driver_alive() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("driver never exited");
+
+        // Stranded: says Running, nothing drives it.
+        {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            info.status = UploadStatus::Running;
+            info.reference = None;
+        }
+        mgr.resume(&id).expect("resume");
+        assert_eq!(handle.driver_spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            wait_terminal(&mgr, &id).await.status,
+            UploadStatus::Completed
+        );
     }
 
     /// `cancel` flips status and stops the driver. Already-pushed

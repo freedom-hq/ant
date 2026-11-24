@@ -72,7 +72,7 @@ pub struct UploadJobInfo {
     /// restarts.
     pub job_id: String,
     /// Absolute path to the source file on the daemon's filesystem.
-    /// The daemon mmaps this — it must stay in place and unchanged
+    /// The daemon re-reads this — it must stay in place and unchanged
     /// for the upload's life. Resume refuses if the size or mtime
     /// changed.
     pub source_path: PathBuf,

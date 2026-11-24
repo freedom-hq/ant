@@ -51,8 +51,7 @@ use ant_retrieval::{
     StreamingSplitter,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use memmap2::Mmap;
-use std::io::Write as _;
+use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -306,23 +305,29 @@ fn split_file(
 ) -> Result<[u8; 32]> {
     let file =
         std::fs::File::open(abs_path).with_context(|| format!("open {}", abs_path.display()))?;
-    let body: Option<Mmap> = if file_size == 0 {
-        None
-    } else {
-        // SAFETY: pinning is read-only and the operator is expected
-        // to keep the source stable during the run. If it changes
-        // mid-run the derived chunk addresses won't match the
-        // expected reference and we abort at the end.
-        Some(unsafe { Mmap::map(&file)? })
-    };
+    // Buffered reads, not mmap: a file that shrinks under a mapping
+    // faults the process (SIGBUS) instead of returning an error. Here
+    // a file that ends before `file_size` is a short read and fails
+    // the pin. If it changes in place, the derived chunk addresses
+    // won't match the expected reference and we abort at the end.
+    let mut reader = BufReader::with_capacity(64 * CHUNK_SIZE, file);
+    let mut buf = vec![0u8; CHUNK_SIZE];
     let mut splitter = StreamingSplitter::new();
     let mut last_report = Instant::now();
     let mut cursor: usize = 0;
-    let total = file_size as usize;
-    let body_slice = body.as_deref();
+    let total = usize::try_from(file_size).context("file too large for this platform")?;
     while cursor < total {
         let end = (cursor + CHUNK_SIZE).min(total);
-        let leaf = &body_slice.expect("non-empty file mmap")[cursor..end];
+        let leaf = &mut buf[..end - cursor];
+        if let Err(e) = reader.read_exact(leaf) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                bail!(
+                    "{} changed during the pin: expected {file_size} bytes, it ended before byte {end}",
+                    abs_path.display(),
+                );
+            }
+            return Err(e).with_context(|| format!("read {}", abs_path.display()));
+        }
         for chunk in splitter.push_leaf(leaf) {
             if let Some(s) = tx {
                 s.send(chunk).map_err(|_| anyhow!("pin worker died"))?;
@@ -428,4 +433,38 @@ fn parse_reference(s: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     hex::decode_to_slice(s, &mut out).map_err(|e| anyhow!("invalid hex: {e}"))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source that is shorter than the size taken from its metadata
+    /// (it shrank between the check and the read) fails the pin with an
+    /// error instead of slicing past the end of a mapping.
+    #[test]
+    fn split_file_errors_when_source_shrank() {
+        let path = std::env::temp_dir().join(format!(
+            "antctl-pin-shrink-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let full = 3 * CHUNK_SIZE + 5;
+        std::fs::write(&path, vec![7u8; full]).expect("write");
+        let ok = split_file(&path, full as u64, None, None);
+        assert!(ok.is_ok(), "intact file splits: {ok:?}");
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_len(CHUNK_SIZE as u64 + 10)
+            .expect("truncate");
+        let err = split_file(&path, full as u64, None, None).expect_err("shrunk source");
+        assert!(
+            err.to_string().contains("changed during the pin"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
