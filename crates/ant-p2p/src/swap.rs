@@ -647,6 +647,17 @@ pub fn issue_cheque(
 /// open compacts). The journal must travel with the file (ant-ffi's
 /// account parking moves both).
 ///
+/// Next to each issued cumulative the ledger keeps the highest one known
+/// to have been delivered ([`Self::confirm_delivered`]), which the next
+/// cheque builds on ([`Self::next_cumulative`], issue #283). These live
+/// in a section of their own, `<chequebook>.confirmed`, keyed
+/// `<chequebook>.confirmed:<beneficiary>` on disk and journaled like the
+/// issued figures (only growing, the larger figure wins); a release that
+/// doesn't know them reads that section as another chequebook's and
+/// leaves it alone. A beneficiary with no confirmed figure (paid before
+/// they were kept) counts as confirmed up to its issued cumulative, and
+/// its next cheque records the one it builds on in the same journal line.
+///
 /// Bare `beneficiary → cumulative` entries — a file from before the
 /// sections, or ones a downgraded release added — are adopted by the
 /// first chequebook that opens the file (the larger figure wins against
@@ -735,6 +746,13 @@ struct OutboundState {
     /// Sum of `cumulatives`, kept up to date so the funds check on the
     /// pay path is O(1).
     total: U256,
+    /// Per beneficiary, the highest cumulative of a cheque known to have
+    /// been delivered ([`OutboundLedger::confirm_delivered`]). Not part of
+    /// the liability (`total`): every confirmed cheque is also issued. A
+    /// beneficiary missing here (figures written before this was kept)
+    /// counts as confirmed up to its issued cumulative
+    /// ([`OutboundLedger::confirmed_for`]).
+    confirmed: HashMap<String, U256>,
     /// The file couldn't be read (an I/O error, not "missing"), so the
     /// chequebook's recorded cumulatives are unknown. Nothing is written
     /// and no cheque is issued until a read succeeds
@@ -755,7 +773,30 @@ impl OutboundState {
         }
         *cur
     }
+
+    /// Raise `beneficiary`'s confirmed cumulative to `v` (it only grows)
+    /// and return the figure it holds now.
+    fn raise_confirmed(&mut self, beneficiary: String, v: U256) -> U256 {
+        let cur = self.confirmed.entry(beneficiary).or_default();
+        if v > *cur {
+            *cur = v;
+        }
+        *cur
+    }
 }
+
+/// The file section holding the confirmed cumulatives of the chequebook
+/// whose section is `chequebook` (see [`OutboundLedger`]). Its name has
+/// no `:`, so a flat key `<chequebook>.confirmed:<beneficiary>` splits
+/// into it, and a release that doesn't know it reads it as one more
+/// chequebook's section, which it never opens: its own figures and
+/// liability are untouched.
+fn confirmed_section(chequebook: &str) -> String {
+    format!("{chequebook}{CONFIRMED_SUFFIX}")
+}
+
+/// Suffix of a [`confirmed_section`] name.
+const CONFIRMED_SUFFIX: &str = ".confirmed";
 
 /// Fewest journal lines that trigger a compaction; above it, the journal
 /// may grow to as many lines as the file has entries, so the cost of
@@ -1292,6 +1333,25 @@ impl JournalStore {
             q.lines += 1;
             q.staged += 1;
         }
+        q.staged
+    }
+
+    /// Stage `entries` as one journal line holding them all, so they
+    /// reach the disk together or not at all. Returns the sequence number
+    /// to wait for.
+    fn stage_line(&self, entries: &[(&str, &str, U256)]) -> u64 {
+        let line = entries
+            .iter()
+            .map(|(chequebook, beneficiary, v)| format!("\"{chequebook}:{beneficiary}\":\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut q = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        q.buf.extend_from_slice(format!("{{{line}}}\n").as_bytes());
+        q.lines += 1;
+        q.staged += 1;
         q.staged
     }
 
@@ -2009,7 +2069,7 @@ fn sectioned_known(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(file
         .chequebooks
         .into_keys()
-        .filter(|k| !k.is_empty())
+        .filter(|k| !k.is_empty() && !k.ends_with(CONFIRMED_SUFFIX))
         .filter(|k| match &marker {
             Ok(None) => true,
             Ok(Some(m)) => m.clears(k),
@@ -2574,6 +2634,11 @@ fn load_outbound_section(
             state.raise(k, v);
         }
     }
+    if let Some(section) = file.chequebooks.remove(&confirmed_section(key)) {
+        for (k, v) in parse_cumulatives(section) {
+            state.raise_confirmed(k, v);
+        }
+    }
     state.unread = None;
     Ok(entries)
 }
@@ -2861,6 +2926,9 @@ impl OutboundLedger {
                 for (k, v) in read.cumulatives {
                     st.raise(k, v);
                 }
+                for (k, v) in read.confirmed {
+                    st.raise_confirmed(k, v);
+                }
                 if st.unread.take().is_some() {
                     self.shared.loaded.store(true, Ordering::SeqCst);
                     info!(
@@ -2932,12 +3000,71 @@ impl OutboundLedger {
         self.lock_state().cumulatives.get(&key).copied()
     }
 
+    /// Highest cumulative of a cheque to `beneficiary` known to have
+    /// been delivered ([`Self::confirm_delivered`]). For a beneficiary
+    /// paid only before this was kept, its issued cumulative: those
+    /// cheques count as delivered, as they did then.
+    #[must_use]
+    pub fn confirmed_for(&self, beneficiary: &[u8; 20]) -> U256 {
+        let key = hex::encode(beneficiary);
+        let st = self.lock_state();
+        st.confirmed
+            .get(&key)
+            .or_else(|| st.cumulatives.get(&key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The cumulative of the next cheque to `beneficiary` paying `amount`
+    /// of debt: the last delivered cheque's ([`Self::confirmed_for`])
+    /// plus `amount`, but never below the last issued one, since
+    /// cumulatives only grow. A cheque issued but not delivered doesn't
+    /// count towards the next one: a retry for the same debt reissues
+    /// the same cumulative (which the peer may already hold, and credits
+    /// only once), and a larger debt supersedes it. So a peer that makes
+    /// deliveries fail can't collect one debt several times (bee's
+    /// `chequebook.Issue` saves the last cheque only once it was sent).
+    /// `None` on overflow. Hold [`Self::beneficiary_lock`] from here to
+    /// recording the cheque.
+    #[must_use]
+    pub fn next_cumulative(&self, beneficiary: &[u8; 20], amount: U256) -> Option<U256> {
+        let issued = self.cumulative_for(beneficiary);
+        let paid = self.confirmed_for(beneficiary).checked_add(amount)?;
+        Some(issued.max(paid))
+    }
+
+    /// Record that the cheque to `beneficiary` at `cumulative` was
+    /// delivered, so the next one builds on it ([`Self::next_cumulative`]).
+    /// In memory at once; the returned write puts it on disk.
+    pub fn confirm_delivered(&self, beneficiary: &[u8; 20], cumulative: U256) -> PendingWrite {
+        let key = hex::encode(beneficiary);
+        let now = self.lock_state().raise_confirmed(key.clone(), cumulative);
+        let Some(store) = &self.shared.store else {
+            return PendingWrite { pending: None };
+        };
+        let section = confirmed_section(&hex::encode(self.chequebook));
+        let seq = store.stage_line(&[(section.as_str(), key.as_str(), now)]);
+        PendingWrite {
+            pending: Some(Pending {
+                store: Arc::clone(store),
+                seq,
+                shared: Arc::clone(&self.shared),
+                note_known: None,
+            }),
+        }
+    }
+
     /// Record `beneficiary` → `new_cumulative` as issued: in memory at
     /// once (so [`Self::total_issued`] counts it from now on), and staged
     /// for the journal. Nothing is written yet and no lock is held on
     /// return; the cheque may be sent only once the returned
     /// [`PendingWrite`] is durable. Cheques staged together are written
     /// and fsynced together.
+    ///
+    /// The first cheque to a beneficiary with no confirmed cumulative on
+    /// record ([`Self::confirmed_for`]) also records its confirmed
+    /// cumulative as the one issued before, in the same journal line, so
+    /// a restart doesn't count this cheque as delivered.
     ///
     /// The journal line is written even while the file can't be read: it
     /// only ever raises a figure, so it can't erase one this ledger
@@ -2948,11 +3075,18 @@ impl OutboundLedger {
     pub fn stage_issued(&self, beneficiary: &[u8; 20], new_cumulative: U256) -> PendingWrite {
         let key = hex::encode(beneficiary);
         let mut st = self.lock_state();
+        let pinned = if st.confirmed.contains_key(&key) {
+            None
+        } else {
+            let before = st.cumulatives.get(&key).copied().unwrap_or_default();
+            Some(st.raise_confirmed(key.clone(), before))
+        };
         let now = st.raise(key.clone(), new_cumulative);
         let Some(store) = &self.shared.store else {
             return PendingWrite { pending: None };
         };
         let chequebook = hex::encode(self.chequebook);
+        let confirmed = confirmed_section(&chequebook);
         // Read before the rewrite is staged: a loss flagged after this
         // point isn't covered by it.
         let generation = self.shared.loss_gen.load(Ordering::SeqCst);
@@ -2960,14 +3094,20 @@ impl OutboundLedger {
             let seq = store.stage(
                 st.cumulatives
                     .iter()
-                    .map(|(b, v)| (chequebook.as_str(), b.as_str(), *v)),
+                    .map(|(b, v)| (chequebook.as_str(), b.as_str(), *v))
+                    .chain(
+                        st.confirmed
+                            .iter()
+                            .map(|(b, v)| (confirmed.as_str(), b.as_str(), *v)),
+                    ),
             );
             (seq, Some((chequebook, generation)))
         } else {
-            (
-                store.stage([(chequebook.as_str(), key.as_str(), now)]),
-                None,
-            )
+            let mut line = vec![(chequebook.as_str(), key.as_str(), now)];
+            if let Some(c) = pinned {
+                line.push((confirmed.as_str(), key.as_str(), c));
+            }
+            (store.stage_line(&line), None)
         };
         drop(st);
         PendingWrite {
@@ -3015,7 +3155,7 @@ async fn write_empty_headers<W: AsyncWriteExt + Unpin>(w: &mut W) -> std::io::Re
     Ok(())
 }
 
-async fn read_delimited<R: AsyncReadExt + Unpin>(
+pub(crate) async fn read_delimited<R: AsyncReadExt + Unpin>(
     r: &mut R,
     max: usize,
 ) -> std::io::Result<Vec<u8>> {
@@ -3067,7 +3207,7 @@ async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<
     }
 }
 
-async fn write_delimited<W, M>(w: &mut W, msg: &M) -> std::io::Result<()>
+pub(crate) async fn write_delimited<W, M>(w: &mut W, msg: &M) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
     M: Message,
@@ -3252,18 +3392,18 @@ impl SettlementRates {
 
 /// Bee `internal/headers/pb::Header`.
 #[derive(Clone, PartialEq, Eq, Message)]
-struct HeaderPb {
+pub(crate) struct HeaderPb {
     #[prost(string, tag = "1")]
-    key: String,
+    pub(crate) key: String,
     #[prost(bytes = "vec", tag = "2")]
-    value: Vec<u8>,
+    pub(crate) value: Vec<u8>,
 }
 
 /// Bee `internal/headers/pb::Headers`.
 #[derive(Clone, PartialEq, Eq, Message)]
-struct HeadersPb {
+pub(crate) struct HeadersPb {
     #[prost(message, repeated, tag = "1")]
-    headers: Vec<HeaderPb>,
+    pub(crate) headers: Vec<HeaderPb>,
 }
 
 /// Decode the swap listener's response headers into [`SettlementRates`],
@@ -3364,11 +3504,20 @@ async fn await_verdict<S>(stream: &mut S) -> Result<(), SwapError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
-    let mut rest = Vec::new();
-    stream
-        .read_to_end(&mut rest)
+    // Bee writes nothing back after the cheque, so the stream's end is
+    // the only thing to read. Any byte is a protocol error: reading to
+    // the end instead would let the peer make us buffer whatever it
+    // sends until the deadline (issue #283).
+    let mut byte = [0u8; 1];
+    let n = stream
+        .read(&mut byte)
         .await
         .map_err(|e| SwapError::Rejected(format!("cheque stream failed: {e}")))?;
+    if n != 0 {
+        return Err(SwapError::Rejected(
+            "the recipient sent data on the cheque stream (bee sends none)".into(),
+        ));
+    }
     if let Err(e) = stream.write(&[]).await {
         return Err(SwapError::Rejected(format!(
             "the recipient reset the cheque stream (refused or lost): {e}"
@@ -3456,6 +3605,39 @@ mod verdict_tests {
             verdict.is_err(),
             "a reset cheque stream must not count as delivered"
         );
+    }
+
+    /// Bee sends nothing back on the cheque stream, so the first byte the
+    /// recipient sends is a protocol error, read and refused at once:
+    /// the payer neither buffers what follows nor waits for the stream to
+    /// end (issue #283).
+    #[tokio::test]
+    async fn data_on_the_cheque_stream_is_refused_at_the_first_byte() {
+        let (mut ours, mut theirs) = stream_pair().await;
+        let flood = tokio::spawn(async move {
+            read_cheque(&mut theirs).await;
+            // Never ends the stream: only the first byte can settle it.
+            let chunk = vec![0xffu8; 64 * 1024];
+            let mut sent = 0usize;
+            while theirs.write_all(&chunk).await.is_ok() {
+                sent += chunk.len();
+            }
+            sent
+        });
+        let verdict =
+            tokio::time::timeout(std::time::Duration::from_secs(5), await_verdict(&mut ours))
+                .await
+                .expect("refused without waiting for the stream to end");
+        let err = verdict.unwrap_err().to_string();
+        assert!(err.contains("sent data"), "{err}");
+        drop(ours);
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), flood)
+            .await
+            .expect("the flood stops once the stream is dropped")
+            .unwrap();
+        // Yamux's receive window (256 KiB) caps what the flood got out
+        // when nothing reads it: no unbounded buffering on our side.
+        assert!(sent <= 1024 * 1024, "{sent}");
     }
 }
 
@@ -4828,7 +5010,13 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap())
                 .expect("a pre-section release must parse the file");
         old.retain(|_, v| U256::from_dec_str(v).is_ok());
-        assert_eq!(old.len(), 3, "{old:?}");
+        // Plus each chequebook's confirmed cumulatives, in sections of
+        // their own that the old release carries along untouched.
+        assert_eq!(
+            old.keys().filter(|k| !k.contains(".confirmed:")).count(),
+            3,
+            "{old:?}"
+        );
         old.insert(hex::encode(q), "90".into());
         std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
 
@@ -4915,10 +5103,12 @@ mod tests {
             4,
             "{journal}"
         );
+        // A first cheque to a beneficiary also records, in the same line,
+        // what was confirmed to it before (here nothing).
         assert!(journal.ends_with(&format!(
-            "{{\"{}:{}\":\"9\"}}\n#4\n",
-            hex::encode(cb),
-            hex::encode(beneficiary(5_000))
+            "{{\"{cb}:{b}\":\"9\",\"{cb}.confirmed:{b}\":\"0\"}}\n#4\n",
+            cb = hex::encode(cb),
+            b = hex::encode(beneficiary(5_000))
         )));
         let expected = (0..2_000u64)
             .map(|i| 1_000_000_000 + i)
@@ -5623,7 +5813,10 @@ mod tests {
         );
         let b2 = hex::encode(beneficiary(2));
         assert_eq!(
-            String::from_utf8_lossy(&after).matches(b2.as_str()).count(),
+            String::from_utf8_lossy(&after)
+                .lines()
+                .filter(|l| l.contains(b2.as_str()))
+                .count(),
             1,
             "the retried line is in the file once"
         );
@@ -5765,6 +5958,84 @@ mod tests {
         assert_eq!(copies, 1);
     }
 
+    /// The confirmed cumulative (issue #283) is kept next to the issued
+    /// one and survives a crash: a cheque issued but not delivered before
+    /// it is reissued at the same cumulative after a restart, not stacked
+    /// on. Figures from before it was kept count as delivered, as they
+    /// did then.
+    #[test]
+    fn the_confirmed_cumulative_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc7u8; 20];
+        let (old, new) = (beneficiary(1), beneficiary(2));
+        let flat: HashMap<String, String> = [(
+            format!("{}:{}", hex::encode(cb), hex::encode(old)),
+            "100".to_string(),
+        )]
+        .into();
+        std::fs::write(&path, serde_json::to_vec(&flat).unwrap()).unwrap();
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.confirmed_for(&old), U256::from(100u64));
+        assert_eq!(l.confirmed_for(&new), U256::zero());
+        let fifty = U256::from(50u64);
+        assert_eq!(l.next_cumulative(&old, fifty), Some(U256::from(150u64)));
+        l.record_issued(&old, U256::from(150u64)).unwrap();
+        l.record_issued(&new, fifty).unwrap();
+        crash(&path, [l]);
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.cumulative_for(&old), U256::from(150u64));
+        assert_eq!(l.confirmed_for(&old), U256::from(100u64));
+        assert_eq!(l.confirmed_for(&new), U256::zero());
+        assert_eq!(l.total_issued(), U256::from(200u64), "not counted twice");
+        // Retries for the same debts reissue the same cumulatives; a
+        // smaller one still never goes below what was issued.
+        assert_eq!(l.next_cumulative(&old, fifty), Some(U256::from(150u64)));
+        assert_eq!(l.next_cumulative(&new, fifty), Some(fifty));
+        assert_eq!(l.next_cumulative(&new, U256::one()), Some(fifty));
+        l.confirm_delivered(&old, U256::from(150u64))
+            .wait()
+            .unwrap();
+        crash(&path, [l]);
+
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        assert_eq!(l.confirmed_for(&old), U256::from(150u64));
+        assert_eq!(l.next_cumulative(&old, fifty), Some(U256::from(200u64)));
+        drop(l);
+        // Folded into the file at close, in a section of its own.
+        let on_disk = read_outbound_file(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.chequebooks[&format!("{}.confirmed", hex::encode(cb))][&hex::encode(old)],
+            "150"
+        );
+        assert_eq!(on_disk.chequebooks[&hex::encode(cb)].len(), 2);
+    }
+
+    /// A cheque whose journal line failed to write stays issued in
+    /// memory, and the retry for the same debt reissues its cumulative
+    /// instead of stacking on it (issue #283).
+    #[test]
+    fn a_failed_journal_write_does_not_stack_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pushsync_outbound.json");
+        let cb = [0xc8u8; 20];
+        let b = beneficiary(3);
+        let l = OutboundLedger::open(Some(path.clone()), cb);
+        let amount = U256::from(70u64);
+        let first = l.next_cumulative(&b, amount).unwrap();
+        FAIL_NEXT_SYNC.with(|f| f.set(true));
+        assert!(l.record_issued(&b, first).is_err());
+        let retry = l.next_cumulative(&b, amount).unwrap();
+        assert_eq!(retry, first);
+        l.record_issued(&b, retry).unwrap();
+        assert_eq!(l.total_issued(), amount);
+        crash(&path, [l]);
+        let l = OutboundLedger::open(Some(path), cb);
+        assert_eq!(l.cumulative_for(&b), amount);
+        assert_eq!(l.confirmed_for(&b), U256::zero());
+    }
+
     /// Once the journal holds as many lines as the threshold, it is folded
     /// into the file in the background, without a cheque waiting for it.
     #[test]
@@ -5785,7 +6056,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let on_disk = read_outbound_file(&path).unwrap().unwrap();
-        assert_eq!(on_disk.entries(), n as usize);
+        assert_eq!(on_disk.chequebooks[&hex::encode(cb)].len(), n as usize);
+        // Each new beneficiary's first cheque also records that nothing
+        // was confirmed to it yet.
+        assert_eq!(on_disk.entries(), 2 * n as usize);
         l.record_issued(&beneficiary(0), U256::from(99u64)).unwrap();
         crash(&path, [l]);
         let l = OutboundLedger::open(Some(path), cb);
