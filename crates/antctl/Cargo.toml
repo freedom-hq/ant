@@ -24,5 +24,10 @@ primitive-types = { version = "0.14.0", default-features = false }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+# `get -o <dir> --force` opens the target with `O_NOFOLLOW|O_NONBLOCK`
+# so it neither follows a symlink nor blocks on a FIFO.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

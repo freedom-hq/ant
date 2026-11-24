@@ -34,7 +34,8 @@ use ant_control::{
 };
 use ant_gateway::testkit::build_router;
 use ant_gateway::{
-    ChainContext, CorsConfig, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry,
+    ChainContext, CorsConfig, GatewayChainState, GatewayHandle, GatewayIdentity, HostPolicy,
+    TagRegistry,
 };
 use ant_retrieval::{
     join_to_sender_range, join_with_options, list_manifest, lookup_path, ByteRange, ChunkFetcher,
@@ -241,6 +242,7 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: false,
             chain: None,
@@ -270,6 +272,7 @@ pub fn cache_router(cache: Option<ant_retrieval::ChunkCaches>, cors: CorsConfig)
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: false,
             chain: None,
@@ -312,6 +315,7 @@ pub fn swap_switch_router(snapshot: StatusSnapshot, cors: CorsConfig) -> Router 
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: None,
@@ -380,6 +384,7 @@ pub fn status_router_with_chain_hooks_and_cors(
         cors,
         None,
         Ok((None, None, None)),
+        Vec::new(),
     )
 }
 
@@ -399,6 +404,7 @@ pub fn status_router_with_chain_and_issued(
         CorsConfig::default(),
         None,
         Ok((issued, None, None)),
+        Vec::new(),
     )
 }
 
@@ -419,6 +425,7 @@ pub fn status_router_with_chain_and_issued_by(
         CorsConfig::default(),
         None,
         Ok((issued, Some(chequebook), None)),
+        Vec::new(),
     )
 }
 
@@ -439,6 +446,7 @@ pub fn status_router_with_chain_and_lost_ledger(
         CorsConfig::default(),
         None,
         Ok((Some(issued), Some(chequebook), Some(lost.to_string()))),
+        Vec::new(),
     )
 }
 
@@ -456,6 +464,7 @@ pub fn status_router_with_chain_and_failing_snapshot(
         CorsConfig::default(),
         None,
         Err("snapshot fixture fails".into()),
+        Vec::new(),
     )
 }
 
@@ -478,6 +487,28 @@ pub fn status_router_recording_registrations(
         CorsConfig::default(),
         Some(seen.clone()),
         Ok((None, None, None)),
+        Vec::new(),
+    );
+    (router, seen)
+}
+
+/// [`status_router_recording_registrations`] whose node lists `postage`
+/// as its registered batches (`PostageList`).
+pub fn status_router_with_postage(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+    postage: Vec<ant_control::PostageStatusView>,
+) -> (Router, Registrations) {
+    let seen = Registrations::default();
+    let router = chain_router(
+        snapshot,
+        chain,
+        None,
+        None,
+        CorsConfig::default(),
+        Some(seen.clone()),
+        Ok((None, None, None)),
+        postage,
     );
     (router, seen)
 }
@@ -486,6 +517,7 @@ pub fn status_router_recording_registrations(
 /// `(issued total, its chequebook, lost-ledger reason)`, or an error.
 type SnapshotFixture = Result<(Option<u128>, Option<[u8; 20]>, Option<String>), String>;
 
+#[allow(clippy::too_many_arguments)]
 fn chain_router(
     snapshot: StatusSnapshot,
     chain: std::sync::Arc<ChainContext>,
@@ -494,6 +526,7 @@ fn chain_router(
     cors: CorsConfig,
     registrations: Option<Registrations>,
     issued: SnapshotFixture,
+    postage: Vec<ant_control::PostageStatusView>,
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -504,6 +537,10 @@ fn chain_router(
     // exercise the node loop).
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::PostageList { ack } = cmd {
+                let _ = ack.send(ControlAck::PostageList(postage.clone()));
+                continue;
+            }
             if let ControlCommand::AccountingSnapshot { ack } = cmd {
                 let _ = ack.send(match &issued {
                     Ok((issued, chequebook, lost)) => {
@@ -549,6 +586,7 @@ fn chain_router(
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: Some(chain),
@@ -578,6 +616,7 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: false,
             chain: None,
@@ -605,6 +644,24 @@ pub fn handle_with_fixture_node() -> Router {
 /// can construct exactly the chunks the "network" holds and inspect the
 /// fetcher afterwards.
 pub fn handle_with_node(fetcher: Arc<DirFetcher>) -> Router {
+    handle_with_node_and_policy(fetcher, CorsConfig::default(), HostPolicy::default())
+}
+
+/// [`handle_with_fixture_node`] with a given CORS and `Host` policy, for
+/// the browser-guard tests (issue #312).
+pub fn handle_with_fixture_node_and_policy(cors: CorsConfig, hosts: HostPolicy) -> Router {
+    handle_with_node_and_policy(
+        Arc::new(DirFetcher::from_dir(&fixture_dir()).expect("load fixture chunks")),
+        cors,
+        hosts,
+    )
+}
+
+fn handle_with_node_and_policy(
+    fetcher: Arc<DirFetcher>,
+    cors: CorsConfig,
+    hosts: HostPolicy,
+) -> Router {
     let snapshot = snapshot_with_one_peer();
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
@@ -629,7 +686,8 @@ pub fn handle_with_node(fetcher: Arc<DirFetcher>) -> Router {
         commands: cmd_tx,
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
-        cors: Arc::new(CorsConfig::default()),
+        cors: Arc::new(cors),
+        hosts: Arc::new(hosts),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: None,
@@ -1368,6 +1426,7 @@ where
         activity: GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: None,

@@ -377,6 +377,7 @@ async fn serve_gateway(log: Arc<Mutex<NodeLog>>) -> String {
         activity: ant_control::GatewayActivity::new(),
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::new(["null"])),
+        hosts: Arc::default(),
         chain_state: GatewayChainState {
             light_mode: true,
             chain: None,

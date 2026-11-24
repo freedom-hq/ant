@@ -40,6 +40,8 @@ pub fn build(handle: GatewayHandle) -> Router {
     let spend_guard =
         middleware::from_fn_with_state(handle.clone(), crate::cors::wallet_spend_guard);
     let local_host = middleware::from_fn_with_state(handle.clone(), cache::local_host_guard);
+    let ws_origin =
+        middleware::from_fn_with_state(handle.clone(), crate::cors::websocket_origin_guard);
     Router::new()
         .route("/health", get(status::health))
         .route("/readiness", get(status::readiness))
@@ -100,13 +102,28 @@ pub fn build(handle: GatewayHandle) -> Router {
         )
         // WebSocket chunk stream (bee `chunk_stream.go`):
         // `bee-chunk-stream-v1` Get/Put when the client offers the
-        // subprotocol, the legacy upload-only framing otherwise.
-        .route("/chunks/stream", get(chunk_stream::chunk_stream))
+        // subprotocol, the legacy upload-only framing otherwise. Browser
+        // sockets need an exactly listed `Origin` (issue #312).
+        .route(
+            "/chunks/stream",
+            get(chunk_stream::chunk_stream).route_layer(ws_origin.clone()),
+        )
         // On-chain postage mutation (PLAN.md J.5 B2/B3): buy / topup /
-        // dilute. `501` when no funded wallet key is configured.
-        .route("/stamps/{amount}/{depth}", post(chain::buy_stamp))
-        .route("/stamps/topup/{id}/{amount}", patch(chain::topup_stamp))
-        .route("/stamps/dilute/{id}/{depth}", patch(chain::dilute_stamp))
+        // dilute. `501` when no funded wallet key is configured. They
+        // spend the wallet's xBZZ and gas, so they refuse web pages
+        // like the routes below (issue #312).
+        .route(
+            "/stamps/{amount}/{depth}",
+            post(chain::buy_stamp).route_layer(spend_guard.clone()),
+        )
+        .route(
+            "/stamps/topup/{id}/{amount}",
+            patch(chain::topup_stamp).route_layer(spend_guard.clone()),
+        )
+        .route(
+            "/stamps/dilute/{id}/{depth}",
+            patch(chain::dilute_stamp).route_layer(spend_guard.clone()),
+        )
         .route("/chequebook/address", get(chain::chequebook_address))
         .route("/chequebook/balance", get(chain::chequebook_balance))
         // Read-only settlement/balance mirror (bee `balances.go`,
@@ -125,8 +142,12 @@ pub fn build(handle: GatewayHandle) -> Router {
             get(settlements::chequebook_cheque_peer),
         )
         // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
-        // chequebook. `501` without a funded wallet key.
-        .route("/chequebook/deposit", post(chain::chequebook_deposit))
+        // chequebook. `501` without a funded wallet key. Refuses web
+        // pages like the spending routes below (issue #312).
+        .route(
+            "/chequebook/deposit",
+            post(chain::chequebook_deposit).route_layer(spend_guard.clone()),
+        )
         // Chequebook withdrawal (bee's `POST /chequebook/withdraw`):
         // xBZZ back to the node wallet, capped at what issued cheques
         // leave free. Refuses web pages like the spending routes below.
@@ -201,8 +222,15 @@ pub fn build(handle: GatewayHandle) -> Router {
         // GSOC/PSS receive: pull-based lurker subscriptions streamed over
         // WebSocket (bee `gsoc.go` / `pss.go` subscribe). Light-node
         // receive without a reserve.
-        .route("/gsoc/subscribe/{address}", get(subscribe::gsoc_subscribe))
-        .route("/pss/subscribe/{topic}", get(subscribe::pss_subscribe))
+        // Browser sockets need an exactly listed `Origin` (issue #312).
+        .route(
+            "/gsoc/subscribe/{address}",
+            get(subscribe::gsoc_subscribe).route_layer(ws_origin.clone()),
+        )
+        .route(
+            "/pss/subscribe/{topic}",
+            get(subscribe::pss_subscribe).route_layer(ws_origin),
+        )
         // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
         // direct data uploads. Returns a `/bytes/<ref>` reference.
         .route("/bytes", post(retrieval::upload_bytes))
@@ -259,14 +287,29 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/bzz/{addr}/{*path}", get_or_head(retrieval::bzz_with_path))
         .fallback(not_implemented)
         .layer(DefaultBodyLimit::max(GATEWAY_MAX_UPLOAD_BYTES as usize))
+        // Writes from web pages outside the CORS list, and from pages
+        // the API serves itself, are refused before any route runs
+        // (issue #312). Inside the span so the refusal is logged with
+        // its request id.
+        .layer(middleware::from_fn_with_state(
+            handle.clone(),
+            crate::cors::cross_origin_write_guard,
+        ))
         .layer(middleware::from_fn(request_span))
-        // CORS is applied outermost so a preflight `OPTIONS` is answered
-        // before the body-limit / span layers and never reaches a route
-        // (PLAN.md J.4.8). `from_fn_with_state` hands it the same handle
-        // the routes use, so the policy reads `handle.cors`.
+        // CORS is applied outside the routes so a preflight `OPTIONS` is
+        // answered before the body-limit / span layers and never reaches
+        // a route (PLAN.md J.4.8). `from_fn_with_state` hands it the
+        // same handle the routes use, so the policy reads `handle.cors`.
         .layer(middleware::from_fn_with_state(
             handle.clone(),
             crate::cors::cors_middleware,
+        ))
+        // The `Host` allowlist is outermost: a DNS-rebinding page is
+        // refused before anything else, preflights included (issue
+        // #312).
+        .layer(middleware::from_fn_with_state(
+            handle.clone(),
+            crate::hosts::host_guard,
         ))
         .with_state(handle)
 }

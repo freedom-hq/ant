@@ -69,11 +69,17 @@ fn shared_key(
     public: &PublicKey,
     topic: &[u8; 32],
 ) -> Result<[u8; 32], CryptoError> {
-    let x = shared_secret_x(secret, public)?;
+    Ok(shared_key_from_x(&shared_secret_x(secret, public)?, topic))
+}
+
+/// [`shared_key`] with the ECDH x-coordinate already computed, so a
+/// caller trying many topics against one secret pays the scalar
+/// multiplication once.
+fn shared_key_from_x(x: &[u8], topic: &[u8; 32]) -> [u8; 32] {
     let mut input = Vec::with_capacity(x.len() + 32);
-    input.extend_from_slice(&x);
+    input.extend_from_slice(x);
     input.extend_from_slice(topic);
-    Ok(keccak256(&input))
+    keccak256(&input)
 }
 
 /// Build the integrity-framed plaintext: `BE16(len) ‖ keccak256(msg)[2..] ‖ msg`.
@@ -476,11 +482,18 @@ pub fn unwrap(
     // so either parity works as long as x is a valid curve point.
     let eph_pub = lift_x(eph_x)?;
 
+    // The node-key ECDH doesn't depend on the topic: compute it once,
+    // not once per subscribed topic. Only the broadcast-mode key (derived
+    // from the topic itself) needs a fresh ECDH per topic.
+    let own_x = shared_secret_x(pss_secret, &eph_pub).ok();
+
     for topic in topics {
-        for secret in [*pss_secret, topic_derived_secret(topic)] {
-            let Ok(sk) = shared_key(&secret, &eph_pub, topic) else {
+        let topic_x = shared_secret_x(&topic_derived_secret(topic), &eph_pub).ok();
+        for x in [own_x.as_deref(), topic_x.as_deref()] {
+            let Some(x) = x else {
                 continue;
             };
+            let sk = shared_key_from_x(x, topic);
             let mut hint_input = [0u8; 64];
             hint_input[..32].copy_from_slice(&sk);
             hint_input[32..].copy_from_slice(topic);
@@ -593,6 +606,47 @@ mod tests {
 
         // A different topic must not match.
         assert!(unwrap(&recipient_secret, &data, &[topic_from_string("other")]).is_none());
+    }
+
+    /// `unwrap` hoists the node-key ECDH out of the topic loop: the
+    /// matching topic, in either mode, must still be found when it is
+    /// not the first one subscribed.
+    #[test]
+    fn unwrap_finds_the_matching_topic_among_many() {
+        let others: Vec<[u8; 32]> = (0..5)
+            .map(|i| topic_from_string(&format!("other-{i}")))
+            .collect();
+        let recipient_secret =
+            hex32("0202020202020202020202020202020202020202020202020202020202020202");
+        let recipient_pub = public_key_of(&recipient_secret).unwrap();
+
+        let topic = topic_from_string("direct-last");
+        let (_, data) = wrap(
+            &topic,
+            b"direct",
+            &Recipient::Key(recipient_pub),
+            &[vec![0x01u8]],
+        )
+        .unwrap();
+        let mut topics = others.clone();
+        topics.push(topic);
+        let got = unwrap(&recipient_secret, &data, &topics).expect("direct decrypt");
+        assert_eq!(got, (topic, b"direct".to_vec()));
+        assert!(unwrap(&recipient_secret, &data, &others).is_none());
+
+        let topic = topic_from_string("broadcast-last");
+        let (_, data) = wrap(
+            &topic,
+            b"broadcast",
+            &Recipient::TopicDerived,
+            &[vec![0x02u8]],
+        )
+        .unwrap();
+        let mut topics = others.clone();
+        topics.push(topic);
+        let got = unwrap(&recipient_secret, &data, &topics).expect("broadcast decrypt");
+        assert_eq!(got, (topic, b"broadcast".to_vec()));
+        assert!(unwrap(&recipient_secret, &data, &others).is_none());
     }
 
     #[test]

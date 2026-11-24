@@ -1539,11 +1539,20 @@ fn collect_entries<'a>(
 /// Fetch a manifest node by a 32-byte (plain) or 64-byte (encrypted)
 /// reference and unmarshal it. Encrypted nodes go through the
 /// decrypting joiner; plain nodes fetch the root chunk and join.
+///
+/// The node's joined size is capped at `max_bytes` (at most
+/// [`DEFAULT_MAX_FILE_BYTES`] makes sense): a node whose root chunk
+/// declares more fails with [`JoinError::TooLarge`] before the rest of
+/// it is fetched. Returns the node and its serialised size, for a
+/// caller (the ACT history walk) that budgets the bytes it joins across
+/// many nodes.
 pub(crate) async fn load_node_ref(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
-) -> Result<Node, ManifestError> {
-    load_node_ref_with_credit(fetcher, node_ref, None, &ReplicaSweeps::new()).await
+    max_bytes: usize,
+) -> Result<(Node, usize), ManifestError> {
+    let bytes = load_node_bytes(fetcher, node_ref, None, &ReplicaSweeps::new(), max_bytes).await?;
+    Ok((Node::unmarshal(&bytes)?, bytes.len()))
 }
 
 /// [`load_node_ref`] whose root-chunk fetch (issue #130) and header
@@ -1559,10 +1568,22 @@ async fn load_node_ref_with_credit(
     credit: Option<&CreditWindow>,
     sweeps: &ReplicaSweeps,
 ) -> Result<Node, ManifestError> {
+    let bytes = load_node_bytes(fetcher, node_ref, credit, sweeps, DEFAULT_MAX_FILE_BYTES).await?;
+    Node::unmarshal(&bytes)
+}
+
+/// Fetch and join a manifest node's serialised bytes, at most
+/// `max_bytes` of them (see [`load_node_ref_with_credit`]).
+async fn load_node_bytes(
+    fetcher: &dyn ChunkFetcher,
+    node_ref: &[u8],
+    credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
-        let bytes = join_encrypted(fetcher, enc_ref, DEFAULT_MAX_FILE_BYTES).await?;
-        return Node::unmarshal(&bytes);
+        return Ok(join_encrypted(fetcher, enc_ref, max_bytes).await?);
     }
     let Ok(addr) = <[u8; 32]>::try_from(node_ref) else {
         return Err(ManifestError::InvalidRefLength(node_ref.len() as u8));
@@ -1641,8 +1662,7 @@ async fn load_node_ref_with_credit(
     // attempt at that chunk instead of being repeated before the join's
     // own retries / erasure recovery.
     sniffed.replay();
-    let bytes = join(&sniffed, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
-    Node::unmarshal(&bytes)
+    Ok(join(&sniffed, &root_chunk, max_bytes).await?)
 }
 
 /// Fetch error as handed out by [`ChunkFetcher::fetch`].
@@ -2111,9 +2131,11 @@ fn parse_flat_json_object(s: &str) -> Result<HashMap<String, String>, ManifestEr
         i += 1;
     }
     if i >= bytes.len() || bytes[i] != b'{' {
+        // Preview by chars, not bytes: a byte cut can land inside a
+        // multi-byte char and panic (`panic = "abort"` in release).
+        let preview: String = s.chars().take(40).collect();
         return Err(ManifestError::InvalidMetadata(format!(
-            "expected '{{', got {:?}",
-            &s[..s.len().min(40)]
+            "expected '{{', got {preview:?}"
         )));
     }
     i += 1;
@@ -2124,7 +2146,7 @@ fn parse_flat_json_object(s: &str) -> Result<HashMap<String, String>, ManifestEr
         if i < bytes.len() && bytes[i] == b'}' {
             return Ok(out);
         }
-        let key = parse_json_string(bytes, &mut i)?;
+        let key = parse_json_string(s, &mut i)?;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
@@ -2135,7 +2157,7 @@ fn parse_flat_json_object(s: &str) -> Result<HashMap<String, String>, ManifestEr
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        let value = parse_json_string(bytes, &mut i)?;
+        let value = parse_json_string(s, &mut i)?;
         out.insert(key, value);
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -2154,7 +2176,10 @@ fn parse_flat_json_object(s: &str) -> Result<HashMap<String, String>, ManifestEr
 /// Parse a single JSON-quoted string starting at `*i`. Advances `*i`
 /// past the closing quote. Handles `\"`, `\\`, `\/`, `\n`, `\t`, `\r`,
 /// `\b`, `\f`, and `\uXXXX` (BMP only — bee never writes anything else).
-fn parse_json_string(bytes: &[u8], i: &mut usize) -> Result<String, ManifestError> {
+/// `*i` must sit on a char boundary of `s` (it always does: it only ever
+/// advances past ASCII bytes or whole runs ending before an ASCII byte).
+fn parse_json_string(s: &str, i: &mut usize) -> Result<String, ManifestError> {
+    let bytes = s.as_bytes();
     if *i >= bytes.len() || bytes[*i] != b'"' {
         return Err(ManifestError::InvalidMetadata("expected '\"'".into()));
     }
@@ -2202,15 +2227,17 @@ fn parse_json_string(bytes: &[u8], i: &mut usize) -> Result<String, ManifestErro
             }
             *i += 1;
         } else {
-            // Raw UTF-8 bytes pass through. Reading char-by-char from
-            // `bytes` would be cheaper but mantaray metadata is tiny so
-            // we eat the cost of the helper.
-            let s = std::str::from_utf8(&bytes[*i..]).map_err(|e| {
-                ManifestError::InvalidMetadata(format!("non-utf8 in metadata: {e}"))
-            })?;
-            let ch = s.chars().next().unwrap();
-            out.push(ch);
-            *i += ch.len_utf8();
+            // Copy the whole run up to the next `"` or `\\` in one go.
+            // Both delimiters are ASCII, so the run ends on a char
+            // boundary, and `s` is already validated UTF-8: linear in
+            // the string length (re-validating the tail per char was
+            // quadratic, ~0.4s per 64 KB multibyte value).
+            let run = bytes[*i..]
+                .iter()
+                .position(|&b| b == b'"' || b == b'\\')
+                .map_or(bytes.len(), |n| *i + n);
+            out.push_str(&s[*i..run]);
+            *i = run;
         }
     }
     Err(ManifestError::InvalidMetadata("unterminated string".into()))
@@ -2503,13 +2530,47 @@ mod tests {
     #[test]
     fn json_string_round_trip() {
         let mut i = 0;
-        let s = b"\"hello world\"";
+        let s = "\"hello world\"";
         assert_eq!(parse_json_string(s, &mut i).unwrap(), "hello world");
         assert_eq!(i, s.len());
 
         let mut i = 0;
-        let s = b"\"a\\nb\"";
+        let s = "\"a\\nb\"";
         assert_eq!(parse_json_string(s, &mut i).unwrap(), "a\nb");
+    }
+
+    /// A non-`{` blob whose 40th byte falls inside a multi-byte char
+    /// must give `InvalidMetadata`, not panic on the error preview's
+    /// byte slice (audit RET-01; release builds abort on panic).
+    #[test]
+    fn non_object_metadata_with_multibyte_at_preview_cut_is_an_error() {
+        let raw = format!("{}é", "a".repeat(39));
+        assert_eq!(raw.len(), 41);
+        assert!(!raw.is_char_boundary(40));
+        match parse_metadata(raw.as_bytes()) {
+            Err(ManifestError::InvalidMetadata(msg)) => {
+                assert!(msg.contains(&raw), "{msg}");
+            }
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    /// A 64 KB metadata value of 2-byte chars parses in linear time
+    /// (audit RET-02: re-validating the tail per char was quadratic,
+    /// ~0.4 s for this input), and the run-copy keeps multibyte text
+    /// and escapes around it intact.
+    #[test]
+    fn large_multibyte_metadata_value_parses_linearly() {
+        let value = "é".repeat(32 * 1024);
+        let raw = format!("{{\"k\":\"{value}\\n\\u00e9{value}\"}}\n\n");
+        let started = std::time::Instant::now();
+        let m = parse_metadata(raw.as_bytes()).unwrap();
+        let took = started.elapsed();
+        assert_eq!(m.get("k").unwrap(), &format!("{value}\né{value}"));
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "parse took {took:?}"
+        );
     }
 
     /// Flat JSON object parser: handles the shapes bee actually writes

@@ -329,6 +329,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "hex",
+ "libc",
  "percent-encoding",
  "primitive-types",
  "serde_json",

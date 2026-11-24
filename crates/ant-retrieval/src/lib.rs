@@ -68,6 +68,9 @@ pub mod shallow_neighbourhoods;
 pub mod splitter;
 pub mod traversal;
 
+#[cfg(test)]
+pub(crate) mod test_alloc;
+
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use cache_control::{

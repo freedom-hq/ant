@@ -55,9 +55,12 @@ land, and an HTTP client disconnect cancels the upstream retrieval task.
 - **GET, single Range** — streaming dispatch with a clamped interval
   mapped to the minimum set of Swarm subtrees required. Returns `206
   Partial Content` with an accurate `Content-Range`. Multi-range
-  (`Range: bytes=a-b,c-d`) is rejected with `416`.
+  (`Range: bytes=a-b,c-d`) gets a `206 multipart/byteranges` built from
+  the body collected in memory, but only for resources up to 32 MiB;
+  above that the Range header is ignored and the full body streams as
+  a `200`.
 
-`GATEWAY_MAX_FILE_BYTES` (1 GiB) caps the per-request total size so a
+`GATEWAY_MAX_FILE_BYTES` (16 GiB) caps the per-request total size so a
 malicious manifest claiming a multi-terabyte span is refused before any
 allocation. See PLAN.md Appendix E for the full design.
 
@@ -138,7 +141,10 @@ One WebSocket path, two protocols, picked by the
   bee served before that PR, unchanged. Each binary message is a raw
   `span ‖ payload` chunk (behind a 113-byte stamp without
   `swarm-postage-batch-id`), and an empty binary message acks it.
-  `swarm-tag` works, and errors close the socket. **This differs
+  `swarm-tag` works, and errors close the socket. A message larger
+  than a stamp plus a maximum-size SOC (4,314 bytes) closes the socket
+  before it is buffered, and a client that sends nothing for 15
+  minutes is dropped, as bee now does. **This differs
   from bee**, which dropped this framing and closes a raw chunk with
   `1003`: ant keeps serving it because its own clients and older
   tooling still send raw chunks. A client that wants the new protocol
@@ -227,6 +233,48 @@ not the local disk. Pinned and just-uploaded chunks live in the same
 disk cache, so they are fetched from the network too under this
 header. A value other than a Go `ParseBool` spelling is a `400`, like
 bee. `/soc` and `/feeds` ignore the header.
+
+### Web pages: `Host`, writes and WebSockets
+
+The gateway has no auth, so it keeps web pages out by what browsers
+send (issue #312, partly a port of
+https://github.com/ethersphere/bee/pull/5651):
+
+- **`Host` allowlist.** On a loopback `api-addr` only `localhost`,
+  `127.0.0.1`, `[::1]`, subdomains of `localhost` (`abc.bzz.localhost`)
+  and the bound IP are answered, with or without the bound port;
+  anything else is `421`. This stops DNS rebinding. `allowed-hosts`
+  (`--allowed-hosts`, `ant_set_gateway_allowed_hosts`) adds names
+  (`host` or `host:port`, e.g. the public name a reverse proxy
+  forwards; `host:443` and `host:80` also match a bare `host`, since
+  browsers leave the default port out of `Host`); `*` turns the check
+  off. On a non-loopback `api-addr`
+  with no `allowed-hosts`, nothing is checked and a warning is logged.
+  With `allowed-hosts` on a wildcard `api-addr` (`0.0.0.0`, `[::]`)
+  there is no single bound IP, so IP literals clients use
+  (`192.168.1.5:1633`) must be listed too.
+  **This differs from bee**, which has no `Host` check.
+- **Writes.** Any request other than `GET`/`HEAD`/`OPTIONS` from a web
+  page is `403` unless its `Origin` is in `cors-allowed-origins`, as in
+  bee. Requests with neither `Origin` nor `Sec-Fetch-Site` (curl, host
+  apps) pass. **Beyond bee**, `/bzz` pages are served on the API's own
+  origin, so `Sec-Fetch-Site: same-origin` (or an `Origin` naming the
+  request's own `Host`) also needs the origin listed exactly; bee lets
+  same-origin pages write.
+- **Spending routes.** `POST /stamps/{amount}/{depth}`,
+  `PATCH /stamps/topup|dilute/...`, `POST /chequebook/deposit|withdraw`,
+  `POST /v0/storage/buy|extend` and `POST /v0/settlement/deposit`
+  accept a web page only from an exactly listed origin; `*`, `null`
+  and wildcard entries never unlock them.
+- **WebSockets** (`/chunks/stream`, `/pss/subscribe`,
+  `/gsoc/subscribe`): the `Origin` must be absent or listed exactly;
+  `null`, `*`, wildcard entries and the API's own origin are refused
+  (bee accepts its own host and `*`).
+- **Preflights** get a fixed `Access-Control-Allow-Headers` list
+  instead of the requested headers echoed back. A `null` entry in
+  `cors-allowed-origins` logs a startup warning: every sandboxed
+  iframe and cross-origin-redirected request on the web sends
+  `Origin: null`.
 
 ### Other intentional non-features
 

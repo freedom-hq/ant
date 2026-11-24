@@ -74,7 +74,6 @@
 use crate::sinks::{HEADERS_MAX, STREAM_TIMEOUT};
 use ant_retrieval::accounting::{Accounting, HotHint};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use futures::StreamExt;
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
 use libp2p_swarm::Stream;
@@ -360,9 +359,12 @@ fn parse_be_u64(bytes: &[u8]) -> Option<u64> {
 /// some peer does we read the Payment, ack zero, and close. NAK-with-zero
 /// keeps their accounting consistent — they treat zero acceptance the
 /// same as "settlement too soon" and don't disconnect.
-pub async fn run_inbound(mut incoming: IncomingStreams) {
-    while let Some((peer_id, stream)) = incoming.next().await {
-        tokio::spawn(async move {
+pub async fn run_inbound(incoming: IncomingStreams, guard: crate::sinks::InboundGuard) {
+    crate::sinks::serve_gated(
+        incoming,
+        guard,
+        PROTOCOL_PSEUDOSETTLE,
+        |peer_id, stream| async move {
             match tokio::time::timeout(STREAM_TIMEOUT, drain_inbound(stream)).await {
                 Ok(Ok(())) => trace!(
                     target: "ant_p2p::pseudosettle",
@@ -381,8 +383,9 @@ pub async fn run_inbound(mut incoming: IncomingStreams) {
                     STREAM_TIMEOUT.as_secs(),
                 ),
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
 async fn drain_inbound(mut stream: Stream) -> std::io::Result<()> {
@@ -830,6 +833,7 @@ mod tests {
         }
     }
 
+    use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
     use libp2p::{noise, tcp, yamux, Multiaddr, Swarm, SwarmBuilder};
     use std::sync::Mutex;
