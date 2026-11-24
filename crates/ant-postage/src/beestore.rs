@@ -21,12 +21,13 @@
 //!   batchIndex(8) ++ timestamp(8) ++ 0`. One per issued stamp; bee
 //!   rebuilds bucket counts from these after an unclean shutdown.
 //!
-//! [`recover_bee_buckets`] reads the `StampIssuerItem` for a batch and
+//! [`BeeStamperStore::recover`] reads the `StampIssuerItem` for a batch and
 //! then folds in the `StampItem` records (taking, per bucket, the
 //! max of the stored count and the highest issued index + 1), matching
 //! bee's own `recoverBuckets` so the result is correct even if bee
 //! exited uncleanly — including before it ever wrote a
-//! `StampIssuerItem`. It reads a private copy of the store, never bee's
+//! `StampIssuerItem`. It reads a private copy of the store (made once per
+//! [`BeeStamperStore::open`] under a caller-chosen directory), never bee's
 //! files in place, and clamps every counter at the batch's capacity.
 
 use std::path::{Path, PathBuf};
@@ -80,112 +81,162 @@ struct BeeStampIssuerData {
 const STAMP_ISSUER_NS: &[u8] = b"StampIssuerItem/";
 const STAMP_ITEM_NS: &[u8] = b"stampItem/";
 
-/// Recover the bucket counters bee persisted for `batch_id` at
-/// `stamperstore_path`.
-///
-/// `batch_depth` and `bucket_depth` are the batch's on-chain depths.
-/// They shape the result when bee left `stampItem/` records but no
-/// `StampIssuerItem` for the batch (an unclean exit before the first
-/// snapshot), and every counter is clamped at the bucket capacity they
-/// imply, so a corrupt or foreign store can't seed a counter past what
-/// the batch can issue. Returns `Ok(None)` when bee left neither record
-/// for the batch, so the caller falls back to a fresh (all-zero) issuer.
+/// A private, read-only snapshot of a bee `stamperstore`, opened once and
+/// queried for any number of batches.
 ///
 /// Bee's store is never opened in place: `LevelDB` writes `LOCK`/`LOG`
 /// files and may compact or rewrite the manifest on open, even when only
-/// reading. The store's files are copied to a private temporary directory
-/// (removed on return) and the copy is opened instead.
+/// reading. The store's files are copied into a fresh directory under the
+/// caller's `scratch_dir` (created with mode `0700` on Unix, never reused)
+/// and the copy is opened instead; the copy is removed when this value is
+/// dropped. Open it once per recovery pass, not once per batch, so a large
+/// store is copied once.
+pub struct BeeStamperStore {
+    // Declared before `_copy` so the database closes before its directory
+    // is removed.
+    db: DB,
+    _copy: TempCopy,
+}
+
+impl BeeStamperStore {
+    /// Copy and open the store at `stamperstore_path`. `scratch_dir` must
+    /// exist and be writable; pass the node's own data directory, which
+    /// the caller has to be able to write anyway, rather than a shared
+    /// temp dir. Returns `Ok(None)` when there is no store, so the caller
+    /// has nothing to recover. Any other failure (copy or open) is an
+    /// error: the caller can't tell what bee issued and must not fall
+    /// back to zeroed counters.
+    pub fn open(
+        stamperstore_path: &Path,
+        scratch_dir: &Path,
+    ) -> Result<Option<Self>, BeeRecoverError> {
+        if !stamperstore_path.exists() {
+            return Ok(None);
+        }
+        let copy = TempCopy::of(stamperstore_path, scratch_dir)?;
+        // Never create structure: the copy holds whatever bee left.
+        let opt = Options {
+            create_if_missing: false,
+            ..Options::default()
+        };
+        let db = DB::open(&copy.0, opt).map_err(|e| BeeRecoverError::Open(e.to_string()))?;
+        Ok(Some(Self { db, _copy: copy }))
+    }
+
+    /// Recover the bucket counters bee persisted for `batch_id`.
+    ///
+    /// `batch_depth` and `bucket_depth` are the batch's on-chain depths.
+    /// They shape the result when bee left `stampItem/` records but no
+    /// `StampIssuerItem` for the batch (an unclean exit before the first
+    /// snapshot), and every counter is clamped at the bucket capacity they
+    /// imply, so a corrupt or foreign store can't seed a counter past what
+    /// the batch can issue. Returns `Ok(None)` when bee left neither
+    /// record for the batch, so the caller falls back to a fresh
+    /// (all-zero) issuer.
+    pub fn recover(
+        &mut self,
+        batch_id: &[u8; 32],
+        batch_depth: u8,
+        bucket_depth: u8,
+    ) -> Result<Option<RecoveredIssuer>, BeeRecoverError> {
+        let db = &mut self.db;
+        let mut issuer_key = Vec::with_capacity(STAMP_ISSUER_NS.len() + 32);
+        issuer_key.extend_from_slice(STAMP_ISSUER_NS);
+        issuer_key.extend_from_slice(batch_id);
+
+        let issuer_item = db.get(&issuer_key);
+        let found_issuer = issuer_item.is_some();
+        let mut recovered = match issuer_item {
+            Some(raw) => {
+                let data: BeeStampIssuerData = rmp_serde::from_slice(&raw)
+                    .map_err(|e| BeeRecoverError::Decode(e.to_string()))?;
+                RecoveredIssuer {
+                    batch_depth: data.batch_depth,
+                    bucket_depth: data.bucket_depth,
+                    buckets: data.buckets,
+                }
+            }
+            None => RecoveredIssuer {
+                batch_depth,
+                bucket_depth,
+                buckets: Vec::new(),
+            },
+        };
+        if recovered.bucket_depth == 0 || recovered.bucket_depth > crate::MAX_BUCKET_DEPTH {
+            return Err(BeeRecoverError::Decode(format!(
+                "bucket depth {} out of range 1..={}",
+                recovered.bucket_depth,
+                crate::MAX_BUCKET_DEPTH
+            )));
+        }
+        let n = 1usize << u32::from(recovered.bucket_depth);
+        if !found_issuer {
+            recovered.buckets = vec![0; n];
+        } else if recovered.buckets.len() != n {
+            return Err(BeeRecoverError::Decode(format!(
+                "{} bucket counters for bucket depth {}",
+                recovered.buckets.len(),
+                recovered.bucket_depth
+            )));
+        }
+        let capacity = crate::bucket_capacity(batch_depth, recovered.bucket_depth)
+            .filter(|_| recovered.bucket_depth < batch_depth)
+            .ok_or_else(|| {
+                BeeRecoverError::Decode(format!(
+                    "bucket depth {} does not fit batch depth {batch_depth}",
+                    recovered.bucket_depth
+                ))
+            })?;
+
+        let saw_items = fold_in_stamp_items(db, batch_id, &mut recovered.buckets)?;
+        if !found_issuer && !saw_items {
+            return Ok(None);
+        }
+        for c in &mut recovered.buckets {
+            *c = (*c).min(capacity);
+        }
+        Ok(Some(recovered))
+    }
+}
+
+/// One-shot [`BeeStamperStore::open`] + [`BeeStamperStore::recover`] for
+/// a single batch. Prefer opening a [`BeeStamperStore`] once when
+/// recovering several batches, so the store is copied only once.
 pub fn recover_bee_buckets(
     stamperstore_path: &Path,
+    scratch_dir: &Path,
     batch_id: &[u8; 32],
     batch_depth: u8,
     bucket_depth: u8,
 ) -> Result<Option<RecoveredIssuer>, BeeRecoverError> {
-    if !stamperstore_path.exists() {
-        return Ok(None);
+    match BeeStamperStore::open(stamperstore_path, scratch_dir)? {
+        Some(mut store) => store.recover(batch_id, batch_depth, bucket_depth),
+        None => Ok(None),
     }
-    let copy = TempCopy::of(stamperstore_path)?;
-    // Never create structure for a missing store: a bee data-dir without
-    // a stamperstore just means "nothing to recover".
-    let opt = Options {
-        create_if_missing: false,
-        ..Options::default()
-    };
-    let mut db = DB::open(&copy.0, opt).map_err(|e| BeeRecoverError::Open(e.to_string()))?;
-
-    let mut issuer_key = Vec::with_capacity(STAMP_ISSUER_NS.len() + 32);
-    issuer_key.extend_from_slice(STAMP_ISSUER_NS);
-    issuer_key.extend_from_slice(batch_id);
-
-    let issuer_item = db.get(&issuer_key);
-    let found_issuer = issuer_item.is_some();
-    let mut recovered = match issuer_item {
-        Some(raw) => {
-            let data: BeeStampIssuerData =
-                rmp_serde::from_slice(&raw).map_err(|e| BeeRecoverError::Decode(e.to_string()))?;
-            RecoveredIssuer {
-                batch_depth: data.batch_depth,
-                bucket_depth: data.bucket_depth,
-                buckets: data.buckets,
-            }
-        }
-        None => RecoveredIssuer {
-            batch_depth,
-            bucket_depth,
-            buckets: Vec::new(),
-        },
-    };
-    if recovered.bucket_depth == 0 || recovered.bucket_depth > crate::MAX_BUCKET_DEPTH {
-        return Err(BeeRecoverError::Decode(format!(
-            "bucket depth {} out of range 1..={}",
-            recovered.bucket_depth,
-            crate::MAX_BUCKET_DEPTH
-        )));
-    }
-    let n = 1usize << u32::from(recovered.bucket_depth);
-    if !found_issuer {
-        recovered.buckets = vec![0; n];
-    } else if recovered.buckets.len() != n {
-        return Err(BeeRecoverError::Decode(format!(
-            "{} bucket counters for bucket depth {}",
-            recovered.buckets.len(),
-            recovered.bucket_depth
-        )));
-    }
-    let capacity = crate::bucket_capacity(batch_depth, recovered.bucket_depth)
-        .filter(|_| recovered.bucket_depth < batch_depth)
-        .ok_or_else(|| {
-            BeeRecoverError::Decode(format!(
-                "bucket depth {} does not fit batch depth {batch_depth}",
-                recovered.bucket_depth
-            ))
-        })?;
-
-    let saw_items = fold_in_stamp_items(&mut db, batch_id, &mut recovered.buckets)?;
-    if !found_issuer && !saw_items {
-        return Ok(None);
-    }
-    for c in &mut recovered.buckets {
-        *c = (*c).min(capacity);
-    }
-    Ok(Some(recovered))
 }
 
 /// A private copy of a `LevelDB` directory, removed on drop.
 struct TempCopy(PathBuf);
 
 impl TempCopy {
-    fn of(src: &Path) -> Result<Self, BeeRecoverError> {
+    fn of(src: &Path, scratch_dir: &Path) -> Result<Self, BeeRecoverError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "ant-bee-stamperstore-{}-{nanos}-{}",
+        let dir = scratch_dir.join(format!(
+            ".ant-bee-stamperstore-copy-{}-{nanos}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir)
+        // `create`, not `create_dir_all`: an existing directory at this
+        // name is someone else's and must not be reused. Owner-only, so
+        // other local users can't read the copy while it exists.
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
             .map_err(|e| BeeRecoverError::Open(format!("{}: {e}", dir.display())))?;
         let copy = Self(dir);
         let entries = std::fs::read_dir(src)
@@ -434,12 +485,80 @@ mod tests {
         // Let a rewrite show up in the mtimes even on coarse clocks.
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let rec = recover_bee_buckets(&store, &batch, 6, 2).unwrap().unwrap();
+        let rec = recover_bee_buckets(&store, &root, &batch, 6, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.buckets, vec![1, 0, 4, 0]);
         assert_eq!(snapshot(&store), before, "bee's store was modified");
         // Twice, to cover a second open of the same store too.
-        recover_bee_buckets(&store, &batch, 6, 2).unwrap().unwrap();
+        recover_bee_buckets(&store, &root, &batch, 6, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot(&store), before, "bee's store was modified");
+        // And the private copies are gone again.
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("stamperstore")]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The copy lives under the caller's scratch dir, owner-only, is
+    /// made once for any number of batches, and is gone afterwards. A
+    /// copy that can't be made is an error, never "nothing to recover".
+    #[test]
+    fn bee_store_copy_is_private_shared_and_removed() {
+        let root = tmpdir("copy");
+        let store = root.join("stamperstore");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let a = [0x47u8; 32];
+        let b = [0x48u8; 32];
+        write_store(&store, &[stamp_item(&a, 1, 1, 2), stamp_item(&b, 2, 3, 5)]);
+
+        let mut bee = BeeStamperStore::open(&store, &scratch).unwrap().unwrap();
+        let copies: Vec<_> = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copies[0]).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "copy dir mode {mode:o}");
+        }
+        assert_eq!(
+            bee.recover(&a, 6, 2).unwrap().unwrap().buckets,
+            vec![0, 3, 0, 0]
+        );
+        assert_eq!(
+            bee.recover(&b, 6, 2).unwrap().unwrap().buckets,
+            vec![0, 0, 0, 6]
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            1,
+            "one copy for both"
+        );
+        drop(bee);
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "copy left behind"
+        );
+
+        // No store at all: nothing to recover, nothing created.
+        assert!(BeeStamperStore::open(&root.join("absent"), &scratch)
+            .unwrap()
+            .is_none());
+        // A store that is there but can't be copied (no scratch dir) is
+        // an error the caller must not read as "nothing to recover".
+        assert!(matches!(
+            recover_bee_buckets(&store, &root.join("missing"), &a, 6, 2),
+            Err(BeeRecoverError::Open(_))
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -462,11 +581,13 @@ mod tests {
                 stamp_item(&other, 5, 2, 9),
             ],
         );
-        let rec = recover_bee_buckets(&store, &batch, 6, 2).unwrap().unwrap();
+        let rec = recover_bee_buckets(&store, &root, &batch, 6, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!((rec.batch_depth, rec.bucket_depth), (6, 2));
         assert_eq!(rec.buckets, vec![3, 16, 0, 8]);
         // A batch with neither record has nothing to recover.
-        assert!(recover_bee_buckets(&store, &[0x44; 32], 6, 2)
+        assert!(recover_bee_buckets(&store, &root, &[0x44; 32], 6, 2)
             .unwrap()
             .is_none());
         std::fs::remove_dir_all(&root).ok();
@@ -485,10 +606,12 @@ mod tests {
                 issuer_record(&deep, 40, 30, Vec::new()),
             ],
         );
-        let rec = recover_bee_buckets(&store, &batch, 6, 2).unwrap().unwrap();
+        let rec = recover_bee_buckets(&store, &root, &batch, 6, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.buckets, vec![16, 16, 16, 3]);
         assert!(matches!(
-            recover_bee_buckets(&store, &deep, 40, 30),
+            recover_bee_buckets(&store, &root, &deep, 40, 30),
             Err(BeeRecoverError::Decode(_))
         ));
         std::fs::remove_dir_all(&root).ok();

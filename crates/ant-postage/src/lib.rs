@@ -262,7 +262,10 @@ impl StampIssuer {
         // Lock before looking at the file: checking `path.exists()` first
         // leaves a window where a concurrent creator writes and fills the
         // store, and we then "create" it again with zeroed counters over
-        // the indices it already issued.
+        // the indices it already issued. Validate the parameters before
+        // that, so a refused open leaves no lock file (or directory)
+        // behind.
+        check_depths(batch_depth, bucket_depth)?;
         let store_lock = acquire_store_lock(&path)?;
         Self::open_or_new_locked(
             path,
@@ -343,8 +346,9 @@ impl StampIssuer {
     ///
     /// If a store already exists at `path` its counters win (they are
     /// at-least-as-current as anything we could seed) and `buckets` is
-    /// ignored — exactly [`Self::open_or_new`]. `buckets.len()` must
-    /// equal `2^bucket_depth`.
+    /// ignored — exactly [`Self::open_or_new`]. `buckets` must still be a
+    /// valid seed (`2^bucket_depth` counters, none above the bucket
+    /// capacity) either way; it is checked before anything touches disk.
     pub fn open_or_new_seeded(
         path: PathBuf,
         batch_id: [u8; 32],
@@ -353,20 +357,9 @@ impl StampIssuer {
         immutable: bool,
         buckets: &[u32],
     ) -> Result<Self, PostageError> {
-        // Lock first, as in `open_or_new`: the existence check decides
-        // whether the seed overwrites the file, so it must not race a
-        // concurrent creator.
-        let store_lock = acquire_store_lock(&path)?;
-        if path.exists() {
-            return Self::open_or_new_locked(
-                path,
-                store_lock,
-                batch_id,
-                batch_depth,
-                bucket_depth,
-                immutable,
-            );
-        }
+        // Validate everything first, so a refused open leaves no lock
+        // file (or directory) behind; a bad seed is a caller bug whether
+        // or not the file already exists.
         check_depths(batch_depth, bucket_depth)?;
         let n = 1usize << u32::from(bucket_depth);
         if buckets.len() != n {
@@ -381,6 +374,20 @@ impl StampIssuer {
             return Err(PostageError::Msg(format!(
                 "seed bucket {i} counter {c} exceeds bucket capacity {upper}"
             )));
+        }
+        // Then lock, as in `open_or_new`: the existence check decides
+        // whether the seed overwrites the file, so it must not race a
+        // concurrent creator.
+        let store_lock = acquire_store_lock(&path)?;
+        if path.exists() {
+            return Self::open_or_new_locked(
+                path,
+                store_lock,
+                batch_id,
+                batch_depth,
+                bucket_depth,
+                immutable,
+            );
         }
         let mut issuer = Self::build(
             batch_id,
@@ -564,8 +571,11 @@ impl StampIssuer {
             let bucket = read_u32_be(&stamp[32..36]) as usize;
             let within = read_u32_be(&stamp[36..40]);
             let Some(slot) = self.buckets.get_mut(bucket).filter(|_| within < upper) else {
-                self.stamp_persistence_failed =
-                    Some("sidecar records an index outside this batch's buckets");
+                self.stamp_persistence_failed = Some(
+                    "sidecar records an index outside this batch's buckets; this fails again \
+                     on every open until the batch's `.stamps` sidecar next to its `.bin` is \
+                     repaired or moved aside (a restart alone does not help)",
+                );
                 return Ok(());
             };
             if *slot <= within {
@@ -2975,6 +2985,17 @@ mod tests {
         assert!(StampIssuer::open_or_new(path.clone(), id, 30, 28, true).is_err());
         assert!(StampIssuer::open_or_new_seeded(path.clone(), id, 30, 28, true, &[]).is_err());
         assert!(!path.exists());
+        // No lock file either (nor its directory), for bad depths or an
+        // over-capacity seed: validation runs before the lock.
+        let nested = dir.join("postage").join("deep.bin");
+        let lock = dir.join("postage").join("deep.bin.lock");
+        assert!(StampIssuer::open_or_new(nested.clone(), id, 30, 28, true).is_err());
+        assert!(StampIssuer::open_or_new_seeded(nested.clone(), id, 30, 28, true, &[]).is_err());
+        // depth 10 / bucket depth 8: capacity 4 per bucket.
+        let mut seed = vec![0u32; 256];
+        seed[3] = 5;
+        assert!(StampIssuer::open_or_new_seeded(nested.clone(), id, 10, 8, true, &seed).is_err());
+        assert!(!lock.exists() && !nested.exists() && !dir.join("postage").exists());
         // A crafted counter file with an over-deep header is a load error.
         let bytes = encode_store(&id, 30, 25, true, &[]);
         std::fs::write(&path, &bytes).unwrap();

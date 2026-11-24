@@ -2425,7 +2425,21 @@ async fn rediscover_batches(
     };
     *full_rescan = false;
     let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
-    let stamperstore = data_dir.join("stamperstore");
+    let out = open_rediscovered(found, data_dir, known);
+    Ok((out, scan.provisional_since))
+}
+
+/// Open the rediscovered batches `known` doesn't hold yet as issuers.
+/// Bee's `stamperstore` is copied (into `data_dir`) at most once for the
+/// whole pass, and only if some batch actually needs its counters. A
+/// batch that can't be opened is logged and skipped. Synchronous: the
+/// `LevelDB` handle isn't `Send`, so it must not live across an await.
+fn open_rediscovered(
+    found: Vec<ant_chain::discover::DiscoveredBatch>,
+    data_dir: &Path,
+    known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
+) -> Vec<([u8; 32], ant_postage::StampIssuer)> {
+    let mut bee = BeeCounters::new(data_dir);
     let postage_dir = data_dir.join("postage");
     let mut out = Vec::new();
     for b in found {
@@ -2433,7 +2447,7 @@ async fn rediscover_batches(
             continue; // already reloaded / pre-registered
         }
         let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
-        match open_recovered_issuer(&stamperstore, &store_path, &b) {
+        match open_recovered_issuer(&mut bee, &store_path, &b) {
             Ok(iss) => {
                 tracing::info!(
                     target: "antd",
@@ -2453,7 +2467,43 @@ async fn rediscover_batches(
             ),
         }
     }
-    Ok((out, scan.provisional_since))
+    out
+}
+
+/// Bee's `<data-dir>/stamperstore`, copied and opened on first use and
+/// shared by every batch of one rediscovery pass. A failed copy/open is
+/// remembered for the pass (the next pass tries again).
+struct BeeCounters {
+    stamperstore: PathBuf,
+    scratch: PathBuf,
+    opened: Option<std::result::Result<Option<ant_postage::beestore::BeeStamperStore>, String>>,
+}
+
+impl BeeCounters {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            stamperstore: data_dir.join("stamperstore"),
+            scratch: data_dir.to_path_buf(),
+            opened: None,
+        }
+    }
+
+    fn recover(
+        &mut self,
+        b: &ant_chain::discover::DiscoveredBatch,
+    ) -> std::result::Result<Option<ant_postage::beestore::RecoveredIssuer>, String> {
+        let opened = self.opened.get_or_insert_with(|| {
+            ant_postage::beestore::BeeStamperStore::open(&self.stamperstore, &self.scratch)
+                .map_err(|e| e.to_string())
+        });
+        match opened {
+            Err(e) => Err(e.clone()),
+            Ok(None) => Ok(None),
+            Ok(Some(store)) => store
+                .recover(&b.batch_id, b.depth, b.bucket_depth)
+                .map_err(|e| e.to_string()),
+        }
+    }
 }
 
 /// One background batch rediscovery: register the batches the saved
@@ -2615,12 +2665,14 @@ async fn confirm_unverified_scan(
 /// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on
 /// chain, carrying over bee's per-bucket counters from a
 /// `stamperstore` when one is present (option a) and falling back to a
-/// fresh issuer with all-zero counters otherwise (option b). The
+/// fresh issuer with all-zero counters when there is no store or it
+/// holds nothing for the batch (option b). A store that is present but
+/// can't be read is an error, not option b. The
 /// counters are the only batch state not on-chain; seeding them keeps
 /// the node from re-stamping `(batchId, bucket, index)` slots the
 /// network has already seen.
 fn open_recovered_issuer(
-    stamperstore: &Path,
+    bee: &mut BeeCounters,
     store_path: &Path,
     b: &ant_chain::discover::DiscoveredBatch,
 ) -> Result<ant_postage::StampIssuer> {
@@ -2647,12 +2699,12 @@ fn open_recovered_issuer(
         )
         .map_err(|e| anyhow!("{e}"))
     };
-    match ant_postage::beestore::recover_bee_buckets(
-        stamperstore,
-        &b.batch_id,
-        b.depth,
-        b.bucket_depth,
-    ) {
+    // An existing counter file wins over any seed (`open_or_new_seeded`
+    // ignores it), so there's nothing to read from bee for it.
+    if store_path.exists() {
+        return fresh();
+    }
+    match bee.recover(b) {
         Ok(Some(rec)) if rec.bucket_depth == b.bucket_depth && rec.buckets.len() == want => {
             let issued: u64 = rec.buckets.iter().map(|&c| u64::from(c)).sum();
             tracing::info!(
@@ -2689,14 +2741,18 @@ fn open_recovered_issuer(
             );
             fresh()
         }
-        Err(e) => {
-            tracing::warn!(
-                target: "antd",
-                batch = %format!("0x{}", hex::encode(b.batch_id)),
-                "bee stamperstore recovery failed: {e}; fresh issuer at 0 (recovery option b)",
-            );
-            fresh()
-        }
+        // A store that is there but couldn't be read (copy failed, scratch
+        // space full, corrupt records) says nothing about what bee issued:
+        // zeroed counters would reissue slots the network has already
+        // seen. Leave the batch unregistered (logged by the caller); antd
+        // rediscovers at every start, so a restart after fixing the cause
+        // retries it. Moving `stamperstore` aside is the deliberate way to
+        // start the batch at 0.
+        Err(e) => Err(anyhow!(
+            "bee stamperstore recovery failed: {e}; not starting the issuer at 0 \
+             over counters bee may have used (fix the store, or move it aside to \
+             accept a fresh issuer)"
+        )),
     }
 }
 
@@ -4247,6 +4303,61 @@ mod tests {
             .await;
         assert_eq!(slot.get(), None);
         assert_eq!(slot.refused(), Some(CB));
+    }
+}
+
+#[cfg(test)]
+mod bee_recovery_tests {
+    use super::*;
+
+    fn batch(id: u8) -> ant_chain::discover::DiscoveredBatch {
+        ant_chain::discover::DiscoveredBatch {
+            batch_id: [id; 32],
+            depth: 6,
+            bucket_depth: 2,
+            immutable: true,
+            remaining_balance: 1,
+        }
+    }
+
+    /// A `stamperstore` that is there but can't be read must not turn
+    /// into a fresh issuer at 0 (which would reissue slots bee already
+    /// used): the batch is refused and no counter file is created. With
+    /// no store at all, the fresh issuer is the right answer.
+    #[test]
+    fn unreadable_stamperstore_refuses_instead_of_zeroing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        // Not a LevelDB (no CURRENT/MANIFEST): opening the copy fails.
+        let store = data_dir.join("stamperstore");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("000001.log"), b"not a leveldb").unwrap();
+        let b = batch(0x51);
+        let bin = data_dir
+            .join("postage")
+            .join(format!("{}.bin", hex::encode(b.batch_id)));
+        let mut bee = BeeCounters::new(data_dir);
+        let err = open_recovered_issuer(&mut bee, &bin, &b).unwrap_err();
+        assert!(
+            err.to_string().contains("not starting the issuer at 0"),
+            "{err}"
+        );
+        assert!(!bin.exists(), "a zeroed counter file was written");
+        assert!(open_rediscovered(vec![b.clone()], data_dir, &|_| false).is_empty());
+        assert!(!bin.exists());
+        // Only bee's store is left in the data dir: no private copy.
+        let left: Vec<_> = std::fs::read_dir(data_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("stamperstore")]);
+
+        // Moved aside: nothing to recover, so a fresh issuer at 0.
+        std::fs::rename(&store, data_dir.join("stamperstore.bad")).unwrap();
+        let found = open_rediscovered(vec![b], data_dir, &|_| false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.issued_count(), 0);
+        assert!(bin.exists());
     }
 }
 
