@@ -2492,10 +2492,12 @@ pub const BITRATE_HEADROOM_PERCENT: u64 = 10;
 /// playlists send [`PLAYLIST_REDUNDANCY_LEVEL`], the same level.
 const UPLOAD_REDUNDANCY_LEVEL: u8 = PLAYLIST_REDUNDANCY_LEVEL;
 
-/// Bytes one recording entry takes at most, for the recording's share of
+/// Bytes one recording entry takes, about, for the recording's share of
 /// the estimate: an `#EXT-X-PROGRAM-DATE-TIME` line, an `#EXTINF` line
 /// and a `"bzz"` URI (`/bzz/<64 hex>/seg-<n>.m4s`), the longer of the
-/// two formats' URIs.
+/// two formats' URIs. An estimate, not a bound: a long segment number or
+/// an `#EXT-X-GAP` line adds a few bytes, and each broadcast or writer
+/// restart adds its own `#EXT-X-DISCONTINUITY` and `#EXT-X-MAP` lines.
 const RECORDING_ENTRY_BYTES: usize = 160;
 
 /// Bytes an fMP4 initialization segment takes, about: the iOS writer's
@@ -5747,10 +5749,17 @@ impl HttpResponse {
 
 /// The most a [`http_get`] response may take, head and body: 64 MiB. The
 /// largest body the publisher reads on purpose is a channel's head when
-/// the previous broadcast ended with its recording, which grows by at
-/// most [`RECORDING_ENTRY_BYTES`] a segment: 64 MiB holds some 400 000
-/// entries, over nine days of 2 s segments. Anything longer is refused
-/// rather than buffered without bound.
+/// the previous broadcast ended with its recording. That recording is
+/// cumulative: it carries every earlier broadcast on the channel (issue
+/// #173, the predecessor's lines are glued in front), so this caps the
+/// channel's whole lifetime, not one broadcast. Each segment adds about
+/// [`RECORDING_ENTRY_BYTES`] (an estimate, not a bound), plus an
+/// `#EXT-X-DISCONTINUITY` and `#EXT-X-MAP` line per broadcast or writer
+/// restart: 64 MiB holds some 400 000 entries, roughly nine days of
+/// total 2 s-segment airtime across all of the channel's broadcasts.
+/// Past that, every later go-live ([`settle_feed_position`]) and every
+/// resume or finalize ([`resume_feed_position`]) on the channel fails
+/// with `response exceeds …` rather than buffering without bound.
 pub(crate) const MAX_GET_RESPONSE_BYTES: u64 = 64 << 20;
 
 /// The most a [`http_post`] response may take: 1 MiB. The gateway
