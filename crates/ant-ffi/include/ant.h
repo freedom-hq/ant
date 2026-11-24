@@ -551,9 +551,10 @@ ssize_t ant_stream_read(AntStream *stream,
  * Pull a contiguous byte range and deliver each joiner-produced chunk
  * to `on_chunk` as soon as it arrives. Unlike ant_stream_read, which
  * blocks until the entire `len` window has buffered, this drives one
- * StreamBzz request through to its terminal StreamDone and invokes
- * the callback for every BytesChunk along the way - matching the
- * shape of AVAssetResourceLoaderDelegate's dataRequest.
+ * StreamBzz request and invokes the callback for each BytesChunk as it
+ * lands, until the terminal StreamDone, an error, or the callback asks
+ * to stop (see below) - matching the shape of
+ * AVAssetResourceLoaderDelegate's dataRequest.
  *
  * The callback returns 0 to keep pulling, non-zero to ask the FFI to
  * stop early (e.g. AVPlayer canceled the dataRequest). The call then

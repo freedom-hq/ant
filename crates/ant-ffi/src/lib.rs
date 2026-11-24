@@ -2171,9 +2171,10 @@ pub unsafe extern "C" fn ant_stream_read(
 /// Pull a contiguous byte range and deliver each joiner-produced
 /// chunk to `on_chunk` as it arrives. Unlike [`ant_stream_read`] —
 /// which holds the calling thread until the entire `len` bytes have
-/// been buffered — this drives a single `StreamBzz` request all the
-/// way to its terminal `StreamDone`, invoking the callback for every
-/// `BytesChunk` ack along the way. That matches the
+/// been buffered — this drives a single `StreamBzz` request,
+/// invoking the callback for each `BytesChunk` ack as it lands, until
+/// the terminal `StreamDone`, an error, or the callback asks to stop
+/// (see below). That matches the
 /// `AVAssetResourceLoaderDelegate` shape on the Swift side: a long-
 /// lived `dataRequest` that wants `respond(with:)` called as soon as
 /// each piece of body lands, not after the whole window has buffered.
