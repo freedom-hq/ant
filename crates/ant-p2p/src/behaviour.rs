@@ -10793,6 +10793,48 @@ mod tests {
         assert_eq!(state.hint_queue.len(), 1);
     }
 
+    /// Issue #301: a gossiped `/dns4/localhost` (or any DNS-named
+    /// underlay) is never dialed: a hint that only carries DNS names is not
+    /// queued, and a mixed one keeps just its IP underlays — both at
+    /// enqueue time and in the dial-time re-filter.
+    #[tokio::test]
+    async fn enqueue_hint_drops_dns_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = PeerId::random();
+
+        let dns_only = PeerId::random();
+        let mut hint = hint_in_bin(dns_only, 0x80, 1);
+        hint.addrs = vec![
+            "/dns4/localhost/tcp/1634".parse().unwrap(),
+            "/dns4/169.254.169.254.nip.io/tcp/80".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.is_empty());
+        assert!(!state.known_dialable.contains_key(&dns_only));
+
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x40, 2);
+        hint.addrs = vec![
+            "/dns4/localhost/tcp/1634".parse().unwrap(),
+            "/ip4/1.2.3.4/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint.clone(), local);
+        let ip_only = vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()];
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].addrs, ip_only);
+        // The dial-time re-filter drops it too, whatever got cached.
+        assert_eq!(state.addrs_for_dial(&hint), Some(ip_only));
+    }
+
     /// A same-LAN private underlay admitted on one network must not be
     /// dialed after the host's networks change (Wi-Fi → cellular, or a
     /// different LAN reusing the same numbering): the dial-time re-filter
