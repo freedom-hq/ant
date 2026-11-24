@@ -65,10 +65,14 @@
 //! - [`encode_signed_cheque_json`] / [`decode_signed_cheque_json`]:
 //!   bee-shape JSON for the wire's `Cheque` payload.
 //! - [`CreditLedger`]: per-`chequebook` cumulative-paid-in tracking
-//!   with crash-safe JSON persistence (atomic write + fsync), so a
-//!   restart can't accept a replayed older cheque.
+//!   with crash-safe JSON persistence (atomic write + fsync, off the
+//!   ledger lock), so a restart can't accept a replayed older cheque.
+//!   Bounded: [`MAX_INBOUND_CHEQUEBOOKS`] in total,
+//!   [`MAX_INBOUND_CHEQUEBOOKS_PER_PEER`] added per peer.
 //! - [`run_inbound`]: listener task that drains accepted streams,
-//!   verifies cheques, and updates the ledger.
+//!   verifies cheques (against the sender's BZZ handshake too: no
+//!   handshake, no cheque; a chequebook named there is the only one the
+//!   peer may pay from), and updates the ledger.
 //! - [`emit_cheque`]: outbound dialer that ships a signed cheque.
 //! - [`open_settlement`] / [`write_cheque`] / [`await_processed`]: the
 //!   steps of bee's `swapprotocol.EmitCheque` that the node's payer
@@ -79,7 +83,10 @@
 //!
 //! - On-chain `chequebook(Cheque.Chequebook).issuer()` validation.
 //!   The ledger pins the `(chequebook → expected_signer)` binding on
-//!   first sight; subsequent cheques must match. A future hardening
+//!   first sight; subsequent cheques must match. A peer whose handshake
+//!   named a chequebook can only pay from that one, but the handshake's
+//!   chequebook is the peer's own claim, so a peer can still name
+//!   someone else's and pin it to its own key first. A future hardening
 //!   step is a one-shot RPC at first contact to confirm the signer
 //!   really controls the chequebook.
 //! - Auto-cashout. Cashing the highest-cumulative cheque on-chain
@@ -282,6 +289,43 @@ struct LedgerSnapshot {
     cheques: HashMap<String, ChequebookCredit>,
 }
 
+/// Most chequebooks the inbound ledger keeps. A cheque on a chequebook
+/// not yet on file is refused once the ledger holds this many; cheques on
+/// chequebooks already on file keep working. Without on-chain checks a
+/// self-signed cheque on a made-up chequebook is all it takes to add an
+/// entry, so this is what bounds the ledger file (about 170 bytes of
+/// JSON per entry, so about 0.7 MB at the cap) and the cost of each
+/// rewrite.
+pub const MAX_INBOUND_CHEQUEBOOKS: usize = 4096;
+
+/// Most chequebooks one peer (by `PeerId`, for the life of the process)
+/// may add to the inbound ledger. Bee pays from one chequebook; two
+/// leaves room for one redeploy without a restart.
+pub const MAX_INBOUND_CHEQUEBOOKS_PER_PEER: u32 = 2;
+
+/// The ledger's in-memory state, behind [`CreditLedger::inner`].
+#[derive(Default)]
+struct LedgerState {
+    snap: LedgerSnapshot,
+    /// Bumped on every accepted cheque; the persister writes the
+    /// snapshot as of some generation and remembers it, so a write that
+    /// a later one already covered is skipped.
+    generation: u64,
+    /// Chequebooks each peer has added to the ledger this process
+    /// (see [`MAX_INBOUND_CHEQUEBOOKS_PER_PEER`]). Only grows on an
+    /// insert, so it never holds more peers than the ledger has entries.
+    added_by_peer: HashMap<PeerId, u32>,
+}
+
+/// What [`CreditLedger::check`] found for an acceptable cheque.
+struct Checked {
+    key: String,
+    issuer_hex: String,
+    prev_cum: U256,
+    /// The chequebook isn't on file yet: accepting adds an entry.
+    new_entry: bool,
+}
+
 /// In-memory + on-disk per-chequebook credit ledger. The ledger is
 /// the **trust anchor**: every accepted cheque must
 ///
@@ -295,12 +339,31 @@ struct LedgerSnapshot {
 ///    `Beneficiary` / `CumulativePayout` triple at the configured
 ///    chain id.
 ///
-/// Persistence is atomic: every `record_accepted` flushes a fresh
-/// JSON snapshot to a temp file, fsyncs, and renames over the live
-/// path. A crash mid-write leaves the previous snapshot intact and
-/// the new cheque unrecorded — bee's cumulative model means the
-/// peer just re-emits the same (or higher) cheque on the next
-/// connection and we accept it then.
+/// Cheques from the wire go through [`Self::record_from_peer`], which
+/// also checks the sender against the swarm's handshake registry
+/// ([`Self::with_peers`]): a peer with no completed handshake is
+/// refused, and a peer whose V15 handshake named a chequebook may only
+/// pay from that one. A chequebook not yet on file is only added while
+/// the ledger holds fewer than [`MAX_INBOUND_CHEQUEBOOKS`] and the peer
+/// has added fewer than [`MAX_INBOUND_CHEQUEBOOKS_PER_PEER`].
+///
+/// None of this proves the chequebook is real: the chequebook address
+/// in a handshake is the peer's own claim, so a peer can still name
+/// someone else's chequebook and pin it to its own key on first sight
+/// (rule 2). Bee closes that with an on-chain check (factory
+/// `deployedContracts` and the chequebook's `issuer()`), which this
+/// ledger doesn't do.
+///
+/// Persistence is atomic: each accepted cheque is followed by a fresh
+/// JSON snapshot written to a temp file, fsynced, and renamed over the
+/// live path. The write runs under its own lock, not the ledger's, so
+/// readers and other cheques aren't held up by the fsync, and a write
+/// already covered by a later one is skipped. On the listener path it
+/// runs on the blocking pool ([`Self::record_from_peer`]), and the
+/// stream is only closed once it is done. A crash mid-write leaves the
+/// previous snapshot intact and the new cheque unrecorded — bee's
+/// cumulative model means the peer just re-emits the same (or higher)
+/// cheque on the next connection and we accept it then.
 ///
 /// A stored `cumulative_payout_dec` that isn't a decimal number
 /// (bee#5656: an empty string, which `U256::from_dec_str` reads as
@@ -313,7 +376,12 @@ struct LedgerSnapshot {
 /// payment once the baseline is set; see `rebaseline` for what that
 /// costs.
 pub struct CreditLedger {
-    inner: Mutex<LedgerSnapshot>,
+    inner: Mutex<LedgerState>,
+    /// Serializes snapshot writes (they share one temp file) and holds
+    /// the generation last written. Never taken while holding `inner`
+    /// the other way round: the writer takes `persist`, then `inner`
+    /// just long enough to clone the snapshot.
+    persist: Mutex<u64>,
     persist_path: Option<PathBuf>,
     chain_id: u64,
     /// Beneficiary address all accepted cheques must target — i.e.
@@ -321,6 +389,12 @@ pub struct CreditLedger {
     /// rejected (the issuer is paying someone else and the wire
     /// is presumably misrouted).
     our_beneficiary: [u8; 20],
+    /// The swarm's handshake registry; see [`Self::with_peers`].
+    peers: crate::PeerEthMap,
+    /// Test hook: runs in the writer after the snapshot is cloned and
+    /// before it is written, with the ledger lock released.
+    #[cfg(test)]
+    persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl CreditLedger {
@@ -330,8 +404,12 @@ impl CreditLedger {
     /// logging — better to lose history than refuse to start. An entry
     /// whose cumulative isn't a decimal number is kept (its issuer pin
     /// still applies) with a warning; the next cheque rebaselines it.
+    ///
+    /// The ledger starts with an empty handshake registry, so
+    /// [`Self::record_from_peer`] refuses every peer until
+    /// [`Self::with_peers`] hands it the swarm's.
     pub fn open(persist_path: Option<PathBuf>, chain_id: u64, our_beneficiary: [u8; 20]) -> Self {
-        let inner = match &persist_path {
+        let snap = match &persist_path {
             Some(p) if p.exists() => match std::fs::read(p) {
                 Ok(bytes) => match serde_json::from_slice::<LedgerSnapshot>(&bytes) {
                     Ok(snap) => {
@@ -377,21 +455,84 @@ impl CreditLedger {
             _ => LedgerSnapshot::default(),
         };
         Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(LedgerState {
+                snap,
+                ..LedgerState::default()
+            }),
+            persist: Mutex::new(0),
             persist_path,
             chain_id,
             our_beneficiary,
+            peers: crate::PeerEthMap::default(),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
         }
+    }
+
+    /// Check wire cheques against `peers`, the swarm's handshake
+    /// registry (`RunConfig::peer_eth`, which the swarm fills on each
+    /// completed BZZ handshake and clears when the peer's last
+    /// connection closes).
+    #[must_use]
+    pub fn with_peers(mut self, peers: crate::PeerEthMap) -> Self {
+        self.peers = peers;
+        self
     }
 
     /// Apply `signed` to the ledger, returning the previous
     /// cumulative payout for that chequebook (zero on first sight; the
     /// cheque's own cumulative when the stored one is damaged, see
     /// [`rebaseline`]). Validates: signature, beneficiary, sticky-issuer
-    /// binding, and monotonicity against the stored figure (skipped when
-    /// that figure is damaged and this cheque becomes the baseline). A pure read-only check (no ledger mutation) is
+    /// binding, monotonicity against the stored figure (skipped when
+    /// that figure is damaged and this cheque becomes the baseline), and
+    /// [`MAX_INBOUND_CHEQUEBOOKS`] for a chequebook not yet on file. No
+    /// handshake checks: cheques from a peer go through
+    /// [`Self::record_from_peer`]. Persists on the calling thread, outside
+    /// the ledger lock. A pure read-only check (no ledger mutation) is
     /// available via [`Self::would_accept`].
     pub fn record_accepted(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
+        let (prev, generation) = self.apply(None, signed)?;
+        self.persist_logged(generation);
+        Ok(prev)
+    }
+
+    /// [`Self::record_accepted`] for a cheque `peer` sent us, the path
+    /// the inbound listener takes. On top of the ledger's own rules it
+    /// refuses a peer with no completed handshake, a cheque on a
+    /// chequebook other than the one `peer`'s handshake named, and a
+    /// chequebook not yet on file once `peer` has added
+    /// [`MAX_INBOUND_CHEQUEBOOKS_PER_PEER`]. The snapshot write runs on
+    /// tokio's blocking pool; this returns once it is done.
+    pub async fn record_from_peer(
+        self: &Arc<Self>,
+        peer: PeerId,
+        signed: &SignedCheque,
+    ) -> Result<U256, SwapError> {
+        let (prev, generation) = self.apply(Some(peer), signed)?;
+        if self.persist_path.is_some() {
+            let this = Arc::clone(self);
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || this.persist_logged(generation)).await
+            {
+                warn!(target: "ant_p2p::swap", "ledger persist task failed: {e}");
+            }
+        }
+        Ok(prev)
+    }
+
+    /// Read-only validation. Returns the would-be previous cumulative
+    /// payout on success, the rejection reason on failure. Pure — no
+    /// ledger mutation. Same checks as [`Self::record_accepted`].
+    pub fn would_accept(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
+        let recovered = self.precheck(None, signed)?;
+        let guard = self.inner.lock().expect("ledger mutex poisoned");
+        Self::check(&guard, None, signed, &recovered, false).map(|c| c.prev_cum)
+    }
+
+    /// The checks that need no ledger state: beneficiary, the sender's
+    /// handshake (when `peer` is given), and the signature. Returns the
+    /// recovered issuer.
+    fn precheck(&self, peer: Option<PeerId>, signed: &SignedCheque) -> Result<[u8; 20], SwapError> {
         if signed.cheque.beneficiary != self.our_beneficiary {
             return Err(SwapError::Rejected(format!(
                 "cheque beneficiary 0x{} != our 0x{}",
@@ -399,17 +540,43 @@ impl CreditLedger {
                 hex::encode(self.our_beneficiary),
             )));
         }
-        let recovered = recover_cheque_signer(signed, self.chain_id)?;
-        let chequebook_key = hex::encode(signed.cheque.chequebook);
-        let recovered_hex = hex::encode(recovered);
-        let mut guard = self.inner.lock().expect("ledger mutex poisoned");
-        let warn_rebaseline = true;
-        let stored = match guard.cheques.get(&chequebook_key) {
-            Some(c) => {
-                if c.issuer_eoa_hex != recovered_hex {
+        if let Some(peer) = peer {
+            match self.peers.handshake_chequebook(&peer) {
+                None => {
                     return Err(SwapError::Rejected(format!(
-                        "issuer for chequebook 0x{chequebook_key} changed: \
-                         saw 0x{recovered_hex}, pinned to 0x{}",
+                        "cheque from {peer}, which has no completed handshake",
+                    )))
+                }
+                Some(Some(named)) if named != signed.cheque.chequebook => {
+                    return Err(SwapError::Rejected(format!(
+                        "cheque on chequebook 0x{}, but {peer}'s handshake named 0x{}",
+                        hex::encode(signed.cheque.chequebook),
+                        hex::encode(named),
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(recover_cheque_signer(signed, self.chain_id)?)
+    }
+
+    /// The checks against the ledger's state: sticky issuer,
+    /// monotonicity (or `rebaseline`), and the caps on new entries.
+    fn check(
+        state: &LedgerState,
+        peer: Option<PeerId>,
+        signed: &SignedCheque,
+        recovered: &[u8; 20],
+        log: bool,
+    ) -> Result<Checked, SwapError> {
+        let key = hex::encode(signed.cheque.chequebook);
+        let issuer_hex = hex::encode(recovered);
+        let stored = match state.snap.cheques.get(&key) {
+            Some(c) => {
+                if c.issuer_eoa_hex != issuer_hex {
+                    return Err(SwapError::Rejected(format!(
+                        "issuer for chequebook 0x{key} changed: \
+                         saw 0x{issuer_hex}, pinned to 0x{}",
                         c.issuer_eoa_hex,
                     )));
                 }
@@ -417,73 +584,92 @@ impl CreditLedger {
             }
             None => Some(U256::zero()),
         };
+        let new_entry = !state.snap.cheques.contains_key(&key);
+        if new_entry {
+            if state.snap.cheques.len() >= MAX_INBOUND_CHEQUEBOOKS {
+                return Err(SwapError::Rejected(format!(
+                    "new chequebook 0x{key} refused: the ledger already \
+                     holds {MAX_INBOUND_CHEQUEBOOKS} chequebooks",
+                )));
+            }
+            if let Some(peer) = peer {
+                let added = state.added_by_peer.get(&peer).copied().unwrap_or(0);
+                if added >= MAX_INBOUND_CHEQUEBOOKS_PER_PEER {
+                    return Err(SwapError::Rejected(format!(
+                        "new chequebook 0x{key} refused: {peer} already \
+                         added {added} chequebooks",
+                    )));
+                }
+            }
+        }
         let prev_cum = match stored {
             Some(prev) => prev,
-            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
+            None => rebaseline(&key, signed, log),
         };
         if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
             return Err(SwapError::Rejected(format!(
-                "non-monotonic cheque for 0x{chequebook_key}: cum={} <= stored={}",
+                "non-monotonic cheque for 0x{key}: cum={} <= stored={}",
                 signed.cheque.cumulative_payout, prev_cum,
             )));
         }
-        guard.cheques.insert(
-            chequebook_key,
+        Ok(Checked {
+            key,
+            issuer_hex,
+            prev_cum,
+            new_entry,
+        })
+    }
+
+    /// Check `signed` and, if it passes, record it in memory. Returns
+    /// the previous cumulative and the generation to persist.
+    fn apply(&self, peer: Option<PeerId>, signed: &SignedCheque) -> Result<(U256, u64), SwapError> {
+        let recovered = self.precheck(peer, signed)?;
+        let mut guard = self.inner.lock().expect("ledger mutex poisoned");
+        let checked = Self::check(&guard, peer, signed, &recovered, true)?;
+        if checked.new_entry {
+            if let Some(peer) = peer {
+                *guard.added_by_peer.entry(peer).or_insert(0) += 1;
+            }
+        }
+        guard.snap.cheques.insert(
+            checked.key,
             ChequebookCredit {
-                issuer_eoa_hex: recovered_hex,
+                issuer_eoa_hex: checked.issuer_hex,
                 cumulative_payout_dec: signed.cheque.cumulative_payout.to_string(),
             },
         );
-        if let Some(path) = &self.persist_path {
-            if let Err(e) = persist_snapshot(path, &guard) {
-                warn!(
-                    target: "ant_p2p::swap",
-                    path = %path.display(),
-                    "ledger persist failed: {e}; in-memory state still updated",
-                );
-            }
-        }
-        Ok(prev_cum)
+        guard.generation += 1;
+        Ok((checked.prev_cum, guard.generation))
     }
 
-    /// Read-only validation. Returns the would-be previous cumulative
-    /// payout on success, the rejection reason on failure. Pure — no
-    /// ledger mutation.
-    pub fn would_accept(&self, signed: &SignedCheque) -> Result<U256, SwapError> {
-        if signed.cheque.beneficiary != self.our_beneficiary {
-            return Err(SwapError::Rejected(format!(
-                "cheque beneficiary 0x{} != our 0x{}",
-                hex::encode(signed.cheque.beneficiary),
-                hex::encode(self.our_beneficiary),
-            )));
-        }
-        let recovered = recover_cheque_signer(signed, self.chain_id)?;
-        let chequebook_key = hex::encode(signed.cheque.chequebook);
-        let recovered_hex = hex::encode(recovered);
-        let guard = self.inner.lock().expect("ledger mutex poisoned");
-        let warn_rebaseline = false;
-        let stored = match guard.cheques.get(&chequebook_key) {
-            Some(c) => {
-                if c.issuer_eoa_hex != recovered_hex {
-                    return Err(SwapError::Rejected(format!(
-                        "issuer for chequebook 0x{chequebook_key} changed",
-                    )));
-                }
-                parse_stored_cumulative(&c.cumulative_payout_dec)
-            }
-            None => Some(U256::zero()),
+    /// Write the snapshot to disk if no write has covered `generation`
+    /// yet, logging a failure (the in-memory state stays updated; the
+    /// next cheque's write retries). Holds the ledger lock only to clone
+    /// the snapshot, never across the write and fsync.
+    fn persist_logged(&self, generation: u64) {
+        let Some(path) = &self.persist_path else {
+            return;
         };
-        let prev_cum = match stored {
-            Some(prev) => prev,
-            None => rebaseline(&chequebook_key, signed, warn_rebaseline),
-        };
-        if signed.cheque.cumulative_payout <= prev_cum && stored.is_some() {
-            return Err(SwapError::Rejected(format!(
-                "non-monotonic cumulative payout {} <= stored {}",
-                signed.cheque.cumulative_payout, prev_cum,
-            )));
+        let mut written = self.persist.lock().expect("ledger persist mutex poisoned");
+        if *written >= generation {
+            return;
         }
-        Ok(prev_cum)
+        let (snap, current) = {
+            let g = self.inner.lock().expect("ledger mutex poisoned");
+            (g.snap.clone(), g.generation)
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.persist_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        match persist_snapshot(path, &snap) {
+            Ok(()) => *written = current,
+            Err(e) => warn!(
+                target: "ant_p2p::swap",
+                path = %path.display(),
+                "ledger persist failed: {e}; in-memory state still updated",
+            ),
+        }
     }
 
     /// Latest accepted cheque amount for `chequebook` (zero if none).
@@ -493,7 +679,7 @@ impl CreditLedger {
     pub fn cumulative_for(&self, chequebook: &[u8; 20]) -> U256 {
         let key = hex::encode(chequebook);
         let guard = self.inner.lock().expect("ledger mutex poisoned");
-        match guard.cheques.get(&key) {
+        match guard.snap.cheques.get(&key) {
             Some(c) => parse_stored_cumulative(&c.cumulative_payout_dec).unwrap_or(U256::zero()),
             None => U256::zero(),
         }
@@ -513,6 +699,7 @@ impl CreditLedger {
     pub fn snapshot(&self) -> Vec<(String, ChequebookCredit)> {
         let guard = self.inner.lock().expect("ledger mutex poisoned");
         guard
+            .snap
             .cheques
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -3327,7 +3514,9 @@ pub struct InboundCheque {
 
 /// Spawn the long-lived inbound listener. For each accepted stream
 /// it: drains the bee headers preamble, reads the `EmitCheque` frame,
-/// parses the JSON cheque, and applies it to the ledger. Successful
+/// parses the JSON cheque, and applies it to the ledger with
+/// [`CreditLedger::record_from_peer`] (which checks the sender's
+/// handshake and persists on the blocking pool). Successful
 /// accepts publish to `events_tx` (best-effort: drops on backpressure).
 ///
 /// Stays compatible with bee's `s.handler`: bee's listener reads the
@@ -3386,7 +3575,7 @@ async fn handle_inbound_stream(
     let body = read_delimited(&mut stream, EMIT_CHEQUE_MAX).await?;
     let msg = EmitChequePb::decode(body.as_slice())?;
     let signed = decode_signed_cheque_json(&msg.cheque)?;
-    let prev = ledger.record_accepted(&signed)?;
+    let prev = ledger.record_from_peer(peer, &signed).await?;
     let issuer = recover_cheque_signer(&signed, ledger.chain_id)?;
     // Half-close so bee's `stream.FullClose()` returns promptly.
     let _ = stream.close().await;
@@ -3947,6 +4136,229 @@ mod tests {
         // Replay of the same cheque must be rejected as non-monotonic.
         let err = ledger2.record_accepted(&signed).unwrap_err();
         assert!(matches!(err, SwapError::Rejected(_)));
+    }
+
+    /// A cheque signed by `secret` on `chequebook` to `our_eoa`.
+    fn inbound_cheque(
+        secret: &[u8; SECP256K1_SECRET_LEN],
+        chequebook: [u8; 20],
+        our_eoa: [u8; 20],
+        cum: u64,
+    ) -> SignedCheque {
+        let c = Cheque {
+            chequebook,
+            beneficiary: our_eoa,
+            cumulative_payout: U256::from(cum),
+        };
+        sign_cheque(secret, &c, 100).unwrap()
+    }
+
+    /// The `n`-th made-up chequebook address.
+    fn fake_chequebook(n: usize) -> [u8; 20] {
+        let mut cb = [0x5au8; 20];
+        cb[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        cb
+    }
+
+    /// Self-signed cheques on made-up chequebooks can't grow the ledger
+    /// without bound: one peer adds at most
+    /// `MAX_INBOUND_CHEQUEBOOKS_PER_PEER`, the ledger holds at most
+    /// `MAX_INBOUND_CHEQUEBOOKS`, a refused cheque leaves no entry, and
+    /// chequebooks already on file keep working at the cap.
+    #[tokio::test]
+    async fn fake_chequebooks_beyond_the_cap_are_refused() {
+        let our_eoa = [0xaau8; 20];
+        let peers = crate::PeerEthMap::new();
+        let ledger = Arc::new(CreditLedger::open(None, 100, our_eoa).with_peers(peers.clone()));
+        let attacker = make_secret();
+
+        // Per peer: a handshaken peer that named no chequebook.
+        let peer = PeerId::random();
+        peers.record(peer, eoa(&attacker));
+        for n in 0..MAX_INBOUND_CHEQUEBOOKS_PER_PEER as usize {
+            let c = inbound_cheque(&attacker, fake_chequebook(n), our_eoa, 1);
+            ledger.record_from_peer(peer, &c).await.unwrap();
+        }
+        let over = fake_chequebook(MAX_INBOUND_CHEQUEBOOKS_PER_PEER as usize);
+        let err = ledger
+            .record_from_peer(peer, &inbound_cheque(&attacker, over, our_eoa, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err}");
+        assert_eq!(
+            ledger.snapshot().len(),
+            MAX_INBOUND_CHEQUEBOOKS_PER_PEER as usize
+        );
+        // Its chequebooks on file still take cheques.
+        let again = inbound_cheque(&attacker, fake_chequebook(0), our_eoa, 2);
+        assert_eq!(
+            ledger.record_from_peer(peer, &again).await.unwrap(),
+            U256::from(1u64)
+        );
+        // A reconnect doesn't reset the peer's count.
+        peers.forget(&peer);
+        peers.record(peer, eoa(&attacker));
+        assert!(ledger
+            .record_from_peer(peer, &inbound_cheque(&attacker, over, our_eoa, 1))
+            .await
+            .is_err());
+
+        // In total: fill the ledger to the cap, one fresh peer per two
+        // chequebooks, as a peer-id-minting attacker would.
+        let mut n = MAX_INBOUND_CHEQUEBOOKS_PER_PEER as usize;
+        while n < MAX_INBOUND_CHEQUEBOOKS {
+            let p = PeerId::random();
+            peers.record(p, eoa(&attacker));
+            for _ in 0..MAX_INBOUND_CHEQUEBOOKS_PER_PEER {
+                if n == MAX_INBOUND_CHEQUEBOOKS {
+                    break;
+                }
+                let c = inbound_cheque(&attacker, fake_chequebook(n + 1), our_eoa, 1);
+                ledger.record_from_peer(p, &c).await.unwrap();
+                n += 1;
+            }
+        }
+        let honest = make_secret();
+        let honest_peer = PeerId::random();
+        let honest_cb = [0x11u8; 20];
+        peers.record_with_chequebook(honest_peer, eoa(&honest), Some(honest_cb));
+        let err = ledger
+            .record_from_peer(honest_peer, &inbound_cheque(&honest, honest_cb, our_eoa, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err}");
+        let fake = inbound_cheque(&attacker, [0x12u8; 20], our_eoa, 1);
+        assert!(
+            ledger.record_accepted(&fake).is_err(),
+            "no-peer path capped too"
+        );
+        assert!(ledger.would_accept(&fake).is_err());
+        assert_eq!(ledger.snapshot().len(), MAX_INBOUND_CHEQUEBOOKS);
+        assert_eq!(ledger.cumulative_for(&honest_cb), U256::zero());
+        // A chequebook on file is still paid at the cap.
+        let known = inbound_cheque(&attacker, fake_chequebook(0), our_eoa, 3);
+        assert_eq!(
+            ledger.record_from_peer(peer, &known).await.unwrap(),
+            U256::from(2u64)
+        );
+    }
+
+    /// A peer whose handshake named a chequebook can only pay from that
+    /// one, so it can't put cheques (and an issuer pin) on anyone else's.
+    /// A peer with no handshake can't pay at all.
+    #[tokio::test]
+    async fn a_cheque_on_a_chequebook_other_than_the_handshakes_is_rejected() {
+        let our_eoa = [0xaau8; 20];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credits.json");
+        let peers = crate::PeerEthMap::new();
+        let ledger = Arc::new(
+            CreditLedger::open(Some(path.clone()), 100, our_eoa).with_peers(peers.clone()),
+        );
+        let secret = make_secret();
+        let declared = [0x77u8; 20];
+        let someone_elses = [0x88u8; 20];
+        let peer = PeerId::random();
+
+        // No handshake yet.
+        let on_declared = inbound_cheque(&secret, declared, our_eoa, 100);
+        let err = ledger
+            .record_from_peer(peer, &on_declared)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err}");
+
+        peers.record_with_chequebook(peer, eoa(&secret), Some(declared));
+        let err = ledger
+            .record_from_peer(peer, &inbound_cheque(&secret, someone_elses, our_eoa, 100))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SwapError::Rejected(m) if m.contains("handshake named")),
+            "{err}"
+        );
+        assert_eq!(ledger.snapshot().len(), 0, "nothing pinned");
+
+        assert_eq!(
+            ledger.record_from_peer(peer, &on_declared).await.unwrap(),
+            U256::zero()
+        );
+        // On disk once the call returns.
+        let reopened = CreditLedger::open(Some(path), 100, our_eoa);
+        assert_eq!(reopened.cumulative_for(&declared), U256::from(100u64));
+        assert_eq!(reopened.cumulative_for(&someone_elses), U256::zero());
+
+        // Gone with the connection.
+        peers.forget(&peer);
+        let next = inbound_cheque(&secret, declared, our_eoa, 200);
+        assert!(ledger.record_from_peer(peer, &next).await.is_err());
+    }
+
+    /// The snapshot write (file write + fsync + rename) runs without the
+    /// ledger lock: while one is parked mid-write, reads answer and
+    /// another cheque is recorded in memory, and both reach disk.
+    #[test]
+    fn the_persist_does_not_hold_the_ledger_mutex() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let our_eoa = [0xaau8; 20];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credits.json");
+        let ledger = Arc::new(CreditLedger::open(Some(path.clone()), 100, our_eoa));
+        let (parked_tx, parked_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let parked_tx = Mutex::new(parked_tx);
+        *ledger.persist_hook.lock().unwrap() = Some(Box::new(move || {
+            let _ = parked_tx.lock().unwrap().send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        }));
+        let secret = make_secret();
+        let (cb1, cb2) = ([0x71u8; 20], [0x72u8; 20]);
+
+        let first = {
+            let (l, c) = (ledger.clone(), inbound_cheque(&secret, cb1, our_eoa, 100));
+            std::thread::spawn(move || l.record_accepted(&c).unwrap())
+        };
+        parked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first write reached the hook");
+
+        // Reads and a second cheque, off-thread so a held lock fails the
+        // test instead of hanging it.
+        let (done_tx, done_rx) = channel();
+        let second = {
+            let (l, c) = (ledger.clone(), inbound_cheque(&secret, cb2, our_eoa, 200));
+            std::thread::spawn(move || {
+                let read = l.cumulative_for(&cb1);
+                let snap = l.snapshot().len();
+                let _ = done_tx.send((read, snap));
+                l.record_accepted(&c).unwrap()
+            })
+        };
+        let (read, snap) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ledger reads blocked by an in-flight persist");
+        assert_eq!((read, snap), (U256::from(100u64), 1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ledger.cumulative_for(&cb2) != U256::from(200u64) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second cheque blocked by an in-flight persist"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), U256::zero());
+        assert_eq!(second.join().unwrap(), U256::zero());
+        let reopened = CreditLedger::open(Some(path), 100, our_eoa);
+        assert_eq!(reopened.cumulative_for(&cb1), U256::from(100u64));
+        assert_eq!(reopened.cumulative_for(&cb2), U256::from(200u64));
     }
 
     /// A damaged stored cumulative (bee#5656) is neither zero nor a

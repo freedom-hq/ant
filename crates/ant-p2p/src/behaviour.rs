@@ -224,8 +224,9 @@ pub struct RunConfig {
     /// `/swarm/swap/1.0.0/swap` listener is wired to a credit ledger
     /// pinned at `our_beneficiary` (typically the same EOA that
     /// signs the BZZ handshake) and inbound cheques are
-    /// signature-verified, monotonicity-checked, and persisted to
-    /// `ledger_path`. When `None`, the protocol is still registered
+    /// signature-verified, monotonicity-checked, checked against the
+    /// sender's BZZ handshake (see `swap::CreditLedger::record_from_peer`),
+    /// and persisted to `ledger_path`. When `None`, the protocol is still registered
     /// — so peers don't see a libp2p disconnect when they emit a
     /// cheque — but every received cheque is silently dropped.
     pub swap: Option<SwapConfig>,
@@ -442,11 +443,18 @@ const BIN_BALANCE_DIAL_CAP: usize = 16;
 /// negotiated.
 fn build_swap_wiring(cfg: &RunConfig) -> Option<sinks::SwapWiring> {
     let swap = cfg.swap.as_ref()?;
-    let ledger = std::sync::Arc::new(crate::swap::CreditLedger::open(
-        Some(swap.ledger_path.clone()),
-        swap.chain_id,
-        swap.our_beneficiary,
-    ));
+    // The ledger reads the swarm's handshake registry (the same map
+    // `SwarmState::peer_eth` records into) to refuse cheques from peers
+    // with no handshake and cheques on a chequebook other than the one
+    // the peer's handshake named.
+    let ledger = std::sync::Arc::new(
+        crate::swap::CreditLedger::open(
+            Some(swap.ledger_path.clone()),
+            swap.chain_id,
+            swap.our_beneficiary,
+        )
+        .with_peers(cfg.peer_eth.clone()),
+    );
     Some(sinks::SwapWiring {
         ledger,
         events: swap.events_tx.clone(),
@@ -9227,7 +9235,13 @@ fn handle_drive_outcome(
             // it up later when emitting cheques. Cheap (one HashMap
             // insert behind RwLock); harmless on builds where SWAP is
             // unconfigured (registry has no consumers in that case).
-            state.peer_eth.record(peer, info.remote_eth_address);
+            // The chequebook the handshake named goes with it: the
+            // inbound SWAP listener only takes cheques on that one.
+            state.peer_eth.record_with_chequebook(
+                peer,
+                info.remote_eth_address,
+                info.remote_chequebook,
+            );
             state.publish_peers();
             let peer_set_size = state.peer_set_size();
             state.failed.retain(|f| f.peer != peer);

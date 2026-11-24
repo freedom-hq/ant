@@ -80,7 +80,8 @@ the still-open items.
   (>30 bytes) are chained transparently.
 - **SWAP wire protocol (`/swarm/swap/1.0.0/swap`).** Full inbound
   listener with EIP-712 cheque verification, monotonicity enforcement,
-  sticky issuer-EOA pinning, and crash-safe credit ledger. Outbound
+  sticky issuer-EOA pinning, cheques only on the chequebook the peer's
+  handshake named, and a crash-safe, size-capped credit ledger. Outbound
   cheques for downloads and uploads alike, priced like bee's
   (`units × exchange + deduction`, capped by the price oracle and the
   chequebook's available balance) and switched by `swap-enable`

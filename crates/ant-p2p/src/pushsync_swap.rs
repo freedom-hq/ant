@@ -102,6 +102,12 @@ pub struct RetrievalSwapPolicy {
 /// connection that closed (or was replaced) meanwhile is seen even though
 /// the stream itself can't tell (see [`PushsyncSwap`]'s delivery check).
 ///
+/// The entry also keeps the chequebook the peer named in its V15
+/// handshake (`None` for a V14 peer or an empty field). The inbound SWAP
+/// listener reads it through [`Self::handshake_chequebook`]: a cheque from
+/// a peer with no entry is refused, and a peer that named a chequebook
+/// may only pay from that one (see [`crate::swap::CreditLedger`]).
+///
 /// The map is intentionally tiny — one 20-byte EOA per peer, peers
 /// churn but never accumulate beyond `state.bzz_peers.len() ~= 100` in
 /// our peer set: `forget(peer)` from `ConnectionClosed` drops the entry,
@@ -111,8 +117,9 @@ pub struct PeerEthMap {
     inner: Arc<RwLock<HashMap<PeerId, PeerSession>>>,
 }
 
-/// A handshaken peer's EOA and its session number.
-type PeerSession = ([u8; 20], u64);
+/// A handshaken peer's EOA, its session number and the chequebook its
+/// handshake named.
+type PeerSession = ([u8; 20], u64, Option<[u8; 20]>);
 
 /// Source of [`PeerEthMap`] sessions.
 static NEXT_PEER_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -130,9 +137,21 @@ impl PeerEthMap {
     /// silently — bee assumes a stable `(peer_id, eoa)` pairing per
     /// session, and so do we.
     pub fn record(&self, peer: PeerId, eth_address: [u8; 20]) {
+        self.record_with_chequebook(peer, eth_address, None);
+    }
+
+    /// [`Self::record`], also keeping the chequebook the peer's V15
+    /// handshake named (`HandshakeInfo::remote_chequebook`). This is what
+    /// the swarm's handshake-success branch calls.
+    pub fn record_with_chequebook(
+        &self,
+        peer: PeerId,
+        eth_address: [u8; 20],
+        chequebook: Option<[u8; 20]>,
+    ) {
         let session = NEXT_PEER_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut g) = self.inner.write() {
-            g.insert(peer, (eth_address, session));
+            g.insert(peer, (eth_address, session, chequebook));
         }
     }
 
@@ -141,7 +160,8 @@ impl PeerEthMap {
     /// connections closes while another stays open: a cheque stream may
     /// have run on the closed one (it can't be told which), so a payment
     /// in flight must see that its connection may be gone, while the
-    /// peer itself stays handshaken. No-op for a peer with no entry.
+    /// peer itself stays handshaken (EOA and handshake chequebook kept).
+    /// No-op for a peer with no entry.
     pub fn renew_session(&self, peer: &PeerId) {
         if let Ok(mut g) = self.inner.write() {
             if let Some(entry) = g.get_mut(peer) {
@@ -165,14 +185,26 @@ impl PeerEthMap {
     /// evicted by [`Self::forget`].
     #[must_use]
     pub fn get(&self, peer: &PeerId) -> Option<[u8; 20]> {
-        self.inner.read().ok()?.get(peer).map(|(eoa, _)| *eoa)
+        self.inner.read().ok()?.get(peer).map(|(eoa, _, _)| *eoa)
+    }
+
+    /// The chequebook `peer`'s handshake named: `None` if the peer has no
+    /// completed handshake on a live connection, `Some(None)` if it is
+    /// handshaken but named no chequebook (V14, or an empty field).
+    #[must_use]
+    pub fn handshake_chequebook(&self, peer: &PeerId) -> Option<Option<[u8; 20]>> {
+        self.inner.read().ok()?.get(peer).map(|(_, _, cb)| *cb)
     }
 
     /// `peer`'s EOA and its current session, if it is connected and
     /// handshaken.
     #[must_use]
     pub fn session(&self, peer: &PeerId) -> Option<([u8; 20], u64)> {
-        self.inner.read().ok()?.get(peer).copied()
+        self.inner
+            .read()
+            .ok()?
+            .get(peer)
+            .map(|(eoa, session, _)| (*eoa, *session))
     }
 }
 
@@ -670,6 +702,23 @@ mod tests {
         assert_eq!(m.get(&p), Some(eoa));
         m.forget(&p);
         assert!(m.get(&p).is_none());
+    }
+
+    /// The handshake's chequebook lives as long as the peer's entry: kept
+    /// across a session renewal, gone with the connection.
+    #[test]
+    fn peer_eth_map_keeps_the_handshake_chequebook() {
+        let m = PeerEthMap::new();
+        let p = PeerId::random();
+        assert_eq!(m.handshake_chequebook(&p), None, "no handshake");
+        m.record(p, [1; 20]);
+        assert_eq!(m.handshake_chequebook(&p), Some(None), "none named");
+        m.record_with_chequebook(p, [1; 20], Some([9; 20]));
+        assert_eq!(m.handshake_chequebook(&p), Some(Some([9; 20])));
+        m.renew_session(&p);
+        assert_eq!(m.handshake_chequebook(&p), Some(Some([9; 20])));
+        m.forget(&p);
+        assert_eq!(m.handshake_chequebook(&p), None);
     }
 
     /// Every handshake starts a new session, and a closed connection
