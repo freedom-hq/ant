@@ -18,12 +18,21 @@
    6. `cargo test --workspace --bins` (the `antctl`/`antd`/`antop`
       unit tests live in their `src/main.rs`, which `--lib` skips)
    7. `cargo test -p ant-ffi --features chain --lib`
+   8. `cargo deny check advisories bans licenses sources` (the separate
+      `cargo-deny` job; install with `cargo install cargo-deny --version 0.22.0 --locked`
+      or the release binary the job uses)
  Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
  (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
  off by default, so the whole-workspace step 2 never compiles them — they
  need an explicit per-crate lint or their code is never type-checked by CI.
- Step 6 exists for the same reason: step 5 never enables `chain`, so the
+ Step 7 exists for the same reason: step 5 never enables `chain`, so the
  chain-gated `ant-ffi` unit tests would be compiled but never run.
+ Step 8 checks `Cargo.lock` against RustSec advisories, yanked
+ versions, the license allow-list and crate sources, per `deny.toml`.
+ It can go red with no code change when a new advisory is published:
+ take the fix with `cargo update -p <crate>` when a compatible one
+ exists, otherwise add a narrow `ignore` entry to `deny.toml`: one advisory ID,
+ with the reason and what removes it (the tracking issue, if any).
  Never merge to `main` (or push a branch you expect to be merged) with a
  known-red gate. Toolchain upgrades can introduce new `clippy`/`rustfmt`
  findings on untouched code — fix those too (the gate is whole-repo, not
@@ -34,7 +43,7 @@
     skips `cargo fmt` and, more importantly, skips `--all-targets`, so it
     never compiles test/integration targets or the rest of the workspace.
     A change that builds clean under `-p ant-ffi -p ant-p2p` can still be
-    red on the real gate. Run steps 1–6 verbatim before opening *or*
+    red on the real gate. Run steps 1–8 verbatim before opening *or*
     pushing to a PR — not a hand-picked subset. (This was learned the hard
     way: PR #16 went red twice post-open on exactly these two blind spots.)
    - **Adding a variant to a widely-matched enum touches more places than
