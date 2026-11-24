@@ -977,9 +977,16 @@ fn write_output(
                 "refusing to overwrite existing {} (pass --force to replace a regular file, or an explicit file path with -o)",
                 target.display()
             ),
-            // `O_NOFOLLOW` on a symlink fails with ELOOP.
+            // `O_NOFOLLOW` on a symlink fails, but the errno differs by
+            // platform (ELOOP on Linux/macOS/OpenBSD, EMLINK on FreeBSD,
+            // EFTYPE on NetBSD), so ask the directory entry itself
+            // rather than matching one errno.
             #[cfg(unix)]
-            Err(e) if force && e.raw_os_error() == Some(libc::ELOOP) => {
+            Err(_)
+                if force
+                    && std::fs::symlink_metadata(&target)
+                        .is_ok_and(|m| m.file_type().is_symlink()) =>
+            {
                 return Err(refuse_link());
             }
             // A FIFO with no reader, opened `O_NONBLOCK` for writing.
@@ -3611,6 +3618,9 @@ mod tests {
             let err = res.unwrap_err();
             assert!(format!("{err:#}").contains("write to"), "{err:#}");
             assert!(!dir.join("big.bin").exists(), "partial file left behind");
+            // Proof for the parent that this branch really ran: a child
+            // whose `--exact` filter matched nothing also exits 0.
+            std::fs::write(dir.join("child-ran"), b"").unwrap();
             return;
         }
         let tmp = TempDir::new("write-output-partial");
@@ -3628,6 +3638,11 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            tmp.0.join("child-ran").exists(),
+            "child ran no test (did the --exact name drift?)\n{}",
+            String::from_utf8_lossy(&out.stdout)
         );
         assert!(!tmp.0.join("big.bin").exists());
     }
