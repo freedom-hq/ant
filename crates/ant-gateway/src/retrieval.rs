@@ -4396,10 +4396,15 @@ fn is_active_content_type(content_type: &str) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    essence.contains("html")
-        || essence.contains("xml")
-        || essence.contains("javascript")
-        || essence.contains("ecmascript")
+    // Matched on the media type, not by substring: `xml` alone would
+    // also catch the (passive) Office types,
+    // `application/vnd.openxmlformats-officedocument.*`.
+    matches!(
+        essence.as_str(),
+        "text/html" | "application/xhtml+xml" | "text/xml" | "application/xml"
+    ) || essence.ends_with("+xml")
+        || essence.ends_with("/javascript")
+        || essence.ends_with("/ecmascript")
 }
 
 fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {

@@ -131,7 +131,7 @@ fn content_type(resp: &axum::http::Response<Body>) -> String {
 async fn bytes_filename_never_yields_an_active_content_type() {
     let router = html_node();
     let names = [
-        "a.html", "a.HTM", "a.xhtml", "a.svg", "a.xml", "a.xsl", "a.js", "a.mjs",
+        "a.html", "a.HTM", "a.xhtml", "a.svg", "a.xml", "a.xsl", "a.rdf", "a.js", "a.mjs",
     ];
     let shapes: &[(Method, Option<&str>)] = &[
         (Method::GET, None),
@@ -176,6 +176,12 @@ async fn bytes_filename_still_types_passive_content() {
         ("tile.wav", "audio/wav"),
         ("tile.png", "image/png"),
         ("notes.txt", "text/plain; charset=utf-8"),
+        ("paper.pdf", "application/pdf"),
+        ("data.json", "application/json"),
+        (
+            "report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
     ] {
         let uri = format!("/bytes/{DATA_REF}?filename={name}");
         let resp = request(router.clone(), Method::GET, &uri, &[]).await;
