@@ -143,8 +143,10 @@ struct Opt {
     /// underlays (plus private ones inside a subnet this host is attached
     /// to) are dialed, since hive gossip carries bee nodes' Docker /
     /// Kubernetes pod addresses and dialing those from a hosted server looks
-    /// like a network scan. Enable only for dev/test networks that live on
-    /// a single private network or on loopback.
+    /// like a network scan. Also keeps peers' gossiped DNS-named underlays
+    /// (`/dns4/…`), which are dropped by default because the name can
+    /// resolve to any of those. Enable only for dev/test networks that live
+    /// on a single private network or on loopback.
     #[arg(long)]
     allow_private_dials: bool,
 

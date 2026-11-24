@@ -95,7 +95,16 @@ where
             continue;
         }
         let mut budget = MAX_DNS_QUERIES;
-        match resolve_recursive(resolver, &addr, &mut seen, 0, &mut budget).await {
+        let res = resolve_recursive(resolver, &addr, &mut seen, 0, &mut budget).await;
+        if budget == 0 {
+            warn!(
+                target: "ant_p2p::dnsaddr",
+                %addr,
+                max = MAX_DNS_QUERIES,
+                "dnsaddr tree used the whole query budget; the rest is skipped",
+            );
+        }
+        match res {
             Ok(v) => {
                 debug!(target: "ant_p2p::dnsaddr", %addr, count = v.len(), "resolved");
                 out.extend(v);
@@ -144,21 +153,19 @@ fn resolve_recursive<'a, L: TxtLookup>(
         };
 
         let key = format!("_dnsaddr.{domain}");
-        if !seen.insert(key.clone()) {
+        if seen.contains(&key) {
             debug!(target: "ant_p2p::dnsaddr", %domain, "already seen");
             return Ok(Vec::new());
         }
-
+        // Checked before marking the name seen: a name skipped here was
+        // never walked, so a later top-level entry (with its own budget)
+        // that references it must still resolve it.
         if *budget == 0 {
-            warn!(
-                target: "ant_p2p::dnsaddr",
-                name = %key,
-                max = MAX_DNS_QUERIES,
-                "dnsaddr query budget exhausted; skipping",
-            );
+            debug!(target: "ant_p2p::dnsaddr", name = %key, "query budget exhausted; skipping");
             return Ok(Vec::new());
         }
         *budget -= 1;
+        seen.insert(key.clone());
 
         debug!(target: "ant_p2p::dnsaddr", name = %key, "TXT query");
         let records = resolver
@@ -311,6 +318,12 @@ mod tests {
     #[tokio::test]
     async fn dnsaddr_budget_is_per_top_level_entry() {
         let mut zone = wide_zone("big.example", 1000);
+        // `big`'s past-budget tail also points at `small`, which must not
+        // be marked seen (and so lost) by the skipped reference.
+        zone.records
+            .get_mut("_dnsaddr.big.example")
+            .unwrap()
+            .push("dnsaddr=/dnsaddr/small.example".into());
         zone.records.insert(
             "_dnsaddr.small.example".into(),
             vec![
