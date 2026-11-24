@@ -18,7 +18,7 @@ pub use bmt::{
 };
 pub use encryption::{
     decrypt_chunk, decrypt_chunk_parts, encrypt_chunk_unpadded, random_encryption_key,
-    stream_xor_in_place, DecryptError, KEY_LENGTH, REFERENCE_SIZE,
+    stream_xor_in_place, DecryptError, EncryptError, KEY_LENGTH, REFERENCE_SIZE,
 };
 pub use error::CryptoError;
 pub use soc::{soc_valid, SOC_HEADER_SIZE, SOC_ID_SIZE, SOC_MIN_CHUNK_SIZE, SOC_SIG_SIZE};
@@ -100,8 +100,9 @@ pub enum HandshakeWireVersion {
 ///
 /// `chequebook` must be either zero-length (peer advertises no
 /// chequebook) or exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes — empty
-/// chequebooks are zero-padded into the preimage for V15.
-#[must_use]
+/// chequebooks are zero-padded into the preimage for V15. Any other
+/// length is [`CryptoError::BadChequebookLen`] (checked for both wire
+/// versions, although V14 doesn't sign the chequebook).
 #[allow(clippy::too_many_arguments)]
 pub fn handshake_sign_data(
     version: HandshakeWireVersion,
@@ -111,8 +112,11 @@ pub fn handshake_sign_data(
     nonce: &[u8; OVERLAY_NONCE_LEN],
     timestamp: i64,
     chequebook: &[u8],
-) -> Vec<u8> {
-    match version {
+) -> Result<Vec<u8>, CryptoError> {
+    if !chequebook.is_empty() && chequebook.len() != HANDSHAKE_CHEQUEBOOK_LEN {
+        return Err(CryptoError::BadChequebookLen(chequebook.len()));
+    }
+    Ok(match version {
         HandshakeWireVersion::V14 => {
             let mut v = Vec::with_capacity(14 + underlay.len() + 32 + 8);
             v.extend_from_slice(b"bee-handshake-");
@@ -125,7 +129,6 @@ pub fn handshake_sign_data(
             let cb_padded: [u8; HANDSHAKE_CHEQUEBOOK_LEN] = if chequebook.is_empty() {
                 [0u8; HANDSHAKE_CHEQUEBOOK_LEN]
             } else {
-                debug_assert_eq!(chequebook.len(), HANDSHAKE_CHEQUEBOOK_LEN);
                 let mut a = [0u8; HANDSHAKE_CHEQUEBOOK_LEN];
                 a.copy_from_slice(chequebook);
                 a
@@ -142,7 +145,7 @@ pub fn handshake_sign_data(
             v.extend_from_slice(&cb_padded);
             v
         }
-    }
+    })
 }
 
 fn ethereum_prefixed_sign_data(sign_data: &[u8]) -> Vec<u8> {
@@ -183,7 +186,7 @@ pub fn sign_handshake_data(
 /// `bee/pkg/soc/soc.go::Sign`.
 ///
 /// Output format matches `sign_handshake_data`: `r ‖ s ‖ v` with `v`
-/// in `27..=30`, i.e. compatible with [`recover_public_key_from_prehash`].
+/// in `27..=28`, i.e. compatible with [`recover_public_key_from_prehash`].
 pub fn sign_prehash(
     secret: &[u8; SECP256K1_SECRET_LEN],
     digest: &[u8; 32],
@@ -198,7 +201,7 @@ pub fn sign_prehash(
     Ok(out)
 }
 
-/// Recover signer public key from a Bee / Ethereum 65-byte signature (`r‖s‖v` with `v` in 27..=30).
+/// Recover signer public key from a Bee / Ethereum 65-byte signature (`r‖s‖v` with `v` in 27..=28).
 pub fn recover_public_key(
     signature: &[u8; 65],
     sign_data: &[u8],
@@ -213,16 +216,19 @@ pub fn recover_public_key(
 /// Used by Swarm's single-owner-chunk verification, which signs
 /// `keccak256(id ‖ cac_address)` directly — see Bee
 /// `pkg/soc/soc.go::FromChunk`.
+///
+/// Only `v ∈ {27, 28}` is accepted: those are the only values Bee (and
+/// go-ethereum) signers emit. The "x-reduced" ids 29/30 are rejected,
+/// and so is a high-S signature (k256's verify step refuses it).
 pub fn recover_public_key_from_prehash(
     signature: &[u8; 65],
     digest: &[u8; 32],
 ) -> Result<VerifyingKey, CryptoError> {
-    let recid = RecoveryId::try_from(
-        signature[64]
-            .checked_sub(27)
-            .ok_or(CryptoError::BadSignature)?,
-    )
-    .map_err(|_| CryptoError::BadSignature)?;
+    let recid = match signature[64] {
+        27 => RecoveryId::new(false, false),
+        28 => RecoveryId::new(true, false),
+        _ => return Err(CryptoError::BadSignature),
+    };
     let sig = Signature::from_slice(&signature[..64])?;
     Ok(VerifyingKey::recover_from_prehash(digest, &sig, recid)?)
 }
@@ -232,9 +238,10 @@ pub fn recover_public_key_from_prehash(
 /// for both wire versions to keep the code path uniform.
 ///
 /// For [`HandshakeWireVersion::V14`] `timestamp` and `chequebook` are
-/// ignored. For [`HandshakeWireVersion::V15`] `chequebook` must be
-/// either empty or exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes — empty
-/// chequebooks are zero-padded into the preimage.
+/// not signed. For both versions `chequebook` must be either empty or
+/// exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes (any other length is
+/// [`CryptoError::BadChequebookLen`]); on V15 an empty chequebook is
+/// zero-padded into the preimage.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_bzz_address_signature(
     version: HandshakeWireVersion,
@@ -248,7 +255,7 @@ pub fn verify_bzz_address_signature(
 ) -> Result<[u8; 20], CryptoError> {
     let sign_data = handshake_sign_data(
         version, underlay, overlay, network_id, nonce, timestamp, chequebook,
-    );
+    )?;
     let vk = recover_public_key(signature, &sign_data)?;
     let eth = ethereum_address_from_public_key(&vk);
     let expected = overlay_from_ethereum_address(&eth, network_id, nonce);
@@ -298,7 +305,8 @@ mod tests {
             &nonce,
             timestamp,
             &chequebook,
-        );
+        )
+        .unwrap();
         let sig = sign_handshake_data(&secret, &sign_data).unwrap();
         let recovered_eth = verify_bzz_address_signature(
             HandshakeWireVersion::V15,
@@ -335,7 +343,8 @@ mod tests {
             &nonce,
             0,
             &[],
-        );
+        )
+        .unwrap();
         let sig = sign_handshake_data(&secret, &sign_data).unwrap();
         let recovered_eth = verify_bzz_address_signature(
             HandshakeWireVersion::V14,
@@ -371,7 +380,8 @@ mod tests {
             &nonce,
             timestamp,
             &chequebook,
-        );
+        )
+        .unwrap();
         let v15 = handshake_sign_data(
             HandshakeWireVersion::V15,
             underlay,
@@ -380,7 +390,8 @@ mod tests {
             &nonce,
             timestamp,
             &chequebook,
-        );
+        )
+        .unwrap();
         assert_eq!(
             v14.len() + OVERLAY_NONCE_LEN + 8 + HANDSHAKE_CHEQUEBOOK_LEN,
             v15.len()
@@ -400,7 +411,8 @@ mod tests {
             &nonce,
             timestamp,
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(v15_empty.len(), v15.len());
         assert!(v15_empty.ends_with(&[0u8; HANDSHAKE_CHEQUEBOOK_LEN]));
     }
@@ -424,7 +436,121 @@ mod tests {
             &nonce,
             0,
             &[],
-        );
+        )
+        .unwrap();
         assert!(sign_data.ends_with(&1u64.to_be_bytes()));
+    }
+
+    /// A signature the real signer produced, plus the digest it signed.
+    fn signed_prehash() -> ([u8; 65], [u8; 32], VerifyingKey) {
+        let secret = [0x11u8; SECP256K1_SECRET_LEN];
+        let vk = VerifyingKey::from(&SigningKey::from_bytes(&secret.into()).unwrap());
+        let digest = keccak256(b"recovery-id test");
+        let sig = sign_prehash(&secret, &digest).unwrap();
+        assert!(sig[64] == 27 || sig[64] == 28);
+        assert_eq!(recover_public_key_from_prehash(&sig, &digest).unwrap(), vk);
+        (sig, digest, vk)
+    }
+
+    /// Bee signers only emit v = 27/28; the x-reduced ids 29/30 (and
+    /// any other value) must not be accepted.
+    #[test]
+    fn recover_rejects_v29_v30() {
+        let (sig, digest, _) = signed_prehash();
+        for v in [0u8, 1, 2, 3, 26, 29, 30, 31, 255] {
+            let mut bad = sig;
+            bad[64] = v;
+            assert!(
+                matches!(
+                    recover_public_key_from_prehash(&bad, &digest),
+                    Err(CryptoError::BadSignature)
+                ),
+                "v = {v} must be rejected"
+            );
+        }
+        // Also a forged signature with `r < p − n`, for which an
+        // x-reduced id (29/30) is mathematically meaningful and k256
+        // recovers *some* key from it.
+        let mut forged = [0u8; 65];
+        let mut reduced_ok = false;
+        for r in 1u8..=32 {
+            forged[31] = r;
+            forged[63] = 1;
+            let Ok(s) = Signature::from_slice(&forged[..64]) else {
+                continue;
+            };
+            for (v, y_odd) in [(29u8, false), (30, true)] {
+                if VerifyingKey::recover_from_prehash(&digest, &s, RecoveryId::new(y_odd, true))
+                    .is_ok()
+                {
+                    reduced_ok = true;
+                    forged[64] = v;
+                    assert!(
+                        recover_public_key_from_prehash(&forged, &digest).is_err(),
+                        "x-reduced v = {v} (r = {r}) must be rejected"
+                    );
+                }
+            }
+        }
+        assert!(
+            reduced_ok,
+            "expected some small r to recover under an x-reduced id"
+        );
+        // The EIP-191 entry point goes through the same check.
+        let mut bad = sign_handshake_data(&[0x22u8; SECP256K1_SECRET_LEN], b"x").unwrap();
+        assert!(recover_public_key(&bad, b"x").is_ok());
+        bad[64] += 2;
+        assert!(recover_public_key(&bad, b"x").is_err());
+    }
+
+    /// Lock in k256's low-S rule: the malleable twin `(r, n − s, v ^ 1)`
+    /// of a valid signature recovers the same key mathematically, but
+    /// must be refused.
+    #[test]
+    fn recover_rejects_high_s() {
+        let (sig, digest, _) = signed_prehash();
+        let low = Signature::from_slice(&sig[..64]).unwrap();
+        assert!(low.normalize_s().is_none(), "signer must emit low-S");
+        let high_s = -*low.s();
+        let high = Signature::from_scalars(low.r().to_bytes(), high_s.to_bytes()).unwrap();
+        assert!(high.normalize_s().is_some(), "twin must be high-S");
+        let mut twin = [0u8; 65];
+        twin[..64].copy_from_slice(&high.to_bytes());
+        for v in [27u8, 28] {
+            twin[64] = v;
+            assert!(
+                recover_public_key_from_prehash(&twin, &digest).is_err(),
+                "high-S with v = {v} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn handshake_sign_data_bad_chequebook_len_errors() {
+        let nonce = [0u8; OVERLAY_NONCE_LEN];
+        for version in [HandshakeWireVersion::V14, HandshakeWireVersion::V15] {
+            for len in [1usize, 19, 21, 32] {
+                let cb = vec![0xab; len];
+                assert!(
+                    matches!(
+                        handshake_sign_data(version, b"u", &[0u8; 32], 1, &nonce, 1, &cb),
+                        Err(CryptoError::BadChequebookLen(l)) if l == len
+                    ),
+                    "{version:?} len {len}"
+                );
+            }
+        }
+        // ... and verification surfaces it rather than panicking.
+        let r = verify_bzz_address_signature(
+            HandshakeWireVersion::V15,
+            b"u",
+            &[0u8; 32],
+            &[0u8; 65],
+            &nonce,
+            1,
+            1,
+            &[0xab; 7],
+        );
+        assert!(matches!(r, Err(CryptoError::BadChequebookLen(7))));
     }
 }

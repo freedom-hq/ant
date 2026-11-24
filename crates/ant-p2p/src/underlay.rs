@@ -14,7 +14,7 @@ use libp2p::multiaddr::{Error as MultiaddrError, Multiaddr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use unsigned_varint::decode::Error as VarintError;
 
-const UNDERLAY_LIST_PREFIX: u8 = 0x99;
+pub(crate) const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 
 /// Maximum number of underlay addresses we will pack into a single
 /// serialized record. Matches bee 2.8 `maxUnderlaysPerPeer`.
@@ -37,6 +37,8 @@ pub enum UnderlayError {
     CountExceeded(usize),
     #[error("underlay bytes {0} exceed cap of {MAX_UNDERLAY_BYTES}")]
     ByteSizeExceeded(usize),
+    #[error("underlay list entry declares {0} bytes, more than remain")]
+    Truncated(u64),
 }
 
 /// Sort + truncate `addrs` to fit inside bee 2.8's count and byte
@@ -156,8 +158,8 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
 pub(crate) enum IpScope {
     /// Publicly routable.
     Global,
-    /// Belongs to *some* private network: RFC1918, IPv4 link-local
-    /// (`169.254/16`), CGNAT (`100.64/10`), IPv6 ULA (`fc00::/7`),
+    /// Belongs to *some* private network: RFC1918, CGNAT (`100.64/10`),
+    /// IPv6 ULA (`fc00::/7`),
     /// deprecated IPv6 site-local (`fec0::/10`) and the local-use NAT64
     /// prefix (`64:ff9b:1::/48`).
     /// Only reachable from a host attached to that same network.
@@ -165,7 +167,9 @@ pub(crate) enum IpScope {
     /// Never meaningful as a remote peer's address: loopback, unspecified,
     /// `0/8`, `240/4` (reserved, incl. broadcast), multicast, documentation
     /// and benchmarking ranges (`198.18/15`, `2001:2::/48`), `192.0.0/24`,
-    /// IPv6 discard-only `100::/64`, and IPv6 link-local (`fe80::/10` — undialable without the zone id, which
+    /// IPv6 discard-only `100::/64`, IPv4 link-local (`169.254/16` — home of
+    /// the cloud metadata service `169.254.169.254`, never a real peer) and
+    /// IPv6 link-local (`fe80::/10` — undialable without the zone id, which
     /// multiaddrs don't carry).
     Local,
 }
@@ -224,9 +228,13 @@ fn ipv4_scope(ip: Ipv4Addr) -> IpScope {
         || (o[0] == 198 && (o[1] & 0xfe) == 18)
         // 240.0.0.0/4 reserved (RFC 1112); includes broadcast
         || o[0] >= 240
+        // 169.254.0.0/16 link-local (RFC 3927): includes the cloud
+        // metadata endpoint 169.254.169.254, so never dial it on a peer's
+        // say-so, even from a host that has a link-local address itself
+        || ip.is_link_local()
     {
         IpScope::Local
-    } else if is_private_ipv4(ip) || is_cgnat_ipv4(ip) {
+    } else if ip.is_private() || is_cgnat_ipv4(ip) {
         IpScope::Private
     } else {
         IpScope::Global
@@ -466,10 +474,16 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 /// Docker/Kubernetes advertise their pod addresses) looks like a network
 /// scan to a hosting provider (issue #88). So an address survives when every
 /// IP component is globally routable, or is [`IpScope::Private`] and inside
-/// one of `local`'s subnets (same-LAN peer). Addresses without an IP
-/// component (`/dns4/…`) pass through. `allow_private` disables the filter
-/// entirely, for dev/test networks that live on one private network or
-/// loopback.
+/// one of `local`'s subnets (same-LAN peer).
+///
+/// DNS-named underlays (`/dns/…`, `/dns4/…`, `/dns6/…`, `/dnsaddr/…`) are
+/// dropped: the name is the peer's say-so, and it can resolve to anything
+/// (`/dns4/localhost`, a `nip.io` name for `10.0.0.1` or the cloud metadata
+/// address), which the IP check above would never see. Bee nodes gossip
+/// IP underlays, so nothing real is lost. Operator-configured bootnodes
+/// don't pass through here and still may be DNS names. `allow_private`
+/// disables the filter entirely, for dev/test networks that live on one
+/// private network or loopback.
 pub(crate) fn filter_dialable_underlays(
     addrs: &[Multiaddr],
     local: &LocalSubnets,
@@ -485,6 +499,10 @@ pub(crate) fn filter_dialable_underlays(
                 let ip = match p {
                     Protocol::Ip4(ip) => IpAddr::V4(ip),
                     Protocol::Ip6(ip) => IpAddr::V6(ip),
+                    Protocol::Dns(_)
+                    | Protocol::Dns4(_)
+                    | Protocol::Dns6(_)
+                    | Protocol::Dnsaddr(_) => return false,
                     _ => return true,
                 };
                 match ip_scope(ip) {
@@ -561,6 +579,12 @@ pub fn deserialize_underlays(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayErro
     Ok(vec![Multiaddr::try_from(data.to_vec())?])
 }
 
+/// Decode the body of a `0x99`-prefixed underlay list. Every length is
+/// peer-supplied, so the conversion, the end offset and the slice are all
+/// checked: a hostile varint (e.g. `u64::MAX`, or one that only wraps on
+/// `i + len`) is an error, never a panic (#279). An empty list is
+/// rejected like an empty underlay, so the handshake's observed-underlay
+/// peer-id check can't be skipped by sending a bare prefix.
 fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayError> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -570,14 +594,19 @@ fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayError> {
         }
         let slice = &data[i..];
         let (len, rest) = unsigned_varint::decode::u64(slice)?;
-        let used = slice.len() - rest.len();
-        i += used;
-        let len = len as usize;
-        if data.len() < i + len {
-            return Err(UnderlayError::Empty);
-        }
-        out.push(Multiaddr::try_from(data[i..i + len].to_vec())?);
-        i += len;
+        i += slice.len() - rest.len();
+        let entry = usize::try_from(len)
+            .ok()
+            .and_then(|len| i.checked_add(len))
+            .and_then(|end| data.get(i..end).map(|entry| (entry, end)));
+        let Some((entry, end)) = entry else {
+            return Err(UnderlayError::Truncated(len));
+        };
+        out.push(Multiaddr::try_from(entry.to_vec())?);
+        i = end;
+    }
+    if out.is_empty() {
+        return Err(UnderlayError::Empty);
     }
     Ok(out)
 }
@@ -616,7 +645,6 @@ mod tests {
             "10.233.1.2",
             "172.17.0.3",
             "192.168.1.20",
-            "169.254.1.1",
             "100.64.0.1",
             "100.127.255.254",
             "fd00::1",
@@ -653,12 +681,20 @@ mod tests {
             "2001:2::1",
             "100::1",
             "100::ffff:ffff:ffff:ffff",
+            // IPv4 link-local, incl. the cloud metadata endpoint (#301).
+            "169.254.1.1",
+            "169.254.169.254",
+            "169.254.0.0",
+            "169.254.255.255",
+            "::ffff:169.254.169.254",
         ] {
             assert_eq!(ip_scope(ip(l)), IpScope::Local, "{l}");
         }
         // Just outside CGNAT / link-local on either side.
         assert_eq!(ip_scope(ip("100.63.255.255")), IpScope::Global);
         assert_eq!(ip_scope(ip("100.128.0.0")), IpScope::Global);
+        assert_eq!(ip_scope(ip("169.253.255.255")), IpScope::Global);
+        assert_eq!(ip_scope(ip("169.255.0.0")), IpScope::Global);
         // Just outside the special-purpose ranges.
         for g in [
             "198.17.255.255",
@@ -938,6 +974,7 @@ mod tests {
             ma("/ip4/1.2.3.4/tcp/1634"),
             ma("/ip6/2a01:4f8::1/tcp/1634"),
             ma("/dns4/node.example.org/tcp/1634"),
+            ma("/ip4/169.254.169.254/tcp/80"),
         ];
         let kept = filter_dialable_underlays(&addrs, &local, false);
         assert_eq!(
@@ -946,13 +983,38 @@ mod tests {
                 ma("/ip4/192.168.1.20/tcp/1634"),
                 ma("/ip4/1.2.3.4/tcp/1634"),
                 ma("/ip6/2a01:4f8::1/tcp/1634"),
-                ma("/dns4/node.example.org/tcp/1634"),
             ],
         );
         // Off the LAN, the same-subnet address goes too.
         let kept = filter_dialable_underlays(&addrs, &LocalSubnets::default(), false);
         assert!(!kept.contains(&ma("/ip4/192.168.1.20/tcp/1634")));
         // Escape hatch keeps everything.
+        assert_eq!(filter_dialable_underlays(&addrs, &local, true), addrs);
+    }
+
+    /// Issue #301: a gossiped DNS name can resolve to anything (loopback,
+    /// a private or metadata IP via `nip.io`), so DNS underlays from hints
+    /// are never dialed; only `allow_private` keeps them.
+    #[test]
+    fn filter_drops_dns_underlays_from_hints() {
+        let local = LocalSubnets::from_nets(vec![(ip("192.168.1.7"), 24)]);
+        let addrs = vec![
+            ma("/dns4/localhost/tcp/1634"),
+            ma("/dns4/169.254.169.254.nip.io/tcp/80"),
+            ma("/dns6/localhost/tcp/1634"),
+            ma("/dns/10.0.0.1.nip.io/tcp/1634/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC"),
+            ma("/dnsaddr/evil.example.org"),
+            ma("/dns4/node.example.org/tcp/1634/ws"),
+            ma("/ip4/1.2.3.4/tcp/1634"),
+        ];
+        assert_eq!(
+            filter_dialable_underlays(&addrs, &local, false),
+            vec![ma("/ip4/1.2.3.4/tcp/1634")],
+        );
+        assert_eq!(
+            filter_dialable_underlays(&addrs[..6], &local, false),
+            Vec::<Multiaddr>::new(),
+        );
         assert_eq!(filter_dialable_underlays(&addrs, &local, true), addrs);
     }
 
@@ -1003,5 +1065,85 @@ mod tests {
         }
         let err = deserialize_underlays(&buf).unwrap_err();
         matches!(err, UnderlayError::CountExceeded(_));
+    }
+
+    /// `0x99` + a varint list body, for the hostile-length cases below.
+    fn list_with_len(len: u64, body: &[u8]) -> Vec<u8> {
+        let mut buf = vec![UNDERLAY_LIST_PREFIX];
+        let mut enc = unsigned_varint::encode::u64_buffer();
+        buf.extend_from_slice(unsigned_varint::encode::u64(len, &mut enc));
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// #279: the audit's 11-byte payload, `0x99` + varint(`u64::MAX`).
+    /// Used to wrap `i + len` and panic on `data[10..9]`.
+    #[test]
+    fn deserialize_rejects_u64_max_length() {
+        let buf = list_with_len(u64::MAX, &[]);
+        assert_eq!(buf.len(), 11);
+        assert!(matches!(
+            deserialize_underlays(&buf),
+            Err(UnderlayError::Truncated(u64::MAX))
+        ));
+    }
+
+    /// #279: a length that only overflows on the `i + len` add, not in
+    /// the `u64 -> usize` conversion (`i` is the varint width).
+    #[test]
+    fn deserialize_rejects_length_that_wraps_on_add() {
+        for len in [usize::MAX, usize::MAX - 1, usize::MAX - 9] {
+            let buf = list_with_len(len as u64, &[0u8; 4]);
+            assert!(
+                matches!(
+                    deserialize_underlays(&buf),
+                    Err(UnderlayError::Truncated(l)) if l == len as u64
+                ),
+                "len {len}"
+            );
+        }
+    }
+
+    /// An entry that runs one byte past the end of the payload is an
+    /// error, and so is a valid entry followed by a truncated one.
+    #[test]
+    fn deserialize_rejects_entry_one_byte_short() {
+        let b = ma("/ip4/1.2.3.4/tcp/1634").to_vec();
+        let buf = list_with_len(b.len() as u64 + 1, &b);
+        assert!(matches!(
+            deserialize_underlays(&buf),
+            Err(UnderlayError::Truncated(_))
+        ));
+
+        let mut two =
+            serialize_underlays(&[ma("/ip4/1.2.3.4/tcp/1634"), ma("/ip4/5.6.7.8/tcp/1634")]);
+        two.pop();
+        assert!(matches!(
+            deserialize_underlays(&two),
+            Err(UnderlayError::Truncated(_))
+        ));
+    }
+
+    /// A bare list prefix decodes to no addresses — that is an empty
+    /// underlay, not `Ok(vec![])` (#279).
+    #[test]
+    fn deserialize_rejects_empty_list() {
+        assert!(matches!(
+            deserialize_underlays(&[UNDERLAY_LIST_PREFIX]),
+            Err(UnderlayError::Empty)
+        ));
+    }
+
+    #[test]
+    fn list_round_trip() {
+        let addrs = vec![ma("/ip4/1.2.3.4/tcp/1634"), ma("/ip6/::1/tcp/1634")];
+        let buf = serialize_underlays(&addrs);
+        assert_eq!(buf[0], UNDERLAY_LIST_PREFIX);
+        assert_eq!(deserialize_underlays(&buf).unwrap(), addrs);
+        let one = vec![ma("/ip4/1.2.3.4/tcp/1634")];
+        assert_eq!(
+            deserialize_underlays(&serialize_underlays(&one)).unwrap(),
+            one
+        );
     }
 }

@@ -206,7 +206,10 @@ impl<'a> EncryptedSplitter<'a> {
             KeySource::Random => random_encryption_key(),
             KeySource::Injected(f) => f(),
         };
-        let mut wire = encrypt_chunk_unpadded(plain_wire, &key);
+        // Every caller hands over a `cac_new` wire or an intermediate
+        // built within `CHUNK_SIZE`, so the bounds hold by construction.
+        let mut wire = encrypt_chunk_unpadded(plain_wire, &key)
+            .expect("plaintext chunk wire is span(8) + ≤ CHUNK_SIZE by construction");
         let cipher_len = wire.len();
         wire.resize(ENC_WIRE_SIZE, 0);
         if matches!(self.keys, KeySource::Random) {

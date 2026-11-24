@@ -56,7 +56,7 @@ use crate::{ChunkAddr, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_INDEX_DOC_KEY};
 
 /// 31 leading bytes of `keccak256("mantaray:0.2")`. Bee writes only the
 /// first 31 bytes on the wire (`versionHashSize = 31`).
-const VERSION_HASH_31: [u8; 31] = [
+pub(crate) const VERSION_HASH_31: [u8; 31] = [
     0x57, 0x68, 0xb3, 0xb6, 0xa7, 0xdb, 0x56, 0xd2, 0x1d, 0x1a, 0xbf, 0xf4, 0x0d, 0x41, 0xce, 0xbf,
     0xc8, 0x34, 0x48, 0xfe, 0xd8, 0xd7, 0xe9, 0xb0, 0x6e, 0xc0, 0xd3, 0xb0, 0x73, 0xf2, 0x8f,
 ];
@@ -123,6 +123,10 @@ pub enum ManifestWriteError {
     /// plain manifests, 64 for encrypted ones).
     #[error("data reference is {have} bytes; this builder needs {want}")]
     RefWidth { have: usize, want: usize },
+    /// A fork's padded metadata blob doesn't fit the node format's
+    /// 2-byte big-endian length field.
+    #[error("fork metadata is {size} bytes after padding; the manifest format caps it at {cap}")]
+    MetadataTooBig { size: usize, cap: usize },
 }
 
 /// Build a single-file manifest with a `website-index-document` pointing
@@ -848,7 +852,11 @@ fn serialize_fork_to_bytes(
         };
         let mut padded = meta_json.into_bytes();
         padded.extend(std::iter::repeat_n(b'\n', pad));
-        let meta_len = padded.len() as u16;
+        let meta_len =
+            u16::try_from(padded.len()).map_err(|_| ManifestWriteError::MetadataTooBig {
+                size: padded.len(),
+                cap: u16::MAX as usize,
+            })?;
         bytes.extend_from_slice(&meta_len.to_be_bytes());
         bytes.extend_from_slice(&padded);
     }
@@ -969,6 +977,42 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::{BTreeSet, HashMap};
     use std::error::Error;
+
+    /// Fork metadata whose padded length overflows the node format's
+    /// u16 length field must be refused, not truncated into a corrupt
+    /// manifest (audit RET-10).
+    #[test]
+    fn oversized_fork_metadata_is_rejected() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("k".to_string(), "x".repeat(70 * 1024));
+        let err = serialize_fork_to_bytes(b"a", &[0u8; 32], &metadata, 0).unwrap_err();
+        assert!(
+            matches!(err, ManifestWriteError::MetadataTooBig { size, cap: 65_535 } if size > 65_535),
+            "{err:?}"
+        );
+
+        let err = build_entries_manifest(&[RawManifestEntry {
+            path: "a".to_string(),
+            reference: [7u8; 32],
+            metadata,
+        }])
+        .unwrap_err();
+        assert!(
+            matches!(err, ManifestWriteError::MetadataTooBig { .. }),
+            "{err:?}"
+        );
+
+        // The largest padded size that still fits is 65_534 (json + 2
+        // padded up to a multiple of 32), reached from 65_533 bytes of
+        // JSON plus one newline; it is written with its exact length.
+        let mut metadata = BTreeMap::new();
+        // `{"k":"` + value + `"}` = value + 8 bytes of JSON.
+        metadata.insert("k".to_string(), "x".repeat(65_533 - 8));
+        let bytes = serialize_fork_to_bytes(b"a", &[0u8; 32], &metadata, 0).unwrap();
+        let at = 2 + MAX_FILENAME_BYTES + 32;
+        assert_eq!(u16::from_be_bytes([bytes[at], bytes[at + 1]]), 65_534);
+        assert_eq!(bytes.len(), at + 2 + 65_534);
+    }
 
     /// Golden references produced by bee itself (via the beemock
     /// conformance oracle) for identical inputs. If these drift, ant's

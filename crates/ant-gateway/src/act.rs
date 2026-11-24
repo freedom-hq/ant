@@ -423,6 +423,11 @@ fn act_grantee_error(e: &ActError) -> Response {
     debug!(target: "ant_gateway", error = %e, "grantee list update failed");
     match e {
         ActError::NotFound => json_error(StatusCode::NOT_FOUND, ERR_ACT_NOT_FOUND),
+        // Ant-only (bee has no epoch cap): the history is well-formed
+        // but can't take another epoch, so say so instead of the
+        // generic grantee-list 500. The request itself can't succeed
+        // against this history; the publisher has to start a new one.
+        ActError::HistoryFull { .. } => json_error(StatusCode::CONFLICT, e.to_string()),
         _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, ERR_ACT_GRANTEE_LIST),
     }
 }
@@ -937,6 +942,36 @@ async fn update_grantees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grantee change against a history already holding the most
+    /// epochs ant reads back is a 409 that names the cause, not the
+    /// generic grantee-list 500 (R1-M1, PR #323).
+    #[tokio::test]
+    async fn full_history_is_a_conflict_naming_the_cap() {
+        let entries: Vec<_> = (1..=acts::MAX_HISTORY_ENTRIES as i64)
+            .map(|t| acts::HistoryEntry {
+                key: acts::history_key(t),
+                reference: [1; 32],
+                metadata: BTreeMap::new(),
+            })
+            .collect();
+        let err =
+            acts::history_with_epoch(&entries, acts::history_key(0), [2; 32], BTreeMap::new())
+                .map(|_| ())
+                .unwrap_err();
+        let resp = act_grantee_error(&err);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("4096"), "{body}");
+        assert!(body.contains("new history"), "{body}");
+
+        // Everything else keeps the bee-compatible generic shape.
+        let resp = act_grantee_error(&ActError::MalformedKvs("x".into()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     /// ACT histories, key-value stores and grantee lists are expected to
     /// exist, so their reads must not ask for the fast-miss fan-out
