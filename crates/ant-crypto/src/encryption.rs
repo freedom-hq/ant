@@ -393,6 +393,14 @@ mod tests {
         let b = ENC_BRANCHES;
         let mut spans = vec![c + 1, 2 * c, b * c, b * c + 1, b * b * c, b * b * c + 1];
         spans.extend([u64::MAX >> 8, (u64::MAX >> 8) - 1, 1u64 << 55]);
+        // `decode_span` keeps level 0 for any top byte <= 128, so the real
+        // largest level-0 span is 0x80FF_FFFF_FFFF_FFFF, not u64::MAX >> 8.
+        // Pin that edge (and the first span past it) against `decode_span`
+        // itself, then check the whole top-byte-0x80 band.
+        let max_level0 = 0x80FF_FFFF_FFFF_FFFFu64;
+        assert_eq!(decode_span(max_level0.to_le_bytes()), (0, max_level0));
+        assert_ne!(decode_span((max_level0 + 1).to_le_bytes()).0, 0);
+        spans.extend([max_level0, max_level0 - 1, 0x8000_0000_0000_0000]);
         for span in spans {
             let len = enc_reference_count(span) * REFERENCE_SIZE;
             assert!(len <= CHUNK_SIZE, "span {span} -> {len}");
