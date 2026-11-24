@@ -77,14 +77,15 @@ impl HostPolicy {
 
     /// Validate one `allowed-hosts` entry: `*`, or a host name / IP
     /// literal with an optional port (`vibing.at`, `node.lan:1633`,
-    /// `[fd00::1]:1633`). No scheme, path or wildcard.
+    /// `[fd00::1]:1633`). No scheme, path or wildcard. A blank entry is
+    /// fine: [`HostPolicy::new`] ignores it.
     ///
     /// # Errors
     ///
     /// Why the entry is not a `host[:port]`.
     pub fn check_entry(entry: &str) -> Result<(), String> {
         let e = entry.trim();
-        if e == "*" {
+        if e.is_empty() || e == "*" {
             return Ok(());
         }
         parse_entry(e).map(|_| ())
@@ -97,6 +98,12 @@ impl HostPolicy {
             bound: Some(addr),
             ..self.clone()
         }
+    }
+
+    /// Whether any `allowed-hosts` entry (`*` included) was configured.
+    #[must_use]
+    pub fn configured(&self) -> bool {
+        self.allow_all || !self.hosts.is_empty()
     }
 
     /// Whether requests are checked at all: not with `*`, and not on a
@@ -354,6 +361,8 @@ mod tests {
             "node.lan:1633",
             "[fd00::1]:1633",
             "10.0.0.2",
+            "",
+            " ",
         ] {
             assert_eq!(HostPolicy::check_entry(ok), Ok(()), "{ok}");
         }

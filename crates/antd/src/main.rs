@@ -4276,7 +4276,7 @@ mod allowed_hosts_tests {
 
     #[test]
     fn accepts_hosts_and_star_rejects_urls() {
-        let ok: Vec<String> = ["*", "vibing.at", "node.lan:1633", "[fd00::1]:1633"]
+        let ok: Vec<String> = ["*", "vibing.at", "node.lan:1633", "[fd00::1]:1633", ""]
             .map(String::from)
             .to_vec();
         assert!(validate_allowed_hosts(&ok).is_ok());

@@ -141,7 +141,7 @@ impl Gateway {
         let local = listener.local_addr().unwrap_or(addr);
         // The Host allowlist needs the real port (a `:0` bind picks one).
         handle.hosts = std::sync::Arc::new(handle.hosts.bound_to(local));
-        if !handle.hosts.enforced() && !local.ip().to_canonical().is_loopback() {
+        if !handle.hosts.configured() && !local.ip().to_canonical().is_loopback() {
             tracing::warn!(
                 target: "ant_gateway",
                 "HTTP API bound to non-loopback {local} without allowed-hosts: the Host header is \
