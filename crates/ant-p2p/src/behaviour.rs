@@ -654,18 +654,33 @@ enum IpReporter {
     Peer(PeerId),
 }
 
+/// Leading bytes of an IPv6 reporter's address that [`reporter_net`]
+/// takes one operator to hold: /48, the usual per-site allocation (RFC
+/// 6177). Coarser than #300's observer grouping (`observed_addr`'s /56):
+/// two networks are enough here to put an IP in the own-IP set, so a
+/// site or hosting customer holding a /48 must not count as 256 /56s.
+const REPORTER_IPV6_PREFIX_BYTES: usize = 6;
+
 /// The network a reporting host's `ip` belongs to, as one operator holds
-/// it: its IPv4 /24, or its IPv6 prefix of
-/// [`crate::observed_addr::IPV6_OPERATOR_PREFIX_BYTES`] (/48, the same
-/// grouping #300's observer count uses). Keying reporters by the full
-/// address would let one IPv6 host count as any number of "hosts" (a
-/// single /64 alone is 2^64 of them), so it could corroborate a junk IP
-/// on its own and crowd honest reporters out of the cap. An IPv4-mapped
-/// IPv6 address counts as its IPv4 address.
+/// it, judged by the address a connection to it reaches
+/// ([`crate::underlay::dial_target_ip`]): its IPv4 /24, or its IPv6
+/// prefix of [`REPORTER_IPV6_PREFIX_BYTES`] (/48). Keying reporters by
+/// the full address would let one IPv6 host count as any number of
+/// "hosts" (a single /64 alone is 2^64 of them), so it could corroborate
+/// a junk IP on its own and crowd honest reporters out of the cap. An
+/// IPv4-mapped, NAT64, IPv4-compatible or 6to4 address counts as the
+/// IPv4 address it embeds, so one IPv4 /24 behind 6to4 is one network
+/// (not one per `2002:aabb:ccdd::/48`), and NAT64 reporters in
+/// `64:ff9b::/96` stay as many networks as the IPv4 hosts behind them.
 fn reporter_net(ip: IpAddr) -> IpAddr {
-    match ip.to_canonical() {
+    match crate::underlay::dial_target_ip(ip) {
         IpAddr::V4(v4) => IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & 0xffff_ff00)),
-        IpAddr::V6(v6) => IpAddr::V6(crate::observed_addr::ipv6_operator_prefix(v6)),
+        IpAddr::V6(v6) => {
+            let mut o = [0u8; 16];
+            o[..REPORTER_IPV6_PREFIX_BYTES]
+                .copy_from_slice(&v6.octets()[..REPORTER_IPV6_PREFIX_BYTES]);
+            IpAddr::V6(std::net::Ipv6Addr::from(o))
+        }
     }
 }
 
@@ -11599,23 +11614,63 @@ mod tests {
     /// `reporter_net` and #300's observer grouping agree on what one IPv6
     /// operator is, so tuning one can't silently leave the other behind.
     #[test]
-    fn reporter_net_groups_ipv6_like_observed_addr() {
+    fn reporter_net_groups_by_operator_and_dial_target() {
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        // IPv6: one /48 together, a different /48 apart.
         let a = ip("2a01:4f8:1:2::1");
-        let same = ip("2a01:4f8:1:ffff::9");
-        let other = ip("2a01:4f8:2::1");
-        assert_eq!(reporter_net(a), reporter_net(same));
-        assert_ne!(reporter_net(a), reporter_net(other));
-        for b in [same, other] {
-            let (IpAddr::V6(a6), IpAddr::V6(b6)) = (a, b) else {
-                unreachable!()
-            };
-            assert_eq!(
-                reporter_net(a) == reporter_net(b),
-                crate::observed_addr::ipv6_operator_prefix(a6)
-                    == crate::observed_addr::ipv6_operator_prefix(b6)
-            );
-        }
+        assert_eq!(reporter_net(a), reporter_net(ip("2a01:4f8:1:ffff::9")));
+        assert_ne!(reporter_net(a), reporter_net(ip("2a01:4f8:2::1")));
+        // 6to4: one IPv4 /24 is one network, however many /48s it spans.
+        assert_eq!(
+            reporter_net(ip("2002:503:301::1")),
+            reporter_net(ip("2002:503:302::1"))
+        );
+        assert_eq!(
+            reporter_net(ip("2002:503:301::1")),
+            reporter_net(ip("5.3.3.200"))
+        );
+        // NAT64 / IPv4-compatible / IPv4-mapped: the embedded IPv4's /24.
+        assert_ne!(
+            reporter_net(ip("64:ff9b::503:301")),
+            reporter_net(ip("64:ff9b::909:909"))
+        );
+        assert_eq!(
+            reporter_net(ip("64:ff9b::503:301")),
+            reporter_net(ip("5.3.3.1"))
+        );
+        assert_eq!(reporter_net(ip("::909:909")), reporter_net(ip("9.9.9.1")));
+        assert_eq!(
+            reporter_net(ip("::ffff:9.9.9.9")),
+            reporter_net(ip("9.9.9.1"))
+        );
+    }
+
+    /// 6to4 reporters from one IPv4 /24 can't corroborate a junk IP
+    /// between them, and NAT64 reporters for two unrelated IPv4 networks
+    /// can corroborate our WAN.
+    #[test]
+    fn own_public_ips_group_embedded_ipv4_reporters() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        // 5.3.3.1 and 5.3.3.2 over 6to4: one IPv4 /24, two /48s.
+        let junk: Multiaddr = "/ip4/8.8.4.4/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip6/2002:503:301::1/tcp/1", &junk);
+        report_on_conn(&mut state, 2, "/ip6/2002:503:302::1/tcp/1", &junk);
+        assert!(!state.own_public_ips.contains(ip("8.8.4.4")));
+
+        // 5.3.3.1 and 9.9.9.9 over NAT64: two networks in one /48.
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 3, "/ip6/64:ff9b::503:301/tcp/1", &wan);
+        report_on_conn(&mut state, 4, "/ip6/64:ff9b::909:909/tcp/1", &wan);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
     }
 
     /// `public_dials_only`'s own-IP set takes an `observed_addr` only when

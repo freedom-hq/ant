@@ -29,7 +29,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::swarm::ConnectionId;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 /// Distinct observers (by peer id *and* by IP group) that must report an
@@ -47,27 +47,12 @@ pub const MAX_OBSERVED_EXTERNAL: usize = 4;
 /// so this only bites an unusual listener set.
 const MAX_ADDRS_PER_VOTE: usize = 4;
 
-/// Leading bytes of an IPv6 address that one operator is taken to hold
-/// as a whole: /48, the usual per-site allocation (RFC 6177), so a site
-/// or hosting customer with a /48 counts once rather than as 256 /56s.
-/// Shared by this module's observer count and `public_dials_only`'s
-/// own-IP reporters (`behaviour.rs`'s `reporter_net`), which count
-/// distinct operators among the same identify `observed_addr` reports.
-pub(crate) const IPV6_OPERATOR_PREFIX_BYTES: usize = 6;
-
-/// `ip` masked to its [`IPV6_OPERATOR_PREFIX_BYTES`] prefix.
-pub(crate) fn ipv6_operator_prefix(ip: Ipv6Addr) -> Ipv6Addr {
-    let mut o = [0u8; 16];
-    o[..IPV6_OPERATOR_PREFIX_BYTES].copy_from_slice(&ip.octets()[..IPV6_OPERATOR_PREFIX_BYTES]);
-    Ipv6Addr::from(o)
-}
-
-/// IPv4 by full address (as go-libp2p groups its observers), IPv6 by
-/// operator prefix ([`ipv6_operator_prefix`], /48; go-libp2p uses /56).
+/// IPv4 by full address, IPv6 by /56 (a typical end-site allocation), the
+/// grouping go-libp2p uses for its observer count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IpGroup {
     V4([u8; 4]),
-    V6(Ipv6Addr),
+    V6([u8; 7]),
 }
 
 fn ip_group(ip: IpAddr) -> IpGroup {
@@ -77,7 +62,9 @@ fn ip_group(ip: IpAddr) -> IpGroup {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 IpGroup::V4(v4.octets())
             } else {
-                IpGroup::V6(ipv6_operator_prefix(v6))
+                let mut g = [0u8; 7];
+                g.copy_from_slice(&v6.octets()[..7]);
+                IpGroup::V6(g)
             }
         }
     }
@@ -536,10 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_observers_group_by_48() {
+    fn ipv6_observers_group_by_56() {
         let a: IpAddr = "2001:db8:aa:bb01::1".parse().unwrap();
-        let b: IpAddr = "2001:db8:aa:ccff::2".parse().unwrap();
-        let c: IpAddr = "2001:db8:ab::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:aa:bbff::2".parse().unwrap();
+        let c: IpAddr = "2001:db8:aa:cc00::1".parse().unwrap();
         assert_eq!(ip_group(a), ip_group(b));
         assert_ne!(ip_group(a), ip_group(c));
     }
