@@ -1118,7 +1118,10 @@ void ant_free_string(char *ptr);
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
- * *out_err (free with ant_free_string). Idempotent: a second call while
+ * *out_err (free with ant_free_string). api_addr is bound before this
+ * returns (a port already in use is a failure here, not a log line
+ * later) and that one socket is served until ant_stop_gateway; nothing
+ * rebinds it in between. Idempotent: a second call while
  * one is live is a success that leaves the gateway untouched; with a
  * `gnosis_rpc` it re-runs the chain startup work above, retrying only
  * what hasn't succeeded: a failed or pending batch check is re-read, a
@@ -1256,7 +1259,9 @@ bool ant_set_gateway_allowed_hosts(const AntHandle *handle,
 /*
  * Stop the in-process HTTP gateway started by ant_start_gateway.
  * Returns true if a gateway was running and was stopped, false if none
- * was running (or `handle` is NULL). Safe to call repeatedly. A
+ * was running (or `handle` is NULL). Waits (up to 2 s) for the
+ * gateway's task to end, so on return its port is free for a next
+ * ant_start_gateway. Safe to call repeatedly. A
  * background rediscovery retry stops with it, before its next attempt;
  * the next start with a `gnosis_rpc` tries again. An unfinished
  * /health.walletScan (pending, scanning, retrying) is dropped with it,
