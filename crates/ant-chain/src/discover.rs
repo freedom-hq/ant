@@ -143,7 +143,9 @@ async fn plausible_head(client: &ChainClient, now_unix: u64) -> Result<u64, RpcE
 /// - read beyond `head` but within `bound`: either the scan or `head` is
 ///   wrong, and there's no telling which. Clamping would let a stale or
 ///   lying-low head drop known transfers and save the truncated scan, so
-///   the pass is refused instead, until the head is past the scan again.
+///   the pass is refused instead, until the head is past the scan again
+///   or a full rescan ([`rescan_transfer_history`], which doesn't check
+///   the scan it replaces) reads the history anew.
 fn fit_to_head(mut scan: TransferScan, head: u64, bound: u64) -> Result<TransferScan, RpcError> {
     if scan.scanned_through <= head {
         return Ok(scan);
@@ -151,7 +153,8 @@ fn fit_to_head(mut scan: TransferScan, head: u64, bound: u64) -> Result<Transfer
     if scan.scanned_through <= bound {
         return Err(RpcError::Rpc(format!(
             "chain head {head} is below block {}, which an earlier scan already read; the RPC \
-             is behind, or was wrong then",
+             is behind, or was wrong then (a full rescan of the chain history replaces that \
+             scan)",
             scan.scanned_through
         )));
     }
@@ -1221,9 +1224,13 @@ async fn update_transfer_scan(
     // derives from it — including the provisional scan a confirming pass
     // saves its progress over (`rewound`), which would otherwise carry an
     // unchecked mark back to disk.
-    let saved = load_transfer_scan(data_dir, chain_id, node_eoa)
-        .map(|s| fit_to_head(s, head, bound))
-        .transpose()?;
+    let saved = match load_transfer_scan(data_dir, chain_id, node_eoa) {
+        None => None,
+        // A full rescan never reads the saved scan, only replaces it: it
+        // is the way out of one the head can't be checked against.
+        Some(s) if mode == ScanMode::Full => Some(s),
+        Some(s) => Some(fit_to_head(s, head, bound)?),
+    };
     // Only a full rescan replaces the saved scan wholesale; a confirming
     // re-read only rewinds it to its confirmed mark, which its progress
     // then carries forward (see below).
@@ -1870,6 +1877,10 @@ fn is_range_limit_error(msg: &str) -> bool {
         "ratelimit",
         "rate limited",
         "too many requests",
+        "request rate",
+        "requests per",
+        "per second",
+        "request limit",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -1977,6 +1988,11 @@ mod tests {
         assert!(!is_range_limit_error(
             "daily request count exceeded, request rate limited"
         ));
+        assert!(!is_range_limit_error("project ID request rate exceeded"));
+        assert!(!is_range_limit_error(
+            "Your app has exceeded its compute units per second capacity"
+        ));
+        assert!(!is_range_limit_error("request limit reached"));
     }
 
     /// A non-ASCII char next to a URL (curly quotes, a trailing `…`) used
@@ -2857,6 +2873,56 @@ mod tests {
         assert!(err.to_string().contains("below block"), "{err}");
         assert!(chain.ranges.lock().unwrap().is_empty());
         assert_eq!(load_transfer_scan(&dir, GNOSIS, &NODE_EOA), Some(saved));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved scan poisoned within the clock's bound (refused by every
+    /// routine scan until the chain passes it) is replaced by a full
+    /// rescan, which doesn't check the scan it replaces; routine scans
+    /// then work again.
+    #[tokio::test]
+    async fn a_full_rescan_replaces_a_saved_scan_past_the_head() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(45_000_000, [1; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-rescan-poisoned");
+        let ahead = HEAD + 500_000;
+        assert!(ahead < max_plausible_head(unix_now()));
+        persist_transfer_scan(
+            &dir,
+            &TransferScan {
+                chain_id: GNOSIS,
+                node_eoa: NODE_EOA,
+                scanned_through: ahead,
+                transfers: Vec::new(),
+                confirmed_through: Some(ahead),
+                provisional_since: None,
+                provisional_through: None,
+                confirmed_above: None,
+            },
+        );
+
+        let err = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("a routine scan can't tell which side is wrong");
+        assert!(err.to_string().contains("full rescan"), "{err}");
+
+        let rescanned = rescan_transfer_history(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(rescanned.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(rescanned.transfers.len(), 1);
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(saved.scanned_through, HEAD - RESCAN_TAIL);
+
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
