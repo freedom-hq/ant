@@ -161,6 +161,16 @@ pub struct RunConfig {
     /// for dev/test networks that live entirely on one private network or
     /// on loopback. Same-LAN private peers are dialed regardless.
     pub allow_private_dials: bool,
+    /// Dial globally routable underlays only: no private underlay, not
+    /// even one inside this host's own subnets (the same-LAN exception of
+    /// the underlay filter), and the host's interfaces are never read for
+    /// it. Hive gossip is signed only by the peer it describes, so any peer
+    /// can name a private address on this host's LAN and have the node
+    /// open TCP connections there, on a port the peer picks. For an
+    /// embedder that has no use for a bee node on its LAN (a wallet reading
+    /// a few chunks). `false` (the default) keeps the same-LAN exception.
+    /// Stricter than [`Self::allow_private_dials`], and wins over it.
+    pub public_dials_only: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
     pub status: Option<watch::Sender<StatusSnapshot>>,
@@ -844,6 +854,8 @@ struct SwarmState {
     hint_queue: VecDeque<sinks::PeerHint>,
     /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
     allow_private_dials: bool,
+    /// [`RunConfig::public_dials_only`]: no same-LAN exception either.
+    public_dials_only: bool,
     /// Cached snapshot of this host's subnets for the same-LAN exception
     /// of the underlay filter, with the time it was taken.
     local_subnets: Option<(Instant, crate::underlay::LocalSubnets)>,
@@ -1123,6 +1135,7 @@ impl SwarmState {
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             allow_private_dials: false,
+            public_dials_only: false,
             local_subnets: None,
             dial_backoff: HashMap::new(),
             target_peers,
@@ -1231,6 +1244,11 @@ impl SwarmState {
     /// hint-driven dial: a same-LAN private underlay admitted on the home
     /// Wi-Fi must not be dialed after the host moved to cellular.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+        if self.public_dials_only {
+            // No subnet is local: no private underlay passes.
+            let none = crate::underlay::LocalSubnets::default();
+            return crate::underlay::filter_dialable_underlays(addrs, &none, false);
+        }
         if self.allow_private_dials {
             return addrs.to_vec();
         }
@@ -1937,6 +1955,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     }
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
+    state.public_dials_only = cfg.public_dials_only;
     state.swap_enabled = cfg.swap_enabled;
     state.status = cfg.status.clone();
     publish_settlement(&state);
@@ -10791,6 +10810,58 @@ mod tests {
         hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
         state.enqueue_hint(hint, local);
         assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// `public_dials_only`: a same-LAN private underlay is dropped like any
+    /// other private one, on enqueue and again at dial time, even with
+    /// `allow_private_dials` set, and the host's interfaces are never read
+    /// for it (no subnet snapshot is taken).
+    #[tokio::test]
+    async fn public_dials_only_drops_same_lan_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.public_dials_only = true;
+        let local = PeerId::random();
+        let lan: Multiaddr = "/ip4/192.168.1.20/tcp/1634".parse().unwrap();
+        let public: Multiaddr = "/ip4/1.2.3.4/tcp/1634".parse().unwrap();
+
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x80, 1);
+        hint.addrs = vec![lan.clone(), public.clone()];
+        state.enqueue_hint(hint, local);
+        let lan_only = PeerId::random();
+        let mut hint = hint_in_bin(lan_only, 0x40, 2);
+        hint.addrs = vec![lan.clone()];
+        state.enqueue_hint(hint, local);
+
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].peer_id, mixed);
+        assert_eq!(state.hint_queue[0].addrs, vec![public.clone()]);
+        assert!(!state.known_dialable.contains_key(&lan_only));
+        assert!(
+            state.local_subnets.is_none(),
+            "the host's interfaces were read"
+        );
+
+        // The host *is* on that LAN, and the escape hatch is on too: still
+        // nothing private, at dial time either.
+        state.local_subnets = Some((
+            Instant::now(),
+            crate::underlay::LocalSubnets::from_nets(vec![("192.168.1.7".parse().unwrap(), 24)]),
+        ));
+        state.allow_private_dials = true;
+        let mut cached = hint_in_bin(lan_only, 0x40, 2);
+        cached.addrs = vec![lan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        cached.addrs = vec![lan, public.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public]));
     }
 
     /// A same-LAN private underlay admitted on one network must not be
