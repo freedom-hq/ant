@@ -2322,7 +2322,7 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
         ManifestWriteError::SegmentTooLong { .. } | ManifestWriteError::EmptyPath => {
             json_error(StatusCode::BAD_REQUEST, e.to_string())
         }
-        ManifestWriteError::ManifestTooBig { .. } => {
+        ManifestWriteError::ManifestTooBig { .. } | ManifestWriteError::MetadataTooBig { .. } => {
             json_error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
         }
         // Internal invariant: the gateway always hands the builder
