@@ -48,7 +48,9 @@ pub fn is_dnsaddr(addr: &Multiaddr) -> bool {
 /// - Each top-level entry may cost at most [`MAX_DNS_QUERIES`] TXT lookups;
 ///   past that its tree is cut short and the leaves found so far are kept.
 ///   Names whose sub-trees were cut short are un-marked from `seen`, so a
-///   later entry sharing them finishes the walk with its own budget.
+///   later entry sharing them finishes the walk with its own budget; that
+///   re-walk skips the name's direct (non-dnsaddr) leaves, which the first
+///   walk already returned, so no leaf comes back twice.
 /// - On lookup failure the original `/dnsaddr/…` is kept as a fallback, so the
 ///   libp2p-dns transport still has a chance to resolve it later.
 pub async fn resolve_all<I>(addrs: I) -> Vec<Multiaddr>
@@ -90,6 +92,8 @@ where
 {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    // Cut-short names whose direct leaves an earlier entry already returned.
+    let mut leaves_done = HashSet::new();
 
     for addr in addrs {
         if !is_dnsaddr(&addr) {
@@ -101,13 +105,20 @@ where
             skipped: false,
             cut_short: Vec::new(),
         };
-        let res = resolve_recursive(resolver, &addr, &mut seen, 0, &mut budget).await;
+        let res = resolve_recursive(resolver, &addr, &mut seen, &leaves_done, 0, &mut budget).await;
         // A name whose children this entry's budget cut off was only
         // partly walked: un-mark it so a later entry referencing it walks
         // it again with its own budget. Children it did finish stay seen,
         // so the re-walk only spends queries on the part that was skipped.
+        // Its direct leaves are already in `out`, so that re-walk only
+        // follows its `/dnsaddr/` children. (Guarded on `Ok`: a failed
+        // entry returns no leaves. Once the budget skips, no further query
+        // is sent, so in practice a cut-short entry can't fail.)
         for name in &budget.cut_short {
             seen.remove(name);
+        }
+        if res.is_ok() {
+            leaves_done.extend(budget.cut_short);
         }
         if budget.skipped {
             warn!(
@@ -158,11 +169,14 @@ struct Budget {
 /// Walk one `/dnsaddr/` tree. `budget.left` is the number of TXT queries
 /// this walk may still send; once it hits zero the remaining sub-trees are
 /// skipped (`budget.skipped`, warned once by the caller) and the leaves
-/// found so far are returned.
+/// found so far are returned. Names in `leaves_done` are re-walks of a
+/// sub-tree an earlier entry cut short: only their `/dnsaddr/` children are
+/// followed, since their direct leaves were already returned.
 fn resolve_recursive<'a, L: TxtLookup>(
     resolver: &'a L,
     addr: &'a Multiaddr,
     seen: &'a mut HashSet<String>,
+    leaves_done: &'a HashSet<String>,
     depth: usize,
     budget: &'a mut Budget,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Multiaddr>, ResolveError>> + Send + 'a>> {
@@ -197,15 +211,18 @@ fn resolve_recursive<'a, L: TxtLookup>(
             .await
             .map_err(|e| ResolveError::DnsLookup(format!("{key}: {e}")))?;
 
+        let rewalk = leaves_done.contains(&key);
         let mut out = Vec::new();
         for s in &records {
             let Some(value) = s.strip_prefix("dnsaddr=") else {
                 continue;
             };
             match value.parse::<Multiaddr>() {
+                Ok(next) if rewalk && !is_dnsaddr(&next) => {}
                 Ok(next) => {
                     let nested =
-                        resolve_recursive(resolver, &next, seen, depth + 1, budget).await?;
+                        resolve_recursive(resolver, &next, seen, leaves_done, depth + 1, budget)
+                            .await?;
                     out.extend(nested);
                 }
                 Err(e) => {
@@ -410,6 +427,35 @@ mod tests {
         let unique: HashSet<_> = out.iter().collect();
         assert_eq!(out.len(), 40);
         assert_eq!(unique.len(), 40);
+        assert!(out.iter().all(|a| !is_dnsaddr(a)));
+    }
+
+    /// R2-M1: the cut-short name also has direct (non-dnsaddr) leaves. The
+    /// first entry returns them; the re-walk finishes the skipped children
+    /// without returning those direct leaves a second time.
+    #[tokio::test]
+    async fn rewalk_of_cut_short_name_skips_its_direct_leaves() {
+        let mut zone = wide_zone("shared.example", 40);
+        zone.records
+            .get_mut("_dnsaddr.shared.example")
+            .unwrap()
+            .insert(0, "dnsaddr=/ip4/9.9.9.9/tcp/1634".into());
+        zone.records.insert(
+            "_dnsaddr.a.example".into(),
+            vec!["dnsaddr=/dnsaddr/shared.example".into()],
+        );
+        let out = resolve_all_with(
+            &zone,
+            [
+                "/dnsaddr/a.example".parse().unwrap(),
+                "/dnsaddr/shared.example".parse().unwrap(),
+            ],
+        )
+        .await;
+        let unique: HashSet<_> = out.iter().collect();
+        assert_eq!(out.len(), 41);
+        assert_eq!(unique.len(), 41);
+        assert!(out.contains(&"/ip4/9.9.9.9/tcp/1634".parse().unwrap()));
         assert!(out.iter().all(|a| !is_dnsaddr(a)));
     }
 
