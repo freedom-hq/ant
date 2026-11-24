@@ -32,7 +32,8 @@ pub struct NodeConfig {
     /// to complete the BZZ handshake without a 10 s peerstore timeout.
     pub external_addrs: Vec<Multiaddr>,
     /// Forwarded to `ant_p2p::RunConfig::allow_private_dials`: dial peers'
-    /// private/loopback underlays even off-LAN. Dev/test networks only.
+    /// private/loopback underlays even off-LAN, and gossiped DNS-named
+    /// underlays. Dev/test networks only.
     pub allow_private_dials: bool,
     /// Optional live status sink written to by the node loop.
     pub status: Option<watch::Sender<StatusSnapshot>>,

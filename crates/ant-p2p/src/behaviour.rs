@@ -160,7 +160,9 @@ pub struct RunConfig {
     /// full of Docker/Kubernetes pod addresses, and dialing them from a
     /// hosted server trips provider netscan detection (issue #88). Only
     /// for dev/test networks that live entirely on one private network or
-    /// on loopback. Same-LAN private peers are dialed regardless.
+    /// on loopback. Same-LAN private peers are dialed regardless. Also
+    /// keeps gossiped DNS-named underlays (`/dns4/…`), dropped by default
+    /// since a peer-chosen name can resolve to any of the above (#301).
     pub allow_private_dials: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
@@ -909,6 +911,14 @@ struct SwarmState {
     /// [`BOOTNODE_SERVING_GRACE`] in the routing table — see
     /// [`serving_peer_count`].
     bootnode_peers: HashSet<PeerId>,
+    /// The operator's configured bootnode multiaddrs, as written (before
+    /// `/dnsaddr/` resolution). A hint address that is exactly one of these
+    /// skips the underlay filter: the peerstore re-queues a `/dns4/…`
+    /// bootnode's dialed address on warm start, and a DNS name is otherwise
+    /// only ever dropped (#301, see [`Self::dialable_underlays`]). Leaves
+    /// of a `/dnsaddr/` bootnode aren't in here; they are re-dialed by the
+    /// bootnode dial at every start.
+    bootnode_addrs: HashSet<Multiaddr>,
     /// When each routing-table entry was admitted. Removed with the entry
     /// on `ConnectionClosed`.
     routing_admitted_at: HashMap<PeerId, Instant>,
@@ -1225,6 +1235,7 @@ impl SwarmState {
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
             bootnode_peers: HashSet::new(),
+            bootnode_addrs: HashSet::new(),
             routing_admitted_at: HashMap::new(),
             ready_in_ms: HashMap::new(),
             routing: RoutingTable::new(base_overlay),
@@ -1362,6 +1373,11 @@ impl SwarmState {
     /// Called both when a hint is enqueued *and* again right before every
     /// hint-driven dial: a same-LAN private underlay admitted on the home
     /// Wi-Fi must not be dialed after the host moved to cellular.
+    ///
+    /// An address that is exactly one of the configured bootnode addresses
+    /// ([`Self::bootnode_addrs`]) is kept as is: the operator chose it, so a
+    /// `/dns4/…` bootnode stored in the peerstore still warm-dials instead
+    /// of being dropped for being a DNS name.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
         if self.allow_private_dials {
             return addrs.to_vec();
@@ -1372,7 +1388,19 @@ impl SwarmState {
             .as_ref()
             .map(|(_, l)| l)
             .expect("refreshed above");
-        crate::underlay::filter_dialable_underlays(addrs, local, false)
+        addrs
+            .iter()
+            .filter(|a| {
+                self.bootnode_addrs.contains(*a)
+                    || !crate::underlay::filter_dialable_underlays(
+                        std::slice::from_ref(*a),
+                        local,
+                        false,
+                    )
+                    .is_empty()
+            })
+            .cloned()
+            .collect()
     }
 
     /// Re-read the host's subnets once the cached snapshot is older than
@@ -1586,8 +1614,10 @@ impl SwarmState {
             self.known.note(hint.overlay);
         }
         // Drop the underlays that only mean something inside the peer's
-        // own network (Docker/Kubernetes pod IPs, RFC1918, loopback, …)
-        // before the hint can reach any dial path — `fill_pipeline_from_hints`,
+        // own network (Docker/Kubernetes pod IPs, RFC1918, loopback, …),
+        // and DNS-named ones (a peer-chosen name can resolve to any of
+        // those, or to the cloud metadata address; #301), before the hint
+        // can reach any dial path — `fill_pipeline_from_hints`,
         // `dial_toward_target` and bin balancing all dial `hint.addrs`
         // (each re-filters against the current networks right before
         // dialing, see `addrs_for_dial`). A peer with nothing dialable left
@@ -9895,6 +9925,7 @@ fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr
 /// stored bootnode from the hint queue first and, if resolution is slow or
 /// fails, counts it as a serving peer for `/readiness` at once (#78).
 fn seed_bootnode_tags(state: &mut SwarmState, peerstore: &PeerStore, bootnodes: &[Multiaddr]) {
+    state.bootnode_addrs.extend(bootnodes.iter().cloned());
     state
         .bootnode_peers
         .extend(bootnodes.iter().filter_map(crate::dial::extract_peer_id));
@@ -11042,6 +11073,75 @@ mod tests {
         hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
         state.enqueue_hint(hint, local);
         assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// Issue #301: a gossiped `/dns4/localhost` (or any DNS-named
+    /// underlay) is never dialed: a hint that only carries DNS names is not
+    /// queued, and a mixed one keeps just its IP underlays — both at
+    /// enqueue time and in the dial-time re-filter.
+    #[tokio::test]
+    async fn enqueue_hint_drops_dns_underlays() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = PeerId::random();
+
+        let dns_only = PeerId::random();
+        let mut hint = hint_in_bin(dns_only, 0x80, 1);
+        hint.addrs = vec![
+            "/dns4/localhost/tcp/1634".parse().unwrap(),
+            "/dns4/169.254.169.254.nip.io/tcp/80".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.is_empty());
+        assert!(!state.known_dialable.contains_key(&dns_only));
+
+        let mixed = PeerId::random();
+        let mut hint = hint_in_bin(mixed, 0x40, 2);
+        hint.addrs = vec![
+            "/dns4/localhost/tcp/1634".parse().unwrap(),
+            "/ip4/1.2.3.4/tcp/1634".parse().unwrap(),
+        ];
+        state.enqueue_hint(hint.clone(), local);
+        let ip_only = vec!["/ip4/1.2.3.4/tcp/1634".parse::<Multiaddr>().unwrap()];
+        assert_eq!(state.hint_queue.len(), 1);
+        assert_eq!(state.hint_queue[0].addrs, ip_only);
+        // The dial-time re-filter drops it too, whatever got cached.
+        assert_eq!(state.addrs_for_dial(&hint), Some(ip_only));
+
+        // A configured `/dns4/…` bootnode, recorded in the peerstore under
+        // the address we dialed (libp2p reports the dialed multiaddr, `/p2p`
+        // included, as `ConnectedPoint::Dialer.address`) and re-queued from
+        // it on warm start, is still dialed.
+        let dir = tempfile::tempdir().unwrap();
+        let boot = PeerId::random();
+        let boot_addr: Multiaddr = format!("/dns4/boot.example.org/tcp/1634/p2p/{boot}")
+            .parse()
+            .unwrap();
+        let mut store = PeerStore::load(dir.path().join("peers.json"));
+        store.record_success(boot, vec![boot_addr.clone()], [3u8; 32], 0, None);
+        seed_bootnode_tags(&mut state, &store, std::slice::from_ref(&boot_addr));
+        for hint in store.warm_hints() {
+            state.enqueue_hint(hint, local);
+        }
+        assert_eq!(state.hint_queue.len(), 2);
+        assert_eq!(state.hint_queue[1].peer_id, boot);
+        assert_eq!(state.hint_queue[1].addrs, vec![boot_addr.clone()]);
+        // … but only that exact address: a gossiped DNS name for the same
+        // peer is still dropped.
+        let mut hint = hint_in_bin(boot, 0x20, 3);
+        hint.addrs = vec![
+            boot_addr.clone(),
+            "/dns4/localhost/tcp/1634".parse().unwrap(),
+        ];
+        assert_eq!(state.addrs_for_dial(&hint), Some(vec![boot_addr]));
     }
 
     /// A same-LAN private underlay admitted on one network must not be
