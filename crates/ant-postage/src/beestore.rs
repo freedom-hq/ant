@@ -89,7 +89,7 @@ const STAMP_ITEM_NS: &[u8] = b"stampItem/";
 /// reading. The store's files are copied into a fresh directory under the
 /// caller's `scratch_dir` (created with mode `0700` on Unix, never reused)
 /// and the copy is opened instead; the copy is removed when this value is
-/// dropped. Open it once per recovery pass, not once per batch, so a large
+/// dropped, or by [`remove_stale_copies`] if the process dies first. Open it once per recovery pass, not once per batch, so a large
 /// store is copied once.
 pub struct BeeStamperStore {
     // Declared before `_copy` so the database closes before its directory
@@ -102,7 +102,9 @@ impl BeeStamperStore {
     /// Copy and open the store at `stamperstore_path`. `scratch_dir` must
     /// exist and be writable; pass the node's own data directory, which
     /// the caller has to be able to write anyway, rather than a shared
-    /// temp dir. Returns `Ok(None)` when there is no store, so the caller
+    /// temp dir. Copying a large store is slow blocking I/O: call this
+    /// from a blocking thread (`spawn_blocking`), not an async task.
+    /// Returns `Ok(None)` when there is no store, so the caller
     /// has nothing to recover. Any other failure (copy or open) is an
     /// error: the caller can't tell what bee issued and must not fall
     /// back to zeroed counters.
@@ -215,7 +217,54 @@ pub fn recover_bee_buckets(
     }
 }
 
-/// A private copy of a `LevelDB` directory, removed on drop.
+/// Name prefix of the private copies [`BeeStamperStore::open`] makes under
+/// its `scratch_dir`.
+const COPY_PREFIX: &str = ".ant-bee-stamperstore-copy-";
+
+/// Remove every private stamperstore copy left under `scratch_dir`.
+///
+/// A copy is normally removed when its [`BeeStamperStore`] is dropped, but
+/// a process killed (`SIGKILL`, OOM, power loss) while copying or reading
+/// a store leaves it behind, full size. Call this once at startup, before
+/// any [`BeeStamperStore::open`] on the same `scratch_dir`, and only while
+/// holding whatever makes this process the directory's sole user (antd's
+/// instance lock): it removes every copy, so it would delete one another
+/// live process were still reading. Returns how many copies it removed;
+/// one that can't be removed is an error, the others are still tried.
+pub fn remove_stale_copies(scratch_dir: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(scratch_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    let mut first_err = None;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(COPY_PREFIX) {
+            continue;
+        }
+        // Never follow a symlink out of the scratch dir.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                first_err.get_or_insert_with(|| {
+                    std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
+                });
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(removed),
+    }
+}
+
+/// A private copy of a `LevelDB` directory, removed on drop (and, after a
+/// crash, by [`remove_stale_copies`]).
 struct TempCopy(PathBuf);
 
 impl TempCopy {
@@ -225,7 +274,7 @@ impl TempCopy {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let dir = scratch_dir.join(format!(
-            ".ant-bee-stamperstore-copy-{}-{nanos}-{}",
+            "{COPY_PREFIX}{}-{nanos}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
@@ -614,6 +663,50 @@ mod tests {
             recover_bee_buckets(&store, &root, &deep, 40, 30),
             Err(BeeRecoverError::Decode(_))
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A copy left by a process that died before dropping its store (here
+    /// leaked with `mem::forget`, as a `SIGKILL` would) is removed by
+    /// `remove_stale_copies`, and nothing else in the scratch dir is.
+    #[test]
+    fn stale_copies_left_by_a_crash_are_swept() {
+        let root = tmpdir("stale");
+        let store = root.join("stamperstore");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let a = [0x49u8; 32];
+        write_store(&store, &[stamp_item(&a, 1, 1, 2)]);
+
+        for _ in 0..2 {
+            let bee = BeeStamperStore::open(&store, &scratch).unwrap().unwrap();
+            // Deliberately leaked: the drop a killed process never runs.
+            #[allow(clippy::mem_forget)]
+            std::mem::forget(bee);
+        }
+        // A half-made copy from a crash mid-copy, and the node's own files.
+        std::fs::create_dir(scratch.join(format!("{COPY_PREFIX}1-2-3"))).unwrap();
+        std::fs::create_dir(scratch.join("postage")).unwrap();
+        std::fs::write(scratch.join("antd.lock"), b"").unwrap();
+        std::fs::write(scratch.join(format!("{COPY_PREFIX}file")), b"").unwrap();
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 6);
+
+        assert_eq!(remove_stale_copies(&scratch).unwrap(), 3);
+        let mut left: Vec<_> = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                format!("{COPY_PREFIX}file"),
+                "antd.lock".to_string(),
+                "postage".to_string()
+            ]
+        );
+        assert_eq!(remove_stale_copies(&scratch).unwrap(), 0);
+        assert_eq!(remove_stale_copies(&root.join("absent")).unwrap(), 0);
         std::fs::remove_dir_all(&root).ok();
     }
 }

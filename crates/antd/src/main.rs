@@ -474,6 +474,11 @@ async fn main() -> Result<()> {
     // alive until `main` returns.
     let _instance_lock = acquire_instance_lock(&data_dir.join("antd.lock"))?;
 
+    // Under the instance lock, before any rediscovery copies bee's
+    // stamperstore: a copy left by an earlier run that was killed mid-copy
+    // can't be in use by anyone now.
+    remove_stale_bee_copies(&data_dir).await;
+
     raise_nofile_soft_limit();
 
     // Under the instance lock, before the node opens the ledger.
@@ -2425,27 +2430,70 @@ async fn rediscover_batches(
     };
     *full_rescan = false;
     let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
-    let out = open_rediscovered(found, data_dir, known);
+    // Already reloaded / pre-registered. A batch registered while the
+    // blocking open below runs is caught by the caller's `or_insert`.
+    let found: Vec<_> = found.into_iter().filter(|b| !known(&b.batch_id)).collect();
+    let out = if found.is_empty() {
+        Vec::new()
+    } else {
+        // Copying bee's stamperstore (one record per stamped chunk, can be
+        // GBs) and opening the counter files is blocking I/O: keep it off
+        // the runtime's worker threads.
+        let data_dir = data_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || open_rediscovered(found, &data_dir)).await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    "opening rediscovered batches failed: {e}; continuing without them",
+                );
+                Vec::new()
+            }
+        }
+    };
     Ok((out, scan.provisional_since))
 }
 
-/// Open the rediscovered batches `known` doesn't hold yet as issuers.
-/// Bee's `stamperstore` is copied (into `data_dir`) at most once for the
-/// whole pass, and only if some batch actually needs its counters. A
-/// batch that can't be opened is logged and skipped. Synchronous: the
-/// `LevelDB` handle isn't `Send`, so it must not live across an await.
+/// Remove the private stamperstore copies an earlier, killed run left in
+/// `data_dir` ([`ant_postage::beestore::remove_stale_copies`]). Must run
+/// under the instance lock and before any rediscovery. Best effort: a
+/// copy that can't be removed is logged, not fatal.
+async fn remove_stale_bee_copies(data_dir: &Path) {
+    let dir = data_dir.to_path_buf();
+    let swept =
+        tokio::task::spawn_blocking(move || ant_postage::beestore::remove_stale_copies(&dir)).await;
+    match swept {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => tracing::info!(
+            target: "antd",
+            removed = n,
+            "removed bee stamperstore copies left by an interrupted run",
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            target: "antd",
+            "could not remove a stale bee stamperstore copy: {e}",
+        ),
+        Err(e) => tracing::warn!(
+            target: "antd",
+            "sweeping stale bee stamperstore copies failed: {e}",
+        ),
+    }
+}
+
+/// Open the rediscovered batches as issuers. Bee's `stamperstore` is
+/// copied (into `data_dir`) at most once for the whole pass, and only if
+/// some batch actually needs its counters. A batch that can't be opened is
+/// logged and skipped. Blocking (file copy, `LevelDB` reads): run it on a
+/// blocking thread, as [`rediscover_batches`] does. The `LevelDB` handle
+/// isn't `Send`, so it lives and dies inside this call.
 fn open_rediscovered(
     found: Vec<ant_chain::discover::DiscoveredBatch>,
     data_dir: &Path,
-    known: &(dyn Fn(&[u8; 32]) -> bool + Sync),
 ) -> Vec<([u8; 32], ant_postage::StampIssuer)> {
     let mut bee = BeeCounters::new(data_dir);
     let postage_dir = data_dir.join("postage");
     let mut out = Vec::new();
     for b in found {
-        if known(&b.batch_id) {
-            continue; // already reloaded / pre-registered
-        }
         let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
         match open_recovered_issuer(&mut bee, &store_path, &b) {
             Ok(iss) => {
@@ -4343,7 +4391,7 @@ mod bee_recovery_tests {
             "{err}"
         );
         assert!(!bin.exists(), "a zeroed counter file was written");
-        assert!(open_rediscovered(vec![b.clone()], data_dir, &|_| false).is_empty());
+        assert!(open_rediscovered(vec![b.clone()], data_dir).is_empty());
         assert!(!bin.exists());
         // Only bee's store is left in the data dir: no private copy.
         let left: Vec<_> = std::fs::read_dir(data_dir)
@@ -4354,10 +4402,27 @@ mod bee_recovery_tests {
 
         // Moved aside: nothing to recover, so a fresh issuer at 0.
         std::fs::rename(&store, data_dir.join("stamperstore.bad")).unwrap();
-        let found = open_rediscovered(vec![b], data_dir, &|_| false);
+        let found = open_rediscovered(vec![b], data_dir);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1.issued_count(), 0);
         assert!(bin.exists());
+    }
+
+    /// A stamperstore copy a killed run left in the data dir is gone after
+    /// the startup sweep; the node's own files stay.
+    #[tokio::test]
+    async fn startup_sweeps_stamperstore_copies_left_by_a_killed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let leaked = data_dir.join(".ant-bee-stamperstore-copy-4242-1-0");
+        std::fs::create_dir(&leaked).unwrap();
+        std::fs::write(leaked.join("000005.ldb"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir(data_dir.join("stamperstore")).unwrap();
+        std::fs::create_dir(data_dir.join("postage")).unwrap();
+        remove_stale_bee_copies(data_dir).await;
+        assert!(!leaked.exists());
+        assert!(data_dir.join("stamperstore").exists());
+        assert!(data_dir.join("postage").exists());
     }
 }
 
