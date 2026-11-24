@@ -534,7 +534,8 @@ AntStream *ant_stream_open(AntHandle *handle,
  * Read `len` bytes starting at `offset` into `dst`. Blocks until the
  * range is delivered (or the per-read timeout fires). Returns the
  * number of bytes written on success (<= len; truncated near EOF), or
- * -1 on failure with an allocated error in *out_err.
+ * -1 on failure with an allocated error in *out_err. `dst` may be
+ * NULL when `len` is 0; the call then returns 0.
  *
  * Safe to call from any thread, but callers should serialise reads on
  * the same stream - concurrent reads issue independent range requests
@@ -555,8 +556,9 @@ ssize_t ant_stream_read(AntStream *stream,
  * shape of AVAssetResourceLoaderDelegate's dataRequest.
  *
  * The callback returns 0 to keep pulling, non-zero to ask the FFI to
- * stop early (e.g. AVPlayer canceled the dataRequest). The FFI then
- * drains the remaining acks for clean shutdown.
+ * stop early (e.g. AVPlayer canceled the dataRequest). The call then
+ * returns the bytes delivered so far at once, the callback is not
+ * invoked again, and the node stops fetching the rest of the range.
  *
  * Returns the total bytes delivered, or -1 on error (with *out_err
  * set if non-null).
