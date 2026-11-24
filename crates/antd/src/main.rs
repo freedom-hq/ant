@@ -46,8 +46,8 @@ struct Opt {
     /// override the built-in defaults. Recognised keys: `api-addr`,
     /// `data-dir`, `password` / `password-file`, `mainnet` /
     /// `network-id`, `blockchain-rpc-endpoint`, `cors-allowed-origins`,
-    /// `verbosity`, `swap-enable`, `cache-capacity`; other bee keys are
-    /// accepted and ignored.
+    /// `allowed-hosts`, `verbosity`, `swap-enable`, `cache-capacity`;
+    /// other bee keys are accepted and ignored.
     #[arg(long)]
     config: Option<PathBuf>,
 
