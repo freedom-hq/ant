@@ -170,9 +170,11 @@ pub(crate) enum IpScope {
     Local,
 }
 
-/// Classify `ip`. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and NAT64
-/// well-known-prefix IPv6 (`64:ff9b::a.b.c.d`) are classified as the
-/// embedded IPv4 address.
+/// Classify `ip`. IPv6 forms that a dial turns into a packet toward an
+/// embedded IPv4 address are classified as that IPv4 address: IPv4-mapped
+/// (`::ffff:a.b.c.d`), the deprecated IPv4-compatible `::a.b.c.d` (`::/96`,
+/// RFC 4291 2.5.5.1), NAT64 well-known-prefix (`64:ff9b::a.b.c.d`) and 6to4
+/// (`2002:aabb:ccdd::/48`, RFC 3056).
 pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
     match ip {
         IpAddr::V4(v4) => ipv4_scope(v4),
@@ -189,6 +191,23 @@ pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
             if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
                 let [a, b] = seg[6].to_be_bytes();
                 let [c, d] = seg[7].to_be_bytes();
+                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
+            }
+            // ::/96 IPv4-compatible (RFC 4291, deprecated): a host with an
+            // automatic tunnel (Linux `sit0`) sends it as IPv4 to the
+            // embedded address. Also covers `::` (0.0.0.0) and `::1`
+            // (0.0.0.1), both Local either way.
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                let [a, b] = seg[6].to_be_bytes();
+                let [c, d] = seg[7].to_be_bytes();
+                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
+            }
+            // 2002::/16 6to4 (RFC 3056): a host with a 6to4 interface
+            // encapsulates it in IPv4 toward the address in bits 16..48, so
+            // `2002:c0a8:101::1` is tunneled to 192.168.1.1.
+            if seg[0] == 0x2002 {
+                let [a, b] = seg[1].to_be_bytes();
+                let [c, d] = seg[2].to_be_bytes();
                 return ipv4_scope(Ipv4Addr::new(a, b, c, d));
             }
             if v6.is_loopback()
@@ -667,11 +686,23 @@ mod tests {
             // NAT64 well-known prefix embedding 192.168.1.1 / 127.0.0.1.
             ma("/ip6/64:ff9b::c0a8:101/tcp/80"),
             ma("/ip6/64:ff9b::7f00:1/tcp/80"),
+            // IPv4-compatible and 6to4 embedding 192.168.1.1: tunneled to
+            // the LAN host on a host with `sit0` / a 6to4 interface.
+            ma("/ip6/::c0a8:101/tcp/80"),
+            ma("/ip6/2002:c0a8:101::1/tcp/80"),
+            ma("/ip6/2002:a00:1::1/tcp/80"),
+            // 6to4 embedding a global IPv4 stays dialable.
+            ma("/ip6/2002:102:304::1/tcp/1634"),
         ];
         let kept = filter_public_underlays(&addrs);
         assert_eq!(
             kept,
-            vec![addrs[0].clone(), addrs[1].clone(), addrs[8].clone()]
+            vec![
+                addrs[0].clone(),
+                addrs[1].clone(),
+                addrs[8].clone(),
+                addrs[14].clone()
+            ]
         );
     }
 
@@ -683,6 +714,8 @@ mod tests {
             "2a01:4f8::1",
             "::ffff:1.2.3.4",
             "64:ff9b::808:808",
+            "::1.2.3.4",
+            "2002:102:304::1",
         ] {
             assert_eq!(ip_scope(ip(g)), IpScope::Global, "{g}");
         }
@@ -702,6 +735,11 @@ mod tests {
             "64:ff9b:1:ffff::1",
             "64:ff9b::c0a8:101",
             "64:ff9b::10.0.0.1",
+            "::c0a8:101",
+            "::10.0.0.1",
+            "2002:c0a8:101::1",
+            "2002:a00:1::",
+            "2002:6440:1::1",
         ] {
             assert_eq!(ip_scope(ip(p)), IpScope::Private, "{p}");
         }
@@ -717,6 +755,9 @@ mod tests {
             "fe80::1",
             "febf::1",
             "64:ff9b::7f00:1",
+            "::127.0.0.1",
+            "2002:7f00:1::1",
+            "2002::1",
             "ff02::1",
             "2001:db8::1",
             "3fff::1",

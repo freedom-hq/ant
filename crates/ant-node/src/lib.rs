@@ -38,8 +38,11 @@ pub struct NodeConfig {
     /// Forwarded to `ant_p2p::RunConfig::public_dials_only`: dial globally
     /// routable IP underlays only, never a private one (not even on this
     /// host's own LAN) and never a DNS one (resolved at dial time, it could
-    /// name loopback or a LAN host). For embedders that only fetch. `false` (the
-    /// default) keeps the same-LAN exception.
+    /// name loopback or a LAN host). It also turns off `UPnP` (no traffic to
+    /// the LAN gateway, no port mapping) and drops underlays naming this
+    /// node's own public IP (behind a NAT, the router's WAN address, which
+    /// hairpin NAT answers from the LAN side). For embedders that only
+    /// fetch. `false` (the default) keeps the same-LAN exception.
     pub public_dials_only: bool,
     /// Optional live status sink written to by the node loop.
     pub status: Option<watch::Sender<StatusSnapshot>>,

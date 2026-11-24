@@ -37,6 +37,7 @@ use libp2p::swarm::{DialError, SwarmEvent};
 use libp2p::{dns, noise, tcp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use libp2p_stream::Control;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -174,7 +175,12 @@ pub struct RunConfig {
     /// Stricter than [`Self::allow_private_dials`], and wins over it. It
     /// also turns off identify's peer address cache, so libp2p's implicit
     /// dials (`open_stream` to a disconnected peer) can't fall back to
-    /// unfiltered addresses a peer reported about itself.
+    /// unfiltered addresses a peer reported about itself; turns off `UPnP`
+    /// (no SSDP or HTTP to the LAN gateway, no port mapping on it); and
+    /// drops underlays naming one of this node's own public IPs (its
+    /// external addresses and identify-observed addresses, learned once a
+    /// peer has reported them), since behind a NAT that is the router's
+    /// WAN address, which hairpin NAT answers from the LAN side.
     pub public_dials_only: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
@@ -341,8 +347,12 @@ mod derived {
         /// CGNAT) the behaviour just emits `GatewayNotFound` /
         /// `NonRoutableGateway` and stays quiet, so leaving it always-on is
         /// safe — handlers in `apply_event` only ever *add* addresses, never
-        /// reject existing ones.
-        pub(super) upnp: libp2p::upnp::tokio::Behaviour,
+        /// reject existing ones. Disabled with
+        /// [`super::RunConfig::public_dials_only`]: `UPnP` talks to the LAN
+        /// gateway (SSDP multicast, then HTTP to the router) and maps a port
+        /// on it, which a fetch-only embedder that keeps off the LAN has no
+        /// use for.
+        pub(super) upnp: libp2p::swarm::behaviour::toggle::Toggle<libp2p::upnp::tokio::Behaviour>,
     }
 }
 
@@ -552,6 +562,7 @@ fn record_external_address(
     addr: Multiaddr,
     source: ExternalAddrSource,
 ) {
+    note_own_public_ips(state, &addr);
     if state.external_addresses.contains_key(&addr) {
         return;
     }
@@ -568,6 +579,35 @@ fn record_external_address(
         .insert(addr.clone(), (source, added_at_unix));
     state.external_addresses_order.push(addr);
     sync_external_addresses_status(status, state);
+}
+
+/// Upper bound on [`SwarmState::own_public_ips`]: a node sees a handful of
+/// WAN addresses over its life (one per network it joins); a peer that
+/// reports a fresh `observed_addr` on every identify can't grow it past
+/// this.
+const OWN_PUBLIC_IPS_CAP: usize = 64;
+
+/// The IP literals in `addr`.
+fn multiaddr_ips(addr: &Multiaddr) -> impl Iterator<Item = IpAddr> + '_ {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().filter_map(|p| match p {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
+}
+
+/// Remember the globally routable IPs of `addr`, an address this node is
+/// reachable or observed at, in [`SwarmState::own_public_ips`].
+fn note_own_public_ips(state: &mut SwarmState, addr: &Multiaddr) {
+    for ip in multiaddr_ips(addr) {
+        if state.own_public_ips.len() >= OWN_PUBLIC_IPS_CAP {
+            return;
+        }
+        if crate::underlay::is_globally_routable_ip(ip) {
+            state.own_public_ips.insert(ip);
+        }
+    }
 }
 
 /// Centralized remove: drops `addr` from the swarm + the tracker, emits
@@ -977,6 +1017,15 @@ struct SwarmState {
     /// order is tracked separately in [`Self::external_addresses_order`]
     /// so the on-wire snapshot stays deterministic.
     external_addresses: HashMap<Multiaddr, (ExternalAddrSource, u64)>,
+    /// IPs this node has been seen at from outside (every external address
+    /// ever recorded, plus identify's observed-address candidates), never
+    /// pruned and capped at [`OWN_PUBLIC_IPS_CAP`]. With
+    /// `public_dials_only`, an underlay naming one of them is dropped: from
+    /// behind a NAT it is our own router's WAN address, which many routers
+    /// answer from the LAN side (hairpin NAT: their admin UI, or a port
+    /// forward to a LAN host), so a gossiped `/ip4/<our WAN IP>/tcp/80`
+    /// would reach the LAN after all.
+    own_public_ips: HashSet<IpAddr>,
     /// Insertion order for `external_addresses` so renders are stable.
     /// Wide enough to keep one slot per address ever advertised in this
     /// process; `UPnP` / listener churn keeps this very small in practice.
@@ -1163,6 +1212,7 @@ impl SwarmState {
             bee_peerstore_stall_warning_emitted: false,
             external_addresses: HashMap::new(),
             external_addresses_order: Vec::new(),
+            own_public_ips: HashSet::new(),
             peer_eth,
             pushsync_swap: None,
             retired_outbound: None,
@@ -1255,7 +1305,12 @@ impl SwarmState {
         if self.public_dials_only {
             // Global IP literals only: no private underlay passes, and no
             // DNS name either (it is resolved at dial time, past any check).
-            return crate::underlay::filter_public_underlays(addrs);
+            // Nor our own WAN address (hairpin NAT, see `own_public_ips`).
+            let mut kept = crate::underlay::filter_public_underlays(addrs);
+            if !self.own_public_ips.is_empty() {
+                kept.retain(|a| !multiaddr_ips(a).any(|ip| self.own_public_ips.contains(&ip)));
+            }
+            return kept;
         }
         if self.allow_private_dials {
             return addrs.to_vec();
@@ -8856,10 +8911,17 @@ fn handle_swarm_event(
         // a candidate here. Promote globally-routable ones to confirmed
         // external addresses so the next outbound identify carries our
         // NAT-punched public multiaddr and bee's peerstore accepts it.
-        SwarmEvent::NewExternalAddrCandidate { address }
-            if is_globally_routable_multiaddr(&address) =>
-        {
-            record_external_address(state, swarm, status, address, ExternalAddrSource::Observed);
+        SwarmEvent::NewExternalAddrCandidate { address } => {
+            note_own_public_ips(state, &address);
+            if is_globally_routable_multiaddr(&address) {
+                record_external_address(
+                    state,
+                    swarm,
+                    status,
+                    address,
+                    ExternalAddrSource::Observed,
+                );
+            }
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -9823,13 +9885,17 @@ fn build_swarm(
         .with_agent_version(AGENT.to_string())
         .with_push_listen_addr_updates(true);
     // Identify caches every listen address a peer reports (100 by default)
-    // and hands them to the swarm for *any* dial to that peer: an implicit
-    // one (`open_stream` to a disconnected peer dials
-    // `DialOpts::peer_id(peer)` with no addresses) and ours too, since
-    // behaviour-supplied addresses are added to explicit ones. Those
-    // addresses never pass `dialable_underlays`, so a peer could report
-    // `/ip4/192.168.1.1/tcp/22` and get it dialed. With
-    // `public_dials_only` the cache is off and every address we dial is
+    // and hands them to the swarm from `handle_pending_outbound_connection`.
+    // The swarm only uses them for a dial whose `DialOpts` extend addresses
+    // through the behaviour: the address-less `DialOpts::peer_id(peer)` dial
+    // `open_stream` makes for a disconnected peer. Our own hint/bootnode
+    // dials pass explicit addresses (`.addresses(..)`), and libp2p-swarm
+    // 0.47 discards behaviour addresses for those
+    // (`extend_addresses_through_behaviour` is false), so they never see
+    // the cache. The implicit dial's addresses never pass
+    // `dialable_underlays`, so a peer could report `/ip4/192.168.1.1/tcp/22`
+    // and get it dialed. With `public_dials_only` the cache is off, the
+    // implicit dial has no address to try, and every address we dial is
     // one we filtered.
     let id_cfg = if public_dials_only {
         id_cfg.with_cache_size(0)
@@ -9844,7 +9910,9 @@ fn build_swarm(
                 .with_interval(liveness.ping_interval)
                 .with_timeout(liveness.ping_timeout),
         ),
-        upnp: libp2p::upnp::tokio::Behaviour::default(),
+        upnp: (!public_dials_only)
+            .then(libp2p::upnp::tokio::Behaviour::default)
+            .into(),
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -10980,7 +11048,46 @@ mod tests {
         cached.addrs = vec![dns_loopback.clone(), dns_lan];
         assert_eq!(state.addrs_for_dial(&cached), None);
         cached.addrs = vec![dns_loopback, public.clone()];
-        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public]));
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+
+        // Our own WAN address, once a peer reported it (identify's observed
+        // address), is the router's: hairpin NAT answers it from the LAN
+        // side. Dropped on enqueue and at dial time; a non-global
+        // candidate (behind CGNAT) adds nothing.
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/80".parse().unwrap();
+        note_own_public_ips(&mut state, &"/ip4/100.64.0.9/tcp/1634".parse().unwrap());
+        assert!(state.own_public_ips.is_empty());
+        cached.addrs = vec![wan.clone(), public.clone()];
+        assert_eq!(
+            state.addrs_for_dial(&cached),
+            Some(vec![wan.clone(), public.clone()])
+        );
+        note_own_public_ips(&mut state, &"/ip4/81.2.69.77/tcp/41234".parse().unwrap());
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+        cached.addrs = vec![wan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        let wan_only = PeerId::random();
+        let mut hint = hint_in_bin(wan_only, 0x10, 4);
+        hint.addrs = vec![wan.clone()];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.iter().all(|h| h.peer_id != wan_only));
+
+        // Only with `public_dials_only`: a node that serves keeps dialing it.
+        state.public_dials_only = false;
+        state.allow_private_dials = false;
+        cached.addrs = vec![wan.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![wan]));
+    }
+
+    /// `public_dials_only` turns `UPnP` off: no SSDP search or HTTP to the
+    /// LAN gateway, no port mapping. Off by default it stays on.
+    #[tokio::test]
+    async fn public_dials_only_disables_upnp() {
+        let cfg = LivenessConfig::DEFAULT;
+        let on = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
+        assert!(on.behaviour().upnp.is_enabled());
+        let off = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
+        assert!(!off.behaviour().upnp.is_enabled());
     }
 
     /// A same-LAN private underlay admitted on one network must not be
