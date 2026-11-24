@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use crate::chain::check_batch_owner;
 use crate::{
     ChainContext, ChainReader, ChainWriter, ChequebookRefusal, ChequebookSlot, DepositView,
     FundingFailure, FundingView, NewBatch, StorageQuoteView, WriteGate,
@@ -201,22 +202,6 @@ impl AntChainWriter {
         self.deposit_target
             .unwrap_or(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR)
     }
-}
-
-/// The owner rule [`AntChainWriter::batch_depth`] applies: a zero owner
-/// is a batch the contract doesn't have; a resize needs `node` to own it.
-fn check_batch_owner(owner: [u8; 20], node: &[u8; 20], resize: bool) -> Result<(), FundingFailure> {
-    if owner == [0u8; 20] {
-        return Err(FundingFailure::NotFound("batch not found on chain".into()));
-    }
-    if resize && &owner != node {
-        return Err(FundingFailure::Rejected(format!(
-            "batch is owned by 0x{}, not this node (0x{}); only its owner can resize it",
-            hex::encode(owner),
-            hex::encode(node),
-        )));
-    }
-    Ok(())
 }
 
 fn funding_view(f: &funding::Funding) -> FundingView {

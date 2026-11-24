@@ -862,6 +862,28 @@ fn writer(
         })
 }
 
+/// The owner rule for a batch about to be changed: a zero owner is a
+/// batch the contract doesn't have (`404`); a resize (`increaseDepth`,
+/// owner-only) needs `node` to own it (`400`). A plain extension
+/// (`topUp`) is open to any payer, so it passes `resize = false`.
+pub(crate) fn check_batch_owner(
+    owner: [u8; 20],
+    node: &[u8; 20],
+    resize: bool,
+) -> Result<(), FundingFailure> {
+    if owner == [0u8; 20] {
+        return Err(FundingFailure::NotFound("batch not found on chain".into()));
+    }
+    if resize && &owner != node {
+        return Err(FundingFailure::Rejected(format!(
+            "batch is owned by 0x{}, not this node (0x{}); only its owner can resize it",
+            hex::encode(owner),
+            hex::encode(node),
+        )));
+    }
+    Ok(())
+}
+
 /// The `409` a write route answers while another write holds the
 /// [`WriteGate`].
 fn busy() -> Response {
@@ -1082,7 +1104,10 @@ pub async fn topup_stamp(
 }
 
 /// `PATCH /stamps/dilute/{id}/{depth}`. Increases a batch's depth
-/// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3).
+/// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3). The batch
+/// is read first: a depth that doesn't raise it, or a batch the node
+/// doesn't own, is a `400` (a batch not on chain a `404`) and nothing
+/// is sent.
 pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
@@ -1099,6 +1124,26 @@ pub async fn dilute_stamp(
         Err(r) => return r,
     };
     let tx = chain.tx_lock.lock().await;
+    // `increaseDepth` is owner-only and must raise the depth; anything
+    // else reverts and burns the gas. Read the batch first and refuse
+    // it the bee way (`400`), sending nothing. A failed read fails the
+    // route (`502`/`504`) rather than letting the transaction through.
+    let meta = match guarded(chain.reader.batch_meta(batch_id)).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if let Err(f) = check_batch_owner(meta.owner, &chain.wallet_eth, true) {
+        return failure_response(f);
+    }
+    if depth <= meta.depth {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid depth: the batch is already depth {}; a dilute must raise it",
+                meta.depth
+            ),
+        );
+    }
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
     }
@@ -1115,7 +1160,8 @@ pub async fn dilute_stamp(
 
 /// `POST /chequebook/deposit?amount=`. Funds the chequebook by
 /// transferring xBZZ into it; returns the `transactionHash` (PLAN.md
-/// D3). Freedom auto-deposits post-purchase.
+/// D3). Freedom auto-deposits post-purchase. An amount of `0`, or more
+/// than the wallet's xBZZ balance, is a `400` and nothing is sent.
 pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1128,6 +1174,9 @@ pub async fn chequebook_deposit(
         return busy();
     };
     let amount: u128 = match q.get("amount").map(|a| a.parse()) {
+        Some(Ok(0)) => {
+            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
+        }
         Some(Ok(a)) => a,
         Some(Err(_)) => {
             return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer")
@@ -1139,7 +1188,17 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    // Held from the balance check through the receipt, so another
+    // wallet transaction can't spend the xBZZ counted here (like the
+    // buy's guard). An unaffordable transfer would revert on chain.
     let _tx = chain.tx_lock.lock().await;
+    let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if amount > balance {
+        return json_error(StatusCode::BAD_REQUEST, "out of funds");
+    }
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,
         Err(r) => return r,

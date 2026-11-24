@@ -39,7 +39,7 @@ impl ChainReader for FakeChain {
         Ok(987_654_321)
     }
     async fn bzz_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
-        Ok(1_500_000_000_000_000_000)
+        Ok(FAKE_BZZ_BALANCE)
     }
     async fn native_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
         Ok(250_000_000_000_000_000)
@@ -50,7 +50,30 @@ impl ChainReader for FakeChain {
     async fn chequebook_total_paid_out(&self, _cb: [u8; 20]) -> Result<u128, String> {
         Ok(3_000_000)
     }
+    /// Every batch is depth [`FAKE_BATCH_DEPTH`] and the node wallet's
+    /// (`0x11…`), except [`FOREIGN_BATCH`] (someone else's) and
+    /// [`MISSING_BATCH`] (zero owner: not on chain).
+    async fn batch_meta(&self, batch_id: [u8; 32]) -> Result<ant_gateway::BatchMetaView, String> {
+        let owner = match batch_id {
+            FOREIGN_BATCH => [0x22; 20],
+            MISSING_BATCH => [0; 20],
+            _ => [0x11; 20],
+        };
+        Ok(ant_gateway::BatchMetaView {
+            owner,
+            depth: FAKE_BATCH_DEPTH,
+            bucket_depth: 16,
+            immutable: true,
+        })
+    }
 }
+
+/// [`FakeChain`]'s node-wallet xBZZ balance.
+const FAKE_BZZ_BALANCE: u128 = 1_500_000_000_000_000_000;
+/// [`FakeChain`]'s depth for every batch.
+const FAKE_BATCH_DEPTH: u8 = 20;
+const FOREIGN_BATCH: [u8; 32] = [0xF0; 32];
+const MISSING_BATCH: [u8; 32] = [0x0E; 32];
 
 fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
@@ -560,6 +583,139 @@ async fn write_endpoints_wait_for_the_wallet_tx_lock() {
     }
 }
 
+/// `POST /chequebook/deposit` refuses, with a `400` and no transaction,
+/// a deposit of nothing and one the wallet can't cover (it would
+/// revert on chain and burn the gas). Exactly the balance goes through.
+#[tokio::test]
+async fn deposit_refuses_zero_and_more_than_the_wallet_holds() {
+    let over = format!("/chequebook/deposit?amount={}", FAKE_BZZ_BALANCE + 1);
+    for (uri, message) in [
+        (
+            "/chequebook/deposit?amount=0",
+            "amount must be more than 0 PLUR",
+        ),
+        (over.as_str(), "out of funds"),
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let router = status_router_with_chain(
+            snapshot_with_one_peer(),
+            funding_ctx_with_chequebook(writer.clone(), Some([0xCD; 20])),
+        );
+        let (status, json) = req(router, Method::POST, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json["message"], message, "{uri}");
+        assert!(writer.calls().is_empty(), "{uri}: {:?}", writer.calls());
+    }
+
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(
+        snapshot_with_one_peer(),
+        funding_ctx_with_chequebook(writer.clone(), Some([0xCD; 20])),
+    );
+    let all = format!("/chequebook/deposit?amount={FAKE_BZZ_BALANCE}");
+    let (status, _) = req(router, Method::POST, &all).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        writer.calls(),
+        [format!("deposit_chequebook({FAKE_BZZ_BALANCE})")]
+    );
+}
+
+/// `PATCH /stamps/dilute` reads the batch first and refuses, with a
+/// `400` and no `increaseDepth`, a depth that doesn't raise it and a
+/// batch the node doesn't own (both would revert on chain). A batch the
+/// contract doesn't have is a `404`. One depth up goes through.
+#[tokio::test]
+async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
+    let ours = hex::encode([0xAB; 32]);
+    let foreign = hex::encode(FOREIGN_BATCH);
+    let missing = hex::encode(MISSING_BATCH);
+    for (uri, want) in [
+        (
+            format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH - 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/stamps/dilute/{ours}/{FAKE_BATCH_DEPTH}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/stamps/dilute/{foreign}/{}", FAKE_BATCH_DEPTH + 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/stamps/dilute/{missing}/{}", FAKE_BATCH_DEPTH + 1),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let (router, seen) = status_router_recording_registrations(
+            snapshot_with_one_peer(),
+            funding_ctx(writer.clone()),
+        );
+        let (status, json) = req(router, Method::PATCH, &uri).await;
+        assert_eq!(status, want, "{uri}: {json}");
+        assert!(writer.calls().is_empty(), "{uri}: {:?}", writer.calls());
+        assert!(seen.lock().unwrap().is_empty(), "{uri} re-registered");
+    }
+
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let uri = format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + 1);
+    let (status, _) = req(router, Method::PATCH, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        writer.calls(),
+        [format!("dilute_batch(ab, {})", FAKE_BATCH_DEPTH + 1)]
+    );
+}
+
+/// A failed batch read fails the dilute (`502`) instead of sending it
+/// unchecked.
+#[tokio::test]
+async fn dilute_fails_when_the_batch_read_fails() {
+    struct NoBatchReads;
+    #[async_trait]
+    impl ChainReader for NoBatchReads {
+        async fn block_number(&self) -> Result<u64, String> {
+            FakeChain.block_number().await
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            FakeChain.current_price().await
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            FakeChain.total_amount().await
+        }
+        async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.bzz_balance(who).await
+        }
+        async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.native_balance(who).await
+        }
+        async fn chequebook_balance(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_balance(cb).await
+        }
+        async fn chequebook_total_paid_out(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_total_paid_out(cb).await
+        }
+    }
+    let writer = Arc::new(FundingWriter::default());
+    let ctx = Arc::new(ChainContext {
+        reader: Arc::new(NoBatchReads),
+        wallet_eth: [0x11; 20],
+        chequebook: ChequebookSlot::new(None),
+        chain_id: 100,
+        writer: Some(writer.clone()),
+        writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
+    });
+    let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+    let uri = format!("/stamps/dilute/{}/22", hex::encode([0xAB; 32]));
+    let (status, _) = req(router, Method::PATCH, &uri).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(writer.calls().is_empty(), "{:?}", writer.calls());
+}
+
 #[tokio::test]
 async fn deposit_requires_amount() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx_rw(Some([0xCD; 20])));
@@ -653,10 +809,12 @@ impl ChainWriter for FundingWriter {
     async fn topup_batch(&self, _id: [u8; 32], _amount: u128) -> Result<(), String> {
         Ok(())
     }
-    async fn dilute_batch(&self, _id: [u8; 32], _depth: u8) -> Result<(), String> {
+    async fn dilute_batch(&self, id: [u8; 32], depth: u8) -> Result<(), String> {
+        self.record(format!("dilute_batch({:02x}, {depth})", id[0]));
         Ok(())
     }
-    async fn deposit_chequebook(&self, _amount: u128) -> Result<[u8; 32], String> {
+    async fn deposit_chequebook(&self, amount: u128) -> Result<[u8; 32], String> {
+        self.record(format!("deposit_chequebook({amount})"));
         Ok([0xD0; 32])
     }
     async fn quote_plan(&self, depth: u8, days: u64) -> Result<StorageQuoteView, FundingFailure> {
@@ -775,10 +933,17 @@ impl ChainWriter for FundingWriter {
 }
 
 fn funding_ctx(writer: Arc<FundingWriter>) -> Arc<ChainContext> {
+    funding_ctx_with_chequebook(writer, None)
+}
+
+fn funding_ctx_with_chequebook(
+    writer: Arc<FundingWriter>,
+    chequebook: Option<[u8; 20]>,
+) -> Arc<ChainContext> {
     Arc::new(ChainContext {
         reader: Arc::new(FakeChain),
         wallet_eth: [0x11; 20],
-        chequebook: ChequebookSlot::new(None),
+        chequebook: ChequebookSlot::new(chequebook),
         chain_id: 100,
         writer: Some(writer),
         writes: WriteGate::default(),
