@@ -2,6 +2,7 @@
 
 use crate::bounded_close::BoundedClose;
 use crate::dial::endpoint_host;
+#[cfg(feature = "dnsaddr")]
 use crate::dnsaddr;
 use crate::handshake::{
     handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
@@ -28,13 +29,15 @@ use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::Transport as _;
+#[cfg(feature = "dnsaddr")]
+use libp2p::dns;
 use libp2p::identify;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use libp2p::ping;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{DialError, SwarmEvent};
-use libp2p::{dns, noise, tcp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder};
+use libp2p::{noise, tcp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use libp2p_stream::Control;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -55,6 +58,14 @@ pub enum RunError {
     Handshake(#[from] crate::handshake::HandshakeError),
     #[error("behaviour: {0}")]
     Behaviour(#[from] libp2p::BehaviourBuilderError),
+    /// A bootnode names a host by DNS (`/dnsaddr/`, `/dns/`, `/dns4/`,
+    /// `/dns6/`) in a build without the `dnsaddr` feature, which resolves
+    /// no names.
+    #[error(
+        "bootnode {0} needs DNS, which this build of ant-p2p leaves out (its `dnsaddr` \
+         feature is off): pass /ip4/ or /ip6/ multiaddrs"
+    )]
+    DnsBootnode(Multiaddr),
 }
 
 /// Postage stamping + signing key wired at daemon startup for pushsync uploads.
@@ -1872,6 +1883,10 @@ fn local_overlay_from_secret(
 /// `target_peers` and the dialer stops pulling from the hint queue.
 pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let local_peer_id = cfg.libp2p_keypair.public().to_peer_id();
+    #[cfg(not(feature = "dnsaddr"))]
+    if let Some(addr) = first_dns_multiaddr(&cfg.bootnodes) {
+        return Err(RunError::DnsBootnode(addr.clone()));
+    }
     let mut swarm = build_swarm(cfg.libp2p_keypair.clone(), &LivenessConfig::DEFAULT)?;
     let mut commands = cfg.commands.take();
     let listen: Multiaddr = LISTEN.parse().unwrap();
@@ -9678,7 +9693,12 @@ fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr
     let bootnodes = bootnodes.to_vec();
     tokio::spawn(async move {
         let start = Instant::now();
+        // Without the `dnsaddr` feature `run` has refused DNS bootnodes:
+        // every entry is already a dialable IP multiaddr.
+        #[cfg(feature = "dnsaddr")]
         let resolved = dnsaddr::resolve_all(bootnodes.iter().cloned()).await;
+        #[cfg(not(feature = "dnsaddr"))]
+        let resolved = bootnodes;
         let total = resolved.len();
         if total == 0 {
             warn!(
@@ -9700,6 +9720,21 @@ fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr
             }
         }
     });
+}
+
+/// The first of `addrs` that names a host by DNS rather than by IP:
+/// what a build without the `dnsaddr` feature cannot dial.
+#[cfg_attr(feature = "dnsaddr", allow(dead_code))]
+fn first_dns_multiaddr(addrs: &[Multiaddr]) -> Option<&Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    addrs.iter().find(|a| {
+        a.iter().any(|p| {
+            matches!(
+                p,
+                Protocol::Dnsaddr(_) | Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)
+            )
+        })
+    })
 }
 
 /// Tag every peer known to be a bootnode before any dial goes out: the
@@ -9761,6 +9796,7 @@ fn handle_bootnode_dial(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState,
 /// the host's `/etc/resolv.conf` entries, so DNSADDR resolution fails on cold
 /// start without a backup). On hosts with `/etc/resolv.conf` unreadable
 /// (Android / minimal containers) we fall through to Cloudflare-only.
+#[cfg(feature = "dnsaddr")]
 fn resolver_config() -> dns::ResolverConfig {
     match hickory_resolver::system_conf::read_system_conf() {
         Ok((cfg, _)) => {
@@ -9816,8 +9852,11 @@ fn build_swarm(
                     .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(BoundedClose::new(muxer)))),
             )
         })
-        .map_err(|e| std::io::Error::other(format!("tcp/noise/yamux: {e}")))?
-        .with_dns_config(resolver_config(), dns::ResolverOpts::default())
+        .map_err(|e| std::io::Error::other(format!("tcp/noise/yamux: {e}")))?;
+    // `/dns*/` addresses are dialable only with the `dnsaddr` feature.
+    #[cfg(feature = "dnsaddr")]
+    let swarm = swarm.with_dns_config(resolver_config(), dns::ResolverOpts::default());
+    let swarm = swarm
         .with_behaviour(|_| behaviour)
         .expect("infallible behaviour")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
@@ -10190,6 +10229,30 @@ mod tests {
         pass(&mut state, &mut backoff);
         assert_eq!(state.seen_hints.len(), 1);
         assert_eq!(backoff, MAX_BACKOFF);
+    }
+
+    /// Issue #270: what a build without the `dnsaddr` feature refuses as
+    /// a bootnode (any DNS name) and what it dials (IP multiaddrs).
+    #[test]
+    fn dns_bootnodes_are_told_from_ip_ones() {
+        let parse = |s: &str| -> Multiaddr { s.parse().unwrap() };
+        let ip = [
+            parse("/ip4/192.0.2.1/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"),
+            parse("/ip6/2001:db8::1/tcp/1634"),
+        ];
+        assert_eq!(first_dns_multiaddr(&ip), None);
+        for dns in [
+            "/dnsaddr/mainnet.ethswarm.org",
+            "/dns/example.org/tcp/1634",
+            "/dns4/example.org/tcp/1634",
+            "/dns6/example.org/tcp/1634",
+        ] {
+            let mut addrs = ip.to_vec();
+            addrs.push(parse(dns));
+            assert_eq!(first_dns_multiaddr(&addrs), Some(&parse(dns)), "{dns}");
+        }
+        let err = RunError::DnsBootnode(parse("/dnsaddr/mainnet.ethswarm.org")).to_string();
+        assert!(err.contains("/dnsaddr/mainnet.ethswarm.org") && err.contains("dnsaddr"));
     }
 
     /// A peer with a duplicate connection keeps its BZZ session, routing

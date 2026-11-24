@@ -33,8 +33,10 @@ tempfile = "3.27.0"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-default = ["chain-rpc"]
+default = ["chain-rpc", "dnsaddr"]
 chain-rpc = ["ant-p2p/chain-rpc"]
+# See ant-p2p's `dnsaddr` feature (issue #270).
+dnsaddr = ["ant-p2p/dnsaddr"]
 
 [lints]
 workspace = true

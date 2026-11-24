@@ -16,12 +16,16 @@
    4. `cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings`
    5. `cargo test --workspace --lib`
    6. `cargo test -p ant-ffi --features chain --lib`
+   7. `cargo clippy -p ant-p2p -p ant-node --no-default-features --all-targets -- -D warnings`
+   8. `cargo test -p ant-p2p --no-default-features --lib`
  Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
  (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
  off by default, so the whole-workspace step 2 never compiles them — they
  need an explicit per-crate lint or their code is never type-checked by CI.
  Step 6 exists for the same reason: step 5 never enables `chain`, so the
- chain-gated `ant-ffi` unit tests would be compiled but never run.
+ chain-gated `ant-ffi` unit tests would be compiled but never run. Steps
+ 7 and 8 are the reverse case: nothing in the workspace turns `ant-p2p`'s
+ default-on `dnsaddr` feature off, so only they build ant without DNS.
  Never merge to `main` (or push a branch you expect to be merged) with a
  known-red gate. Toolchain upgrades can introduce new `clippy`/`rustfmt`
  findings on untouched code — fix those too (the gate is whole-repo, not

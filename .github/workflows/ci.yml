@@ -88,6 +88,24 @@ jobs:
         # it — without this step a regression there ships uncaught.
         run: cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings
 
+      - name: cargo clippy (ant-p2p + ant-node without dnsaddr)
+        # `dnsaddr` (default on) is the only DNS in ant: without it the
+        # node takes IP bootnodes only and builds no resolver (issue
+        # #270). Nothing in the workspace turns it off, so the step
+        # above never compiles that configuration.
+        run: cargo clippy -p ant-p2p -p ant-node --no-default-features --all-targets -- -D warnings
+
+      - name: no DNS resolver without dnsaddr
+        # The point of the feature: hickory and libp2p's DNS transport
+        # are not in the graph at all, on any target.
+        run: |
+          for crate in hickory-proto hickory-resolver libp2p-dns; do
+            found=$(cargo tree -p ant-node --no-default-features -e normal,build --target all -i "$crate" 2>/dev/null)
+            if [ -n "$found" ]; then
+              echo "$crate is in ant-node's graph without dnsaddr:"; echo "$found"; exit 1
+            fi
+          done
+
       - name: cargo test (lib only)
         # Lib tests cover the unit-test surface (BMT, joiner,
         # mantaray, parse_reference). Integration tests against
@@ -110,6 +128,9 @@ jobs:
         # verification) are compiled by the clippy step but never run
         # without this step.
         run: cargo test -p ant-ffi --features chain --lib
+
+      - name: cargo test (ant-p2p without dnsaddr, lib only)
+        run: cargo test -p ant-p2p --no-default-features --lib
 
   # -------------------------------------------------------------------
   # Declared Rust floor. ant tracks current stable Rust; `rust-version`

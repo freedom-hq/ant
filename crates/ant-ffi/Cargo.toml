@@ -55,8 +55,9 @@ ant-crypto = { path = "../ant-crypto" }
 # `ant_init` already started. `http-api` (default) is the only feature
 # needed; `chain` stays off here (wallet/stamps report bee zero-stubs).
 ant-gateway = { path = "../ant-gateway" }
-ant-node = { path = "../ant-node", default-features = false }
-ant-p2p = { path = "../ant-p2p", default-features = false }
+# `dnsaddr`: `default_mainnet_bootnodes()` is a `/dnsaddr/` entry.
+ant-node = { path = "../ant-node", default-features = false, features = ["dnsaddr"] }
+ant-p2p = { path = "../ant-p2p", default-features = false, features = ["dnsaddr"] }
 ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 hex.workspace = true

@@ -36,8 +36,8 @@ clap = { version = "4.5.37", features = ["derive"] }
 hex = "0.4.3"
 hyper = "1.9.0"
 k256 = { version = "0.13.4", features = ["digest", "ecdh", "ecdsa", "sha256"] }
+# No `dns` here: ant-p2p's `dnsaddr` feature turns it on (issue #270).
 libp2p = { version = "0.56.0", features = [
-  "dns",
   "ecdsa",
   "identify",
   "macros",

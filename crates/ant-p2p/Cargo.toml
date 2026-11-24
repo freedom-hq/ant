@@ -8,6 +8,7 @@ license.workspace = true
 [[example]]
 name = "cheque_smoke"
 path = "examples/cheque_smoke.rs"
+required-features = ["dnsaddr"]
 
 [dependencies]
 # `default-features = false` cuts the `chain-rpc` chain (reqwest +
@@ -26,7 +27,7 @@ base64 = "0.22.1"
 futures = "0.3.31"
 hex.workspace = true
 if-addrs = "0.15.0"
-hickory-resolver = { version = "0.25.2", default-features = false, features = [
+hickory-resolver = { version = "0.25.2", default-features = false, optional = true, features = [
   "system-config",
   "tokio"
 ] }
@@ -54,8 +55,15 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-default = ["chain-rpc"]
+default = ["chain-rpc", "dnsaddr"]
 chain-rpc = ["ant-chain/chain-rpc"]
+# DNS for peers' addresses: `/dnsaddr/` bootnodes resolved through
+# hickory-resolver (the `dnsaddr` module) and `/dns*/` addresses dialed
+# through libp2p's DNS transport. Without it neither is built, ant makes
+# no DNS query of its own, and a bootnode with a DNS name is refused at
+# start (`RunError::DnsBootnode`): for embedders that pass bootnodes as
+# IP multiaddrs (issue #270).
+dnsaddr = ["dep:hickory-resolver", "libp2p/dns"]
 
 [lints]
 workspace = true
