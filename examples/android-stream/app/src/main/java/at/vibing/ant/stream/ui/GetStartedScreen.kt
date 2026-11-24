@@ -87,7 +87,7 @@ fun GetStartedScreen(node: AntNode, onClose: () -> Unit) {
         activating = true
         error = null
         scope.launch {
-            runCatching { node.buyStorage(tier.depth, q.amountPerChunk) }
+            runCatching { node.buyStorage(tier.depth, q.amountPerChunk, q.swapInput) }
                 .onSuccess {
                     if (node.hasStorage) onClose() else error = "Storage didn't activate. Please try again."
                 }

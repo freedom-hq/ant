@@ -308,8 +308,11 @@ class AntNode(private val context: Context) {
         StorageQuote.parse(json) ?: throw AntException("could not read plan price")
     }
 
-    suspend fun buyStorage(depth: Int, amountPerChunk: String) = withContext(Dispatchers.IO) {
-        val json = withHandle { AntNative.nativeStorageBuyXdai(it, gnosisRpc, depth, amountPerChunk, false) }
+    /** [maxXdaiWei] is the quote's `swapInput`: the swap never sends more. */
+    suspend fun buyStorage(depth: Int, amountPerChunk: String, maxXdaiWei: String) = withContext(Dispatchers.IO) {
+        val json = withHandle {
+            AntNative.nativeStorageBuyXdai(it, gnosisRpc, depth, amountPerChunk, false, maxXdaiWei)
+        }
         StoragePlan.parse(json)?.let { _plan.value = it }
         refreshAll()
     }
@@ -374,10 +377,12 @@ class AntNode(private val context: Context) {
 
     /**
      * Fund the chequebook up to its plan's deposit, paying with xDAI (the
-     * node swaps for the xBZZ it lacks). Spends real funds.
+     * node swaps for the xBZZ it lacks). Spends real funds. The swap is
+     * capped at the card's own `swapInput` (the price the user saw).
      */
     suspend fun topUpDeposit() = withContext(Dispatchers.IO) {
-        val json = withHandle { AntNative.nativeSettlementTopup(it, gnosisRpc) }
+        val maxXdaiWei = settlementDeposit.value?.swapInput ?: "0"
+        val json = withHandle { AntNative.nativeSettlementTopup(it, gnosisRpc, maxXdaiWei) }
         afterChequebookChange(json)
     }
 
@@ -407,7 +412,9 @@ class AntNode(private val context: Context) {
                     "your wallet now holds ${formatBzz(w.bzzPlur)}, less than ${formatBzz(amountPlur)}; nothing was sent",
                 )
             }
-            AntNative.nativeSettlementTopupAmount(h, gnosisRpc, amountPlur.toString())
+            // The wallet holds it: a cap of 0 makes the node refuse rather
+            // than swap if that changed in between.
+            AntNative.nativeSettlementTopupAmount(h, gnosisRpc, amountPlur.toString(), "0")
         }
         afterChequebookChange(json)
     }

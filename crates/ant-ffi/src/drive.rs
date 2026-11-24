@@ -1651,6 +1651,17 @@ fn parse_amount(amount_per_chunk: &str, what: &str) -> Result<u128, DriveError> 
         .map_err(|_| DriveError::Op(format!("invalid {what} price")))
 }
 
+/// Parse the most xDAI (wei) a swap may send, which the app got from
+/// the quote it showed (`swap_input`).
+#[cfg(feature = "chain")]
+pub(crate) fn parse_max_xdai(max_xdai_wei: &str) -> Result<u128, DriveError> {
+    max_xdai_wei.trim().parse().map_err(|_| {
+        DriveError::Op(format!(
+            "invalid max_xdai_wei {max_xdai_wei:?}: pass the quote's swap_input (wei)"
+        ))
+    })
+}
+
 /// The C API's quote JSON (see [`Quote`]) for a shared quote.
 #[cfg(feature = "chain")]
 fn quote_json(q: &funding::PlanQuote) -> Result<String, DriveError> {
@@ -1677,6 +1688,7 @@ fn quote_json(q: &funding::PlanQuote) -> Result<String, DriveError> {
         account_xdai_display: format_native(wallet_xdai),
         needed_bzz: f.bzz_to_acquire.to_string(),
         needed_bzz_display: format_bzz(f.bzz_to_acquire),
+        swap_input: f.swap_input_wei.to_string(),
         xdai_required: f.xdai_required_wei.to_string(),
         xdai_required_display: format_native(f.xdai_required_wei),
         xdai_to_send: f.xdai_to_send_wei.to_string(),
@@ -1748,7 +1760,9 @@ pub(crate) fn storage_topup_quote(
 /// xDAI**: swap the xBZZ shortfall on-chain if needed, `approve` the
 /// postage contract for `amount_per_chunk × 2^depth`, then submit
 /// `PostageStamp.topUp`. `amount_per_chunk` is the value from
-/// [`storage_topup_quote`] so the charge matches the approved quote.
+/// [`storage_topup_quote`] so the charge matches the approved quote, and
+/// `max_xdai_wei` its `swap_input`: the swap never sends more (see
+/// [`funding::extend_with_xdai`]).
 /// The batch's depth doesn't change, so no re-registration is needed.
 /// Returns the refreshed [`storage_validity`] JSON so the caller can
 /// show the new expiry immediately.
@@ -1760,8 +1774,10 @@ pub(crate) fn storage_topup_xdai(
     h: &AntHandle,
     rpc: String,
     amount_per_chunk: String,
+    max_xdai_wei: String,
 ) -> Result<String, DriveError> {
     let amount = parse_amount(&amount_per_chunk, "top-up")?;
+    let max_xdai = parse_max_xdai(&max_xdai_wei)?;
     let cmd_tx = h.cmd_tx.clone();
     let wallet = node_wallet(h)?;
     let tx_rpc = rpc.clone();
@@ -1773,7 +1789,7 @@ pub(crate) fn storage_topup_xdai(
         // Balance reads, swap, approve and top-up under the account's
         // wallet tx lock (see [`wallet_tx_lock`]).
         let _tx = wallet_tx_lock(&h.eth).lock_owned().await;
-        funding::extend_with_xdai(&payer, &batch_id, view.batch_depth, None, amount)
+        funding::extend_with_xdai(&payer, &batch_id, view.batch_depth, None, amount, max_xdai)
             .await
             .map_err(funding_err)
     })?;
@@ -1893,7 +1909,8 @@ pub(crate) fn storage_buy(
 /// Buy and activate a storage plan funding **only with xDAI**: the node
 /// swaps the xBZZ the plan and the settlement deposit still need through
 /// the on-chain helper, then runs the same `approve` + `createBatch`
-/// flow as [`storage_buy`].
+/// flow as [`storage_buy`]. The swap sends at most `max_xdai_wei`, the
+/// quote's `swap_input` (see [`funding::buy_plan_with_xdai`]).
 ///
 /// Submits up to six real Gnosis transactions (one-time helper deploy,
 /// swap, approve, createBatch, then the one-time chequebook deploy and
@@ -1906,8 +1923,10 @@ pub(crate) fn storage_buy_xdai(
     depth: u8,
     amount_per_chunk: String,
     immutable: bool,
+    max_xdai_wei: String,
 ) -> Result<String, DriveError> {
     let amount = parse_amount(&amount_per_chunk, "plan")?;
+    let max_xdai = parse_max_xdai(&max_xdai_wei)?;
     let wallet = node_wallet(h)?;
     let policy = deposit_policy(h, depth);
     h.runtime.block_on(async move {
@@ -1918,7 +1937,7 @@ pub(crate) fn storage_buy_xdai(
         // shortfall is read after any other spend finished; released
         // before the settlement step below, which takes it itself.
         let tx = wallet_tx_lock(&h.eth).lock_owned().await;
-        let new = funding::buy_plan_with_xdai(&payer, policy, depth, amount, immutable)
+        let new = funding::buy_plan_with_xdai(&payer, policy, depth, amount, immutable, max_xdai)
             .await
             .map_err(funding_err)?;
         drop(tx);
@@ -2594,17 +2613,35 @@ async fn fund_chequebook_best_effort(
 /// funded — or when its chequebook was disqualified (see
 /// [`settlement_deposit_for`]). Two or three light `eth_call`s, so it belongs on an explicit
 /// refresh, not on every status poll.
+///
+/// With `amount`, the top-up figures (`swap_input`, `xdai_required`, …)
+/// price depositing that many PLUR more instead, as
+/// [`settlement_topup_xdai`] with the same `amount` would; the rest still
+/// describes the deposit against its target. Its `swap_input` is that
+/// call's `max_xdai`.
 #[cfg(feature = "chain")]
-pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+pub(crate) fn settlement_deposit(
+    h: &AntHandle,
+    rpc: String,
+    amount: Option<u128>,
+) -> Result<String, DriveError> {
     let wallet = node_wallet(h)?;
     h.runtime.block_on(async move {
         let target = plan_deposit_target(&h.cmd_tx).await;
-        settlement_deposit_for(&h.chain_client(rpc), &wallet, &h.data_dir, &h.eth, target).await
+        settlement_deposit_for(
+            &h.chain_client(rpc),
+            &wallet,
+            &h.data_dir,
+            &h.eth,
+            target,
+            amount,
+        )
+        .await
     })
 }
 
 /// [`settlement_deposit`]'s body, against an explicit chain client and
-/// deposit `target` (PLUR). A
+/// deposit `target` (PLUR), priced for `amount` when given. A
 /// chequebook this process's chain check disqualified reads as "none",
 /// the same answer [`settlement_status`] gives: its settlement is off,
 /// so the card must not offer to top it up.
@@ -2615,6 +2652,7 @@ async fn settlement_deposit_for(
     data_dir: &std::path::Path,
     owner: &[u8; 20],
     target: u128,
+    amount: Option<u128>,
 ) -> Result<String, DriveError> {
     let Some(cb) = persisted_chequebook(data_dir, owner) else {
         return to_json(&SettlementDeposit::none(target));
@@ -2625,9 +2663,10 @@ async fn settlement_deposit_for(
     let payer = Payer::gnosis(client, wallet);
     // The card JSON carries no wallet balances, so a funded chequebook
     // costs one deposit read, not two more wallet reads.
-    let status = funding::deposit_status(&payer, &cb, target, funding::WalletRead::WhenShort)
-        .await
-        .map_err(funding_err)?;
+    let status =
+        funding::deposit_status(&payer, &cb, target, amount, funding::WalletRead::WhenShort)
+            .await
+            .map_err(funding_err)?;
     to_json(&SettlementDeposit::of(&status))
 }
 
@@ -2648,11 +2687,17 @@ async fn settlement_deposit_for(
 /// target (a host topping up browsing credit beyond the default
 /// deposit); the gateway's `POST /v0/settlement/deposit?amount=` runs
 /// the same shared step.
+///
+/// The swap sends at most `max_xdai` (wei): the `swap_input` of the
+/// [`settlement_deposit`] (same `amount`) the user approved, or `0` to
+/// forbid a swap and deposit only xBZZ the wallet already holds (see
+/// [`funding::fund_deposit_with_xdai`]).
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_topup_xdai(
     h: &AntHandle,
     rpc: String,
     amount: Option<u128>,
+    max_xdai: u128,
 ) -> Result<String, DriveError> {
     let data_dir = h.data_dir.clone();
     let owner = h.eth;
@@ -2667,6 +2712,7 @@ pub(crate) fn settlement_topup_xdai(
             secret,
             &h.gateway_chequebook,
             amount,
+            max_xdai,
         )
         .await
     })
@@ -2700,12 +2746,23 @@ async fn settlement_topup_xdai_for(
     secret: [u8; 32],
     slot: &ant_gateway::ChequebookSlot,
 ) -> Result<String, DriveError> {
-    settlement_topup_xdai_adding(cmd_tx, client, data_dir, owner, secret, slot, None).await
+    settlement_topup_xdai_adding(
+        cmd_tx,
+        client,
+        data_dir,
+        owner,
+        secret,
+        slot,
+        None,
+        u128::MAX,
+    )
+    .await
 }
 
 /// [`settlement_topup_xdai_for`] with an optional explicit amount (see
 /// [`settlement_topup_xdai`]).
 #[cfg(feature = "chain")]
+#[allow(clippy::too_many_arguments)]
 async fn settlement_topup_xdai_adding(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     client: &ant_chain::ChainClient,
@@ -2714,9 +2771,11 @@ async fn settlement_topup_xdai_adding(
     secret: [u8; 32],
     slot: &ant_gateway::ChequebookSlot,
     amount: Option<u128>,
+    max_xdai: u128,
 ) -> Result<String, DriveError> {
     let result =
-        settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret, amount).await;
+        settlement_topup_xdai_checked(cmd_tx, client, data_dir, owner, secret, amount, max_xdai)
+            .await;
     if result.is_err() {
         // Clears the slot only if it holds a chequebook now in
         // `DISQUALIFIED`; any other failure leaves it alone.
@@ -2734,6 +2793,7 @@ async fn settlement_topup_xdai_checked(
     owner: [u8; 20],
     secret: [u8; 32],
     amount: Option<u128>,
+    max_xdai: u128,
 ) -> Result<String, DriveError> {
     let cb = persisted_chequebook(data_dir, &owner).ok_or_else(|| {
         DriveError::Op(
@@ -2775,8 +2835,15 @@ async fn settlement_topup_xdai_checked(
     // before we waited would send it a second time.
     let funded = {
         let _tx = wallet_tx_lock(&owner).lock_owned().await;
-        funding::fund_deposit_with_xdai(&payer, &cb, target, amount, funding::WalletRead::WhenShort)
-            .await
+        funding::fund_deposit_with_xdai(
+            &payer,
+            &cb,
+            target,
+            amount,
+            funding::WalletRead::WhenShort,
+            max_xdai,
+        )
+        .await
     };
     match funded {
         Ok(status) => {
@@ -2880,7 +2947,7 @@ async fn settlement_withdraw_for(
     // The withdrawal has confirmed: a failed re-read must not turn that
     // into an error, or the app reports "withdraw failed" and a retry
     // sends a second real transaction.
-    match settlement_deposit_for(client, wallet, data_dir, &owner, target).await {
+    match settlement_deposit_for(client, wallet, data_dir, &owner, target, None).await {
         Ok(json) => Ok(json),
         Err(e) => {
             tracing::warn!(
@@ -3601,6 +3668,11 @@ struct SettlementDeposit {
     /// `shortfall > 0`, via `DepositStatus::needs_top_up` — the one
     /// predicate the UI summary and the top-up action both read.
     needs_top_up: bool,
+    /// xDAI (wei) the top-up's swap for the missing xBZZ sends; `0` when
+    /// the wallet holds it or nothing is missing. Pass it back as the
+    /// top-up's `max_xdai_wei`: the swap is re-priced when it runs, and
+    /// one above this is refused with nothing sent (#305).
+    swap_input: String,
     /// Total xDAI (wei + display) the account must hold to run the
     /// top-up: the swap input for the missing xBZZ plus a gas reserve.
     /// Zero when nothing is missing.
@@ -3633,6 +3705,7 @@ impl SettlementDeposit {
             shortfall_plur: status.shortfall_plur.to_string(),
             shortfall_bzz: format_bzz(status.shortfall_plur),
             needs_top_up: status.needs_top_up(),
+            swap_input: f.swap_input_wei.to_string(),
             xdai_required: f.xdai_required_wei.to_string(),
             xdai_required_display: format_native(f.xdai_required_wei),
             xdai_to_send: f.xdai_to_send_wei.to_string(),
@@ -3652,6 +3725,7 @@ impl SettlementDeposit {
             shortfall_plur: "0".into(),
             shortfall_bzz: format_bzz(0),
             needs_top_up: false,
+            swap_input: "0".into(),
             xdai_required: "0".into(),
             xdai_required_display: format_native(0),
             xdai_to_send: "0".into(),
@@ -3708,6 +3782,11 @@ struct Quote {
     /// xBZZ still needed for the plan (PLUR), i.e. cost minus balance.
     needed_bzz: String,
     needed_bzz_display: String,
+    /// xDAI (wei) the swap for `needed_bzz` sends: the pool price plus a
+    /// 5% buffer. Pass it back as the buy's `max_xdai_wei`: the swap is
+    /// re-priced when it runs, and one above this is refused with
+    /// nothing sent (#305).
+    swap_input: String,
     /// Total xDAI the account must hold to activate via auto-swap: the
     /// (buffered) swap input plus a gas reserve.
     xdai_required: String,
@@ -4902,6 +4981,14 @@ mod chain_tests {
                         word(1) // deployedContracts: registered
                     } else if to == hex0x(&GNOSIS_SWAP_PRICE_ORACLE) {
                         json!(format!("0x{:064x}{:064x}", 100_000, 100))
+                    } else if to == ant_chain::GNOSIS_BZZ_WXDAI_POOL.to_ascii_lowercase() {
+                        // slot0(): about 0.06 xDAI per xBZZ, then padding.
+                        assert_eq!(sel, "3850c7bd", "slot0");
+                        json!(format!(
+                            "0x{:064x}{}",
+                            193_688_776_437_782_838_521_006_693_800u128,
+                            "0".repeat(64 * 6)
+                        ))
                     } else {
                         assert_eq!(to, hex0x(&self.chequebook), "unscripted eth_call {data}");
                         if sel == hex::encode(chequebook_total_paid_out_selector()) {
@@ -5081,6 +5168,8 @@ mod chain_tests {
             eth,
             NODE_KEY,
             Some(2 * MILLI_BZZ),
+            // The wallet holds it: the apps' "add credit" allows no swap.
+            0,
         )
         .await
         .unwrap();
@@ -5091,6 +5180,72 @@ mod chain_tests {
         assert_eq!(
             node.lock().unwrap().funds.first().map(|f| (f.0, f.1)),
             Some((CB, 3 * MILLI_BZZ))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #305: the C API's top-up passes its `max_xdai` down to the shared
+    /// funding step. A deposit the wallet's xBZZ doesn't cover needs a
+    /// swap; with the apps' "add credit" cap of 0 (a plain transfer was
+    /// promised) it is refused with nothing sent, and the card's own
+    /// quote for that amount is exactly the cap that lets it through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topup_amount_never_swaps_past_its_cap() {
+        const CB: [u8; 20] = [0xc8; 20];
+        let (wallet, eth) = node_wallet();
+        let dir = scratch("cb-topup-capped");
+        persist(&dir, CB, eth);
+        let script = std::sync::Arc::new(MoneyScript::new(eth, CB, MILLI_BZZ, MILLI_BZZ));
+        let (cmd_tx, _node) = fake_node();
+
+        let err = super::settlement_topup_xdai_checked(
+            &cmd_tx,
+            &money_client(&script),
+            &dir,
+            eth,
+            NODE_KEY,
+            Some(2 * MILLI_BZZ),
+            0,
+        )
+        .await
+        .expect_err("a swap past the cap");
+        assert!(err.to_string().contains("price moved"), "got {err}");
+        assert!(
+            script.sent().is_empty(),
+            "nothing sent: {:?}",
+            script.sent()
+        );
+
+        let card = super::settlement_deposit_for(
+            &money_client(&script),
+            &wallet,
+            &dir,
+            &eth,
+            MILLI_BZZ,
+            Some(2 * MILLI_BZZ),
+        )
+        .await
+        .unwrap();
+        let card: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(card["needs_top_up"], false, "described against the target");
+        let quoted: u128 = card["swap_input"].as_str().unwrap().parse().unwrap();
+        assert!(quoted > 0, "{card}");
+        let err = super::settlement_topup_xdai_checked(
+            &cmd_tx,
+            &money_client(&script),
+            &dir,
+            eth,
+            NODE_KEY,
+            Some(2 * MILLI_BZZ),
+            quoted - 1,
+        )
+        .await
+        .expect_err("one wei under the quote");
+        assert!(err.to_string().contains("price moved"), "got {err}");
+        assert!(
+            script.sent().is_empty(),
+            "nothing sent: {:?}",
+            script.sent()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6257,6 +6412,7 @@ mod chain_tests {
             &dir,
             &eth,
             super::NO_PLAN_DEPOSIT_PLUR,
+            None,
         )
         .await
         .unwrap();
@@ -6649,6 +6805,7 @@ mod chain_tests {
             &dir,
             &b,
             super::NO_PLAN_DEPOSIT_PLUR,
+            None,
         )
         .await
         .unwrap();

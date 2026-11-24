@@ -373,6 +373,7 @@ struct GetStartedView: View {
             do {
                 try await node.buyStorage(rpc: activeRpc, depth: tier.depth,
                                           amountPerChunk: quote.amountPerChunk,
+                                          maxXdaiWei: quote.swapInput,
                                           immutable: false)
                 if node.hasStorage {
                     dismiss()

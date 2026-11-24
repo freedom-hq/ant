@@ -165,36 +165,45 @@ pub trait ChainWriter: Send + Sync {
     ) -> Result<StorageQuoteView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
-    /// Buy a plan, swapping xDAI for the xBZZ it and the deposit need.
-    /// Returns the new batch id; the route registers it.
+    /// Buy a plan, swapping xDAI for the xBZZ it and the deposit need,
+    /// at most `max_xdai_wei` of it (the quote's `swapInputWei`; a swap
+    /// priced above it is refused before anything is sent). Returns the
+    /// new batch id; the route registers it.
     async fn buy_with_xdai(
         &self,
         _depth: u8,
         _amount_per_chunk: u128,
         _immutable: bool,
+        _max_xdai_wei: u128,
     ) -> Result<NewBatch, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
     /// Extend (and with `new_depth`, resize) `batch_id`, swapping xDAI
-    /// for the xBZZ it needs. Returns the batch's depth afterwards.
+    /// for the xBZZ it needs, at most `max_xdai_wei` of it as in
+    /// [`Self::buy_with_xdai`]. Returns the batch's depth afterwards.
     async fn extend_with_xdai(
         &self,
         _batch_id: [u8; 32],
         _new_depth: Option<u8>,
         _amount_per_chunk: u128,
+        _max_xdai_wei: u128,
     ) -> Result<u8, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
-    /// The chequebook's settlement deposit and what topping it up takes.
-    async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+    /// The chequebook's settlement deposit and what topping it up takes;
+    /// with `amount`, what growing it by that many PLUR takes (the quote
+    /// for [`Self::fund_deposit_with_xdai`] with the same `amount`).
+    async fn deposit_status(&self, _amount: Option<u128>) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
     /// Top the chequebook's deposit up to its target, or with `amount`
-    /// grow it by that many PLUR, swapping xDAI for the xBZZ it needs.
+    /// grow it by that many PLUR, swapping xDAI for the xBZZ it needs,
+    /// at most `max_xdai_wei` of it as in [`Self::buy_with_xdai`].
     /// Returns the status afterwards.
     async fn fund_deposit_with_xdai(
         &self,
         _amount: Option<u128>,
+        _max_xdai_wei: u128,
     ) -> Result<DepositView, FundingFailure> {
         Err(FundingFailure::Unsupported)
     }
@@ -1465,6 +1474,18 @@ fn param<T: std::str::FromStr>(
         .transpose()
 }
 
+/// The deposit routes' optional `?amount=<PLUR>`: a zero is refused.
+#[allow(clippy::result_large_err)]
+fn deposit_amount(q: &HashMap<String, String>) -> Result<Option<u128>, Response> {
+    match param::<u128>(q, "amount")? {
+        Some(0) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "amount must be more than 0 PLUR",
+        )),
+        a => Ok(a),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn required<T: std::str::FromStr>(q: &HashMap<String, String>, name: &str) -> Result<T, Response> {
     param(q, name)?.ok_or_else(|| {
@@ -1616,11 +1637,15 @@ pub async fn storage_quote(
     }
 }
 
-/// `POST /v0/storage/buy?depth=&amountPerChunk=&immutable=` buys a plan
-/// paid from the node wallet's xDAI (swapping for the xBZZ it and the
-/// chequebook deposit need), registers it, and runs the same after-buy
-/// settlement as `POST /stamps`. `immutable` defaults to `true`, like
-/// bee. `amountPerChunk` comes from the matching quote.
+/// `POST /v0/storage/buy?depth=&amountPerChunk=&maxXdaiWei=&immutable=`
+/// buys a plan paid from the node wallet's xDAI (swapping for the xBZZ it
+/// and the chequebook deposit need), registers it, and runs the same
+/// after-buy settlement as `POST /stamps`. `immutable` defaults to
+/// `true`, like bee. `amountPerChunk` comes from the matching quote, and
+/// so does the required `maxXdaiWei`: its `swapInputWei`, the most xDAI
+/// the swap may send. The swap is re-priced when it runs; one priced
+/// above `maxXdaiWei` (the pool moved, or its read was forged) is a `400`
+/// with nothing sent (#305).
 pub async fn storage_buy(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1633,10 +1658,11 @@ pub async fn storage_buy(
     let params = (|| {
         let depth = valid_depth(required(&q, "depth")?)?;
         let amount: u128 = required(&q, "amountPerChunk")?;
+        let max_xdai: u128 = required(&q, "maxXdaiWei")?;
         let immutable = flag(q.get("immutable").map(String::as_str), "immutable", true)?;
-        Ok::<_, Response>((depth, amount, immutable))
+        Ok::<_, Response>((depth, amount, max_xdai, immutable))
     })();
-    let (depth, amount, immutable) = match params {
+    let (depth, amount, max_xdai, immutable) = match params {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -1651,7 +1677,7 @@ pub async fn storage_buy(
     let new = match funding_call(
         FUNDING_TX_TIMEOUT,
         "chain transaction timed out",
-        w.buy_with_xdai(depth, amount, immutable),
+        w.buy_with_xdai(depth, amount, immutable, max_xdai),
     )
     .await
     {
@@ -1662,10 +1688,11 @@ pub async fn storage_buy(
     bought(&handle, new, depth, immutable).await
 }
 
-/// `POST /v0/storage/extend?batchId=&amountPerChunk=[&depth=]` tops a
-/// batch up paid from the node wallet's xDAI; with `depth`, then resizes
-/// it and re-registers it at the new depth. `amountPerChunk` comes from
-/// the matching quote (same `depth`).
+/// `POST /v0/storage/extend?batchId=&amountPerChunk=&maxXdaiWei=[&depth=]`
+/// tops a batch up paid from the node wallet's xDAI; with `depth`, then
+/// resizes it and re-registers it at the new depth. `amountPerChunk` and
+/// the required `maxXdaiWei` (its `swapInputWei`) come from the matching
+/// quote (same `depth`), as for `POST /v0/storage/buy`.
 pub async fn storage_extend(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1678,10 +1705,11 @@ pub async fn storage_extend(
     let params = (|| {
         let batch_id = parse_batch_id(q.get("batchId").map_or("", String::as_str))?;
         let amount: u128 = required(&q, "amountPerChunk")?;
+        let max_xdai: u128 = required(&q, "maxXdaiWei")?;
         let new_depth = param::<u8>(&q, "depth")?.map(valid_depth).transpose()?;
-        Ok::<_, Response>((batch_id, amount, new_depth))
+        Ok::<_, Response>((batch_id, amount, max_xdai, new_depth))
     })();
-    let (batch_id, amount, new_depth) = match params {
+    let (batch_id, amount, max_xdai, new_depth) = match params {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -1692,7 +1720,7 @@ pub async fn storage_extend(
     let depth = match funding_call(
         FUNDING_TX_TIMEOUT,
         "chain transaction timed out",
-        w.extend_with_xdai(batch_id, new_depth, amount),
+        w.extend_with_xdai(batch_id, new_depth, amount, max_xdai),
     )
     .await
     {
@@ -1717,15 +1745,27 @@ pub async fn storage_extend(
 /// `GET /v0/settlement/deposit`: the chequebook's settlement deposit and
 /// what topping it up to its target takes, priced in xDAI. No
 /// transaction is sent.
-pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response {
+///
+/// `?amount=<PLUR>` prices depositing that much more instead (the
+/// funding figures; the rest still describes the deposit against its
+/// target): the quote whose `swapInputWei` is the `maxXdaiWei` for
+/// `POST /v0/settlement/deposit?amount=` with the same amount.
+pub async fn settlement_deposit(
+    State(handle): State<GatewayHandle>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let (chain, w) = match writer(&handle) {
         Ok(cw) => cw,
+        Err(r) => return r,
+    };
+    let amount = match deposit_amount(&q) {
+        Ok(a) => a,
         Err(r) => return r,
     };
     match funding_call(
         FUNDING_READ_TIMEOUT,
         "chain rpc request timed out",
-        w.deposit_status(),
+        w.deposit_status(amount),
     )
     .await
     {
@@ -1744,6 +1784,12 @@ pub async fn settlement_deposit(State(handle): State<GatewayHandle>) -> Response
 /// product flow (the xDAI→xBZZ swap covers only what the wallet lacks);
 /// a missing, non-numeric or zero amount is a `400`.
 ///
+/// `?maxXdaiWei=` is required: the most xDAI the swap may send, the
+/// `swapInputWei` of the `GET /v0/settlement/deposit` (with the same
+/// `amount`) the user approved, or `0` to forbid a swap and deposit only
+/// xBZZ the wallet already holds. A swap priced above it is a `400` with
+/// nothing sent (#305).
+///
 /// The deposit and balances are read under the [`WalletTxLock`], so a
 /// background top-up that just landed isn't paid twice. Nothing is
 /// spent on a chequebook the chain rejects (`ant_chain::funding`); such
@@ -1758,18 +1804,23 @@ pub async fn settlement_fund_deposit(
         Ok(cw) => cw,
         Err(r) => return r,
     };
-    let amount = match param::<u128>(&q, "amount") {
-        Ok(Some(0)) => {
-            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
-        }
+    let amount = match deposit_amount(&q) {
         Ok(a) => a,
+        Err(r) => return r,
+    };
+    let max_xdai: u128 = match required(&q, "maxXdaiWei") {
+        Ok(m) => m,
         Err(r) => return r,
     };
     let Some(_one_write) = chain.writes.try_begin() else {
         return busy();
     };
     let tx = chain.tx_lock.lock().await;
-    let funded = tokio::time::timeout(FUNDING_TX_TIMEOUT, w.fund_deposit_with_xdai(amount)).await;
+    let funded = tokio::time::timeout(
+        FUNDING_TX_TIMEOUT,
+        w.fund_deposit_with_xdai(amount, max_xdai),
+    )
+    .await;
     drop(tx);
     match funded {
         Ok(Ok(d)) => deposit_response(chain.wallet_eth, &d),

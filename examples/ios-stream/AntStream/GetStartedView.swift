@@ -109,6 +109,7 @@ struct GetStartedView: View {
         accountXdai: "0",
         accountXdaiDisplay: "0.0000",
         neededBzzDisplay: "0.0510",
+        swapInput: "0",
         xdaiRequiredDisplay: "0.60",
         xdaiToSendDisplay: "0.60",
         sufficientFunds: false
@@ -503,6 +504,7 @@ struct GetStartedView: View {
                 // long broadcast can't eat its own beginning.
                 try await node.buyStorage(rpc: activeRpc, depth: tier.depth,
                                           amountPerChunk: quote.amountPerChunk,
+                                          maxXdaiWei: quote.swapInput,
                                           immutable: true)
                 if node.hasStorage {
                     dismiss()

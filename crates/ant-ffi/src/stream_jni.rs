@@ -448,11 +448,6 @@ rpc_string_shim!(
     crate::ant_storage_settlement_deposit,
     "settlement deposit"
 );
-rpc_string_shim!(
-    Java_at_vibing_ant_stream_AntNative_nativeSettlementTopup,
-    crate::ant_storage_settlement_topup,
-    "top up settlement deposit"
-);
 
 rpc_string_shim!(
     Java_at_vibing_ant_stream_AntNative_nativeWalletBalance,
@@ -460,10 +455,14 @@ rpc_string_shim!(
     "wallet balance"
 );
 
-/// `AntNative.<name>(handle, rpc, amountPlur): String` over a C call
-/// taking the handle, an RPC URL and a decimal PLUR amount.
+/// `AntNative.<name>(handle, rpc, <arg>): String` over a C call taking
+/// the handle, an RPC URL and one decimal amount (`$arg` names it in
+/// errors).
 macro_rules! rpc_amount_string_shim {
     ($export:ident, $ffi:path, $name:literal) => {
+        rpc_amount_string_shim!($export, $ffi, $name, "amountPlur");
+    };
+    ($export:ident, $ffi:path, $name:literal, $arg:literal) => {
         #[doc = concat!("`AntNative` shim over `", stringify!($ffi), "`.")]
         #[unsafe(no_mangle)]
         pub extern "system" fn $export<'caller>(
@@ -481,7 +480,7 @@ macro_rules! rpc_amount_string_shim {
                     let Some(rpc) = c_arg(env, &rpc, "rpc") else {
                         return Ok(JString::null());
                     };
-                    let Some(amount) = c_arg(env, &amount_plur, "amountPlur") else {
+                    let Some(amount) = c_arg(env, &amount_plur, $arg) else {
                         return Ok(JString::null());
                     };
                     // SAFETY: live handle; strings outlive the call.
@@ -494,12 +493,57 @@ macro_rules! rpc_amount_string_shim {
     };
 }
 
-// Both spend real funds; the app confirms first.
+// These spend real funds; the app confirms first.
+//
+// `nativeSettlementTopup(handle, rpc, maxXdaiWei)`: the cap is the
+// deposit card's `swap_input` (#305).
 rpc_amount_string_shim!(
-    Java_at_vibing_ant_stream_AntNative_nativeSettlementTopupAmount,
-    crate::ant_storage_settlement_topup_amount,
-    "add to credit"
+    Java_at_vibing_ant_stream_AntNative_nativeSettlementTopup,
+    crate::ant_storage_settlement_topup,
+    "top up settlement deposit",
+    "maxXdaiWei"
 );
+
+/// `AntNative.nativeSettlementTopupAmount(handle, rpc, amountPlur,
+/// maxXdaiWei): String` — `ant_storage_settlement_topup_amount`. Spends
+/// real funds.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeSettlementTopupAmount<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+    rpc: JString<'caller>,
+    amount_plur: JString<'caller>,
+    max_xdai_wei: JString<'caller>,
+) -> JString<'caller> {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<JString<'caller>> {
+            let Some(h) = handle_ptr(env, handle) else {
+                return Ok(JString::null());
+            };
+            let Some(rpc) = c_arg(env, &rpc, "rpc") else {
+                return Ok(JString::null());
+            };
+            let Some(amount) = c_arg(env, &amount_plur, "amountPlur") else {
+                return Ok(JString::null());
+            };
+            let Some(max_xdai) = c_arg(env, &max_xdai_wei, "maxXdaiWei") else {
+                return Ok(JString::null());
+            };
+            // SAFETY: live handle; strings outlive the call.
+            Ok(string_call(env, "add to credit", |err| unsafe {
+                crate::ant_storage_settlement_topup_amount(
+                    h,
+                    rpc.as_ptr(),
+                    amount.as_ptr(),
+                    max_xdai.as_ptr(),
+                    err,
+                )
+            }))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 rpc_amount_string_shim!(
     Java_at_vibing_ant_stream_AntNative_nativeSettlementWithdrawAmount,
     crate::ant_storage_settlement_withdraw_amount,
@@ -538,7 +582,8 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStorageQuote<'c
 }
 
 /// `AntNative.nativeStorageBuyXdai(handle, rpc, depth, amountPerChunk,
-/// immutable): String` — `ant_storage_buy_xdai`. Spends real funds.
+/// immutable, maxXdaiWei): String` — `ant_storage_buy_xdai`, capped at
+/// the quote's `swap_input` (#305). Spends real funds.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStorageBuyXdai<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -548,6 +593,7 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStorageBuyXdai<
     depth: jint,
     amount_per_chunk: JString<'caller>,
     immutable: jboolean,
+    max_xdai_wei: JString<'caller>,
 ) -> JString<'caller> {
     unowned_env
         .with_env(|env| -> jni::errors::Result<JString<'caller>> {
@@ -558,6 +604,9 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStorageBuyXdai<
                 return Ok(JString::null());
             };
             let Some(amount) = c_arg(env, &amount_per_chunk, "amountPerChunk") else {
+                return Ok(JString::null());
+            };
+            let Some(max_xdai) = c_arg(env, &max_xdai_wei, "maxXdaiWei") else {
                 return Ok(JString::null());
             };
             let Ok(depth) = u8::try_from(depth) else {
@@ -572,6 +621,7 @@ pub extern "system" fn Java_at_vibing_ant_stream_AntNative_nativeStorageBuyXdai<
                     depth,
                     amount.as_ptr(),
                     i32::from(immutable),
+                    max_xdai.as_ptr(),
                     err,
                 )
             }))

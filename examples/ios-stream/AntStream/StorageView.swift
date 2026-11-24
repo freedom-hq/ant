@@ -988,7 +988,8 @@ private struct ExtendStorageSheet: View {
         withAnimation { step = .extending }
         Task {
             do {
-                try await node.topUpStorage(rpc: activeRpc, amountPerChunk: quote.amountPerChunk)
+                try await node.topUpStorage(rpc: activeRpc, amountPerChunk: quote.amountPerChunk,
+                                            maxXdaiWei: quote.swapInput)
                 let until = node.validity.map { " — valid until \($0.expiryDateLabel)" } ?? ""
                 dismiss()
                 onDone("Storage extended\(until)")

@@ -664,8 +664,12 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
  * Settlement-deposit status as a JSON object:
  *   {"enabled":bool,"chequebook":"0x…"|null,"deposit_plur","deposit_bzz",
  *    "target_plur","target_bzz","shortfall_plur","shortfall_bzz",
- *    "needs_top_up":bool,"xdai_required","xdai_required_display",
- *    "xdai_to_send","xdai_to_send_display","sufficient_funds":bool}
+ *    "needs_top_up":bool,"swap_input","xdai_required",
+ *    "xdai_required_display","xdai_to_send","xdai_to_send_display",
+ *    "sufficient_funds":bool}
+ * `swap_input` (wei) is what the top-up's xDAI->xBZZ swap sends, 0 when
+ * the wallet holds the xBZZ or nothing is missing: pass it back as
+ * ant_storage_settlement_topup's `max_xdai_wei`.
  * ant_storage_settlement_status says whether a chequebook is deployed;
  * this says whether it actually backs the cheques it signs. A chequebook
  * at deposit 0 publishes fine until the peers' payment tolerance runs
@@ -684,6 +688,21 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
 char *ant_storage_settlement_deposit(const AntHandle *handle,
                                      const char *gnosis_rpc,
                                      char **out_err);
+
+/*
+ * Like ant_storage_settlement_deposit, but the top-up figures
+ * (`swap_input`, `xdai_required`, `xdai_to_send`, `sufficient_funds`)
+ * price depositing `amount_plur` more (a decimal PLUR string), as
+ * ant_storage_settlement_topup_amount with the same amount would: its
+ * `swap_input` is that call's `max_xdai_wei`. The other fields still
+ * describe the deposit against its target. Mirrors the gateway's
+ * GET /v0/settlement/deposit?amount=. No transaction is sent. Requires
+ * the `chain` cargo feature.
+ */
+char *ant_storage_settlement_deposit_amount(const AntHandle *handle,
+                                            const char *gnosis_rpc,
+                                            const char *amount_plur,
+                                            char **out_err);
 
 /*
  * Fund this account's chequebook up to the settlement deposit target
@@ -707,9 +726,16 @@ char *ant_storage_settlement_deposit(const AntHandle *handle,
  * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
  * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
  * Requires the `chain` cargo feature.
+ * `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+ * send: the `swap_input` of the ant_storage_settlement_deposit the user approved. The swap is
+ * re-priced from the pool when it runs, so a price that moved (or a
+ * forged pool read) since that quote is refused with nothing sent
+ * (#305); refresh the quote and try again.
+ * "0" forbids a swap: only xBZZ the wallet already holds is deposited.
  */
 char *ant_storage_settlement_topup(const AntHandle *handle,
                                    const char *gnosis_rpc,
+                                   const char *max_xdai_wei,
                                    char **out_err);
 
 /*
@@ -723,10 +749,18 @@ char *ant_storage_settlement_topup(const AntHandle *handle,
  * ant_storage_settlement_deposit JSON. SUBMITS REAL TRANSACTIONS AND
  * SPENDS REAL FUNDS, and BLOCKS until they confirm. Requires the `chain`
  * cargo feature.
+ * `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+ * send: the `swap_input` of the ant_storage_settlement_deposit_amount (same amount) the user approved. The swap is
+ * re-priced from the pool when it runs, so a price that moved (or a
+ * forged pool read) since that quote is refused with nothing sent
+ * (#305); refresh the quote and try again.
+ * "0" forbids a swap: only xBZZ the wallet already holds is deposited
+ * (the apps' "add credit", which checked that first).
  */
 char *ant_storage_settlement_topup_amount(const AntHandle *handle,
                                           const char *gnosis_rpc,
                                           const char *amount_plur,
+                                          const char *max_xdai_wei,
                                           char **out_err);
 
 /*
@@ -940,11 +974,14 @@ char *ant_deploy_chequebook(const AntHandle *handle,
  *    "total_cost_bzz","settlement_deposit_plur","settlement_deposit_bzz",
  *    "capacity_bytes","account_bzz",
  *    "account_bzz_display","account_xdai","account_xdai_display",
- *    "needed_bzz","needed_bzz_display","xdai_required",
+ *    "needed_bzz","needed_bzz_display","swap_input","xdai_required",
  *    "xdai_required_display","xdai_to_send","xdai_to_send_display",
  *    "sufficient_funds"}
  * For the xDAI-only flow, `xdai_to_send_display` is exactly how much more
  * xDAI to send; the node swaps it to xBZZ and buys the plan itself.
+ * `swap_input` (wei) is what that swap sends (pool price plus a 5%
+ * buffer; 0 when the wallet holds the xBZZ): pass it back as
+ * ant_storage_buy_xdai's `max_xdai_wei`.
  * `settlement_deposit_*` is the one-time xBZZ deposit this purchase also
  * puts behind the node's chequebook so its cheques are backed: what it
  * is short of the target for a `depth` plan (0.1 xBZZ at depth 21,
@@ -995,10 +1032,16 @@ char *ant_storage_topup_quote(const AntHandle *handle,
  * the user approved. Returns the refreshed ant_storage_validity JSON
  * (the new expiry). SUBMITS REAL TRANSACTIONS AND SPENDS REAL FUNDS.
  * Requires the `chain` cargo feature.
+ * `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+ * send: the `swap_input` of the ant_storage_topup_quote the user approved. The swap is
+ * re-priced from the pool when it runs, so a price that moved (or a
+ * forged pool read) since that quote is refused with nothing sent
+ * (#305); refresh the quote and try again.
  */
 char *ant_storage_topup_xdai(const AntHandle *handle,
                              const char *gnosis_rpc,
                              const char *amount_per_chunk,
+                             const char *max_xdai_wei,
                              char **out_err);
 
 /*
@@ -1022,12 +1065,18 @@ char *ant_storage_buy(const AntHandle *handle,
  * value from ant_storage_quote; `immutable` is 0 or 1. Returns the
  * refreshed ant_storage_status JSON. SUBMITS REAL TRANSACTIONS AND SPENDS
  * REAL FUNDS. Requires the `chain` cargo feature.
+ * `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+ * send: the `swap_input` of the ant_storage_quote the user approved. The swap is
+ * re-priced from the pool when it runs, so a price that moved (or a
+ * forged pool read) since that quote is refused with nothing sent
+ * (#305); refresh the quote and try again.
  */
 char *ant_storage_buy_xdai(const AntHandle *handle,
                            const char *gnosis_rpc,
                            uint8_t depth,
                            const char *amount_per_chunk,
                            int immutable,
+                           const char *max_xdai_wei,
                            char **out_err);
 
 /*
