@@ -135,20 +135,28 @@ async fn plausible_head(client: &ChainClient, now_unix: u64) -> Result<u64, RpcE
 ///
 /// - read up to at most `head`: as it is;
 /// - read beyond `bound`: written by a pass that trusted a lying head
-///   (before that was refused), so its marks are clamped to `head` minus
-///   the rescan tail. Its confirmed mark is dropped — the lying pass
-///   never read the blocks between the real head then and `head` now —
-///   so the next confirming check reads the history once more before a
-///   "none" may lead to a deploy;
+///   (before that was refused). Dropped (`None`): the next pass reads the
+///   history again from the xBZZ deploy block. None of its marks says how
+///   far it really read — the lying pass started somewhere at or below the
+///   real head of its day and saved a mark far above it, so the blocks
+///   from there up to `head` now were never read. Clamping it to `head`
+///   would mark them read and hide any transfer in them from every later
+///   routine scan (a batch bought in that gap would never be rediscovered);
+///   its transfers can't anchor a mark either, since the lying RPC may
+///   have answered for blocks that only exist now;
 /// - read beyond `head` but within `bound`: either the scan or `head` is
 ///   wrong, and there's no telling which. Clamping would let a stale or
 ///   lying-low head drop known transfers and save the truncated scan, so
 ///   the pass is refused instead, until the head is past the scan again
 ///   or a full rescan ([`rescan_transfer_history`], which doesn't check
 ///   the scan it replaces) reads the history anew.
-fn fit_to_head(mut scan: TransferScan, head: u64, bound: u64) -> Result<TransferScan, RpcError> {
+fn fit_to_head(
+    scan: TransferScan,
+    head: u64,
+    bound: u64,
+) -> Result<Option<TransferScan>, RpcError> {
     if scan.scanned_through <= head {
-        return Ok(scan);
+        return Ok(Some(scan));
     }
     if scan.scanned_through <= bound {
         return Err(RpcError::Rpc(format!(
@@ -158,21 +166,14 @@ fn fit_to_head(mut scan: TransferScan, head: u64, bound: u64) -> Result<Transfer
             scan.scanned_through
         )));
     }
-    let through = head.saturating_sub(RESCAN_TAIL);
     tracing::warn!(
         target: "ant_chain",
         saved_through = scan.scanned_through,
         head,
-        clamped_to = through,
         "saved transfer scan reaches past any plausible chain head (an RPC lied about it); \
-         clamping it, and re-confirming the history before trusting a \"none\"",
+         dropping it and reading the history again from the xBZZ deploy block",
     );
-    scan.scanned_through = through;
-    scan.transfers.retain(|t| t.block <= through);
-    scan.confirmed_through = None;
-    scan.provisional_through = scan.provisional_through.map(|p| p.min(through));
-    scan.confirmed_above = None;
-    Ok(scan)
+    Ok(None)
 }
 
 /// Version of the persisted [`TransferScan`] file. Version 1 wasn't keyed
@@ -1229,7 +1230,7 @@ async fn update_transfer_scan(
         // A full rescan never reads the saved scan, only replaces it: it
         // is the way out of one the head can't be checked against.
         Some(s) if mode == ScanMode::Full => Some(s),
-        Some(s) => Some(fit_to_head(s, head, bound)?),
+        Some(s) => fit_to_head(s, head, bound)?,
     };
     // Only a full rescan replaces the saved scan wholesale; a confirming
     // re-read only rewinds it to its confirmed mark, which its progress
@@ -1279,7 +1280,7 @@ async fn update_transfer_scan(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&partial_key)
-            .and_then(|p| fit_to_head(p, head, bound).ok()),
+            .and_then(|p| fit_to_head(p, head, bound).ok().flatten()),
         // Drop what the routine scans read above the confirmed mark; the
         // scan below reads those blocks again — including any read only
         // from the unverified source, which this pass reads verified.
@@ -2781,19 +2782,21 @@ mod tests {
     }
 
     /// A scan an earlier build saved after trusting a lying head (marks
-    /// near `u64::MAX`) is clamped to the real head on load, so the scan
-    /// sees new blocks again; its confirmed mark is dropped, so a
-    /// confirming check reads the history once more before a "none" may
-    /// lead to a deploy.
+    /// near `u64::MAX`) is dropped on load and the history read again from
+    /// the xBZZ deploy block, so the scan sees new blocks again. It isn't
+    /// clamped to the real head: the lying pass never read the blocks
+    /// between the real head of its day and now, and a transfer there (here
+    /// at `HEAD - 50_000`, absent from the poisoned file) would otherwise
+    /// stay hidden from every routine scan.
     #[tokio::test]
-    async fn a_saved_scan_beyond_the_head_is_clamped() {
+    async fn a_saved_scan_beyond_the_bound_is_read_again() {
         let chain = std::sync::Arc::new(GrowingChain::default());
         chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
-        chain
-            .transfers
-            .lock()
-            .unwrap()
-            .push(to_cb(HEAD - 100, [5; 32]));
+        chain.transfers.lock().unwrap().extend([
+            to_cb(45_000_000, [1; 32]),
+            to_cb(HEAD - 50_000, [4; 32]),
+            to_cb(HEAD - 100, [5; 32]),
+        ]);
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let dir = scratch_dir("scan-poisoned");
         let poisoned = u64::MAX - RESCAN_TAIL;
@@ -2815,19 +2818,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
-        assert_eq!(scan.confirmed_through, None);
         assert_eq!(
-            *chain.ranges.lock().unwrap(),
-            vec![(HEAD - RESCAN_TAIL + 1, HEAD)],
-            "the blocks since the clamped mark are read"
+            chain.ranges.lock().unwrap()[0].0,
+            GNOSIS_XBZZ_DEPLOY_BLOCK,
+            "the history is read again from the deploy block"
         );
         let blocks: Vec<u64> = scan.transfers.iter().map(|t| t.block).collect();
-        assert_eq!(blocks, vec![45_000_000, HEAD - 100]);
+        assert_eq!(
+            blocks,
+            vec![45_000_000, HEAD - 50_000, HEAD - 100],
+            "the transfer in the never-read gap is found, the bogus one is gone"
+        );
+        // Read from the deploy block in one pass, so it is confirmed again.
+        assert_eq!(scan.confirmed_through, Some(scan.scanned_through));
         let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
-        assert_eq!(saved.scanned_through, HEAD - RESCAN_TAIL);
-        assert_eq!(saved.confirmed_through, None);
+        assert_eq!(saved, scan);
 
         // And new blocks are seen again.
+        chain.ranges.lock().unwrap().clear();
         chain
             .head
             .store(HEAD + 1_000, std::sync::atomic::Ordering::SeqCst);
@@ -2839,6 +2847,10 @@ mod tests {
         let next = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
             .await
             .unwrap();
+        assert_eq!(
+            *chain.ranges.lock().unwrap(),
+            vec![(HEAD - RESCAN_TAIL + 1, HEAD + 1_000)]
+        );
         assert_eq!(next.scanned_through, HEAD + 1_000 - RESCAN_TAIL);
         assert!(next.transfers.iter().any(|t| t.block == HEAD + 500));
         std::fs::remove_dir_all(&dir).ok();
