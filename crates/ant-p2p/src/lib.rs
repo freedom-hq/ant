@@ -1,8 +1,9 @@
-//! libp2p host (TCP + DNS, Noise, Yamux, Identify, Ping) and Swarm `/swarm/handshake/14.0.0/handshake`.
+//! libp2p host (TCP, DNS with the `dnsaddr` feature, Noise, Yamux, Identify, Ping) and Swarm `/swarm/handshake/14.0.0/handshake`.
 
 mod behaviour;
 mod bounded_close;
 mod dial;
+#[cfg(feature = "dnsaddr")]
 pub mod dnsaddr;
 mod handshake;
 mod liveness;
@@ -36,10 +37,13 @@ pub use pushsync_swap::{
 };
 pub use routing::{proximity, RoutingTable, NUM_BINS, OVERLAY_LEN};
 
+#[cfg(feature = "dnsaddr")]
 use libp2p::multiaddr::Multiaddr;
 
 /// Default mainnet bootnodes, matching upstream `bee` >= 2.7
-/// (`/dnsaddr/mainnet.ethswarm.org` is the only published entry).
+/// (`/dnsaddr/mainnet.ethswarm.org` is the only published entry). Needs
+/// the `dnsaddr` feature: without it a `/dnsaddr/` bootnode is refused.
+#[cfg(feature = "dnsaddr")]
 #[must_use]
 pub fn default_mainnet_bootnodes() -> Vec<Multiaddr> {
     ["/dnsaddr/mainnet.ethswarm.org"]

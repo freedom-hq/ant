@@ -21,6 +21,8 @@
    8. `cargo deny check advisories bans licenses sources` (the separate
       `cargo-deny` job; install with `cargo install cargo-deny --version 0.22.0 --locked`
       or the release binary the job uses)
+   9. `cargo clippy -p ant-p2p -p ant-node --no-default-features --all-targets -- -D warnings`
+   10. `cargo test -p ant-p2p --no-default-features --lib`
  Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
  (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
  off by default, so the whole-workspace step 2 never compiles them — they
@@ -33,6 +35,9 @@
  take the fix with `cargo update -p <crate>` when a compatible one
  exists, otherwise add a narrow `ignore` entry to `deny.toml`: one advisory ID,
  with the reason and what removes it (the tracking issue, if any).
+ Steps 9 and 10 are the reverse case of step 7: nothing in the workspace
+ turns `ant-p2p`'s default-on `dnsaddr` feature off, so only they build
+ ant without DNS.
  Never merge to `main` (or push a branch you expect to be merged) with a
  known-red gate. Toolchain upgrades can introduce new `clippy`/`rustfmt`
  findings on untouched code — fix those too (the gate is whole-repo, not
