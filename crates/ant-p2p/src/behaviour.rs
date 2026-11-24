@@ -1619,11 +1619,8 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     // outbound dial — e.g. a libp2p-internal redial or a stray
     // address book attempt — would otherwise pollute the
     // pipeline with `Failed` rows the operator never asked for.
-    let started = state.dial_started.remove(&p);
-    let started_unproven = state.dial_started_unproven.remove(&p);
+    let (started, started_unproven) = clear_dial_tracking(state, p);
     let was_tracked = started.is_some();
-    state.dialing.remove(&p);
-    state.dial_hint_addr.remove(&p);
     if was_tracked {
         record_swarm_failure(state, p);
     }
@@ -1646,6 +1643,16 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
     // already noops for unknown peers.
     peerstore.record_failure(&p);
+}
+
+/// Drop `p`'s in-flight dial markers. Returns its `dial_started` time and
+/// whether that start was unproven.
+fn clear_dial_tracking(state: &mut SwarmState, p: PeerId) -> (Option<Instant>, bool) {
+    let started = state.dial_started.remove(&p);
+    let started_unproven = state.dial_started_unproven.remove(&p);
+    state.dialing.remove(&p);
+    state.dial_hint_addr.remove(&p);
+    (started, started_unproven)
 }
 
 fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
@@ -9086,10 +9093,16 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            // A dial our own connection limits refused (the per-peer cap)
-            // says nothing about the peer: don't back it off for it.
-            if let (Some(p), false) = (peer_id, matches!(error, DialError::Denied { .. })) {
-                note_outgoing_dial_error(state, peerstore, p);
+            if let Some(p) = peer_id {
+                if matches!(error, DialError::Denied { .. }) {
+                    // Our own connection limits refused it (the per-peer
+                    // cap): that says nothing about the peer, so end the
+                    // dial without backing the peer off or counting a
+                    // peerstore failure.
+                    clear_dial_tracking(state, p);
+                } else {
+                    note_outgoing_dial_error(state, peerstore, p);
+                }
             }
             // Bootnode dial failures are noisy during rotation; demote to
             // debug once we're past the cold start (peer set > 0).
@@ -13749,11 +13762,89 @@ mod tests {
         assert_eq!(listener.network_info().num_peers(), 1);
     }
 
-    /// The production per-peer cap leaves room for our own dial next to a
-    /// peer's inbound connection (it counts both directions).
-    #[test]
-    fn per_peer_cap_leaves_room_for_our_dial() {
+    /// The production limits cap one peer's connections: a fourth inbound
+    /// connection from the same peer is refused. The cap counts both
+    /// directions, so it must leave room for our own dial next to a
+    /// peer's inbound connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_limits_cap_connections_per_peer() {
         const { assert!(MAX_CONNECTIONS_PER_PEER >= 2) };
+        let mut listener = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
+        let addr = listening(&mut listener).await;
+        let mut dialer = build_swarm_with_limits(
+            Keypair::generate_ed25519(),
+            &FAST_LIVENESS,
+            libp2p::connection_limits::ConnectionLimits::default(),
+        )
+        .unwrap();
+        let tries = MAX_CONNECTIONS_PER_PEER + 1;
+        for _ in 0..tries {
+            dialer.dial(addr.clone()).unwrap();
+        }
+        drive(dialer);
+        let (mut established, mut denied) = (0, 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while established + denied < tries {
+            let ev = tokio::time::timeout_at(deadline, listener.select_next_some())
+                .await
+                .expect("listener saw every connection attempt");
+            match ev {
+                SwarmEvent::ConnectionEstablished { .. } => established += 1,
+                SwarmEvent::IncomingConnectionError {
+                    error: libp2p::swarm::ListenError::Denied { cause },
+                    ..
+                } => {
+                    assert!(cause
+                        .downcast::<libp2p::connection_limits::Exceeded>()
+                        .is_ok());
+                    denied += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((established, denied), (MAX_CONNECTIONS_PER_PEER, 1));
+    }
+
+    /// A dial our own limits deny ends the dial (the peer leaves
+    /// `dialing`, so it can be dialed again) without backing the peer off.
+    #[tokio::test]
+    async fn denied_dial_is_cleared_but_not_charged() {
+        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
+        let mut state = test_state();
+        // Connectivity up, so an ordinary failure would be charged.
+        state.bzz_peers.insert(pid());
+        state.liveness = Liveness::new(FAST_LIVENESS, Instant::now());
+        let mut control = swarm.behaviour().stream.new_control();
+        let hs = HandshakeParams {
+            local_peer_id: *swarm.local_peer_id(),
+            signing_secret: [7u8; SECP256K1_SECRET_LEN],
+            overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+            network_id: 1,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let mut peerstore = PeerStore::disabled();
+        let peer = pid();
+        state.dialing.insert(peer);
+        state.note_dial_started(peer);
+        handle_swarm_event(
+            &mut swarm,
+            &mut state,
+            None,
+            &mut control,
+            &hs,
+            &result_tx,
+            &mut peerstore,
+            SwarmEvent::OutgoingConnectionError {
+                connection_id: ConnectionId::new_unchecked(1),
+                peer_id: Some(peer),
+                error: DialError::Denied {
+                    cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("limit")),
+                },
+            },
+        );
+        assert!(!state.dialing.contains(&peer));
+        assert!(!state.dial_started.contains_key(&peer));
+        assert!(!state.dial_backoff.contains_key(&peer));
     }
 
     /// Run the real sinks on a node with `gate`, connect a remote, open a
