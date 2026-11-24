@@ -3903,7 +3903,9 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// live (issue #176). `config_json` is the [`publisher::PublisherConfig`]
 /// the broadcast would start with (only its `batch_id`, `format`,
 /// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
-/// counts everything a segment carries, so a host adds its audio rate);
+/// counts everything a segment carries, so a host adds its audio rate; a
+/// `segment_ms` or `bitrate_kbps` past what [`ant_publisher_start`]
+/// accepts is estimated at that bound);
 /// `plan_json` is the plan as [`ant_storage_status`] reports it (its
 /// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
 /// `usable` and `propagating` are read; pass `usable` through, since a

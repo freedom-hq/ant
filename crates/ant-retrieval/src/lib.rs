@@ -115,7 +115,8 @@ pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushCredit, PushCreditAction, PushsyncSettlement};
 pub use rs::{fetch_root_with_replicas, replica_addresses, REPLICAS_OWNER, REPLICA_COUNTS};
 pub use rs_encode::{
-    replica_chunks, split_bytes_with_redundancy, RedundantSplitResult, RedundantSplitter,
+    redundant_chunk_count, replica_chunks, split_bytes_with_redundancy, RedundantSplitResult,
+    RedundantSplitter,
 };
 pub use shallow_neighbourhoods::ShallowNeighbourhoods;
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};

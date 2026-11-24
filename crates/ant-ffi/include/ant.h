@@ -1473,7 +1473,9 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * live (issue #176). `config_json` is the publisher config the broadcast
  * would start with (its "batch_id", "format", "bitrate_kbps",
  * "segment_ms" and "ladder" are read; "bitrate_kbps" counts everything a
- * segment carries, so a host adds its audio rate); `plan_json` is the
+ * segment carries, so a host adds its audio rate; a "segment_ms" over
+ * 60000 or "bitrate_kbps" over 100000, which ant_publisher_start
+ * refuses, is estimated at that bound); `plan_json` is the
  * plan as ant_storage_status reports it (its "enabled", "batch_id",
  * "immutable", "worst_case_remaining_chunks", "usable" and "propagating"
  * are read; pass "usable" through, since a missing one reads as true and
@@ -1536,15 +1538,15 @@ char *ant_publisher_capacity(const char *config_json,
  *     "topic":           "0x<64 hex>",            // or raw topic bytes
  *     "format":          "bzz",                   // or "solar-punk"; see above
  *     "start_index":     0,                       // override: exact first feed index; see below
- *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
+ *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address; no whitespace or control characters
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
- *     "segment_ms":      2000,                    // nominal segment duration
- *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition
+ *     "segment_ms":      2000,                    // nominal segment duration; 1..60000
+ *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition; at most 100000
  *     "max_in_flight":   4,                       // measured stable window
  *     "max_backlog":     4,                       // drop-oldest past this
  *     "playlist_window": 64,                      // most segments listed; 4096 bytes binds first
  *     "notes":           "iPhone 15 Pro / LTE",
- *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default)
+ *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default); at most 86400000 (a day)
  *     "ladder":          true,                       // master playlist + ladder time markers; false (default)
  *     "width":           640,                        // the starting size (catalog rung, master RESOLUTION); ant_publisher_set_rendition changes it
  *     "height":          360,
