@@ -916,9 +916,16 @@ fn safe_output_name(filename_hint: Option<&str>) -> &str {
 /// replaces what is already there: an existing file (or any symlink,
 /// even a dangling one) of that name is refused, so a manifest can't
 /// silently overwrite a user's file or write through a link the user
-/// didn't make. `force` allows overwriting an existing regular file but
-/// still refuses a symlink. An explicit file path is the user's own
-/// choice and is written as given, as before.
+/// didn't make. `force` allows overwriting an existing regular file and
+/// nothing else: the target is opened without following a symlink
+/// (`O_NOFOLLOW`, so a link swapped in after any check is still refused)
+/// and without blocking (`O_NONBLOCK`, so a FIFO can't hang us), and the
+/// opened handle must be a regular file before it is truncated, so a
+/// FIFO, device node or directory is refused too. A file this call
+/// created is removed again if writing it fails, so a failed get (disk
+/// full) doesn't leave a truncated file that the retry then refuses to
+/// overwrite. An explicit file path is the user's own choice and is
+/// written as given, as before.
 fn write_output(
     out: Option<&Path>,
     filename_hint: Option<&str>,
@@ -936,16 +943,27 @@ fn write_output(
         // callers do `antctl get bzz://<ref>/ -o ./` and end up with
         // `./index.html` automatically.
         let target = p.join(safe_output_name(filename_hint));
+        let refuse_link = || {
+            anyhow!(
+                "refusing to write {}: it is a symlink (pass an explicit file path with -o to choose the destination)",
+                target.display()
+            )
+        };
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true);
         if force {
-            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
-                bail!(
-                    "refusing to write {}: it is a symlink (pass an explicit file path with -o to choose the destination)",
-                    target.display()
-                );
+            // Truncation happens below, only once the opened handle is
+            // known to be a regular file.
+            opts.create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
-            opts.create(true).truncate(true);
+            #[cfg(not(unix))]
+            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(refuse_link());
+            }
         } else {
             // `create_new` is O_CREAT|O_EXCL: it fails on any existing
             // entry, symlinks included, without following them.
@@ -957,12 +975,43 @@ fn write_output(
                 "refusing to overwrite existing {} (pass --force to replace a regular file, or an explicit file path with -o)",
                 target.display()
             ),
+            // `O_NOFOLLOW` on a symlink fails with ELOOP.
+            #[cfg(unix)]
+            Err(e) if force && e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(refuse_link());
+            }
+            // A FIFO with no reader, opened `O_NONBLOCK` for writing.
+            #[cfg(unix)]
+            Err(e) if force && e.raw_os_error() == Some(libc::ENXIO) => bail!(
+                "refusing to write {}: it is not a regular file",
+                target.display()
+            ),
             Err(e) => {
                 return Err(e).with_context(|| format!("write to {}", target.display()));
             }
         };
-        file.write_all(data)
-            .with_context(|| format!("write to {}", target.display()))?;
+        if force {
+            let meta = file
+                .metadata()
+                .with_context(|| format!("stat {}", target.display()))?;
+            if !meta.is_file() {
+                bail!(
+                    "refusing to write {}: it is not a regular file",
+                    target.display()
+                );
+            }
+            file.set_len(0)
+                .with_context(|| format!("truncate {}", target.display()))?;
+        }
+        if let Err(e) = file.write_all(data) {
+            drop(file);
+            if !force {
+                // We created this file (`create_new`); don't leave a
+                // partial one behind for the retry to trip over.
+                let _ = std::fs::remove_file(&target);
+            }
+            return Err(e).with_context(|| format!("write to {}", target.display()));
+        }
         return Ok(Some(target));
     }
     io::stdout().lock().write_all(data)?;
@@ -2359,7 +2408,7 @@ fn parse_reference_with_mode(
 /// line. The caller decides whether progress makes sense (TTY check,
 /// `--json`, single-chunk fetches, etc.) so this function can stay
 /// focused on plumbing.
-// Nine args is two over clippy's preferred ceiling, but every one of
+// Ten args is three over clippy's preferred ceiling of seven, but every one of
 // them is a CLI-driven knob with a distinct meaning, and bundling them
 // into a struct just for clippy would obscure the call site below.
 #[allow(clippy::too_many_arguments)]
@@ -3488,6 +3537,80 @@ mod tests {
         }
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         assert!(!dangling_target.exists(), "dangling symlink was followed");
+    }
+
+    /// `--force` replaces a regular file only: a FIFO must be refused
+    /// without blocking (no reader is ever attached here, so a blocking
+    /// open would hang the test), and a directory is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_force_refuses_non_regular_files() {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let tmp = TempDir::new("write-output-special");
+        let dir = &tmp.0;
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        for name in ["pipe", "sub"] {
+            let err = write_output(Some(dir), Some(name), true, b"evil").unwrap_err();
+            assert!(
+                err.to_string().contains("refusing") || format!("{err:#}").contains("directory"),
+                "{name}: {err:#}"
+            );
+        }
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert!(dir.join("sub").is_dir());
+
+        // The same FIFO with a reader attached opens fine, and is still
+        // refused by the regular-file check rather than written to.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let err = write_output(Some(dir), Some("pipe"), true, b"evil").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err:#}");
+    }
+
+    /// A write that fails partway (here: past `RLIMIT_FSIZE`, standing in
+    /// for a full disk) must not leave a partial file of its own behind,
+    /// or the retry refuses to overwrite it. `setrlimit` is per process,
+    /// so the failing write runs in a child copy of this test binary.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_removes_a_partial_file_it_created() {
+        const CHILD: &str = "ANTCTL_TEST_FSIZE_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let lim = libc::rlimit {
+                    rlim_cur: 4,
+                    rlim_max: 4,
+                };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lim), 0);
+            }
+            let err = write_output(Some(&dir), Some("big.bin"), false, &[7u8; 4096]).unwrap_err();
+            assert!(format!("{err:#}").contains("write to"), "{err:#}");
+            assert!(!dir.join("big.bin").exists(), "partial file left behind");
+            return;
+        }
+        let tmp = TempDir::new("write-output-partial");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::write_output_removes_a_partial_file_it_created",
+            ])
+            .env(CHILD, &tmp.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child: {status}");
+        assert!(!tmp.0.join("big.bin").exists());
     }
 
     /// Every argument that can carry a secret (a private key, or an RPC
