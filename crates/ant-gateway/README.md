@@ -60,7 +60,7 @@ land, and an HTTP client disconnect cancels the upstream retrieval task.
   above that the Range header is ignored and the full body streams as
   a `200`.
 
-`GATEWAY_MAX_FILE_BYTES` (1 GiB) caps the per-request total size so a
+`GATEWAY_MAX_FILE_BYTES` (16 GiB) caps the per-request total size so a
 malicious manifest claiming a multi-terabyte span is refused before any
 allocation. See PLAN.md Appendix E for the full design.
 
