@@ -5803,6 +5803,63 @@ mod tests {
         std::net::TcpListener::bind(addr).expect("port is free after the second stop");
     }
 
+    /// A keep-alive connection opened before `ant_stop_gateway` must not
+    /// outlive the stop: axum serves each connection on its own task, so
+    /// it would otherwise keep answering through the old router (old
+    /// CORS list, old allowed hosts) after a restart with new settings.
+    #[test]
+    fn gateway_stop_closes_open_keep_alive_connections() {
+        use std::io::{Read, Write};
+        let h = gateway_test_handle("gw-stop-keepalive");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        let request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                       Origin: https://app.example\r\n\r\n";
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("first response");
+        let first = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+        assert!(first.starts_with("http/1.1 200"), "{first}");
+        assert!(
+            first.contains("access-control-allow-origin: https://app.example"),
+            "{first}"
+        );
+
+        // Stop closes the idle connection (dropping the serve future
+        // starts hyper's graceful shutdown on every connection task, a
+        // scheduler hop after stop returns): the old socket reads EOF.
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("unexpected bytes after stop: {:?}", &buf[..n]),
+            Err(e) => assert!(
+                e.kind() == std::io::ErrorKind::ConnectionReset,
+                "old connection not closed after stop: {e}"
+            ),
+        }
+
+        // Narrow the CORS list across a restart on the same port.
+        set_cors(&raw const h, &[]).expect("clear cors");
+        start_gateway_on(&h, addr).expect("restart on the same port");
+
+        // The old connection is gone: a second request on it gets no
+        // answer from the old router (EOF, or a reset/broken pipe).
+        let _ = stream.write_all(request.as_bytes());
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+        let rest = String::from_utf8_lossy(&rest).to_ascii_lowercase();
+        assert!(
+            !rest.contains("http/1.1"),
+            "a pre-stop keep-alive connection answered after the restart:\n{rest}"
+        );
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+    }
+
     #[test]
     fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
         let h = gateway_test_handle("gw-cors-bad-input");

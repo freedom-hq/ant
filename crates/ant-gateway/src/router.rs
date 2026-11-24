@@ -34,8 +34,8 @@ const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 /// Build the production [`axum::Router`] from a [`GatewayHandle`].
 ///
 /// Public so integration tests can mount it without standing up a
-/// listener; the binary code in [`crate::Gateway::serve`] uses the same
-/// builder.
+/// listener; [`crate::Gateway::serve_listener`] (behind
+/// [`crate::Gateway::serve`] and ant-ffi's gateway) uses the same builder.
 pub fn build(handle: GatewayHandle) -> Router {
     let spend_guard =
         middleware::from_fn_with_state(handle.clone(), crate::cors::wallet_spend_guard);

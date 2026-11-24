@@ -95,11 +95,14 @@ use std::net::SocketAddr;
 #[cfg(feature = "http-api")]
 use thiserror::Error;
 
-/// Errors raised by [`Gateway::serve`].
+/// Errors raised by [`Gateway::serve`] and [`Gateway::serve_listener`].
 ///
-/// `Bind` and `Serve` are kept distinct so a startup failure (port already
-/// in use) shows up differently from a runtime failure (hyper graceful
-/// shutdown error after a long uptime).
+/// `Bind` (only from [`Gateway::serve`], which binds for the caller) is
+/// kept distinct from `Serve` so a port already in use shows up
+/// differently from a failure on a listener that did bind: reading its
+/// local address at startup, or a hyper error after a long uptime. An
+/// embedder that binds itself ([`Gateway::serve_listener`]) reports its
+/// own bind error.
 #[cfg(feature = "http-api")]
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -114,8 +117,8 @@ pub enum GatewayError {
 }
 
 /// HTTP gateway entry point. Holds no state of its own; everything is
-/// driven by the [`GatewayHandle`] passed to [`Gateway::serve`], which
-/// owns the live status receiver and the command sender into the node
+/// driven by the [`GatewayHandle`] passed to [`Gateway::serve`] or
+/// [`Gateway::serve_listener`], which owns the live status receiver and the command sender into the node
 /// loop.
 #[cfg(feature = "http-api")]
 pub struct Gateway;
@@ -142,7 +145,10 @@ impl Gateway {
     }
 
     /// Serve the bee-shaped HTTP API on a listener the caller already
-    /// bound, until it errors. Same as [`Gateway::serve`] otherwise.
+    /// bound, until it errors. Same as [`Gateway::serve`] otherwise:
+    /// this is where the `allowed-hosts` policy is resolved against the
+    /// real bound address and the non-loopback / `null`-origin warnings
+    /// are logged, for both entry points.
     ///
     /// For an embedder that must report a bind failure synchronously
     /// (ant-ffi's `ant_start_gateway`): it binds once, up front, and

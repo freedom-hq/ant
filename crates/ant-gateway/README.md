@@ -348,6 +348,12 @@ Gateway::serve(handle, addr).await?;
 # Ok(()) }
 ```
 
+An embedder that must hold the port from the moment it reports success
+(ant-ffi's `ant_start_gateway`) binds a `tokio::net::TcpListener` itself
+and passes it to `Gateway::serve_listener(handle, listener)` instead;
+`Gateway::serve` is a bind followed by that call, so both resolve the
+`allowed-hosts` policy against the real bound address the same way.
+
 Embedders that don't want the HTTP surface (most importantly the
 `ant-ffi` mobile artefact) compile this crate with default features
 disabled — the `http-api` feature is the only thing that pulls in

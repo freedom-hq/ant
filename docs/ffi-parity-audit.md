@@ -33,7 +33,7 @@ Stamps are bought **only** through the gateway: `POST /stamps/{amount}/{depth}` 
 
 | Status | Meaning |
 |---|---|
-| **shared** | Implemented in a shared crate. Both entry points get it just by running `run_node` or `Gateway::serve`, or by calling the same helper. |
+| **shared** | Implemented in a shared crate. Both entry points get it just by running `run_node` or `Gateway::serve`/`Gateway::serve_listener` (ant-ffi uses the latter), or by calling the same helper. |
 | **ported** | ant-ffi has its own implementation that mirrors antd's. It can drift. |
 | **host** | ant-ffi exposes it as an FFI call the host must make; the call is named. |
 | **missing** | antd does it and ant-ffi has no equivalent. |
