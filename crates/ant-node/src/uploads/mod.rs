@@ -844,12 +844,15 @@ struct JobHandle {
 }
 
 /// Of several on-disk manifests for one job (a pre-#292 `<prefix>.json`
-/// next to `<job_id>.json`), the one to keep: the most recently updated,
-/// with ties going to the full-id file. A prefix copy holds the status a
-/// `pause`/`resume`/`cancel` set, the full-id copy the driver's
-/// checkpoints; whichever was written last is the job's latest state
-/// (an older cursor only means re-pushing a few chunks). Returns the kept
-/// path and manifest plus every other path.
+/// next to `<job_id>.json`), the one to keep: the most recently updated.
+/// A prefix copy holds the status a `pause`/`resume`/`cancel` set, the
+/// full-id copy the driver's checkpoints; whichever was written last is
+/// the job's latest state (an older cursor only means re-pushing a few
+/// chunks). `last_update_unix` is in whole seconds, so a prefix `cancel`
+/// and the driver's last checkpoint can tie: a tie goes to the copy that
+/// doesn't restart the job (never resurrect a pause or cancel), then to
+/// the full-id file. Returns the kept path and manifest plus every other
+/// path.
 fn pick_manifest(
     canonical: &Path,
     mut copies: Vec<(PathBuf, UploadJobInfo)>,
@@ -857,7 +860,13 @@ fn pick_manifest(
     let best = copies
         .iter()
         .enumerate()
-        .max_by_key(|(_, (path, info))| (info.last_update_unix, path.as_path() == canonical))
+        .max_by_key(|(_, (path, info))| {
+            (
+                info.last_update_unix,
+                !info.wants_driver(),
+                path.as_path() == canonical,
+            )
+        })
         .map(|(i, _)| i)
         .expect("at least one manifest per job");
     let (kept_path, kept) = copies.swap_remove(best);
@@ -1361,6 +1370,11 @@ impl UploadManager {
     /// memory but not restarted, so `antctl upload list` still
     /// shows them.
     ///
+    /// Manifests a pre-#292 build left under an id prefix
+    /// (`<prefix>.json` beside `<job_id>.json`) are folded into one per
+    /// job (see [`pick_manifest`]) and the strays deleted, so a job
+    /// never gets two handles or two drivers.
+    ///
     /// `auto_resume` controls whether `Running`/`Pending` jobs
     /// found on disk get a fresh driver task. Operators who want
     /// to inspect state before re-engaging the network can pass
@@ -1462,9 +1476,7 @@ impl UploadManager {
             // Auto-resume also restarts jobs the *system* paused
             // (`auto_paused` — the app was suspended mid-upload and
             // never woke), but never a user pause.
-            let needs_restart =
-                matches!(info.status, UploadStatus::Running | UploadStatus::Pending)
-                    || (info.status == UploadStatus::Paused && info.auto_paused);
+            let needs_restart = info.wants_driver();
             let (progress_tx, _rx) = watch::channel(info.clone());
             let handle = Arc::new(JobHandle {
                 info: Mutex::new(info),
@@ -2091,8 +2103,9 @@ impl UploadManager {
     /// Start a driver task for `handle`. If an earlier driver is still
     /// in the slot, the new task waits for it to exit first, so two
     /// drivers never stamp and checkpoint the same job at once — and
-    /// skips running if the earlier one left the job terminal (it
-    /// finished the upload, failed, or was cancelled meanwhile).
+    /// skips running if the job is then terminal (the earlier driver
+    /// finished, failed or was cancelled meanwhile) or `Paused` again
+    /// (a pause landed after the resume that spawned this one).
     fn spawn_driver(&self, handle: Arc<JobHandle>) {
         let mgr = self.clone();
         let task_handle = handle.clone();
@@ -2118,9 +2131,11 @@ impl UploadManager {
                     "upload driver returned error: {e}",
                 );
                 // The one place a driver error marks the job `Failed`:
-                // `run_job` only returns it. While `run_job` is still
-                // returning, this driver counts as alive, so a resume
-                // can't land in between and be undone by this write.
+                // `run_job` only returns it, so a resume that sees the
+                // `Failed` status (and spawns a new driver) can't be
+                // undone by a second write here. Until this mark the
+                // driver counts as alive, so a resume of a still-`Running`
+                // job is a no-op rather than a second driver.
                 mgr.mark_failed(&task_handle, e.to_string());
             }
         });
@@ -5775,6 +5790,15 @@ mod tests {
             (
                 Some(job("cccccccccccccccc", UploadStatus::Running, 100)),
                 vec![job("cccccccccccccccc", UploadStatus::Cancelled, 200)],
+                UploadStatus::Cancelled,
+                0,
+            ),
+            // Same second (the real old-build sequence: a prefix
+            // `cancel`, the driver exiting without a checkpoint): the
+            // cancel wins, the job is not auto-resumed.
+            (
+                Some(job("eeeeeeeeeeeeeeee", UploadStatus::Running, 100)),
+                vec![job("eeeeeeeeeeeeeeee", UploadStatus::Cancelled, 100)],
                 UploadStatus::Cancelled,
                 0,
             ),
