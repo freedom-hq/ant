@@ -1158,14 +1158,23 @@ async fn pull_bin(
         // (the driver discards the position on an epoch change), and
         // only for a `topmost` that checks out against the peer's cursor.
         let key = (peer_id, bin);
-        let mut verdict = advance_position(&positions, key, epoch, start, page.topmost, cursor);
+        let mut verdict = advance_position(
+            &positions,
+            key,
+            epoch,
+            start,
+            page.topmost,
+            cursor,
+            TOPMOST_CURSOR_SLACK,
+        );
         if verdict == TopmostCheck::AboveCursor {
             // Past the cursor we last read: the bin may simply have grown
             // since. Re-read it (same reserve epoch) and check again.
             match pullsync::get_cursors(&mut control, peer_id).await {
                 Ok(c) if c.epoch == epoch => {
                     cursor = c.cursors.get(bin as usize).copied().unwrap_or(0);
-                    verdict = advance_position(&positions, key, epoch, start, page.topmost, cursor);
+                    verdict =
+                        advance_position(&positions, key, epoch, start, page.topmost, cursor, 0);
                 }
                 outcome => {
                     tracing::debug!(
@@ -1204,20 +1213,24 @@ enum TopmostCheck {
     /// `u64::MAX`: there is no next binID to pull from, and saving it
     /// would park every replacement puller above all real binIDs.
     AtMax,
-    /// More than [`TOPMOST_CURSOR_SLACK`] above the cursor given: re-read
-    /// the cursor and check again; still above a fresh cursor is a
-    /// protocol error.
+    /// More than the given slack above the cursor: with
+    /// [`TOPMOST_CURSOR_SLACK`] against the cursor read at spawn, re-read
+    /// it and check again with no slack; still above the fresh cursor is
+    /// a protocol error.
     AboveCursor,
 }
 
 /// Check a page's `topmost` against the `start` it was requested at and
 /// the peer's bin `cursor` (its highest binID in the bin, as last read).
-fn check_topmost(start: u64, topmost: u64, cursor: u64) -> TopmostCheck {
+/// `slack` is how far past `cursor` still counts as valid:
+/// [`TOPMOST_CURSOR_SLACK`] against a cursor read before the page, `0`
+/// against one re-read after it (an honest `topmost` is then at most it).
+fn check_topmost(start: u64, topmost: u64, cursor: u64, slack: u64) -> TopmostCheck {
     if topmost < start {
         TopmostCheck::BelowStart
     } else if topmost == u64::MAX {
         TopmostCheck::AtMax
-    } else if topmost > cursor.saturating_add(TOPMOST_CURSOR_SLACK) {
+    } else if topmost > cursor.saturating_add(slack) {
         TopmostCheck::AboveCursor
     } else {
         TopmostCheck::Advance(topmost + 1)
@@ -1234,8 +1247,9 @@ fn advance_position(
     start: u64,
     topmost: u64,
     cursor: u64,
+    slack: u64,
 ) -> TopmostCheck {
-    let verdict = check_topmost(start, topmost, cursor);
+    let verdict = check_topmost(start, topmost, cursor, slack);
     if let TopmostCheck::Advance(next) = verdict {
         positions
             .lock()
@@ -1495,7 +1509,7 @@ async fn sweep_bin(
         // the campaign retries (bounded by SWEEP_MAX_ATTEMPTS) instead of
         // counting the unswept rest of the window as covered. Nothing is
         // saved, so there is no cursor ceiling to check here.
-        match check_topmost(start, page.topmost, u64::MAX) {
+        match check_topmost(start, page.topmost, u64::MAX, 0) {
             TopmostCheck::Advance(next) => start = next,
             bad => {
                 tracing::warn!(
@@ -1768,28 +1782,31 @@ mod tests {
         let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
         let key = (PeerId::random(), 7);
         assert_eq!(
-            advance_position(&positions, key, 1, 100, 99, 1_000),
+            advance_position(&positions, key, 1, 100, 99, 1_000, TOPMOST_CURSOR_SLACK),
             TopmostCheck::BelowStart
         );
         assert_eq!(
-            advance_position(&positions, key, 1, 100, 0, 1_000),
+            advance_position(&positions, key, 1, 100, 0, 1_000, TOPMOST_CURSOR_SLACK),
             TopmostCheck::BelowStart
         );
         assert!(positions.lock().unwrap().is_empty());
 
         assert_eq!(
-            advance_position(&positions, key, 1, 100, 150, 1_000),
+            advance_position(&positions, key, 1, 100, 150, 1_000, TOPMOST_CURSOR_SLACK),
             TopmostCheck::Advance(151)
         );
         assert_eq!(positions.lock().unwrap().get(&key), Some(&(1, 151)));
         // A later bad page doesn't touch the saved position.
         assert_eq!(
-            advance_position(&positions, key, 1, 151, 150, 1_000),
+            advance_position(&positions, key, 1, 151, 150, 1_000, TOPMOST_CURSOR_SLACK),
             TopmostCheck::BelowStart
         );
         assert_eq!(positions.lock().unwrap().get(&key), Some(&(1, 151)));
         // `topmost == start` is a valid one-binID page.
-        assert_eq!(check_topmost(151, 151, 1_000), TopmostCheck::Advance(152));
+        assert_eq!(
+            check_topmost(151, 151, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::Advance(152)
+        );
     }
 
     /// `topmost = u64::MAX` (and anything else past the peer's cursor)
@@ -1800,13 +1817,32 @@ mod tests {
         let key = (PeerId::random(), 3);
         let cursor = 5_000;
         assert_eq!(
-            advance_position(&positions, key, 1, 10, u64::MAX, cursor),
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                u64::MAX,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
             TopmostCheck::AtMax
         );
         // Even against a cursor whose slack saturates at u64::MAX.
-        assert_eq!(check_topmost(10, u64::MAX, u64::MAX), TopmostCheck::AtMax);
         assert_eq!(
-            advance_position(&positions, key, 1, 10, u64::MAX - 1, cursor),
+            check_topmost(10, u64::MAX, u64::MAX, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::AtMax
+        );
+        assert_eq!(
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                u64::MAX - 1,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
             TopmostCheck::AboveCursor
         );
         assert_eq!(
@@ -1816,11 +1852,22 @@ mod tests {
                 1,
                 10,
                 cursor + TOPMOST_CURSOR_SLACK + 1,
-                cursor
+                cursor,
+                TOPMOST_CURSOR_SLACK
             ),
             TopmostCheck::AboveCursor
         );
+        // Re-checked against a cursor re-read after the page (no slack):
+        // anything above it is out, the cursor itself is fine.
+        assert_eq!(
+            advance_position(&positions, key, 1, 10, cursor + 1, cursor, 0),
+            TopmostCheck::AboveCursor
+        );
         assert!(positions.lock().unwrap().is_empty());
+        assert_eq!(
+            check_topmost(10, cursor, cursor, 0),
+            TopmostCheck::Advance(cursor + 1)
+        );
         // Within the slack (a bin that grew since the cursor read) is fine.
         assert_eq!(
             advance_position(
@@ -1829,7 +1876,8 @@ mod tests {
                 1,
                 10,
                 cursor + TOPMOST_CURSOR_SLACK,
-                cursor
+                cursor,
+                TOPMOST_CURSOR_SLACK
             ),
             TopmostCheck::Advance(cursor + TOPMOST_CURSOR_SLACK + 1)
         );
