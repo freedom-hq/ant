@@ -21,7 +21,9 @@
 //!   reverse proxy forwards. An entry without a port matches that name
 //!   on any port; `name:port` only that port. Browsers and proxies leave
 //!   a default port out of `Host`, so `name:443` and `name:80` also
-//!   match a bare `name`. `*` turns the check off.
+//!   match a bare `name`. IP literals match in any spelling
+//!   (`[fd00:0:0:0:0:0:0:1]` is `[fd00::1]`, `[::ffff:10.0.0.2]` is
+//!   `10.0.0.2`). `*` turns the check off.
 //! - A listener bound to a non-loopback address with no `allowed-hosts`
 //!   is not checked (clients reach it under names the node can't know);
 //!   [`crate::Gateway::serve`] warns at startup.
@@ -48,7 +50,8 @@ use crate::handle::GatewayHandle;
 pub struct HostPolicy {
     /// `*` was configured: no check at all.
     allow_all: bool,
-    /// Extra names (lowercased, no trailing dot; IPv6 without brackets)
+    /// Extra names (lowercased, no trailing dot; IP literals in canonical
+    /// form: IPv6 compressed and without brackets, IPv4-mapped as IPv4)
     /// and an optional port.
     hosts: Vec<(String, Option<u16>)>,
     /// The listener's local address, once known.
@@ -191,8 +194,9 @@ fn is_dns_name(s: &str) -> bool {
         })
 }
 
-/// Split a `Host` value into a lowercased host (IPv6 without brackets,
-/// one trailing dot dropped) and its port.
+/// Split a `Host` value into a lowercased host (one trailing dot
+/// dropped; an IP literal in canonical form, IPv6 without brackets) and
+/// its port.
 fn split_host_port(value: &str) -> Result<(String, Option<u16>), &'static str> {
     let v = value.trim().to_ascii_lowercase();
     let (host, port) = if let Some(rest) = v.strip_prefix('[') {
@@ -217,10 +221,15 @@ fn split_host_port(value: &str) -> Result<(String, Option<u16>), &'static str> {
         }
         Some(_) => return Err("bad port"),
     };
-    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
-    if host.parse::<IpAddr>().is_err() && !is_dns_name(&host) {
-        return Err("not a host name or IP literal");
-    }
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    // IP literals are compared in one spelling: `[fd00:0:0:0:0:0:0:1]`
+    // and `[fd00::1]` (what browsers send) are the same host, and so are
+    // `[::ffff:10.0.0.2]` and `10.0.0.2`.
+    let host = match host.parse::<IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) if is_dns_name(host) => host.to_string(),
+        Err(_) => return Err("not a host name or IP literal"),
+    };
     Ok((host, port))
 }
 
@@ -339,6 +348,28 @@ mod tests {
         assert!(!p.allows("node.lan"));
         assert!(p.allows("[fd00::1]:1633"));
         assert!(!p.allows("sub.vibing.at"));
+    }
+
+    #[test]
+    fn ip_literal_entries_match_any_spelling() {
+        let p = loopback(&[
+            "[fd00:0:0:0:0:0:0:1]",
+            "[FD00::2]:8080",
+            "[::ffff:10.0.0.2]",
+            "10.0.0.3",
+        ]);
+        assert!(p.allows("[fd00::1]:1633"));
+        assert!(p.allows("[fd00:0000::0001]"));
+        assert!(p.allows("[fd00::2]:8080"));
+        assert!(p.allows("[fd00:0:0:0:0:0:0:2]:8080"));
+        assert!(!p.allows("[fd00::2]:8081"));
+        assert!(p.allows("10.0.0.2:1633"));
+        assert!(p.allows("[::ffff:10.0.0.2]:1633"));
+        assert!(p.allows("[::ffff:10.0.0.3]"));
+        assert!(!p.allows("[fd00::3]"));
+        assert!(!p.allows("10.0.0.4"));
+        // A mapped loopback is loopback.
+        assert!(p.allows("[::ffff:127.0.0.1]:1633"));
     }
 
     #[test]
