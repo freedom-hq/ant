@@ -14,7 +14,7 @@ use libp2p::multiaddr::{Error as MultiaddrError, Multiaddr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use unsigned_varint::decode::Error as VarintError;
 
-const UNDERLAY_LIST_PREFIX: u8 = 0x99;
+pub(crate) const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 
 /// Maximum number of underlay addresses we will pack into a single
 /// serialized record. Matches bee 2.8 `maxUnderlaysPerPeer`.
@@ -37,6 +37,8 @@ pub enum UnderlayError {
     CountExceeded(usize),
     #[error("underlay bytes {0} exceed cap of {MAX_UNDERLAY_BYTES}")]
     ByteSizeExceeded(usize),
+    #[error("underlay list entry declares {0} bytes, more than remain")]
+    Truncated(u64),
 }
 
 /// Sort + truncate `addrs` to fit inside bee 2.8's count and byte
@@ -561,6 +563,12 @@ pub fn deserialize_underlays(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayErro
     Ok(vec![Multiaddr::try_from(data.to_vec())?])
 }
 
+/// Decode the body of a `0x99`-prefixed underlay list. Every length is
+/// peer-supplied, so the conversion, the end offset and the slice are all
+/// checked: a hostile varint (e.g. `u64::MAX`, or one that only wraps on
+/// `i + len`) is an error, never a panic (#279). An empty list is
+/// rejected like an empty underlay, so the handshake's observed-underlay
+/// peer-id check can't be skipped by sending a bare prefix.
 fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayError> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -570,14 +578,19 @@ fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, UnderlayError> {
         }
         let slice = &data[i..];
         let (len, rest) = unsigned_varint::decode::u64(slice)?;
-        let used = slice.len() - rest.len();
-        i += used;
-        let len = len as usize;
-        if data.len() < i + len {
-            return Err(UnderlayError::Empty);
-        }
-        out.push(Multiaddr::try_from(data[i..i + len].to_vec())?);
-        i += len;
+        i += slice.len() - rest.len();
+        let entry = usize::try_from(len)
+            .ok()
+            .and_then(|len| i.checked_add(len))
+            .and_then(|end| data.get(i..end).map(|entry| (entry, end)));
+        let Some((entry, end)) = entry else {
+            return Err(UnderlayError::Truncated(len));
+        };
+        out.push(Multiaddr::try_from(entry.to_vec())?);
+        i = end;
+    }
+    if out.is_empty() {
+        return Err(UnderlayError::Empty);
     }
     Ok(out)
 }
@@ -1003,5 +1016,85 @@ mod tests {
         }
         let err = deserialize_underlays(&buf).unwrap_err();
         matches!(err, UnderlayError::CountExceeded(_));
+    }
+
+    /// `0x99` + a varint list body, for the hostile-length cases below.
+    fn list_with_len(len: u64, body: &[u8]) -> Vec<u8> {
+        let mut buf = vec![UNDERLAY_LIST_PREFIX];
+        let mut enc = unsigned_varint::encode::u64_buffer();
+        buf.extend_from_slice(unsigned_varint::encode::u64(len, &mut enc));
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// #279: the audit's 11-byte payload, `0x99` + varint(`u64::MAX`).
+    /// Used to wrap `i + len` and panic on `data[10..9]`.
+    #[test]
+    fn deserialize_rejects_u64_max_length() {
+        let buf = list_with_len(u64::MAX, &[]);
+        assert_eq!(buf.len(), 11);
+        assert!(matches!(
+            deserialize_underlays(&buf),
+            Err(UnderlayError::Truncated(u64::MAX))
+        ));
+    }
+
+    /// #279: a length that only overflows on the `i + len` add, not in
+    /// the `u64 -> usize` conversion (`i` is the varint width).
+    #[test]
+    fn deserialize_rejects_length_that_wraps_on_add() {
+        for len in [usize::MAX, usize::MAX - 1, usize::MAX - 9] {
+            let buf = list_with_len(len as u64, &[0u8; 4]);
+            assert!(
+                matches!(
+                    deserialize_underlays(&buf),
+                    Err(UnderlayError::Truncated(l)) if l == len as u64
+                ),
+                "len {len}"
+            );
+        }
+    }
+
+    /// An entry that runs one byte past the end of the payload is an
+    /// error, and so is a valid entry followed by a truncated one.
+    #[test]
+    fn deserialize_rejects_entry_one_byte_short() {
+        let b = ma("/ip4/1.2.3.4/tcp/1634").to_vec();
+        let buf = list_with_len(b.len() as u64 + 1, &b);
+        assert!(matches!(
+            deserialize_underlays(&buf),
+            Err(UnderlayError::Truncated(_))
+        ));
+
+        let mut two =
+            serialize_underlays(&[ma("/ip4/1.2.3.4/tcp/1634"), ma("/ip4/5.6.7.8/tcp/1634")]);
+        two.pop();
+        assert!(matches!(
+            deserialize_underlays(&two),
+            Err(UnderlayError::Truncated(_))
+        ));
+    }
+
+    /// A bare list prefix decodes to no addresses — that is an empty
+    /// underlay, not `Ok(vec![])` (#279).
+    #[test]
+    fn deserialize_rejects_empty_list() {
+        assert!(matches!(
+            deserialize_underlays(&[UNDERLAY_LIST_PREFIX]),
+            Err(UnderlayError::Empty)
+        ));
+    }
+
+    #[test]
+    fn list_round_trip() {
+        let addrs = vec![ma("/ip4/1.2.3.4/tcp/1634"), ma("/ip6/::1/tcp/1634")];
+        let buf = serialize_underlays(&addrs);
+        assert_eq!(buf[0], UNDERLAY_LIST_PREFIX);
+        assert_eq!(deserialize_underlays(&buf).unwrap(), addrs);
+        let one = vec![ma("/ip4/1.2.3.4/tcp/1634")];
+        assert_eq!(
+            deserialize_underlays(&serialize_underlays(&one)).unwrap(),
+            one
+        );
     }
 }
