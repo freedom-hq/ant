@@ -3377,24 +3377,31 @@ async fn resolve_or_deploy_chequebook(
         chequebook_store::auto_deploy_chequebook(client, wallet, &node_eth, deposit, &persist_path)
             .await
     };
-    match deployed {
-        Ok(cb) => {
-            // Brand new, so it has issued no cheques: a lost outbound
-            // ledger on record doesn't apply to it (PR #126 R1-M3).
-            if let Err(e) =
-                ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
-            {
-                tracing::warn!(
-                    target: "ant-ffi",
-                    "new chequebook not fully recorded: {e}",
-                );
-            }
-            Ok(Resolution::Use(ResolvedChequebook {
-                address: cb,
-                deployed: true,
-                verified: true,
-            }))
+    // Brand new, so it has issued no cheques: a lost outbound ledger on
+    // record doesn't apply to it (PR #126 R1-M3). That holds too for one
+    // recorded unverified (`RecordedUnverified`): the next trigger adopts
+    // it from `chequebook.json` (`check_persisted_chequebook`), a path
+    // that never marks it fresh.
+    let fresh = match &deployed {
+        Ok(cb) => Some(*cb),
+        Err(e) => e.recorded_fresh(),
+    };
+    if let Some(cb) = fresh {
+        if let Err(e) =
+            ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
+        {
+            tracing::warn!(
+                target: "ant-ffi",
+                "new chequebook not fully recorded: {e}",
+            );
         }
+    }
+    match deployed {
+        Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
+            address: cb,
+            deployed: true,
+            verified: true,
+        })),
         Err(ChequebookError::InsufficientGas { need, .. }) => {
             tracing::warn!(
                 target: "ant-ffi",

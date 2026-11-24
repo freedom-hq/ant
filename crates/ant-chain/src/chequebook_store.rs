@@ -139,6 +139,34 @@ pub enum ChequebookError {
     #[cfg(feature = "chain-rpc")]
     #[error("deploy tx 0x{0} confirmed but emitted no SimpleSwapDeployed log")]
     NoDeployLog(String),
+    /// [`auto_deploy_chequebook`] deployed `chequebook` and recorded it in
+    /// `chequebook.json` unfunded, but couldn't read its checks back. It
+    /// is still a chequebook this deploy just made, so it has issued no
+    /// cheques: a caller must mark it fresh for the outbound ledger just
+    /// as on `Ok` (`ant_p2p::swap::note_fresh_chequebook`), or the next
+    /// trigger adopts it through the saved-chequebook path, which never
+    /// does, and a pre-section ledger's cumulatives (or a lost-ledger
+    /// marker) would apply to it. See [`ChequebookError::recorded_fresh`].
+    #[cfg(feature = "chain-rpc")]
+    #[error("{message}")]
+    RecordedUnverified {
+        chequebook: [u8; 20],
+        message: String,
+    },
+}
+
+impl ChequebookError {
+    /// The chequebook this error's deploy recorded, unverified
+    /// ([`ChequebookError::RecordedUnverified`]); `None` for every other
+    /// error, which recorded nothing.
+    #[must_use]
+    pub fn recorded_fresh(&self) -> Option<[u8; 20]> {
+        #[cfg(feature = "chain-rpc")]
+        if let ChequebookError::RecordedUnverified { chequebook, .. } = self {
+            return Some(*chequebook);
+        }
+        None
+    }
 }
 
 fn strip_0x(s: &str) -> &str {
@@ -1286,6 +1314,9 @@ pub async fn check_chequebook(
 ///   failing would have every later trigger deploy again with no bound.
 ///   The next trigger finds the record and runs its usual checks on
 ///   it, and [`top_up_chequebook`] re-verifies before any deposit.
+///   This is [`ChequebookError::RecordedUnverified`], which names the
+///   chequebook so the caller can mark it fresh for the outbound ledger
+///   exactly as on `Ok`.
 ///
 /// A gas pre-flight runs first: a deploy we can't pay for just burns a
 /// failed-tx wait, so an underfunded wallet surfaces as
@@ -1391,13 +1422,16 @@ pub async fn auto_deploy_chequebook(
                 "deployed chequebook could not be verified ({why}); recorded it unfunded so \
                  the next attempt checks it again instead of deploying another",
             );
-            return Err(ChequebookError::Chain(format!(
-                "could not verify the chequebook 0x{} deployed in tx 0x{} after {attempt} reads \
-                 ({why}); recorded it but did not fund it or turn settlement on (the next \
-                 attempt re-checks it before any deposit)",
-                hex::encode(cb),
-                hex::encode(receipt.tx_hash),
-            )));
+            return Err(ChequebookError::RecordedUnverified {
+                chequebook: cb,
+                message: format!(
+                    "could not verify the chequebook 0x{} deployed in tx 0x{} after {attempt} \
+                     reads ({why}); recorded it but did not fund it or turn settlement on (the \
+                     next attempt re-checks it before any deposit)",
+                    hex::encode(cb),
+                    hex::encode(receipt.tx_hash),
+                ),
+            });
         }
         if attempt >= DEPLOY_CHECK_ATTEMPTS {
             return Err(ChequebookError::Chain(format!(
@@ -3014,7 +3048,11 @@ mod tests {
                 tag,
             )
             .await;
-            let e = result.unwrap_err().to_string();
+            let e = result.unwrap_err();
+            // A recorded chequebook is named, so the caller marks it
+            // fresh for the outbound ledger as on `Ok`.
+            assert_eq!(e.recorded_fresh(), kept.then_some(CHEQUEBOOK), "{tag}: {e}");
+            let e = e.to_string();
             assert!(e.contains("could not verify"), "{tag}: {e}");
             assert_eq!(sent, ["deploy"], "{tag}: no deposit");
             assert_eq!(persisted, kept, "{tag}");
