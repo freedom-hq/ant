@@ -3143,16 +3143,27 @@ async fn resolve_chequebook(
         .await
     };
     wallet.note_deploy_attempt(&deployed);
+    // Brand new, so it has issued no cheques: a lost outbound ledger on
+    // record doesn't apply to it (PR #126 R1-M3). That holds too for one
+    // recorded unverified (`RecordedUnverified`): the next
+    // `resolve_chequebook` run adopts it from `chequebook.json` (step 2),
+    // a path that never marks it fresh. That run is either the next start
+    // or, in this same process, `SettlementOnBuy::enable` on a
+    // `POST /stamps` buy while settlement is off.
+    let fresh = match &deployed {
+        Ok(cb) => Some(*cb),
+        Err(e) => e.recorded_fresh(),
+    };
+    if let Some(cb) = fresh {
+        if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
+            tracing::warn!(
+                target: "antd",
+                "new chequebook not fully recorded: {e}",
+            );
+        }
+    }
     match deployed {
         Ok(cb) => {
-            // Brand new, so it has issued no cheques: a lost outbound
-            // ledger on record doesn't apply to it (PR #126 R1-M3).
-            if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
-                tracing::warn!(
-                    target: "antd",
-                    "new chequebook not fully recorded: {e}",
-                );
-            }
             // Freshly factory-deployed, so it's registered by construction
             // — skip the redundant `deployedContracts` round-trip.
             let pushsync = ant_p2p::PushsyncSwapConfig::new(

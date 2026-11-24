@@ -2998,9 +2998,11 @@ pub(crate) async fn chequebook_refused(
 /// if `<data_dir>/chequebook.json` already records a chequebook, it's
 /// returned without a redeploy (though a chequebook still short of its
 /// settlement deposit is topped up); otherwise this signs an on-chain
-/// `factory.deploySimpleSwap`, funds it with the account's
-/// [`plan_deposit_target`] xBZZ so its cheques are backed, persists the association, and returns
-/// the new address. Blocks on the handle's tokio runtime.
+/// `factory.deploySimpleSwap`, verifies the new chequebook on-chain
+/// (factory-registered, `issuer()` is the node EOA; see
+/// `chequebook_store::auto_deploy_chequebook`), persists the association,
+/// funds it with the account's [`plan_deposit_target`] xBZZ so its
+/// cheques are backed, and returns the new address. Blocks on the handle's tokio runtime.
 ///
 /// It also switches outbound settlement on in the running node, so a
 /// chequebook deployed now is used this session rather than from the
@@ -3375,24 +3377,31 @@ async fn resolve_or_deploy_chequebook(
         chequebook_store::auto_deploy_chequebook(client, wallet, &node_eth, deposit, &persist_path)
             .await
     };
-    match deployed {
-        Ok(cb) => {
-            // Brand new, so it has issued no cheques: a lost outbound
-            // ledger on record doesn't apply to it (PR #126 R1-M3).
-            if let Err(e) =
-                ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
-            {
-                tracing::warn!(
-                    target: "ant-ffi",
-                    "new chequebook not fully recorded: {e}",
-                );
-            }
-            Ok(Resolution::Use(ResolvedChequebook {
-                address: cb,
-                deployed: true,
-                verified: true,
-            }))
+    // Brand new, so it has issued no cheques: a lost outbound ledger on
+    // record doesn't apply to it (PR #126 R1-M3). That holds too for one
+    // recorded unverified (`RecordedUnverified`): the next trigger adopts
+    // it from `chequebook.json` (`check_persisted_chequebook`), a path
+    // that never marks it fresh.
+    let fresh = match &deployed {
+        Ok(cb) => Some(*cb),
+        Err(e) => e.recorded_fresh(),
+    };
+    if let Some(cb) = fresh {
+        if let Err(e) =
+            ant_p2p::swap::note_fresh_chequebook(&data_dir.join("pushsync_outbound.json"), cb)
+        {
+            tracing::warn!(
+                target: "ant-ffi",
+                "new chequebook not fully recorded: {e}",
+            );
         }
+    }
+    match deployed {
+        Ok(cb) => Ok(Resolution::Use(ResolvedChequebook {
+            address: cb,
+            deployed: true,
+            verified: true,
+        })),
         Err(ChequebookError::InsufficientGas { need, .. }) => {
             tracing::warn!(
                 target: "ant-ffi",
@@ -4933,12 +4942,12 @@ mod chain_tests {
                     } else {
                         panic!("unscripted transaction to 0x{}", hex::encode(&to));
                     };
-                    let mut sent = self.sent.lock().unwrap();
-                    sent.push(kind);
-                    word(sent.len() as u128)
+                    self.sent.lock().unwrap().push(kind);
+                    json!(format!("0x{}", hex::encode(ant_crypto::keccak256(&raw))))
                 }
                 "eth_getTransactionReceipt" => {
-                    json!({"status": "0x1", "blockNumber": "0x10", "logs": []})
+                    json!({"transactionHash": req["params"][0], "status": "0x1",
+                        "blockNumber": "0x10", "logs": []})
                 }
                 other => panic!("unscripted method {other}"),
             };

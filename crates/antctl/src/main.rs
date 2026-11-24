@@ -1339,7 +1339,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 .await
                 .context("factory.deploySimpleSwap")?;
 
-            let Some(cb) = extract_deployed_chequebook(&receipt) else {
+            let Some(cb) = extract_deployed_chequebook(&receipt, &factory_addr) else {
                 bail!(
                     "factory tx 0x{} confirmed in block {} but emitted no SimpleSwapDeployed log; logs were {:?}",
                     hex::encode(receipt.tx_hash),
@@ -1644,7 +1644,7 @@ async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
                 )
                 .await
                 .context("createBatch")?;
-            let batch_id = extract_created_batch_id(&create_rcpt).ok_or_else(|| {
+            let batch_id = extract_created_batch_id(&create_rcpt, &postage).ok_or_else(|| {
                 anyhow::anyhow!(
                     "createBatch confirmed (tx {}) but no BatchCreated event found in receipt",
                     hex::encode(create_rcpt.tx_hash),
