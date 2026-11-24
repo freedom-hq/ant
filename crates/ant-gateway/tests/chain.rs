@@ -20,6 +20,7 @@ use common::{
     status_router_with_chain_and_failing_snapshot, status_router_with_chain_and_hook,
     status_router_with_chain_and_issued, status_router_with_chain_and_issued_by,
     status_router_with_chain_and_lost_ledger, status_router_with_chain_hooks_and_cors,
+    status_router_with_postage,
 };
 use serde_json::Value;
 
@@ -66,6 +67,16 @@ impl ChainReader for FakeChain {
             immutable: true,
         })
     }
+    /// Every batch has balance left, except [`EXPIRED_BATCH`] (`0`, as
+    /// the contract clamps an expired batch) and [`MISSING_BATCH`]
+    /// (`remainingBalance` reverts for a batch the contract lacks).
+    async fn batch_remaining_balance(&self, batch_id: [u8; 32]) -> Result<u128, String> {
+        match batch_id {
+            EXPIRED_BATCH => Ok(0),
+            MISSING_BATCH => Err("execution reverted".into()),
+            _ => Ok(1_000_000),
+        }
+    }
 }
 
 /// [`FakeChain`]'s node-wallet xBZZ balance.
@@ -74,6 +85,7 @@ const FAKE_BZZ_BALANCE: u128 = 1_500_000_000_000_000_000;
 const FAKE_BATCH_DEPTH: u8 = 20;
 const FOREIGN_BATCH: [u8; 32] = [0xF0; 32];
 const MISSING_BATCH: [u8; 32] = [0x0E; 32];
+const EXPIRED_BATCH: [u8; 32] = [0xE1; 32];
 
 fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
@@ -607,6 +619,21 @@ async fn deposit_refuses_zero_and_more_than_the_wallet_holds() {
         assert!(writer.calls().is_empty(), "{uri}: {:?}", writer.calls());
     }
 
+    // No chequebook: that's the answer, even for an amount the wallet
+    // can't cover either (not a masking "out of funds").
+    for uri in [over.as_str(), "/chequebook/deposit?amount=1"] {
+        let writer = Arc::new(FundingWriter::default());
+        let router =
+            status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+        let (status, json) = req(router, Method::POST, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            json["message"], "no chequebook configured to deposit into",
+            "{uri}"
+        );
+        assert!(writer.calls().is_empty(), "{uri}: {:?}", writer.calls());
+    }
+
     let writer = Arc::new(FundingWriter::default());
     let router = status_router_with_chain(
         snapshot_with_one_peer(),
@@ -622,14 +649,15 @@ async fn deposit_refuses_zero_and_more_than_the_wallet_holds() {
 }
 
 /// `PATCH /stamps/dilute` reads the batch first and refuses, with a
-/// `400` and no `increaseDepth`, a depth that doesn't raise it and a
-/// batch the node doesn't own (both would revert on chain). A batch the
+/// `400` and no `increaseDepth`, a depth that doesn't raise it, a batch
+/// the node doesn't own and an expired one (all would revert on chain). A batch the
 /// contract doesn't have is a `404`. One depth up goes through.
 #[tokio::test]
 async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
     let ours = hex::encode([0xAB; 32]);
     let foreign = hex::encode(FOREIGN_BATCH);
     let missing = hex::encode(MISSING_BATCH);
+    let expired = hex::encode(EXPIRED_BATCH);
     for (uri, want) in [
         (
             format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH - 1),
@@ -646,6 +674,10 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
         (
             format!("/stamps/dilute/{missing}/{}", FAKE_BATCH_DEPTH + 1),
             StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/stamps/dilute/{expired}/{}", FAKE_BATCH_DEPTH + 1),
+            StatusCode::BAD_REQUEST,
         ),
     ] {
         let writer = Arc::new(FundingWriter::default());
@@ -714,6 +746,141 @@ async fn dilute_fails_when_the_batch_read_fails() {
     let (status, _) = req(router, Method::PATCH, &uri).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(writer.calls().is_empty(), "{:?}", writer.calls());
+}
+
+/// A failed `remainingBalance` read (the expiry check) fails the
+/// dilute (`502`) instead of sending it unchecked.
+#[tokio::test]
+async fn dilute_fails_when_the_balance_read_fails() {
+    struct NoBalanceReads;
+    #[async_trait]
+    impl ChainReader for NoBalanceReads {
+        async fn block_number(&self) -> Result<u64, String> {
+            FakeChain.block_number().await
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            FakeChain.current_price().await
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            FakeChain.total_amount().await
+        }
+        async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.bzz_balance(who).await
+        }
+        async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.native_balance(who).await
+        }
+        async fn chequebook_balance(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_balance(cb).await
+        }
+        async fn chequebook_total_paid_out(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_total_paid_out(cb).await
+        }
+        async fn batch_meta(&self, id: [u8; 32]) -> Result<ant_gateway::BatchMetaView, String> {
+            FakeChain.batch_meta(id).await
+        }
+    }
+    let writer = Arc::new(FundingWriter::default());
+    let ctx = Arc::new(ChainContext {
+        reader: Arc::new(NoBalanceReads),
+        wallet_eth: [0x11; 20],
+        chequebook: ChequebookSlot::new(None),
+        chain_id: 100,
+        writer: Some(writer.clone()),
+        writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
+    });
+    let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+    let uri = format!(
+        "/stamps/dilute/{}/{}",
+        hex::encode([0xAB; 32]),
+        FAKE_BATCH_DEPTH + 1
+    );
+    let (status, _) = req(router, Method::PATCH, &uri).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(writer.calls().is_empty(), "{:?}", writer.calls());
+}
+
+/// The node's view of [`MISSING_BATCH`] (which the fake chain reads as
+/// zero owner, like an RPC backend that hasn't seen its block yet).
+fn missing_batch_view(
+    depth: u8,
+    registered_secs_ago: Option<u64>,
+    block_number: Option<u64>,
+) -> ant_control::PostageStatusView {
+    ant_control::PostageStatusView {
+        enabled: true,
+        batch_id: format!("0x{}", hex::encode(MISSING_BATCH)),
+        batch_depth: depth,
+        bucket_depth: 16,
+        registered_secs_ago,
+        block_number,
+        ..Default::default()
+    }
+}
+
+/// A batch this node bought moments ago that the chain read can't see
+/// yet (zero owner from a lagging RPC backend) is diluted against the
+/// node's own view of it, not refused as `404`; a depth that doesn't
+/// raise that view's is still a `400`. Outside the grace window, or for
+/// a batch the node didn't buy itself, the zero owner stands: `404`.
+#[tokio::test]
+async fn dilute_trusts_the_node_for_a_batch_it_just_bought() {
+    let missing = hex::encode(MISSING_BATCH);
+    let up = format!("/stamps/dilute/{missing}/{}", FAKE_BATCH_DEPTH + 1);
+
+    let writer = Arc::new(FundingWriter::default());
+    let (router, seen) = status_router_with_postage(
+        snapshot_with_one_peer(),
+        funding_ctx(writer.clone()),
+        vec![missing_batch_view(
+            FAKE_BATCH_DEPTH,
+            Some(5),
+            Some(48_500_001),
+        )],
+    );
+    let (status, json) = req(router, Method::PATCH, &up).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        writer.calls(),
+        [format!("dilute_batch(0e, {})", FAKE_BATCH_DEPTH + 1)]
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    let same = format!("/stamps/dilute/{missing}/{FAKE_BATCH_DEPTH}");
+    for (uri, view, want) in [
+        (
+            same.as_str(),
+            missing_batch_view(FAKE_BATCH_DEPTH, Some(5), Some(48_500_001)),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            up.as_str(),
+            missing_batch_view(FAKE_BATCH_DEPTH, Some(600), Some(48_500_001)),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            up.as_str(),
+            missing_batch_view(FAKE_BATCH_DEPTH, Some(5), None),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            up.as_str(),
+            missing_batch_view(FAKE_BATCH_DEPTH, None, Some(48_500_001)),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let (router, seen) = status_router_with_postage(
+            snapshot_with_one_peer(),
+            funding_ctx(writer.clone()),
+            vec![view.clone()],
+        );
+        let (status, json) = req(router, Method::PATCH, uri).await;
+        assert_eq!(status, want, "{uri} {view:?}: {json}");
+        assert!(writer.calls().is_empty(), "{uri}: {:?}", writer.calls());
+        assert!(seen.lock().unwrap().is_empty(), "{uri} re-registered");
+    }
 }
 
 #[tokio::test]

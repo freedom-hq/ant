@@ -1105,9 +1105,12 @@ pub async fn topup_stamp(
 
 /// `PATCH /stamps/dilute/{id}/{depth}`. Increases a batch's depth
 /// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3). The batch
-/// is read first: a depth that doesn't raise it, or a batch the node
-/// doesn't own, is a `400` (a batch not on chain a `404`) and nothing
-/// is sent.
+/// is read first: a depth that doesn't raise it, a batch the node
+/// doesn't own, or an expired one (`remainingBalance` `0`) is a `400`
+/// (a batch not on chain a `404`) and nothing is sent. A batch this
+/// node bought within the last few minutes that the chain read can't
+/// see yet (a lagging RPC backend) is checked against the node's own
+/// view of it instead of answering `404`.
 pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
@@ -1132,17 +1135,49 @@ pub async fn dilute_stamp(
         Ok(m) => m,
         Err(r) => return r,
     };
-    if let Err(f) = check_batch_owner(meta.owner, &chain.wallet_eth, true) {
-        return failure_response(f);
-    }
-    if depth <= meta.depth {
+    // A zero owner is "not on chain", unless this node bought the batch
+    // moments ago: then the RPC backend that answered most likely
+    // hasn't seen the buy's block yet (the `/stamps` grace), and the
+    // node's own view stands in for it (the node wallet owns what it
+    // buys, and the view's depth follows each dilute).
+    let just_bought = if meta.owner == [0u8; 20] {
+        match crate::stamps::just_bought_batch(&handle, batch_id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        }
+    } else {
+        None
+    };
+    let current_depth = if let Some(view) = &just_bought {
+        view.batch_depth
+    } else {
+        if let Err(f) = check_batch_owner(meta.owner, &chain.wallet_eth, true) {
+            return failure_response(f);
+        }
+        meta.depth
+    };
+    if depth <= current_depth {
         return json_error(
             StatusCode::BAD_REQUEST,
             format!(
-                "invalid depth: the batch is already depth {}; a dilute must raise it",
-                meta.depth
+                "invalid depth: the batch is already depth {current_depth}; a dilute must raise it"
             ),
         );
+    }
+    // `increaseDepth` also reverts on an expired batch (its balance is
+    // used up: `remainingBalance` reads `0`). A just-bought batch can't
+    // be, and a backend that hasn't seen it would revert the read.
+    if just_bought.is_none() {
+        let remaining = match guarded(chain.reader.batch_remaining_balance(batch_id)).await {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        if remaining == 0 {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "batch expired: its balance is used up, so it can't be diluted",
+            );
+        }
     }
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
@@ -1160,8 +1195,9 @@ pub async fn dilute_stamp(
 
 /// `POST /chequebook/deposit?amount=`. Funds the chequebook by
 /// transferring xBZZ into it; returns the `transactionHash` (PLAN.md
-/// D3). Freedom auto-deposits post-purchase. An amount of `0`, or more
-/// than the wallet's xBZZ balance, is a `400` and nothing is sent.
+/// D3). Freedom auto-deposits post-purchase. An amount of `0`, no
+/// chequebook to deposit into, or an amount above the wallet's xBZZ
+/// balance is a `400` and nothing is sent.
 pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1188,6 +1224,15 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    // Same answer as `/chequebook/withdraw` without one; checked before
+    // the balance so it isn't masked by an "out of funds". (The writer
+    // checks again: the slot can change.)
+    if chain.chequebook.get().is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "no chequebook configured to deposit into",
+        );
+    }
     // Held from the balance check through the receipt, so another
     // wallet transaction can't spend the xBZZ counted here (like the
     // buy's guard). An unaffordable transfer would revert on chain.
