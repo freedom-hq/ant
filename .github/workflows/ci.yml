@@ -119,7 +119,7 @@ jobs:
   # one advisory or crate each, with the reason. A new RustSec advisory
   # can turn this red with no code change on our side: fix it with a
   # `cargo update -p <crate>` or, if no compatible fix exists, a narrow
-  # ignore entry in deny.toml that names the tracking issue.
+  # ignore entry in deny.toml that says why and what removes it.
   # -------------------------------------------------------------------
   cargo-deny:
     name: cargo deny (advisories, bans, licenses, sources)

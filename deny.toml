@@ -21,11 +21,12 @@ all-features = true
 yanked = "deny"
 ignore = [
     # --- hickory-proto / hickory-resolver 0.25 -------------------------
-    # Pulled in by ant-p2p (bootnode /dnsaddr resolution) and libp2p-dns.
-    # The fixes are in hickory 0.26, which libp2p-dns 0.44 does not
-    # accept. Dropping hickory 0.25 from the build is tracked in
+    # Pulled in by ant-p2p (bootnode /dnsaddr resolution) and libp2p-dns
+    # (the libp2p `dns` transport). There is no fix on the 0.25 line;
+    # the advisories that have a fix at all have it in 0.26, which needs
+    # libp2p 0.57 (libp2p-dns 0.44 pins 0.25). Tracked in
     # https://github.com/freedom-hq/ant/issues/270; remove these entries
-    # when that lands.
+    # once hickory 0.25 is out of the dependency graph.
     #
     # DNSSEC validation: the workspace builds hickory without any
     # `dnssec-*` feature (check with
@@ -49,7 +50,8 @@ ignore = [
     { id = "RUSTSEC-2026-0489", reason = "hickory 0.25 SVCB text parser panic; ant parses no record text; fix only in 0.26, see #270" },
     { id = "RUSTSEC-2026-0490", reason = "hickory 0.25 zone-file lexer panic; ant parses no zone files; fix only in 0.26, see #270" },
     # Reachable: these two concern wire-format messages ant does encode
-    # and decode on every /dnsaddr lookup. They stay open until #270.
+    # and decode on every DNS lookup (/dnsaddr bootnode expansion, and
+    # /dns* dial addresses through libp2p-dns). They stay open until #270.
     { id = "RUSTSEC-2026-0119", reason = "hickory 0.25 O(n^2) name compression, reachable; fix only in 0.26 (ant-p2p and libp2p-dns 0.44 are on 0.25), see #270" },
     { id = "RUSTSEC-2026-0491", reason = "hickory 0.25 memory amplification from header record counts, reachable; fix only in 0.26 (ant-p2p and libp2p-dns 0.44 are on 0.25), see #270" },
 
