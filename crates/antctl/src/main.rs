@@ -146,7 +146,8 @@ Examples:
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
         /// With `--out <dir>`, overwrite an existing regular file of the
-        /// manifest-derived name. A symlink there is still refused.
+        /// manifest-derived name. A symlink, FIFO, device node or
+        /// directory there is still refused.
         #[arg(long, requires = "out")]
         force: bool,
         /// Force `bytes` (multi-chunk join) mode regardless of the
@@ -921,11 +922,12 @@ fn safe_output_name(filename_hint: Option<&str>) -> &str {
 /// (`O_NOFOLLOW`, so a link swapped in after any check is still refused)
 /// and without blocking (`O_NONBLOCK`, so a FIFO can't hang us), and the
 /// opened handle must be a regular file before it is truncated, so a
-/// FIFO, device node or directory is refused too. A file this call
-/// created is removed again if writing it fails, so a failed get (disk
-/// full) doesn't leave a truncated file that the retry then refuses to
-/// overwrite. An explicit file path is the user's own choice and is
-/// written as given, as before.
+/// FIFO, device node or directory is refused too. Without `force`, the
+/// file this call created is removed again if writing it fails, so a
+/// failed get (disk full) doesn't leave a truncated file that the retry
+/// then refuses to overwrite; with `force` a partial file is left, and
+/// the retry (also with `force`) replaces it. An explicit file path is
+/// the user's own choice and is written as given, as before.
 fn write_output(
     out: Option<&Path>,
     filename_hint: Option<&str>,
@@ -3587,29 +3589,46 @@ mod tests {
         const CHILD: &str = "ANTCTL_TEST_FSIZE_CHILD";
         if let Some(dir) = std::env::var_os(CHILD) {
             let dir = PathBuf::from(dir);
+            // Lower only the soft limit, and put it back before asserting,
+            // so the harness can still write its own output afterwards.
+            let mut saved = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             unsafe {
                 libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut saved), 0);
                 let lim = libc::rlimit {
                     rlim_cur: 4,
-                    rlim_max: 4,
+                    rlim_max: saved.rlim_max,
                 };
                 assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lim), 0);
             }
-            let err = write_output(Some(&dir), Some("big.bin"), false, &[7u8; 4096]).unwrap_err();
+            let res = write_output(Some(&dir), Some("big.bin"), false, &[7u8; 4096]);
+            unsafe {
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const saved), 0);
+            }
+            let err = res.unwrap_err();
             assert!(format!("{err:#}").contains("write to"), "{err:#}");
             assert!(!dir.join("big.bin").exists(), "partial file left behind");
             return;
         }
         let tmp = TempDir::new("write-output-partial");
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "tests::write_output_removes_a_partial_file_it_created",
             ])
             .env(CHILD, &tmp.0)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "child: {status}");
+        assert!(
+            out.status.success(),
+            "child: {}\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(!tmp.0.join("big.bin").exists());
     }
 
