@@ -733,7 +733,7 @@ mod tests {
         assert!(ctx.writer.is_none());
     }
 
-    /// #305: a swap priced above the caller's cap is the user's to
+    /// #305: a swap the caller's cap no longer covers is the user's to
     /// resolve (refresh the quote), not a chain fault: a `400` with the
     /// message, like a short wallet.
     #[test]

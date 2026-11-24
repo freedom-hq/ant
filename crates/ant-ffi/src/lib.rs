@@ -2713,9 +2713,10 @@ fn parse_deposit_amount(call: &str, amount: &str) -> Result<u128, String> {
 ///
 /// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
 /// send: the `swap_input` of the [`ant_storage_settlement_deposit`] the user approved. The swap
-/// is re-priced from the pool when it runs, so a price that moved (or a
-/// forged pool read) since the quote is refused with nothing sent
-/// (#305); refresh the quote and try again.
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused with nothing sent (#305); refresh the quote and try again.
 /// `"0"` forbids a swap: only xBZZ the wallet already holds is deposited.
 ///
 /// # Safety
@@ -2768,9 +2769,10 @@ pub unsafe extern "C" fn ant_storage_settlement_topup(
 ///
 /// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
 /// send: the `swap_input` of the [`ant_storage_settlement_deposit_amount`] (same amount) the user approved. The swap
-/// is re-priced from the pool when it runs, so a price that moved (or a
-/// forged pool read) since the quote is refused with nothing sent
-/// (#305); refresh the quote and try again.
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused with nothing sent (#305); refresh the quote and try again.
 /// `"0"` forbids a swap: the call then only deposits xBZZ the wallet
 /// already holds (the apps' "add credit", which checked that first).
 ///
@@ -3395,9 +3397,10 @@ pub unsafe extern "C" fn ant_storage_topup_quote(
 ///
 /// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
 /// send: the `swap_input` of the [`ant_storage_topup_quote`] the user approved. The swap
-/// is re-priced from the pool when it runs, so a price that moved (or a
-/// forged pool read) since the quote is refused with nothing sent
-/// (#305); refresh the quote and try again.
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused with nothing sent (#305); refresh the quote and try again.
 ///
 /// # Safety
 ///
@@ -3485,9 +3488,10 @@ pub unsafe extern "C" fn ant_storage_buy(
 ///
 /// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
 /// send: the `swap_input` of the [`ant_storage_quote`] the user approved. The swap
-/// is re-priced from the pool when it runs, so a price that moved (or a
-/// forged pool read) since the quote is refused with nothing sent
-/// (#305); refresh the quote and try again.
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused with nothing sent (#305); refresh the quote and try again.
 ///
 /// # Safety
 ///

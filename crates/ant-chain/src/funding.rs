@@ -16,7 +16,9 @@
 //! at execution time, and nothing else ties it to that quote, so a
 //! forged or moved price (a sandwich, an untrusted fallback read) is
 //! refused with [`FundingError::PriceMoved`] before anything is sent
-//! (audit MY-03, #305).
+//! (audit MY-03, #305). A small upward tick that the quote's swap buffer
+//! still absorbs goes through, sending at most the cap
+//! ([`capped_swap_value`]).
 //!
 //! One orchestration, two sequencers (AGENTS.md): `ant-ffi`'s C API
 //! (`ant_storage_quote`, `ant_storage_buy_xdai`, …) and the gateway's
@@ -62,6 +64,17 @@ pub const GAS_RESERVE_WEI: u128 = 15_000_000_000_000_000;
 /// in the wallet as a little extra xBZZ.
 const SWAP_BUFFER_NUM: u128 = 105;
 const SWAP_BUFFER_DEN: u128 = 100;
+
+/// The least margin over fair value a capped swap still goes through
+/// with: when the price ticked up since the quote and the re-priced
+/// input (fresh price + [`SWAP_BUFFER_NUM`]) is over the caller's cap,
+/// the swap sends the cap itself as long as the cap still covers the
+/// fresh fair value by this much (the 0.3% pool fee plus a little price
+/// impact). `amountOutMin` stays the xBZZ needed, so the chain refuses
+/// a swap that would buy less, and nothing past the approved cap is
+/// ever sent.
+const SWAP_MIN_MARGIN_NUM: u128 = 101;
+const SWAP_MIN_MARGIN_DEN: u128 = 100;
 
 /// What a storage purchase funds besides the plan itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,8 +180,11 @@ pub enum FundingError {
     #[error("{0}")]
     Invalid(String),
     /// The swap would send more xDAI than the caller's `max_xdai_wei`
-    /// (the quote the user approved): the pool price moved, or the read
-    /// was forged. Nothing was sent.
+    /// (the quote the user approved) allows: the pool price moved past
+    /// what the cap still covers (see [`SWAP_MIN_MARGIN_NUM`]), the read
+    /// was forged, or the call has more xBZZ to buy than when it was
+    /// quoted (the wallet's xBZZ was spent, or the deposit due grew).
+    /// Nothing was sent.
     #[error("{}", price_moved_message(*input_wei, *max_wei))]
     PriceMoved { input_wei: u128, max_wei: u128 },
     /// The wallet holds less xDAI than the swap plus the gas reserve.
@@ -217,9 +233,12 @@ fn price_moved_message(input_wei: u128, max_wei: u128) -> String {
     } else {
         format!("more than the {} xDAI you approved", xdai(max_wei))
     };
+    // `acquire_bzz` only sees the cap, not the quote's xBZZ amount, so
+    // it can't tell a price move from more xBZZ to buy: name both.
     format!(
-        "the xBZZ price moved since your quote: the swap now needs {} xDAI, {approved}; \
-         nothing was sent, refresh the quote and try again",
+        "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is \
+         more xBZZ to buy): the swap now needs {} xDAI, {approved}; nothing was sent, refresh \
+         the quote and try again",
         xdai(input_wei)
     )
 }
@@ -308,7 +327,33 @@ fn bzz_to_acquire(plan_plur: u128, deposit_due_plur: u128, wallet_bzz: u128) -> 
 /// `(sqrtPriceX96 / 2^96)^2` is WXDAI-wei per BZZ-PLUR (token1 has 18
 /// decimals, token0 16), so `plur × price` is the WXDAI to send. `None`
 /// when the result doesn't fit a `u128`.
+#[cfg(test)]
 fn swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
+    Some(buffered(fair_swap_input_for(sqrt_price_x96, bzz_plur)?))
+}
+
+/// The swap buffer on a fair-value input.
+fn buffered(fair: u128) -> u128 {
+    fair.saturating_mul(SWAP_BUFFER_NUM) / SWAP_BUFFER_DEN
+}
+
+/// What a capped swap sends: the buffered input when the cap allows it,
+/// else the cap itself when it still covers `fair` by
+/// [`SWAP_MIN_MARGIN_NUM`], else `None` (refuse).
+fn capped_swap_value(fair: u128, max_xdai_wei: u128) -> Option<u128> {
+    let input = buffered(fair);
+    if input <= max_xdai_wei {
+        return Some(input);
+    }
+    let least = fair
+        .saturating_mul(SWAP_MIN_MARGIN_NUM)
+        .div_ceil(SWAP_MIN_MARGIN_DEN);
+    (least <= max_xdai_wei).then_some(max_xdai_wei)
+}
+
+/// Fair-value xDAI (wei) for `bzz_plur` of xBZZ at the pool's
+/// `sqrtPriceX96`, without the swap buffer.
+fn fair_swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
     use primitive_types::U512;
     let sp = U512::from_big_endian(sqrt_price_x96);
     let fair = sp
@@ -318,7 +363,7 @@ fn swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
     if fair > U512::from(u128::MAX) {
         return None;
     }
-    Some(fair.low_u128().saturating_mul(SWAP_BUFFER_NUM) / SWAP_BUFFER_DEN)
+    Some(fair.low_u128())
 }
 
 /// The `topUp` per chunk that lets a batch holding `remaining` per chunk
@@ -460,6 +505,11 @@ async fn chequebook_deposit(
 
 /// xDAI (wei, buffered) the swap helper needs for `bzz_plur` of xBZZ.
 async fn swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingError> {
+    Ok(buffered(fair_swap_input(payer, bzz_plur).await?))
+}
+
+/// [`swap_input`] without the buffer.
+async fn fair_swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingError> {
     if bzz_plur == 0 {
         return Ok(0);
     }
@@ -471,7 +521,7 @@ async fn swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingEr
             what: "read swap price",
             message: e.to_string(),
         })?;
-    swap_input_for(&word, bzz_plur)
+    fair_swap_input_for(&word, bzz_plur)
         .ok_or_else(|| FundingError::Invalid("swap amount too large".into()))
 }
 
@@ -535,8 +585,9 @@ async fn deposit_due(payer: &Payer<'_>, policy: DepositPolicy) -> u128 {
 }
 
 /// Swap enough xDAI for `bzz_plur` of xBZZ, delivered to the node
-/// wallet. Refuses before sending anything (the helper deploy included)
-/// when the freshly priced swap input exceeds `max_xdai_wei`
+/// wallet. Sends at most `max_xdai_wei` ([`capped_swap_value`]), and
+/// refuses before sending anything (the helper deploy included) when the
+/// cap no longer covers the freshly priced swap
 /// ([`FundingError::PriceMoved`]), or when the wallet can't also keep
 /// [`GAS_RESERVE_WEI`] for the transactions that follow.
 async fn acquire_bzz(
@@ -555,13 +606,13 @@ async fn acquire_bzz(
             what: "read xDAI balance",
             message: e.to_string(),
         })?;
-    let input = swap_input(payer, bzz_plur).await?;
-    if input > max_xdai_wei {
+    let fair = fair_swap_input(payer, bzz_plur).await?;
+    let Some(input) = capped_swap_value(fair, max_xdai_wei) else {
         return Err(FundingError::PriceMoved {
-            input_wei: input,
+            input_wei: buffered(fair),
             max_wei: max_xdai_wei,
         });
-    }
+    };
     let required = input.saturating_add(GAS_RESERVE_WEI);
     if xdai < required {
         return Err(FundingError::InsufficientXdai {
@@ -686,8 +737,8 @@ fn resize_delta(depth: u8, new_depth: u8) -> Result<u8, FundingError> {
 ///
 /// Recomputes the shortfall from current balances, so a retry after a
 /// partial failure only swaps what is still missing. The swap sends at
-/// most `max_xdai_wei` (the quote's `swap_input_wei`); a swap priced
-/// above it is refused before anything is sent
+/// most `max_xdai_wei` (the quote's `swap_input_wei`); a swap the cap no
+/// longer covers is refused before anything is sent
 /// ([`FundingError::PriceMoved`]).
 pub async fn buy_plan_with_xdai(
     payer: &Payer<'_>,
@@ -918,7 +969,7 @@ async fn status_for(
 /// The swap sends at most `max_xdai_wei`: the `swap_input_wei` of the
 /// [`deposit_status`] the user approved (priced with the same `add`),
 /// or `0` when the wallet already holds the xBZZ and no swap may happen.
-/// A swap priced above it is refused before anything is sent
+/// A swap the cap no longer covers is refused before anything is sent
 /// ([`FundingError::PriceMoved`]).
 ///
 /// Nothing is spent on a chequebook the chain rejects: before a swap
@@ -1133,6 +1184,9 @@ mod tests {
             m.contains("needs 0.00350001 xDAI, more than the 0.00350000 xDAI"),
             "{m}"
         );
+        // R1-M2: a larger xBZZ amount at an unchanged price is refused
+        // the same way, so the message doesn't blame the price alone.
+        assert!(m.contains("or there is more xBZZ to buy"), "{m}");
         let m = FundingError::PriceMoved {
             input_wei: WEI_PER_XDAI,
             max_wei: 0,
@@ -1182,6 +1236,8 @@ mod tests {
         /// wallet and `eth_getBalance`.
         wallet_reads: std::sync::atomic::AtomicUsize,
         sent: std::sync::Mutex<Vec<&'static str>>,
+        /// The xDAI (wei) each swap transaction carried.
+        swap_values: std::sync::Mutex<Vec<u128>>,
     }
 
     const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
@@ -1277,6 +1333,13 @@ mod tests {
                     let kind = if hex::encode(&to) == crate::CREATE2_DEPLOYER[2..].to_lowercase() {
                         "deploy"
                     } else if to == crate::tx::swap_helper_address() {
+                        let value = rlp::Rlp::new(&raw).at(4).unwrap().data().unwrap().to_vec();
+                        let mut word = [0u8; 16];
+                        word[16 - value.len()..].copy_from_slice(&value);
+                        self.swap_values
+                            .lock()
+                            .unwrap()
+                            .push(u128::from_be_bytes(word));
                         "swap"
                     } else if to == crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES {
                         // transfer(address,uint256) vs approve.
@@ -1719,6 +1782,16 @@ mod tests {
         call: &str,
         max_xdai_wei: u128,
     ) -> (Result<(), FundingError>, Vec<&'static str>) {
+        let (result, sent, _) = pay_capped_valued(chain, call, max_xdai_wei).await;
+        (result, sent)
+    }
+
+    /// [`pay_capped`], plus the xDAI each swap carried.
+    async fn pay_capped_valued(
+        chain: ScriptedChain,
+        call: &str,
+        max_xdai_wei: u128,
+    ) -> (Result<(), FundingError>, Vec<&'static str>, Vec<u128>) {
         let chain = std::sync::Arc::new(chain);
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
@@ -1748,7 +1821,8 @@ mod tests {
             other => unreachable!("{other}"),
         };
         let sent = chain.sent.lock().unwrap().clone();
-        (result, sent)
+        let values = chain.swap_values.lock().unwrap().clone();
+        (result, sent, values)
     }
 
     /// The `swap_input_wei` each paying call's quote shows the user, at
@@ -1819,30 +1893,76 @@ mod tests {
         }
     }
 
-    /// The cap is the quote itself: at the price the user was quoted the
-    /// call goes through (deploying the helper first), and one wei
-    /// below that quote it refuses.
+    /// At the price the user was quoted, the swap sends exactly the
+    /// quote (deploying the helper first). A cap a little under the quote
+    /// is still covered by the swap buffer, so it goes through sending
+    /// the cap itself, never more.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_quoted_swap_input_is_exactly_enough() {
+    async fn the_quoted_swap_input_is_what_is_sent() {
         for (call, rest) in [
             ("buy", &["approve", "createBatch"][..]),
             ("extend", &["approve", "createBatch"][..]),
             ("deposit", &["transfer"][..]),
         ] {
             let quoted = quoted_swap_input(call).await;
-            let (result, sent) = pay_capped(payable(HONEST_SQRT_PRICE), call, quoted).await;
+            let (result, sent, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE), call, quoted).await;
             result.unwrap_or_else(|e| panic!("{call}: {e}"));
             let mut want = vec!["deploy", "swap"];
             want.extend_from_slice(rest);
             assert_eq!(sent, want, "{call}");
+            assert_eq!(values, [quoted], "{call}");
 
-            let (result, sent) = pay_capped(payable(HONEST_SQRT_PRICE), call, quoted - 1).await;
-            assert!(
-                matches!(result, Err(FundingError::PriceMoved { .. })),
-                "{call}: {result:?}"
-            );
+            let (result, _, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE), call, quoted - 1).await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(values, [quoted - 1], "{call}: never past the cap");
+        }
+    }
+
+    /// R1-M1: a small upward tick between the quote and the call (here
+    /// the price up 3%) is absorbed by the quote's 5% swap buffer: the
+    /// swap goes through sending exactly the cap, with `amountOutMin`
+    /// still the xBZZ needed. A move the cap no longer covers by
+    /// [`SWAP_MIN_MARGIN_NUM`] (here about 6%) is refused with nothing
+    /// sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_small_price_tick_is_absorbed_by_the_cap() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            // sqrtPrice +1.5% is the price +3.02%.
+            let (result, _, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE / 1000 * 1015), call, quoted).await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(values, [quoted], "{call}: the cap, not the re-priced input");
+
+            // sqrtPrice +3% is the price +6.09%: past buffer and margin.
+            let (result, sent) =
+                pay_capped(payable(HONEST_SQRT_PRICE / 100 * 103), call, quoted).await;
+            match result {
+                Err(FundingError::PriceMoved { input_wei, max_wei }) => {
+                    assert_eq!(max_wei, quoted, "{call}");
+                    assert!(input_wei > quoted, "{call}");
+                }
+                other => panic!("{call}: expected PriceMoved, got {other:?}"),
+            }
             assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
         }
+    }
+
+    #[test]
+    fn a_capped_swap_never_sends_past_the_cap() {
+        let fair = 1_000_000u128;
+        // Within the cap: the buffered input.
+        assert_eq!(capped_swap_value(fair, 1_050_000), Some(1_050_000));
+        assert_eq!(capped_swap_value(fair, 2_000_000), Some(1_050_000));
+        // Under the buffered input but still 1% over fair: the cap.
+        assert_eq!(capped_swap_value(fair, 1_049_999), Some(1_049_999));
+        assert_eq!(capped_swap_value(fair, 1_010_000), Some(1_010_000));
+        // Less than 1% over fair: refused.
+        assert_eq!(capped_swap_value(fair, 1_009_999), None);
+        assert_eq!(capped_swap_value(fair, 0), None);
+        assert_eq!(capped_swap_value(0, 0), Some(0));
     }
 
     /// A cap of 0 forbids any swap but doesn't stand in the way of a call
@@ -1914,7 +2034,8 @@ mod tests {
             let sent = chain.sent.lock().unwrap().clone();
             (r, sent)
         };
-        let (r, sent) = pay(quoted - 1).await;
+        // Under what the quote's buffer absorbs: refused.
+        let (r, sent) = pay(quoted / 106 * 100).await;
         assert!(matches!(r, Err(FundingError::PriceMoved { .. })), "{r:?}");
         assert!(sent.is_empty(), "{sent:?}");
         let (r, sent) = pay(quoted).await;

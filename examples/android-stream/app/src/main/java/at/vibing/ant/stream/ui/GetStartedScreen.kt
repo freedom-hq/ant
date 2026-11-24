@@ -91,24 +91,39 @@ fun GetStartedScreen(node: AntNode, onClose: () -> Unit) {
                 .onSuccess {
                     if (node.hasStorage) onClose() else error = "Storage didn't activate. Please try again."
                 }
-                .onFailure { error = it.message }
+                .onFailure {
+                    error = it.message
+                    // The cap this used may be what was refused (the price
+                    // moved): drop the cached quote so the picker re-prices
+                    // and a re-selected tier never resubmits it.
+                    quotes.remove(tier.id)
+                }
             activating = false
         }
     }
 
-    // Poll the quote until the payment lands, then activate once.
+    // Poll the quote until the payment lands, then activate once. The
+    // picker's cached quote is only shown: activation waits for a quote
+    // this poll fetched itself, so its `swapInput` cap is current (a
+    // re-selected tier after a refused buy would otherwise resubmit the
+    // refused cap at once).
     LaunchedEffect(selected) {
         val tier = selected ?: return@LaunchedEffect
+        var fresh = false
         while (true) {
             val q = quote
-            if (q != null && q.sufficientFunds) {
+            if (fresh && q != null && q.sufficientFunds) {
                 activate(tier, q)
                 return@LaunchedEffect
             }
-            delay(6_000)
-            runCatching { node.quoteStorage(tier.depth, tier.days) }.getOrNull()?.let {
-                quote = it
-                quotes[tier.id] = it
+            if (fresh) delay(6_000)
+            val got = runCatching { node.quoteStorage(tier.depth, tier.days) }.getOrNull()
+            if (got != null) {
+                quote = got
+                quotes[tier.id] = got
+                fresh = true
+            } else if (!fresh) {
+                delay(6_000)
             }
         }
     }

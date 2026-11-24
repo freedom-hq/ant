@@ -5188,7 +5188,7 @@ mod chain_tests {
     /// funding step. A deposit the wallet's xBZZ doesn't cover needs a
     /// swap; with the apps' "add credit" cap of 0 (a plain transfer was
     /// promised) it is refused with nothing sent, and the card's own
-    /// quote for that amount is exactly the cap that lets it through.
+    /// quote for that amount is the cap that lets it through.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn topup_amount_never_swaps_past_its_cap() {
         const CB: [u8; 20] = [0xc8; 20];
@@ -5237,10 +5237,12 @@ mod chain_tests {
             eth,
             NODE_KEY,
             Some(2 * MILLI_BZZ),
-            quoted - 1,
+            // Under what the quote's swap buffer absorbs (a cap a little
+            // under the quote still goes through, sending the cap).
+            quoted / 106 * 100,
         )
         .await
-        .expect_err("one wei under the quote");
+        .expect_err("well under the quote");
         assert!(err.to_string().contains("price moved"), "got {err}");
         assert!(
             script.sent().is_empty(),

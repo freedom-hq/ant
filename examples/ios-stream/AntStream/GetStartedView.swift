@@ -28,6 +28,12 @@ struct GetStartedView: View {
     /// One-shot guard so funds-detected auto-activation fires only once per
     /// payment session (a failed activation must not re-trigger a loop).
     @State private var didAutoActivate = false
+    /// `quote` may be out of date: it came from the picker's cache, or an
+    /// activation with it just failed (a `PriceMoved` refusal is final
+    /// for that quote's `swapInput`). Activation waits for the poll's
+    /// next fresh quote, so a retry is capped at the current price
+    /// rather than resubmitting the refused cap.
+    @State private var quoteStale = false
     /// The payment step's ⓘ sheet: everything a payer may need beyond
     /// the amount and the code.
     @State private var showPaymentHelp = false
@@ -301,9 +307,13 @@ struct GetStartedView: View {
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.8))
             if error != nil {
-                GlassPillButton(title: "Activate", icon: "bolt.fill",
-                                tint: .blue.opacity(0.5)) {
-                    activate()
+                if quoteStale {
+                    ProgressView().tint(.white)
+                } else {
+                    GlassPillButton(title: "Activate", icon: "bolt.fill",
+                                    tint: .blue.opacity(0.5)) {
+                        activate()
+                    }
                 }
             }
         }
@@ -435,6 +445,7 @@ struct GetStartedView: View {
         // otherwise fetch it now.
         if let cached = quotes[tier.id] {
             quote = cached
+            quoteStale = true
             withAnimation { step = .payment }
         } else {
             reprice()
@@ -452,6 +463,7 @@ struct GetStartedView: View {
                                                     days: tier.days)
                 quote = q
                 quotes[tier.id] = q
+                quoteStale = false
                 withAnimation { step = .payment }
             } catch {
                 self.error = error.localizedDescription
@@ -459,26 +471,39 @@ struct GetStartedView: View {
         }
     }
 
-    /// While the payment step is on screen and the plan is still unfunded,
-    /// re-quote every few seconds. A re-quote re-reads the account's
-    /// on-chain xDAI balance, so when an incoming transfer lands we activate
-    /// the plan automatically — no tap needed. The `.task` driving this is
-    /// cancelled when the step changes (Back / Activate), ending the loop.
+    /// While the payment step is on screen, re-quote every few seconds.
+    /// A re-quote re-reads the account's on-chain xDAI balance, so when an
+    /// incoming transfer lands we activate the plan automatically — no tap
+    /// needed. A stale quote (from the picker's cache, or one an
+    /// activation just failed with) is re-quoted at once, and nothing
+    /// activates on it. After the one auto-activation the loop keeps the
+    /// quote fresh, so the manual Activate retry is capped at the current
+    /// price. The `.task` driving this is cancelled when the step changes
+    /// (Back / Activate), ending the loop.
     private func pollForPayment() async {
         guard let tier = selected else { return }
         while !Task.isCancelled {
-            if quote?.sufficientFunds == true { autoActivateIfFunded(); return }
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            if Task.isCancelled { return }
+            if !quoteStale, !didAutoActivate, quote?.sufficientFunds == true {
+                autoActivateIfFunded()
+                return
+            }
+            if !quoteStale {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                if Task.isCancelled { return }
+            }
             guard let fresh = try? await node.quoteStorage(rpc: activeRpc,
                                                            depth: tier.depth,
                                                            days: tier.days)
-            else { continue }
+            else {
+                if quoteStale { try? await Task.sleep(nanoseconds: 6_000_000_000) }
+                continue
+            }
+            if Task.isCancelled { return }
             withAnimation {
                 quote = fresh
                 quotes[tier.id] = fresh
+                quoteStale = false
             }
-            if fresh.sufficientFunds { autoActivateIfFunded(); return }
         }
     }
 
@@ -486,6 +511,15 @@ struct GetStartedView: View {
     /// payment session — so a failed activation (which drops back to the
     /// payment step) doesn't immediately re-trigger an infinite loop. The
     /// Activate button remains as a manual retry.
+    /// Back to the payment step after a failed activation, with the quote
+    /// it used marked stale: the poll re-quotes at once and the retry
+    /// uses that quote's cap (a re-selected tier re-quotes too).
+    private func retryWithFreshQuote(_ tier: StoragePlanTier) {
+        quotes[tier.id] = nil
+        quoteStale = true
+        withAnimation { step = .payment }
+    }
+
     private func autoActivateIfFunded() {
         guard !didAutoActivate else { return }
         didAutoActivate = true
@@ -493,7 +527,7 @@ struct GetStartedView: View {
     }
 
     private func activate() {
-        guard let tier = selected, let quote else { return }
+        guard let tier = selected, let quote, !quoteStale else { return }
         error = nil
         withAnimation { step = .activating }
         Task {
@@ -510,11 +544,11 @@ struct GetStartedView: View {
                     dismiss()
                 } else {
                     error = "Storage didn't activate — please try again."
-                    withAnimation { step = .payment }
+                    retryWithFreshQuote(tier)
                 }
             } catch {
                 self.error = error.localizedDescription
-                withAnimation { step = .payment }
+                retryWithFreshQuote(tier)
             }
         }
     }

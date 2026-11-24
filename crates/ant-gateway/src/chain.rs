@@ -167,7 +167,7 @@ pub trait ChainWriter: Send + Sync {
     }
     /// Buy a plan, swapping xDAI for the xBZZ it and the deposit need,
     /// at most `max_xdai_wei` of it (the quote's `swapInputWei`; a swap
-    /// priced above it is refused before anything is sent). Returns the
+    /// the cap no longer covers is refused before anything is sent). Returns the
     /// new batch id; the route registers it.
     async fn buy_with_xdai(
         &self,
@@ -1787,7 +1787,8 @@ pub async fn settlement_deposit(
 /// `?maxXdaiWei=` is required: the most xDAI the swap may send, the
 /// `swapInputWei` of the `GET /v0/settlement/deposit` (with the same
 /// `amount`) the user approved, or `0` to forbid a swap and deposit only
-/// xBZZ the wallet already holds. A swap priced above it is a `400` with
+/// xBZZ the wallet already holds. A swap the cap no longer covers (a price
+/// move past what the quote's swap buffer absorbs) is a `400` with
 /// nothing sent (#305).
 ///
 /// The deposit and balances are read under the [`WalletTxLock`], so a
