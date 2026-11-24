@@ -93,6 +93,85 @@ pub struct DiscoveredBatch {
 /// [`rescan_transfer_history`] is for.
 const RESCAN_TAIL: u64 = 1_024;
 
+/// Unix time of Gnosis block 1 (block 0's timestamp is 0). With
+/// [`GNOSIS_SLOT_SECS`], bounds how high a genuine chain head can be now.
+const GNOSIS_BLOCK_1_UNIX: u64 = 1_539_024_185;
+
+/// Gnosis' block time. Missed slots only make the real head lower than
+/// "one block every 5 s since block 1" (about 1.86 M blocks lower in
+/// November 2026), never higher.
+const GNOSIS_SLOT_SECS: u64 = 5;
+
+/// Blocks a head may sit above "one block every 5 s since block 1" by
+/// this device's clock: one day of blocks, for a clock running slow
+/// (on top of the missed-slot slack above, ~100 days today).
+const HEAD_CLOCK_MARGIN: u64 = 17_280;
+
+/// The highest chain head that can be genuine at `now_unix` (this
+/// device's clock). A higher `eth_blockNumber` is a lying or broken RPC:
+/// scanning up to it would hold the scan lock for an effectively endless
+/// crawl and save a `scanned_through` above every block the chain will
+/// have for years, so later scans never look at new blocks again.
+fn max_plausible_head(now_unix: u64) -> u64 {
+    now_unix.saturating_sub(GNOSIS_BLOCK_1_UNIX) / GNOSIS_SLOT_SECS + 1 + HEAD_CLOCK_MARGIN
+}
+
+/// The chain head, refused when it is above [`max_plausible_head`]`(now)`.
+async fn plausible_head(client: &ChainClient, now_unix: u64) -> Result<u64, RpcError> {
+    let head = client.eth_block_number().await?;
+    let bound = max_plausible_head(now_unix);
+    if head > bound {
+        return Err(RpcError::Rpc(format!(
+            "implausible chain head {head}: by this device's clock (unix {now_unix}) the chain \
+             can't be past block {bound}; the RPC is wrong, or the clock is"
+        )));
+    }
+    Ok(head)
+}
+
+/// `scan` (saved, or an earlier attempt's progress) checked against
+/// `head`, the chain head this pass reads to (already within `bound`,
+/// [`max_plausible_head`]):
+///
+/// - read up to at most `head`: as it is;
+/// - read beyond `bound`: written by a pass that trusted a lying head
+///   (before that was refused), so its marks are clamped to `head` minus
+///   the rescan tail. Its confirmed mark is dropped — the lying pass
+///   never read the blocks between the real head then and `head` now —
+///   so the next confirming check reads the history once more before a
+///   "none" may lead to a deploy;
+/// - read beyond `head` but within `bound`: either the scan or `head` is
+///   wrong, and there's no telling which. Clamping would let a stale or
+///   lying-low head drop known transfers and save the truncated scan, so
+///   the pass is refused instead, until the head is past the scan again.
+fn fit_to_head(mut scan: TransferScan, head: u64, bound: u64) -> Result<TransferScan, RpcError> {
+    if scan.scanned_through <= head {
+        return Ok(scan);
+    }
+    if scan.scanned_through <= bound {
+        return Err(RpcError::Rpc(format!(
+            "chain head {head} is below block {}, which an earlier scan already read; the RPC \
+             is behind, or was wrong then",
+            scan.scanned_through
+        )));
+    }
+    let through = head.saturating_sub(RESCAN_TAIL);
+    tracing::warn!(
+        target: "ant_chain",
+        saved_through = scan.scanned_through,
+        head,
+        clamped_to = through,
+        "saved transfer scan reaches past any plausible chain head (an RPC lied about it); \
+         clamping it, and re-confirming the history before trusting a \"none\"",
+    );
+    scan.scanned_through = through;
+    scan.transfers.retain(|t| t.block <= through);
+    scan.confirmed_through = None;
+    scan.provisional_through = scan.provisional_through.map(|p| p.min(through));
+    scan.confirmed_above = None;
+    Ok(scan)
+}
+
 /// Version of the persisted [`TransferScan`] file. Version 1 wasn't keyed
 /// by chain; its files are ignored (a full scan, once).
 const TRANSFER_SCAN_VERSION: u32 = 2;
@@ -491,12 +570,17 @@ fn without_urls(error: &str) -> String {
         .split(' ')
         .map(|word| match word.find("://") {
             Some(scheme_end) => {
+                // Slice after the matched char, not one byte past its
+                // start: a non-ASCII neighbour (`“https://…”`, a trailing
+                // `…`) is several bytes long.
                 let start = word[..scheme_end]
-                    .rfind(|c: char| !c.is_ascii_alphanumeric())
-                    .map_or(0, |i| i + 1);
+                    .char_indices()
+                    .rfind(|&(_, c)| !c.is_ascii_alphanumeric())
+                    .map_or(0, |(i, c)| i + c.len_utf8());
                 let end = word
-                    .rfind(|c: char| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
-                    .map_or(word.len(), |i| i + 1)
+                    .char_indices()
+                    .rfind(|&(_, c)| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
+                    .map_or(word.len(), |(i, c)| i + c.len_utf8())
                     .max(scheme_end + 3);
                 format!("{}<url>{}", &word[..start], &word[end..])
             }
@@ -622,8 +706,8 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Scan the node wallet's xBZZ transfers from `from_block` to the head,
-/// continuing `previous` (same wallet) from where it stopped instead of
+/// Scan the node wallet's xBZZ transfers from `from_block` to `head` (a
+/// [`plausible_head`]), continuing `previous` (same wallet) from where it stopped instead of
 /// starting over. Its transfers in the rescan tail are dropped and read
 /// again. With `save_to`, the progress is saved there every
 /// [`SCAN_SAVE_EVERY`] while the scan runs, and when it fails. With
@@ -664,6 +748,7 @@ async fn scan_transfers(
     xbzz_token: &str,
     node_eoa: &[u8; 20],
     from_block: u64,
+    head: u64,
     previous: Option<TransferScan>,
     save_to: Option<&std::path::Path>,
     confirms: bool,
@@ -679,15 +764,6 @@ async fn scan_transfers(
             persist_transfer_scan(dir, &confirm_progress(rewound, scan));
         }
         _ => persist_transfer_scan(dir, scan),
-    };
-    let head = match client.eth_block_number().await {
-        Ok(head) => head,
-        Err(error) => {
-            return Err(ScanFailed {
-                stop: ScanStop::Rpc(error),
-                progress: previous.map(Box::new),
-            })
-        }
     };
     let report_status = |change: &dyn Fn(&mut WalletScanStatus)| {
         if let Some(key) = report {
@@ -1138,7 +1214,16 @@ async fn update_transfer_scan(
     static SCANS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _scanning = SCANS.lock().await;
     let chain_id = client.eth_chain_id().await?;
-    let saved = load_transfer_scan(data_dir, chain_id, node_eoa);
+    let now = unix_now();
+    let head = plausible_head(client, now).await?;
+    let bound = max_plausible_head(now);
+    // A saved scan is checked against the head before anything below
+    // derives from it — including the provisional scan a confirming pass
+    // saves its progress over (`rewound`), which would otherwise carry an
+    // unchecked mark back to disk.
+    let saved = load_transfer_scan(data_dir, chain_id, node_eoa)
+        .map(|s| fit_to_head(s, head, bound))
+        .transpose()?;
     // Only a full rescan replaces the saved scan wholesale; a confirming
     // re-read only rewinds it to its confirmed mark, which its progress
     // then carries forward (see below).
@@ -1182,10 +1267,12 @@ async fn update_transfer_scan(
         // A full rescan an earlier attempt cut short: every block it read
         // was read from the deploy block on, through the verified route, so
         // it continues from there.
+        // One that doesn't fit the head is dropped: the rescan starts over.
         ScanMode::Full => PARTIAL_RESCANS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&partial_key),
+            .remove(&partial_key)
+            .and_then(|p| fit_to_head(p, head, bound).ok()),
         // Drop what the routine scans read above the confirmed mark; the
         // scan below reads those blocks again — including any read only
         // from the unverified source, which this pass reads verified.
@@ -1235,6 +1322,7 @@ async fn update_transfer_scan(
         xbzz_token,
         node_eoa,
         GNOSIS_XBZZ_DEPLOY_BLOCK,
+        head,
         previous,
         save_progress.then_some(data_dir),
         confirms,
@@ -1447,7 +1535,12 @@ impl ChainClient {
                 Ok(logs) => {
                     window(end, logs);
                     windows += 1;
-                    start = end.saturating_add(1);
+                    // `end + 1` saturates at `u64::MAX`: without this, a
+                    // range ending there would never get past it.
+                    if end == to_block {
+                        return Ok(None);
+                    }
+                    start = end + 1;
                     chunk = chunk.saturating_mul(2).min(INITIAL_SCAN_CHUNK);
                 }
                 Err(RpcError::Rpc(msg)) if chunk > 1 && is_range_limit_error(&msg) => {
@@ -1763,8 +1856,26 @@ fn parse_log_entry(v: &serde_json::Value) -> Result<LogEntry, RpcError> {
 /// Heuristic: does this RPC error mean "your block range / result set
 /// was too big"? Such errors are recoverable by shrinking the window;
 /// anything else (auth, malformed) should propagate immediately.
+///
+/// A rate limit is not one: "rate limit exceeded" contains "limit", but
+/// a narrower window doesn't help against it — halving down to one block
+/// only spends ~26 more refused requests, with no backoff, before failing
+/// anyway. It propagates like any other error, and the caller's retry
+/// (with its delay) handles it.
 fn is_range_limit_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
+    if [
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "rate limited",
+        "too many requests",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+    {
+        return false;
+    }
     [
         "block range",
         "range",
@@ -1860,6 +1971,49 @@ mod tests {
             "query returned more than 10000 results"
         ));
         assert!(!is_range_limit_error("invalid api key"));
+        // A rate limit isn't a range limit: no narrower window helps.
+        assert!(!is_range_limit_error("rate limit exceeded"));
+        assert!(!is_range_limit_error("Too Many Requests"));
+        assert!(!is_range_limit_error(
+            "daily request count exceeded, request rate limited"
+        ));
+    }
+
+    /// A non-ASCII char next to a URL (curly quotes, a trailing `…`) used
+    /// to slice `without_urls` mid-char and panic (a release build
+    /// aborts). The URL, which may carry an API key, is still dropped.
+    #[test]
+    fn without_urls_handles_non_ascii_neighbours() {
+        assert_eq!(
+            without_urls("see \u{201c}https://x.y/a\u{201d}"),
+            "see \u{201c}<url>"
+        );
+        assert_eq!(without_urls("go https://x/k\u{2026}"), "go <url>");
+        assert_eq!(
+            without_urls("\u{e9}https://key.example/abc). done"),
+            "\u{e9}<url>). done"
+        );
+        // Unchanged for the ASCII cases.
+        assert_eq!(
+            without_urls("post (https://rpc.example/KEY), retry"),
+            "post (<url>), retry"
+        );
+    }
+
+    /// A chain head above "one block every 5 s since block 1" by this
+    /// clock is refused; a real one isn't.
+    #[test]
+    fn plausible_head_bound() {
+        // Gnosis, measured: block 49 443 862 at unix 1 795 519 020.
+        assert!(max_plausible_head(1_795_519_020) >= 49_443_862);
+        // Block 1, a day of margin, nothing more.
+        assert_eq!(
+            max_plausible_head(GNOSIS_BLOCK_1_UNIX),
+            1 + HEAD_CLOCK_MARGIN
+        );
+        // The scan tests' head is genuine today.
+        assert!(max_plausible_head(unix_now()) > HEAD + 1_000);
+        assert!(max_plausible_head(unix_now()) < u64::MAX / 2);
     }
 
     #[test]
@@ -1907,12 +2061,14 @@ mod tests {
         node_eoa: &[u8; 20],
         from_block: u64,
     ) -> Result<Vec<DiscoveredBatch>, RpcError> {
+        let head = client.eth_block_number().await?;
         let scan = scan_transfers(
             client,
             100,
             xbzz_token,
             node_eoa,
             from_block,
+            head,
             None,
             None,
             false,
@@ -1935,12 +2091,14 @@ mod tests {
         node_eoa: &[u8; 20],
         from_block: u64,
     ) -> Result<Option<[u8; 20]>, RpcError> {
+        let head = client.eth_block_number().await?;
         let scan = scan_transfers(
             client,
             100,
             xbzz_token,
             node_eoa,
             from_block,
+            head,
             None,
             None,
             false,
@@ -2566,6 +2724,208 @@ mod tests {
         assert_eq!(second.transfers.len(), 2);
         assert_eq!(second.scanned_through, HEAD + 1_000 - RESCAN_TAIL);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A lying `eth_blockNumber` (`u64::MAX`) is refused before any log
+    /// is read, and saves nothing: before, it started an effectively
+    /// endless crawl under the scan lock, and the `scanned_through` it
+    /// saved put every later block out of the scan's reach.
+    #[tokio::test]
+    async fn an_implausible_head_is_refused_and_saves_nothing() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain
+            .head
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-lying-head");
+
+        let err = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("a u64::MAX head must be refused");
+        assert!(err.to_string().contains("implausible chain head"), "{err}");
+        assert!(chain.ranges.lock().unwrap().is_empty(), "no log was read");
+        assert!(
+            load_transfer_scan(&dir, GNOSIS, &NODE_EOA).is_none(),
+            "nothing was saved"
+        );
+
+        // Nor does it touch a scan saved before.
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        let saved = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        chain
+            .head
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap_err();
+        assert_eq!(load_transfer_scan(&dir, GNOSIS, &NODE_EOA), Some(saved));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan an earlier build saved after trusting a lying head (marks
+    /// near `u64::MAX`) is clamped to the real head on load, so the scan
+    /// sees new blocks again; its confirmed mark is dropped, so a
+    /// confirming check reads the history once more before a "none" may
+    /// lead to a deploy.
+    #[tokio::test]
+    async fn a_saved_scan_beyond_the_head_is_clamped() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD - 100, [5; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-poisoned");
+        let poisoned = u64::MAX - RESCAN_TAIL;
+        persist_transfer_scan(
+            &dir,
+            &TransferScan {
+                chain_id: GNOSIS,
+                node_eoa: NODE_EOA,
+                scanned_through: poisoned,
+                transfers: vec![to_cb(45_000_000, [1; 32]), to_cb(poisoned, [9; 32])],
+                confirmed_through: Some(poisoned),
+                provisional_since: None,
+                provisional_through: None,
+                confirmed_above: None,
+            },
+        );
+
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(scan.confirmed_through, None);
+        assert_eq!(
+            *chain.ranges.lock().unwrap(),
+            vec![(HEAD - RESCAN_TAIL + 1, HEAD)],
+            "the blocks since the clamped mark are read"
+        );
+        let blocks: Vec<u64> = scan.transfers.iter().map(|t| t.block).collect();
+        assert_eq!(blocks, vec![45_000_000, HEAD - 100]);
+        let saved = load_transfer_scan(&dir, GNOSIS, &NODE_EOA).unwrap();
+        assert_eq!(saved.scanned_through, HEAD - RESCAN_TAIL);
+        assert_eq!(saved.confirmed_through, None);
+
+        // And new blocks are seen again.
+        chain
+            .head
+            .store(HEAD + 1_000, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD + 500, [6; 32]));
+        let next = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+        assert_eq!(next.scanned_through, HEAD + 1_000 - RESCAN_TAIL);
+        assert!(next.transfers.iter().any(|t| t.block == HEAD + 500));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved scan past the head but within what the clock allows can't
+    /// tell which one is wrong: the pass is refused, and the saved scan
+    /// (with its transfers) is left alone rather than cut back to a head
+    /// that may be stale.
+    #[tokio::test]
+    async fn a_head_below_a_plausible_saved_scan_is_refused() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain.head.store(HEAD, std::sync::atomic::Ordering::SeqCst);
+        chain
+            .transfers
+            .lock()
+            .unwrap()
+            .push(to_cb(HEAD - 5_000, [7; 32]));
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let dir = scratch_dir("scan-head-behind");
+        let saved = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .unwrap();
+
+        chain.ranges.lock().unwrap().clear();
+        chain
+            .head
+            .store(HEAD - 10_000, std::sync::atomic::Ordering::SeqCst);
+        let err = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &NODE_EOA, &dir)
+            .await
+            .expect_err("a head below the saved scan must be refused");
+        assert!(err.to_string().contains("below block"), "{err}");
+        assert!(chain.ranges.lock().unwrap().is_empty());
+        assert_eq!(load_transfer_scan(&dir, GNOSIS, &NODE_EOA), Some(saved));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A range that ends at `u64::MAX` is read once and finished:
+    /// `end + 1` saturates there, so the loop used to read the last
+    /// window forever.
+    #[tokio::test]
+    async fn a_scan_ending_at_u64_max_terminates() {
+        let chain = std::sync::Arc::new(GrowingChain::default());
+        chain
+            .head
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        let logs = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.scan_logs(crate::GNOSIS_BZZ_TOKEN, &topics, u64::MAX - 5, u64::MAX),
+        )
+        .await
+        .expect("the scan must end")
+        .unwrap();
+        assert!(logs.is_empty());
+        assert_eq!(
+            *chain.ranges.lock().unwrap(),
+            vec![(u64::MAX - 5, u64::MAX)]
+        );
+    }
+
+    /// Answers every `eth_getLogs` with a rate-limit error, counting them.
+    #[derive(Default)]
+    struct RateLimitedLogs {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ChainTransport for RateLimitedLogs {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            assert_eq!(req["method"], "eth_getLogs");
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "error": {"code": -32005, "message": "rate limit exceeded"},
+                })
+                .to_string(),
+            )
+        }
+    }
+
+    /// A rate-limited `eth_getLogs` fails the scan at once: it doesn't
+    /// halve the window ~26 times, each another refused request.
+    #[tokio::test]
+    async fn a_rate_limit_does_not_shrink_the_window() {
+        let rpc = std::sync::Arc::new(RateLimitedLogs::default());
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(rpc.clone()));
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        let err = client
+            .scan_logs(
+                crate::GNOSIS_BZZ_TOKEN,
+                &topics,
+                GNOSIS_XBZZ_DEPLOY_BLOCK,
+                HEAD,
+            )
+            .await
+            .expect_err("a rate limit must propagate");
+        assert!(err.to_string().contains("rate limit"), "{err}");
+        assert_eq!(rpc.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A transfer seen in the reorg tail isn't remembered as final: if a
