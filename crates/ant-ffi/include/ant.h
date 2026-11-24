@@ -1086,8 +1086,10 @@ void ant_free_string(char *ptr);
  * a new or existing chequebook's deposit up to the settlement target
  * from the wallet's existing xBZZ (nothing is swapped).
  *
- * The gateway's chain wiring is captured here, once. A host serving
- * chain reads itself must call ant_set_chain_transport BEFORE this.
+ * The gateway's chain wiring is built here, once, over the handle's
+ * chain transport slot: a transport set with ant_set_chain_transport
+ * before or after this call serves the gateway's chain requests from
+ * then on, with no restart.
  *
  * CORS: the gateway allows cross-origin reads only for the origins last
  * set with ant_set_gateway_cors. By default none: it sends no CORS
@@ -1344,14 +1346,19 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * replacing call, and calling ant_set_chain_transport from *inside* the
  * callback deadlocks.
  *
- * Ordering: effective immediately for ant_storage_* / ant_settlement_* /
- * ant_deploy_chequebook, which build a chain client per call. The
- * in-process gateway captures its chain wiring at ant_start_gateway, so
- * a transport installed while no transport was installed at its start
- * is only guaranteed to reach it after a restart (ant_stop_gateway +
- * ant_start_gateway) — install it first. Replacing or clearing a
- * transport the gateway did start with takes effect in it immediately,
- * per Lifetime above.
+ * Ordering: effective immediately, for the next chain request of
+ * ant_storage_* / ant_storage_settlement_* / ant_deploy_chequebook and
+ * of a running in-process gateway alike. The gateway builds its chain
+ * wiring at ant_start_gateway over the handle's one transport slot, so
+ * a transport installed after the gateway started reaches its chain
+ * reads, its after-buy and chequebook-refused hooks and the chequebook
+ * funds watch with no restart. The background confirmation of a
+ * wallet scan read from the unverified logs source, whose backoff
+ * reaches 30 minutes, is woken to try the new transport within a
+ * minute. Requests that already went to gnosis_rpc before the install
+ * are not repeated; another background retry that already failed tries
+ * again at its next backoff step. Replacing or clearing a transport
+ * takes effect in the same way, per Lifetime above.
  *
  * Returns ANT_CHAIN_TRANSPORT_OK (0) on success,
  * ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) if `handle` is NULL, or

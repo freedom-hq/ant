@@ -311,7 +311,32 @@ pub fn build(handle: GatewayHandle) -> Router {
             handle.clone(),
             crate::hosts::host_guard,
         ))
+        // Outermost so every answer carries it, the host/CORS refusals
+        // included (issue #297).
+        .layer(middleware::from_fn(nosniff))
         .with_state(handle)
+}
+
+/// `X-Content-Type-Options: nosniff` on every response (issue #297; bee
+/// sets it globally since ethersphere/bee#5651), so a browser never
+/// reinterprets uploaded bytes as a type the response didn't declare —
+/// e.g. runs a `text/plain` or `application/octet-stream` body as HTML
+/// on the API's origin. The one exception is a response marked
+/// [`retrieval::AllowSniffing`]: a `/bzz` entry stored with an empty
+/// content type, which bee also leaves for the browser to sniff.
+async fn nosniff(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    if resp
+        .extensions()
+        .get::<retrieval::AllowSniffing>()
+        .is_none()
+    {
+        resp.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+    }
+    resp
 }
 
 /// Source of the per-request id carried in the `http` span (`req=N`),
