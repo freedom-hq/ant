@@ -3945,13 +3945,16 @@ mod tests {
             assert!(arg.get_env().is_some(), "{id} has no env");
             assert!(arg.is_hide_env_values_set(), "{id} shows its env value");
         }
-        std::env::set_var(
-            "GNOSIS_UNVERIFIED_LOGS_RPC_URL",
-            "https://rpc.example/v2/SECRETAPIKEY",
-        );
-        let help = Opt::command().render_long_help().to_string();
-        std::env::remove_var("GNOSIS_UNVERIFIED_LOGS_RPC_URL");
-        assert!(help.contains("GNOSIS_UNVERIFIED_LOGS_RPC_URL"), "{help}");
+        // Point the arg at a test-only env name so no parallel test that
+        // parses `Opt` can see the value; `hide_env_values` stays as set.
+        const ENV: &str = "ANT_TEST_288_UNVERIFIED_LOGS_RPC_URL";
+        std::env::set_var(ENV, "https://rpc.example/v2/SECRETAPIKEY");
+        let help = Opt::command()
+            .mut_arg("gnosis_unverified_logs_rpc_url", |a| a.env(ENV))
+            .render_long_help()
+            .to_string();
+        std::env::remove_var(ENV);
+        assert!(help.contains(ENV), "{help}");
         assert!(!help.contains("SECRETAPIKEY"), "{help}");
     }
 

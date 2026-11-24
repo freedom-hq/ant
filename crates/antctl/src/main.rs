@@ -137,7 +137,9 @@ Examples:
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
-        /// Path to write the bytes to. Defaults to stdout.
+        /// Path to write the bytes to. Defaults to stdout. If it is an
+        /// existing directory, the file is named after the manifest's
+        /// `Filename`, reduced to its final component (else `data.bin`).
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
         /// Force `bytes` (multi-chunk join) mode regardless of the
@@ -3342,7 +3344,7 @@ mod tests {
         let dir = root.join("a").join("b").join("out");
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
-        let outside = root.join("x");
+        let outside = root.join("a").join("x");
         for (hint, expect) in [
             ("/etc/x", "x"),
             ("../../x", "x"),
