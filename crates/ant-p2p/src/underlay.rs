@@ -174,46 +174,59 @@ pub(crate) enum IpScope {
     Local,
 }
 
-/// Classify `ip`. IPv6 forms that a dial turns into a packet toward an
-/// embedded IPv4 address are classified as that IPv4 address: IPv4-mapped
-/// (`::ffff:a.b.c.d`), the deprecated IPv4-compatible `::a.b.c.d` (`::/96`,
-/// RFC 4291 2.5.5.1), NAT64 well-known-prefix (`64:ff9b::a.b.c.d`) and 6to4
-/// (`2002:aabb:ccdd::/48`, RFC 3056).
+/// The address a dial to `ip` actually reaches: `ip` itself, or for an
+/// IPv6 form that a dial turns into a packet toward an embedded IPv4
+/// address, that IPv4 address. Covers IPv4-mapped (`::ffff:a.b.c.d`), the
+/// deprecated IPv4-compatible `::a.b.c.d` (`::/96`, RFC 4291 2.5.5.1),
+/// NAT64 well-known-prefix (`64:ff9b::a.b.c.d`) and 6to4
+/// (`2002:aabb:ccdd::/48`, RFC 3056). [`ip_scope`] classifies through it,
+/// and anything comparing a dial target against known IPs (the
+/// `public_dials_only` own-WAN check) should too.
+pub(crate) fn dial_target_ip(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let seg = v6.segments();
+    let v4 = |hi: u16, lo: u16| {
+        let [a, b] = hi.to_be_bytes();
+        let [c, d] = lo.to_be_bytes();
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    };
+    // 64:ff9b::/96 NAT64 well-known prefix (RFC 6052): the dial is
+    // translated to the embedded IPv4, so it is that address that gets
+    // reached. RFC 6052 forbids embedding a non-global IPv4 here, but a
+    // translator that doesn't enforce it would connect to e.g.
+    // 192.168.1.1 for 64:ff9b::c0a8:101.
+    if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return v4(seg[6], seg[7]);
+    }
+    // ::/96 IPv4-compatible (RFC 4291, deprecated): a host with an
+    // automatic tunnel (Linux `sit0`) sends it as IPv4 to the embedded
+    // address. Also covers `::` (0.0.0.0) and `::1` (0.0.0.1), both Local
+    // either way.
+    if seg[..6] == [0, 0, 0, 0, 0, 0] {
+        return v4(seg[6], seg[7]);
+    }
+    // 2002::/16 6to4 (RFC 3056): a host with a 6to4 interface
+    // encapsulates it in IPv4 toward the address in bits 16..48, so
+    // `2002:c0a8:101::1` is tunneled to 192.168.1.1.
+    if seg[0] == 0x2002 {
+        return v4(seg[1], seg[2]);
+    }
+    ip
+}
+
+/// Classify `ip`, by the address a dial to it reaches
+/// ([`dial_target_ip`]): an IPv6 form embedding an IPv4 address is
+/// classified as that IPv4 address.
 pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
-    match ip {
+    match dial_target_ip(ip) {
         IpAddr::V4(v4) => ipv4_scope(v4),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return ipv4_scope(v4);
-            }
             let seg = v6.segments();
-            // 64:ff9b::/96 NAT64 well-known prefix (RFC 6052): the dial is
-            // translated to the embedded IPv4, so it is that address that
-            // gets reached. RFC 6052 forbids embedding a non-global IPv4
-            // here, but a translator that doesn't enforce it would connect
-            // to e.g. 192.168.1.1 for 64:ff9b::c0a8:101.
-            if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = seg[6].to_be_bytes();
-                let [c, d] = seg[7].to_be_bytes();
-                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
-            }
-            // ::/96 IPv4-compatible (RFC 4291, deprecated): a host with an
-            // automatic tunnel (Linux `sit0`) sends it as IPv4 to the
-            // embedded address. Also covers `::` (0.0.0.0) and `::1`
-            // (0.0.0.1), both Local either way.
-            if seg[..6] == [0, 0, 0, 0, 0, 0] {
-                let [a, b] = seg[6].to_be_bytes();
-                let [c, d] = seg[7].to_be_bytes();
-                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
-            }
-            // 2002::/16 6to4 (RFC 3056): a host with a 6to4 interface
-            // encapsulates it in IPv4 toward the address in bits 16..48, so
-            // `2002:c0a8:101::1` is tunneled to 192.168.1.1.
-            if seg[0] == 0x2002 {
-                let [a, b] = seg[1].to_be_bytes();
-                let [c, d] = seg[2].to_be_bytes();
-                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
-            }
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()

@@ -170,9 +170,10 @@ pub struct RunConfig {
     /// even one inside this host's own subnets (the same-LAN exception of
     /// the underlay filter), no DNS underlay (`/dns`, `/dns4`, `/dns6`,
     /// `/dnsaddr` are resolved at dial time and could name loopback or a
-    /// LAN host), and the host's interfaces are never read for it. Hive gossip is signed only by the peer it describes, so any peer
-    /// can name a private address on this host's LAN and have the node
-    /// open TCP connections there, on a port the peer picks. For an
+    /// LAN host), and the host's interfaces are never read for it. Hive
+    /// gossip is signed only by the peer it describes, so any peer can
+    /// name a private address on this host's LAN and have the node open
+    /// TCP connections there, on a port the peer picks. For an
     /// embedder that has no use for a bee node on its LAN (a wallet reading
     /// a few chunks). `false` (the default) keeps the same-LAN exception.
     /// Stricter than [`Self::allow_private_dials`], and wins over it. It
@@ -186,7 +187,9 @@ pub struct RunConfig {
     /// reported the same IP, so one peer or one operator's address block
     /// can neither fake nor crowd it out), since behind a NAT that
     /// is the router's WAN address, which hairpin NAT answers from the LAN
-    /// side.
+    /// side. An IPv6 underlay that a dial turns into a packet toward an
+    /// embedded IPv4 (NAT64 `64:ff9b::/96`, 6to4, IPv4-compatible or
+    /// -mapped) is compared by that IPv4.
     pub public_dials_only: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
@@ -652,17 +655,17 @@ enum IpReporter {
 }
 
 /// The network a reporting host's `ip` belongs to, as one operator holds
-/// it: its IPv4 /24, or its IPv6 /48. Keying reporters by the full address
-/// would let one IPv6 host count as any number of "hosts" (a single /64
-/// alone is 2^64 of them), so it could corroborate a junk IP on its own
-/// and crowd honest reporters out of the cap. An IPv4-mapped IPv6 address
-/// counts as its IPv4 address.
+/// it: its IPv4 /24, or its IPv6 prefix of
+/// [`crate::observed_addr::IPV6_OPERATOR_PREFIX_BYTES`] (/48, the same
+/// grouping #300's observer count uses). Keying reporters by the full
+/// address would let one IPv6 host count as any number of "hosts" (a
+/// single /64 alone is 2^64 of them), so it could corroborate a junk IP
+/// on its own and crowd honest reporters out of the cap. An IPv4-mapped
+/// IPv6 address counts as its IPv4 address.
 fn reporter_net(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V4(v4) => IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & 0xffff_ff00)),
-        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(
-            u128::from(v6) & !((1u128 << 80) - 1),
-        )),
+        IpAddr::V6(v6) => IpAddr::V6(crate::observed_addr::ipv6_operator_prefix(v6)),
     }
 }
 
@@ -690,7 +693,11 @@ struct OwnPublicIps {
 impl OwnPublicIps {
     /// `ip` is ours: a trusted external address, or the `observed_addr`
     /// of at least [`OWN_IP_CORROBORATION`] distinct reporting networks.
+    /// Compared by the address a dial to `ip` reaches
+    /// ([`crate::underlay::dial_target_ip`]), so a NAT64, 6to4,
+    /// IPv4-compatible or IPv4-mapped IPv6 form of our WAN IPv4 matches it.
     fn contains(&self, ip: IpAddr) -> bool {
+        let ip = crate::underlay::dial_target_ip(ip);
         self.trusted.contains(&ip)
             || self.reports.values().filter(|(r, _)| *r == ip).count() >= OWN_IP_CORROBORATION
     }
@@ -706,7 +713,7 @@ impl OwnPublicIps {
                 return;
             }
             if crate::underlay::is_globally_routable_ip(ip) {
-                self.trusted.insert(ip);
+                self.trusted.insert(crate::underlay::dial_target_ip(ip));
             }
         }
     }
@@ -762,7 +769,10 @@ impl OwnPublicIps {
                 self.reports.remove(&victim);
             }
         }
-        self.reports.insert(reporter, (ip, Instant::now()));
+        self.reports.insert(
+            reporter,
+            (crate::underlay::dial_target_ip(ip), Instant::now()),
+        );
     }
 }
 
@@ -11545,6 +11555,67 @@ mod tests {
         let peer = PeerId::random();
         state.own_public_ips.on_established(conn, peer, &endpoint);
         state.own_public_ips.on_observed(conn, peer, observed);
+    }
+
+    /// The hairpin check compares by the address a dial reaches: a NAT64,
+    /// IPv4-compatible, 6to4 or IPv4-mapped IPv6 form of our WAN IPv4 is
+    /// our WAN all the same (on a NAT64 network or a `sit0`/6to4 host the
+    /// dial goes there), while one embedding another global IPv4 stays.
+    #[test]
+    fn public_dials_only_drops_embedded_own_wan() {
+        let mut state = test_state();
+        state.public_dials_only = true;
+        let observed_wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip4/5.0.3.1/tcp/1634", &observed_wan);
+        report_on_conn(&mut state, 2, "/ip4/5.0.4.3/tcp/1634", &observed_wan);
+        let addrs: Vec<Multiaddr> = [
+            "/ip4/81.2.69.77/tcp/80",
+            "/ip6/64:ff9b::5102:454d/tcp/80",
+            "/ip6/::5102:454d/tcp/80",
+            "/ip6/2002:5102:454d::1/tcp/80",
+            "/ip6/::ffff:81.2.69.77/tcp/80",
+            "/ip6/64:ff9b::808:808/tcp/80",
+            "/ip6/2002:808:808::1/tcp/80",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(
+            state.dialable_underlays(&addrs),
+            vec![addrs[5].clone(), addrs[6].clone()]
+        );
+
+        // A trusted own address given in an IPv6 form matches the plain
+        // IPv4 underlay too.
+        let mut state = test_state();
+        state.public_dials_only = true;
+        state
+            .own_public_ips
+            .note_trusted(&"/ip6/64:ff9b::5102:454e/tcp/1634".parse().unwrap());
+        let plain: Multiaddr = "/ip4/81.2.69.78/tcp/80".parse().unwrap();
+        assert_eq!(state.dialable_underlays(&[plain]), Vec::<Multiaddr>::new());
+    }
+
+    /// `reporter_net` and #300's observer grouping agree on what one IPv6
+    /// operator is, so tuning one can't silently leave the other behind.
+    #[test]
+    fn reporter_net_groups_ipv6_like_observed_addr() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let a = ip("2a01:4f8:1:2::1");
+        let same = ip("2a01:4f8:1:ffff::9");
+        let other = ip("2a01:4f8:2::1");
+        assert_eq!(reporter_net(a), reporter_net(same));
+        assert_ne!(reporter_net(a), reporter_net(other));
+        for b in [same, other] {
+            let (IpAddr::V6(a6), IpAddr::V6(b6)) = (a, b) else {
+                unreachable!()
+            };
+            assert_eq!(
+                reporter_net(a) == reporter_net(b),
+                crate::observed_addr::ipv6_operator_prefix(a6)
+                    == crate::observed_addr::ipv6_operator_prefix(b6)
+            );
+        }
     }
 
     /// `public_dials_only`'s own-IP set takes an `observed_addr` only when
