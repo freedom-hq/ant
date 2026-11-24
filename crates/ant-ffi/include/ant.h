@@ -1265,9 +1265,11 @@ bool ant_set_gateway_allowed_hosts(const AntHandle *handle,
  * ant_start_gateway takes, so a start racing this stop (any thread, same
  * port) waits for it too. If the runtime is too busy to drop the task
  * within 2 s, this still returns true (logging a warning) and the port
- * is freed a moment later; a start in that moment fails with
- * "bind <addr>: Address in use" and can simply be retried. Safe to call
- * repeatedly. A
+ * is freed a moment later; a start in that moment fails with the OS's
+ * address-in-use error, e.g. "ant_start_gateway: bind 127.0.0.1:1633:
+ * Address already in use (os error 98)" (os error 48 on Apple
+ * platforms), and can simply be retried; match on "bind <addr>" plus
+ * "already in use", not the exact OS text. Safe to call repeatedly. A
  * background rediscovery retry stops with it, before its next attempt;
  * the next start with a `gnosis_rpc` tries again. An unfinished
  * /health.walletScan (pending, scanning, retrying) is dropped with it,

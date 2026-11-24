@@ -5789,6 +5789,9 @@ mod tests {
         // the bind error, and the first one keeps serving.
         let err = start_gateway_on(&second, addr).expect_err("port is taken");
         assert!(err.contains(&format!("bind {addr}")), "{err}");
+        // The text `ant_stop_gateway`'s docs tell hosts to match on.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        assert!(err.contains("already in use"), "{err}");
         assert!(second.gateway_task.lock().unwrap().is_none());
         let status = status_for_host(addr, "localhost");
         assert!(status.starts_with("http/1.1 200"), "{status}");
