@@ -171,7 +171,10 @@ pub struct RunConfig {
     /// open TCP connections there, on a port the peer picks. For an
     /// embedder that has no use for a bee node on its LAN (a wallet reading
     /// a few chunks). `false` (the default) keeps the same-LAN exception.
-    /// Stricter than [`Self::allow_private_dials`], and wins over it.
+    /// Stricter than [`Self::allow_private_dials`], and wins over it. It
+    /// also turns off identify's peer address cache, so libp2p's implicit
+    /// dials (`open_stream` to a disconnected peer) can't fall back to
+    /// unfiltered addresses a peer reported about itself.
     pub public_dials_only: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
@@ -1895,7 +1898,11 @@ fn local_overlay_from_secret(
 /// `target_peers` and the dialer stops pulling from the hint queue.
 pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let local_peer_id = cfg.libp2p_keypair.public().to_peer_id();
-    let mut swarm = build_swarm(cfg.libp2p_keypair.clone(), &LivenessConfig::DEFAULT)?;
+    let mut swarm = build_swarm(
+        cfg.libp2p_keypair.clone(),
+        &LivenessConfig::DEFAULT,
+        cfg.public_dials_only,
+    )?;
     let mut commands = cfg.commands.take();
     let listen: Multiaddr = LISTEN.parse().unwrap();
     swarm
@@ -9804,6 +9811,7 @@ fn resolver_config() -> dns::ResolverConfig {
 fn build_swarm(
     keypair: Keypair,
     liveness: &LivenessConfig,
+    public_dials_only: bool,
 ) -> Result<Swarm<AntBehaviour>, RunError> {
     // `push_listen_addr_updates` triggers an identify-push whenever our
     // listener set changes. That matters for bee: if a later listener arrives
@@ -9814,6 +9822,20 @@ fn build_swarm(
     let id_cfg = identify::Config::new(AGENT.to_string(), keypair.public())
         .with_agent_version(AGENT.to_string())
         .with_push_listen_addr_updates(true);
+    // Identify caches every listen address a peer reports (100 by default)
+    // and hands them to the swarm for *any* dial to that peer: an implicit
+    // one (`open_stream` to a disconnected peer dials
+    // `DialOpts::peer_id(peer)` with no addresses) and ours too, since
+    // behaviour-supplied addresses are added to explicit ones. Those
+    // addresses never pass `dialable_underlays`, so a peer could report
+    // `/ip4/192.168.1.1/tcp/22` and get it dialed. With
+    // `public_dials_only` the cache is off and every address we dial is
+    // one we filtered.
+    let id_cfg = if public_dials_only {
+        id_cfg.with_cache_size(0)
+    } else {
+        id_cfg
+    };
     let behaviour = AntBehaviour {
         stream: libp2p_stream::Behaviour::default(),
         identify: identify::Behaviour::new(id_cfg),
@@ -10012,7 +10034,7 @@ mod tests {
         let cfg = FAST_LIVENESS;
         let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
         // Remote: a plain node of ours on loopback, frozen on demand.
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10045,7 +10067,7 @@ mod tests {
         // forwarding but keeps both sockets open. Nothing reaches either
         // side any more and nobody sees a FIN or RST: a half-open link.
         let (proxy_addr, freeze) = freezable_tcp_relay(&remote_addr).await;
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         let mut state = test_state();
         state.liveness = Liveness::new(cfg, Instant::now());
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
@@ -10166,7 +10188,8 @@ mod tests {
     /// visible as the cleared hint dedup), once per cooldown window.
     #[tokio::test]
     async fn link_failure_streak_triggers_one_self_heal_per_window() {
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT, false).unwrap();
         let mut state = test_state();
         let (dial_tx, _dial_rx) = mpsc::channel::<Multiaddr>(8);
         let (mut backoff, mut last_boot, mut last_top_up) =
@@ -10222,7 +10245,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_one_of_two_connections_keeps_the_peer() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10237,7 +10260,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         let mut state = test_state();
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
         let mut control = ours.behaviour().stream.new_control();
@@ -10314,7 +10337,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn duplicate_dialer_connection_clears_dial_start_markers() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10329,7 +10352,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
         let mut state = test_state();
         let mut control = ours.behaviour().stream.new_control();
         let hs = HandshakeParams {
@@ -10815,6 +10838,82 @@ mod tests {
         hint.addrs = vec!["/ip4/127.0.0.1/tcp/1634".parse().unwrap()];
         state.enqueue_hint(hint, local);
         assert_eq!(state.hint_queue.len(), 1);
+    }
+
+    /// `public_dials_only` also covers libp2p's own dials: a peer reports a
+    /// private address (here a loopback sentinel) in identify, drops the
+    /// connection, and the next `open_stream` to it makes the swarm dial
+    /// `DialOpts::peer_id(peer)` with no addresses of ours. With the option
+    /// off, identify's address cache supplies the sentinel and it is
+    /// connected to; with it on, the cache is off and nothing is dialed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_dials_only_ignores_identify_reported_addresses() {
+        assert!(sentinel_dialed_after_identify(false).await);
+        assert!(!sentinel_dialed_after_identify(true).await);
+    }
+
+    async fn sentinel_dialed_after_identify(public_dials_only: bool) -> bool {
+        let cfg = FAST_LIVENESS;
+        let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
+        let sentinel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sentinel_addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            sentinel.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, false).unwrap();
+        remote
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let remote_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.select_next_some().await {
+                break address;
+            }
+        };
+        // Reported to us in identify's `listen_addrs`.
+        remote.add_external_address(sentinel_addr);
+        let remote_task = tokio::spawn(async move {
+            loop {
+                remote.select_next_some().await;
+            }
+        });
+
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, public_dials_only).unwrap();
+        let mut control = ours.behaviour().stream.new_control();
+        ours.dial(remote_addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let peer = loop {
+            assert!(Instant::now() < deadline, "identify never arrived");
+            if let SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                ..
+            })) = ours.select_next_some().await
+            {
+                break peer_id;
+            }
+        };
+        ours.disconnect_peer_id(peer).unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "connection never closed");
+            if let SwarmEvent::ConnectionClosed { .. } = ours.select_next_some().await {
+                break;
+            }
+        }
+
+        let open = tokio::spawn(async move { control.open_stream(peer, proto).await });
+        let driven = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                ours.select_next_some().await;
+            }
+        });
+        let accepted = tokio::select! {
+            r = sentinel.accept() => r.is_ok(),
+            _ = driven => false,
+        };
+        open.abort();
+        remote_task.abort();
+        accepted
     }
 
     /// `public_dials_only`: a same-LAN private underlay is dropped like any

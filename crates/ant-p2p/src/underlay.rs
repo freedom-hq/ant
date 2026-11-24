@@ -170,7 +170,8 @@ pub(crate) enum IpScope {
     Local,
 }
 
-/// Classify `ip`. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is classified as the
+/// Classify `ip`. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and NAT64
+/// well-known-prefix IPv6 (`64:ff9b::a.b.c.d`) are classified as the
 /// embedded IPv4 address.
 pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
     match ip {
@@ -180,6 +181,16 @@ pub(crate) fn ip_scope(ip: IpAddr) -> IpScope {
                 return ipv4_scope(v4);
             }
             let seg = v6.segments();
+            // 64:ff9b::/96 NAT64 well-known prefix (RFC 6052): the dial is
+            // translated to the embedded IPv4, so it is that address that
+            // gets reached. RFC 6052 forbids embedding a non-global IPv4
+            // here, but a translator that doesn't enforce it would connect
+            // to e.g. 192.168.1.1 for 64:ff9b::c0a8:101.
+            if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = seg[6].to_be_bytes();
+                let [c, d] = seg[7].to_be_bytes();
+                return ipv4_scope(Ipv4Addr::new(a, b, c, d));
+            }
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -653,6 +664,9 @@ mod tests {
             ma("/dns6/example.com/tcp/1634"),
             ma("/dnsaddr/example.com"),
             ma("/ip4/1.2.3.4/tcp/1634/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA"),
+            // NAT64 well-known prefix embedding 192.168.1.1 / 127.0.0.1.
+            ma("/ip6/64:ff9b::c0a8:101/tcp/80"),
+            ma("/ip6/64:ff9b::7f00:1/tcp/80"),
         ];
         let kept = filter_public_underlays(&addrs);
         assert_eq!(
@@ -663,7 +677,13 @@ mod tests {
 
     #[test]
     fn ip_scope_classifies_unroutable_ranges() {
-        for g in ["1.2.3.4", "8.8.8.8", "2a01:4f8::1", "::ffff:1.2.3.4"] {
+        for g in [
+            "1.2.3.4",
+            "8.8.8.8",
+            "2a01:4f8::1",
+            "::ffff:1.2.3.4",
+            "64:ff9b::808:808",
+        ] {
             assert_eq!(ip_scope(ip(g)), IpScope::Global, "{g}");
         }
         for p in [
@@ -680,6 +700,8 @@ mod tests {
             "feff::1",
             "64:ff9b:1::1",
             "64:ff9b:1:ffff::1",
+            "64:ff9b::c0a8:101",
+            "64:ff9b::10.0.0.1",
         ] {
             assert_eq!(ip_scope(ip(p)), IpScope::Private, "{p}");
         }
@@ -694,6 +716,7 @@ mod tests {
             "::",
             "fe80::1",
             "febf::1",
+            "64:ff9b::7f00:1",
             "ff02::1",
             "2001:db8::1",
             "3fff::1",
