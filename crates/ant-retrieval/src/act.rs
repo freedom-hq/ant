@@ -211,9 +211,10 @@ const MAX_HISTORY_NODE_VISITS: usize = 2 * MAX_HISTORY_ENTRIES + 1;
 /// than 19; one more level of slack.
 const MAX_HISTORY_DEPTH: usize = 20;
 
-/// Most fork-metadata bytes (keys plus values) the returned entries may
-/// carry in total. A real epoch carries at most one `encryptedglref`
-/// (about 150 bytes), so a full history needs well under 1 MiB; a fork's
+/// Most fork-metadata bytes (keys plus values) one history walk may
+/// hold: every fork of every distinct node it loads, plus each returned
+/// entry's copy. A real epoch carries at most one `encryptedglref`
+/// (about 150 bytes), so a full history needs about 1.2 MiB; a fork's
 /// metadata can be up to 64 KiB, and without this cap
 /// [`MAX_HISTORY_ENTRIES`] crafted forks could retain 256 MiB.
 const MAX_HISTORY_METADATA_BYTES: usize = ACT_MAX_BYTES;
@@ -231,7 +232,7 @@ const MAX_HISTORY_METADATA_BYTES: usize = ACT_MAX_BYTES;
 /// as bee does), and a manifest that needs more than
 /// [`MAX_HISTORY_NODE_VISITS`] visits, is deeper than
 /// [`MAX_HISTORY_DEPTH`], has more than [`MAX_HISTORY_ENTRIES`] epochs
-/// or more than [`MAX_HISTORY_METADATA_BYTES`] of epoch metadata is
+/// or more than [`MAX_HISTORY_METADATA_BYTES`] of fork metadata is
 /// [`ActError::MalformedKvs`].
 pub async fn history_entries(
     fetcher: &dyn ChunkFetcher,
@@ -273,8 +274,31 @@ impl HistoryWalk<'_> {
             return Ok(Arc::clone(node));
         }
         let node = Arc::new(load_node_ref(self.fetcher, node_ref).await?);
+        // The cache keeps every fork's metadata alive for the whole
+        // walk, including forks into children with no entry, which
+        // never reach `out`: charge it once per distinct node.
+        self.charge_metadata(node.forks.values().map(|f| &f.metadata))?;
         self.nodes.insert(node_ref.to_vec(), Arc::clone(&node));
         Ok(node)
+    }
+
+    /// Count metadata bytes (keys plus values) against
+    /// [`MAX_HISTORY_METADATA_BYTES`].
+    fn charge_metadata<'m>(
+        &mut self,
+        maps: impl IntoIterator<Item = &'m HashMap<String, String>>,
+    ) -> Result<(), ActError> {
+        self.metadata_bytes += maps
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>();
+        if self.metadata_bytes > MAX_HISTORY_METADATA_BYTES {
+            return Err(ActError::MalformedKvs(format!(
+                "history carries more than {MAX_HISTORY_METADATA_BYTES} metadata bytes"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -311,16 +335,8 @@ where
                         "history has more than {MAX_HISTORY_ENTRIES} epochs"
                     )));
                 }
-                walk.metadata_bytes += fork
-                    .metadata
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len())
-                    .sum::<usize>();
-                if walk.metadata_bytes > MAX_HISTORY_METADATA_BYTES {
-                    return Err(ActError::MalformedKvs(format!(
-                        "history epochs carry more than {MAX_HISTORY_METADATA_BYTES} metadata bytes"
-                    )));
-                }
+                // Each entry holds its own copy of the fork's metadata.
+                walk.charge_metadata([&fork.metadata])?;
                 walk.out.push(HistoryEntry {
                     key: fork_path.clone(),
                     reference,
@@ -708,6 +724,25 @@ mod tests {
         let heavy = f.put_file(&raw_node(None, &heavy));
         let fan: Vec<_> = (0..18u8).map(|b| (vec![b], heavy, None)).collect();
         let root = f.put_file(&raw_node(None, &fan));
+        assert_malformed(history_entries(&f, root).await, "metadata bytes");
+    }
+
+    /// Heavy metadata on forks into children *without* an entry never
+    /// reaches the output, but the node cache still holds it: 72
+    /// distinct nodes of one 60 KB fork each is 4.3 MB with no entries.
+    #[tokio::test]
+    async fn metadata_budget_counts_forks_without_entries() {
+        let mut f = MapFetcher::default();
+        let empty = f.put_file(&raw_node(None, &[]));
+        let big = Some(format!(r#"{{"encryptedglref":"{}"}}"#, "a".repeat(60_000)));
+        let root_forks: Vec<_> = (0..72u8)
+            .map(|b| {
+                // A distinct prefix per node keeps each one distinct.
+                let heavy = f.put_file(&raw_node(None, &[(vec![b'0', b], empty, big.clone())]));
+                (vec![b], heavy, None)
+            })
+            .collect();
+        let root = f.put_file(&raw_node(None, &root_forks));
         assert_malformed(history_entries(&f, root).await, "metadata bytes");
     }
 
