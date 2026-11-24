@@ -18,6 +18,7 @@
 //! dropped. On a soft cap of [`MAX_ENTRIES`] entries we evict by oldest
 //! `last_seen_unix` first. Successful handshakes reset the failure counter.
 
+use crate::handshake::KnownBzzRecord;
 use crate::sinks::PeerHint;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,18 @@ impl PeerStore {
     #[cfg(test)]
     pub fn contains(&self, peer_id: &PeerId) -> bool {
         self.entries.contains_key(peer_id)
+    }
+
+    /// The newest signed V15 record held for `peer_id`, for the
+    /// handshake's stale-timestamp check. `None` when the peer is unknown
+    /// or only ever handshook over V14 (timestamp 0).
+    pub fn known_bzz_record(&self, peer_id: &PeerId) -> Option<KnownBzzRecord> {
+        let e = self.entries.get(peer_id)?;
+        let timestamp = i64::try_from(e.bzz_timestamp).ok().filter(|t| *t > 0)?;
+        Some(KnownBzzRecord {
+            overlay: e.overlay,
+            timestamp,
+        })
     }
 
     /// Convert loaded entries into hints for the dial pipeline, ordered by

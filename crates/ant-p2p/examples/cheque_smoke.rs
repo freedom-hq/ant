@@ -322,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new(),
         advertise_full_node,
         HandshakeWireVersion::V15,
+        None,
     )
     .await?;
 

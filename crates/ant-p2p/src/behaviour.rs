@@ -4,7 +4,7 @@ use crate::bounded_close::BoundedClose;
 use crate::dial::endpoint_host;
 use crate::dnsaddr;
 use crate::handshake::{
-    handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
+    handshake_outbound, HandshakeError, HandshakeInfo, KnownBzzRecord, PROTOCOL_HANDSHAKE_V14,
     PROTOCOL_HANDSHAKE_V15,
 };
 use crate::liveness::{Liveness, LivenessConfig};
@@ -1641,8 +1641,10 @@ impl SwarmState {
             // Retain the full dial info (addrs + overlay) so we can dial
             // *toward a chunk's neighbourhood* on demand later — even for
             // peers we don't dial now (peer set full / already seen).
-            // Skip peers that carry no overlay (older hive adverts) since
-            // we can't rank those by proximity to a target.
+            // Hive hints carry a signature-verified overlay (forged
+            // entries never become hints, see `sinks::decode_hive_peers`),
+            // so a fake advert can't evict a real entry here. Skip peers
+            // with no overlay since we can't rank those by proximity.
             if hint.overlay != [0u8; 32] && !self.bzz_peers.contains(&hint.peer_id) {
                 if self.known_dialable.len() >= KNOWN_DIALABLE_CAP
                     && !self.known_dialable.contains_key(&hint.peer_id)
@@ -2063,7 +2065,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // either triggers an instant `Disconnect`.
     let (hint_tx, mut hint_rx) = mpsc::channel::<sinks::PeerHint>(HINT_CHAN_CAP);
     let handshake_gate = sinks::HandshakeGate::default();
-    let registrations = sinks::register(&mut control, hint_tx, handshake_gate.clone());
+    let registrations = sinks::register(
+        &mut control,
+        hint_tx,
+        handshake_gate.clone(),
+        cfg.network_id,
+    );
     // Hook the swap listener to a credit ledger if the operator
     // configured both a chequebook beneficiary and a persistence
     // directory; otherwise we register the protocol but throw away
@@ -9075,6 +9082,9 @@ fn handle_swarm_event(
             state.sync_gate(peer_id);
             let listen_addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
             let our_identify_useful = our_identify_useful_for_bee(swarm);
+            // The peer's newest signed record we hold: the handshake
+            // rejects an older one for the same overlay (a replay).
+            let known = peerstore.known_bzz_record(&peer_id);
             spawn_handshake_driver(
                 peer_id,
                 address,
@@ -9084,6 +9094,7 @@ fn handle_swarm_event(
                 rx,
                 result_tx.clone(),
                 our_identify_useful,
+                known,
             );
         }
         SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Sent {
@@ -9529,6 +9540,7 @@ fn spawn_handshake_driver(
     identify_signal: oneshot::Receiver<()>,
     result_tx: mpsc::Sender<(PeerId, DriveOutcome)>,
     our_identify_useful: bool,
+    known: Option<KnownBzzRecord>,
 ) {
     tokio::spawn(async move {
         let wait_budget = if our_identify_useful {
@@ -9572,6 +9584,7 @@ fn spawn_handshake_driver(
                 &dial_addrs,
                 listen_addrs.clone(),
                 version,
+                known,
             )
             .await
             {
@@ -10936,6 +10949,80 @@ mod tests {
             addrs: vec!["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
             overlay,
         }
+    }
+
+    /// #299 (P2P-12): with the dial book full, a hive message of forged
+    /// entries (real overlays with an attacker's underlays, unsigned
+    /// records) yields no hint, so it can't evict a single real entry. A
+    /// genuine record in the same position does get in (the control).
+    #[tokio::test]
+    async fn forged_hive_entries_evict_nothing_from_full_dial_book() {
+        use ant_crypto::HandshakeWireVersion::V15;
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = PeerId::random();
+        for i in 0..KNOWN_DIALABLE_CAP {
+            let mut hint = hint_in_bin(PeerId::random(), 0x80, i as u8);
+            hint.overlay[1] = (i >> 8) as u8;
+            state.known_dialable.insert(hint.peer_id, hint);
+        }
+        let before: HashSet<PeerId> = state.known_dialable.keys().copied().collect();
+        let victim = *before.iter().next().unwrap();
+        let victim_overlay = state.known_dialable[&victim].overlay;
+
+        let attacker_addr = |peer: PeerId| -> Multiaddr {
+            format!("/ip4/6.6.6.6/tcp/1634/p2p/{peer}").parse().unwrap()
+        };
+        let mut stolen =
+            sinks::signed_hive_entry(&[6; 32], V15, 1, &[attacker_addr(PeerId::random())]);
+        stolen.overlay = victim_overlay.to_vec();
+        let mut unsigned =
+            sinks::signed_hive_entry(&[6; 32], V15, 1, &[attacker_addr(PeerId::random())]);
+        unsigned.signature = vec![0u8; 65];
+        let mut body = Vec::new();
+        prost::Message::encode(
+            &sinks::PeersPb {
+                peers: vec![stolen, unsigned],
+            },
+            &mut body,
+        )
+        .unwrap();
+        let hints = sinks::decode_hive_peers(&body, V15, 1);
+        assert!(hints.is_empty());
+        for hint in hints {
+            state.enqueue_hint(hint, local);
+        }
+        let after: HashSet<PeerId> = state.known_dialable.keys().copied().collect();
+        assert_eq!(before, after);
+        assert!(state.hint_queue.is_empty());
+
+        // Control: a genuine signed record does become a hint and enter
+        // the book (evicting one entry, as the cap requires).
+        let genuine_peer = PeerId::random();
+        let genuine = sinks::signed_hive_entry(&[7; 32], V15, 1, &[attacker_addr(genuine_peer)]);
+        let mut body = Vec::new();
+        prost::Message::encode(
+            &sinks::PeersPb {
+                peers: vec![genuine],
+            },
+            &mut body,
+        )
+        .unwrap();
+        let hints = sinks::decode_hive_peers(&body, V15, 1);
+        assert_eq!(hints.len(), 1);
+        for hint in hints {
+            state.enqueue_hint(hint, local);
+        }
+        assert!(state.known_dialable.contains_key(&genuine_peer));
+        assert_eq!(state.known_dialable.len(), KNOWN_DIALABLE_CAP);
     }
 
     /// Issue #202: a peer streaming fabricated public hints must not grow
@@ -14084,7 +14171,7 @@ mod tests {
         let mut node = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
         let mut control = node.behaviour().stream.new_control();
         let (hint_tx, _hint_rx) = mpsc::channel(8);
-        sinks::spawn(sinks::register(&mut control, hint_tx, gate), None);
+        sinks::spawn(sinks::register(&mut control, hint_tx, gate, 1), None);
         let addr = listening(&mut node).await;
         let node_peer = *node.local_peer_id();
         drive(node);

@@ -58,7 +58,9 @@
 //! [`bee-headers`]: https://github.com/ethersphere/bee/blob/v2.7.1/pkg/p2p/libp2p/headers.go
 
 use crate::dial::extract_peer_id;
+use crate::handshake::check_wire_timestamp;
 use crate::underlay::deserialize_underlays;
+use ant_crypto::{verify_bzz_address_signature, HandshakeWireVersion, OVERLAY_NONCE_LEN};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
@@ -89,6 +91,10 @@ pub const PROTOCOL_HIVE_PEERS: &str = PROTOCOL_HIVE_PEERS_V2;
 
 /// Tight bound for the pricing payload — it's a single big.Int.
 const PRICING_MAX: usize = 1024;
+/// Bee's hive `maxBatchSize`: it never puts more peers in one `Peers`
+/// message. Each entry costs us a signature recovery, so a message
+/// carrying more than this only has its first entries looked at.
+const HIVE_MAX_PEERS: usize = 30;
 /// Hive batches up to 30 peers × (overlay + underlay + sig + nonce) per stream.
 /// Round up to a comfortable cap so we don't reject valid gossip from bee.
 const HIVE_MAX: usize = 128 * 1024;
@@ -351,15 +357,16 @@ pub(crate) async fn serve_gated<F, Fut>(
 pub struct PeerHint {
     pub peer_id: PeerId,
     pub addrs: Vec<Multiaddr>,
-    #[allow(dead_code)]
+    /// From a hive entry this is a signature-verified overlay; a warm
+    /// hint carries the overlay its last handshake verified.
     pub overlay: [u8; 32],
 }
 
 /// hive.proto `message Peers { repeated BzzAddress peers = 1; }`.
 #[derive(Clone, PartialEq, prost::Message)]
-struct PeersPb {
+pub(crate) struct PeersPb {
     #[prost(message, repeated, tag = "1")]
-    peers: Vec<BzzAddressPb>,
+    pub(crate) peers: Vec<BzzAddressPb>,
 }
 
 /// hive.proto `message BzzAddress`. Bee 2.7 ships tags 1-4
@@ -374,31 +381,31 @@ struct PeersPb {
 ///
 /// Underlay is `bzz.SerializeUnderlays(addrs)` — either raw multiaddr
 /// bytes (single address, backward-compat) or the 0x99-prefixed
-/// length-delimited list. Signature and Nonce are required on the
-/// wire (both empty is a decode error for bee) but we ignore them:
-/// we don't verify overlays for hints.
+/// length-delimited list. Every entry is checked like bee's
+/// `ParseAddress` before it becomes a hint (see [`decode_hive_peers`]):
+/// the signature over underlay ‖ overlay ‖ network id (‖ nonce ‖
+/// timestamp ‖ chequebook on 2.0.0) must recover to a key whose overlay
+/// is the declared one.
 #[derive(Clone, PartialEq, prost::Message)]
-struct BzzAddressPb {
+pub(crate) struct BzzAddressPb {
     #[prost(bytes = "vec", tag = "1")]
-    underlay: Vec<u8>,
+    pub(crate) underlay: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
-    signature: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
-    overlay: Vec<u8>,
+    pub(crate) overlay: Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
-    nonce: Vec<u8>,
-    /// Bee 2.8+. Unix seconds of the signed `BzzAddress` record. We
-    /// currently ignore the value but accept it for forward-compat.
+    pub(crate) nonce: Vec<u8>,
+    /// Bee 2.8+. Unix seconds of the signed `BzzAddress` record. Part
+    /// of the signed preimage on hive 2.0.0, and must be positive and
+    /// not in the future there.
     #[prost(int64, tag = "5")]
-    #[allow(dead_code)]
-    timestamp: i64,
+    pub(crate) timestamp: i64,
     /// Bee 2.8+. Peer's chequebook contract address (20 bytes) or
-    /// empty when the peer has no chequebook. We accept it for
-    /// forward-compat without acting on it: hive hints feed the
-    /// dialer, which still re-verifies via the BZZ handshake itself.
+    /// empty when the peer has no chequebook. Part of the signed
+    /// preimage on hive 2.0.0; otherwise not acted on.
     #[prost(bytes = "vec", tag = "6")]
-    #[allow(dead_code)]
-    chequebook_address: Vec<u8>,
+    pub(crate) chequebook_address: Vec<u8>,
 }
 
 /// Handles on the `IncomingStreams` we need to keep alive while the node runs.
@@ -411,6 +418,7 @@ pub struct Registrations {
     swap: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
     guard: InboundGuard,
+    network_id: u64,
 }
 
 /// Claim every bee protocol we need to silently drain. Must run before the
@@ -419,11 +427,13 @@ pub struct Registrations {
 /// loop for nothing.
 ///
 /// `gate` is the swarm loop's view of who is handshaked; every sink
-/// resets streams from anyone else (see the module docs).
+/// resets streams from anyone else (see the module docs). `network_id`
+/// is the one hive entries' signatures are checked against.
 pub fn register(
     control: &mut Control,
     hint_tx: mpsc::Sender<PeerHint>,
     gate: HandshakeGate,
+    network_id: u64,
 ) -> Registrations {
     let pricing = control
         .accept(StreamProtocol::new(PROTOCOL_PRICING))
@@ -455,6 +465,7 @@ pub fn register(
         swap,
         hint_tx,
         guard: InboundGuard::new(gate),
+        network_id,
     }
 }
 
@@ -469,8 +480,22 @@ pub fn register(
 pub fn spawn(reg: Registrations, swap: Option<SwapWiring>) {
     let guard = reg.guard;
     tokio::spawn(run_pricing(reg.pricing, guard.clone()));
-    tokio::spawn(run_hive(reg.hive_v1, reg.hint_tx.clone(), guard.clone()));
-    tokio::spawn(run_hive(reg.hive_v2, reg.hint_tx, guard.clone()));
+    // Hive 1.1.0 (bee 2.7) carries records signed over the V14 preimage,
+    // hive 2.0.0 (bee 2.8) over the V15 one.
+    tokio::spawn(run_hive(
+        reg.hive_v1,
+        reg.hint_tx.clone(),
+        guard.clone(),
+        HandshakeWireVersion::V14,
+        reg.network_id,
+    ));
+    tokio::spawn(run_hive(
+        reg.hive_v2,
+        reg.hint_tx,
+        guard.clone(),
+        HandshakeWireVersion::V15,
+        reg.network_id,
+    ));
     tokio::spawn(crate::pseudosettle::run_inbound(
         reg.pseudosettle,
         guard.clone(),
@@ -521,19 +546,32 @@ async fn run_pricing(incoming: IncomingStreams, guard: InboundGuard) {
     .await;
 }
 
-async fn run_hive(incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>, guard: InboundGuard) {
+async fn run_hive(
+    incoming: IncomingStreams,
+    hint_tx: mpsc::Sender<PeerHint>,
+    guard: InboundGuard,
+    version: HandshakeWireVersion,
+    network_id: u64,
+) {
     serve_gated(incoming, guard, "hive", move |peer_id, stream| {
         let tx = hint_tx.clone();
         async move {
             let res = tokio::time::timeout(STREAM_TIMEOUT, drain_stream(stream, HIVE_MAX)).await;
             match res {
                 Ok(Ok(d)) => {
-                    let hints = decode_hive_peers(&d.body);
+                    let (headers, body_len) = (d.headers, d.body.len());
+                    // Up to `HIVE_MAX_PEERS` signature recoveries: keep
+                    // them off the async workers.
+                    let hints = tokio::task::spawn_blocking(move || {
+                        decode_hive_peers(&d.body, version, network_id)
+                    })
+                    .await
+                    .unwrap_or_default();
                     trace!(
                         target: "ant_p2p::hive",
                         %peer_id,
-                        headers = d.headers,
-                        body = d.body.len(),
+                        headers,
+                        body = body_len,
                         peers = hints.len(),
                         "drained",
                     );
@@ -563,35 +601,74 @@ async fn run_hive(incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>, gu
     .await;
 }
 
-/// Decode a hive `Peers` payload into `PeerHint`s. Entries without a
-/// `/p2p/<peer_id>` component in their underlay are dropped: libp2p's `Dial`
-/// needs a peer id to multiplex concurrent dials, and bee's hive
-/// `broadcastPeers` always includes one, so a missing id is a corrupted peer.
-fn decode_hive_peers(body: &[u8]) -> Vec<PeerHint> {
+/// Decode a hive `Peers` payload into `PeerHint`s, checking each entry
+/// the way bee's hive does with `bzz.ParseAddress`: the underlay must
+/// decode to a non-empty list, and the signature over the record (V14
+/// preimage on hive 1.1.0, V15 with timestamp and chequebook on 2.0.0)
+/// must recover to a key whose overlay is the declared one. An entry
+/// that fails is dropped on its own, so a forged record never becomes a
+/// hint and can't displace a real one in the dial book. Entries without a
+/// `/p2p/<peer_id>` component in their underlay are dropped too: libp2p's
+/// `Dial` needs a peer id to multiplex concurrent dials, and bee's hive
+/// `broadcastPeers` always includes one. Only the first
+/// [`HIVE_MAX_PEERS`] entries are looked at.
+pub(crate) fn decode_hive_peers(
+    body: &[u8],
+    version: HandshakeWireVersion,
+    network_id: u64,
+) -> Vec<PeerHint> {
     let Ok(msg) = PeersPb::decode(body) else {
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(msg.peers.len());
-    for p in msg.peers {
-        let Ok(addrs) = deserialize_underlays(&p.underlay) else {
-            continue;
-        };
-        // All underlays of a single BzzAddress describe the same peer, so
-        // pull the peer id from the first one that has it.
-        let Some(peer_id) = addrs.iter().find_map(extract_peer_id) else {
-            continue;
-        };
-        let mut overlay = [0u8; 32];
-        if p.overlay.len() == 32 {
-            overlay.copy_from_slice(&p.overlay);
+    msg.peers
+        .iter()
+        .take(HIVE_MAX_PEERS)
+        .filter_map(|p| verified_hint(p, version, network_id))
+        .collect()
+}
+
+/// One hive entry as a hint, or `None` when it fails any check of
+/// [`decode_hive_peers`].
+fn verified_hint(
+    p: &BzzAddressPb,
+    version: HandshakeWireVersion,
+    network_id: u64,
+) -> Option<PeerHint> {
+    let addrs = deserialize_underlays(&p.underlay).ok()?;
+    // All underlays of a single BzzAddress describe the same peer, so
+    // pull the peer id from the first one that has it.
+    let peer_id = addrs.iter().find_map(extract_peer_id)?;
+    let overlay: [u8; 32] = p.overlay.as_slice().try_into().ok()?;
+    let signature: [u8; 65] = p.signature.as_slice().try_into().ok()?;
+    let nonce: [u8; OVERLAY_NONCE_LEN] = p.nonce.as_slice().try_into().ok()?;
+    let timestamp = match version {
+        HandshakeWireVersion::V14 => 0,
+        HandshakeWireVersion::V15 => {
+            if let Err(e) = check_wire_timestamp(p.timestamp) {
+                trace!(target: "ant_p2p::hive", %peer_id, "dropping hive entry: {e}");
+                return None;
+            }
+            p.timestamp
         }
-        out.push(PeerHint {
-            peer_id,
-            addrs,
-            overlay,
-        });
+    };
+    if let Err(e) = verify_bzz_address_signature(
+        version,
+        &p.underlay,
+        &overlay,
+        &signature,
+        &nonce,
+        network_id,
+        timestamp,
+        &p.chequebook_address,
+    ) {
+        trace!(target: "ant_p2p::hive", %peer_id, "dropping unverified hive entry: {e}");
+        return None;
     }
-    out
+    Some(PeerHint {
+        peer_id,
+        addrs,
+        overlay,
+    })
 }
 
 #[derive(Debug)]
@@ -705,6 +782,32 @@ async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<
     }
 }
 
+/// A hive entry for `addrs`, signed by `secret` like bee signs its
+/// `BzzAddress` (V15 records stamped now).
+#[cfg(test)]
+pub(crate) fn signed_hive_entry(
+    secret: &[u8; 32],
+    version: HandshakeWireVersion,
+    network_id: u64,
+    addrs: &[Multiaddr],
+) -> BzzAddressPb {
+    let underlay = crate::underlay::serialize_underlays(addrs);
+    let timestamp = match version {
+        HandshakeWireVersion::V14 => 0,
+        HandshakeWireVersion::V15 => crate::handshake::tests_now(),
+    };
+    let (overlay, signature, nonce) =
+        crate::handshake::sign_test_record(secret, version, network_id, &underlay, timestamp);
+    BzzAddressPb {
+        underlay,
+        signature: signature.to_vec(),
+        overlay: overlay.to_vec(),
+        nonce: nonce.to_vec(),
+        timestamp,
+        chequebook_address: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,136 +884,193 @@ mod tests {
         assert_eq!(wire, &[0xDD, 0xEE]);
     }
 
-    #[test]
-    fn decodes_single_peer_hive_message() {
-        let addr: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(std::slice::from_ref(&addr));
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![0u8; 65],
-                overlay: vec![0xab; 32],
-                nonce: vec![0xcd; 32],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
+    const NET: u64 = 1;
 
-        let hints = decode_hive_peers(&buf);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].addrs, vec![addr]);
-        assert_eq!(hints[0].overlay, [0xab; 32]);
+    fn addr_of(peer: PeerId, ip: &str) -> Multiaddr {
+        format!("/{ip}/tcp/1634/p2p/{peer}").parse().unwrap()
+    }
+
+    fn encode(peers: Vec<BzzAddressPb>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        PeersPb { peers }.encode(&mut buf).unwrap();
+        buf
     }
 
     #[test]
-    fn decodes_multi_underlay_peer() {
-        let a4: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
-        let a6: Multiaddr =
-            "/ip6/2001:db8::1/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(&[a4.clone(), a6.clone()]);
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![],
-                overlay: vec![0u8; 32],
-                nonce: vec![],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
+    fn decodes_signed_v15_peer() {
+        let peer = PeerId::random();
+        let addr = addr_of(peer, "ip4/1.2.3.4");
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V15,
+            NET,
+            std::slice::from_ref(&addr),
+        );
+        let overlay = entry.overlay.clone();
 
-        let hints = decode_hive_peers(&buf);
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, peer);
+        assert_eq!(hints[0].addrs, vec![addr]);
+        assert_eq!(hints[0].overlay.as_slice(), overlay.as_slice());
+    }
+
+    #[test]
+    fn decodes_signed_v14_multi_underlay_peer() {
+        let peer = PeerId::random();
+        let a4 = addr_of(peer, "ip4/1.2.3.4");
+        let a6 = addr_of(peer, "ip6/2001:db8::1");
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V14,
+            NET,
+            &[a4.clone(), a6.clone()],
+        );
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V14, NET);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].addrs, vec![a4, a6]);
     }
 
+    /// #299 (P2P-12): a forged entry, one signed for another network or
+    /// over the other hive version's preimage, or one carrying a bad
+    /// timestamp produces no hint, and doesn't take the valid entry next
+    /// to it down with it.
+    #[test]
+    fn forged_hive_entries_produce_no_hint() {
+        let v15 = HandshakeWireVersion::V15;
+        let good_peer = PeerId::random();
+        let good = signed_hive_entry(&[5; 32], v15, NET, &[addr_of(good_peer, "ip4/1.2.3.4")]);
+        let entry = || {
+            signed_hive_entry(
+                &[6; 32],
+                v15,
+                NET,
+                &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+            )
+        };
+
+        // A victim's overlay with an attacker's underlay: the signature no
+        // longer covers the record.
+        let mut stolen_overlay = entry();
+        stolen_overlay.overlay.clone_from(&good.overlay);
+        // Someone else's signed record with the underlay swapped out.
+        let mut swapped_underlay = entry();
+        swapped_underlay.underlay =
+            serialize_underlays(&[addr_of(PeerId::random(), "ip4/6.6.6.6")]);
+        let unsigned = BzzAddressPb {
+            signature: vec![0u8; 65],
+            ..entry()
+        };
+        let no_signature = BzzAddressPb {
+            signature: Vec::new(),
+            ..entry()
+        };
+        let other_network = signed_hive_entry(
+            &[6; 32],
+            v15,
+            NET + 1,
+            &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+        );
+        let v14_signed = signed_hive_entry(
+            &[6; 32],
+            HandshakeWireVersion::V14,
+            NET,
+            &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+        );
+        let mut zero_ts = entry();
+        zero_ts.timestamp = 0;
+        // A future timestamp, validly signed.
+        let mut future = entry();
+        let ts = future.timestamp + 3600;
+        let (overlay, sig, nonce) =
+            crate::handshake::sign_test_record(&[6; 32], v15, NET, &future.underlay, ts);
+        future.overlay = overlay.to_vec();
+        future.signature = sig.to_vec();
+        future.nonce = nonce.to_vec();
+        future.timestamp = ts;
+
+        let forged = vec![
+            stolen_overlay,
+            swapped_underlay,
+            unsigned,
+            no_signature,
+            other_network,
+            v14_signed,
+            zero_ts,
+            future,
+        ];
+        for (i, f) in forged.iter().enumerate() {
+            assert!(
+                decode_hive_peers(&encode(vec![f.clone()]), v15, NET).is_empty(),
+                "forged entry {i} produced a hint"
+            );
+        }
+        let mut all = forged;
+        all.push(good);
+        let hints = decode_hive_peers(&encode(all), v15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, good_peer);
+    }
+
     /// #279: hostile underlays in hive gossip (an overflowing list
     /// length, a bare list prefix) drop that one peer, not the process
-    /// and not the rest of the batch.
+    /// and not the rest of the batch — even when the hostile bytes are
+    /// what the record's signature covers.
     #[test]
     fn skips_peers_with_hostile_underlay_lists() {
-        let good: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
+        let v15 = HandshakeWireVersion::V15;
+        let good = addr_of(PeerId::random(), "ip4/1.2.3.4");
         let mut overflow = vec![0x99];
         overflow.extend_from_slice(&[0xff; 9]);
         overflow.push(0x01);
-        let peer = |underlay: Vec<u8>| BzzAddressPb {
-            underlay,
-            overlay: vec![0u8; 32],
-            ..Default::default()
+        let signed_raw = |underlay: Vec<u8>| {
+            let ts = crate::handshake::tests_now();
+            let (overlay, sig, nonce) =
+                crate::handshake::sign_test_record(&[6; 32], v15, NET, &underlay, ts);
+            BzzAddressPb {
+                underlay,
+                signature: sig.to_vec(),
+                overlay: overlay.to_vec(),
+                nonce: nonce.to_vec(),
+                timestamp: ts,
+                chequebook_address: Vec::new(),
+            }
         };
-        let msg = PeersPb {
-            peers: vec![
-                peer(overflow),
-                peer(vec![0x99]),
-                peer(serialize_underlays(std::slice::from_ref(&good))),
-            ],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
-
-        let hints = decode_hive_peers(&buf);
+        let body = encode(vec![
+            signed_raw(overflow),
+            signed_raw(vec![0x99]),
+            signed_hive_entry(&[5; 32], v15, NET, std::slice::from_ref(&good)),
+        ]);
+        let hints = decode_hive_peers(&body, v15, NET);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].addrs, vec![good]);
     }
 
+    /// Bee never batches more than `HIVE_MAX_PEERS` entries per message;
+    /// past that we don't spend signature recoveries.
     #[test]
-    fn decodes_bee_2_8_payload_with_new_tags() {
-        // A bee-2.8 hive Peers payload carries Timestamp (tag 5) and
-        // ChequebookAddress (tag 6) inside each BzzAddress. We don't
-        // act on either yet but the decoder must still produce the
-        // correct hint (dropping the new fields cleanly).
-        let addr: Multiaddr =
-            "/ip4/4.3.2.1/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(std::slice::from_ref(&addr));
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![0u8; 65],
-                overlay: vec![0xab; 32],
-                nonce: vec![0xcd; 32],
-                timestamp: 1_715_000_000,
-                chequebook_address: vec![0xef; 20],
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
-
-        let hints = decode_hive_peers(&buf);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].addrs, vec![addr]);
-        assert_eq!(hints[0].overlay, [0xab; 32]);
+    fn looks_at_most_hive_max_peers_entries() {
+        let v15 = HandshakeWireVersion::V15;
+        let entries: Vec<_> = (0..HIVE_MAX_PEERS + 5)
+            .map(|_| {
+                signed_hive_entry(
+                    &[5; 32],
+                    v15,
+                    NET,
+                    &[addr_of(PeerId::random(), "ip4/1.2.3.4")],
+                )
+            })
+            .collect();
+        assert_eq!(
+            decode_hive_peers(&encode(entries), v15, NET).len(),
+            HIVE_MAX_PEERS
+        );
     }
 
     #[test]
     fn drops_peers_without_p2p_id() {
         let bare: Multiaddr = "/ip4/1.2.3.4/tcp/1634".parse().unwrap();
-        let underlay = serialize_underlays(&[bare]);
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![],
-                overlay: vec![0u8; 32],
-                nonce: vec![],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
-        assert!(decode_hive_peers(&buf).is_empty());
+        let entry = signed_hive_entry(&[5; 32], HandshakeWireVersion::V15, NET, &[bare]);
+        assert!(decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET).is_empty());
     }
 }
