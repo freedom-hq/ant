@@ -46,7 +46,10 @@ pub use chain_transport::{
     ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
     ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
 };
-pub use gateway::{ant_chain_init, ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
+pub use gateway::{
+    ant_chain_init, ant_set_gateway_allowed_hosts, ant_set_gateway_cors, ant_start_gateway,
+    ant_stop_gateway,
+};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
@@ -202,6 +205,11 @@ pub struct AntHandle {
     /// (the setter checks under the `gateway_task` lock), so a live
     /// gateway always serves exactly the list it started with.
     gateway_cors: Mutex<Vec<String>>,
+    /// Extra `Host` names the next [`ant_start_gateway`] answers, set by
+    /// [`ant_set_gateway_allowed_hosts`] (issue #312). Empty by default:
+    /// only the loopback names. Written under the same rule as
+    /// `gateway_cors`.
+    gateway_allowed_hosts: Mutex<Vec<String>>,
     /// The `AntStream` publisher throughput benchmark currently running
     /// on this handle, if any (issue #67 stage 1). `None` until
     /// [`ant_bench_start`]; cleared by [`ant_bench_stop`]. Exactly one
@@ -1067,6 +1075,7 @@ fn init_inner(
         memory_cache,
         gateway_task: Mutex::new(None),
         gateway_cors: Mutex::new(Vec::new()),
+        gateway_allowed_hosts: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
         publisher: Mutex::new(None),
         announcing: AtomicBool::new(false),
@@ -2126,7 +2135,8 @@ pub unsafe extern "C" fn ant_stream_open(
 ///
 /// * `stream` must come from [`ant_stream_open`] and must not have been
 ///   passed to [`ant_stream_close`].
-/// * `dst` must point at a writable buffer of at least `len` bytes.
+/// * `dst` must point at a writable buffer of at least `len` bytes. It
+///   may be null when `len` is 0 (the call then returns 0).
 /// * `out_err` may be null to opt out of error reporting.
 #[no_mangle]
 pub unsafe extern "C" fn ant_stream_read(
@@ -2140,7 +2150,12 @@ pub unsafe extern "C" fn ant_stream_read(
         clear_out_err(out_err);
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<usize, FfiError> {
             let stream = stream.as_ref().ok_or(FfiError::NullPointer)?;
-            if dst.is_null() && len > 0 {
+            if len == 0 {
+                // Nothing to read, and `dst` may be null:
+                // `from_raw_parts_mut(NULL, 0)` is undefined behaviour.
+                return Ok(0);
+            }
+            if dst.is_null() {
                 return Err(FfiError::NullPointer);
             }
             let dst_slice = std::slice::from_raw_parts_mut(dst, len);
@@ -2165,16 +2180,19 @@ pub unsafe extern "C" fn ant_stream_read(
 /// Pull a contiguous byte range and deliver each joiner-produced
 /// chunk to `on_chunk` as it arrives. Unlike [`ant_stream_read`] —
 /// which holds the calling thread until the entire `len` bytes have
-/// been buffered — this drives a single `StreamBzz` request all the
-/// way to its terminal `StreamDone`, invoking the callback for every
-/// `BytesChunk` ack along the way. That matches the
+/// been buffered — this drives a single `StreamBzz` request,
+/// invoking the callback for each `BytesChunk` ack as it lands, until
+/// the terminal `StreamDone`, an error, or the callback asks to stop
+/// (see below). That matches the
 /// `AVAssetResourceLoaderDelegate` shape on the Swift side: a long-
 /// lived `dataRequest` that wants `respond(with:)` called as soon as
 /// each piece of body lands, not after the whole window has buffered.
 ///
 /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value asks
 /// the FFI to stop pulling early (e.g. `AVPlayer` canceled the
-/// `dataRequest`). The remaining acks are drained for clean shutdown.
+/// `dataRequest`). The call then returns the bytes delivered so far
+/// at once, the callback is not invoked again, and the node stops
+/// fetching the rest of the range.
 /// The callback runs on a tokio runtime worker thread and must be
 /// non-blocking and Send-safe.
 ///
@@ -3121,8 +3139,14 @@ pub unsafe extern "C" fn ant_storage_discover_full(
 /// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy —
 /// though one still short of its settlement deposit is topped up from
 /// spare xBZZ. Otherwise this signs an on-chain `factory.deploySimpleSwap`
-/// (issuer = node EOA), funds it with the settlement deposit for the
-/// account's storage plan so its cheques are actually backed, persists the association, and
+/// (issuer = node EOA), checks the new chequebook on-chain
+/// (factory-registered, `issuer()` is the node EOA; a check that says no
+/// fails the call with nothing persisted or funded; one that still can't
+/// be read after a few retries fails the call with the association
+/// persisted but unfunded, so the next call re-checks that chequebook
+/// instead of deploying another),
+/// persists the association, funds it with the settlement deposit for the
+/// account's storage plan so its cheques are actually backed, and
 /// returns the new address. These are on-chain transactions: they spend
 /// gas plus the deposit and **block** until confirmed. Light-mode
 /// (`chain`-feature) builds only.
@@ -3879,7 +3903,9 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// live (issue #176). `config_json` is the [`publisher::PublisherConfig`]
 /// the broadcast would start with (only its `batch_id`, `format`,
 /// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
-/// counts everything a segment carries, so a host adds its audio rate);
+/// counts everything a segment carries, so a host adds its audio rate; a
+/// `segment_ms` or `bitrate_kbps` past what [`ant_publisher_start`]
+/// accepts is estimated at that bound);
 /// `plan_json` is the plan as [`ant_storage_status`] reports it (its
 /// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
 /// `usable` and `propagating` are read; pass `usable` through, since a
@@ -5626,6 +5652,104 @@ mod tests {
         );
     }
 
+    fn set_allowed_hosts(h: *const AntHandle, hosts: &[&str]) -> Result<(), String> {
+        let owned: Vec<std::ffi::CString> = hosts
+            .iter()
+            .map(|o| std::ffi::CString::new(*o).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok =
+            unsafe { ant_set_gateway_allowed_hosts(h, ptrs.as_ptr(), ptrs.len(), &raw mut err) };
+        let msg = unsafe { take_err(err) };
+        if ok {
+            Ok(())
+        } else {
+            Err(msg)
+        }
+    }
+
+    /// `GET /health` with the given `Host` header; the status line.
+    fn status_for_host(addr: std::net::SocketAddr, host: &str) -> String {
+        use std::io::{Read, Write};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("connect {addr}: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        let text = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+        text.lines().next().unwrap_or("").to_string()
+    }
+
+    /// Issue #312: the in-process gateway answers only loopback `Host`
+    /// names on its own port (no DNS rebinding), plus what the host
+    /// adds with `ant_set_gateway_allowed_hosts`, which follows the
+    /// CORS setter's rules (validated, fixed while running).
+    #[test]
+    fn gateway_checks_the_host_header() {
+        let h = gateway_test_handle("gw-allowed-hosts");
+        let addr = start_test_gateway(&h);
+        let port = addr.port();
+        for ok in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("abc.bzz.localhost:{port}"),
+            "localhost".to_string(),
+        ] {
+            let status = status_for_host(addr, &ok);
+            assert!(status.starts_with("http/1.1 200"), "{ok}: {status}");
+        }
+        for bad in [
+            format!("evil.example:{port}"),
+            format!("localhost:{}", port.wrapping_add(1)),
+            "vibing.at".to_string(),
+        ] {
+            let status = status_for_host(addr, &bad);
+            assert!(status.starts_with("http/1.1 421"), "{bad}: {status}");
+        }
+
+        let err = set_allowed_hosts(&raw const h, &["vibing.at"]).expect_err("running");
+        assert!(err.contains("gateway is running"), "{err}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        for bad in ["https://vibing.at", "vibing.at/ant", "*.vibing.at"] {
+            let err = set_allowed_hosts(&raw const h, &[bad]).expect_err(bad);
+            assert!(err.contains("host 0"), "{bad}: {err}");
+        }
+        set_allowed_hosts(&raw const h, &["vibing.at", " "]).expect("set after stop");
+        assert_eq!(
+            *h.gateway_allowed_hosts.lock().unwrap(),
+            vec!["vibing.at".to_string()]
+        );
+        let addr = start_test_gateway(&h);
+        let status = status_for_host(addr, "vibing.at");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        let status = status_for_host(addr, "evil.example");
+        assert!(status.starts_with("http/1.1 421"), "{status}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        set_allowed_hosts(&raw const h, &["*"]).expect("star");
+        let addr = start_test_gateway(&h);
+        let status = status_for_host(addr, "evil.example");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
     #[test]
     fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
         let h = gateway_test_handle("gw-cors-bad-input");
@@ -5865,6 +5989,25 @@ mod tests {
         (Box::into_raw(Box::new(h)), dir)
     }
 
+    /// `ant_stream_read` with `len == 0` returns 0 without building a
+    /// slice over `dst`, so a null `dst` is fine (audit FFI-03, issue
+    /// #289). Before the fix this reached `from_raw_parts_mut(NULL, 0)`.
+    #[test]
+    fn stream_read_of_zero_bytes_into_null_returns_zero() {
+        let runtime = Runtime::new().expect("runtime");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let stream = Box::into_raw(Box::new(AntStream::for_test(
+            runtime.handle().clone(),
+            cmd_tx,
+            100,
+        )));
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let n = unsafe { ant_stream_read(stream, 0, 0, std::ptr::null_mut(), &raw mut err) };
+        assert_eq!(n, 0);
+        assert!(err.is_null());
+        unsafe { ant_stream_close(stream) };
+    }
+
     /// A handle over `runtime` with everything else inert — enough for
     /// the [`ant_shutdown`] contract, which only touches the runtime.
     fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
@@ -5885,6 +6028,7 @@ mod tests {
             memory_cache: Arc::new(InMemoryChunkCache::new(8)),
             gateway_task: Mutex::new(None),
             gateway_cors: Mutex::new(Vec::new()),
+            gateway_allowed_hosts: Mutex::new(Vec::new()),
             bench: Mutex::new(None),
             publisher: Mutex::new(None),
             announcing: AtomicBool::new(false),

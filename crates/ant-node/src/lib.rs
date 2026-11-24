@@ -32,8 +32,9 @@ pub struct NodeConfig {
     /// to complete the BZZ handshake without a 10 s peerstore timeout.
     pub external_addrs: Vec<Multiaddr>,
     /// Forwarded to `ant_p2p::RunConfig::allow_private_dials`: dial peers'
-    /// private/loopback underlays even off-LAN. Dev/test networks only.
-    /// Ignored when [`Self::public_dials_only`] is set.
+    /// private/loopback underlays even off-LAN, and gossiped DNS-named
+    /// underlays. Dev/test networks only. Ignored when
+    /// [`Self::public_dials_only`] is set.
     pub allow_private_dials: bool,
     /// Forwarded to `ant_p2p::RunConfig::public_dials_only`: dial globally
     /// routable IP underlays only, never a private one (not even on this
@@ -105,7 +106,9 @@ pub struct NodeConfig {
     /// SWAP / chequebook configuration. When `Some`, the node
     /// participates in `/swarm/swap/1.0.0/swap` exchanges with peers
     /// — accepting their cheques (signature-verified, monotonic,
-    /// pinned to chequebook) into a persistent ledger. When `None`,
+    /// pinned to chequebook, only from handshaken peers and only on the
+    /// chequebook a peer's handshake named, new chequebooks capped) into
+    /// a persistent ledger. When `None`,
     /// the protocol is still negotiated but every received cheque is
     /// dropped silently.
     pub swap: Option<SwapConfig>,

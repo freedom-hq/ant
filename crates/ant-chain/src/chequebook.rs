@@ -81,7 +81,7 @@ pub struct Cheque {
 }
 
 /// `Cheque + 65-byte (r ‖ s ‖ v)` signature, as carried on the swap
-/// wire. `v` is in `27..=30`, matching `ant_crypto::sign_prehash`.
+/// wire. `v` is 27 or 28, matching `ant_crypto::sign_prehash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedCheque {
     pub cheque: Cheque,
@@ -402,18 +402,28 @@ pub fn random_chequebook_salt() -> [u8; 32] {
     salt
 }
 
-/// Decode a `SimpleSwapDeployed(address)` log emitted by the
-/// factory in the same tx as a `deploySimpleSwap` call. The
-/// parameter is non-indexed, so the address sits right-padded in
-/// the first 32-byte word of `data`. Returns `None` if no matching
-/// log is in the receipt — the deploy probably reverted partway
+/// Decode a `SimpleSwapDeployed(address)` log emitted by `factory`
+/// in the same tx as a `deploySimpleSwap` call. The parameter is
+/// non-indexed, so the address sits right-aligned in the first 32-byte
+/// word of `data`. Only a log whose emitter is `factory` and whose word
+/// is a clean address (`data[..12]` zero) counts: any contract can emit
+/// a look-alike event in the same tx (issue #284). Returns `None` if no
+/// matching log is in the receipt — the deploy probably reverted partway
 /// through, in which case the caller should dump the full receipt.
 #[must_use]
-pub fn extract_deployed_chequebook(receipt: &crate::tx::TxReceipt) -> Option<[u8; 20]> {
+pub fn extract_deployed_chequebook(
+    receipt: &crate::tx::TxReceipt,
+    factory: &[u8; 20],
+) -> Option<[u8; 20]> {
     receipt
         .logs
         .iter()
-        .find(|l| l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC) && l.data.len() >= 32)
+        .find(|l| {
+            &l.address == factory
+                && l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC)
+                && l.data.len() >= 32
+                && l.data[..12].iter().all(|&b| b == 0)
+        })
         .map(|l| {
             let mut addr = [0u8; 20];
             addr.copy_from_slice(&l.data[12..32]);
@@ -650,7 +660,10 @@ mod tests {
                 data,
             }],
         };
-        assert_eq!(extract_deployed_chequebook(&receipt), Some(cb));
+        assert_eq!(
+            extract_deployed_chequebook(&receipt, &GNOSIS_CHEQUEBOOK_FACTORY),
+            Some(cb)
+        );
     }
 
     /// Receipt without the factory's `SimpleSwapDeployed` log →
@@ -666,7 +679,46 @@ mod tests {
                 data: vec![0u8; 32],
             }],
         };
-        assert_eq!(extract_deployed_chequebook(&receipt), None);
+        assert_eq!(
+            extract_deployed_chequebook(&receipt, &GNOSIS_CHEQUEBOOK_FACTORY),
+            None
+        );
+    }
+
+    /// Issue #284 (c): a `SimpleSwapDeployed` log from any emitter but
+    /// the factory, or with junk above the address, is not a deploy,
+    /// even ahead of the real one in the receipt.
+    #[test]
+    fn extract_deployed_chequebook_needs_the_factory_and_a_clean_word() {
+        let word = |cb: [u8; 20], junk: u8| {
+            let mut data = vec![0u8; 32];
+            data[0] = junk;
+            data[12..32].copy_from_slice(&cb);
+            data
+        };
+        let log = |address, data| crate::tx::EventLog {
+            address,
+            topics: vec![SIMPLE_SWAP_DEPLOYED_TOPIC],
+            data,
+        };
+        let receipt = |logs| crate::tx::TxReceipt {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            logs,
+        };
+        let f = &GNOSIS_CHEQUEBOOK_FACTORY;
+        let foreign = receipt(vec![log([0x66; 20], word([0xee; 20], 0))]);
+        assert_eq!(extract_deployed_chequebook(&foreign, f), None);
+        let dirty = receipt(vec![log(*f, word([0xee; 20], 1))]);
+        assert_eq!(extract_deployed_chequebook(&dirty, f), None);
+        let decoy_first = receipt(vec![
+            log([0x66; 20], word([0xee; 20], 0)),
+            log(*f, word([0xab; 20], 0)),
+        ]);
+        assert_eq!(
+            extract_deployed_chequebook(&decoy_first, f),
+            Some([0xab; 20])
+        );
     }
 
     #[test]

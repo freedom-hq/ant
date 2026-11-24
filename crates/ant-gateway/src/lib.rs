@@ -54,6 +54,8 @@ mod fallback;
 #[cfg(feature = "http-api")]
 mod handle;
 #[cfg(feature = "http-api")]
+mod hosts;
+#[cfg(feature = "http-api")]
 mod pins;
 #[cfg(feature = "http-api")]
 mod retrieval;
@@ -83,6 +85,8 @@ pub use cors::CorsConfig;
 pub use handle::{
     BatchBoughtHook, ChequebookRefusedHook, GatewayChainState, GatewayHandle, GatewayIdentity,
 };
+#[cfg(feature = "http-api")]
+pub use hosts::HostPolicy;
 #[cfg(feature = "http-api")]
 pub use tags::TagRegistry;
 
@@ -130,15 +134,31 @@ impl Gateway {
     /// the caller is expected to race this future against the node
     /// loop with `tokio::select!` so a node-side fatal still tears the
     /// process down.
-    pub async fn serve(handle: GatewayHandle, addr: SocketAddr) -> Result<(), GatewayError> {
-        let app = router::build(handle);
+    pub async fn serve(mut handle: GatewayHandle, addr: SocketAddr) -> Result<(), GatewayError> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| GatewayError::Bind { addr, source: e })?;
-        let bound = listener
-            .local_addr()
-            .map_or_else(|_| addr.to_string(), |a| a.to_string());
-        tracing::info!(target: "ant_gateway", "HTTP API listening on {bound}");
+        let local = listener.local_addr().unwrap_or(addr);
+        // The Host allowlist needs the real port (a `:0` bind picks one).
+        handle.hosts = std::sync::Arc::new(handle.hosts.bound_to(local));
+        if !handle.hosts.configured() && !local.ip().to_canonical().is_loopback() {
+            tracing::warn!(
+                target: "ant_gateway",
+                "HTTP API bound to non-loopback {local} without allowed-hosts: the Host header is \
+                 not checked, so a DNS-rebinding page can reach the API; set allowed-hosts to \
+                 the names clients use"
+            );
+        }
+        if handle.cors.allows_null() {
+            tracing::warn!(
+                target: "ant_gateway",
+                "cors-allowed-origins contains `null`: every sandboxed iframe, `file://` page \
+                 and cross-origin-redirected request on the web sends `Origin: null`, so any \
+                 site can read the API and send it writes"
+            );
+        }
+        let app = router::build(handle);
+        tracing::info!(target: "ant_gateway", "HTTP API listening on {local}");
         // Connect info: the `/v0/cache` writes only answer loopback peers.
         axum::serve(
             listener,

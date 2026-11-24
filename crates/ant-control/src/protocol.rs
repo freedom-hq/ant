@@ -834,10 +834,13 @@ pub struct ExternalAddressInfo {
     pub addr: String,
     /// Free-form source identifier. Stable values produced by `antd`:
     /// `manual` (`--external-address`), `listener` (auto-promoted
-    /// non-loopback listener), `observed` (from a remote's identify
-    /// `observed_addr`), `upnp` (mapped via libp2p-upnp / IGD). Future
-    /// daemons may add new sources, so UIs should treat unknown values
-    /// as opaque labels.
+    /// non-loopback listener), `observed` (from remotes' identify
+    /// `observed_addr`, once several distinct observers agree), `upnp`
+    /// (mapped via libp2p-upnp / IGD). When more than one source vouches
+    /// for the same address, this is the longest-standing one still
+    /// doing so; the address stays advertised until every source has
+    /// withdrawn it. Future daemons may add new sources, so UIs should
+    /// treat unknown values as opaque labels.
     pub source: String,
     /// Wall-clock unix timestamp at which the address was registered.
     /// Useful for "added 12 s ago" rendering.

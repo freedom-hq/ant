@@ -130,8 +130,10 @@ pub struct DeliveredChunk {
 /// The result of one `sync_once` page.
 #[derive(Clone, Debug)]
 pub struct SyncPage {
-    /// Highest binID covered by this page; the next round starts at
-    /// `topmost + 1`.
+    /// Highest binID covered by this page, as the peer sent it; the next
+    /// round starts at `topmost + 1`. Not validated here: a caller must
+    /// check it against `start` and the peer's cursor before trusting or
+    /// saving it (the lurker's `check_topmost`).
     pub topmost: u64,
     /// Chunks the caller wanted and the server delivered (placeholders
     /// for dropped chunks are skipped).

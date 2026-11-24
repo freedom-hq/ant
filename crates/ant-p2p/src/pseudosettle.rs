@@ -71,10 +71,10 @@
 //!    the bound, and backs off after a failure. See [`run_driver`] for why
 //!    each rule matters (issue #129).
 
+use crate::log_limit::WarnLimiter;
 use crate::sinks::{HEADERS_MAX, STREAM_TIMEOUT};
 use ant_retrieval::accounting::{Accounting, HotHint};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use futures::StreamExt;
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
 use libp2p_swarm::Stream;
@@ -260,12 +260,21 @@ where
     Ok(())
 }
 
+/// How long after warning about a peer's over-ack its repeats are
+/// logged at `debug` only (see [`crate::log_limit`]).
+const PEER_WARN_INTERVAL: Duration = Duration::from_mins(10);
+static OVER_ACK_WARNS: WarnLimiter<PeerId> = WarnLimiter::new(PEER_WARN_INTERVAL);
+
 /// Outcome of one pseudosettle round trip.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshOk {
-    /// Amount bee accepted (`<= attempted`). At most
-    /// `lightRefreshRate * elapsed`, often less when our debt with this
-    /// peer is below the time-based budget.
+    /// Amount the peer acked, clamped to what we offered (see
+    /// [`clamp_accepted`]), so at most
+    /// `LIGHT_REFRESH_RATE_UNITS_PER_SEC * MAX_REFRESH_WINDOW_SECS`. An
+    /// honest bee also caps it at `lightRefreshRate * elapsed` and at our
+    /// debt with it (often less), but that bound is the peer's to keep:
+    /// we can't check `elapsed` against its clock, so a misbehaving peer
+    /// can ack up to the full offer at any time.
     pub accepted: u64,
     /// Bee-side Unix timestamp from the `PaymentAck`. Returned for
     /// optional logging; the driver uses local wall-clock to schedule the
@@ -318,6 +327,26 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
             "PaymentAck.amount overflows u64",
         )
     })?;
+    if accepted > amount {
+        // A peer that over-acks will do so on every refresh; warn once
+        // per peer per interval, the repeats go to debug.
+        if OVER_ACK_WARNS.allow(peer, Instant::now()) {
+            tracing::warn!(
+                target: "ant_p2p::pseudosettle",
+                %peer, accepted, offered = amount,
+                "peer acked more than we offered; clamping to the offered amount \
+                 (repeats from this peer logged at debug for {}s)",
+                PEER_WARN_INTERVAL.as_secs(),
+            );
+        } else {
+            debug!(
+                target: "ant_p2p::pseudosettle",
+                %peer, accepted, offered = amount,
+                "peer acked more than we offered; clamping to the offered amount",
+            );
+        }
+    }
+    let accepted = clamp_accepted(accepted, amount);
 
     // Half-close so bee's `stream.FullClose()` returns promptly. Drop on
     // error path is fine — yamux sends a Reset, bee handles it.
@@ -327,6 +356,16 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
         accepted,
         timestamp: ack.timestamp,
     })
+}
+
+/// The amount a refresh really settled: the peer's `PaymentAck.amount`,
+/// never more than the `offered` amount we sent. Bee clamps its ack to
+/// the payment it received, so a larger figure is a misbehaving peer;
+/// crediting it as-is would wipe more of that peer's balance in our
+/// accounting mirror than was ever settled (so we'd under-count what we
+/// owe and overdraw it) and inflate the `/timesettlements` total.
+fn clamp_accepted(accepted: u64, offered: u64) -> u64 {
+    accepted.min(offered)
 }
 
 /// Encode a non-negative `u64` as the big-endian unsigned bytes that
@@ -360,9 +399,12 @@ fn parse_be_u64(bytes: &[u8]) -> Option<u64> {
 /// some peer does we read the Payment, ack zero, and close. NAK-with-zero
 /// keeps their accounting consistent — they treat zero acceptance the
 /// same as "settlement too soon" and don't disconnect.
-pub async fn run_inbound(mut incoming: IncomingStreams) {
-    while let Some((peer_id, stream)) = incoming.next().await {
-        tokio::spawn(async move {
+pub async fn run_inbound(incoming: IncomingStreams, guard: crate::sinks::InboundGuard) {
+    crate::sinks::serve_gated(
+        incoming,
+        guard,
+        PROTOCOL_PSEUDOSETTLE,
+        |peer_id, stream| async move {
             match tokio::time::timeout(STREAM_TIMEOUT, drain_inbound(stream)).await {
                 Ok(Ok(())) => trace!(
                     target: "ant_p2p::pseudosettle",
@@ -381,8 +423,9 @@ pub async fn run_inbound(mut incoming: IncomingStreams) {
                     STREAM_TIMEOUT.as_secs(),
                 ),
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
 async fn drain_inbound(mut stream: Stream) -> std::io::Result<()> {
@@ -806,6 +849,18 @@ pub async fn run_driver(
 mod tests {
     use super::*;
 
+    /// A peer acking more than we offered is credited only the offered
+    /// amount; an honest ack (at or below the offer) passes unchanged.
+    #[test]
+    fn over_large_accepted_is_clamped_to_the_offer() {
+        let offered = LIGHT_REFRESH_RATE_UNITS_PER_SEC.saturating_mul(MAX_REFRESH_WINDOW_SECS);
+        assert_eq!(clamp_accepted(offered + 1, offered), offered);
+        assert_eq!(clamp_accepted(u64::MAX, offered), offered);
+        assert_eq!(clamp_accepted(offered, offered), offered);
+        assert_eq!(clamp_accepted(offered / 2, offered), offered / 2);
+        assert_eq!(clamp_accepted(0, offered), 0);
+    }
+
     #[test]
     fn big_int_be_round_trip() {
         for v in [
@@ -830,6 +885,7 @@ mod tests {
         }
     }
 
+    use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
     use libp2p::{noise, tcp, yamux, Multiaddr, Swarm, SwarmBuilder};
     use std::sync::Mutex;

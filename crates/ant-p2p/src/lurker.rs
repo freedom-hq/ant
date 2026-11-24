@@ -18,6 +18,7 @@
 //!   full node does when it `TryUnwrap`s every passing chunk. Callers
 //!   that only need GSOC leave `pss_secret` unset and pay nothing.
 
+use crate::log_limit::WarnLimiter;
 use crate::lurker_registry::{Delivery, SharedWatch};
 use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
@@ -240,10 +241,35 @@ const MAX_BIN: u8 = 31;
 /// cheaply. With `SYNC_ROUND_TIMEOUT` this probes roughly once a minute
 /// on an idle bin.
 const STALENESS_PROBE_ROUNDS: u32 = 3;
+/// How far a page's `topmost` may run past the bin cursor a live puller
+/// last read before it re-reads the peer's cursors to check it. The
+/// cursor is the peer's highest binID in the bin, so an honest `topmost`
+/// never exceeds a cursor read after it; the slack only spares a cursor
+/// round trip per page while tailing a busy bin (one re-read per this
+/// many binIDs). A `topmost` still above a freshly read cursor is a
+/// protocol error: the puller drops without saving it.
+const TOPMOST_CURSOR_SLACK: u64 = 1 << 16;
+/// How long after warning about a (peer, bin)'s invalid `topmost` its
+/// repeats are logged at `debug` only (see [`crate::log_limit`]).
+const PEER_WARN_INTERVAL: Duration = Duration::from_mins(10);
+static BAD_TOPMOST_WARNS: WarnLimiter<(PeerId, u8)> = WarnLimiter::new(PEER_WARN_INTERVAL);
+/// How long the saved resume positions of a peer that is no longer
+/// connected are kept. Long enough that a peer that drops and redials
+/// resumes where its puller stopped (no gap), short enough that the map
+/// doesn't grow with every peer ever pulled from.
+const POSITION_GRACE: Duration = Duration::from_mins(10);
 
 /// Per-`(peer, bin)` resume position `(reserve_epoch, next_start)`,
 /// shared with the pullers. The epoch tag lets the driver discard a
-/// stale position after a peer wipes its reserve.
+/// stale position after a peer wipes its reserve. Only a `topmost` that
+/// passes [`advance_position`] is saved: one below `start`, at
+/// `u64::MAX`, or above a freshly re-read cursor never is. One within
+/// [`TOPMOST_CURSOR_SLACK`] of the cursor the puller last read is saved
+/// *without* a re-read, so a lying peer can park an entry up to
+/// `cursor + TOPMOST_CURSOR_SLACK + 1`; that is not checked here but at
+/// respawn, where [`usable_resume`] ignores a position past the fresh
+/// cursor + 1. A disconnected peer's entries are pruned after
+/// [`POSITION_GRACE`] (see [`prune_positions`]).
 type Positions = Arc<Mutex<HashMap<(PeerId, u8), (u64, u64)>>>;
 /// Readiness map: `(peer, bin) → generation` of the puller that marked
 /// it ready (stream open, `Get` sent). Tagged with a per-puller
@@ -730,8 +756,10 @@ pub async fn run(
     // absurdly high) position would park the puller above every new
     // binID forever. Bee's puller likewise drops saved intervals on an
     // epoch change; we drop the saved position and start fresh from the
-    // new cursor.
+    // new cursor. A peer that stays disconnected past POSITION_GRACE has
+    // its positions pruned (`gone_since` tracks since when).
     let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
+    let mut gone_since: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     // (peer, bin) pullers that have completed at least one successful
     // pull round — proof the stream actually opened and the bin is
     // covered. The coordinated handover retires an obsolete puller only
@@ -798,6 +826,16 @@ pub async fn run(
             )
         };
         let now = tokio::time::Instant::now();
+        {
+            let connected: HashSet<PeerId> = peers.borrow().iter().map(|(p, _)| *p).collect();
+            prune_positions(
+                &mut positions.lock().unwrap_or_else(PoisonError::into_inner),
+                &mut gone_since,
+                &connected,
+                |k| active.contains_key(k),
+                now,
+            );
+        }
         if want_pss {
             mailbox.admit(history_seq);
         }
@@ -903,6 +941,7 @@ pub async fn run(
                     .copied()
                     .filter(|(epoch, _)| *epoch == cursors.epoch)
                     .map(|(_, start)| start);
+                let resume = usable_resume(resume, cursor);
                 // A replaced puller resumes exactly where it stopped;
                 // otherwise it tails live with a small backlog to cover
                 // the reside/cursor-read window. Mailbox history is the
@@ -923,6 +962,7 @@ pub async fn run(
                     bin,
                     start,
                     cursors.epoch,
+                    cursor,
                     next_generation,
                     Arc::clone(&watch),
                     Arc::clone(&seen),
@@ -1001,7 +1041,11 @@ pub async fn run(
 
 /// Live-pull one bin from one peer, forwarding decoded messages. Runs
 /// until the peer's stream errors (peer likely gone → the driver drops
-/// this puller) or the subscriber leaves. A round timeout is *not* fatal:
+/// this puller), the peer sends an invalid `topmost` (below `start`, or
+/// above its own bin cursor — see [`check_topmost`]; the bad position is
+/// not saved and the driver re-spawns a puller on its next pass), or the
+/// subscriber leaves. `cursor` is the peer's bin cursor read when this
+/// puller was spawned, re-read when a page runs past it. A round timeout is *not* fatal:
 /// the server long-blocks on a quiet bin, so a timeout just means "no new
 /// chunk yet" and we re-open at the same `start`.
 #[allow(clippy::too_many_arguments)]
@@ -1011,6 +1055,7 @@ async fn pull_bin(
     bin: u8,
     mut start: u64,
     epoch: u64,
+    mut cursor: u64,
     generation: u64,
     watch: SharedWatch,
     seen: Arc<Mutex<Seen>>,
@@ -1117,16 +1162,157 @@ async fn pull_bin(
                 return;
             }
         }
-        start = page.topmost.saturating_add(1);
         // Publish how far this (peer, bin) got, tagged with the reserve
         // epoch it was read under, so a replacement puller resumes here
         // rather than skipping the gap — but only while the epoch holds
-        // (the driver discards the position on an epoch change).
+        // (the driver discards the position on an epoch change), and
+        // only for a `topmost` that checks out against the peer's cursor.
+        let key = (peer_id, bin);
+        let mut verdict = advance_position(
+            &positions,
+            key,
+            epoch,
+            start,
+            page.topmost,
+            cursor,
+            TOPMOST_CURSOR_SLACK,
+        );
+        if verdict == TopmostCheck::AboveCursor {
+            // Past the cursor we last read: the bin may simply have grown
+            // since. Re-read it (same reserve epoch) and check again.
+            match pullsync::get_cursors(&mut control, peer_id).await {
+                Ok(c) if c.epoch == epoch => {
+                    cursor = c.cursors.get(bin as usize).copied().unwrap_or(0);
+                    verdict =
+                        advance_position(&positions, key, epoch, start, page.topmost, cursor, 0);
+                }
+                outcome => {
+                    tracing::debug!(
+                        target: "ant_p2p::lurker",
+                        peer = %peer_id, bin, topmost = page.topmost,
+                        alive = outcome.is_ok(),
+                        "cursor re-read failed or epoch changed; rotating puller",
+                    );
+                    return;
+                }
+            }
+        }
+        match verdict {
+            TopmostCheck::Advance(next) => start = next,
+            bad => {
+                // The driver respawns a puller for this (peer, bin) on
+                // its next pass, and a lying peer lies again: warn once
+                // per (peer, bin) per interval, the repeats go to debug.
+                if BAD_TOPMOST_WARNS.allow((peer_id, bin), std::time::Instant::now()) {
+                    tracing::warn!(
+                        target: "ant_p2p::lurker",
+                        peer = %peer_id, bin, start, topmost = page.topmost, cursor, verdict = ?bad,
+                        "peer sent an invalid pullsync topmost; dropping puller without saving its position \
+                         (repeats for this peer and bin logged at debug for {}s)",
+                        PEER_WARN_INTERVAL.as_secs(),
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "ant_p2p::lurker",
+                        peer = %peer_id, bin, start, topmost = page.topmost, cursor, verdict = ?bad,
+                        "peer sent an invalid pullsync topmost; dropping puller without saving its position",
+                    );
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// What a pullsync page's `topmost` means for the next round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopmostCheck {
+    /// Valid: pull on from this binID (`topmost + 1`).
+    Advance(u64),
+    /// Below the `start` we asked for. Bee offers binIDs `>= start` only,
+    /// so this is a protocol error; following it would re-request the
+    /// same interval in a loop paced only by round trips.
+    BelowStart,
+    /// `u64::MAX`: there is no next binID to pull from, and saving it
+    /// would park every replacement puller above all real binIDs.
+    AtMax,
+    /// More than the given slack above the cursor: with
+    /// [`TOPMOST_CURSOR_SLACK`] against the cursor read at spawn, re-read
+    /// it and check again with no slack; still above the fresh cursor is
+    /// a protocol error.
+    AboveCursor,
+}
+
+/// Check a page's `topmost` against the `start` it was requested at and
+/// the peer's bin `cursor` (its highest binID in the bin, as last read).
+/// `slack` is how far past `cursor` still counts as valid:
+/// [`TOPMOST_CURSOR_SLACK`] against a cursor read before the page, `0`
+/// against one re-read after it (an honest `topmost` is then at most it).
+fn check_topmost(start: u64, topmost: u64, cursor: u64, slack: u64) -> TopmostCheck {
+    if topmost < start {
+        TopmostCheck::BelowStart
+    } else if topmost == u64::MAX {
+        TopmostCheck::AtMax
+    } else if topmost > cursor.saturating_add(slack) {
+        TopmostCheck::AboveCursor
+    } else {
+        TopmostCheck::Advance(topmost + 1)
+    }
+}
+
+/// [`check_topmost`], and save the resume position `(epoch, topmost + 1)`
+/// for `key` only when it checks out against `cursor` + `slack`. A
+/// `topmost` below `start`, at `u64::MAX` or past that bound never
+/// reaches `positions`. With [`TOPMOST_CURSOR_SLACK`] against a stale
+/// cursor, though, a lying `topmost` up to `cursor + slack` is saved
+/// without a re-read: this does not guarantee a saved position is
+/// valid, only bounded. [`usable_resume`] is what keeps such an entry
+/// from parking a replacement puller (see [`Positions`]).
+fn advance_position(
+    positions: &Positions,
+    key: (PeerId, u8),
+    epoch: u64,
+    start: u64,
+    topmost: u64,
+    cursor: u64,
+    slack: u64,
+) -> TopmostCheck {
+    let verdict = check_topmost(start, topmost, cursor, slack);
+    if let TopmostCheck::Advance(next) = verdict {
         positions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert((peer_id, bin), (epoch, start));
+            .insert(key, (epoch, next));
     }
+    verdict
+}
+
+/// Drop the saved resume positions of peers that have been disconnected
+/// (absent from `connected`) for [`POSITION_GRACE`] or longer and have
+/// no puller left for that (peer, bin). `gone_since` records when each
+/// absent peer was first seen gone; a reconnected peer's timer is reset,
+/// and timers of peers with no positions left are forgotten too.
+fn prune_positions(
+    positions: &mut HashMap<(PeerId, u8), (u64, u64)>,
+    gone_since: &mut HashMap<PeerId, tokio::time::Instant>,
+    connected: &HashSet<PeerId>,
+    is_active: impl Fn(&(PeerId, u8)) -> bool,
+    now: tokio::time::Instant,
+) {
+    for (peer, _) in positions.keys() {
+        if !connected.contains(peer) {
+            gone_since.entry(*peer).or_insert(now);
+        }
+    }
+    positions.retain(|key, _| {
+        connected.contains(&key.0)
+            || is_active(key)
+            || gone_since
+                .get(&key.0)
+                .is_none_or(|t| now.duration_since(*t) < POSITION_GRACE)
+    });
+    gone_since
+        .retain(|peer, _| !connected.contains(peer) && positions.keys().any(|(p, _)| p == peer));
 }
 
 /// The bins to pull from one covering peer at proximity `b_p` to the
@@ -1183,8 +1369,10 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
 /// - **Fresh**: a short [`PULL_BACKLOG`] behind the cursor — covers the
 ///   window between a storer accepting a chunk and us reading its
 ///   cursor, without pulling history. (Mailbox history is a separate
-///   one-shot [`sweep_bin`], never a live puller's start.)
+///   one-shot [`sweep_bin`], never a live puller's start.) Also taken
+///   for a saved position above `cursor + 1` (see [`usable_resume`]).
 fn start_bin_id(resume: Option<u64>, cursor: u64) -> u64 {
+    let resume = usable_resume(resume, cursor);
     if let Some(start) = resume {
         return start;
     }
@@ -1192,6 +1380,16 @@ fn start_bin_id(resume: Option<u64>, cursor: u64) -> u64 {
         .saturating_add(1)
         .saturating_sub(PULL_BACKLOG)
         .max(HISTORY_FLOOR)
+}
+
+/// A saved resume position, unless it is past `cursor + 1` (the next
+/// binID after the peer's highest one in the bin). An honest peer's
+/// position never is (the cursor only grows within an epoch), but a
+/// `topmost` within [`TOPMOST_CURSOR_SLACK`] of the old cursor is saved
+/// without a re-read (see [`Positions`]), so a lying peer's can be; one
+/// that is would park the puller above every real binID.
+fn usable_resume(resume: Option<u64>, cursor: u64) -> Option<u64> {
+    resume.filter(|start| *start <= cursor.saturating_add(1))
 }
 
 /// The inclusive binID range a mailbox sweep covers on a bin whose
@@ -1240,9 +1438,10 @@ async fn mailbox_update_pending(
 /// decoded **PSS** messages as backlog for `tickets` only — the registry
 /// routes them to the subscribers holding those tickets, never to
 /// live-only or GSOC subscribers — then exit. Never touches the live
-/// pullers' positions, readiness, or dedup set. A stream error, or
-/// [`SWEEP_STALL_RETRIES`] + 1 consecutive round timeouts short of `to`,
-/// ends the sweep early with a warning naming the unswept binIDs and
+/// pullers' positions, readiness, or dedup set. A stream error, an
+/// invalid `topmost` (below `start` or `u64::MAX`, see [`check_topmost`]),
+/// or [`SWEEP_STALL_RETRIES`] + 1 consecutive round timeouts short of
+/// `to`, ends the sweep early with a warning naming the unswept binIDs and
 /// reports the (peer, bin) in `failed` (waking the driver), so the
 /// campaign re-sweeps it while the peer still covers — see [`Campaign`]
 /// (the campaign's `seen` dedups what this attempt already delivered).
@@ -1335,10 +1534,24 @@ async fn sweep_bin(
                 return;
             }
         }
-        if page.topmost < start {
-            return; // no progress: don't spin on a misbehaving peer
+        // A `topmost` below `start` (no progress) or at `u64::MAX` is a
+        // misbehaving peer: end the sweep as failed, not as complete, so
+        // the campaign retries (bounded by SWEEP_MAX_ATTEMPTS) instead of
+        // counting the unswept rest of the window as covered. Nothing is
+        // saved, so there is no cursor ceiling to check here.
+        match check_topmost(start, page.topmost, u64::MAX, 0) {
+            TopmostCheck::Advance(next) => start = next,
+            bad => {
+                tracing::warn!(
+                    target: "ant_p2p::lurker",
+                    peer = %peer_id, bin, unswept_from = start, unswept_to = to,
+                    topmost = page.topmost, verdict = ?bad,
+                    "peer sent an invalid pullsync topmost; ending sweep of this (peer, bin) early (retried while the peer still covers)",
+                );
+                report_failed();
+                return;
+            }
         }
-        start = page.topmost.saturating_add(1);
     }
 }
 
@@ -1589,6 +1802,209 @@ mod tests {
         assert_eq!(start_bin_id(None, 2), HISTORY_FLOOR);
         // An epoch-matched replacement continues exactly where it stopped.
         assert_eq!(start_bin_id(Some(12_345), 50_000), 12_345);
+    }
+
+    /// A page whose `topmost` is below the `start` we asked for is a
+    /// protocol error and leaves no saved position (an existing one is
+    /// kept as is); a valid page saves `topmost + 1`.
+    #[test]
+    fn topmost_below_start_is_an_error_and_saves_nothing() {
+        let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
+        let key = (PeerId::random(), 7);
+        assert_eq!(
+            advance_position(&positions, key, 1, 100, 99, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::BelowStart
+        );
+        assert_eq!(
+            advance_position(&positions, key, 1, 100, 0, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::BelowStart
+        );
+        assert!(positions.lock().unwrap().is_empty());
+
+        assert_eq!(
+            advance_position(&positions, key, 1, 100, 150, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::Advance(151)
+        );
+        assert_eq!(positions.lock().unwrap().get(&key), Some(&(1, 151)));
+        // A later bad page doesn't touch the saved position.
+        assert_eq!(
+            advance_position(&positions, key, 1, 151, 150, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::BelowStart
+        );
+        assert_eq!(positions.lock().unwrap().get(&key), Some(&(1, 151)));
+        // `topmost == start` is a valid one-binID page.
+        assert_eq!(
+            check_topmost(151, 151, 1_000, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::Advance(152)
+        );
+    }
+
+    /// `topmost = u64::MAX`, and anything past the peer's cursor plus the
+    /// given slack, is never persisted. A `topmost` within the slack is
+    /// (last assertion), even if the bin never grew that far; that one is
+    /// dropped at respawn by `usable_resume` instead (see
+    /// `resume_above_the_cursor_is_ignored`).
+    #[test]
+    fn absurd_topmost_is_not_persisted() {
+        let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
+        let key = (PeerId::random(), 3);
+        let cursor = 5_000;
+        assert_eq!(
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                u64::MAX,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
+            TopmostCheck::AtMax
+        );
+        // Even against a cursor whose slack saturates at u64::MAX.
+        assert_eq!(
+            check_topmost(10, u64::MAX, u64::MAX, TOPMOST_CURSOR_SLACK),
+            TopmostCheck::AtMax
+        );
+        assert_eq!(
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                u64::MAX - 1,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
+            TopmostCheck::AboveCursor
+        );
+        assert_eq!(
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                cursor + TOPMOST_CURSOR_SLACK + 1,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
+            TopmostCheck::AboveCursor
+        );
+        // Re-checked against a cursor re-read after the page (no slack):
+        // anything above it is out, the cursor itself is fine.
+        assert_eq!(
+            advance_position(&positions, key, 1, 10, cursor + 1, cursor, 0),
+            TopmostCheck::AboveCursor
+        );
+        assert!(positions.lock().unwrap().is_empty());
+        assert_eq!(
+            check_topmost(10, cursor, cursor, 0),
+            TopmostCheck::Advance(cursor + 1)
+        );
+        // Within the slack (a bin that grew since the cursor read) is fine.
+        assert_eq!(
+            advance_position(
+                &positions,
+                key,
+                1,
+                10,
+                cursor + TOPMOST_CURSOR_SLACK,
+                cursor,
+                TOPMOST_CURSOR_SLACK
+            ),
+            TopmostCheck::Advance(cursor + TOPMOST_CURSOR_SLACK + 1)
+        );
+    }
+
+    /// A saved position above `cursor + 1` can't have come from an honest
+    /// page, so a replacement puller ignores it and tails from the cursor;
+    /// one at `cursor + 1` (fully caught up) still resumes.
+    #[test]
+    fn resume_above_the_cursor_is_ignored() {
+        assert_eq!(usable_resume(Some(50_001), 50_000), Some(50_001));
+        assert_eq!(usable_resume(Some(50_002), 50_000), None);
+        assert_eq!(usable_resume(Some(u64::MAX), 50_000), None);
+        assert_eq!(start_bin_id(Some(50_001), 50_000), 50_001);
+        assert_eq!(
+            start_bin_id(Some(u64::MAX), 50_000),
+            50_000 + 1 - PULL_BACKLOG
+        );
+    }
+
+    /// A disconnected peer's positions survive a short absence (it may
+    /// redial and resume), are pruned once it has been gone for
+    /// `POSITION_GRACE`, and are kept while a puller for them still runs;
+    /// a connected peer's positions are never pruned.
+    #[test]
+    fn stale_peer_position_is_pruned() {
+        let (here, gone, busy) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut positions: HashMap<(PeerId, u8), (u64, u64)> = HashMap::new();
+        positions.insert((here, 1), (1, 10));
+        positions.insert((gone, 1), (1, 20));
+        positions.insert((gone, 2), (1, 21));
+        positions.insert((busy, 1), (1, 30));
+        let mut gone_since = HashMap::new();
+        let connected: HashSet<PeerId> = [here].into_iter().collect();
+        let active = |k: &(PeerId, u8)| k.0 == busy;
+        let t0 = tokio::time::Instant::now();
+
+        prune_positions(&mut positions, &mut gone_since, &connected, active, t0);
+        assert_eq!(positions.len(), 4, "nothing pruned inside the grace");
+        let just_short = t0 + POSITION_GRACE - Duration::from_secs(1);
+        prune_positions(
+            &mut positions,
+            &mut gone_since,
+            &connected,
+            active,
+            just_short,
+        );
+        assert_eq!(positions.len(), 4);
+
+        let past = t0 + POSITION_GRACE;
+        prune_positions(&mut positions, &mut gone_since, &connected, active, past);
+        assert!(positions.contains_key(&(here, 1)));
+        assert!(
+            positions.contains_key(&(busy, 1)),
+            "a running puller keeps its position"
+        );
+        assert!(!positions.contains_key(&(gone, 1)));
+        assert!(!positions.contains_key(&(gone, 2)));
+        assert!(
+            !gone_since.contains_key(&gone),
+            "its timer is forgotten too"
+        );
+
+        // A peer that reconnects within the grace has its timer reset.
+        let mut positions: HashMap<(PeerId, u8), (u64, u64)> = HashMap::new();
+        positions.insert((gone, 1), (1, 20));
+        let mut gone_since = HashMap::new();
+        prune_positions(
+            &mut positions,
+            &mut gone_since,
+            &HashSet::new(),
+            |_| false,
+            t0,
+        );
+        let back: HashSet<PeerId> = [gone].into_iter().collect();
+        prune_positions(
+            &mut positions,
+            &mut gone_since,
+            &back,
+            |_| false,
+            just_short,
+        );
+        assert!(gone_since.is_empty());
+        prune_positions(
+            &mut positions,
+            &mut gone_since,
+            &HashSet::new(),
+            |_| false,
+            past,
+        );
+        assert!(
+            positions.contains_key(&(gone, 1)),
+            "grace restarts after a reconnect"
+        );
     }
 
     /// The mailbox sweep covers a bounded window ending at the cursor;

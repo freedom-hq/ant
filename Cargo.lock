@@ -137,6 +137,7 @@ name = "ant-control"
 version = "0.5.79"
 dependencies = [
  "hex",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -330,6 +331,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "hex",
+ "libc",
  "memmap2",
  "percent-encoding",
  "primitive-types",
@@ -368,10 +370,12 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
