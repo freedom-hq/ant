@@ -107,8 +107,12 @@ pub struct BoundControlSocket {
 /// `InvalidInput` error, so the daemon falls back as for an over-long path.
 ///
 /// An existing file at `socket_path` owned by another user is refused,
-/// not removed: in a shared directory that is a squatter, and silently
-/// binding elsewhere would hide it.
+/// not removed, unless the directory holding it is ours and writable by
+/// no one else: in a shared directory that file is a squatter, and
+/// silently binding elsewhere would hide it, but in our own private
+/// directory only root could have put it there (a one-off `sudo antd` on
+/// the same data dir leaves a root-owned `antd.sock`, since antd doesn't
+/// remove its socket on exit), so it is replaced like our own.
 pub fn bind(socket_path: PathBuf) -> Result<BoundControlSocket, ServerError> {
     bind_owned_by(socket_path, effective_uid())
 }
@@ -159,26 +163,47 @@ fn bind_owned_by(socket_path: PathBuf, uid: u32) -> Result<BoundControlSocket, S
 }
 
 /// Remove whatever an earlier run left at `path`, unless it belongs to
-/// another user.
+/// another user in a directory others can write to (see
+/// [`may_replace_stale`]).
 fn remove_stale_socket(path: &Path, uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.uid() != uid {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to replace {}: owned by uid {}, not {uid}",
-                        path.display(),
-                        meta.uid(),
-                    ),
-                ));
+                let parent = match path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                let dir = std::fs::symlink_metadata(parent)?;
+                if !may_replace_stale(meta.uid(), dir.uid(), dir.mode(), uid) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to replace {}: owned by uid {}, not {uid}, in a \
+                             directory (uid {}, mode {:o}) not private to uid {uid}",
+                            path.display(),
+                            meta.uid(),
+                            dir.uid(),
+                            dir.mode() & 0o7777,
+                        ),
+                    ));
+                }
             }
             std::fs::remove_file(path)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Whether a stale file at the socket path may be removed: always when
+/// it is ours, and when it is another user's only if its directory is
+/// owned by us and has no group/world write bit. Nobody but us and root
+/// can create entries in such a directory, so a foreign file there is a
+/// leftover (in practice a root-owned socket from a `sudo antd` run),
+/// not a squatter.
+fn may_replace_stale(file_uid: u32, dir_uid: u32, dir_mode: u32, uid: u32) -> bool {
+    file_uid == uid || (dir_uid == uid && dir_mode & 0o022 == 0)
 }
 
 /// A freshly created, owner-only (`0700`) directory the socket is bound
@@ -252,23 +277,54 @@ impl Drop for StagingDir {
     }
 }
 
-/// A private directory for the control socket when it cannot live in the
-/// data dir (path too long for `sun_path`, issue #39): `$XDG_RUNTIME_DIR`
-/// when it is set and private to this user, else `<temp>/antd-<uid>`,
-/// created `0700`. Unlike a socket directly in the shared temp dir, the
-/// path can't be pre-created or squatted by another local user: an
-/// existing directory that isn't ours, isn't a real directory, or is
+/// A path for the control socket named `file_name` in a private
+/// directory, for when it cannot live in the data dir (path too long for
+/// `sun_path`, issue #39): `$XDG_RUNTIME_DIR` when it is set, private to
+/// this user, and short enough that the socket (and its staging path,
+/// see [`bind`]) fits `sun_path` there; else `<temp>/antd-<uid>`, created
+/// `0700`. Unlike a socket directly in the shared temp dir, the path
+/// can't be pre-created or squatted by another local user: an existing
+/// directory that isn't ours, isn't a real directory, or is
 /// group/world-accessible is refused, never adopted (issue #307).
-pub fn private_runtime_dir() -> std::io::Result<PathBuf> {
-    let uid = effective_uid();
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        if dir.is_absolute() && check_private_dir(&dir, uid).is_ok() {
-            return Ok(dir);
+///
+/// The temp-dir path is returned even if it doesn't fit either (only a
+/// very long `$TMPDIR` does that); [`bind`] then fails with the usual
+/// `SUN_LEN` error.
+pub fn private_runtime_socket(file_name: &str) -> std::io::Result<PathBuf> {
+    runtime_socket_in(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        &std::env::temp_dir(),
+        effective_uid(),
+        file_name,
+    )
+}
+
+fn runtime_socket_in(
+    xdg: Option<PathBuf>,
+    temp: &Path,
+    uid: u32,
+    file_name: &str,
+) -> std::io::Result<PathBuf> {
+    if let Some(dir) = xdg {
+        let path = dir.join(file_name);
+        if dir.is_absolute() && socket_path_fits(&path) && check_private_dir(&dir, uid).is_ok() {
+            return Ok(path);
         }
     }
-    let dir = std::env::temp_dir().join(format!("antd-{uid}"));
+    let dir = temp.join(format!("antd-{uid}"));
     ensure_private_dir(&dir, uid)?;
-    Ok(dir)
+    Ok(dir.join(file_name))
+}
+
+/// Whether [`bind`] can bind at `path` as far as `sun_path` goes: the
+/// path itself fits and at least one staging name does too.
+fn socket_path_fits(path: &Path) -> bool {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::os::unix::net::SocketAddr::from_pathname(path).is_ok()
+        && !staging_names(parent, path.file_name()).is_empty()
 }
 
 /// Create `dir` as `0700` if absent, then require it to be private to
@@ -1241,11 +1297,65 @@ mod tests {
 
     #[test]
     fn private_runtime_dir_is_private() {
-        let dir = private_runtime_dir().unwrap();
-        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        let path = private_runtime_socket("antd-test.sock").unwrap();
+        assert_eq!(path.file_name().unwrap(), "antd-test.sock");
+        let dir = path.parent().unwrap();
+        let meta = std::fs::symlink_metadata(dir).unwrap();
         assert!(meta.is_dir());
         assert_eq!(meta.uid(), effective_uid());
         assert_eq!(meta.mode() & 0o077, 0);
+    }
+
+    /// A private `$XDG_RUNTIME_DIR` is used only when the socket fits
+    /// `sun_path` there; a longer one falls through to `<temp>/antd-<uid>`
+    /// instead of yielding a path whose bind is bound to fail.
+    #[test]
+    fn xdg_runtime_dir_too_long_for_sun_path_is_skipped() {
+        let base = scratch_dir("xdg");
+        let me = effective_uid();
+        let name = "antd-0123456789abcdef.sock";
+        let temp = base.join("t");
+        std::fs::create_dir(&temp).unwrap();
+
+        let short = base.join("x");
+        std::fs::create_dir(&short).unwrap();
+        std::fs::set_permissions(&short, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if socket_path_fits(&short.join(name)) {
+            assert_eq!(
+                runtime_socket_in(Some(short.clone()), &temp, me, name).unwrap(),
+                short.join(name),
+            );
+        }
+
+        let long = base.join("x".repeat(120));
+        std::fs::create_dir(&long).unwrap();
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
+        check_private_dir(&long, me).unwrap();
+        assert!(!socket_path_fits(&long.join(name)));
+        let path = runtime_socket_in(Some(long), &temp, me, name).unwrap();
+        assert_eq!(path, temp.join(format!("antd-{me}")).join(name));
+        check_private_dir(path.parent().unwrap(), me).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A foreign stale file is replaced only in a directory that is ours
+    /// and that no one else can write to (a root-owned `antd.sock` left
+    /// in our data dir by `sudo antd`); in a directory others can write
+    /// to, or one we don't own, it is a squatter and stays.
+    #[test]
+    fn foreign_stale_socket_replaced_only_in_our_private_dir() {
+        let me = 1000;
+        // Ours: always.
+        assert!(may_replace_stale(me, 0, 0o1777, me));
+        // Root's leftover in our 0755/0700 data dir: replaced.
+        assert!(may_replace_stale(0, me, 0o40755, me));
+        assert!(may_replace_stale(0, me, 0o40700, me));
+        // Group/world-writable dir, even ours: refused.
+        assert!(!may_replace_stale(0, me, 0o40775, me));
+        assert!(!may_replace_stale(1001, me, 0o41777, me));
+        // Someone else's dir (shared temp dir, root-owned): refused.
+        assert!(!may_replace_stale(1001, 0, 0o41777, me));
+        assert!(!may_replace_stale(0, 0, 0o40755, me));
     }
 
     #[test]

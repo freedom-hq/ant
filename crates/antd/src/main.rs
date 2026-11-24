@@ -1232,7 +1232,7 @@ async fn main() -> Result<()> {
 
 /// Bind the control socket at its intended path, falling back to a
 /// short per-data-dir path in a private per-user directory
-/// ([`ant_control::private_runtime_dir`]) when that fails
+/// ([`ant_control::private_runtime_socket`]) when that fails
 /// (deep data dirs — Electron `userData`, containers, CI workspaces —
 /// routinely exceed `sun_path`'s ~104-byte limit; issue #39). On
 /// fallback, a [`ant_control::SOCKET_POINTER_FILE`] in the data dir
@@ -1315,15 +1315,18 @@ fn bind_control_socket(
 /// `antd-<hash-of-data-dir>.sock` in a directory only this user can
 /// reach (`$XDG_RUNTIME_DIR`, else `<temp>/antd-<uid>`, `0700`; issue
 /// #307 — a bare name in the shared temp dir could be pre-created or
-/// squatted by another local user). Stays under `sun_path` limits on
-/// every platform we ship. Clients don't need to recompute the hash —
-/// the pointer file carries the actual path.
+/// squatted by another local user). `$XDG_RUNTIME_DIR` is skipped when
+/// the socket wouldn't fit `sun_path` there; `<temp>/antd-<uid>` fits
+/// on every platform we ship unless `$TMPDIR` itself is very long, in
+/// which case the fallback bind fails with `SUN_LEN` like the primary one.
+/// Clients don't need to recompute the hash — the pointer file carries
+/// the actual path.
 #[cfg(unix)]
 fn fallback_control_socket_path(data_dir: &Path) -> std::io::Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data_dir.hash(&mut h);
-    Ok(ant_control::private_runtime_dir()?.join(format!("antd-{:016x}.sock", h.finish())))
+    ant_control::private_runtime_socket(&format!("antd-{:016x}.sock", h.finish()))
 }
 
 /// Flatten the spawned node loop's `JoinHandle` outcome into the

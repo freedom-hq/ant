@@ -37,13 +37,13 @@ pub use client::{
     request_streaming, request_sync, request_upload_follow, ClientError, StreamEvent,
 };
 #[cfg(unix)]
-pub use server::{bind, private_runtime_dir, serve, BoundControlSocket, ServerError};
+pub use server::{bind, private_runtime_socket, serve, BoundControlSocket, ServerError};
 
 /// Name of the pointer file `antd` writes into the data dir when the
 /// control socket could not bind at its intended `<data-dir>/antd.sock`
 /// path (most commonly: the path exceeds `sun_path`'s ~104-byte limit,
 /// issue #39) and a fallback in a private per-user directory
-/// ([`private_runtime_dir`]) was bound instead.
+/// ([`private_runtime_socket`]) was bound instead.
 /// Contains the actual socket path, one line. Clients resolve through
 /// it via [`resolve_client_socket`].
 pub const SOCKET_POINTER_FILE: &str = "antd.sock.path";
