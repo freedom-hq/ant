@@ -97,6 +97,10 @@ pub struct BoundControlSocket {
 /// and only then `rename`d into place. The umask is never touched: it is
 /// process-wide and other threads may be creating files.
 ///
+/// `socket_path` itself must fit `sun_path`, checked before anything is
+/// touched: a longer path fails here exactly as a direct `bind(2)` would,
+/// even though the shorter staged path alone would have bound.
+///
 /// An existing file at `socket_path` owned by another user is refused,
 /// not removed: in a shared directory that is a squatter, and silently
 /// binding elsewhere would hide it.
@@ -105,6 +109,14 @@ pub fn bind(socket_path: PathBuf) -> Result<BoundControlSocket, ServerError> {
 }
 
 fn bind_owned_by(socket_path: PathBuf, uid: u32) -> Result<BoundControlSocket, ServerError> {
+    // The socket is bound at the shorter staged path and `rename(2)`
+    // doesn't check `sun_path`, so a final path a few bytes over the
+    // limit would bind fine and yet be unreachable: every client's
+    // `connect` fails with SUN_LEN, and the daemon never tries its
+    // fallback. Check the final path up front, failing with the same
+    // error a direct `bind` at it would (issue #39's fallback keys off
+    // the bind failing), before anything is removed or created.
+    std::os::unix::net::SocketAddr::from_pathname(&socket_path)?;
     let parent = match socket_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -975,6 +987,33 @@ mod tests {
         let bound = bind(path.clone()).unwrap();
         assert_eq!(bound.socket_path(), path);
         assert_eq!(entries(&dir), vec!["antd.sock".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One byte over that limit (and a little more), the shorter staged
+    /// path alone would still bind and `rename` would move it into place
+    /// unreachable: no client can `connect` to it. Bind must fail like a
+    /// direct bind at the final path, so the daemon falls back, and must
+    /// leave nothing behind (neither staging dir nor a stale file).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_path_over_the_sun_path_limit_is_refused() {
+        let base = scratch_dir("sunlen-over");
+        for len in [108usize, 109, 110, 111] {
+            let room = len - base.as_os_str().len() - "/antd.sock".len() - 1;
+            let dir = base.join("d".repeat(room));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("antd.sock");
+            assert_eq!(path.as_os_str().len(), len);
+            std::fs::write(&path, b"stale").unwrap();
+            let err = bind(path.clone()).err().expect("must refuse");
+            assert!(
+                matches!(&err, ServerError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{len}: {err}"
+            );
+            assert_eq!(entries(&dir), vec!["antd.sock".to_string()], "{len}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
