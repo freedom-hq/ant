@@ -42,6 +42,18 @@
 //! `sendHeaders` to see `io.EOF` on its read, which bubbles up as
 //! `ConnectIn` failure on pricing and triggers an immediate disconnect.
 //!
+//! # Who may open these streams (#300)
+//!
+//! Every sink here is only meaningful *after* a BZZ handshake, so each
+//! accept loop runs through [`serve_gated`]: a stream from a peer we have
+//! no handshake with (or in flight) is reset on the spot, before any task
+//! is spawned for it. A peer whose handshake is still in flight gets
+//! [`HANDSHAKE_GATE_WAIT`] to finish, because bee opens pricing from its
+//! side of the handshake, which can land a moment before our swarm loop
+//! has recorded the outcome. Spawned stream tasks are capped globally
+//! ([`MAX_SINK_TASKS`]) and per peer ([`MAX_SINK_TASKS_PER_PEER`]); a
+//! stream over either cap is reset too.
+//!
 //! [`pricing`]: https://github.com/ethersphere/bee/blob/v2.7.1/pkg/pricing/pricing.go
 //! [`bee-headers`]: https://github.com/ethersphere/bee/blob/v2.7.1/pkg/p2p/libp2p/headers.go
 
@@ -53,8 +65,11 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
 use libp2p_swarm::Stream;
 use prost::Message;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 
 /// bee `pkg/pricing`, sends a single `AnnouncePaymentThreshold` (<= ~256 bits).
@@ -86,6 +101,248 @@ pub const HEADERS_MAX: usize = 8 * 1024;
 /// a 5 s context and its headers exchange a 10 s one, so 15 s is enough to
 /// survive both without letting a stuck stream leak forever.
 pub const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a stream from a peer whose BZZ handshake is still in flight
+/// waits for the swarm loop to record the outcome before it is reset.
+/// Bee opens pricing (`ConnectIn`) as soon as *its* side of our handshake
+/// completes, which is a moment before our driver task hands the result
+/// back to the swarm loop. Kept well under the 5 s context bee gives
+/// `AnnouncePaymentThreshold`.
+pub const HANDSHAKE_GATE_WAIT: Duration = Duration::from_secs(2);
+/// Inbound sink streams being served at once, across all peers and all
+/// sink protocols. Bee opens one pricing and one hive stream per
+/// handshake and the odd pseudosettle / swap stream afterwards, each
+/// done in milliseconds, so this is far above steady-state use.
+pub const MAX_SINK_TASKS: usize = 256;
+/// Inbound sink streams one peer may have served at once, so a single
+/// handshaked peer can't take every [`MAX_SINK_TASKS`] permit and get
+/// everyone else's pricing stream reset (which makes bee disconnect).
+pub const MAX_SINK_TASKS_PER_PEER: usize = 8;
+
+/// Where a peer stands in our BZZ handshake, as far as the inbound sinks
+/// are concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPhase {
+    /// Connected and our outbound handshake is in flight.
+    Pending,
+    /// Handshake done; the peer is in the BZZ peer set.
+    Ready,
+}
+
+/// Shared view of which peers have (or are finishing) a BZZ handshake.
+/// Written by the swarm loop, read by the sink accept loops. Cheap to
+/// clone; every clone sees the same set.
+#[derive(Clone, Default)]
+pub struct HandshakeGate(Arc<GateInner>);
+
+#[derive(Default)]
+struct GateInner {
+    peers: Mutex<HashMap<PeerId, PeerPhase>>,
+    changed: Notify,
+}
+
+impl HandshakeGate {
+    /// Record `peer`'s phase; `None` forgets it (disconnected, or the
+    /// handshake failed).
+    pub fn set(&self, peer: PeerId, phase: Option<PeerPhase>) {
+        let changed = {
+            let mut peers = self.0.peers.lock().expect("handshake gate poisoned");
+            match phase {
+                Some(p) => peers.insert(peer, p) != Some(p),
+                None => peers.remove(&peer).is_some(),
+            }
+        };
+        if changed {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    pub fn phase(&self, peer: &PeerId) -> Option<PeerPhase> {
+        self.0
+            .peers
+            .lock()
+            .expect("handshake gate poisoned")
+            .get(peer)
+            .copied()
+    }
+
+    /// Wait up to `wait` for `peer` to become [`PeerPhase::Ready`].
+    /// Returns `false` as soon as the peer is forgotten, or when the wait
+    /// runs out with the handshake still pending.
+    pub async fn wait_ready(&self, peer: &PeerId, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            // Register before reading, so a change between the read and
+            // the await still wakes us.
+            notified.as_mut().enable();
+            match self.phase(peer) {
+                Some(PeerPhase::Ready) => return true,
+                None => return false,
+                Some(PeerPhase::Pending) => {}
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.phase(peer) == Some(PeerPhase::Ready);
+            }
+        }
+    }
+}
+
+/// Admission control for inbound sink streams: the handshake gate plus
+/// the global and per-peer task caps. One guard is shared by every sink.
+#[derive(Clone)]
+pub struct InboundGuard {
+    gate: HandshakeGate,
+    tasks: Arc<Semaphore>,
+    per_peer: Arc<Mutex<HashMap<PeerId, usize>>>,
+    per_peer_cap: usize,
+}
+
+impl InboundGuard {
+    pub fn new(gate: HandshakeGate) -> Self {
+        Self::with_caps(gate, MAX_SINK_TASKS, MAX_SINK_TASKS_PER_PEER)
+    }
+
+    fn with_caps(gate: HandshakeGate, total: usize, per_peer: usize) -> Self {
+        Self {
+            gate,
+            tasks: Arc::new(Semaphore::new(total)),
+            per_peer: Arc::new(Mutex::new(HashMap::new())),
+            per_peer_cap: per_peer,
+        }
+    }
+
+    /// Decide on a fresh inbound stream from `peer` without waiting.
+    fn admit(&self, peer: PeerId) -> Result<Admission, Refusal> {
+        let phase = self.gate.phase(&peer).ok_or(Refusal::NotHandshaked)?;
+        let slot = {
+            let mut counts = self.per_peer.lock().expect("sink peer counts poisoned");
+            let n = counts.entry(peer).or_insert(0);
+            if *n >= self.per_peer_cap {
+                return Err(Refusal::PeerBusy);
+            }
+            *n += 1;
+            PeerSlot {
+                counts: self.per_peer.clone(),
+                peer,
+            }
+        };
+        let permit = self
+            .tasks
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Refusal::Busy)?;
+        Ok(Admission {
+            gate: self.gate.clone(),
+            peer,
+            pending: phase == PeerPhase::Pending,
+            _slot: slot,
+            _permit: permit,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    NotHandshaked,
+    PeerBusy,
+    Busy,
+}
+
+impl Refusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHandshaked => "peer not handshaked",
+            Self::PeerBusy => "per-peer sink cap reached",
+            Self::Busy => "sink task cap reached",
+        }
+    }
+}
+
+/// Releases one per-peer slot on drop.
+struct PeerSlot {
+    counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+    peer: PeerId,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().expect("sink peer counts poisoned");
+        if let Some(n) = counts.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// A stream let in by [`InboundGuard::admit`]; holds its task permit and
+/// per-peer slot until dropped.
+struct Admission {
+    gate: HandshakeGate,
+    peer: PeerId,
+    pending: bool,
+    _slot: PeerSlot,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Admission {
+    /// `true` once the peer is handshaked; a peer that was still pending
+    /// gets [`HANDSHAKE_GATE_WAIT`] to get there.
+    async fn ready(&self) -> bool {
+        !self.pending || self.gate.wait_ready(&self.peer, HANDSHAKE_GATE_WAIT).await
+    }
+}
+
+/// Accept loop shared by every inbound sink. A stream the [`InboundGuard`]
+/// refuses is dropped right here, with no task spawned; dropping an open
+/// yamux stream resets it. An admitted stream is served by `handle` on
+/// its own task, once its peer is handshaked.
+pub(crate) async fn serve_gated<F, Fut>(
+    mut incoming: IncomingStreams,
+    guard: InboundGuard,
+    protocol: &'static str,
+    handle: F,
+) where
+    F: Fn(PeerId, Stream) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    while let Some((peer_id, stream)) = incoming.next().await {
+        let admission = match guard.admit(peer_id) {
+            Ok(a) => a,
+            Err(why) => {
+                debug!(
+                    target: "ant_p2p::sinks",
+                    %peer_id,
+                    protocol,
+                    "resetting inbound stream: {}",
+                    why.as_str(),
+                );
+                drop(stream);
+                continue;
+            }
+        };
+        // An async fn's future does nothing until polled, so building it
+        // here only moves the stream in; dropping it unpolled resets it.
+        let serve = handle(peer_id, stream);
+        tokio::spawn(async move {
+            if admission.ready().await {
+                serve.await;
+            } else {
+                debug!(
+                    target: "ant_p2p::sinks",
+                    %peer_id,
+                    protocol,
+                    "resetting inbound stream: handshake did not complete in {:?}",
+                    HANDSHAKE_GATE_WAIT,
+                );
+            }
+            drop(admission);
+        });
+    }
+}
 
 /// A decoded hive `BzzAddress` reduced to the fields the swarm loop needs
 /// to dial the peer. The overlay is carried through so the swarm loop can
@@ -153,13 +410,21 @@ pub struct Registrations {
     pseudosettle: IncomingStreams,
     swap: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
+    guard: InboundGuard,
 }
 
 /// Claim every bee protocol we need to silently drain. Must run before the
 /// first outbound handshake completes: if bee's `ConnectIn` races ahead of
 /// our registration, the first peer gets kicked and we start the backoff
 /// loop for nothing.
-pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Registrations {
+///
+/// `gate` is the swarm loop's view of who is handshaked; every sink
+/// resets streams from anyone else (see the module docs).
+pub fn register(
+    control: &mut Control,
+    hint_tx: mpsc::Sender<PeerHint>,
+    gate: HandshakeGate,
+) -> Registrations {
     let pricing = control
         .accept(StreamProtocol::new(PROTOCOL_PRICING))
         .expect("pricing protocol registered exactly once");
@@ -189,6 +454,7 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
         pseudosettle,
         swap,
         hint_tx,
+        guard: InboundGuard::new(gate),
     }
 }
 
@@ -201,16 +467,22 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
 /// — so peers that emit one don't see an unsupported-protocol
 /// disconnect on the libp2p layer.
 pub fn spawn(reg: Registrations, swap: Option<SwapWiring>) {
-    tokio::spawn(run_pricing(reg.pricing));
-    tokio::spawn(run_hive(reg.hive_v1, reg.hint_tx.clone()));
-    tokio::spawn(run_hive(reg.hive_v2, reg.hint_tx));
-    tokio::spawn(crate::pseudosettle::run_inbound(reg.pseudosettle));
+    let guard = reg.guard;
+    tokio::spawn(run_pricing(reg.pricing, guard.clone()));
+    tokio::spawn(run_hive(reg.hive_v1, reg.hint_tx.clone(), guard.clone()));
+    tokio::spawn(run_hive(reg.hive_v2, reg.hint_tx, guard.clone()));
+    tokio::spawn(crate::pseudosettle::run_inbound(
+        reg.pseudosettle,
+        guard.clone(),
+    ));
     match swap {
         Some(s) => {
-            tokio::spawn(crate::swap::run_inbound(reg.swap, s.ledger, s.events));
+            tokio::spawn(crate::swap::run_inbound(
+                reg.swap, guard, s.ledger, s.events,
+            ));
         }
         None => {
-            tokio::spawn(crate::swap::drain_inbound_unconfigured(reg.swap));
+            tokio::spawn(crate::swap::drain_inbound_unconfigured(reg.swap, guard));
         }
     }
 }
@@ -224,9 +496,12 @@ pub struct SwapWiring {
     pub events: Option<mpsc::Sender<crate::swap::InboundCheque>>,
 }
 
-async fn run_pricing(mut incoming: IncomingStreams) {
-    while let Some((peer_id, stream)) = incoming.next().await {
-        tokio::spawn(async move {
+async fn run_pricing(incoming: IncomingStreams, guard: InboundGuard) {
+    serve_gated(
+        incoming,
+        guard,
+        PROTOCOL_PRICING,
+        |peer_id, stream| async move {
             let res = tokio::time::timeout(STREAM_TIMEOUT, drain_stream(stream, PRICING_MAX)).await;
             match res {
                 Ok(Ok(d)) => trace!(
@@ -241,14 +516,15 @@ async fn run_pricing(mut incoming: IncomingStreams) {
                     STREAM_TIMEOUT.as_secs(),
                 ),
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
-async fn run_hive(mut incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>) {
-    while let Some((peer_id, stream)) = incoming.next().await {
+async fn run_hive(incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>, guard: InboundGuard) {
+    serve_gated(incoming, guard, "hive", move |peer_id, stream| {
         let tx = hint_tx.clone();
-        tokio::spawn(async move {
+        async move {
             let res = tokio::time::timeout(STREAM_TIMEOUT, drain_stream(stream, HIVE_MAX)).await;
             match res {
                 Ok(Ok(d)) => {
@@ -282,8 +558,9 @@ async fn run_hive(mut incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>
                     STREAM_TIMEOUT.as_secs(),
                 ),
             }
-        });
-    }
+        }
+    })
+    .await;
 }
 
 /// Decode a hive `Peers` payload into `PeerHint`s. Entries without a
@@ -432,6 +709,58 @@ async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<
 mod tests {
     use super::*;
     use crate::underlay::serialize_underlays;
+
+    /// A pending peer that never completes its handshake is refused once
+    /// `HANDSHAKE_GATE_WAIT` runs out; one that completes, or is
+    /// forgotten, resolves at once.
+    #[tokio::test(start_paused = true)]
+    async fn gate_waits_for_pending_peers_then_gives_up() {
+        let gate = HandshakeGate::default();
+        let peer = PeerId::random();
+        assert!(
+            !gate.wait_ready(&peer, HANDSHAKE_GATE_WAIT).await,
+            "unknown"
+        );
+
+        gate.set(peer, Some(PeerPhase::Pending));
+        let started = tokio::time::Instant::now();
+        assert!(!gate.wait_ready(&peer, HANDSHAKE_GATE_WAIT).await);
+        assert_eq!(started.elapsed(), HANDSHAKE_GATE_WAIT);
+
+        for (outcome, ready) in [(Some(PeerPhase::Ready), true), (None, false)] {
+            gate.set(peer, Some(PeerPhase::Pending));
+            let g = gate.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                g.set(peer, outcome);
+            });
+            let started = tokio::time::Instant::now();
+            assert_eq!(gate.wait_ready(&peer, HANDSHAKE_GATE_WAIT).await, ready);
+            assert_eq!(started.elapsed(), Duration::from_millis(100));
+        }
+    }
+
+    /// Unknown peers are refused outright; one peer can't take more than
+    /// its share of task slots, and the global cap holds across peers.
+    /// A finished stream gives its slots back.
+    #[test]
+    fn guard_caps_tasks_per_peer_and_in_total() {
+        let gate = HandshakeGate::default();
+        let guard = InboundGuard::with_caps(gate.clone(), 3, 2);
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        assert_eq!(guard.admit(a).err(), Some(Refusal::NotHandshaked));
+        for p in [a, b, c] {
+            gate.set(p, Some(PeerPhase::Ready));
+        }
+        let a1 = guard.admit(a).unwrap();
+        let _a2 = guard.admit(a).unwrap();
+        assert_eq!(guard.admit(a).err(), Some(Refusal::PeerBusy));
+        let _b1 = guard.admit(b).unwrap();
+        assert_eq!(guard.admit(c).err(), Some(Refusal::Busy));
+        drop(a1);
+        let _c1 = guard.admit(c).unwrap();
+        assert_eq!(guard.admit(a).err(), Some(Refusal::Busy));
+    }
 
     /// A frame that declares more bytes than the peer sends fails with
     /// `UnexpectedEof` (the body buffer only grows with bytes received).

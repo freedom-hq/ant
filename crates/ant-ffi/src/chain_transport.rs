@@ -459,6 +459,7 @@ mod tests {
             memory_cache: std::sync::Arc::new(ant_retrieval::InMemoryChunkCache::new(8)),
             gateway_task: std::sync::Mutex::new(None),
             gateway_cors: std::sync::Mutex::new(Vec::new()),
+            gateway_allowed_hosts: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
             publisher: std::sync::Mutex::new(None),
             announcing: std::sync::atomic::AtomicBool::new(false),
@@ -954,8 +955,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let body = loop {
             if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .unwrap();
+                write!(
+                    s,
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
                 let mut out = String::new();
                 s.read_to_string(&mut out).unwrap();
                 break out;

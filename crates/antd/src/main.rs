@@ -46,8 +46,8 @@ struct Opt {
     /// override the built-in defaults. Recognised keys: `api-addr`,
     /// `data-dir`, `password` / `password-file`, `mainnet` /
     /// `network-id`, `blockchain-rpc-endpoint`, `cors-allowed-origins`,
-    /// `verbosity`, `swap-enable`, `cache-capacity`; other bee keys are
-    /// accepted and ignored.
+    /// `allowed-hosts`, `verbosity`, `swap-enable`, `cache-capacity`;
+    /// other bee keys are accepted and ignored.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -124,12 +124,33 @@ struct Opt {
     /// scheme, without port; `host` needs at least two labels, and any
     /// other entry containing `*` is rejected at startup. Empty
     /// (default) disables CORS, matching a bee node started without the
-    /// option. The xDAI-spending `POST /v0/storage/*` and
-    /// `POST /v0/settlement/deposit` refuse web pages except an origin
-    /// listed here exactly (`*`, `null` and wildcard entries don't unlock
-    /// them).
+    /// option. The list also gates writes (issue #312): a non-GET
+    /// request from a web page is refused (`403`) unless its origin is
+    /// in this list, and one from a page this API serves itself
+    /// (`Sec-Fetch-Site: same-origin`) unless its origin is listed
+    /// exactly. The wallet-spending routes (`POST /stamps/...`,
+    /// `PATCH /stamps/topup|dilute/...`, `POST /chequebook/deposit|withdraw`,
+    /// `POST /v0/storage/*`, `POST /v0/settlement/deposit`) and WebSocket
+    /// upgrades accept a web page only when its origin is listed here
+    /// exactly (`*`, `null` and wildcard entries don't unlock them).
+    /// `null` matches every sandboxed or redirected page on the web;
+    /// a startup warning says so.
     #[arg(long, value_delimiter = ',')]
     cors_allowed_origins: Vec<String>,
+
+    /// Extra `Host` names the HTTP API answers (ant extension, issue
+    /// #312), comma-separated: `host` (any port) or `host:port`
+    /// (`host:443`/`host:80` also match a bare `host`), e.g. the public
+    /// name a reverse proxy forwards. On a loopback
+    /// `--api-addr` only `localhost`, `127.0.0.1`, `[::1]`, subdomains of
+    /// `localhost` and the bound IP are answered without it (others get
+    /// `421`), which stops DNS-rebinding pages. `*` turns the check off.
+    /// On a non-loopback `--api-addr` with no entries the check is off
+    /// and a warning is logged. With entries on a wildcard `--api-addr`
+    /// (`0.0.0.0`, `[::]`) there is no single bound IP, so list any IP
+    /// literal clients use (`192.168.1.5`) as well.
+    #[arg(long, value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
 
     /// Externally reachable multiaddrs to advertise via libp2p-identify.
     /// Bee bootnodes stall our handshake by 10 s when their peerstore lacks a
@@ -450,6 +471,7 @@ async fn main() -> Result<()> {
     };
     let (resolved_password, ignored_config_keys) = apply_config_file(&mut opt, &matches)?;
     validate_cors_origins(&opt.cors_allowed_origins)?;
+    validate_allowed_hosts(&opt.allowed_hosts)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -855,6 +877,8 @@ async fn main() -> Result<()> {
             cors: Arc::new(ant_gateway::CorsConfig::new(
                 opt.cors_allowed_origins.iter(),
             )),
+            // `Gateway::serve` resolves it against the bound address.
+            hosts: Arc::new(ant_gateway::HostPolicy::new(opt.allowed_hosts.iter())),
             // ACT publisher identity = the node's swarm key, exactly
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
@@ -1473,6 +1497,16 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Reject a malformed `allowed-hosts` entry (CLI or config file) rather
+/// than letting [`ant_gateway::HostPolicy::new`] drop it, which would
+/// leave the name refused with no hint why.
+fn validate_allowed_hosts(hosts: &[String]) -> Result<()> {
+    for h in hosts {
+        ant_gateway::HostPolicy::check_entry(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
 /// Bee counts `cache-capacity` in chunks and sizes it at 4096 bytes
 /// each ("multiply by 4096 to get approximate capacity in bytes").
 const BEE_CACHE_CHUNK_BYTES: u64 = 4096;
@@ -1541,6 +1575,12 @@ fn apply_config_file(
             let origins = cfg.cors_origins_vec();
             if !origins.is_empty() {
                 opt.cors_allowed_origins = origins;
+            }
+        }
+        if !from_cli("allowed_hosts") {
+            let hosts = cfg.allowed_hosts_vec();
+            if !hosts.is_empty() {
+                opt.allowed_hosts = hosts;
             }
         }
         if !from_cli("log_level") {
@@ -4363,6 +4403,23 @@ mod tests {
             .await;
         assert_eq!(slot.get(), None);
         assert_eq!(slot.refused(), Some(CB));
+    }
+}
+
+#[cfg(test)]
+mod allowed_hosts_tests {
+    use super::validate_allowed_hosts;
+
+    #[test]
+    fn accepts_hosts_and_star_rejects_urls() {
+        let ok: Vec<String> = ["*", "vibing.at", "node.lan:1633", "[fd00::1]:1633", ""]
+            .map(String::from)
+            .to_vec();
+        assert!(validate_allowed_hosts(&ok).is_ok());
+        for bad in ["https://vibing.at", "vibing.at/ant", "*.vibing.at"] {
+            let err = validate_allowed_hosts(&[bad.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("allowed-hosts"), "{bad}: {err}");
+        }
     }
 }
 

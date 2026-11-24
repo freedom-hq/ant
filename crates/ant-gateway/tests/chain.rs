@@ -1160,7 +1160,8 @@ impl ChainWriter for FundingWriter {
             block: 48_500_001,
         })
     }
-    async fn topup_batch(&self, _id: [u8; 32], _amount: u128) -> Result<(), String> {
+    async fn topup_batch(&self, _id: [u8; 32], amount: u128) -> Result<(), String> {
+        self.record(format!("topup_batch({amount})"));
         Ok(())
     }
     async fn dilute_batch(&self, id: [u8; 32], depth: u8) -> Result<(), String> {
@@ -1924,6 +1925,71 @@ async fn status_with_headers(
         b = b.header(*k, *v);
     }
     send(router, b.body(Body::empty()).unwrap()).await.status()
+}
+
+/// The on-chain postage and chequebook writes refuse web pages the same
+/// way (issue #312): a no-cors `POST`/`PATCH` from a foreign page, a
+/// `null`-origin page or the API's own pages buys, tops up, dilutes or
+/// deposits nothing. A request with neither `Origin` nor
+/// `Sec-Fetch-Site` (curl, a host app) still goes through.
+#[tokio::test]
+async fn postage_and_chequebook_writes_refuse_web_pages() {
+    let id = "ab".repeat(32);
+    let writes: [(Method, String); 4] = [
+        (Method::POST, "/stamps/1/17".to_string()),
+        (Method::PATCH, format!("/stamps/topup/{id}/500")),
+        (Method::PATCH, format!("/stamps/dilute/{id}/22")),
+        (Method::POST, "/chequebook/deposit?amount=100".to_string()),
+    ];
+    let browser_headers: [&[(&str, &str)]; 5] = [
+        &[("origin", "https://evil")],
+        &[("sec-fetch-site", "cross-site")],
+        &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+        &[("origin", "https://anything.example")],
+        &[
+            ("origin", "http://127.0.0.1:1633"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    ];
+    for cors in [
+        CorsConfig::default(),
+        CorsConfig::new(["*", "null"]),
+        CorsConfig::new(["https://app.example"]),
+    ] {
+        let writer = Arc::new(FundingWriter::default());
+        let router = status_router_with_chain_hooks_and_cors(
+            snapshot_with_one_peer(),
+            funding_ctx_with_chequebook(writer.clone(), Some([0xCD; 20])),
+            None,
+            None,
+            cors.clone(),
+        );
+        for (method, uri) in &writes {
+            for h in browser_headers {
+                assert_eq!(
+                    status_with_headers(router.clone(), method.clone(), uri, h).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri} {h:?} {cors:?}",
+                );
+            }
+        }
+        assert_eq!(writer.calls(), Vec::<String>::new(), "{cors:?}");
+        // Without browser headers every one of them runs.
+        for (method, uri) in &writes {
+            let s = status_with_headers(router.clone(), method.clone(), uri, &[]).await;
+            assert!(s.is_success(), "{method} {uri}: {s}");
+        }
+        assert_eq!(
+            writer.calls(),
+            vec![
+                "buy_batch(1, 17, immutable=true)".to_string(),
+                "topup_batch(500)".to_string(),
+                "dilute_batch(ab, 22)".to_string(),
+                "deposit_chequebook(100)".to_string(),
+            ],
+            "{cors:?}"
+        );
+    }
 }
 
 /// The xDAI-spending routes are query-only, so a page could send them
