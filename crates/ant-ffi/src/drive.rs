@@ -3671,7 +3671,8 @@ struct SettlementDeposit {
     /// xDAI (wei) the top-up's swap for the missing xBZZ sends; `0` when
     /// the wallet holds it or nothing is missing. Pass it back as the
     /// top-up's `max_xdai_wei`: the swap is re-priced when it runs, and
-    /// one above this is refused without swapping (#305).
+    /// one above this is refused without swapping (#305), at most after a
+    /// fresh wallet's one-time swap helper deploy.
     swap_input: String,
     /// Total xDAI (wei + display) the account must hold to run the
     /// top-up: the swap input for the missing xBZZ plus a gas reserve.
@@ -3784,8 +3785,9 @@ struct Quote {
     needed_bzz_display: String,
     /// xDAI (wei) the swap for `needed_bzz` sends: the pool price plus a
     /// 5% buffer. Pass it back as the buy's `max_xdai_wei`: the swap is
-    /// re-priced when it runs, and one above this is refused with
-    /// nothing sent (#305).
+    /// re-priced when it runs, and one above this is refused without
+    /// swapping (#305), at most after a fresh wallet's one-time swap
+    /// helper deploy.
     swap_input: String,
     /// Total xDAI the account must hold to activate via auto-swap: the
     /// (buffered) swap input plus a gas reserve.

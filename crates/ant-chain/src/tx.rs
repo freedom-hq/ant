@@ -98,9 +98,6 @@ pub fn swap_helper_calldata(recipient: &[u8; 20], amount_out_min: &U256) -> Vec<
     data
 }
 
-/// Salt used for the helper's CREATE2 deployment. Zero — the init code
-/// already fully determines the address, and we only ever want one
-/// canonical instance.
 /// Whether a successful `swapXdaiForBzz` dry run really ran the swap:
 /// its `uint256 bzzOut` return word must be there and cover
 /// `amount_out_min`. Empty output is what an `eth_call` to an address
@@ -124,6 +121,9 @@ pub(crate) fn check_swap_dry_run(out: &[u8], amount_out_min: U256) -> Result<(),
     Ok(())
 }
 
+/// Salt used for the helper's CREATE2 deployment. Zero — the init code
+/// already fully determines the address, and we only ever want one
+/// canonical instance.
 const SWAP_HELPER_SALT: [u8; 32] = [0u8; 32];
 
 /// Decode a `0x`-prefixed 20-byte hex address constant. Panics on a

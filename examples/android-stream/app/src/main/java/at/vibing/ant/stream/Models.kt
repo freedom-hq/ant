@@ -106,8 +106,9 @@ data class SettlementDeposit(
     val sufficientFunds: Boolean,
     /**
      * xDAI (wei) the top-up's swap sends at this card's price: passed back
-     * as the top-up's cap, so a price that moved since is refused with
-     * nothing sent (#305).
+     * as the top-up's cap, so a price that moved since is refused without
+     * swapping (#305), at most after a fresh wallet's one-time swap helper
+     * deploy.
      */
     val swapInput: String = "0",
 ) {
@@ -219,8 +220,9 @@ data class StorageQuote(
     val sufficientFunds: Boolean,
     /**
      * xDAI (wei) the buy's swap sends at this quote's price: passed back as
-     * the buy's cap, so a price that moved since is refused with nothing
-     * sent (#305).
+     * the buy's cap, so a price that moved since is refused without
+     * swapping (#305), at most after a fresh wallet's one-time swap helper
+     * deploy.
      */
     val swapInput: String = "0",
 ) {
