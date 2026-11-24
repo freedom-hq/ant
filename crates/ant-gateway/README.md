@@ -55,9 +55,12 @@ land, and an HTTP client disconnect cancels the upstream retrieval task.
 - **GET, single Range** — streaming dispatch with a clamped interval
   mapped to the minimum set of Swarm subtrees required. Returns `206
   Partial Content` with an accurate `Content-Range`. Multi-range
-  (`Range: bytes=a-b,c-d`) is rejected with `416`.
+  (`Range: bytes=a-b,c-d`) gets a `206 multipart/byteranges` built from
+  the body collected in memory, but only for resources up to 32 MiB;
+  above that the Range header is ignored and the full body streams as
+  a `200`.
 
-`GATEWAY_MAX_FILE_BYTES` (1 GiB) caps the per-request total size so a
+`GATEWAY_MAX_FILE_BYTES` (16 GiB) caps the per-request total size so a
 malicious manifest claiming a multi-terabyte span is refused before any
 allocation. See PLAN.md Appendix E for the full design.
 

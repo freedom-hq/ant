@@ -3130,8 +3130,14 @@ pub unsafe extern "C" fn ant_storage_discover_full(
 /// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy —
 /// though one still short of its settlement deposit is topped up from
 /// spare xBZZ. Otherwise this signs an on-chain `factory.deploySimpleSwap`
-/// (issuer = node EOA), funds it with the settlement deposit for the
-/// account's storage plan so its cheques are actually backed, persists the association, and
+/// (issuer = node EOA), checks the new chequebook on-chain
+/// (factory-registered, `issuer()` is the node EOA; a check that says no
+/// fails the call with nothing persisted or funded; one that still can't
+/// be read after a few retries fails the call with the association
+/// persisted but unfunded, so the next call re-checks that chequebook
+/// instead of deploying another),
+/// persists the association, funds it with the settlement deposit for the
+/// account's storage plan so its cheques are actually backed, and
 /// returns the new address. These are on-chain transactions: they spend
 /// gas plus the deposit and **block** until confirmed. Light-mode
 /// (`chain`-feature) builds only.

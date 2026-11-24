@@ -21,11 +21,14 @@
 //!   `StreamRange`. The daemon's range-aware joiner walks only the
 //!   chunks that overlap the requested byte interval; the gateway emits
 //!   `206 Partial Content` with `Content-Range` and the slice length.
+//! - **GET, several Ranges**: `206 multipart/byteranges`, sliced from
+//!   the body collected in memory (the joiner produces one ordered byte
+//!   stream, not a seekable reader). Only resources up to
+//!   `MULTI_RANGE_MAX_BUFFER_BYTES` (32 MiB) get that; above it the
+//!   Range header is ignored and the full body streams as a `200`.
 //!
-//! Multi-range requests are still rejected with `416` — the joiner
-//! produces one ordered byte stream, multipart `byteranges` would
-//! demand framing logic the plan explicitly defers (PLAN.md E.20).
-//! Body payloads do not materialise in memory: `Body::from_stream`
+//! Other than that bounded multi-range case, body payloads do not
+//! materialise in memory: `Body::from_stream`
 //! pumps `BytesChunk` acks into hyper as they arrive.
 //!
 //! `GATEWAY_MAX_FILE_BYTES` keeps the joiner's per-request size cap
@@ -2221,7 +2224,23 @@ fn assemble_collection(
             continue;
         }
 
-        let mut buf = Vec::with_capacity(entry.header().size().unwrap_or(0) as usize);
+        // The entry's size (header field, or a pax `size` record) is
+        // untrusted: a base-256 size can claim up to 2^63 bytes in a
+        // 1.5 KiB archive, and pre-sizing from it aborts the process on
+        // the allocation. Bound it by the bytes actually left in the
+        // body, and reject an entry that claims more than that (the tar
+        // reader would otherwise hand back a silently truncated file).
+        let left = (body.len() as u64).saturating_sub(entry.raw_file_position());
+        let declared = entry.size();
+        if declared > left {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tar entry {path_str}: declared size {declared} exceeds the {left} bytes left in the archive"
+                ),
+            ));
+        }
+        let mut buf = Vec::with_capacity(declared as usize);
         if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut buf) {
             return Err(json_error(
                 StatusCode::BAD_REQUEST,
@@ -2322,7 +2341,7 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
         ManifestWriteError::SegmentTooLong { .. } | ManifestWriteError::EmptyPath => {
             json_error(StatusCode::BAD_REQUEST, e.to_string())
         }
-        ManifestWriteError::ManifestTooBig { .. } => {
+        ManifestWriteError::ManifestTooBig { .. } | ManifestWriteError::MetadataTooBig { .. } => {
             json_error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
         }
         // Internal invariant: the gateway always hands the builder
@@ -2682,7 +2701,7 @@ pub async fn bytes(
     let parsed = if head_only {
         GoRanges::Full
     } else {
-        parse_go_ranges(raw_range.as_deref(), total)
+        parse_go_ranges_streamed(raw_range.as_deref(), total)
     };
     let parsed_range = match parsed {
         GoRanges::Invalid => {
@@ -2710,7 +2729,9 @@ pub async fn bytes(
         GoRanges::Multi(ranges) => {
             // Multipart: collect the whole body from the already-live
             // full stream once, then slice each part like Go seeks
-            // the underlying reader.
+            // the underlying reader. `parse_go_ranges_streamed` only
+            // lets a resource of at most `MULTI_RANGE_MAX_BUFFER_BYTES`
+            // reach this arm; anything larger streams as a 200.
             let content_type = sniff_content_type(&started.first_bytes, query.filename());
             let full = match started.collect_body().await {
                 Ok(b) => b,
@@ -3161,7 +3182,7 @@ async fn bzz_inner(
     let parsed = if head_only {
         GoRanges::Full
     } else {
-        parse_go_ranges(raw_range.as_deref(), total)
+        parse_go_ranges_streamed(raw_range.as_deref(), total)
     };
 
     let content_type = started
@@ -4080,13 +4101,23 @@ fn parse_owner_pair(
     }
 }
 
+/// The client's `Swarm-Chunk-Retrieval-Timeout`, or `default`, capped
+/// at [`MAX_REQUEST_TIMEOUT`] so callers can add it to an `Instant`.
 pub(crate) fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
     headers
         .get(&SWARM_CHUNK_RETRIEVAL_TIMEOUT)
         .and_then(|v| v.to_str().ok())
         .and_then(humantime::parse_duration_lite)
         .unwrap_or(default)
+        .min(MAX_REQUEST_TIMEOUT)
 }
+
+/// Ceiling on any client-supplied `Swarm-Chunk-Retrieval-Timeout`.
+/// Handlers add the timeout to an `Instant` to get a deadline, and an
+/// unchecked `Instant + Duration` with a value like `u64::MAX` seconds
+/// overflows and panics (an abort in release builds). An hour is far
+/// past any single request the gateway serves.
+pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Parse-and-ignore bee's download-side redundancy headers (see the
 /// constants' doc comment for why they are no-ops here). Any value —
@@ -4434,7 +4465,9 @@ fn content_type_from_extension(filename: &str) -> Option<&'static str> {
 /// * only past-the-end ranges → **416** with `Content-Range:
 ///   bytes */{total}` and the body `invalid range: failed to overlap`;
 /// * exactly one satisfiable range → **206** with `Content-Range`;
-/// * several satisfiable ranges → **206** `multipart/byteranges`.
+/// * several satisfiable ranges → **206** `multipart/byteranges`
+///   (streamed handlers call [`parse_go_ranges_streamed`], which turns
+///   this into a full 200 above `MULTI_RANGE_MAX_BUFFER_BYTES`).
 #[derive(Debug, PartialEq, Eq)]
 enum GoRanges {
     Full,
@@ -4447,6 +4480,24 @@ enum GoRanges {
     Multi(Vec<(u64, u64)>),
     NoOverlap,
     Invalid,
+}
+
+/// Largest resource a multi-range request is answered for with a
+/// `multipart/byteranges` 206. That answer is built from the whole body
+/// collected in memory, so above this size the Range header is ignored
+/// and the full body streams as a plain 200 instead (RFC 9110 §14.2
+/// lets a server ignore Range). Without the cap one request could pin
+/// up to [`GATEWAY_MAX_FILE_BYTES`] (16 GiB) in RAM.
+const MULTI_RANGE_MAX_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// [`parse_go_ranges`] for a streamed resource: a multi-range set on a
+/// resource larger than [`MULTI_RANGE_MAX_BUFFER_BYTES`] degrades to
+/// [`GoRanges::Full`] so the caller streams instead of buffering.
+fn parse_go_ranges_streamed(raw: Option<&str>, total: u64) -> GoRanges {
+    match parse_go_ranges(raw, total) {
+        GoRanges::Multi(_) if total > MULTI_RANGE_MAX_BUFFER_BYTES => GoRanges::Full,
+        parsed => parsed,
+    }
 }
 
 /// Go `textproto.TrimString`: strip leading/trailing spaces and tabs.
@@ -5090,7 +5141,7 @@ pub async fn download_feed(
     let parsed = if head_only {
         GoRanges::Full
     } else {
-        parse_go_ranges(raw_range.as_deref(), total)
+        parse_go_ranges_streamed(raw_range.as_deref(), total)
     };
     let parsed_range = match parsed {
         GoRanges::Invalid => {
@@ -5289,7 +5340,10 @@ fn only_root_chunk_header(headers: &HeaderMap) -> Result<bool, Response> {
 
 /// Tiny `humantime`-shaped duration parser so we don't pull in a whole
 /// crate for one optional header. Accepts plain integers (interpreted
-/// as seconds, matching bee) and `<n>ms`, `<n>s`, `<n>m` suffixes.
+/// as seconds, matching bee) and `<n>ms`, `<n>s`, `<n>m`, `<n>h`
+/// suffixes. Every result is clamped to [`super::MAX_REQUEST_TIMEOUT`];
+/// a value too large to represent (`99999999999999999h`) maps to the
+/// clamp instead of wrapping.
 mod humantime {
     use std::time::Duration;
 
@@ -5298,13 +5352,19 @@ mod humantime {
         if s.is_empty() {
             return None;
         }
+        let clamp = |ms: Option<u64>| {
+            Some(
+                ms.map_or(super::MAX_REQUEST_TIMEOUT, Duration::from_millis)
+                    .min(super::MAX_REQUEST_TIMEOUT),
+            )
+        };
         if let Ok(secs) = s.parse::<u64>() {
-            return Some(Duration::from_secs(secs));
+            return clamp(secs.checked_mul(1_000));
         }
         for (suffix, factor_ms) in [("ms", 1u64), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)] {
             if let Some(num) = s.strip_suffix(suffix) {
                 if let Ok(n) = num.trim().parse::<u64>() {
-                    return Some(Duration::from_millis(n * factor_ms));
+                    return clamp(n.checked_mul(factor_ms));
                 }
             }
         }
@@ -5438,6 +5498,69 @@ mod tests {
         assert_eq!(
             humantime::parse_duration_lite("250ms"),
             Some(Duration::from_millis(250))
+        );
+    }
+
+    /// A timeout too large to represent maps to the clamp instead of
+    /// wrapping (`n * factor_ms` used to overflow silently) or
+    /// overflowing a later `Instant + Duration` deadline.
+    #[test]
+    fn huge_timeouts_clamp_instead_of_overflowing() {
+        for raw in [
+            "99999999999999999h",
+            "18446744073709551615",
+            "18446744073709551615ms",
+            "18446744073709551615m",
+            "2h",
+            "3601s",
+        ] {
+            assert_eq!(
+                humantime::parse_duration_lite(raw),
+                Some(MAX_REQUEST_TIMEOUT),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            humantime::parse_duration_lite("1h"),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            humantime::parse_duration_lite("90s"),
+            Some(Duration::from_secs(90))
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SWARM_CHUNK_RETRIEVAL_TIMEOUT.clone(),
+            HeaderValue::from_static("18446744073709551615"),
+        );
+        let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+        assert_eq!(timeout, MAX_REQUEST_TIMEOUT);
+        // The deadline arithmetic the handlers do must not panic.
+        let _ = tokio::time::Instant::now() + timeout;
+    }
+
+    /// A multi-range set on a resource too big to buffer degrades to a
+    /// full 200; small resources still get `multipart/byteranges`.
+    #[test]
+    fn multi_range_on_a_large_resource_streams_in_full() {
+        let raw = Some("bytes=0-99,200-299");
+        assert_eq!(
+            parse_go_ranges_streamed(raw, MULTI_RANGE_MAX_BUFFER_BYTES + 1),
+            GoRanges::Full
+        );
+        assert_eq!(
+            parse_go_ranges_streamed(raw, MULTI_RANGE_MAX_BUFFER_BYTES),
+            GoRanges::Multi(vec![(0, 100), (200, 100)])
+        );
+        // Single ranges on a large resource are untouched: they stream
+        // a ranged join, never a buffer.
+        assert_eq!(
+            parse_go_ranges_streamed(Some("bytes=0-99"), u64::MAX / 2),
+            GoRanges::Single {
+                start: 0,
+                length: 100
+            }
         );
     }
 }

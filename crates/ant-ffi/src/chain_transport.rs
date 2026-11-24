@@ -203,6 +203,14 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// fallback URL's error instead of the real one. Map any non-coverage
 /// failure to a different code, or answer authoritatively.
 ///
+/// **Transactions:** `eth_sendRawTransaction` must answer the hash of
+/// the transaction it was given (keccak256 of the raw bytes), and an
+/// `eth_getTransactionReceipt` result must carry that hash as
+/// `transactionHash`. ant waits on the hash it computed itself (a
+/// different `eth_sendRawTransaction` answer is logged and ignored) and
+/// fails the write on a receipt naming another hash or none, so a relay
+/// can't pass off another transaction's receipt (issue #284).
+///
 /// Pass `NULL` for `transport` to clear a previously-installed one.
 /// `host_ctx` is opaque and simply handed back on every call.
 ///

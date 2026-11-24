@@ -732,7 +732,8 @@ pub async fn buy_batch(
             what: "buy storage",
             source,
         })?;
-    let id = crate::tx::extract_created_batch_id(&receipt).ok_or(FundingError::NoBatchInReceipt)?;
+    let id = crate::tx::extract_created_batch_id(&receipt, &payer.postage)
+        .ok_or(FundingError::NoBatchInReceipt)?;
     Ok(NewBatch {
         id,
         block: receipt.block_number,
@@ -1183,11 +1184,11 @@ mod tests {
                     } else {
                         "createBatch"
                     };
-                    let mut sent = self.sent.lock().unwrap();
-                    sent.push(kind);
-                    json!(format!("0x{:064x}", sent.len()))
+                    self.sent.lock().unwrap().push(kind);
+                    json!(format!("0x{}", hex::encode(ant_crypto::keccak256(&raw))))
                 }
                 "eth_getTransactionReceipt" => json!({
+                    "transactionHash": req["params"][0],
                     "status": "0x1",
                     "blockNumber": "0x1",
                     "logs": [{

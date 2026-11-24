@@ -505,6 +505,38 @@ mod tests {
         assert_eq!(hints[0].addrs, vec![a4, a6]);
     }
 
+    /// #279: hostile underlays in hive gossip (an overflowing list
+    /// length, a bare list prefix) drop that one peer, not the process
+    /// and not the rest of the batch.
+    #[test]
+    fn skips_peers_with_hostile_underlay_lists() {
+        let good: Multiaddr =
+            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
+                .parse()
+                .unwrap();
+        let mut overflow = vec![0x99];
+        overflow.extend_from_slice(&[0xff; 9]);
+        overflow.push(0x01);
+        let peer = |underlay: Vec<u8>| BzzAddressPb {
+            underlay,
+            overlay: vec![0u8; 32],
+            ..Default::default()
+        };
+        let msg = PeersPb {
+            peers: vec![
+                peer(overflow),
+                peer(vec![0x99]),
+                peer(serialize_underlays(std::slice::from_ref(&good))),
+            ],
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+
+        let hints = decode_hive_peers(&buf);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].addrs, vec![good]);
+    }
+
     #[test]
     fn decodes_bee_2_8_payload_with_new_tags() {
         // A bee-2.8 hive Peers payload carries Timestamp (tag 5) and
