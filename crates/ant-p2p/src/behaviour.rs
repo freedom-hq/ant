@@ -1484,7 +1484,8 @@ impl SwarmState {
         // Drop the underlays that only mean something inside the peer's
         // own network (Docker/Kubernetes pod IPs, RFC1918, loopback, …),
         // and DNS-named ones (a peer-chosen name can resolve to any of
-        // those, or to the cloud metadata address; #301), before the hint can reach any dial path — `fill_pipeline_from_hints`,
+        // those, or to the cloud metadata address; #301), before the hint
+        // can reach any dial path — `fill_pipeline_from_hints`,
         // `dial_toward_target` and bin balancing all dial `hint.addrs`
         // (each re-filters against the current networks right before
         // dialing, see `addrs_for_dial`). A peer with nothing dialable left

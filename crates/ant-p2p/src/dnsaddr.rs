@@ -47,6 +47,8 @@ pub fn is_dnsaddr(addr: &Multiaddr) -> bool {
 ///   so identical sub-trees aren't re-walked and CNAME-style cycles terminate.
 /// - Each top-level entry may cost at most [`MAX_DNS_QUERIES`] TXT lookups;
 ///   past that its tree is cut short and the leaves found so far are kept.
+///   Names whose sub-trees were cut short are un-marked from `seen`, so a
+///   later entry sharing them finishes the walk with its own budget.
 /// - On lookup failure the original `/dnsaddr/…` is kept as a fallback, so the
 ///   libp2p-dns transport still has a chance to resolve it later.
 pub async fn resolve_all<I>(addrs: I) -> Vec<Multiaddr>
@@ -97,8 +99,16 @@ where
         let mut budget = Budget {
             left: MAX_DNS_QUERIES,
             skipped: false,
+            cut_short: Vec::new(),
         };
         let res = resolve_recursive(resolver, &addr, &mut seen, 0, &mut budget).await;
+        // A name whose children this entry's budget cut off was only
+        // partly walked: un-mark it so a later entry referencing it walks
+        // it again with its own budget. Children it did finish stay seen,
+        // so the re-walk only spends queries on the part that was skipped.
+        for name in &budget.cut_short {
+            seen.remove(name);
+        }
         if budget.skipped {
             warn!(
                 target: "ant_p2p::dnsaddr",
@@ -136,11 +146,13 @@ fn extract_domain(addr: &Multiaddr) -> Option<String> {
     })
 }
 
-/// TXT queries one top-level entry may still send, and whether any name
-/// was skipped for lack of them.
+/// TXT queries one top-level entry may still send, whether any name was
+/// skipped for lack of them, and the names queried whose sub-trees that
+/// skip cut short.
 struct Budget {
     left: usize,
     skipped: bool,
+    cut_short: Vec<String>,
 }
 
 /// Walk one `/dnsaddr/` tree. `budget.left` is the number of TXT queries
@@ -200,6 +212,12 @@ fn resolve_recursive<'a, L: TxtLookup>(
                     warn!(target: "ant_p2p::dnsaddr", %value, "bad multiaddr in TXT: {e}");
                 }
             }
+        }
+        // `skipped` can't already have been set when this name was
+        // queried (`left` was > 0 and never grows back), so if it is set
+        // now, the skip happened inside this name's own sub-tree.
+        if budget.skipped {
+            budget.cut_short.push(key);
         }
         Ok(out)
     })
@@ -362,6 +380,37 @@ mod tests {
         let out = resolve_all_with(&zone, ["/dnsaddr/ok.example".parse().unwrap()]).await;
         assert_eq!(out.len(), 5);
         assert_eq!(zone.queries.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    /// A sub-tree shared by two top-level entries, cut short by the first
+    /// entry's budget, is finished by the second with its own budget rather
+    /// than hitting `seen` and returning nothing.
+    #[tokio::test]
+    async fn shared_subtree_cut_short_is_finished_by_later_entry() {
+        // a.example → shared.example → 40 sub-domains, one leaf each.
+        let mut zone = wide_zone("shared.example", 40);
+        zone.records.insert(
+            "_dnsaddr.a.example".into(),
+            vec!["dnsaddr=/dnsaddr/shared.example".into()],
+        );
+        let out = resolve_all_with(
+            &zone,
+            [
+                "/dnsaddr/a.example".parse().unwrap(),
+                "/dnsaddr/shared.example".parse().unwrap(),
+            ],
+        )
+        .await;
+        // First entry: a + shared + 30 leaves' sub-domains = 32. Second:
+        // shared again + the 10 sub-domains the first entry skipped.
+        assert_eq!(
+            zone.queries.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_DNS_QUERIES + 11
+        );
+        let unique: HashSet<_> = out.iter().collect();
+        assert_eq!(out.len(), 40);
+        assert_eq!(unique.len(), 40);
+        assert!(out.iter().all(|a| !is_dnsaddr(a)));
     }
 
     #[tokio::test]
