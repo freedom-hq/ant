@@ -330,6 +330,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "hex",
+ "libc",
  "memmap2",
  "percent-encoding",
  "primitive-types",

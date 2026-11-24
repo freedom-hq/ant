@@ -15,7 +15,9 @@
    3. `cargo clippy -p ant-ffi --features jni --all-targets -- -D warnings`
    4. `cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings`
    5. `cargo test --workspace --lib`
-   6. `cargo test -p ant-ffi --features chain --lib`
+   6. `cargo test --workspace --bins` (the `antctl`/`antd`/`antop`
+      unit tests live in their `src/main.rs`, which `--lib` skips)
+   7. `cargo test -p ant-ffi --features chain --lib`
  Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
  (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
  off by default, so the whole-workspace step 2 never compiles them — they
