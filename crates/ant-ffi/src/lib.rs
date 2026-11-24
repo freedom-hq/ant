@@ -2716,7 +2716,8 @@ fn parse_deposit_amount(call: &str, amount: &str) -> Result<u128, String> {
 /// is re-priced from the pool when it runs and never sends more than the cap:
 /// a small upward move the quote's swap buffer absorbs still goes
 /// through, a larger one (or a forged pool read, or more xBZZ to buy)
-/// is refused with nothing sent (#305); get a new quote and try again.
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
 /// `"0"` forbids a swap: only xBZZ the wallet already holds is deposited.
 ///
 /// # Safety
@@ -2772,7 +2773,8 @@ pub unsafe extern "C" fn ant_storage_settlement_topup(
 /// is re-priced from the pool when it runs and never sends more than the cap:
 /// a small upward move the quote's swap buffer absorbs still goes
 /// through, a larger one (or a forged pool read, or more xBZZ to buy)
-/// is refused with nothing sent (#305); get a new quote and try again.
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
 /// `"0"` forbids a swap: the call then only deposits xBZZ the wallet
 /// already holds (the apps' "add credit", which checked that first).
 ///
@@ -3400,7 +3402,8 @@ pub unsafe extern "C" fn ant_storage_topup_quote(
 /// is re-priced from the pool when it runs and never sends more than the cap:
 /// a small upward move the quote's swap buffer absorbs still goes
 /// through, a larger one (or a forged pool read, or more xBZZ to buy)
-/// is refused with nothing sent (#305); get a new quote and try again.
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
 ///
 /// # Safety
 ///
@@ -3491,7 +3494,8 @@ pub unsafe extern "C" fn ant_storage_buy(
 /// is re-priced from the pool when it runs and never sends more than the cap:
 /// a small upward move the quote's swap buffer absorbs still goes
 /// through, a larger one (or a forged pool read, or more xBZZ to buy)
-/// is refused with nothing sent (#305); get a new quote and try again.
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
 ///
 /// # Safety
 ///

@@ -101,6 +101,29 @@ pub fn swap_helper_calldata(recipient: &[u8; 20], amount_out_min: &U256) -> Vec<
 /// Salt used for the helper's CREATE2 deployment. Zero — the init code
 /// already fully determines the address, and we only ever want one
 /// canonical instance.
+/// Whether a successful `swapXdaiForBzz` dry run really ran the swap:
+/// its `uint256 bzzOut` return word must be there and cover
+/// `amount_out_min`. Empty output is what an `eth_call` to an address
+/// with no code returns (a lagging RPC backend that doesn't see the
+/// helper yet), not a passed check.
+#[cfg(feature = "chain-rpc")]
+pub(crate) fn check_swap_dry_run(out: &[u8], amount_out_min: U256) -> Result<(), crate::RpcError> {
+    let Some(word) = out.get(..32) else {
+        return Err(crate::RpcError::Decode(format!(
+            "the swap dry run returned {} bytes, not the xBZZ it buys (is the swap helper \
+             deployed on this RPC yet?)",
+            out.len()
+        )));
+    };
+    let bzz_out = U256::from_big_endian(word);
+    if bzz_out < amount_out_min {
+        return Err(crate::RpcError::Decode(format!(
+            "the swap dry run buys {bzz_out} PLUR of xBZZ, less than the {amount_out_min} needed"
+        )));
+    }
+    Ok(())
+}
+
 const SWAP_HELPER_SALT: [u8; 32] = [0u8; 32];
 
 /// Decode a `0x`-prefixed 20-byte hex address constant. Panics on a
@@ -924,13 +947,19 @@ impl Wallet {
     /// CREATE2-derived) address. If no bytecode is present yet, deploy it
     /// once through the deterministic deployer — a one-time cost the first
     /// xDAI-funder pays; everyone afterwards reuses the same instance.
-    pub async fn ensure_swap_helper(&self, client: &ChainClient) -> Result<[u8; 20], TxError> {
+    /// The `bool` is whether this call sent that deploy, so a caller
+    /// refusing the swap afterwards can say so instead of claiming
+    /// nothing was sent.
+    pub async fn ensure_swap_helper(
+        &self,
+        client: &ChainClient,
+    ) -> Result<([u8; 20], bool), TxError> {
         let helper = swap_helper_address();
         let code = client
             .eth_get_code(&format!("0x{}", hex::encode(helper)))
             .await?;
         if !code.is_empty() {
-            return Ok(helper);
+            return Ok((helper, false));
         }
         let deployer = decode_addr_const(crate::CREATE2_DEPLOYER);
         self.send_signed(
@@ -940,7 +969,7 @@ impl Wallet {
             SWAP_HELPER_DEPLOY_GAS,
         )
         .await?;
-        Ok(helper)
+        Ok((helper, true))
     }
 
     /// Swap `value` wei of native xDAI into xBZZ via the helper,
@@ -963,6 +992,13 @@ impl Wallet {
     /// value, calldata and gas limit) without sending anything. `Ok`
     /// when the swap would go through at the latest block; a would-be
     /// revert (`amountOutMin` not met) is an [`crate::RpcError::Rpc`].
+    ///
+    /// `Ok` also needs the call's `bzzOut` return word, at least
+    /// `amount_out_min`. An `eth_call` to an address with no code
+    /// succeeds with empty output, so a load-balanced RPC whose backend
+    /// doesn't see the just-deployed helper yet would otherwise pass a
+    /// swap it never ran. A missing or short answer is an
+    /// [`crate::RpcError::Decode`]: the check couldn't be made.
     pub async fn simulate_swap_xdai_for_bzz(
         &self,
         client: &ChainClient,
@@ -972,10 +1008,10 @@ impl Wallet {
         amount_out_min: U256,
     ) -> Result<(), crate::RpcError> {
         let data = swap_helper_calldata(recipient, &amount_out_min);
-        client
+        let out = client
             .eth_call_value(&self.address, helper, &data, value, SWAP_HELPER_SWAP_GAS)
-            .await
-            .map(drop)
+            .await?;
+        check_swap_dry_run(&out, amount_out_min)
     }
 }
 

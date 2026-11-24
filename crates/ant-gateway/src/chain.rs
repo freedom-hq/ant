@@ -167,8 +167,9 @@ pub trait ChainWriter: Send + Sync {
     }
     /// Buy a plan, swapping xDAI for the xBZZ it and the deposit need,
     /// at most `max_xdai_wei` of it (the quote's `swapInputWei`; a swap
-    /// the cap no longer covers is refused before anything is sent). Returns the
-    /// new batch id; the route registers it.
+    /// the cap no longer covers is refused without swapping; at most the
+    /// one-time swap helper setup has gone out, and the error says so).
+    /// Returns the new batch id; the route registers it.
     async fn buy_with_xdai(
         &self,
         _depth: u8,
@@ -1645,7 +1646,8 @@ pub async fn storage_quote(
 /// so does the required `maxXdaiWei`: its `swapInputWei`, the most xDAI
 /// the swap may send. The swap is re-priced when it runs; one priced
 /// above `maxXdaiWei` (the pool moved, or its read was forged) is a `400`
-/// with nothing sent (#305).
+/// without the swap sent (#305; at most the one-time swap helper setup
+/// has gone out, and the message says so).
 pub async fn storage_buy(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1788,8 +1790,9 @@ pub async fn settlement_deposit(
 /// `swapInputWei` of the `GET /v0/settlement/deposit` (with the same
 /// `amount`) the user approved, or `0` to forbid a swap and deposit only
 /// xBZZ the wallet already holds. A swap the cap no longer covers (a price
-/// move past what the quote's swap buffer absorbs) is a `400` with
-/// nothing sent (#305).
+/// move past what the quote's swap buffer absorbs) is a `400` without
+/// the swap sent (#305; at most the one-time swap helper setup has gone
+/// out, and the message says so).
 ///
 /// The deposit and balances are read under the [`WalletTxLock`], so a
 /// background top-up that just landed isn't paid twice. Nothing is

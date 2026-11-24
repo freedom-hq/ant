@@ -741,6 +741,7 @@ mod tests {
         let e = FundingError::PriceMoved {
             input_wei: 2 * ant_chain::funding::WEI_PER_XDAI,
             max_wei: ant_chain::funding::WEI_PER_XDAI / 10,
+            helper_deployed: false,
         };
         match failure(e) {
             FundingFailure::Rejected(m) => {

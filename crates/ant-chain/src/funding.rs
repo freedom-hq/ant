@@ -18,7 +18,9 @@
 //! refused with [`FundingError::PriceMoved`] before anything is sent
 //! (audit MY-03, #305). A small upward tick that the quote's swap buffer
 //! still absorbs goes through, sending at most the cap
-//! ([`capped_swap_value`]).
+//! ([`capped_swap_value`]), once a dry run of it passes; a dry run that
+//! reverts is refused the same way, after the one-time helper deploy
+//! may have gone out (the refusal then says so).
 //!
 //! One orchestration, two sequencers (AGENTS.md): `ant-ffi`'s C API
 //! (`ant_storage_quote`, `ant_storage_buy_xdai`, …) and the gateway's
@@ -188,10 +190,15 @@ pub enum FundingError {
     /// was forged, or the call has more xBZZ to buy than when it was
     /// quoted (the wallet's xBZZ was spent, or the deposit due grew), or
     /// a dry run of the capped swap reverted (the cap doesn't cover the
-    /// pool fee plus price impact). Nothing was sent, apart from possibly
-    /// the one-time swap helper deploy in that last case.
-    #[error("{}", price_moved_message(*input_wei, *max_wei))]
-    PriceMoved { input_wei: u128, max_wei: u128 },
+    /// pool fee plus price impact). Nothing was sent, apart from the
+    /// one-time swap helper deploy in that last case when
+    /// `helper_deployed` (later swaps reuse it).
+    #[error("{}", price_moved_message(*input_wei, *max_wei, *helper_deployed))]
+    PriceMoved {
+        input_wei: u128,
+        max_wei: u128,
+        helper_deployed: bool,
+    },
     /// The wallet holds less xDAI than the swap plus the gas reserve.
     #[error(
         "not enough xDAI: send {} more xDAI to your account, then try again",
@@ -227,7 +234,7 @@ pub enum FundingError {
 /// [`FundingError::PriceMoved`] for the user. The figures carry 8
 /// decimals, so a small move doesn't read as "needs 0.0035, more than
 /// the 0.0035 you approved".
-fn price_moved_message(input_wei: u128, max_wei: u128) -> String {
+fn price_moved_message(input_wei: u128, max_wei: u128, helper_deployed: bool) -> String {
     let xdai = |wei: u128| {
         let step = WEI_PER_XDAI / 100_000_000;
         let steps = wei.div_ceil(step);
@@ -238,12 +245,17 @@ fn price_moved_message(input_wei: u128, max_wei: u128) -> String {
     } else {
         format!("more than the {} xDAI you approved", xdai(max_wei))
     };
+    let sent = if helper_deployed {
+        "only the one-time swap helper setup was sent (later swaps reuse it)"
+    } else {
+        "nothing was sent"
+    };
     // `acquire_bzz` only sees the cap, not the quote's xBZZ amount, so
     // it can't tell a price move from more xBZZ to buy: name both.
     format!(
         "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is \
-         more xBZZ to buy): the swap now needs {} xDAI, {approved}; nothing was sent, get a new \
-         quote and try again",
+         more xBZZ to buy): the swap now needs {} xDAI, {approved}; {sent}, get a new quote and \
+         try again",
         xdai(input_wei)
     )
 }
@@ -597,7 +609,10 @@ async fn deposit_due(payer: &Payer<'_>, policy: DepositPolicy) -> u128 {
 /// [`GAS_RESERVE_WEI`] for the transactions that follow. A swap sending
 /// the cap is dry-run first (`eth_call`) and refused the same way if it
 /// would revert; by then the one-time helper deploy may have gone out,
-/// which later swaps reuse.
+/// which later swaps reuse, and the refusal says so
+/// (`helper_deployed`). A dry run that passes without the swap's
+/// `bzzOut` answer (a lagging RPC backend that doesn't see the helper
+/// yet) fails the call as a read, sending nothing more.
 async fn acquire_bzz(
     payer: &Payer<'_>,
     bzz_plur: u128,
@@ -619,6 +634,7 @@ async fn acquire_bzz(
         return Err(FundingError::PriceMoved {
             input_wei: buffered(fair),
             max_wei: max_xdai_wei,
+            helper_deployed: false,
         });
     };
     let required = input.saturating_add(GAS_RESERVE_WEI);
@@ -627,7 +643,7 @@ async fn acquire_bzz(
             short_wei: required - xdai,
         });
     }
-    let helper = payer
+    let (helper, helper_deployed) = payer
         .wallet
         .ensure_swap_helper(payer.client)
         .await
@@ -641,7 +657,9 @@ async fn acquire_bzz(
         // price impact can eat. Dry-run it so a swap that would miss
         // `amountOutMin` is refused here rather than reverting on chain
         // and burning its gas. A failed dry run that isn't a revert
-        // fails the call too: nothing is sent on a check we couldn't make.
+        // fails the call too (an empty answer included, see
+        // `simulate_swap_xdai_for_bzz`): the swap isn't sent on a check
+        // we couldn't make.
         if let Err(e) = payer
             .wallet
             .simulate_swap_xdai_for_bzz(
@@ -657,6 +675,7 @@ async fn acquire_bzz(
                 crate::RpcError::Rpc(msg) if is_revert(&msg) => FundingError::PriceMoved {
                     input_wei: buffered(fair),
                     max_wei: max_xdai_wei,
+                    helper_deployed,
                 },
                 e => FundingError::Read {
                     what: "check the capped swap",
@@ -782,8 +801,8 @@ fn resize_delta(depth: u8, new_depth: u8) -> Result<u8, FundingError> {
 /// Recomputes the shortfall from current balances, so a retry after a
 /// partial failure only swaps what is still missing. The swap sends at
 /// most `max_xdai_wei` (the quote's `swap_input_wei`); a swap the cap no
-/// longer covers is refused before anything is sent
-/// ([`FundingError::PriceMoved`]).
+/// longer covers is refused without swapping, at most after the one-time
+/// helper deploy ([`FundingError::PriceMoved`]).
 pub async fn buy_plan_with_xdai(
     payer: &Payer<'_>,
     policy: DepositPolicy,
@@ -1013,8 +1032,8 @@ async fn status_for(
 /// The swap sends at most `max_xdai_wei`: the `swap_input_wei` of the
 /// [`deposit_status`] the user approved (priced with the same `add`),
 /// or `0` when the wallet already holds the xBZZ and no swap may happen.
-/// A swap the cap no longer covers is refused before anything is sent
-/// ([`FundingError::PriceMoved`]).
+/// A swap the cap no longer covers is refused without swapping, at most
+/// after the one-time helper deploy ([`FundingError::PriceMoved`]).
 ///
 /// Nothing is spent on a chequebook the chain rejects: before a swap
 /// the chequebook's checks (factory registration, `issuer()` is the
@@ -1222,6 +1241,7 @@ mod tests {
         let m = FundingError::PriceMoved {
             input_wei: 3_500_000_000_000_001,
             max_wei: 3_500_000_000_000_000,
+            helper_deployed: false,
         }
         .to_string();
         assert!(
@@ -1234,6 +1254,7 @@ mod tests {
         let m = FundingError::PriceMoved {
             input_wei: WEI_PER_XDAI,
             max_wei: 0,
+            helper_deployed: false,
         }
         .to_string();
         assert!(
@@ -1287,6 +1308,9 @@ mod tests {
         swap_reverts: bool,
         /// A dry run of the swap fails without reverting (rate limit).
         swap_dry_run_fails: bool,
+        /// The swap dry run succeeds with empty output (a lagging RPC
+        /// backend that doesn't see the helper's code yet).
+        swap_dry_run_empty: bool,
         /// The xDAI (wei) each swap dry run carried.
         dry_run_values: std::sync::Mutex<Vec<u128>>,
     }
@@ -1349,8 +1373,15 @@ mod tests {
                     json!({"code": 3, "message": "execution reverted: Too little received"})
                 } else if self.swap_dry_run_fails {
                     json!({"code": -32005, "message": "rate limit exceeded"})
-                } else {
+                } else if self.swap_dry_run_empty {
+                    // What a backend that doesn't see the helper's code
+                    // answers.
                     return Some(json!({"jsonrpc": "2.0", "id": id, "result": "0x"}).to_string());
+                } else {
+                    // `bzzOut`: exactly the `amountOutMin` asked for.
+                    let data = call["data"].as_str().unwrap();
+                    let out = format!("0x{}", &data[2 + 8 + 64..]);
+                    return Some(json!({"jsonrpc": "2.0", "id": id, "result": out}).to_string());
                 };
                 return Some(json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string());
             }
@@ -1966,7 +1997,12 @@ mod tests {
             let quoted = quoted_swap_input(call).await;
             let (result, sent) = pay_capped(payable(HONEST_SQRT_PRICE * 10), call, quoted).await;
             match result {
-                Err(FundingError::PriceMoved { input_wei, max_wei }) => {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
                     assert_eq!(max_wei, quoted, "{call}");
                     assert!(input_wei > 50 * quoted, "{call}: {input_wei} vs {quoted}");
                 }
@@ -2023,7 +2059,12 @@ mod tests {
             let (result, sent) =
                 pay_capped(payable(HONEST_SQRT_PRICE / 100 * 103), call, quoted).await;
             match result {
-                Err(FundingError::PriceMoved { input_wei, max_wei }) => {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
                     assert_eq!(max_wei, quoted, "{call}");
                     assert!(input_wei > quoted, "{call}");
                 }
@@ -2050,7 +2091,12 @@ mod tests {
                 ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
             });
             match pay_capped_on(&chain, call, quoted).await {
-                Err(FundingError::PriceMoved { input_wei, max_wei }) => {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
                     assert_eq!(max_wei, quoted, "{call}");
                     assert!(input_wei > quoted, "{call}");
                 }
@@ -2099,6 +2145,55 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{call}: {e}"));
             assert!(chain.dry_run_values.lock().unwrap().is_empty(), "{call}");
             assert_eq!(*chain.swap_values.lock().unwrap(), [quoted], "{call}");
+        }
+    }
+
+    /// R4-M1: a fresh wallet's capped swap deploys the helper before its
+    /// dry run, so a dry run that then reverts has sent that deploy. The
+    /// refusal says so instead of "nothing was sent".
+    /// R4-M2: a dry run answering `0x` (an `eth_call` to an address with
+    /// no code, e.g. a backend that doesn't see the just-deployed helper
+    /// yet) is not a pass: the call fails as a read and the swap isn't
+    /// sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_swap_after_the_helper_deploy() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(
+                    e @ FundingError::PriceMoved {
+                        helper_deployed: true,
+                        ..
+                    },
+                ) => {
+                    let m = e.to_string();
+                    assert!(!m.contains("nothing was sent"), "{call}: {m}");
+                    assert!(
+                        m.contains("only the one-time swap helper setup was sent"),
+                        "{call}: {m}"
+                    );
+                }
+                other => panic!("{call}: expected PriceMoved after a deploy, got {other:?}"),
+            }
+            assert_eq!(*chain.sent.lock().unwrap(), ["deploy"], "{call}");
+
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_dry_run_empty: true,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::Read { what, message }) => {
+                    assert_eq!(what, "check the capped swap", "{call}");
+                    assert!(message.contains("returned 0 bytes"), "{call}: {message}");
+                }
+                other => panic!("{call}: expected Read, got {other:?}"),
+            }
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            assert_eq!(*chain.sent.lock().unwrap(), ["deploy"], "{call}: no swap");
         }
     }
 
