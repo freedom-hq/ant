@@ -16,12 +16,21 @@
    4. `cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings`
    5. `cargo test --workspace --lib`
    6. `cargo test -p ant-ffi --features chain --lib`
+   7. `cargo deny check advisories bans licenses sources` (the separate
+      `cargo-deny` job; install with `cargo install cargo-deny --locked`
+      or the release binary the job uses)
  Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
  (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
  off by default, so the whole-workspace step 2 never compiles them — they
  need an explicit per-crate lint or their code is never type-checked by CI.
  Step 6 exists for the same reason: step 5 never enables `chain`, so the
  chain-gated `ant-ffi` unit tests would be compiled but never run.
+ Step 7 checks `Cargo.lock` against RustSec advisories, yanked
+ versions, the license allow-list and crate sources, per `deny.toml`.
+ It can go red with no code change when a new advisory is published:
+ take the fix with `cargo update -p <crate>` when a compatible one
+ exists, otherwise add a narrow `ignore` entry (one advisory ID, with
+ the reason and the tracking issue) to `deny.toml`.
  Never merge to `main` (or push a branch you expect to be merged) with a
  known-red gate. Toolchain upgrades can introduce new `clippy`/`rustfmt`
  findings on untouched code — fix those too (the gate is whole-repo, not

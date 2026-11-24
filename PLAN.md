@@ -137,8 +137,8 @@ Optional further shrink (nightly): `cargo +nightly build -Z build-std=std,panic_
   - Test suite + mainnet smoke must pass before the PR merges.
 - **Dependabot / Renovate** generate PRs continuously for interim bumps.
 - **`cargo-outdated`** in CI fails the build if any dependency is more than **one minor version** behind latest stable.
-- **`cargo-deny`** enforces: no yanked versions, no duplicate major versions of the same crate, allowed licenses only, no known-advisory versions (via `cargo-audit` integration).
-- **`cargo-vet`** tracks human-reviewed audits of new crate versions entering the tree. Reused for supply-chain review.
+- **`cargo-deny`** (CI job `cargo-deny`, policy in `deny.toml`) enforces: no known-advisory versions (the RustSec database, the same one `cargo-audit` reads, so there is no separate `cargo-audit` step), no yanked versions, allowed licenses only, crates.io as the only source. Every advisory exception in `deny.toml` names one advisory ID with its reason. Duplicate versions of the same crate are reported but don't fail the check yet: the tree still carries several through upstream crates (see the single-version rule below).
+- **`cargo-vet`** is not set up. Whether to keep human-reviewed audits of new crate versions is a separate decision.
 - **Exception policy:** a dependency may be held back only with a dated `# PINNED: reason, review by YYYY-MM-DD` comment in `Cargo.toml`. Anything past its review date blocks CI.
 - **Single version per crate:** if two transitive deps force us onto two majors of the same crate, the upgrade is itself a blocking task — we don't carry duplicate majors into release artifacts (this is both a size and a security concern).
 
@@ -2349,7 +2349,7 @@ data costs argue for a ≤ 5 MB Play Store download).
 - **Stamp replay / over-issue:** bucket counters persisted atomically before the chunk leaves the device; stamp signatures include monotonic bucket index.
 - **Cheque replay:** cumulative payout is monotonically increasing per peer; we never sign a cheque with a lower value than previously sent.
 - **Key compromise:** wallet key controls chequebook funds + batches. Offer a panic-withdraw flow to drain the chequebook to a recovery address.
-- **Supply chain:** audit crates via `cargo-vet`, gate with `cargo-deny` and `cargo-audit`, reproducible builds via committed `Cargo.lock`. Versions pinned in the lockfile are continuously rebased onto latest stable per the §3 dependency policy — we never freeze dependencies for long.
+- **Supply chain:** gate with `cargo-deny` (advisories, bans, licenses, sources; see §3), reproducible builds via committed `Cargo.lock`. `cargo-vet` audits are not in place (separate decision). Versions pinned in the lockfile are continuously rebased onto latest stable per the §3 dependency policy — we never freeze dependencies for long.
 
 ---
 

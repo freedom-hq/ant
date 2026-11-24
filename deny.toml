@@ -1,0 +1,112 @@
+# cargo-deny policy for the ant workspace (PLAN.md § 3 / § 13).
+#
+# CI runs `cargo deny check advisories bans licenses sources` against
+# this file (the `cargo-deny` job in .github/workflows/ci.yml). Run the
+# same command locally before you push a dependency change.
+#
+# Every exception below is narrow (one advisory ID, one crate) and says
+# why it is there and what removes it. Don't add a blanket allow; if a
+# new advisory has a semver-compatible fix, take it with
+# `cargo update -p <crate>` instead of listing it here.
+
+[graph]
+# Check the dependency graph of every feature, not just the defaults:
+# ant-ffi's `chain` (reqwest + rustls) and `jni` features are off by
+# default and would otherwise never be looked at, the same blind spot
+# the per-feature clippy steps in CI exist for.
+all-features = true
+
+[advisories]
+# A yanked version in Cargo.lock fails the check.
+yanked = "deny"
+ignore = [
+    # --- hickory-proto / hickory-resolver 0.25 -------------------------
+    # Pulled in by ant-p2p (bootnode /dnsaddr resolution) and libp2p-dns.
+    # The fixes are in hickory 0.26, which libp2p-dns 0.44 does not
+    # accept. Dropping hickory 0.25 from the build is tracked in
+    # https://github.com/freedom-hq/ant/issues/270; remove these entries
+    # when that lands.
+    #
+    # DNSSEC validation: the workspace builds hickory without any
+    # `dnssec-*` feature (check with
+    # `cargo tree -e features -i hickory-proto --all-features`), so the
+    # validation code these advisories are about is not compiled in.
+    { id = "RUSTSEC-2026-0118", reason = "hickory 0.25 DNSSEC (NSEC3), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0504", reason = "hickory 0.25 DNSSEC (NSEC3), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0505", reason = "hickory 0.25 DNSSEC (NSEC3), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0511", reason = "hickory 0.25 DNSSEC (NXDOMAIN proof), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0512", reason = "hickory 0.25 DNSSEC (RRset), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0514", reason = "hickory-resolver 0.25 returns DNSSEC-bogus records; validation not enabled; fix only in 0.26, see #270" },
+    { id = "RUSTSEC-2026-0530", reason = "hickory 0.25 DNSSEC (NSEC), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0531", reason = "hickory 0.25 DNSSEC (DS proof), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0532", reason = "hickory 0.25 DNSSEC (NSEC3), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0549", reason = "hickory 0.25 DNSSEC (NSEC3), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0550", reason = "hickory 0.25 DNSSEC (NSEC), no dnssec feature enabled; no fix on 0.25, see #270" },
+    { id = "RUSTSEC-2026-0551", reason = "hickory 0.25 DNSSEC (record class), no dnssec feature enabled; no fix on 0.25, see #270" },
+    # Zone-file / record-text parsing: ant only decodes DNS wire-format
+    # answers and never parses zone files or record text.
+    { id = "RUSTSEC-2026-0487", reason = "hickory 0.25 SVCB text parser panic; ant parses no record text; fix only in 0.26, see #270" },
+    { id = "RUSTSEC-2026-0489", reason = "hickory 0.25 SVCB text parser panic; ant parses no record text; fix only in 0.26, see #270" },
+    { id = "RUSTSEC-2026-0490", reason = "hickory 0.25 zone-file lexer panic; ant parses no zone files; fix only in 0.26, see #270" },
+    # Reachable: these two concern wire-format messages ant does encode
+    # and decode on every /dnsaddr lookup. They stay open until #270.
+    { id = "RUSTSEC-2026-0119", reason = "hickory 0.25 O(n^2) name compression, reachable; fix only in 0.26 (ant-p2p and libp2p-dns 0.44 are on 0.25), see #270" },
+    { id = "RUSTSEC-2026-0491", reason = "hickory 0.25 memory amplification from header record counts, reachable; fix only in 0.26 (ant-p2p and libp2p-dns 0.44 are on 0.25), see #270" },
+
+    # --- crypto-bigint 0.5 ----------------------------------------------
+    # Via elliptic-curve 0.13 (k256 0.13 / p256 0.13). The fix is in
+    # crypto-bigint 0.7.6; elliptic-curve 0.13 requires ^0.5, so taking
+    # it means moving k256/p256 to the 0.14 line. Remove with that move.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing variability; elliptic-curve 0.13 (k256/p256 0.13) pins ^0.5, fix needs the 0.14 line" },
+
+    # --- libsqlite3-sys 0.37 (bundled SQLite < 3.54) --------------------
+    # Via rusqlite 0.39 in ant-retrieval (the chunk cache). The fix needs
+    # rusqlite 0.41, a breaking upgrade. Exposure is local only: SQLite
+    # has to open a database + `-wal` pair a less trusted party wrote,
+    # and ant only opens its own cache file inside its data directory.
+    # Remove when rusqlite is bumped to 0.41.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54 (crafted db + -wal pair); ant opens only its own cache file; fix needs rusqlite 0.41 (breaking)" },
+]
+
+[licenses]
+# Permissive licenses only. Anything else needs a per-crate exception
+# below with a reason.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-roots (Mozilla's CA root list).
+    "CDLA-Permissive-2.0",
+]
+exceptions = [
+    # MPL-2.0 is file-level copyleft: fine to link unmodified. Allowed
+    # per crate rather than globally so a new MPL dependency is a
+    # deliberate decision.
+    # attohttpc: igd-next -> libp2p-upnp (UPnP port mapping).
+    { crate = "attohttpc", allow = ["MPL-2.0"] },
+    # option-ext: dirs-sys -> dirs (antd / antctl / antop config paths).
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+# Unpublished workspace crates (xtask, `publish = false`) carry no
+# license field; they ship nowhere, so don't check them.
+ignore = true
+
+[bans]
+# PLAN.md § 3 wants a single version per crate. Today the tree carries
+# several duplicates through upstream crates (hashbrown, lru, rand, …)
+# that ant can't collapse on its own, so duplicates are reported but
+# don't fail the check yet.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# crates.io only: no other registry, no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
