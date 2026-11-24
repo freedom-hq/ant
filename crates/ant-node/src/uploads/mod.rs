@@ -1231,9 +1231,10 @@ impl UploadManager {
     /// alone. Returns at once either way; the new driver starts once
     /// the old one has drained, which takes about [`PUSH_TIMEOUT`]
     /// (2 min) at worst: its in-flight pushes drain concurrently, each
-    /// a single attempt under that timeout. A `Completed` job instead triggers a background self-heal
-    /// that re-pushes only its missing chunks on the same job (see body);
-    /// other terminal states error with `BadState`.
+    /// a single attempt under that timeout. A `Completed` job instead
+    /// triggers a background self-heal that re-pushes only its missing
+    /// chunks on the same job (see body); other terminal states error
+    /// with `BadState`.
     pub fn resume(&self, id: &str) -> Result<UploadJobInfo, UploadError> {
         let handle = self.resolve(id)?;
 
