@@ -884,8 +884,8 @@ const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const DIAL_BACKOFF_MAX: Duration = Duration::from_mins(30);
 /// Most per-binding [`DialBackoff`] entries kept for one peer id: the dial
 /// book holds at most two bindings per id (held + rival), plus room for
-/// forgeries re-gossiped under fresh overlays. Past it the entry whose
-/// window ends first is dropped.
+/// forgeries re-gossiped under fresh overlays. Past it the binding entry
+/// whose window ends first is dropped; the peer-id entry never is.
 const DIAL_BACKOFF_BINDINGS: usize = 4;
 /// How long a [`LocalSubnets`](crate::underlay::LocalSubnets) snapshot is
 /// trusted before the interfaces are re-read (phone switching Wi-Fi ↔
@@ -1679,9 +1679,12 @@ impl SwarmState {
             i
         } else {
             if entries.len() >= DIAL_BACKOFF_BINDINGS {
+                // Never the peer-id (`None`) entry: it holds back every
+                // binding, so dropping it would free them all at once.
                 if let Some(i) = entries
                     .iter()
                     .enumerate()
+                    .filter(|(_, b)| b.binding.is_some())
                     .min_by_key(|(_, b)| b.until)
                     .map(|(i, _)| i)
                 {
@@ -2052,9 +2055,14 @@ fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
 }
 
 /// [`record_swarm_failure`] for a dial to `peer`'s unverified `binding`
-/// (see [`PeerFailure::binding`]).
+/// (see [`PeerFailure::binding`]). Replaces only an earlier failure it
+/// covers: a peer-id (`None`) failure supersedes every entry for `peer`,
+/// a binding's failure only that binding's, so it never drops an active
+/// peer-id failure that still holds back the id's other bindings.
 fn record_swarm_failure_of(state: &mut SwarmState, peer: PeerId, binding: Option<[u8; 32]>) {
-    state.failed.retain(|f| f.peer != peer);
+    state
+        .failed
+        .retain(|f| f.peer != peer || (binding.is_some() && f.binding != binding));
     state.failed.push(PeerFailure {
         peer,
         at: Instant::now(),
@@ -11612,6 +11620,46 @@ mod tests {
         assert_eq!(state.dial_backoff[&peer].len(), DIAL_BACKOFF_BINDINGS);
         assert!(state.dial_backed_off_as(&peer, [1; 32]));
         assert!(!state.dial_backed_off_as(&peer, [2; 32]));
+    }
+
+    /// #299 (R4-M2): hitting the cap never evicts the peer-id entry, even
+    /// when its window ends first.
+    #[test]
+    fn per_binding_cap_keeps_the_peer_id_backoff() {
+        let mut state = test_state();
+        let peer = pid();
+        state.note_dial_failure_of(peer, None);
+        for o in 1..=(DIAL_BACKOFF_BINDINGS as u8 + 2) {
+            state.note_dial_failure_of(peer, Some([o; 32]));
+            state.note_dial_failure_of(peer, Some([o; 32]));
+        }
+        assert_eq!(state.dial_backoff[&peer].len(), DIAL_BACKOFF_BINDINGS);
+        assert!(state.dial_backoff[&peer]
+            .iter()
+            .any(|b| b.binding.is_none()));
+        assert!(state.dial_backed_off_as(&peer, [0xee; 32]));
+    }
+
+    /// #299 (R4-M1): a binding's failure doesn't overwrite an active
+    /// peer-id failure, which keeps holding back every binding; a later
+    /// peer-id failure supersedes the binding entries.
+    #[test]
+    fn binding_failure_keeps_the_peer_id_failure() {
+        let mut state = test_state();
+        let victim = pid();
+        let genuine = hint_in_bin(victim, 0x80, 1);
+        let rival = hint_in_bin(victim, 0x80, 2);
+
+        record_swarm_failure(&mut state, victim);
+        record_swarm_failure_of(&mut state, victim, Some(rival.overlay));
+        assert!(state.bin_balance_skips(&genuine));
+        assert!(state.bin_balance_skips(&rival));
+
+        record_swarm_failure_of(&mut state, victim, Some(rival.overlay));
+        assert_eq!(state.failed.iter().filter(|f| f.peer == victim).count(), 2);
+
+        record_swarm_failure(&mut state, victim);
+        assert_eq!(state.failed.iter().filter(|f| f.peer == victim).count(), 1);
     }
 
     /// #299 (R3-M2): a forged binding's failed dial lands in `failed`, but
