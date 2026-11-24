@@ -834,8 +834,8 @@ pub struct ExternalAddressInfo {
     pub addr: String,
     /// Free-form source identifier. Stable values produced by `antd`:
     /// `manual` (`--external-address`), `listener` (auto-promoted
-    /// non-loopback listener), `observed` (from a remote's identify
-    /// `observed_addr`), `upnp` (mapped via libp2p-upnp / IGD). Future
+    /// non-loopback listener), `observed` (from remotes' identify
+    /// `observed_addr`, once several distinct observers agree), `upnp` (mapped via libp2p-upnp / IGD). Future
     /// daemons may add new sources, so UIs should treat unknown values
     /// as opaque labels.
     pub source: String,

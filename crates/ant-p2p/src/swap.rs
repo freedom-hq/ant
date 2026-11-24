@@ -104,7 +104,6 @@ use ant_crypto::{CryptoError, SECP256K1_SECRET_LEN};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use futures::StreamExt;
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
 use libp2p_swarm::Stream;
@@ -3085,9 +3084,15 @@ where
 /// still want to accept the protocol negotiation so bee doesn't
 /// disconnect us, but we have nothing meaningful to do with the
 /// cheque. Logs at trace.
-pub async fn drain_inbound_unconfigured(mut incoming: IncomingStreams) {
-    while let Some((peer, mut stream)) = incoming.next().await {
-        tokio::spawn(async move {
+pub async fn drain_inbound_unconfigured(
+    incoming: IncomingStreams,
+    guard: crate::sinks::InboundGuard,
+) {
+    crate::sinks::serve_gated(
+        incoming,
+        guard,
+        PROTOCOL_SWAP,
+        |peer, mut stream| async move {
             let _ = tokio::time::timeout(STREAM_TIMEOUT, async move {
                 let _ = read_delimited(&mut stream, HEADERS_MAX).await;
                 let _ = write_empty_headers(&mut stream).await;
@@ -3100,8 +3105,9 @@ pub async fn drain_inbound_unconfigured(mut incoming: IncomingStreams) {
                 %peer,
                 "drained inbound cheque (no chequebook configured; ignored)",
             );
-        });
-    }
+        },
+    )
+    .await;
 }
 
 // --- listener ---
@@ -3130,14 +3136,15 @@ pub struct InboundCheque {
 /// listener here, so we mirror that — read first, then ack with
 /// empty headers, then read the payload.
 pub async fn run_inbound(
-    mut incoming: IncomingStreams,
+    incoming: IncomingStreams,
+    guard: crate::sinks::InboundGuard,
     ledger: Arc<CreditLedger>,
     events_tx: Option<mpsc::Sender<InboundCheque>>,
 ) {
-    while let Some((peer, stream)) = incoming.next().await {
+    crate::sinks::serve_gated(incoming, guard, PROTOCOL_SWAP, move |peer, stream| {
         let l = ledger.clone();
         let tx = events_tx.clone();
-        tokio::spawn(async move {
+        async move {
             match tokio::time::timeout(STREAM_TIMEOUT, handle_inbound_stream(peer, stream, l)).await
             {
                 Ok(Ok(ev)) => {
@@ -3165,8 +3172,9 @@ pub async fn run_inbound(
                     STREAM_TIMEOUT.as_secs(),
                 ),
             }
-        });
-    }
+        }
+    })
+    .await;
 }
 
 async fn handle_inbound_stream(
