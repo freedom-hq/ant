@@ -229,8 +229,12 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// through the handle's one transport slot, so installing a transport
 /// after the gateway started reaches its chain reader, after-buy and
 /// chequebook-refused hooks and the chequebook funds watch without a
-/// restart (issue #303). Requests that already went to the configured
-/// URL before the install are not repeated through it. Replacing or
+/// restart (issue #303). The background confirmation of a wallet scan
+/// read from the unverified logs source, whose backoff reaches 30
+/// minutes, is woken to try the new transport within a minute. Requests
+/// that already went to the configured URL before the install are not
+/// repeated through it; another background retry that already failed
+/// tries again at its next backoff step. Replacing or
 /// **clearing** a transport is effective everywhere at once in the same
 /// way; see the lifetime rule below.
 ///
@@ -277,6 +281,12 @@ pub unsafe extern "C" fn ant_set_chain_transport(
         // in-flight callback has returned, which is what lets the host
         // free `host_ctx` once this returns.
         let installed = handle.chain_transport.set(transport, host_ctx);
+        // The route every handle-built client reads through is the same
+        // slot before and after, so nothing hands the unverified-history
+        // confirmation a "new" client: wake it here, or one backed off to
+        // its 30-minute cap would wait that out before trying the new
+        // transport.
+        handle.chain_init.transport_changed();
         tracing::info!(
             target: "ant-ffi",
             installed,
@@ -471,6 +481,43 @@ mod tests {
             gateway_chequebook: ant_gateway::ChequebookSlot::default(),
         };
         (handle, (cmd_rx, status_tx))
+    }
+
+    /// `ant_set_chain_transport` wakes the handle's running
+    /// unverified-history confirmation (install and clear alike), and
+    /// leaves no wake behind when none runs (issue #303).
+    #[test]
+    fn ffi_set_wakes_a_running_confirmation() {
+        let (mut handle, _peers) = handle_for_test();
+        let woken = |handle: &AntHandle| {
+            handle.runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    handle.chain_init.confirm_woken(),
+                )
+                .await
+                .is_ok()
+            })
+        };
+        let set = |handle: &mut AntHandle, transport: AntChainTransportFn| unsafe {
+            ant_set_chain_transport(std::ptr::from_mut(handle), transport, 0xBEEF as *mut c_void)
+        };
+
+        assert_eq!(
+            set(&mut handle, Some(serving_host_ffi)),
+            ANT_CHAIN_TRANSPORT_OK
+        );
+        assert!(!woken(&handle), "no confirmation running: nothing to wake");
+
+        handle.chain_init.set_confirm_running(true);
+        assert_eq!(
+            set(&mut handle, Some(serving_host_ffi)),
+            ANT_CHAIN_TRANSPORT_OK
+        );
+        assert!(woken(&handle), "an install wakes the running confirmation");
+        assert_eq!(set(&mut handle, None), ANT_CHAIN_TRANSPORT_OK);
+        assert!(woken(&handle), "a clear wakes it too");
+        handle.chain_init.set_confirm_running(false);
     }
 
     /// End-to-end through the real FFI entry point: once a host

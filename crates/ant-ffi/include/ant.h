@@ -1352,9 +1352,13 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * wiring at ant_start_gateway over the handle's one transport slot, so
  * a transport installed after the gateway started reaches its chain
  * reads, its after-buy and chequebook-refused hooks and the chequebook
- * funds watch with no restart. Requests that already went to
- * gnosis_rpc before the install are not repeated. Replacing or clearing
- * a transport takes effect in the same way, per Lifetime above.
+ * funds watch with no restart. The background confirmation of a
+ * wallet scan read from the unverified logs source, whose backoff
+ * reaches 30 minutes, is woken to try the new transport within a
+ * minute. Requests that already went to gnosis_rpc before the install
+ * are not repeated; another background retry that already failed tries
+ * again at its next backoff step. Replacing or clearing a transport
+ * takes effect in the same way, per Lifetime above.
  *
  * Returns ANT_CHAIN_TRANSPORT_OK (0) on success,
  * ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) if `handle` is NULL, or

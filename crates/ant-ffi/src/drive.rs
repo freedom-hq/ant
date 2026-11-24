@@ -156,7 +156,9 @@ pub(crate) struct ChainInit {
     /// through — the latest one handed to it.
     confirm_loop: std::sync::Mutex<ConfirmLoop>,
     /// Wakes a confirmation waiting out its backoff when a client on a
-    /// different route is handed to it (not a re-hand of the same RPC).
+    /// different route is handed to it (not a re-hand of the same RPC),
+    /// or the host chain transport its client reads through changes
+    /// ([`Self::transport_changed`]).
     confirm_wake: tokio::sync::Notify,
     /// Set once settlement has been switched on for an adopted
     /// chequebook, so a later run (every idempotent `ant_start_gateway`
@@ -658,7 +660,9 @@ impl ChainInit {
     /// cuts the loop's wait to at most the first backoff step and restarts
     /// its backoff; re-handing the route it already reads through (an
     /// idempotent start re-call, a discover at every start) leaves the
-    /// backoff where it is.
+    /// backoff where it is. A host transport installed, replaced or
+    /// cleared under the same route wakes it the same way
+    /// ([`Self::transport_changed`]).
     ///
     /// `epoch` is the calling gateway start's [`Self::retry_epoch`]
     /// (`None` for a discover, which no gateway stop retires): if the
@@ -789,6 +793,35 @@ impl ChainInit {
         state.running = false;
         state.chain = None;
         adopted
+    }
+
+    /// The handle's host chain transport was installed, replaced or
+    /// cleared ([`crate::ant_set_chain_transport`]). Every handle-built
+    /// client reads through that one slot, so the confirmation's client
+    /// keeps its route ([`ant_chain::ChainClient::same_route`]) and
+    /// [`Self::confirm_unverified`] has nothing to hand over — yet its
+    /// next attempt now reads through a different backend. Wake a running
+    /// loop the way a route change does: its wait drops to at most the
+    /// first backoff step and the backoff starts over, instead of a loop
+    /// already backed off to its 30-minute cap waiting that out before it
+    /// tries the new transport (issue #303). No loop running: nothing to
+    /// do; the next one starts through the slot as it is then.
+    pub(crate) fn transport_changed(&self) {
+        if self.lock_confirm_loop().running {
+            self.confirm_wake.notify_one();
+        }
+    }
+
+    /// Test hook: mark the confirmation loop running, without one.
+    #[cfg(test)]
+    pub(crate) fn set_confirm_running(&self, running: bool) {
+        self.lock_confirm_loop().running = running;
+    }
+
+    /// Test hook: wait for a wake of the confirmation loop.
+    #[cfg(test)]
+    pub(crate) async fn confirm_woken(&self) {
+        self.confirm_wake.notified().await;
     }
 
     fn lock_confirm_loop(&self) -> std::sync::MutexGuard<'_, ConfirmLoop> {
@@ -5820,6 +5853,81 @@ mod chain_tests {
         }
         looping.await.unwrap();
         assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A host transport installed under the route a running confirmation
+    /// already reads through (every handle-built client shares the one
+    /// slot, so `same_route` holds and nothing is handed over) still
+    /// wakes it: the next attempt through the now-serving transport lands
+    /// within the first backoff step, not after the doubled step the loop
+    /// was waiting out (issue #303).
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_change_wakes_the_confirmation() {
+        const EOA: [u8; 20] = [0x7e; 20];
+        let (init, dir, verified_script, unverified) =
+            unconfirmed_init(EOA, "chain-init-confirm-transport-change");
+        // Stands in for the handle's slot: one backend, whose answer the
+        // "install" below improves without changing the client's route.
+        let slot = std::sync::Arc::new(verified_script());
+        let route = || client(&slot).with_unverified_logs_client(Some(client(&unverified)));
+        let (cmd_tx, node) = fake_node();
+        init.note_pending();
+        assert!(init.rediscover_owned(&route(), &cmd_tx, &dir).await);
+        assert!(init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+
+        // No loop yet: nothing to wake, and no stale wake left behind.
+        init.transport_changed();
+
+        let looping = {
+            let (init, cmd_tx, dir, chain) = (
+                std::sync::Arc::clone(&init),
+                cmd_tx.clone(),
+                dir.clone(),
+                route(),
+            );
+            tokio::spawn(async move {
+                init.confirm_unverified(&chain, &cmd_tx, &dir, NODE_KEY, None)
+                    .await
+            })
+        };
+        let requests = || slot.seen.lock().unwrap().len();
+        // Step with some real time in between (see the hand-over test).
+        let step = || async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            tokio::task::yield_now().await;
+        };
+        // Right after the loop's first attempt, so its next is a doubled
+        // step (2 min) away.
+        let before = requests();
+        while requests() == before {
+            step().await;
+        }
+        let mut quiet = 0;
+        let mut last = requests();
+        while quiet < 5 {
+            step().await;
+            let now = requests();
+            quiet = if now == last { quiet + 1 } else { 0 };
+            last = now;
+        }
+
+        // The host installs a transport that serves the span: same route.
+        slot.cap.store(0, std::sync::atomic::Ordering::SeqCst);
+        init.transport_changed();
+        let installed = tokio::time::Instant::now();
+        while !node.lock().unwrap().registered.contains(&[0xc6; 32]) {
+            assert!(
+                installed.elapsed() < std::time::Duration::from_secs(90),
+                "a transport change is tried within the first step, not the doubled one"
+            );
+            step().await;
+        }
+        looping.await.unwrap();
+        assert!(!init.unconfirmed.load(std::sync::atomic::Ordering::Acquire));
+        // The loop is over: a later change has nothing to wake.
+        init.transport_changed();
         std::fs::remove_dir_all(&dir).ok();
     }
 
