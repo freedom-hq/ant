@@ -863,6 +863,18 @@ impl PendingPhase {
 struct PeerFailure {
     peer: PeerId,
     at: Instant,
+    /// The unverified dial-book binding the failed dial was for, if any
+    /// (see [`DialBackoff`]): a failure under it says nothing about the
+    /// peer id's other bindings, so it doesn't keep those out of bin
+    /// balancing. `None` is a failure of the peer id itself.
+    binding: Option<[u8; 32]>,
+}
+
+impl PeerFailure {
+    /// Does this failure hold back a dial to `peer` under `overlay`?
+    fn holds_back(&self, peer: &PeerId, overlay: [u8; 32]) -> bool {
+        self.peer == *peer && self.binding.is_none_or(|o| o == overlay)
+    }
 }
 
 /// First retry delay after an outbound dial to a hinted peer fails at the
@@ -870,6 +882,11 @@ struct PeerFailure {
 const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Ceiling for the doubling dial backoff.
 const DIAL_BACKOFF_MAX: Duration = Duration::from_mins(30);
+/// Most per-binding [`DialBackoff`] entries kept for one peer id: the dial
+/// book holds at most two bindings per id (held + rival), plus room for
+/// forgeries re-gossiped under fresh overlays. Past it the entry whose
+/// window ends first is dropped.
+const DIAL_BACKOFF_BINDINGS: usize = 4;
 /// How long a [`LocalSubnets`](crate::underlay::LocalSubnets) snapshot is
 /// trusted before the interfaces are re-read (phone switching Wi-Fi ↔
 /// cellular changes which private underlays are same-LAN).
@@ -886,6 +903,12 @@ const LOCAL_SUBNETS_TTL: Duration = Duration::from_secs(30);
 /// hive record that names the peer without being it (#299), and charging
 /// the id would hold back the peer's genuine record too. `None` charges the
 /// peer id whatever overlay it is dialed under.
+///
+/// Each binding of a peer id keeps its own entry (at most
+/// [`DIAL_BACKOFF_BINDINGS`] per id), so failures alternating between a
+/// genuine record and a forged rival each keep doubling their own window
+/// instead of resetting one shared counter, and one binding's failure never
+/// clears another's backoff.
 struct DialBackoff {
     failures: u32,
     until: Instant,
@@ -970,7 +993,7 @@ struct SwarmState {
     local_subnets: Option<(Instant, crate::underlay::LocalSubnets)>,
     /// Hint-dial backoff for peers whose dials failed; cleared when a
     /// connection to the peer is established. See [`DialBackoff`].
-    dial_backoff: HashMap<PeerId, DialBackoff>,
+    dial_backoff: HashMap<PeerId, Vec<DialBackoff>>,
     target_peers: usize,
     /// Order in which peers first appeared in the pipeline. Used as the sort
     /// key in [`build_peer_pipeline_entries`] so new peers are appended to
@@ -1328,8 +1351,10 @@ impl SwarmState {
     /// (every gossiped peer that ever failed a dial lands here); a peer
     /// failing again after that starts over at `DIAL_BACKOFF_BASE`.
     fn prune_dial_backoff(&mut self, now: Instant) {
-        self.dial_backoff
-            .retain(|_, b| now.saturating_duration_since(b.until) < DIAL_BACKOFF_MAX);
+        self.dial_backoff.retain(|_, entries| {
+            entries.retain(|b| now.saturating_duration_since(b.until) < DIAL_BACKOFF_MAX);
+            !entries.is_empty()
+        });
     }
 
     /// Republish the current routing-table snapshot on `peers_watch`.
@@ -1597,16 +1622,44 @@ impl SwarmState {
     fn dial_backed_off(&self, peer: &PeerId) -> bool {
         self.dial_backoff
             .get(peer)
-            .is_some_and(|b| b.until > Instant::now())
+            .is_some_and(|e| e.iter().any(|b| b.until > Instant::now()))
+    }
+
+    /// The backoff entry charged to `binding` of `peer`.
+    #[cfg(test)]
+    fn backoff_entry(&mut self, peer: &PeerId, binding: Option<[u8; 32]>) -> &mut DialBackoff {
+        self.dial_backoff
+            .get_mut(peer)
+            .and_then(|e| e.iter_mut().find(|b| b.binding == binding))
+            .expect("backoff entry")
     }
 
     /// Is a dial to `peer` under `overlay` suppressed by [`DialBackoff`]? A
     /// backoff charged to another unverified binding of the same peer id
     /// doesn't hold this one back.
     fn dial_backed_off_as(&self, peer: &PeerId, overlay: [u8; 32]) -> bool {
-        self.dial_backoff
-            .get(peer)
-            .is_some_and(|b| b.until > Instant::now() && b.binding.is_none_or(|o| o == overlay))
+        let now = Instant::now();
+        self.dial_backoff.get(peer).is_some_and(|e| {
+            e.iter()
+                .any(|b| b.until > now && b.binding.is_none_or(|o| o == overlay))
+        })
+    }
+
+    /// Does bin balancing leave `hint` alone? It does for a peer id that is
+    /// live or mid-pipeline, and for a binding a recent failure or a backoff
+    /// holds back; a failure or backoff charged to another unverified
+    /// binding of the same id doesn't.
+    fn bin_balance_skips(&self, hint: &sinks::PeerHint) -> bool {
+        let peer_id = &hint.peer_id;
+        self.bzz_peers.contains(peer_id)
+            || self.pending.contains_key(peer_id)
+            || self.dialing.contains(peer_id)
+            || self.closing.contains(peer_id)
+            || self
+                .failed
+                .iter()
+                .any(|f| f.holds_back(peer_id, hint.overlay))
+            || self.dial_backed_off_as(peer_id, hint.overlay)
     }
 
     /// Record an outbound dial failure: double the peer's backoff (from
@@ -1617,23 +1670,37 @@ impl SwarmState {
     }
 
     /// [`Self::note_dial_failure`], charged to `binding` (see
-    /// [`DialBackoff`]). A failure under another binding than the one the
-    /// backoff was charged to starts it over.
+    /// [`DialBackoff`]). Each binding escalates its own entry; another
+    /// binding's entry is left as it is.
     fn note_dial_failure_of(&mut self, peer: PeerId, binding: Option<[u8; 32]>) {
-        let entry = self.dial_backoff.entry(peer).or_insert(DialBackoff {
-            failures: 0,
-            until: Instant::now(),
-            binding,
-        });
-        if entry.binding != binding {
-            entry.failures = 0;
-            entry.binding = binding;
-        }
+        let now = Instant::now();
+        let entries = self.dial_backoff.entry(peer).or_default();
+        let idx = if let Some(i) = entries.iter().position(|b| b.binding == binding) {
+            i
+        } else {
+            if entries.len() >= DIAL_BACKOFF_BINDINGS {
+                if let Some(i) = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| b.until)
+                    .map(|(i, _)| i)
+                {
+                    entries.swap_remove(i);
+                }
+            }
+            entries.push(DialBackoff {
+                failures: 0,
+                until: now,
+                binding,
+            });
+            entries.len() - 1
+        };
+        let entry = &mut entries[idx];
         entry.failures = entry.failures.saturating_add(1);
         let delay = DIAL_BACKOFF_BASE
             .saturating_mul(1u32 << entry.failures.saturating_sub(1).min(16))
             .min(DIAL_BACKOFF_MAX);
-        entry.until = Instant::now() + delay;
+        entry.until = now + delay;
     }
 
     /// Are we cut off ourselves? Then an outbound dial failure says more
@@ -1917,9 +1984,6 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     // pipeline with `Failed` rows the operator never asked for.
     let (started, started_unproven, dialed) = clear_dial_tracking(state, p);
     let was_tracked = started.is_some();
-    if was_tracked {
-        record_swarm_failure(state, p);
-    }
     // The binding this dial was for, if no handshake ever verified it: it
     // may be a hive record that names `p` without being `p` (#299). A hint
     // dial records the overlay it dialed; any other dial falls back to the
@@ -1928,6 +1992,9 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     let unverified = dialed
         .or_else(|| state.known_dialable.get(&p).map(|h| h.overlay))
         .filter(|o| verified != Some(*o));
+    if was_tracked {
+        record_swarm_failure_of(state, p, unverified);
+    }
     // Judge the link both now and as it was when the dial started: a SYN
     // sent during the zombie / post-`Resume` window (or before a later
     // suspected network change) only fails after the OS SYN timeout
@@ -1981,10 +2048,17 @@ fn clear_dial_tracking(
 }
 
 fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
+    record_swarm_failure_of(state, peer, None);
+}
+
+/// [`record_swarm_failure`] for a dial to `peer`'s unverified `binding`
+/// (see [`PeerFailure::binding`]).
+fn record_swarm_failure_of(state: &mut SwarmState, peer: PeerId, binding: Option<[u8; 32]>) {
     state.failed.retain(|f| f.peer != peer);
     state.failed.push(PeerFailure {
         peer,
         at: Instant::now(),
+        binding,
     });
     const MAX_FAIL: usize = 64;
     if state.failed.len() > MAX_FAIL {
@@ -9138,15 +9212,7 @@ fn maybe_balance_bins(
         state.routing.base(),
         &bin_counts,
         state.dial_book_hints(),
-        |hint| {
-            let peer_id = &hint.peer_id;
-            state.bzz_peers.contains(peer_id)
-                || state.pending.contains_key(peer_id)
-                || state.dialing.contains(peer_id)
-                || state.closing.contains(peer_id)
-                || state.failed.iter().any(|f| f.peer == *peer_id)
-                || state.dial_backed_off_as(peer_id, hint.overlay)
-        },
+        |hint| state.bin_balance_skips(hint),
     );
     if candidates.is_empty() {
         return;
@@ -11491,11 +11557,93 @@ mod tests {
         assert!(!state.dial_backed_off_as(&victim, genuine.overlay));
         assert!(state.dial_backed_off_as(&victim, forged.overlay));
 
-        // A failure under the genuine overlay starts the backoff over
-        // rather than escalating the forgery's.
+        // A failure under the genuine overlay starts its own backoff
+        // rather than escalating the forgery's, which stays as it was.
         dial_binding_and_fail(&mut state, &mut peerstore, &genuine);
         assert!(state.dial_backed_off_as(&victim, genuine.overlay));
-        assert_eq!(state.dial_backoff[&victim].failures, 1);
+        assert_eq!(
+            state.backoff_entry(&victim, Some(genuine.overlay)).failures,
+            1
+        );
+        assert!(state.dial_backed_off_as(&victim, forged.overlay));
+    }
+
+    /// #299 (R3-M1): failures alternating between a dead genuine record and
+    /// a forged rival each escalate their own backoff instead of resetting
+    /// one shared counter, and one's failure doesn't clear the other's.
+    #[tokio::test]
+    async fn alternating_binding_failures_each_keep_climbing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peerstore = peerstore_with(dir.path(), &[]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        for round in 1..=3u32 {
+            for hint in [&genuine, &forged] {
+                state.enqueue_gossip_hint(hint.clone(), local, None);
+                dial_binding_and_fail(&mut state, &mut peerstore, hint);
+            }
+            for hint in [&genuine, &forged] {
+                assert!(state.dial_backed_off_as(&victim, hint.overlay));
+                let b = state.backoff_entry(&victim, Some(hint.overlay));
+                assert_eq!(b.failures, round);
+                let left = b.until - Instant::now();
+                assert!(left > DIAL_BACKOFF_BASE * (1 << (round - 1)) / 2);
+            }
+        }
+    }
+
+    /// #299 (R3-M1): per-binding entries for one peer id stay bounded; the
+    /// one whose window ends first goes.
+    #[test]
+    fn per_binding_backoffs_are_capped() {
+        let mut state = test_state();
+        let peer = pid();
+        state.note_dial_failure_of(peer, Some([1; 32]));
+        state.note_dial_failure_of(peer, Some([1; 32]));
+        for o in 2..=(DIAL_BACKOFF_BINDINGS as u8 + 1) {
+            state.note_dial_failure_of(peer, Some([o; 32]));
+        }
+        assert_eq!(state.dial_backoff[&peer].len(), DIAL_BACKOFF_BINDINGS);
+        assert!(state.dial_backed_off_as(&peer, [1; 32]));
+        assert!(!state.dial_backed_off_as(&peer, [2; 32]));
+    }
+
+    /// #299 (R3-M2): a forged binding's failed dial lands in `failed`, but
+    /// only holds back that binding from bin balancing; the genuine record
+    /// promoted in its place is still a candidate.
+    #[tokio::test]
+    async fn forged_binding_failure_doesnt_keep_genuine_out_of_bin_balance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peerstore = peerstore_with(dir.path(), &[]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        dial_binding_and_fail(&mut state, &mut peerstore, &forged);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert!(state.failed.iter().any(|f| f.peer == victim));
+
+        assert!(state.bin_balance_skips(&forged));
+        assert!(!state.bin_balance_skips(&genuine));
+        let held = state.binding_hint(&victim, genuine.overlay).unwrap();
+        assert!(!state.bin_balance_skips(&held));
+
+        // A failure of the peer id itself (a handshake failure) still
+        // holds back every binding.
+        record_swarm_failure(&mut state, victim);
+        assert!(state.bin_balance_skips(&genuine));
     }
 
     /// #299 (R2): a dial to a rival forgery doesn't move the genuine held
@@ -11555,7 +11703,7 @@ mod tests {
         assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
 
         // Its backoff expires; the queue still holds it and pops it.
-        state.dial_backoff.get_mut(&victim).unwrap().until = Instant::now();
+        state.backoff_entry(&victim, Some(forged.overlay)).until = Instant::now();
         let stale = state.pop_dialable_hint().unwrap();
         assert_eq!(stale.overlay, forged.overlay);
         dial_binding_and_fail(&mut state, &mut peerstore, &stale);
@@ -11981,18 +12129,18 @@ mod tests {
         assert!(!state.dial_backed_off(&peer));
         state.note_dial_failure(peer);
         assert!(state.dial_backed_off(&peer));
-        let first = state.dial_backoff[&peer].until - Instant::now();
+        let first = state.backoff_entry(&peer, None).until - Instant::now();
         assert!(first <= DIAL_BACKOFF_BASE && first > DIAL_BACKOFF_BASE / 2);
         state.note_dial_failure(peer);
-        let second = state.dial_backoff[&peer].until - Instant::now();
+        let second = state.backoff_entry(&peer, None).until - Instant::now();
         assert!(second > DIAL_BACKOFF_BASE && second <= DIAL_BACKOFF_BASE * 2);
         for _ in 0..40 {
             state.note_dial_failure(peer);
         }
-        let capped = state.dial_backoff[&peer].until - Instant::now();
+        let capped = state.backoff_entry(&peer, None).until - Instant::now();
         assert!(capped <= DIAL_BACKOFF_MAX && capped > DIAL_BACKOFF_MAX / 2);
         // An expired backoff no longer suppresses dials.
-        state.dial_backoff.get_mut(&peer).unwrap().until = Instant::now();
+        state.backoff_entry(&peer, None).until = Instant::now();
         assert!(!state.dial_backed_off(&peer));
     }
 
@@ -12305,7 +12453,7 @@ mod tests {
         assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), None);
 
         // Backoff expired: the next gossip round gets it dialed.
-        state.dial_backoff.get_mut(&dead).unwrap().until = Instant::now();
+        state.backoff_entry(&dead, None).until = Instant::now();
         state.enqueue_hint(hint_in_bin(dead, 0x80, 1), local);
         assert_eq!(state.pop_dialable_hint().map(|h| h.peer_id), Some(dead));
     }
@@ -15158,8 +15306,8 @@ mod tests {
         state.prune_dial_backoff(now);
         assert!(state.dial_backoff.contains_key(&gossiped));
         state.note_dial_failure(fresh);
-        let later = state.dial_backoff[&gossiped].until + DIAL_BACKOFF_MAX;
-        state.dial_backoff.get_mut(&fresh).unwrap().until = later;
+        let later = state.backoff_entry(&gossiped, None).until + DIAL_BACKOFF_MAX;
+        state.backoff_entry(&fresh, None).until = later;
         state.prune_dial_backoff(later);
         assert!(!state.dial_backoff.contains_key(&gossiped));
         assert!(state.dial_backoff.contains_key(&fresh));
