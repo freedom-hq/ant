@@ -638,9 +638,13 @@ async fn run_hive(
             match res {
                 Ok(Ok(d)) => {
                     let (headers, body_len) = (d.headers, d.body.len());
-                    let mut entries = PeersPb::decode(d.body.as_slice())
-                        .map(|m| m.peers)
-                        .unwrap_or_default();
+                    let mut entries = match PeersPb::decode(d.body.as_slice()) {
+                        Ok(m) => m.peers,
+                        Err(e) => {
+                            debug!(target: "ant_p2p::hive", %peer_id, "undecodable peers message: {e}");
+                            Vec::new()
+                        }
+                    };
                     entries.truncate(HIVE_MAX_PEERS);
                     let granted = budget.take(peer_id, entries.len(), Instant::now());
                     if granted < entries.len() {
