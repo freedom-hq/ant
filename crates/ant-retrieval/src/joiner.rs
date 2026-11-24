@@ -204,7 +204,10 @@ pub enum JoinError {
     #[error("file too large: span {span} bytes, cap {cap} bytes")]
     TooLarge { span: u64, cap: usize },
     /// An intermediate chunk's payload size isn't a whole multiple of
-    /// the reference length, or the chunk is shorter than declared.
+    /// the reference length, or the chunk is shorter than declared, or
+    /// the tree's shape can't be honest for its span: deeper than the
+    /// span needs, a child claiming more than its section of the parent,
+    /// or (encrypted) more chunk visits than the span allows.
     #[error("malformed intermediate chunk at offset {offset}: {detail}")]
     MalformedChunk { offset: u64, detail: String },
     /// A data chunk of a redundancy-encoded intermediate node could not
@@ -280,7 +283,16 @@ pub async fn join_with_options(
         });
     }
 
-    join_subtree(fetcher, payload, span, 0, level, parity).await
+    join_subtree(
+        fetcher,
+        payload,
+        span,
+        0,
+        level,
+        parity,
+        max_tree_depth(span),
+    )
+    .await
 }
 
 /// Decode a root chunk's span into `(redundancy level, plain span,
@@ -373,7 +385,8 @@ pub async fn enumerate_chunk_tree(
         return Ok(inv);
     }
     inv.intermediates.push(root_addr);
-    let sub = enumerate_subtree(fetcher, payload, span, 0, level, parity).await?;
+    let depth = max_tree_depth(span);
+    let sub = enumerate_subtree(fetcher, payload, span, 0, level, parity, depth).await?;
     inv.leaves.extend(sub.leaves);
     inv.intermediates.extend(sub.intermediates);
     Ok(inv)
@@ -400,10 +413,14 @@ fn enumerate_subtree<'a>(
     offset: u64,
     level: u8,
     parity: usize,
+    depth_left: u32,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ChunkInventory, JoinError>> + Send + 'a>,
 > {
     Box::pin(async move {
+        if depth_left == 0 {
+            return Err(too_deep(offset, subtree_span));
+        }
         let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
 
         let mut inv = ChunkInventory::default();
@@ -432,6 +449,7 @@ fn enumerate_subtree<'a>(
                     child_offset,
                     child_level,
                     child_parity,
+                    depth_left - 1,
                 )
                 .await?;
                 inv.leaves.extend(sub.leaves);
@@ -537,13 +555,15 @@ pub async fn join_to_sender_range(
     let head = ReadHead::new(range.map_or(0, |r| r.start));
     let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(1);
     let join = priority::with_read_head(head.clone(), async move {
+        let depth = max_tree_depth(span);
         let r = match range {
             None => {
-                join_subtree_to_sender(fetcher, payload, span, 0, level, parity, &relay_tx).await
+                join_subtree_to_sender(fetcher, payload, span, 0, level, parity, depth, &relay_tx)
+                    .await
             }
             Some(range) => {
                 join_subtree_range_to_sender(
-                    fetcher, payload, span, 0, level, parity, range, &relay_tx,
+                    fetcher, payload, span, 0, level, parity, depth, range, &relay_tx,
                 )
                 .await
             }
@@ -793,6 +813,7 @@ fn join_subtree<'a>(
     offset: u64,
     level: u8,
     parity: usize,
+    depth_left: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, JoinError>> + Send + 'a>> {
     Box::pin(async move {
         // Leaf: the chunk *is* the data. `subtree_span` was carried from
@@ -804,6 +825,9 @@ fn join_subtree<'a>(
 
         // Intermediate: payload must be `[ref32; N]`. We never accept
         // 64-byte (encrypted) refs in the joiner.
+        if depth_left == 0 {
+            return Err(too_deep(offset, subtree_span));
+        }
         let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
         let refs = node.specs.len();
         trace!(
@@ -833,6 +857,7 @@ fn join_subtree<'a>(
                         addr,
                         child_span,
                         child_offset,
+                        depth_left - 1,
                     )
                     .await?;
                     Ok((index, child))
@@ -843,8 +868,15 @@ fn join_subtree<'a>(
 
         let mut pending = BTreeMap::new();
         let mut next_index = 0;
-        let mut out = Vec::with_capacity(subtree_span as usize);
+        // Reserve only once a child has actually arrived, and at most
+        // `MAX_SUBTREE_PREALLOC`: the span is the uploader's claim, and
+        // a level that is still waiting on its children must not hold a
+        // buffer sized by it (issue #286).
+        let mut out = Vec::new();
         while let Some((index, child)) = children.try_next().await? {
+            if out.capacity() == 0 {
+                out.reserve(subtree_span.min(MAX_SUBTREE_PREALLOC) as usize);
+            }
             pending.insert(index, child);
             while let Some(child) = pending.remove(&next_index) {
                 out.extend_from_slice(&child);
@@ -863,6 +895,7 @@ fn join_subtree_to_sender<'a>(
     offset: u64,
     level: u8,
     parity: usize,
+    depth_left: u32,
     out: &'a mpsc::Sender<Vec<u8>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
     Box::pin(async move {
@@ -871,6 +904,9 @@ fn join_subtree_to_sender<'a>(
                 .await
                 .map_err(|_| JoinError::OutputClosed)?;
             return Ok(());
+        }
+        if depth_left == 0 {
+            return Err(too_deep(offset, subtree_span));
         }
 
         let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
@@ -917,6 +953,7 @@ fn join_subtree_to_sender<'a>(
                     addr,
                     child_span,
                     child_offset,
+                    depth_left - 1,
                     &tx,
                 )
                 .await;
@@ -957,6 +994,7 @@ fn join_subtree_to_sender<'a>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn join_child_to_sender(
     fetcher: &dyn ChunkFetcher,
     decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
@@ -964,6 +1002,7 @@ async fn join_child_to_sender(
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
+    depth_left: u32,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
     let child_chunk = priority::at_offset(
@@ -980,6 +1019,7 @@ async fn join_child_to_sender(
         child_offset,
         child_level,
         child_parity,
+        depth_left,
         out,
     )
     .await
@@ -1084,6 +1124,7 @@ fn join_subtree_range_to_sender<'a>(
     offset: u64,
     level: u8,
     parity: usize,
+    depth_left: u32,
     range: ByteRange,
     out: &'a mpsc::Sender<Vec<u8>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
@@ -1109,6 +1150,9 @@ fn join_subtree_range_to_sender<'a>(
                 .await
                 .map_err(|_| JoinError::OutputClosed)?;
             return Ok(());
+        }
+        if depth_left == 0 {
+            return Err(too_deep(offset, subtree_span));
         }
 
         let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
@@ -1146,6 +1190,7 @@ fn join_subtree_range_to_sender<'a>(
                     addr,
                     child_span,
                     child_offset,
+                    depth_left - 1,
                     out,
                 )
                 .await?;
@@ -1157,6 +1202,7 @@ fn join_subtree_range_to_sender<'a>(
                     addr,
                     child_span,
                     child_offset,
+                    depth_left - 1,
                     range,
                     out,
                 )
@@ -1175,6 +1221,7 @@ async fn join_child_range_to_sender(
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
+    depth_left: u32,
     range: ByteRange,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
@@ -1192,6 +1239,7 @@ async fn join_child_range_to_sender(
         child_offset,
         child_level,
         child_parity,
+        depth_left,
         range,
         out,
     )
@@ -1208,6 +1256,7 @@ async fn join_child_with_retries(
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
+    depth_left: u32,
 ) -> Result<Vec<u8>, JoinError> {
     let window = CreditWindow::new(BUFFERED_CREDIT_WINDOW);
     for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
@@ -1218,6 +1267,7 @@ async fn join_child_with_retries(
             addr,
             child_span,
             child_offset,
+            depth_left,
             window.budget(),
         )
         .await
@@ -1235,6 +1285,7 @@ async fn join_child_with_retries(
     unreachable!("retry loop returns on the final attempt");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn join_child_once(
     fetcher: &dyn ChunkFetcher,
     decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
@@ -1242,6 +1293,7 @@ async fn join_child_once(
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
+    depth_left: u32,
     credit_budget: Duration,
 ) -> Result<Vec<u8>, JoinError> {
     let child_chunk = fetch_child_chunk(fetcher, decoder, index, addr, credit_budget).await?;
@@ -1254,6 +1306,7 @@ async fn join_child_once(
         child_offset,
         child_level,
         child_parity,
+        depth_left,
     )
     .await
 }
@@ -1336,6 +1389,99 @@ pub(crate) const fn subtrie_section(refs: usize, subtree_span: u64, branching: u
     }
 }
 
+/// Extra intermediate levels a tree may have beyond the minimum its span
+/// needs ([`max_tree_depth`]). Bee's splitter never builds a deeper tree
+/// than the span requires; the slack only tolerates other uploaders that
+/// wrap a lone reference once more.
+const TREE_DEPTH_SLACK: u32 = 2;
+
+/// Upper bound on the up-front buffer reservation of one buffered
+/// subtree in [`join_subtree`]. A subtree's span is the *declared*
+/// (untrusted) size: reserving it whole at every level let a chain of
+/// one-reference intermediates hold 32 MiB per level while it waited
+/// (security audit RET-03, issue #286). Past this the buffer grows as
+/// bytes actually arrive.
+const MAX_SUBTREE_PREALLOC: u64 = 4 * 1024 * 1024;
+
+/// Number of intermediate levels a tree of `span` bytes needs when every
+/// node has `branching` data children: the smallest `d` with
+/// `4096 * branching^d >= span`. A span that fits one chunk needs none.
+const fn tree_levels(span: u64, branching: u64) -> u32 {
+    let mut cap = CHUNK_SIZE as u64;
+    let mut levels = 0;
+    while cap < span {
+        cap = cap.saturating_mul(branching);
+        levels += 1;
+    }
+    levels
+}
+
+/// Narrowest data branching an intermediate can have at any redundancy
+/// level: each child chunk decodes its own level from its own span, so a
+/// depth or size bound must hold for the narrowest one, not just the
+/// root's.
+fn min_branching(encrypted: bool) -> u64 {
+    (0..=crate::rs::MAX_LEVEL)
+        .map(|level| {
+            if encrypted {
+                crate::rs::max_enc_shards(level)
+            } else {
+                crate::rs::max_shards(level)
+            }
+        })
+        .min()
+        .unwrap_or(1)
+        .max(2) as u64
+}
+
+/// Deepest chain of intermediate chunks (root included) a plain tree of
+/// `span` bytes may have: [`tree_levels`] at the narrowest branching of
+/// any redundancy level, plus [`TREE_DEPTH_SLACK`].
+///
+/// The plain walkers carry the span a parent assigns to each child, and
+/// the last child inherits the whole remainder, so a chain of
+/// intermediates holding one reference each keeps the root span at every
+/// level. Nothing about the span stops that chain; this bound does
+/// (security audit RET-03, issue #286).
+fn max_tree_depth(span: u64) -> u32 {
+    tree_levels(span, min_branching(false)) + TREE_DEPTH_SLACK
+}
+
+/// The [`JoinError::MalformedChunk`] for an intermediate chunk found
+/// below the depth its root span allows.
+fn too_deep(offset: u64, subtree_span: u64) -> JoinError {
+    JoinError::MalformedChunk {
+        offset,
+        detail: format!(
+            "chunk tree deeper than its span allows (intermediate chunk of span {subtree_span} past the depth limit)"
+        ),
+    }
+}
+
+/// Most chunks an encrypted walk of a `span`-byte root may visit before
+/// it is treated as malformed (security audit RET-04, issue #286).
+///
+/// Every child's span is held to its section of the parent, so a walk
+/// visits at most the nodes of a full tree of `span` bytes. At the
+/// narrowest encrypted branching that is `ceil(span / 4096)` leaves plus
+/// `ceil(n / b)` intermediates per level above them. Each intermediate's
+/// rounding can add one partial leaf, so intermediates are counted twice,
+/// plus a little slack. A full 32 MiB tree at level 0 is 8,323 chunks;
+/// this allows 9,076.
+fn max_encrypted_visits(span: u64) -> u64 {
+    let branching = min_branching(true);
+    let leaves = span.div_ceil(CHUNK_SIZE as u64).max(1);
+    let mut intermediates = 0u64;
+    let mut n = leaves;
+    while n > 1 {
+        n = n.div_ceil(branching);
+        intermediates = intermediates.saturating_add(n);
+    }
+    leaves
+        .saturating_add(intermediates.saturating_mul(2))
+        .saturating_add(16)
+}
+
 /// Reconstruct a file from a 64-byte **encrypted** root reference
 /// (`address(32) ‖ key(32)`) into a single buffer.
 ///
@@ -1368,7 +1514,11 @@ pub(crate) const fn subtrie_section(refs: usize, subtree_span: u64, branching: u
 /// or streaming. It backs encrypted feed content and the gateway's
 /// `/bytes`+`/bzz` reads of 128-hex references; `max_bytes` bounds the
 /// allocation and range requests over encrypted content fall back to a
-/// full fetch at the gateway.
+/// full fetch at the gateway. `max_bytes` alone doesn't bound the *work*
+/// (a span-0 leaf adds no bytes), so every child's span is also held to
+/// its section of the parent and the walk to a chunk-visit budget derived
+/// from the root span; either violation is a
+/// [`JoinError::MalformedChunk`] (issue #286).
 ///
 /// Never waits for peer credit (issue #117): the walk is in order and
 /// buffered, with no in-place retry, so a credit wait per chunk would add
@@ -1382,7 +1532,19 @@ pub async fn join_encrypted(
 ) -> Result<Vec<u8>, JoinError> {
     let fetcher = &crate::NoCreditWait(fetcher);
     let mut out = Vec::new();
-    join_encrypted_into(fetcher, root_ref, EncFetch::Root, max_bytes, &mut out).await?;
+    // One visit for the root; once its span is known the walk gets the
+    // rest of `max_encrypted_visits(span)`.
+    let mut visits_left = 1;
+    join_encrypted_into(
+        fetcher,
+        root_ref,
+        EncFetch::Root,
+        None,
+        max_bytes,
+        &mut visits_left,
+        &mut out,
+    )
+    .await?;
     Ok(out)
 }
 
@@ -1404,14 +1566,34 @@ enum EncFetch {
 
 /// Recursive worker for [`join_encrypted`]. Boxed because the recursion is
 /// async (a node expands into child nodes of the same future type).
+///
+/// `section` is the part of the parent's span this node covers (`None`
+/// for the root). A node whose own decrypted span is larger is rejected,
+/// like bee's `ErrMalformedTrie`, so each level's span strictly shrinks
+/// and a node can't re-claim its parent's whole span.
+/// `visits_left` is the walk's shared chunk-visit budget
+/// ([`max_encrypted_visits`] of the root span): a backstop so a DAG that
+/// references the same chunks over and over (span-0 leaves add no bytes,
+/// so `max_bytes` never trips) can't turn a few chunks into an unbounded
+/// number of fetches and decrypts (security audit RET-04, issue #286).
 fn join_encrypted_into<'a>(
     fetcher: &'a dyn ChunkFetcher,
     node_ref: [u8; ENCRYPTED_REF_SIZE],
     via: EncFetch,
+    section: Option<u64>,
     max_bytes: usize,
+    visits_left: &'a mut u64,
     out: &'a mut Vec<u8>,
 ) -> Pin<Box<dyn Future<Output = Result<(), JoinError>> + Send + 'a>> {
     Box::pin(async move {
+        if *visits_left == 0 {
+            return Err(JoinError::MalformedChunk {
+                offset: out.len() as u64,
+                detail: "encrypted chunk tree visits more chunks than its span allows".into(),
+            });
+        }
+        *visits_left -= 1;
+
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&node_ref[..32]);
         let mut key = [0u8; ant_crypto::KEY_LENGTH];
@@ -1452,11 +1634,26 @@ fn join_encrypted_into<'a>(
         // (bee `redundancy.DecodeSpan`); the rest is the plain byte count.
         let (level, plain_span) = crate::rs::decode_span(span_raw);
         let span = u64::from_le_bytes(plain_span);
-        if span > max_bytes as u64 {
-            return Err(JoinError::TooLarge {
-                span,
-                cap: max_bytes,
-            });
+        match section {
+            Some(section) if span > section => {
+                return Err(JoinError::MalformedChunk {
+                    offset: out.len() as u64,
+                    detail: format!(
+                        "encrypted chunk {} spans {span} bytes, more than the {section} its parent assigns it",
+                        hex::encode(addr)
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => {
+                if span > max_bytes as u64 {
+                    return Err(JoinError::TooLarge {
+                        span,
+                        cap: max_bytes,
+                    });
+                }
+                *visits_left = max_encrypted_visits(span).saturating_sub(1);
+            }
         }
 
         // Leaf: any subtree of at most one chunk is stored as a single
@@ -1528,8 +1725,18 @@ fn join_encrypted_into<'a>(
                 Some(d) => EncFetch::Shard(d.clone(), i),
                 None => EncFetch::Plain,
             };
-            join_encrypted_into(fetcher, child, via, max_bytes, out).await?;
-            remaining = remaining.saturating_sub(branch_size.min(remaining));
+            let child_section = branch_size.min(remaining);
+            join_encrypted_into(
+                fetcher,
+                child,
+                via,
+                Some(child_section),
+                max_bytes,
+                visits_left,
+                out,
+            )
+            .await?;
+            remaining -= child_section;
         }
         Ok(())
     })
@@ -2314,9 +2521,10 @@ mod tests {
         };
         let fetcher = crate::NoCreditWait(&inner);
         let started = tokio::time::Instant::now();
-        let err = join_child_with_retries(&fetcher, None, 0, [7u8; 32], 8192, 0)
-            .await
-            .unwrap_err();
+        let err =
+            join_child_with_retries(&fetcher, None, 0, [7u8; 32], 8192, 0, max_tree_depth(8192))
+                .await
+                .unwrap_err();
         assert!(fetch_chunk_pool_starved(&err), "got {err:?}");
         assert_eq!(inner.calls.load(Ordering::SeqCst), SUBTREE_RETRY_ATTEMPTS);
         assert!(started.elapsed() > BUFFERED_CREDIT_WINDOW);
@@ -2329,7 +2537,7 @@ mod tests {
         // Waiting: the buffered child gives up by its window's end.
         inner.calls.store(0, Ordering::SeqCst);
         let started = tokio::time::Instant::now();
-        join_child_with_retries(&inner, None, 0, [7u8; 32], 8192, 0)
+        join_child_with_retries(&inner, None, 0, [7u8; 32], 8192, 0, max_tree_depth(8192))
             .await
             .unwrap_err();
         assert!(started.elapsed() <= BUFFERED_CREDIT_WINDOW);
@@ -3188,5 +3396,365 @@ mod tests {
             Err(JoinError::TooLarge { cap, .. }) => assert_eq!(cap, 1000),
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    // ---- Malformed-tree bounds (security audit RET-03/RET-04, #286) ----
+
+    /// Wraps a fetcher and counts every fetch, so a test can bound how
+    /// much of a malformed tree a walk touched before it gave up.
+    struct CountingFetcher<F> {
+        inner: F,
+        fetches: AtomicUsize,
+    }
+
+    impl<F> CountingFetcher<F> {
+        fn new(inner: F) -> Self {
+            Self {
+                inner,
+                fetches: AtomicUsize::new(0),
+            }
+        }
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<F: crate::ChunkFetcher> crate::ChunkFetcher for CountingFetcher<F> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch(addr).await
+        }
+    }
+
+    /// A chain of `levels` intermediate chunks holding one reference
+    /// each, over a single 4 KiB leaf, with a root claiming `root_span`
+    /// bytes. Returns the root's wire bytes.
+    fn one_ref_chain(fetcher: &mut MapFetcher, levels: usize, root_span: u64) -> Vec<u8> {
+        let leaf = vec![0x5au8; CHUNK_SIZE];
+        let mut child = chunk_addr(&leaf, CHUNK_SIZE as u64);
+        let mut wire = (CHUNK_SIZE as u64).to_le_bytes().to_vec();
+        wire.extend_from_slice(&leaf);
+        fetcher.insert(child, wire);
+        for _ in 0..levels {
+            let addr = chunk_addr(&child, root_span);
+            let mut wire = root_span.to_le_bytes().to_vec();
+            wire.extend_from_slice(&child);
+            fetcher.insert(addr, wire.clone());
+            child = addr;
+        }
+        let mut root = root_span.to_le_bytes().to_vec();
+        root.extend_from_slice(&child);
+        root
+    }
+
+    fn assert_too_deep<T: std::fmt::Debug>(r: Result<T, JoinError>, walker: &str) {
+        match r {
+            Err(JoinError::MalformedChunk { detail, .. }) => assert!(
+                detail.contains("deeper than its span allows"),
+                "{walker}: unexpected detail {detail}"
+            ),
+            other => panic!("{walker}: expected MalformedChunk, got {other:?}"),
+        }
+    }
+
+    /// RET-03: a 200-level chain of one-reference intermediates (each
+    /// inheriting the root's full 32 MiB span) is rejected as malformed
+    /// after only the few levels its span allows, by every plain walker,
+    /// and the buffered join never reserves span-sized buffers on the
+    /// way down. Before #286 each level reserved 32 MiB up front while it
+    /// waited on its child, and nothing stopped the descent.
+    #[test]
+    fn deep_one_reference_chain_is_rejected_with_low_peak_allocation() {
+        let span = DEFAULT_MAX_FILE_BYTES as u64;
+        let mut map = MapFetcher::new();
+        let root = one_ref_chain(&mut map, 200, span);
+        let fetcher = CountingFetcher::new(map);
+        let depth = max_tree_depth(span) as usize;
+        assert!(depth < 10, "depth bound {depth} for a 32 MiB span");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (r, peak) = crate::test_alloc::peak_during(|| {
+            rt.block_on(join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES))
+        });
+        assert_too_deep(r, "join");
+        assert!(
+            peak < 256 * 1024,
+            "buffered join of a malformed chain peaked at {peak} bytes"
+        );
+        // The root is in hand; one fetch per allowed level below it.
+        assert!(
+            fetcher.fetches() <= depth,
+            "buffered join fetched {} chunks with a depth bound of {depth}",
+            fetcher.fetches()
+        );
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let drain = rt.spawn(async move { while rx.recv().await.is_some() {} });
+        let r = rt.block_on(join_to_sender(
+            &fetcher,
+            &root,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+            tx,
+        ));
+        assert_too_deep(r, "join_to_sender");
+        drop(drain);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let drain = rt.spawn(async move { while rx.recv().await.is_some() {} });
+        let r = rt.block_on(join_to_sender_range(
+            &fetcher,
+            &root,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+            ByteRange::clamp(0, 10, span),
+            tx,
+        ));
+        assert_too_deep(r, "join_to_sender_range");
+        drop(drain);
+
+        let r = rt.block_on(enumerate_chunk_tree(
+            &fetcher,
+            [0x11; 32],
+            &root,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+        ));
+        assert_too_deep(r, "enumerate_chunk_tree");
+    }
+
+    /// Depth of an honest plain tree of `span` bytes at `level`: one
+    /// intermediate per level down the (largest) first child.
+    fn honest_plain_depth(span: u64, level: u8) -> u32 {
+        if span <= CHUNK_SIZE as u64 {
+            return 0;
+        }
+        let (shards, _) = crate::rs::reference_count(span, level);
+        let section = subtrie_section(shards, span, crate::rs::max_shards(level) as u64);
+        1 + honest_plain_depth(section.min(span), level)
+    }
+
+    /// Every honest plain tree, at every redundancy level and up to the
+    /// durability cap, fits inside the depth bound, with the slack spare.
+    #[test]
+    fn honest_plain_trees_fit_the_depth_bound() {
+        for level in 0..=crate::rs::MAX_LEVEL {
+            for span in [
+                CHUNK_SIZE as u64 + 1,
+                128 * CHUNK_SIZE as u64,
+                128 * CHUNK_SIZE as u64 + 1,
+                DEFAULT_MAX_FILE_BYTES as u64,
+                DURABILITY_MAX_FILE_BYTES,
+            ] {
+                let honest = honest_plain_depth(span, level);
+                assert!(
+                    honest + TREE_DEPTH_SLACK <= max_tree_depth(span),
+                    "level {level} span {span}: honest depth {honest}, bound {}",
+                    max_tree_depth(span)
+                );
+            }
+        }
+    }
+
+    /// Chunks an honest encrypted tree of `span` bytes at `level` holds,
+    /// walking the same geometry `join_encrypted_into` does.
+    fn honest_encrypted_nodes(span: u64, level: u8) -> u64 {
+        if span <= CHUNK_SIZE as u64 {
+            return 1;
+        }
+        let (shards, _) = crate::rs::reference_count_enc(span, level);
+        let section = subtrie_section(shards, span, crate::rs::max_enc_shards(level) as u64);
+        let mut remaining = span;
+        let mut nodes = 1;
+        for _ in 0..shards {
+            let child = section.min(remaining);
+            nodes += honest_encrypted_nodes(child, level);
+            remaining -= child;
+        }
+        nodes
+    }
+
+    /// Every honest encrypted tree, at every redundancy level, visits no
+    /// more chunks than the budget allows — including a full 32 MiB tree.
+    #[test]
+    fn honest_encrypted_trees_fit_the_visit_budget() {
+        for level in 0..=crate::rs::MAX_LEVEL {
+            for span in [
+                0,
+                CHUNK_SIZE as u64,
+                CHUNK_SIZE as u64 + 1,
+                64 * CHUNK_SIZE as u64 + 1,
+                5_000_000,
+                DEFAULT_MAX_FILE_BYTES as u64 - 1,
+                DEFAULT_MAX_FILE_BYTES as u64,
+            ] {
+                let honest = honest_encrypted_nodes(span, level);
+                assert!(
+                    honest <= max_encrypted_visits(span),
+                    "level {level} span {span}: honest tree {honest} chunks, budget {}",
+                    max_encrypted_visits(span)
+                );
+            }
+        }
+        assert_eq!(
+            honest_encrypted_nodes(DEFAULT_MAX_FILE_BYTES as u64, 0),
+            8323
+        );
+        assert_eq!(max_encrypted_visits(DEFAULT_MAX_FILE_BYTES as u64), 9076);
+    }
+
+    /// Wire of an encrypted intermediate whose 64-byte refs are
+    /// `children`, claiming `span`.
+    fn enc_intermediate(
+        fetcher: &mut MapFetcher,
+        children: &[[u8; 64]],
+        span: u64,
+        key: &[u8; 32],
+    ) -> [u8; 64] {
+        let payload: Vec<u8> = children.iter().flatten().copied().collect();
+        let (wire, r) = build_enc_chunk(&payload, span, key);
+        fetcher.insert(r[..32].try_into().unwrap(), wire);
+        r
+    }
+
+    /// RET-04: a 4-level, 64-wide encrypted DAG whose every reference at
+    /// each level points at the same chunk, over a span-0 leaf. The leaf
+    /// adds no bytes, so `max_bytes` never trips, and before #286 the
+    /// walk made 64^4 (~16.7M) fetches and decrypts from 5 chunks. Every
+    /// node claims 16 MiB (64 sections of 256 KiB), so a child claiming
+    /// more than its parent's section is refused at once, well inside the
+    /// visit budget.
+    #[tokio::test]
+    async fn encrypted_span_zero_dag_errors_within_the_visit_budget() {
+        let mut map = MapFetcher::new();
+        let span = 64 * 64 * CHUNK_SIZE as u64; // 16 MiB
+        let (leaf_wire, leaf) = build_enc_chunk(&[], 0, &[0x01; 32]);
+        map.insert(leaf[..32].try_into().unwrap(), leaf_wire);
+        let mut node = leaf;
+        for level in 0..4u8 {
+            node = enc_intermediate(&mut map, &[node; 64], span, &[0x10 + level; 32]);
+        }
+        let fetcher = CountingFetcher::new(map);
+
+        let r = join_encrypted(&fetcher, node, DEFAULT_MAX_FILE_BYTES).await;
+        assert!(
+            matches!(r, Err(JoinError::MalformedChunk { .. })),
+            "expected MalformedChunk, got {r:?}"
+        );
+        let budget = max_encrypted_visits(span) as usize;
+        assert!(
+            fetcher.fetches() <= budget,
+            "walk fetched {} chunks, budget {budget}",
+            fetcher.fetches()
+        );
+    }
+
+    /// A child whose own span is larger than the section of its parent it
+    /// sits in is malformed (bee `ErrMalformedTrie`). Here a root of two
+    /// 4 KiB sections has a first child claiming 5,000 bytes: before #286
+    /// the walk joined 9,096 bytes for a root that declares 8,192.
+    #[tokio::test]
+    async fn encrypted_child_span_larger_than_its_section_is_rejected() {
+        let mut map = MapFetcher::new();
+        let (w, a) = build_enc_chunk(&[b'a'; CHUNK_SIZE], CHUNK_SIZE as u64, &[0x01; 32]);
+        map.insert(a[..32].try_into().unwrap(), w);
+        let (w, b) = build_enc_chunk(&[b'b'; 904], 904, &[0x02; 32]);
+        map.insert(b[..32].try_into().unwrap(), w);
+        let oversized = enc_intermediate(&mut map, &[a, b], 5_000, &[0x03; 32]);
+        let (w, c) = build_enc_chunk(&[b'c'; CHUNK_SIZE], CHUNK_SIZE as u64, &[0x04; 32]);
+        map.insert(c[..32].try_into().unwrap(), w);
+        let root = enc_intermediate(
+            &mut map,
+            &[oversized, c],
+            2 * CHUNK_SIZE as u64,
+            &[0x05; 32],
+        );
+
+        match join_encrypted(&map, root, DEFAULT_MAX_FILE_BYTES).await {
+            Err(JoinError::MalformedChunk { detail, .. }) => assert!(
+                detail.contains("more than the 4096 its parent assigns it"),
+                "unexpected detail {detail}"
+            ),
+            other => panic!("expected MalformedChunk, got {other:?}"),
+        }
+    }
+
+    /// The visit budget stops a walk on its own, independent of the
+    /// section check: with only 10 visits left, the honest 66-chunk tree
+    /// below is refused on the 11th chunk and nothing past it is fetched.
+    #[tokio::test]
+    async fn encrypted_walk_stops_at_the_visit_budget() {
+        let mut map = MapFetcher::new();
+        let mut leaves = Vec::new();
+        for i in 0..64u8 {
+            let (w, r) = build_enc_chunk(&[i; CHUNK_SIZE], CHUNK_SIZE as u64, &[i; 32]);
+            map.insert(r[..32].try_into().unwrap(), w);
+            leaves.push(r);
+        }
+        let full = enc_intermediate(&mut map, &leaves, 64 * CHUNK_SIZE as u64, &[0xb0; 32]);
+        let (w, tail) = build_enc_chunk(&[0xee; 300], 300, &[0xb1; 32]);
+        map.insert(tail[..32].try_into().unwrap(), w);
+        let root = enc_intermediate(
+            &mut map,
+            &[full, tail],
+            64 * CHUNK_SIZE as u64 + 300,
+            &[0xb2; 32],
+        );
+        let fetcher = CountingFetcher::new(map);
+
+        let mut visits_left = 10;
+        let mut out = Vec::new();
+        let r = join_encrypted_into(
+            &fetcher,
+            root,
+            EncFetch::Plain,
+            Some(u64::MAX),
+            DEFAULT_MAX_FILE_BYTES,
+            &mut visits_left,
+            &mut out,
+        )
+        .await;
+        match r {
+            Err(JoinError::MalformedChunk { detail, .. }) => assert!(
+                detail.contains("visits more chunks than its span allows"),
+                "unexpected detail {detail}"
+            ),
+            other => panic!("expected MalformedChunk, got {other:?}"),
+        }
+        assert_eq!(fetcher.fetches(), 10);
+    }
+
+    /// An honest three-level encrypted tree (a full 64-leaf intermediate
+    /// plus a 300-byte leaf remainder) still joins under the section check and
+    /// visit budget: the first child's section is a full 256 KiB, the
+    /// last one gets the remainder.
+    #[tokio::test]
+    async fn join_encrypted_three_level_tree() {
+        let mut map = MapFetcher::new();
+        let mut expected = Vec::new();
+        let mut leaves = Vec::new();
+        for i in 0..64u8 {
+            let data = vec![i; CHUNK_SIZE];
+            let (w, r) = build_enc_chunk(&data, CHUNK_SIZE as u64, &[i; 32]);
+            map.insert(r[..32].try_into().unwrap(), w);
+            leaves.push(r);
+            expected.extend_from_slice(&data);
+        }
+        let full = enc_intermediate(&mut map, &leaves, 64 * CHUNK_SIZE as u64, &[0xa0; 32]);
+        let tail = vec![0xeeu8; 300];
+        let (w, tail_leaf) = build_enc_chunk(&tail, tail.len() as u64, &[0xa1; 32]);
+        map.insert(tail_leaf[..32].try_into().unwrap(), w);
+        expected.extend_from_slice(&tail);
+        let total = expected.len() as u64;
+        let root = enc_intermediate(&mut map, &[full, tail_leaf], total, &[0xa3; 32]);
+
+        let out = join_encrypted(&map, root, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("honest three-level encrypted join");
+        assert_eq!(out, expected);
     }
 }
