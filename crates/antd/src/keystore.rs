@@ -43,7 +43,8 @@ const MIN_DKLEN: u64 = 32;
 const MAX_DKLEN: u64 = 64;
 /// Largest scrypt `n` we accept (2^20). go-ethereum's "standard"
 /// keystore uses 2^18 and bee 2^15; 2^20 leaves headroom while keeping
-/// the work and memory a keystore can demand bounded.
+/// the `ROMix` table bounded. It does not bound CPU time on its own:
+/// `p` repeats the whole `ROMix` pass, see [`MAX_SCRYPT_WORK`].
 const MAX_SCRYPT_N: u64 = 1 << 20;
 /// Largest scrypt buffer we accept, for each of the two `scrypt` sizes
 /// from the file: the `ROMix` table (`128 * n * r` bytes) and the block
@@ -51,6 +52,19 @@ const MAX_SCRYPT_N: u64 = 1 << 20;
 /// `r = 8`. Bounding `n` alone isn't enough, since `r` and `p` size
 /// their own allocations.
 const MAX_SCRYPT_MEM: u64 = 1 << 30;
+/// Largest scrypt `n * r * p` we accept (2^23). scrypt's CPU time grows
+/// with that product (`p` sequential `ROMix` passes of `2 * n` `BlockMix`
+/// rounds over `r`-sized blocks), and the memory caps above don't bound
+/// it: `n = 2^20, r = 8, p = 2^20` passes both and then runs 2^20 full
+/// 1 GiB passes. The cap is the largest single pass the memory cap
+/// allows (`n = 2^20, r = 8, p = 1`); geth standard (2^18, 8, 1) is 2^21
+/// and bee (2^15, 8, 1) 2^18.
+const MAX_SCRYPT_WORK: u64 = 1 << 23;
+/// Largest pbkdf2 iteration count `c` we accept (2^22). go-ethereum
+/// writes 2^18 (262144); 16x that is a few seconds at most, where an
+/// unbounded `c` (up to `u32::MAX`, ~4.3e9 HMAC rounds) would hang
+/// startup for hours.
+const MAX_PBKDF2_C: u32 = 1 << 22;
 
 #[derive(Deserialize)]
 struct Keystore {
@@ -185,6 +199,11 @@ fn derive_key(
             if blocks > u128::from(MAX_SCRYPT_MEM) {
                 bail!("scrypt r={r}, p={p} needs {blocks} bytes of memory (max {MAX_SCRYPT_MEM})");
             }
+            // n <= 2^20 and r, p < 2^32, so this fits a u128.
+            let work = u128::from(n) * u128::from(r) * u128::from(p);
+            if work > u128::from(MAX_SCRYPT_WORK) {
+                bail!("scrypt n={n}, r={r}, p={p} is too much work (n*r*p={work}, max {MAX_SCRYPT_WORK})");
+            }
             let log_n = n.trailing_zeros() as u8;
             let sparams = scrypt::Params::new(log_n, r, p, dklen)
                 .map_err(|e| anyhow!("invalid scrypt params: {e}"))?;
@@ -200,6 +219,9 @@ fn derive_key(
                 bail!("unsupported pbkdf2 prf {prf:?} (only hmac-sha256)");
             }
             let c = u32_param(params, "c")?;
+            if c > MAX_PBKDF2_C {
+                bail!("pbkdf2 c={c} is too much work (max {MAX_PBKDF2_C})");
+            }
             pbkdf2::pbkdf2_hmac::<Sha256>(password, &salt, c, &mut out);
         }
         other => bail!("unsupported kdf {other:?}"),
@@ -452,6 +474,35 @@ pub(crate) mod tests {
         // Passes the `n * r` bound but `p` sizes a 64 GiB block buffer.
         rejected("scrypt", scrypt_params(2, 1, 1 << 29, 32), "memory");
         rejected("scrypt", scrypt_params(2, 1, u32::MAX.into(), 32), "memory");
+    }
+
+    /// Parameters inside every memory cap can still demand days of CPU
+    /// through `p` (each one a full `ROMix` pass).
+    #[test]
+    fn rejects_scrypt_work_over_cap() {
+        // Both buffers exactly at the 1 GiB cap, then 2^20 passes.
+        rejected(
+            "scrypt",
+            scrypt_params(1 << 20, 8, 1 << 20, 32),
+            "too much work",
+        );
+        // One step past the largest single pass the memory cap allows.
+        rejected("scrypt", scrypt_params(1 << 20, 8, 2, 32), "too much work");
+        // Tiny buffers, but 2^24 passes.
+        rejected("scrypt", scrypt_params(2, 1, 1 << 23, 32), "too much work");
+        // Under the cap, the bounds pass and it reaches the MAC check.
+        rejected("scrypt", scrypt_params(16, 8, 4, 32), "MAC mismatch");
+    }
+
+    /// `c = u32::MAX` fits a u32 but is ~4.3e9 HMAC rounds.
+    #[test]
+    fn rejects_pbkdf2_c_over_work_cap() {
+        rejected(
+            "pbkdf2",
+            pbkdf2_params(u32::MAX.into(), 32),
+            "too much work",
+        );
+        rejected("pbkdf2", pbkdf2_params((1 << 22) + 1, 32), "too much work");
     }
 
     /// A stored MAC of the wrong length is a mismatch, not a panic.
