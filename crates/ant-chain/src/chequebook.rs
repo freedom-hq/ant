@@ -81,7 +81,7 @@ pub struct Cheque {
 }
 
 /// `Cheque + 65-byte (r ‖ s ‖ v)` signature, as carried on the swap
-/// wire. `v` is in `27..=30`, matching `ant_crypto::sign_prehash`.
+/// wire. `v` is 27 or 28, matching `ant_crypto::sign_prehash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedCheque {
     pub cheque: Cheque,

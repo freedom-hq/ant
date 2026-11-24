@@ -431,7 +431,7 @@ async fn handshake_outbound_inner(
         overlay_nonce,
         our_timestamp,
         our_chequebook,
-    );
+    )?;
     let sig = sign_handshake_data(signing_secret, &sign_data)?;
 
     if resp_ack.network_id != network_id {
