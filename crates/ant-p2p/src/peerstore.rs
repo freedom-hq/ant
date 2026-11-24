@@ -18,6 +18,7 @@
 //! dropped. On a soft cap of [`MAX_ENTRIES`] entries we evict by oldest
 //! `last_seen_unix` first. Successful handshakes reset the failure counter.
 
+use crate::handshake::KnownBzzRecord;
 use crate::sinks::PeerHint;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,28 @@ impl PeerStore {
     #[cfg(test)]
     pub fn contains(&self, peer_id: &PeerId) -> bool {
         self.entries.contains_key(peer_id)
+    }
+
+    /// The overlay `peer_id` proved in its last successful BZZ handshake
+    /// (V14 or V15), or `None` for an unknown peer. A hive entry that
+    /// names this peer under a different overlay is not believed (#299).
+    pub fn verified_overlay(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
+        self.entries
+            .get(peer_id)
+            .map(|e| e.overlay)
+            .filter(|o| *o != [0u8; 32])
+    }
+
+    /// The newest signed V15 record held for `peer_id`, for the
+    /// handshake's stale-timestamp check. `None` when the peer is unknown
+    /// or only ever handshook over V14 (timestamp 0).
+    pub fn known_bzz_record(&self, peer_id: &PeerId) -> Option<KnownBzzRecord> {
+        let e = self.entries.get(peer_id)?;
+        let timestamp = i64::try_from(e.bzz_timestamp).ok().filter(|t| *t > 0)?;
+        Some(KnownBzzRecord {
+            overlay: e.overlay,
+            timestamp,
+        })
     }
 
     /// Convert loaded entries into hints for the dial pipeline, ordered by
@@ -660,6 +683,32 @@ mod tests {
         let e = reloaded.entries.get(&peer).unwrap();
         assert_eq!(e.bzz_timestamp, 1_715_000_000);
         assert_eq!(e.chequebook, Some(cb));
+    }
+
+    /// #299: the handshake's stale-timestamp check reads the held V15
+    /// record, across a restart; a V14-only peer or an unknown one has
+    /// none (so nothing blocks it).
+    #[test]
+    fn known_bzz_record_is_the_held_v15_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut store = PeerStore::load(path.clone());
+        let v15 = fake_peer(70);
+        let v14 = fake_peer(71);
+        store.record_success(v15, vec![fake_addr(1)], [0xab; 32], 1_715_000_000, None);
+        store.record_success(v14, vec![fake_addr(2)], [0xac; 32], 0, None);
+        store.flush();
+
+        let reloaded = PeerStore::load(path);
+        assert_eq!(
+            reloaded.known_bzz_record(&v15),
+            Some(KnownBzzRecord {
+                overlay: [0xab; 32],
+                timestamp: 1_715_000_000,
+            })
+        );
+        assert_eq!(reloaded.known_bzz_record(&v14), None);
+        assert_eq!(reloaded.known_bzz_record(&fake_peer(72)), None);
     }
 
     #[test]

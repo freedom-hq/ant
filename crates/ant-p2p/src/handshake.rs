@@ -90,6 +90,27 @@ pub enum HandshakeError {
     TimestampInvalid(i64),
     #[error("remote timestamp in future (got {0}, now {1})")]
     TimestampInFuture(i64, i64),
+    /// The signed V15 record is strictly older than the one we already
+    /// hold for this overlay (bee's `bzz.ErrTimestampStale`): a replay of
+    /// a superseded record.
+    #[error("remote timestamp stale (got {0}, already have {1})")]
+    TimestampStale(i64, i64),
+    /// None of the signed underlays ends in `/p2p/<id>` of the peer that
+    /// authenticated this connection, so the `BzzAddress` belongs to
+    /// someone else (a replayed, publicly gossiped record).
+    #[error("remote underlay does not name the connected peer id")]
+    UnderlayPeerId,
+}
+
+/// The newest signed `BzzAddress` we already hold for a peer (from the
+/// peerstore). A V15 handshake presenting an older record for the same
+/// overlay is rejected, like bee's `CheckTimestamp` with
+/// `TimestampSourceHandshake`: equal is accepted (a peer re-presenting
+/// its current record on reconnect is benign).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownBzzRecord {
+    pub overlay: [u8; 32],
+    pub timestamp: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +281,7 @@ pub async fn handshake_outbound<S>(
     remote_peer_addrs: &[Multiaddr],
     local_listen_addrs: Vec<Multiaddr>,
     version: HandshakeWireVersion,
+    known: Option<KnownBzzRecord>,
 ) -> Result<HandshakeInfo, HandshakeError>
 where
     S: AsyncReadExt + AsyncWriteExt + Send + Unpin,
@@ -275,6 +297,7 @@ where
         local_listen_addrs,
         advertise_full_node_from_env(),
         version,
+        known,
     )
     .await
 }
@@ -327,6 +350,7 @@ pub async fn handshake_outbound_with_role<S>(
     local_listen_addrs: Vec<Multiaddr>,
     advertise_full_node: bool,
     version: HandshakeWireVersion,
+    known: Option<KnownBzzRecord>,
 ) -> Result<HandshakeInfo, HandshakeError>
 where
     S: AsyncReadExt + AsyncWriteExt + Send + Unpin,
@@ -344,6 +368,7 @@ where
             local_listen_addrs,
             advertise_full_node,
             version,
+            known,
         ),
     )
     .await
@@ -362,6 +387,7 @@ async fn handshake_outbound_inner(
     local_listen_addrs: Vec<Multiaddr>,
     advertise_full_node: bool,
     version: HandshakeWireVersion,
+    known: Option<KnownBzzRecord>,
 ) -> Result<HandshakeInfo, HandshakeError> {
     let sk = SigningKey::from_bytes(signing_secret.into())?;
     let vk = k256::ecdsa::VerifyingKey::from(&sk);
@@ -389,12 +415,11 @@ async fn handshake_outbound_inner(
         .ok_or(HandshakeError::IncompleteSynAck)?;
 
     let observed = deserialize_underlays(&resp_syn.observed_underlay)?;
+    // The peer id an address names is its *last* `/p2p/` (a circuit's
+    // destination, not its relay), the same rule `check_remote_underlay`
+    // and the hive hint use.
     for o in &observed {
-        let info = o.iter().find_map(|p| match p {
-            Protocol::P2p(pid) => Some(pid),
-            _ => None,
-        });
-        if info != Some(local_peer_id) {
+        if crate::dial::extract_peer_id(o) != Some(local_peer_id) {
             return Err(HandshakeError::SynPeerId);
         }
     }
@@ -469,13 +494,7 @@ async fn handshake_outbound_inner(
     let (remote_timestamp, remote_chequebook): (i64, Option<[u8; 20]>) = match version {
         HandshakeWireVersion::V14 => (0, None),
         HandshakeWireVersion::V15 => {
-            if addr.timestamp <= 0 {
-                return Err(HandshakeError::TimestampInvalid(addr.timestamp));
-            }
-            let now = unix_now_i64();
-            if addr.timestamp > now.saturating_add(MAX_CLOCK_SKEW) {
-                return Err(HandshakeError::TimestampInFuture(addr.timestamp, now));
-            }
+            check_wire_timestamp(addr.timestamp)?;
             let cb = match addr.chequebook_address.len() {
                 0 => None,
                 HANDSHAKE_CHEQUEBOOK_LEN => {
@@ -499,6 +518,8 @@ async fn handshake_outbound_inner(
         remote_timestamp,
         addr.chequebook_address.as_slice(),
     )?;
+    check_remote_underlay(&addr.underlay, remote_peer_id)?;
+    check_not_stale(version, &remote_overlay, remote_timestamp, known)?;
 
     if !resp_ack.welcome_message.is_empty() {
         debug!(
@@ -554,6 +575,62 @@ async fn handshake_outbound_inner(
     })
 }
 
+/// Bee's `CheckTimestamp` bounds that need no stored record: a signed V15
+/// timestamp must be positive and at most [`MAX_CLOCK_SKEW`] ahead of our
+/// clock. Shared by the handshake and hive gossip.
+pub(crate) fn check_wire_timestamp(timestamp: i64) -> Result<(), HandshakeError> {
+    if timestamp <= 0 {
+        return Err(HandshakeError::TimestampInvalid(timestamp));
+    }
+    let now = unix_now_i64();
+    if timestamp > now.saturating_add(MAX_CLOCK_SKEW) {
+        return Err(HandshakeError::TimestampInFuture(timestamp, now));
+    }
+    Ok(())
+}
+
+/// Bee's `ParseAddress` decodes the signed underlay and rejects an empty
+/// list. On top of that we bind the record to the connection: at least
+/// one underlay must end in `/p2p/<remote_peer_id>` (bee's `buildFullMA`
+/// always appends it), so a peer can't present someone else's publicly
+/// gossiped `BzzAddress` as its own.
+fn check_remote_underlay(underlay: &[u8], remote_peer_id: PeerId) -> Result<(), HandshakeError> {
+    let addrs = deserialize_underlays(underlay)?;
+    if addrs
+        .iter()
+        .any(|a| crate::dial::extract_peer_id(a) == Some(remote_peer_id))
+    {
+        Ok(())
+    } else {
+        Err(HandshakeError::UnderlayPeerId)
+    }
+}
+
+/// Bee's `CheckTimestamp(.., TimestampSourceHandshake)`: a V15 record
+/// strictly older than the one held for the same overlay is stale. A
+/// held timestamp of 0 (V14 / pre-timestamp) never blocks.
+fn check_not_stale(
+    version: HandshakeWireVersion,
+    remote_overlay: &[u8; 32],
+    remote_timestamp: i64,
+    known: Option<KnownBzzRecord>,
+) -> Result<(), HandshakeError> {
+    match known {
+        Some(k)
+            if version == HandshakeWireVersion::V15
+                && k.overlay == *remote_overlay
+                && k.timestamp > 0
+                && remote_timestamp < k.timestamp =>
+        {
+            Err(HandshakeError::TimestampStale(
+                remote_timestamp,
+                k.timestamp,
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn unix_now_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -598,6 +675,39 @@ fn build_full_peer_maddrs(
 fn sort_dedupe_maddrs(addrs: &mut Vec<Multiaddr>) {
     addrs.sort_by_key(std::string::ToString::to_string);
     addrs.dedup_by(|a, b| a == b);
+}
+
+/// A `BzzAddress` record signed by `secret` over `underlay` (empty
+/// chequebook, fixed nonce): `(overlay, signature, nonce)`.
+#[cfg(test)]
+pub(crate) fn sign_test_record(
+    secret: &[u8; SECP256K1_SECRET_LEN],
+    version: HandshakeWireVersion,
+    network_id: u64,
+    underlay: &[u8],
+    timestamp: i64,
+) -> ([u8; 32], [u8; 65], [u8; OVERLAY_NONCE_LEN]) {
+    let sk = SigningKey::from_bytes(secret.into()).unwrap();
+    let eth = ant_crypto::ethereum_address_from_public_key(&k256::ecdsa::VerifyingKey::from(&sk));
+    let nonce = [0x11u8; OVERLAY_NONCE_LEN];
+    let overlay = overlay_from_ethereum_address(&eth, network_id, &nonce);
+    let data = ant_crypto::handshake_sign_data(
+        version,
+        underlay,
+        &overlay,
+        network_id,
+        &nonce,
+        timestamp,
+        &[],
+    )
+    .unwrap();
+    (overlay, sign_handshake_data(secret, &data).unwrap(), nonce)
+}
+
+/// Our clock, for tests in other modules stamping V15 records.
+#[cfg(test)]
+pub(crate) fn tests_now() -> i64 {
+    unix_now_i64()
 }
 
 #[cfg(test)]
@@ -691,6 +801,16 @@ mod tests {
     /// Run our outbound handshake against a "remote" that has already
     /// answered with `syn_ack`, and return how it ended.
     async fn outbound_against(syn_ack: SynAck) -> Result<HandshakeInfo, HandshakeError> {
+        outbound_between(syn_ack, PeerId::random(), PeerId::random(), None).await
+    }
+
+    /// [`outbound_against`] with chosen peer ids and a held record.
+    async fn outbound_between(
+        syn_ack: SynAck,
+        local: PeerId,
+        remote: PeerId,
+        known: Option<KnownBzzRecord>,
+    ) -> Result<HandshakeInfo, HandshakeError> {
         use tokio::io::AsyncWriteExt as _;
         use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -699,8 +819,6 @@ mod tests {
         syn_ack.encode_length_delimited(&mut buf).unwrap();
         theirs.write_all(&buf).await.unwrap();
 
-        let local = PeerId::random();
-        let remote = PeerId::random();
         let res = handshake_outbound_with_role(
             ours.compat(),
             local,
@@ -712,10 +830,196 @@ mod tests {
             Vec::new(),
             false,
             HandshakeWireVersion::V15,
+            known,
         )
         .await;
         drop(theirs);
         res
+    }
+
+    const REMOTE_SECRET: [u8; SECP256K1_SECRET_LEN] = [9u8; SECP256K1_SECRET_LEN];
+
+    /// A well-formed V15 `SynAck` from a full node whose signed record
+    /// carries `underlay` (raw bytes, signed as-is) and `timestamp`.
+    /// Returns it with the record's overlay.
+    fn signed_syn_ack(local: PeerId, underlay: Vec<u8>, timestamp: i64) -> (SynAck, [u8; 32]) {
+        let observed: Multiaddr = format!("/ip4/5.6.7.8/tcp/4001/p2p/{local}")
+            .parse()
+            .unwrap();
+        let (overlay, signature, nonce) = sign_test_record(
+            &REMOTE_SECRET,
+            HandshakeWireVersion::V15,
+            1,
+            &underlay,
+            timestamp,
+        );
+        let syn_ack = SynAck {
+            syn: Some(Syn {
+                observed_underlay: serialize_underlays(&[observed]),
+            }),
+            ack: Some(Ack {
+                address: Some(BzzAddress {
+                    underlay,
+                    signature: signature.to_vec(),
+                    overlay: overlay.to_vec(),
+                    nonce: nonce.to_vec(),
+                    timestamp,
+                    chequebook_address: Vec::new(),
+                }),
+                network_id: 1,
+                full_node: true,
+                nonce: Vec::new(),
+                welcome_message: String::new(),
+            }),
+        };
+        (syn_ack, overlay)
+    }
+
+    fn underlay_for(peer: PeerId) -> Vec<u8> {
+        let a: Multiaddr = format!("/ip4/1.2.3.4/tcp/1634/p2p/{peer}").parse().unwrap();
+        serialize_underlays(&[a])
+    }
+
+    /// #299 (P2P-03): a validly signed `BzzAddress` is only accepted from
+    /// the peer its underlay names. The same record replayed by another
+    /// `PeerId` (it is gossiped publicly by hive) is rejected.
+    #[tokio::test]
+    async fn replayed_bzz_address_from_another_peer_is_rejected() {
+        let local = PeerId::random();
+        let owner = PeerId::random();
+        let ts = unix_now_i64();
+        let (syn_ack, overlay) = signed_syn_ack(local, underlay_for(owner), ts);
+
+        let info = outbound_between(syn_ack.clone(), local, owner, None)
+            .await
+            .expect("the owner's own record is accepted");
+        assert_eq!(info.remote_overlay, overlay);
+
+        let replayer = PeerId::random();
+        let err = outbound_between(syn_ack, local, replayer, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::UnderlayPeerId), "{err}");
+    }
+
+    /// The bound peer id is the *last* `/p2p/` of an underlay: on a
+    /// circuit address that's the destination, not the relay.
+    #[tokio::test]
+    async fn underlay_peer_id_is_the_last_p2p_component() {
+        let local = PeerId::random();
+        let relay = PeerId::random();
+        let target = PeerId::random();
+        let circuit: Multiaddr =
+            format!("/ip4/1.2.3.4/tcp/1634/p2p/{relay}/p2p-circuit/p2p/{target}")
+                .parse()
+                .unwrap();
+        let underlay = serialize_underlays(&[circuit]);
+        let ts = unix_now_i64();
+        let (syn_ack, _) = signed_syn_ack(local, underlay, ts);
+        outbound_between(syn_ack.clone(), local, target, None)
+            .await
+            .expect("the circuit's destination owns the record");
+        let err = outbound_between(syn_ack, local, relay, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::UnderlayPeerId), "{err}");
+    }
+
+    /// Our observed underlay names us by its *last* `/p2p/`: a circuit
+    /// address through a relay to us is accepted, one through us to a
+    /// third peer is not.
+    #[tokio::test]
+    async fn observed_underlay_peer_id_is_the_last_p2p_component() {
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let relay = PeerId::random();
+        let ts = unix_now_i64();
+        let (mut syn_ack, _) = signed_syn_ack(local, underlay_for(remote), ts);
+        let with_observed = |syn_ack: &mut SynAck, a: String| {
+            let a: Multiaddr = a.parse().unwrap();
+            syn_ack.syn.as_mut().unwrap().observed_underlay = serialize_underlays(&[a]);
+        };
+
+        with_observed(
+            &mut syn_ack,
+            format!("/ip4/5.6.7.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{local}"),
+        );
+        outbound_between(syn_ack.clone(), local, remote, None)
+            .await
+            .expect("a circuit to us is our observed underlay");
+
+        with_observed(
+            &mut syn_ack,
+            format!("/ip4/5.6.7.8/tcp/4001/p2p/{local}/p2p-circuit/p2p/{relay}"),
+        );
+        let err = outbound_between(syn_ack, local, remote, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::SynPeerId), "{err}");
+    }
+
+    /// #299 (P2P-03): a signed record whose underlay is empty or not a
+    /// multiaddr list is rejected, as bee's `ParseAddress` does. The
+    /// signature is valid in each case, so only the underlay check can
+    /// refuse it.
+    #[tokio::test]
+    async fn empty_or_garbage_underlay_is_rejected() {
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let ts = unix_now_i64();
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("empty", Vec::new()),
+            (
+                "bare list prefix",
+                vec![crate::underlay::UNDERLAY_LIST_PREFIX],
+            ),
+            ("garbage", b"not a multiaddr".to_vec()),
+        ];
+        for (name, underlay) in cases {
+            let (syn_ack, _) = signed_syn_ack(local, underlay, ts);
+            let err = outbound_between(syn_ack, local, remote, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, HandshakeError::Underlay(_)), "{name}: {err}");
+        }
+    }
+
+    /// #299 (P2P-13): a V15 record older than the one held for the same
+    /// overlay is stale; an equal or newer one, one for another overlay,
+    /// or a held V14 record (timestamp 0) doesn't block.
+    #[tokio::test]
+    async fn older_timestamp_than_held_record_is_rejected() {
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let ts = unix_now_i64() - 600;
+        let (syn_ack, overlay) = signed_syn_ack(local, underlay_for(remote), ts);
+        let held = |timestamp| Some(KnownBzzRecord { overlay, timestamp });
+
+        let err = outbound_between(syn_ack.clone(), local, remote, held(ts + 1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandshakeError::TimestampStale(got, have) if got == ts && have == ts + 1),
+            "{err}"
+        );
+
+        for (name, known) in [
+            ("no record", None),
+            ("equal", held(ts)),
+            ("older held", held(ts - 1)),
+            ("held V14", held(0)),
+            (
+                "other overlay",
+                Some(KnownBzzRecord {
+                    overlay: [0xee; 32],
+                    timestamp: ts + 1,
+                }),
+            ),
+        ] {
+            outbound_between(syn_ack.clone(), local, remote, known)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     /// #279: a `SynAck` whose `observed_underlay` is a bare list prefix

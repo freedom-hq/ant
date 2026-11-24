@@ -14,14 +14,21 @@
 //!
 //! 2. **Kademlia's `Announce`** then calls
 //!    `discovery.BroadcastPeers(ctx, peer, addrs...)` on every new peer,
-//!    which dials `/swarm/hive/1.1.0/peers` to us. On failure bee calls
+//!    which dials hive's `peers` stream to us (`/swarm/hive/2.0.0/peers`
+//!    since bee 2.8, `1.1.0` before). On failure bee calls
 //!    `Disconnect(peer, "failed broadcasting to peer")`.
 //!
 //! For pricing we drain and close — that's all bee wants. For hive we parse
-//! the protobuf (`Peers { repeated BzzAddress }`) and forward each underlay
-//! multiaddr to the swarm loop via an mpsc channel. That turns bee's
-//! bookkeeping chatter into free peer discovery: bootnodes broadcast their
-//! neighbourhood to us the moment our BZZ handshake finishes.
+//! the protobuf (`Peers { repeated BzzAddress }`) and check each entry the
+//! way bee's `bzz.ParseAddress` does — a decodable underlay with a
+//! `/p2p/<peer id>`, a signature that recovers to the declared overlay,
+//! and on 2.0.0 a sane timestamp (see [`verify_hive_entries`]). Only entries
+//! that pass are forwarded to the swarm loop as hints, via an mpsc channel.
+//! Each check costs a signature recovery, so a peer gets bee's own hive
+//! budget of them ([`HiveBudget`]); entries past it are drained unread.
+//! That turns bee's bookkeeping chatter into free peer discovery:
+//! bootnodes broadcast their neighbourhood to us the moment our BZZ
+//! handshake finishes.
 //!
 //! # The bee-headers framing
 //!
@@ -58,7 +65,9 @@
 //! [`bee-headers`]: https://github.com/ethersphere/bee/blob/v2.7.1/pkg/p2p/libp2p/headers.go
 
 use crate::dial::extract_peer_id;
+use crate::handshake::check_wire_timestamp;
 use crate::underlay::deserialize_underlays;
+use ant_crypto::{verify_bzz_address_signature, HandshakeWireVersion, OVERLAY_NONCE_LEN};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
@@ -68,7 +77,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 
@@ -89,6 +98,19 @@ pub const PROTOCOL_HIVE_PEERS: &str = PROTOCOL_HIVE_PEERS_V2;
 
 /// Tight bound for the pricing payload — it's a single big.Int.
 const PRICING_MAX: usize = 1024;
+/// Bee's hive `maxBatchSize`: it never puts more peers in one `Peers`
+/// message. Each entry costs us a signature recovery, so a message
+/// carrying more than this only has its first entries looked at.
+const HIVE_MAX_PEERS: usize = 30;
+/// Bee's hive inbound limiter (`limitBurst = 4 * swarm.MaxBins`): a peer
+/// may hand us this many entries in a burst. Bee's outbound limiter for
+/// the same peer is identical, so an honest bee never sends more.
+const HIVE_ENTRY_BURST: u64 = 128;
+/// Bee's hive `limitRate`: the burst refills one entry per this long.
+const HIVE_ENTRY_REFILL: Duration = Duration::from_secs(60);
+/// Past this many tracked peers, [`HiveBudget`] forgets the ones whose
+/// budget has refilled in full (they'd start from a full budget anyway).
+const HIVE_BUDGET_PRUNE_AT: usize = 4096;
 /// Hive batches up to 30 peers × (overlay + underlay + sig + nonce) per stream.
 /// Round up to a comfortable cap so we don't reject valid gossip from bee.
 const HIVE_MAX: usize = 128 * 1024;
@@ -344,22 +366,78 @@ pub(crate) async fn serve_gated<F, Fut>(
     }
 }
 
+/// Per-peer budget of hive entries we spend a signature recovery on,
+/// mirroring bee v2.8.0's hive `inLimiter` (a token bucket of
+/// [`HIVE_ENTRY_BURST`] entries refilling one per [`HIVE_ENTRY_REFILL`],
+/// charged by entry count). Where bee resets an over-budget stream, we
+/// still drain it and only skip checking the entries past the budget:
+/// a reset makes bee disconnect us. A peer's budget is kept across
+/// reconnects, so redialing doesn't buy a fresh burst.
+#[derive(Clone, Default)]
+pub(crate) struct HiveBudget {
+    buckets: Arc<Mutex<HashMap<PeerId, HiveBucket>>>,
+}
+
+#[derive(Clone, Copy)]
+struct HiveBucket {
+    tokens: u64,
+    refilled_at: Instant,
+}
+
+impl HiveBucket {
+    /// Credit the refills due by `now`; returns the tokens held.
+    fn refill(&mut self, now: Instant) -> u64 {
+        let periods =
+            now.saturating_duration_since(self.refilled_at).as_secs() / HIVE_ENTRY_REFILL.as_secs();
+        if periods > 0 {
+            self.tokens = self.tokens.saturating_add(periods).min(HIVE_ENTRY_BURST);
+            self.refilled_at = if self.tokens == HIVE_ENTRY_BURST {
+                now
+            } else {
+                self.refilled_at + HIVE_ENTRY_REFILL * periods as u32
+            };
+        }
+        self.tokens
+    }
+}
+
+impl HiveBudget {
+    /// Spend up to `want` entries of `peer`'s budget; returns how many
+    /// may be checked.
+    pub(crate) fn take(&self, peer: PeerId, want: usize, now: Instant) -> usize {
+        let mut buckets = self.buckets.lock().expect("hive budget poisoned");
+        if buckets.len() >= HIVE_BUDGET_PRUNE_AT && !buckets.contains_key(&peer) {
+            buckets.retain(|_, b| b.refill(now) < HIVE_ENTRY_BURST);
+        }
+        let bucket = buckets.entry(peer).or_insert(HiveBucket {
+            tokens: HIVE_ENTRY_BURST,
+            refilled_at: now,
+        });
+        let granted = bucket.refill(now).min(want as u64);
+        bucket.tokens -= granted;
+        granted as usize
+    }
+}
+
 /// A decoded hive `BzzAddress` reduced to the fields the swarm loop needs
-/// to dial the peer. The overlay is carried through so the swarm loop can
-/// correlate hive hints with handshake outcomes in future work.
+/// to dial the peer. The overlay is what neighbourhood and bin-balance
+/// dials rank the peer by.
 #[derive(Debug, Clone)]
 pub struct PeerHint {
     pub peer_id: PeerId,
     pub addrs: Vec<Multiaddr>,
-    #[allow(dead_code)]
+    /// From a hive entry this is a signature-verified overlay, though
+    /// nothing binds it to `peer_id` (the swarm loop's
+    /// `enqueue_gossip_hint` handles that); a warm hint carries the
+    /// overlay its last handshake verified.
     pub overlay: [u8; 32],
 }
 
 /// hive.proto `message Peers { repeated BzzAddress peers = 1; }`.
 #[derive(Clone, PartialEq, prost::Message)]
-struct PeersPb {
+pub(crate) struct PeersPb {
     #[prost(message, repeated, tag = "1")]
-    peers: Vec<BzzAddressPb>,
+    pub(crate) peers: Vec<BzzAddressPb>,
 }
 
 /// hive.proto `message BzzAddress`. Bee 2.7 ships tags 1-4
@@ -374,31 +452,31 @@ struct PeersPb {
 ///
 /// Underlay is `bzz.SerializeUnderlays(addrs)` — either raw multiaddr
 /// bytes (single address, backward-compat) or the 0x99-prefixed
-/// length-delimited list. Signature and Nonce are required on the
-/// wire (both empty is a decode error for bee) but we ignore them:
-/// we don't verify overlays for hints.
+/// length-delimited list. Every entry is checked like bee's
+/// `ParseAddress` before it becomes a hint (see [`verify_hive_entries`]):
+/// the signature over underlay ‖ overlay ‖ network id (‖ nonce ‖
+/// timestamp ‖ chequebook on 2.0.0) must recover to a key whose overlay
+/// is the declared one.
 #[derive(Clone, PartialEq, prost::Message)]
-struct BzzAddressPb {
+pub(crate) struct BzzAddressPb {
     #[prost(bytes = "vec", tag = "1")]
-    underlay: Vec<u8>,
+    pub(crate) underlay: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
-    signature: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
-    overlay: Vec<u8>,
+    pub(crate) overlay: Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
-    nonce: Vec<u8>,
-    /// Bee 2.8+. Unix seconds of the signed `BzzAddress` record. We
-    /// currently ignore the value but accept it for forward-compat.
+    pub(crate) nonce: Vec<u8>,
+    /// Bee 2.8+. Unix seconds of the signed `BzzAddress` record. Part
+    /// of the signed preimage on hive 2.0.0, and must be positive and
+    /// not in the future there.
     #[prost(int64, tag = "5")]
-    #[allow(dead_code)]
-    timestamp: i64,
+    pub(crate) timestamp: i64,
     /// Bee 2.8+. Peer's chequebook contract address (20 bytes) or
-    /// empty when the peer has no chequebook. We accept it for
-    /// forward-compat without acting on it: hive hints feed the
-    /// dialer, which still re-verifies via the BZZ handshake itself.
+    /// empty when the peer has no chequebook. Part of the signed
+    /// preimage on hive 2.0.0; otherwise not acted on.
     #[prost(bytes = "vec", tag = "6")]
-    #[allow(dead_code)]
-    chequebook_address: Vec<u8>,
+    pub(crate) chequebook_address: Vec<u8>,
 }
 
 /// Handles on the `IncomingStreams` we need to keep alive while the node runs.
@@ -411,6 +489,7 @@ pub struct Registrations {
     swap: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
     guard: InboundGuard,
+    network_id: u64,
 }
 
 /// Claim every bee protocol we need to silently drain. Must run before the
@@ -419,11 +498,13 @@ pub struct Registrations {
 /// loop for nothing.
 ///
 /// `gate` is the swarm loop's view of who is handshaked; every sink
-/// resets streams from anyone else (see the module docs).
+/// resets streams from anyone else (see the module docs). `network_id`
+/// is the one hive entries' signatures are checked against.
 pub fn register(
     control: &mut Control,
     hint_tx: mpsc::Sender<PeerHint>,
     gate: HandshakeGate,
+    network_id: u64,
 ) -> Registrations {
     let pricing = control
         .accept(StreamProtocol::new(PROTOCOL_PRICING))
@@ -455,6 +536,7 @@ pub fn register(
         swap,
         hint_tx,
         guard: InboundGuard::new(gate),
+        network_id,
     }
 }
 
@@ -468,9 +550,28 @@ pub fn register(
 /// disconnect on the libp2p layer.
 pub fn spawn(reg: Registrations, swap: Option<SwapWiring>) {
     let guard = reg.guard;
+    // One budget for both hive versions: a peer can't double it by
+    // opening the other protocol id.
+    let budget = HiveBudget::default();
     tokio::spawn(run_pricing(reg.pricing, guard.clone()));
-    tokio::spawn(run_hive(reg.hive_v1, reg.hint_tx.clone(), guard.clone()));
-    tokio::spawn(run_hive(reg.hive_v2, reg.hint_tx, guard.clone()));
+    // Hive 1.1.0 (bee 2.7) carries records signed over the V14 preimage,
+    // hive 2.0.0 (bee 2.8) over the V15 one.
+    tokio::spawn(run_hive(
+        reg.hive_v1,
+        reg.hint_tx.clone(),
+        guard.clone(),
+        HandshakeWireVersion::V14,
+        reg.network_id,
+        budget.clone(),
+    ));
+    tokio::spawn(run_hive(
+        reg.hive_v2,
+        reg.hint_tx,
+        guard.clone(),
+        HandshakeWireVersion::V15,
+        reg.network_id,
+        budget,
+    ));
     tokio::spawn(crate::pseudosettle::run_inbound(
         reg.pseudosettle,
         guard.clone(),
@@ -521,19 +622,57 @@ async fn run_pricing(incoming: IncomingStreams, guard: InboundGuard) {
     .await;
 }
 
-async fn run_hive(incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>, guard: InboundGuard) {
+async fn run_hive(
+    incoming: IncomingStreams,
+    hint_tx: mpsc::Sender<PeerHint>,
+    guard: InboundGuard,
+    version: HandshakeWireVersion,
+    network_id: u64,
+    budget: HiveBudget,
+) {
     serve_gated(incoming, guard, "hive", move |peer_id, stream| {
         let tx = hint_tx.clone();
+        let budget = budget.clone();
         async move {
             let res = tokio::time::timeout(STREAM_TIMEOUT, drain_stream(stream, HIVE_MAX)).await;
             match res {
                 Ok(Ok(d)) => {
-                    let hints = decode_hive_peers(&d.body);
+                    let (headers, body_len) = (d.headers, d.body.len());
+                    let mut entries = match PeersPb::decode(d.body.as_slice()) {
+                        Ok(m) => m.peers,
+                        Err(e) => {
+                            debug!(target: "ant_p2p::hive", %peer_id, "undecodable peers message: {e}");
+                            Vec::new()
+                        }
+                    };
+                    entries.truncate(HIVE_MAX_PEERS);
+                    let granted = budget.take(peer_id, entries.len(), Instant::now());
+                    if granted < entries.len() {
+                        debug!(
+                            target: "ant_p2p::hive",
+                            %peer_id,
+                            skipped = entries.len() - granted,
+                            "hive budget spent; not checking the rest of the message",
+                        );
+                        entries.truncate(granted);
+                    }
+                    // Up to `HIVE_MAX_PEERS` signature recoveries: keep
+                    // them off the async workers.
+                    let hints = if entries.is_empty() {
+                        Vec::new()
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            verify_hive_entries(&entries, version, network_id)
+                        })
+                        .await
+                        .unwrap_or_default()
+                    };
                     trace!(
                         target: "ant_p2p::hive",
                         %peer_id,
-                        headers = d.headers,
-                        body = d.body.len(),
+                        headers,
+                        ?version,
+                        body = body_len,
                         peers = hints.len(),
                         "drained",
                     );
@@ -563,35 +702,96 @@ async fn run_hive(incoming: IncomingStreams, hint_tx: mpsc::Sender<PeerHint>, gu
     .await;
 }
 
-/// Decode a hive `Peers` payload into `PeerHint`s. Entries without a
-/// `/p2p/<peer_id>` component in their underlay are dropped: libp2p's `Dial`
-/// needs a peer id to multiplex concurrent dials, and bee's hive
-/// `broadcastPeers` always includes one, so a missing id is a corrupted peer.
-fn decode_hive_peers(body: &[u8]) -> Vec<PeerHint> {
+/// Turn decoded hive entries into `PeerHint`s, checking each the way
+/// bee's hive does with `bzz.ParseAddress`: the underlay must decode to a
+/// non-empty list, and the signature over the record (V14 preimage on
+/// hive 1.1.0, V15 with timestamp and chequebook on 2.0.0) must recover
+/// to a key whose overlay is the declared one; on 2.0.0 the timestamp
+/// must be positive and not in the future. An entry that fails is dropped
+/// on its own, so a forged record never becomes a hint. Entries without a
+/// `/p2p/<peer_id>` component in their underlay are dropped too: libp2p's
+/// `Dial` needs a peer id to multiplex concurrent dials, and bee's hive
+/// `broadcastPeers` always includes one. Only the first
+/// [`HIVE_MAX_PEERS`] entries are looked at, and `run_hive` passes no
+/// more than the sender's [`HiveBudget`] allows.
+///
+/// The signature proves the overlay, not the `/p2p/<peer id>`: bee's
+/// libp2p key is separate from its overlay key, so a peer can sign a
+/// record of its own naming someone else's peer id. The swarm loop's
+/// `enqueue_gossip_hint` never lets such a hint displace the dial-book
+/// entry it holds for that peer id under another overlay: it is dropped
+/// against an overlay a handshake verified, and otherwise kept only as
+/// that entry's rival until a dial settles which one is real.
+fn verify_hive_entries(
+    peers: &[BzzAddressPb],
+    version: HandshakeWireVersion,
+    network_id: u64,
+) -> Vec<PeerHint> {
+    peers
+        .iter()
+        .take(HIVE_MAX_PEERS)
+        .filter_map(|p| verified_hint(p, version, network_id))
+        .collect()
+}
+
+/// A hive `Peers` payload through [`verify_hive_entries`], as `run_hive`
+/// does it (less the budget).
+#[cfg(test)]
+pub(crate) fn decode_hive_peers(
+    body: &[u8],
+    version: HandshakeWireVersion,
+    network_id: u64,
+) -> Vec<PeerHint> {
     let Ok(msg) = PeersPb::decode(body) else {
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(msg.peers.len());
-    for p in msg.peers {
-        let Ok(addrs) = deserialize_underlays(&p.underlay) else {
-            continue;
-        };
-        // All underlays of a single BzzAddress describe the same peer, so
-        // pull the peer id from the first one that has it.
-        let Some(peer_id) = addrs.iter().find_map(extract_peer_id) else {
-            continue;
-        };
-        let mut overlay = [0u8; 32];
-        if p.overlay.len() == 32 {
-            overlay.copy_from_slice(&p.overlay);
+    verify_hive_entries(&msg.peers, version, network_id)
+}
+
+/// One hive entry as a hint, or `None` when it fails any check of
+/// [`verify_hive_entries`].
+fn verified_hint(
+    p: &BzzAddressPb,
+    version: HandshakeWireVersion,
+    network_id: u64,
+) -> Option<PeerHint> {
+    let addrs = deserialize_underlays(&p.underlay).ok()?;
+    // All underlays of a single BzzAddress describe the same peer, so
+    // pull the peer id from the first one that has it — its destination
+    // (last `/p2p/`), the component the handshake binds the record to,
+    // not a circuit address's relay hop.
+    let peer_id = addrs.iter().find_map(extract_peer_id)?;
+    let overlay: [u8; 32] = p.overlay.as_slice().try_into().ok()?;
+    let signature: [u8; 65] = p.signature.as_slice().try_into().ok()?;
+    let nonce: [u8; OVERLAY_NONCE_LEN] = p.nonce.as_slice().try_into().ok()?;
+    let timestamp = match version {
+        HandshakeWireVersion::V14 => 0,
+        HandshakeWireVersion::V15 => {
+            if let Err(e) = check_wire_timestamp(p.timestamp) {
+                trace!(target: "ant_p2p::hive", %peer_id, "dropping hive entry: {e}");
+                return None;
+            }
+            p.timestamp
         }
-        out.push(PeerHint {
-            peer_id,
-            addrs,
-            overlay,
-        });
+    };
+    if let Err(e) = verify_bzz_address_signature(
+        version,
+        &p.underlay,
+        &overlay,
+        &signature,
+        &nonce,
+        network_id,
+        timestamp,
+        &p.chequebook_address,
+    ) {
+        trace!(target: "ant_p2p::hive", %peer_id, "dropping unverified hive entry: {e}");
+        return None;
     }
-    out
+    Some(PeerHint {
+        peer_id,
+        addrs,
+        overlay,
+    })
 }
 
 #[derive(Debug)]
@@ -705,6 +905,32 @@ async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<
     }
 }
 
+/// A hive entry for `addrs`, signed by `secret` like bee signs its
+/// `BzzAddress` (V15 records stamped now).
+#[cfg(test)]
+pub(crate) fn signed_hive_entry(
+    secret: &[u8; 32],
+    version: HandshakeWireVersion,
+    network_id: u64,
+    addrs: &[Multiaddr],
+) -> BzzAddressPb {
+    let underlay = crate::underlay::serialize_underlays(addrs);
+    let timestamp = match version {
+        HandshakeWireVersion::V14 => 0,
+        HandshakeWireVersion::V15 => crate::handshake::tests_now(),
+    };
+    let (overlay, signature, nonce) =
+        crate::handshake::sign_test_record(secret, version, network_id, &underlay, timestamp);
+    BzzAddressPb {
+        underlay,
+        signature: signature.to_vec(),
+        overlay: overlay.to_vec(),
+        nonce: nonce.to_vec(),
+        timestamp,
+        chequebook_address: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,136 +1007,263 @@ mod tests {
         assert_eq!(wire, &[0xDD, 0xEE]);
     }
 
-    #[test]
-    fn decodes_single_peer_hive_message() {
-        let addr: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(std::slice::from_ref(&addr));
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![0u8; 65],
-                overlay: vec![0xab; 32],
-                nonce: vec![0xcd; 32],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
+    const NET: u64 = 1;
 
-        let hints = decode_hive_peers(&buf);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].addrs, vec![addr]);
-        assert_eq!(hints[0].overlay, [0xab; 32]);
+    fn addr_of(peer: PeerId, ip: &str) -> Multiaddr {
+        format!("/{ip}/tcp/1634/p2p/{peer}").parse().unwrap()
+    }
+
+    fn encode(peers: Vec<BzzAddressPb>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        PeersPb { peers }.encode(&mut buf).unwrap();
+        buf
     }
 
     #[test]
-    fn decodes_multi_underlay_peer() {
-        let a4: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
-        let a6: Multiaddr =
-            "/ip6/2001:db8::1/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(&[a4.clone(), a6.clone()]);
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![],
-                overlay: vec![0u8; 32],
-                nonce: vec![],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
+    fn decodes_signed_v15_peer() {
+        let peer = PeerId::random();
+        let addr = addr_of(peer, "ip4/1.2.3.4");
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V15,
+            NET,
+            std::slice::from_ref(&addr),
+        );
+        let overlay = entry.overlay.clone();
 
-        let hints = decode_hive_peers(&buf);
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, peer);
+        assert_eq!(hints[0].addrs, vec![addr]);
+        assert_eq!(hints[0].overlay.as_slice(), overlay.as_slice());
+    }
+
+    /// R1-M1: a circuit underlay names its relay first; the hint belongs
+    /// to the destination the record was signed for, the same peer the
+    /// handshake binds it to, never to the relay.
+    #[test]
+    fn circuit_underlay_hint_keys_the_destination_not_the_relay() {
+        let (relay, target) = (PeerId::random(), PeerId::random());
+        let addr: Multiaddr = format!("/ip4/1.2.3.4/tcp/1634/p2p/{relay}/p2p-circuit/p2p/{target}")
+            .parse()
+            .unwrap();
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V15,
+            NET,
+            std::slice::from_ref(&addr),
+        );
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, target);
+        assert_eq!(hints[0].addrs, vec![addr]);
+    }
+
+    #[test]
+    fn decodes_signed_v14_multi_underlay_peer() {
+        let peer = PeerId::random();
+        let a4 = addr_of(peer, "ip4/1.2.3.4");
+        let a6 = addr_of(peer, "ip6/2001:db8::1");
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V14,
+            NET,
+            &[a4.clone(), a6.clone()],
+        );
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V14, NET);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].addrs, vec![a4, a6]);
     }
 
+    /// #299 (P2P-12): a forged entry, one signed for another network or
+    /// over the other hive version's preimage, or one carrying a bad
+    /// timestamp produces no hint, and doesn't take the valid entry next
+    /// to it down with it.
+    #[test]
+    fn forged_hive_entries_produce_no_hint() {
+        let v15 = HandshakeWireVersion::V15;
+        let good_peer = PeerId::random();
+        let good = signed_hive_entry(&[5; 32], v15, NET, &[addr_of(good_peer, "ip4/1.2.3.4")]);
+        let entry = || {
+            signed_hive_entry(
+                &[6; 32],
+                v15,
+                NET,
+                &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+            )
+        };
+
+        // A victim's overlay with an attacker's underlay: the signature no
+        // longer covers the record.
+        let mut stolen_overlay = entry();
+        stolen_overlay.overlay.clone_from(&good.overlay);
+        // Someone else's signed record with the underlay swapped out.
+        let mut swapped_underlay = entry();
+        swapped_underlay.underlay =
+            serialize_underlays(&[addr_of(PeerId::random(), "ip4/6.6.6.6")]);
+        let unsigned = BzzAddressPb {
+            signature: vec![0u8; 65],
+            ..entry()
+        };
+        let no_signature = BzzAddressPb {
+            signature: Vec::new(),
+            ..entry()
+        };
+        let other_network = signed_hive_entry(
+            &[6; 32],
+            v15,
+            NET + 1,
+            &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+        );
+        let v14_signed = signed_hive_entry(
+            &[6; 32],
+            HandshakeWireVersion::V14,
+            NET,
+            &[addr_of(PeerId::random(), "ip4/5.6.7.8")],
+        );
+        let mut zero_ts = entry();
+        zero_ts.timestamp = 0;
+        // A future timestamp, validly signed.
+        let mut future = entry();
+        let ts = future.timestamp + 3600;
+        let (overlay, sig, nonce) =
+            crate::handshake::sign_test_record(&[6; 32], v15, NET, &future.underlay, ts);
+        future.overlay = overlay.to_vec();
+        future.signature = sig.to_vec();
+        future.nonce = nonce.to_vec();
+        future.timestamp = ts;
+
+        let forged = vec![
+            stolen_overlay,
+            swapped_underlay,
+            unsigned,
+            no_signature,
+            other_network,
+            v14_signed,
+            zero_ts,
+            future,
+        ];
+        for (i, f) in forged.iter().enumerate() {
+            assert!(
+                decode_hive_peers(&encode(vec![f.clone()]), v15, NET).is_empty(),
+                "forged entry {i} produced a hint"
+            );
+        }
+        let mut all = forged;
+        all.push(good);
+        let hints = decode_hive_peers(&encode(all), v15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, good_peer);
+    }
+
     /// #279: hostile underlays in hive gossip (an overflowing list
     /// length, a bare list prefix) drop that one peer, not the process
-    /// and not the rest of the batch.
+    /// and not the rest of the batch — even when the hostile bytes are
+    /// what the record's signature covers.
     #[test]
     fn skips_peers_with_hostile_underlay_lists() {
-        let good: Multiaddr =
-            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-                .parse()
-                .unwrap();
+        let v15 = HandshakeWireVersion::V15;
+        let good = addr_of(PeerId::random(), "ip4/1.2.3.4");
         let mut overflow = vec![0x99];
         overflow.extend_from_slice(&[0xff; 9]);
         overflow.push(0x01);
-        let peer = |underlay: Vec<u8>| BzzAddressPb {
-            underlay,
-            overlay: vec![0u8; 32],
-            ..Default::default()
+        let signed_raw = |underlay: Vec<u8>| {
+            let ts = crate::handshake::tests_now();
+            let (overlay, sig, nonce) =
+                crate::handshake::sign_test_record(&[6; 32], v15, NET, &underlay, ts);
+            BzzAddressPb {
+                underlay,
+                signature: sig.to_vec(),
+                overlay: overlay.to_vec(),
+                nonce: nonce.to_vec(),
+                timestamp: ts,
+                chequebook_address: Vec::new(),
+            }
         };
-        let msg = PeersPb {
-            peers: vec![
-                peer(overflow),
-                peer(vec![0x99]),
-                peer(serialize_underlays(std::slice::from_ref(&good))),
-            ],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
-
-        let hints = decode_hive_peers(&buf);
+        let body = encode(vec![
+            signed_raw(overflow),
+            signed_raw(vec![0x99]),
+            signed_hive_entry(&[5; 32], v15, NET, std::slice::from_ref(&good)),
+        ]);
+        let hints = decode_hive_peers(&body, v15, NET);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].addrs, vec![good]);
     }
 
+    /// Bee never batches more than `HIVE_MAX_PEERS` entries per message;
+    /// past that we don't spend signature recoveries.
     #[test]
-    fn decodes_bee_2_8_payload_with_new_tags() {
-        // A bee-2.8 hive Peers payload carries Timestamp (tag 5) and
-        // ChequebookAddress (tag 6) inside each BzzAddress. We don't
-        // act on either yet but the decoder must still produce the
-        // correct hint (dropping the new fields cleanly).
-        let addr: Multiaddr =
-            "/ip4/4.3.2.1/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8"
-                .parse()
-                .unwrap();
-        let underlay = serialize_underlays(std::slice::from_ref(&addr));
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![0u8; 65],
-                overlay: vec![0xab; 32],
-                nonce: vec![0xcd; 32],
-                timestamp: 1_715_000_000,
-                chequebook_address: vec![0xef; 20],
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
+    fn looks_at_most_hive_max_peers_entries() {
+        let v15 = HandshakeWireVersion::V15;
+        let entries: Vec<_> = (0..HIVE_MAX_PEERS + 5)
+            .map(|_| {
+                signed_hive_entry(
+                    &[5; 32],
+                    v15,
+                    NET,
+                    &[addr_of(PeerId::random(), "ip4/1.2.3.4")],
+                )
+            })
+            .collect();
+        assert_eq!(
+            decode_hive_peers(&encode(entries), v15, NET).len(),
+            HIVE_MAX_PEERS
+        );
+    }
 
-        let hints = decode_hive_peers(&buf);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].addrs, vec![addr]);
-        assert_eq!(hints[0].overlay, [0xab; 32]);
+    /// R1-M1: a peer gets bee's hive budget of signature checks — a
+    /// burst of `HIVE_ENTRY_BURST` entries refilling one per
+    /// `HIVE_ENTRY_REFILL` — kept per peer and capped at the burst.
+    #[test]
+    fn hive_budget_mirrors_bee_inbound_limiter() {
+        let budget = HiveBudget::default();
+        let (peer, other) = (PeerId::random(), PeerId::random());
+        let t0 = Instant::now();
+        let msg = HIVE_MAX_PEERS;
+        let full_msgs = HIVE_ENTRY_BURST as usize / msg;
+        for _ in 0..full_msgs {
+            assert_eq!(budget.take(peer, msg, t0), msg);
+        }
+        let rest = HIVE_ENTRY_BURST as usize - full_msgs * msg;
+        assert_eq!(budget.take(peer, msg, t0), rest);
+        assert_eq!(budget.take(peer, msg, t0), 0);
+        // Another peer has its own budget.
+        assert_eq!(budget.take(other, msg, t0), msg);
+        // One entry per refill period, not more.
+        assert_eq!(budget.take(peer, msg, t0 + HIVE_ENTRY_REFILL / 2), 0);
+        assert_eq!(budget.take(peer, msg, t0 + HIVE_ENTRY_REFILL), 1);
+        assert_eq!(budget.take(peer, msg, t0 + HIVE_ENTRY_REFILL * 3), 2);
+        // A long silence refills to the burst, no further.
+        let later = t0 + HIVE_ENTRY_REFILL * 10_000;
+        assert_eq!(
+            budget.take(peer, 10 * HIVE_ENTRY_BURST as usize, later),
+            HIVE_ENTRY_BURST as usize
+        );
+    }
+
+    /// The budget map stays bounded: past `HIVE_BUDGET_PRUNE_AT` peers,
+    /// those whose budget has refilled in full are forgotten, those still
+    /// owing are kept.
+    #[test]
+    fn hive_budget_forgets_refilled_peers() {
+        let budget = HiveBudget::default();
+        let t0 = Instant::now();
+        let owing = PeerId::random();
+        for _ in 0..HIVE_BUDGET_PRUNE_AT - 1 {
+            budget.take(PeerId::random(), 1, t0);
+        }
+        budget.take(owing, HIVE_ENTRY_BURST as usize, t0);
+        let later = t0 + HIVE_ENTRY_REFILL * 2;
+        budget.take(PeerId::random(), 1, later);
+        let buckets = budget.buckets.lock().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert!(buckets.contains_key(&owing));
     }
 
     #[test]
     fn drops_peers_without_p2p_id() {
         let bare: Multiaddr = "/ip4/1.2.3.4/tcp/1634".parse().unwrap();
-        let underlay = serialize_underlays(&[bare]);
-        let msg = PeersPb {
-            peers: vec![BzzAddressPb {
-                underlay,
-                signature: vec![],
-                overlay: vec![0u8; 32],
-                nonce: vec![],
-                ..Default::default()
-            }],
-        };
-        let mut buf = Vec::new();
-        msg.encode(&mut buf).unwrap();
-        assert!(decode_hive_peers(&buf).is_empty());
+        let entry = signed_hive_entry(&[5; 32], HandshakeWireVersion::V15, NET, &[bare]);
+        assert!(decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET).is_empty());
     }
 }

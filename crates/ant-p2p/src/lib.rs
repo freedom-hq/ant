@@ -28,7 +28,7 @@ pub use behaviour::{
 };
 pub use handshake::{
     handshake_outbound, handshake_outbound_with_role, HandshakeError, HandshakeInfo,
-    PROTOCOL_HANDSHAKE, PROTOCOL_HANDSHAKE_V14, PROTOCOL_HANDSHAKE_V15,
+    KnownBzzRecord, PROTOCOL_HANDSHAKE, PROTOCOL_HANDSHAKE_V14, PROTOCOL_HANDSHAKE_V15,
 };
 pub use pushsync_swap::{
     NoopPushsyncSettlement, PeerEthMap, PushsyncSwap, PushsyncSwapConfig, RetrievalSwapPolicy,
