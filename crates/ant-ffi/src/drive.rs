@@ -2606,7 +2606,7 @@ async fn fund_chequebook_best_effort(
 ///
 /// Returns JSON `{"enabled","chequebook","deposit_plur","deposit_bzz",
 /// "target_plur","target_bzz","shortfall_plur","shortfall_bzz",
-/// "needs_top_up","xdai_required","xdai_required_display","xdai_to_send",
+/// "needs_top_up","swap_input","xdai_required","xdai_required_display","xdai_to_send",
 /// "xdai_to_send_display","sufficient_funds"}`. `enabled=false` (with
 /// zeroed fields) when this account has no chequebook yet — there is
 /// nothing to top up then; buying or connecting a plan deploys one,

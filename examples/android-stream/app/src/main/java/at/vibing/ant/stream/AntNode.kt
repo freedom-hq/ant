@@ -378,11 +378,18 @@ class AntNode(private val context: Context) {
     /**
      * Fund the chequebook up to its plan's deposit, paying with xDAI (the
      * node swaps for the xBZZ it lacks). Spends real funds. The swap is
-     * capped at the card's own `swapInput` (the price the user saw).
+     * capped at the card's own `swapInput` (the price the user saw); a
+     * failure (e.g. the price moved) re-reads the card, so a retry is
+     * shown, and capped at, the current price.
      */
     suspend fun topUpDeposit() = withContext(Dispatchers.IO) {
         val maxXdaiWei = settlementDeposit.value?.swapInput ?: "0"
-        val json = withHandle { AntNative.nativeSettlementTopup(it, gnosisRpc, maxXdaiWei) }
+        val json = try {
+            withHandle { AntNative.nativeSettlementTopup(it, gnosisRpc, maxXdaiWei) }
+        } catch (e: Exception) {
+            refreshSettlementDeposit()
+            throw e
+        }
         afterChequebookChange(json)
     }
 

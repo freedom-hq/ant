@@ -169,12 +169,7 @@ pub enum FundingError {
     /// The swap would send more xDAI than the caller's `max_xdai_wei`
     /// (the quote the user approved): the pool price moved, or the read
     /// was forged. Nothing was sent.
-    #[error(
-        "the xBZZ price moved since your quote: the swap now needs {} xDAI, more than the \
-         {} xDAI you approved; nothing was sent, refresh the quote and try again",
-        format_xdai_up(*input_wei),
-        format_xdai_up(*max_wei)
-    )]
+    #[error("{}", price_moved_message(*input_wei, *max_wei))]
     PriceMoved { input_wei: u128, max_wei: u128 },
     /// The wallet holds less xDAI than the swap plus the gas reserve.
     #[error(
@@ -206,6 +201,27 @@ pub enum FundingError {
     /// ([`crate::chequebook_store::top_up_chequebook`]).
     #[error("deposit into chequebook: {0}")]
     Deposit(ChequebookError),
+}
+
+/// [`FundingError::PriceMoved`] for the user. The figures carry 8
+/// decimals, so a small move doesn't read as "needs 0.0035, more than
+/// the 0.0035 you approved".
+fn price_moved_message(input_wei: u128, max_wei: u128) -> String {
+    let xdai = |wei: u128| {
+        let step = WEI_PER_XDAI / 100_000_000;
+        let steps = wei.div_ceil(step);
+        format!("{}.{:08}", steps / 100_000_000, steps % 100_000_000)
+    };
+    let approved = if max_wei == 0 {
+        "no swap was approved".to_string()
+    } else {
+        format!("more than the {} xDAI you approved", xdai(max_wei))
+    };
+    format!(
+        "the xBZZ price moved since your quote: the swap now needs {} xDAI, {approved}; \
+         nothing was sent, refresh the quote and try again",
+        xdai(input_wei)
+    )
 }
 
 /// Why a chequebook refused by the chain can't take a deposit, for the
@@ -1104,6 +1120,28 @@ mod tests {
         );
         assert_eq!(format_xdai_up(WEI_PER_XDAI), "1.0000");
         assert_eq!(format_xdai_up(1), "0.0001");
+    }
+
+    #[test]
+    fn a_moved_price_names_both_figures_apart() {
+        let m = FundingError::PriceMoved {
+            input_wei: 3_500_000_000_000_001,
+            max_wei: 3_500_000_000_000_000,
+        }
+        .to_string();
+        assert!(
+            m.contains("needs 0.00350001 xDAI, more than the 0.00350000 xDAI"),
+            "{m}"
+        );
+        let m = FundingError::PriceMoved {
+            input_wei: WEI_PER_XDAI,
+            max_wei: 0,
+        }
+        .to_string();
+        assert!(
+            m.contains("needs 1.00000000 xDAI, no swap was approved"),
+            "{m}"
+        );
     }
 
     #[test]

@@ -372,7 +372,8 @@ struct Opt {
     /// shared with `ant-ffi`
     /// (`ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`).
     /// Ignored for a manually supplied chequebook. A host adds more on
-    /// demand with `POST /v0/settlement/deposit?amount=<PLUR>`. Falls
+    /// demand with `POST /v0/settlement/deposit?amount=<PLUR>&maxXdaiWei=<wei>`
+    /// (the cap from `GET /v0/settlement/deposit?amount=`). Falls
     /// back to `CHEQUEBOOK_DEPOSIT_PLUR` env.
     #[arg(
         long,

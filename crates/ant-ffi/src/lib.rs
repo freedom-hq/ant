@@ -3263,7 +3263,9 @@ pub unsafe extern "C" fn ant_deploy_chequebook(
 /// the lot — the "payment information" the Get Started flow shows before
 /// activating. The all-in figures (`needed_bzz`, `xdai_required`,
 /// `xdai_to_send`, `sufficient_funds`) include the deposit, because
-/// activating a plan is also what deploys and funds the chequebook. No
+/// activating a plan is also what deploys and funds the chequebook.
+/// `swap_input` (wei) is what the xDAI->xBZZ swap sends at this price:
+/// pass it back as [`ant_storage_buy_xdai`]'s `max_xdai_wei`. No
 /// transaction is sent. Requires the `chain` build feature.
 ///
 /// # Safety
