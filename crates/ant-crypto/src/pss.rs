@@ -608,6 +608,47 @@ mod tests {
         assert!(unwrap(&recipient_secret, &data, &[topic_from_string("other")]).is_none());
     }
 
+    /// `unwrap` hoists the node-key ECDH out of the topic loop: the
+    /// matching topic, in either mode, must still be found when it is
+    /// not the first one subscribed.
+    #[test]
+    fn unwrap_finds_the_matching_topic_among_many() {
+        let others: Vec<[u8; 32]> = (0..5)
+            .map(|i| topic_from_string(&format!("other-{i}")))
+            .collect();
+        let recipient_secret =
+            hex32("0202020202020202020202020202020202020202020202020202020202020202");
+        let recipient_pub = public_key_of(&recipient_secret).unwrap();
+
+        let topic = topic_from_string("direct-last");
+        let (_, data) = wrap(
+            &topic,
+            b"direct",
+            &Recipient::Key(recipient_pub),
+            &[vec![0x01u8]],
+        )
+        .unwrap();
+        let mut topics = others.clone();
+        topics.push(topic);
+        let got = unwrap(&recipient_secret, &data, &topics).expect("direct decrypt");
+        assert_eq!(got, (topic, b"direct".to_vec()));
+        assert!(unwrap(&recipient_secret, &data, &others).is_none());
+
+        let topic = topic_from_string("broadcast-last");
+        let (_, data) = wrap(
+            &topic,
+            b"broadcast",
+            &Recipient::TopicDerived,
+            &[vec![0x02u8]],
+        )
+        .unwrap();
+        let mut topics = others.clone();
+        topics.push(topic);
+        let got = unwrap(&recipient_secret, &data, &topics).expect("broadcast decrypt");
+        assert_eq!(got, (topic, b"broadcast".to_vec()));
+        assert!(unwrap(&recipient_secret, &data, &others).is_none());
+    }
+
     #[test]
     fn wrap_cancellable_stops_without_a_result() {
         // A pre-flipped cancel flag makes every miner thread exit on its

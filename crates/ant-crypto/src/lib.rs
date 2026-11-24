@@ -238,9 +238,10 @@ pub fn recover_public_key_from_prehash(
 /// for both wire versions to keep the code path uniform.
 ///
 /// For [`HandshakeWireVersion::V14`] `timestamp` and `chequebook` are
-/// ignored. For [`HandshakeWireVersion::V15`] `chequebook` must be
-/// either empty or exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes — empty
-/// chequebooks are zero-padded into the preimage.
+/// not signed. For both versions `chequebook` must be either empty or
+/// exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes (any other length is
+/// [`CryptoError::BadChequebookLen`]); on V15 an empty chequebook is
+/// zero-padded into the preimage.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_bzz_address_signature(
     version: HandshakeWireVersion,
@@ -467,9 +468,9 @@ mod tests {
                 "v = {v} must be rejected"
             );
         }
-        // The case the gate exists for: with `r < p − n`, an x-reduced id
-        // (29/30) does recover *some* key in k256, so only the explicit
-        // {27, 28} check refuses it.
+        // Also a forged signature with `r < p − n`, for which an
+        // x-reduced id (29/30) is mathematically meaningful and k256
+        // recovers *some* key from it.
         let mut forged = [0u8; 65];
         let mut reduced_ok = false;
         for r in 1u8..=32 {
@@ -515,8 +516,13 @@ mod tests {
         assert!(high.normalize_s().is_some(), "twin must be high-S");
         let mut twin = [0u8; 65];
         twin[..64].copy_from_slice(&high.to_bytes());
-        twin[64] = if sig[64] == 27 { 28 } else { 27 };
-        assert!(recover_public_key_from_prehash(&twin, &digest).is_err());
+        for v in [27u8, 28] {
+            twin[64] = v;
+            assert!(
+                recover_public_key_from_prehash(&twin, &digest).is_err(),
+                "high-S with v = {v} must be rejected"
+            );
+        }
     }
 
     #[test]
