@@ -718,8 +718,10 @@ async fn run_hive(
 /// The signature proves the overlay, not the `/p2p/<peer id>`: bee's
 /// libp2p key is separate from its overlay key, so a peer can sign a
 /// record of its own naming someone else's peer id. The swarm loop's
-/// `enqueue_gossip_hint` refuses such a hint when it holds another
-/// overlay for that peer id, so it can't displace a real dial-book entry.
+/// `enqueue_gossip_hint` never lets such a hint displace the dial-book
+/// entry it holds for that peer id under another overlay: it is dropped
+/// against an overlay a handshake verified, and otherwise kept only as
+/// that entry's rival until a dial settles which one is real.
 fn verify_hive_entries(
     peers: &[BzzAddressPb],
     version: HandshakeWireVersion,
