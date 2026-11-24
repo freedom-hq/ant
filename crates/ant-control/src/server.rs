@@ -99,7 +99,12 @@ pub struct BoundControlSocket {
 ///
 /// `socket_path` itself must fit `sun_path`, checked before anything is
 /// touched: a longer path fails here exactly as a direct `bind(2)` would,
-/// even though the shorter staged path alone would have bound.
+/// even though a shorter staged path alone might have bound. The staged
+/// path must fit too, and is picked to: its directory name shrinks to a
+/// single byte when needed, so any socket file name of 3 bytes or more
+/// stages wherever it fits. Only a 1-2 byte file name within 2 bytes of
+/// the limit can't be staged; that is refused up front with the same
+/// `InvalidInput` error, so the daemon falls back as for an over-long path.
 ///
 /// An existing file at `socket_path` owned by another user is refused,
 /// not removed: in a shared directory that is a squatter, and silently
@@ -109,9 +114,9 @@ pub fn bind(socket_path: PathBuf) -> Result<BoundControlSocket, ServerError> {
 }
 
 fn bind_owned_by(socket_path: PathBuf, uid: u32) -> Result<BoundControlSocket, ServerError> {
-    // The socket is bound at the shorter staged path and `rename(2)`
-    // doesn't check `sun_path`, so a final path a few bytes over the
-    // limit would bind fine and yet be unreachable: every client's
+    // The socket is bound at a staged path that may be shorter, and
+    // `rename(2)` doesn't check `sun_path`, so a final path a few bytes
+    // over the limit would bind fine and yet be unreachable: every client's
     // `connect` fails with SUN_LEN, and the daemon never tries its
     // fallback. Check the final path up front, failing with the same
     // error a direct `bind` at it would (issue #39's fallback keys off
@@ -121,9 +126,27 @@ fn bind_owned_by(socket_path: PathBuf, uid: u32) -> Result<BoundControlSocket, S
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    // The staged path `<parent>/<name>/s` must fit as well. It is up to
+    // 3 bytes longer than a final path with a short file name (a custom
+    // `--control-socket <dir>/ctl`), so pick only staging names whose
+    // staged path fits, and refuse (again before touching anything) if
+    // not even the shortest one does.
+    let file_name = socket_path.file_name().map(std::ffi::OsStr::to_os_string);
+    let names = staging_names(&parent, file_name.as_deref());
+    if names.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "control socket path {} leaves no room under sun_path for its \
+                 staging directory (use a socket file name of 3 bytes or more)",
+                socket_path.display(),
+            ),
+        )
+        .into());
+    }
     std::fs::create_dir_all(&parent)?;
     remove_stale_socket(&socket_path, uid)?;
-    let staging = StagingDir::create(&parent)?;
+    let staging = StagingDir::create(&parent, &names)?;
     let staged = staging.path.join("s");
     let listener = UnixListener::bind(&staged)?;
     restrict_socket_permissions(&staged)?;
@@ -160,27 +183,49 @@ fn remove_stale_socket(path: &Path, uid: u32) -> std::io::Result<()> {
 
 /// A freshly created, owner-only (`0700`) directory the socket is bound
 /// in before being moved into place. Removed on drop, so a failed bind
-/// leaves nothing behind. Named `.as<n>` with `n` counting up (at most
-/// [`STAGING_ATTEMPTS`] tries) until `mkdir` succeeds, which claims the
-/// name atomically. The staged path `<parent>/.as<n>/s` is never longer
-/// than `<parent>/antd.sock`, so a data dir whose default socket fits
-/// `sun_path` still fits while staged.
+/// leaves nothing behind. Named from [`staging_names`], trying each in
+/// turn until `mkdir` succeeds, which claims the name atomically. The
+/// usual `.as<n>` names keep `<parent>/.as<n>/s` no longer than
+/// `<parent>/antd.sock`; shorter fallback names cover shorter socket
+/// file names near the `sun_path` limit.
 struct StagingDir {
     path: PathBuf,
 }
 
+/// How many `.as<n>` names are tried before the short fallback names.
 const STAGING_ATTEMPTS: u32 = 64;
 
 fn staging_name(n: u32) -> String {
     format!(".as{n}")
 }
 
+/// Staging directory names, in the order they are tried, keeping only
+/// those whose staged socket path `<parent>/<name>/s` fits `sun_path`
+/// (checked with the platform's own limit, so 104 on macOS, 108 on
+/// Linux) and that aren't the socket's own file name (the rename would
+/// then target the staging directory itself). First the `.as<n>` names,
+/// then `.a`-`.z` and finally single letters `a`-`z`, so a 3-byte file
+/// name such as `ctl` stages wherever `<parent>/ctl` itself fits.
+fn staging_names(parent: &Path, file_name: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let short = (b'a'..=b'z').map(|c| format!(".{}", c as char));
+    let shortest = (b'a'..=b'z').map(|c| (c as char).to_string());
+    (0..STAGING_ATTEMPTS)
+        .map(staging_name)
+        .chain(short)
+        .chain(shortest)
+        .filter(|name| file_name != Some(std::ffi::OsStr::new(name)))
+        .filter(|name| {
+            std::os::unix::net::SocketAddr::from_pathname(parent.join(name).join("s")).is_ok()
+        })
+        .collect()
+}
+
 impl StagingDir {
-    fn create(parent: &Path) -> std::io::Result<Self> {
+    fn create(parent: &Path, names: &[String]) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         let mut last = None;
-        for n in 0..STAGING_ATTEMPTS {
-            let path = parent.join(staging_name(n));
+        for name in names {
+            let path = parent.join(name);
             match std::fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
@@ -1014,6 +1059,106 @@ mod tests {
             assert_eq!(entries(&dir), vec!["antd.sock".to_string()], "{len}");
             assert_eq!(std::fs::read(&path).unwrap(), b"stale");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Path of exactly `len` bytes ending in `/<name>`, under `base`.
+    #[cfg(target_os = "linux")]
+    fn path_of_len(base: &Path, name: &str, len: usize) -> (PathBuf, PathBuf) {
+        let room = len - base.as_os_str().len() - name.len() - 2;
+        let dir = base.join("d".repeat(room));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        assert_eq!(path.as_os_str().len(), len);
+        (dir, path)
+    }
+
+    /// A custom socket file name shorter than `antd.sock` (here `ctl`)
+    /// at the longest path `sun_path` accepts still binds at that path:
+    /// `<dir>/.as0/s` would be 3 bytes over, so staging must pick a
+    /// shorter directory name instead of failing the bind (which would
+    /// push antd to its fallback while `antctl --socket <dir>/ctl`
+    /// keeps looking at the path it was given).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn short_socket_name_at_the_sun_path_limit_still_binds() {
+        let base = scratch_dir("sunlen-short");
+        let (dir, path) = path_of_len(&base, "ctl", 107);
+        let bound = bind(path.clone()).unwrap();
+        assert_eq!(bound.socket_path(), path);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(entries(&dir), vec!["ctl".to_string()]);
+
+        let serve = tokio::spawn(bound.serve("antd/test".into(), status_rx(), None));
+        let p = path.clone();
+        let reply =
+            tokio::task::spawn_blocking(move || crate::client::request_sync(&p, &Request::Version))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(reply, Response::Version(v) if v.agent == "antd/test"));
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When every `.as<n>` name that fits is taken (here `.as0`-`.as9`,
+    /// with `.as10` one byte too long), staging moves on to the short
+    /// names rather than failing, and leaves the taken ones alone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn taken_staging_names_fall_through_to_short_names() {
+        let base = scratch_dir("sunlen-taken");
+        let (dir, path) = path_of_len(&base, "sockt1", 107);
+        let names = staging_names(&dir, path.file_name());
+        assert!(names.contains(&staging_name(9)));
+        assert!(!names.contains(&staging_name(10)));
+        for n in 0..10 {
+            std::fs::create_dir(dir.join(staging_name(n))).unwrap();
+        }
+        let bound = bind(path.clone()).unwrap();
+        assert_eq!(bound.socket_path(), path);
+        let mut want: Vec<String> = (0..10).map(staging_name).collect();
+        want.push("sockt1".to_string());
+        want.sort();
+        assert_eq!(entries(&dir), want);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A staging name equal to the socket's own file name is never
+    /// used: the socket would be renamed onto its own staging directory.
+    #[test]
+    fn staging_names_skip_the_socket_file_name() {
+        let names = staging_names(Path::new("/x"), Some(std::ffi::OsStr::new("a")));
+        assert!(!names.iter().any(|n| n == "a"));
+        assert!(names.iter().any(|n| n == "b"));
+        assert_eq!(names.first().map(String::as_str), Some(".as0"));
+    }
+
+    /// A 1-2 byte file name within 2 bytes of the limit can't be staged
+    /// at all: refused with `InvalidInput` (as for an over-long path, so
+    /// antd falls back) before anything in the dir is touched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unstageable_short_name_is_refused_untouched() {
+        let base = scratch_dir("sunlen-unstageable");
+        for (name, len) in [("s", 107usize), ("s", 106), ("ab", 107)] {
+            let (dir, path) = path_of_len(&base, name, len);
+            std::fs::write(&path, b"stale").unwrap();
+            let err = bind(path.clone()).err().expect("must refuse");
+            assert!(
+                matches!(&err, ServerError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{name}/{len}: {err}"
+            );
+            assert_eq!(entries(&dir), vec![name.to_string()]);
+            assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        // One byte shorter than that, `s` stages under a 1-byte name.
+        let (dir, path) = path_of_len(&base, "s", 105);
+        drop(bind(path.clone()).unwrap());
+        assert_eq!(entries(&dir), vec!["s".to_string()]);
         let _ = std::fs::remove_dir_all(&base);
     }
 
