@@ -749,7 +749,9 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 /// The gateway binds loopback and answers only requests whose `Host` is
 /// `localhost`, `127.0.0.1` or `[::1]`, a subdomain of `localhost`
 /// (`abc.bzz.localhost`), or the bound IP, each with or without the
-/// bound port; anything else gets `421`. That stops a DNS-rebinding page
+/// bound port; anything else gets `421` (a wildcard `api_addr`,
+/// `0.0.0.0`/`[::]`, has no single bound IP, so list any IP literal
+/// clients use). That stops a DNS-rebinding page
 /// (`http://evil.example:<port>` re-pointed at `127.0.0.1`) from
 /// talking to the API as its own origin. `hosts` points at `hosts_len`
 /// NUL-terminated UTF-8 entries that extend the list: `host` (any port)

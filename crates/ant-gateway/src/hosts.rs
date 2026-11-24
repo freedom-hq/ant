@@ -12,7 +12,10 @@
 //! - Always accepted: `localhost`, `127.0.0.1` and `[::1]`, any
 //!   subdomain of `localhost` (`abc.bzz.localhost`, as Bee's subdomain
 //!   router uses), and the literal IP the listener is bound to. Each
-//!   with or without the bound port; a different port is refused.
+//!   with or without the bound port; a different port is refused. A
+//!   wildcard bind (`0.0.0.0`, `[::]`) has no single IP of its own, so
+//!   there any IP literal clients use (`192.168.1.5:1633`) must be
+//!   listed in `allowed-hosts` like a name.
 //! - Extra names come from `allowed-hosts` (antd) /
 //!   `ant_set_gateway_allowed_hosts` (ant-ffi), e.g. the public name a
 //!   reverse proxy forwards. An entry without a port matches that name
@@ -134,6 +137,8 @@ impl HostPolicy {
         if is_local_name(&host) && port_ok(port) {
             return true;
         }
+        // A wildcard bind has no IP of its own to accept: an IP literal
+        // then has to be listed like any other name.
         if let (Ok(ip), Some(addr)) = (host.parse::<IpAddr>(), self.bound) {
             let bound_ip = addr.ip().to_canonical();
             if !bound_ip.is_unspecified() && ip.to_canonical() == bound_ip && port_ok(port) {
@@ -363,6 +368,12 @@ mod tests {
         assert!(p.allows("node.lan:1633"));
         assert!(p.allows("localhost:1633"));
         assert!(!p.allows("evil.example:1633"));
+        // A wildcard bind has no own IP: a literal must be listed.
+        assert!(!p.allows("192.168.1.5:1633"));
+        assert!(!p.allows("0.0.0.0:1633"));
+        let listed = HostPolicy::new(["node.lan", "192.168.1.5"]).bound_to(any);
+        assert!(listed.allows("192.168.1.5:1633"));
+        assert!(!listed.allows("192.168.1.6:1633"));
         // A specific non-loopback bind also accepts its own IP literal.
         let lan = HostPolicy::new(["node.lan"]).bound_to("192.168.1.5:1633".parse().unwrap());
         assert!(lan.allows("192.168.1.5:1633"));

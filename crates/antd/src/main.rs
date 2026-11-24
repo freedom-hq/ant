@@ -146,7 +146,9 @@ struct Opt {
     /// `localhost` and the bound IP are answered without it (others get
     /// `421`), which stops DNS-rebinding pages. `*` turns the check off.
     /// On a non-loopback `--api-addr` with no entries the check is off
-    /// and a warning is logged.
+    /// and a warning is logged. With entries on a wildcard `--api-addr`
+    /// (`0.0.0.0`, `[::]`) there is no single bound IP, so list any IP
+    /// literal clients use (`192.168.1.5`) as well.
     #[arg(long, value_delimiter = ',')]
     allowed_hosts: Vec<String>,
 

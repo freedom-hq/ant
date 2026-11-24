@@ -1104,7 +1104,8 @@ void ant_free_string(char *ptr);
  * 127.0.0.1, [::1], a subdomain of localhost, or the bound IP, with or
  * without its own port, plus the names set with
  * ant_set_gateway_allowed_hosts; others get 421 (after 0.5.79). This
- * stops DNS-rebinding pages.
+ * stops DNS-rebinding pages. A wildcard api_addr (0.0.0.0, [::]) has no
+ * single bound IP: list any IP literal clients use there as well.
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
@@ -1221,8 +1222,9 @@ bool ant_set_gateway_cors(const AntHandle *handle,
  *
  * Without it the gateway answers only requests whose Host is localhost,
  * 127.0.0.1, [::1], a subdomain of localhost (abc.bzz.localhost) or the
- * bound IP, each with or without the bound port; anything else gets 421.
- * That stops a DNS-rebinding page (evil.example re-pointed at 127.0.0.1)
+ * bound IP, each with or without the bound port; anything else gets 421
+ * (a wildcard api_addr, 0.0.0.0 / [::], has no single bound IP, so list
+ * any IP literal clients use). That stops a DNS-rebinding page (evil.example re-pointed at 127.0.0.1)
  * from using the API as its own origin. `hosts` points at `hosts_len`
  * NUL-terminated UTF-8 entries that extend the list: "host" (any port)
  * or "host:port" (that port only; :443/:80 also match a Host without

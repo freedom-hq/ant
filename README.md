@@ -288,6 +288,8 @@ cargo run -p antd -- \
   `421`, against DNS rebinding). Behind a reverse proxy that forwards
   its own `Host`, list that name with `--allowed-hosts` (or
   `allowed-hosts:` in a `--config` file); `*` turns the check off.
+  On a wildcard `--api-addr` (`0.0.0.0`, `[::]`) with `--allowed-hosts`
+  set, also list any IP literal clients use (`192.168.1.5`).
   Web pages can only write through the API, or open its WebSockets,
   from origins in `--cors-allowed-origins`; see the gateway README.
 - `--no-disk-cache` falls back to memory-only caching.

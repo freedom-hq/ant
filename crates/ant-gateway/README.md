@@ -247,6 +247,9 @@ https://github.com/ethersphere/bee/pull/5651):
   browsers leave the default port out of `Host`); `*` turns the check
   off. On a non-loopback `api-addr`
   with no `allowed-hosts`, nothing is checked and a warning is logged.
+  With `allowed-hosts` on a wildcard `api-addr` (`0.0.0.0`, `[::]`)
+  there is no single bound IP, so IP literals clients use
+  (`192.168.1.5:1633`) must be listed too.
   **This differs from bee**, which has no `Host` check.
 - **Writes.** Any request other than `GET`/`HEAD`/`OPTIONS` from a web
   page is `403` unless its `Origin` is in `cors-allowed-origins`, as in
