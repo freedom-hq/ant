@@ -494,3 +494,54 @@ async fn intercept_commands(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn node(outbound_only: bool) -> (NodeConfig, watch::Receiver<StatusSnapshot>) {
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+        let cfg = NodeConfig::mainnet_default(
+            ant_crypto::random_secp256k1_secret(),
+            ant_crypto::random_overlay_nonce(),
+            Vec::new(),
+            Keypair::generate_ed25519(),
+        )
+        .with_network_id(4020)
+        .with_status(tx)
+        .with_outbound_only(outbound_only);
+        (cfg, rx)
+    }
+
+    /// Issue #269, end to end through `run_node`: an outbound-only node
+    /// runs without opening a listener (a listener shows up in the
+    /// status snapshot within milliseconds of the swarm's first poll) and
+    /// without an external address, and external addresses configured
+    /// for one are refused at start. (No bootnodes: nothing is dialed.)
+    #[tokio::test]
+    async fn an_outbound_only_node_opens_no_listener() {
+        let (cfg, status) = node(true);
+        let task = tokio::spawn(run_node(cfg));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task.is_finished(), "the node stopped");
+        let st = status.borrow().clone();
+        assert!(st.listeners.is_empty(), "listening on {:?}", st.listeners);
+        assert!(
+            st.external_addresses.is_empty(),
+            "advertising {:?}",
+            st.external_addresses
+        );
+        task.abort();
+
+        let (cfg, _status) = node(true);
+        let cfg = cfg.with_external_addrs(vec!["/ip4/203.0.113.10/tcp/1634".parse().unwrap()]);
+        let got = tokio::time::timeout(Duration::from_secs(5), run_node(cfg))
+            .await
+            .expect("refused at start");
+        assert!(
+            matches!(got, Err(NodeError::P2p(ant_p2p::RunError::Config(_)))),
+            "{got:?}"
+        );
+    }
+}

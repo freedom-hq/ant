@@ -10245,7 +10245,9 @@ mod tests {
     /// external address, neither from a listener address nor from a
     /// peer's `observed_addr`; the same events on a default node do
     /// register both (so the assertions are not vacuous). External
-    /// addresses configured for an outbound-only node are refused.
+    /// addresses configured for an outbound-only node are refused. That
+    /// `run` opens no listener is `ant-node`'s
+    /// `an_outbound_only_node_opens_no_listener`.
     #[tokio::test]
     async fn outbound_only_node_registers_no_external_address() {
         let public_listener: Multiaddr = "/ip4/198.51.100.30/tcp/1634".parse().unwrap();
@@ -10290,7 +10292,6 @@ mod tests {
             if outbound_only {
                 assert!(advertised.is_empty(), "advertised {advertised:?}");
                 assert!(state.external_addresses.is_empty());
-                assert_eq!(ours.listeners().count(), 0);
             } else {
                 assert!(
                     advertised.contains(&public_listener),
