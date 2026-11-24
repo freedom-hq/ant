@@ -139,9 +139,16 @@ Examples:
         reference: String,
         /// Path to write the bytes to. Defaults to stdout. If it is an
         /// existing directory, the file is named after the manifest's
-        /// `Filename`, reduced to its final component (else `data.bin`).
+        /// `Filename`, reduced to its final component with any leading
+        /// dots dropped (else `data.bin`), and an existing file or
+        /// symlink of that name is refused unless `--force` is given.
+        /// An explicit file path is written as given.
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
+        /// With `--out <dir>`, overwrite an existing regular file of the
+        /// manifest-derived name. A symlink there is still refused.
+        #[arg(long, requires = "out")]
+        force: bool,
         /// Force `bytes` (multi-chunk join) mode regardless of the
         /// reference's URL scheme.
         #[arg(long, conflicts_with = "bzz")]
@@ -789,6 +796,7 @@ fn main() -> Result<()> {
         Command::Get {
             reference,
             out,
+            force,
             bytes,
             bzz,
             bzz_path,
@@ -823,6 +831,7 @@ fn main() -> Result<()> {
                 &socket,
                 &reference,
                 out.as_deref(),
+                force,
                 opt.json,
                 mode,
                 allow_degraded_redundancy,
@@ -874,15 +883,19 @@ const DEFAULT_OUTPUT_NAME: &str = "data.bin";
 /// Reduce a manifest-supplied `Filename` to a single plain file name
 /// that is safe to join onto the user's `--out <dir>`. The hint comes
 /// from whoever uploaded the content, so it is untrusted: only its final
-/// path component is kept (splitting on both `/` and `\`), and anything
-/// that is still not exactly one normal component (`..`, `.`, empty, a
-/// drive prefix, a NUL byte) falls back to [`DEFAULT_OUTPUT_NAME`]. The
-/// result never climbs out of, or replaces, the target directory.
+/// path component is kept (splitting on both `/` and `\`), leading dots
+/// are dropped so it can't plant a dotfile (`.bashrc`, `.npmrc`) in a
+/// home directory, and anything that is still not exactly one normal
+/// component (empty, a drive prefix, a NUL byte) falls back to
+/// [`DEFAULT_OUTPUT_NAME`]. The result never climbs out of, or replaces,
+/// the target directory. A user who wants the dotted name passes it
+/// explicitly as `-o <dir>/.name`.
 fn safe_output_name(filename_hint: Option<&str>) -> &str {
     let Some(hint) = filename_hint else {
         return DEFAULT_OUTPUT_NAME;
     };
     let name = hint.rsplit(['/', '\\']).next().unwrap_or("");
+    let name = name.trim_start_matches('.');
     if name.contains('\0') {
         return DEFAULT_OUTPUT_NAME;
     }
@@ -898,23 +911,58 @@ fn safe_output_name(filename_hint: Option<&str>) -> &str {
 /// daemon hands us a `Filename` from manifest metadata and the user
 /// passed `--out <dir>` rather than a file — `<dir>/<Filename>`, with
 /// the name reduced by [`safe_output_name`] so it stays inside `<dir>`.
+///
+/// Because that name is chosen by the uploader, the directory case never
+/// replaces what is already there: an existing file (or any symlink,
+/// even a dangling one) of that name is refused, so a manifest can't
+/// silently overwrite a user's file or write through a link the user
+/// didn't make. `force` allows overwriting an existing regular file but
+/// still refuses a symlink. An explicit file path is the user's own
+/// choice and is written as given, as before.
 fn write_output(
     out: Option<&Path>,
     filename_hint: Option<&str>,
+    force: bool,
     data: &[u8],
 ) -> Result<Option<PathBuf>> {
     use std::io::Write;
     if let Some(p) = out {
-        // If `out` is an existing directory, append the manifest filename
+        if !p.is_dir() {
+            std::fs::write(p, data).with_context(|| format!("write to {}", p.display()))?;
+            return Ok(Some(p.to_path_buf()));
+        }
+        // `out` is an existing directory: append the manifest filename
         // (or fall back to "data.bin" if there isn't one). This lets
         // callers do `antctl get bzz://<ref>/ -o ./` and end up with
         // `./index.html` automatically.
-        let target = if p.is_dir() {
-            p.join(safe_output_name(filename_hint))
+        let target = p.join(safe_output_name(filename_hint));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        if force {
+            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!(
+                    "refusing to write {}: it is a symlink (pass an explicit file path with -o to choose the destination)",
+                    target.display()
+                );
+            }
+            opts.create(true).truncate(true);
         } else {
-            p.to_path_buf()
+            // `create_new` is O_CREAT|O_EXCL: it fails on any existing
+            // entry, symlinks included, without following them.
+            opts.create_new(true);
+        }
+        let mut file = match opts.open(&target) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => bail!(
+                "refusing to overwrite existing {} (pass --force to replace a regular file, or an explicit file path with -o)",
+                target.display()
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| format!("write to {}", target.display()));
+            }
         };
-        std::fs::write(&target, data).with_context(|| format!("write to {}", target.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("write to {}", target.display()))?;
         return Ok(Some(target));
     }
     io::stdout().lock().write_all(data)?;
@@ -2311,7 +2359,7 @@ fn parse_reference_with_mode(
 /// line. The caller decides whether progress makes sense (TTY check,
 /// `--json`, single-chunk fetches, etc.) so this function can stay
 /// focused on plumbing.
-// Eight args is one over clippy's preferred ceiling, but every one of
+// Nine args is two over clippy's preferred ceiling, but every one of
 // them is a CLI-driven knob with a distinct meaning, and bundling them
 // into a struct just for clippy would obscure the call site below.
 #[allow(clippy::too_many_arguments)]
@@ -2319,6 +2367,7 @@ fn run_get(
     socket: &Path,
     reference: &str,
     out: Option<&Path>,
+    force: bool,
     json: bool,
     mode: FetchMode,
     allow_degraded_redundancy: bool,
@@ -2360,7 +2409,7 @@ fn run_get(
         other => bail!("unexpected response: {other:?}"),
     };
 
-    let written = write_output(out, filename.as_deref(), &data)?;
+    let written = write_output(out, filename.as_deref(), force, &data)?;
 
     if json {
         let mut payload = serde_json::json!({
@@ -3325,42 +3374,120 @@ mod tests {
         assert_eq!(safe_output_name(Some("../../x")), "x");
         assert_eq!(safe_output_name(Some("a/../../b")), "b");
         assert_eq!(safe_output_name(Some("..\\..\\x")), "x");
-        for bad in ["", ".", "..", "/", "a/..", "../", "x/.", "a\0b"] {
+        for bad in ["", ".", "..", "...", "/", "a/..", "../", "x/.", "a\0b"] {
             assert_eq!(safe_output_name(Some(bad)), DEFAULT_OUTPUT_NAME, "{bad:?}");
         }
         assert_eq!(safe_output_name(None), DEFAULT_OUTPUT_NAME);
+        // An uploader can't plant a dotfile in the target dir.
+        assert_eq!(safe_output_name(Some(".bashrc")), "bashrc");
+        assert_eq!(
+            safe_output_name(Some("../.ssh/..authorized_keys")),
+            "authorized_keys"
+        );
+        assert_eq!(safe_output_name(Some("a.b.")), "a.b.");
+    }
+
+    /// A fresh, empty directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "antctl-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root.canonicalize().unwrap())
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn write_output_keeps_hostile_filenames_inside_the_target_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "antctl-write-output-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let dir = root.join("a").join("b").join("out");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
-        let outside = root.join("a").join("x");
         for (hint, expect) in [
             ("/etc/x", "x"),
             ("../../x", "x"),
             ("a/../../b", "b"),
             ("..", DEFAULT_OUTPUT_NAME),
+            ("../.bashrc", "bashrc"),
         ] {
-            let written = write_output(Some(&dir), Some(hint), b"payload")
+            let tmp = TempDir::new("write-output");
+            let root = &tmp.0;
+            let dir = root.join("a").join("b").join("out");
+            std::fs::create_dir_all(&dir).unwrap();
+            let written = write_output(Some(&dir), Some(hint), false, b"payload")
                 .unwrap()
                 .expect("written to a file");
             assert_eq!(written, dir.join(expect), "hint {hint:?}");
             assert_eq!(written.parent(), Some(dir.as_path()), "hint {hint:?}");
             assert_eq!(std::fs::read(&written).unwrap(), b"payload");
+            assert!(!root.join("a").join("x").exists(), "{hint:?} escaped");
+            assert!(
+                !root.join("a").join("b").join("b").exists(),
+                "{hint:?} escaped"
+            );
+            assert!(!dir.join(".bashrc").exists(), "{hint:?} planted a dotfile");
         }
-        assert!(!outside.exists(), "../../x escaped the target dir");
-        assert!(!root.join("a").join("b").join("b").exists());
-        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The uploader picks the name inside `--out <dir>`, so an existing
+    /// file of that name is left alone unless the user passes `--force`.
+    #[test]
+    fn write_output_refuses_to_overwrite_an_existing_file_in_the_dir() {
+        let tmp = TempDir::new("write-output-existing");
+        let dir = &tmp.0;
+        let existing = dir.join("notes.txt");
+        std::fs::write(&existing, b"mine").unwrap();
+
+        let err = write_output(Some(dir), Some("notes.txt"), false, b"theirs").unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        assert!(err.to_string().contains("--force"), "{err:#}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"mine");
+
+        let written = write_output(Some(dir), Some("notes.txt"), true, b"theirs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, existing);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"theirs");
+
+        // An explicit file path is the user's own choice and still
+        // overwrites without `--force`.
+        write_output(Some(&existing), Some("ignored"), false, b"explicit").unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"explicit");
+    }
+
+    /// A symlink at the manifest-derived name, live or dangling, is never
+    /// followed, with or without `--force`.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_never_follows_a_symlink_in_the_dir() {
+        let tmp = TempDir::new("write-output-symlink");
+        let dir = tmp.0.join("out");
+        std::fs::create_dir(&dir).unwrap();
+        let victim = tmp.0.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dangling_target = tmp.0.join("not-yet");
+        std::os::unix::fs::symlink(&victim, dir.join("live")).unwrap();
+        std::os::unix::fs::symlink(&dangling_target, dir.join("dangling")).unwrap();
+
+        for name in ["live", "dangling"] {
+            for force in [false, true] {
+                let err = write_output(Some(&dir), Some(name), force, b"evil").unwrap_err();
+                assert!(
+                    err.to_string().contains("refusing"),
+                    "{name} {force}: {err:#}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!dangling_target.exists(), "dangling symlink was followed");
     }
 
     /// Every argument that can carry a secret (a private key, or an RPC
@@ -3400,12 +3527,20 @@ mod tests {
 
     #[test]
     fn postage_create_help_does_not_print_the_owner_key() {
-        std::env::set_var("POSTAGE_OWNER_KEY", "deadbeefSECRET");
-        let err = <Opt as clap::Parser>::try_parse_from(["antctl", "postage", "create", "--help"])
+        // Point the arg at a test-only env name so no parallel test that
+        // parses postage args can pick the value up as a real owner key;
+        // `hide_env_values` stays as declared on `owner_key`.
+        const ENV: &str = "ANT_TEST_288_POSTAGE_OWNER_KEY";
+        std::env::set_var(ENV, "deadbeefSECRET");
+        let err = <Opt as clap::CommandFactory>::command()
+            .mut_subcommand("postage", |c| {
+                c.mut_subcommand("create", |c| c.mut_arg("owner_key", |a| a.env(ENV)))
+            })
+            .try_get_matches_from(["antctl", "postage", "create", "--help"])
             .expect_err("--help exits early");
-        std::env::remove_var("POSTAGE_OWNER_KEY");
+        std::env::remove_var(ENV);
         let help = err.render().to_string();
-        assert!(help.contains("POSTAGE_OWNER_KEY"), "{help}");
+        assert!(help.contains(ENV), "{help}");
         assert!(!help.contains("deadbeefSECRET"), "{help}");
     }
 
