@@ -65,6 +65,9 @@ pub enum DecryptError {
     /// The stored chunk is shorter than its 8-byte span header.
     #[error("encrypted chunk too short: {0} bytes")]
     TooShort(usize),
+    /// The stored chunk is longer than `span(8) ‖ data(4096)`.
+    #[error("encrypted chunk too long: {0} bytes")]
+    TooLong(usize),
     /// The decrypted span declares a Reed–Solomon redundancy level we
     /// don't decode (only `NONE` is supported on the read path).
     #[error("encrypted chunk uses unsupported redundancy level {0}")]
@@ -73,6 +76,18 @@ pub enum DecryptError {
     /// is wrong or the chunk is corrupt.
     #[error("decrypted length {length} exceeds chunk payload {payload}")]
     LengthOverflow { length: usize, payload: usize },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EncryptError {
+    /// The plaintext chunk is shorter than its 8-byte span header.
+    #[error("plaintext chunk too short: {0} bytes")]
+    TooShort(usize),
+    /// The plaintext chunk is longer than `span(8) ‖ payload(4096)`.
+    /// Encrypting it would run the data keystream into counter 128, the
+    /// block that encrypts the span.
+    #[error("plaintext chunk too long: {0} bytes")]
+    TooLong(usize),
 }
 
 /// Keystream block for 32-byte segment counter `ctr`:
@@ -161,14 +176,24 @@ fn enc_reference_count(span: u64) -> usize {
 /// The chunk's stored address is the BMT hash of the **padded** result
 /// (header = the encrypted span), and its encrypted reference is
 /// `address(32) ‖ key(32)`.
-#[must_use]
-pub fn encrypt_chunk_unpadded(plain_wire: &[u8], key: &[u8; KEY_LENGTH]) -> Vec<u8> {
-    debug_assert!(plain_wire.len() >= SPAN_SIZE);
-    debug_assert!(plain_wire.len() <= SPAN_SIZE + CHUNK_SIZE);
+///
+/// Rejects input shorter than [`SPAN_SIZE`] or longer than
+/// `SPAN_SIZE + CHUNK_SIZE`: the latter would reuse the span's keystream
+/// block (counter 128) for payload segment 128.
+pub fn encrypt_chunk_unpadded(
+    plain_wire: &[u8],
+    key: &[u8; KEY_LENGTH],
+) -> Result<Vec<u8>, EncryptError> {
+    if plain_wire.len() < SPAN_SIZE {
+        return Err(EncryptError::TooShort(plain_wire.len()));
+    }
+    if plain_wire.len() > SPAN_SIZE + CHUNK_SIZE {
+        return Err(EncryptError::TooLong(plain_wire.len()));
+    }
     let mut out = plain_wire.to_vec();
     transcrypt(&mut out[..SPAN_SIZE], key, SPAN_INIT_CTR);
     transcrypt(&mut out[SPAN_SIZE..], key, 0);
-    out
+    Ok(out)
 }
 
 /// A fresh random 32-byte chunk encryption key from the OS RNG
@@ -182,7 +207,19 @@ pub fn random_encryption_key() -> [u8; KEY_LENGTH] {
 
 /// Decrypt a stored, encrypted chunk into its raw parts: the decrypted
 /// 8-byte span (level byte intact) and the **full** decrypted data
-/// (padding included, no truncation). Callers that must handle
+/// (padding included, no truncation), always [`CHUNK_SIZE`] bytes long.
+///
+/// A wire shorter than `SPAN_SIZE + CHUNK_SIZE` is zero-extended before
+/// decrypting. BMT zero-pads the payload when hashing, so [`cac_valid`]
+/// accepts a stored chunk with its trailing `0x00` bytes stripped; the
+/// zero-extended ciphertext is exactly the bytes the address commits to.
+/// Without this, a full leaf whose last ciphertext byte happens to be 0
+/// could be served shortened and fail to decrypt. A wire longer than
+/// `SPAN_SIZE + CHUNK_SIZE` is rejected.
+///
+/// [`cac_valid`]: crate::cac_valid
+///
+/// Callers that must handle
 /// Reed–Solomon-level spans use this and compute the truncation with
 /// their own erasure tables (`bee`'s `DecryptChunkData`); everyone else
 /// wants [`decrypt_chunk`].
@@ -193,10 +230,14 @@ pub fn decrypt_chunk_parts(
     if stored_wire.len() < SPAN_SIZE {
         return Err(DecryptError::TooShort(stored_wire.len()));
     }
+    if stored_wire.len() > SPAN_SIZE + CHUNK_SIZE {
+        return Err(DecryptError::TooLong(stored_wire.len()));
+    }
     let mut span = [0u8; SPAN_SIZE];
     span.copy_from_slice(&stored_wire[..SPAN_SIZE]);
     transcrypt(&mut span, key, SPAN_INIT_CTR);
     let mut data = stored_wire[SPAN_SIZE..].to_vec();
+    data.resize(CHUNK_SIZE, 0);
     transcrypt(&mut data, key, 0);
     Ok((span, data))
 }
@@ -246,7 +287,7 @@ mod tests {
     /// `ChunkSize` bee applies (deterministic zeros here rather than
     /// random; decrypt truncates to the real length so the value is moot).
     fn encrypt_chunk(plain_wire: &[u8], key: &[u8; KEY_LENGTH]) -> Vec<u8> {
-        let mut out = encrypt_chunk_unpadded(plain_wire, key);
+        let mut out = encrypt_chunk_unpadded(plain_wire, key).unwrap();
         out.resize(SPAN_SIZE + CHUNK_SIZE, 0);
         out
     }
@@ -325,6 +366,80 @@ mod tests {
         assert!(matches!(
             decrypt_chunk(&[0u8; 4], &[0u8; KEY_LENGTH]),
             Err(DecryptError::TooShort(4))
+        ));
+    }
+
+    #[test]
+    fn encrypt_rejects_short_and_oversize() {
+        let key = [3u8; KEY_LENGTH];
+        assert_eq!(
+            encrypt_chunk_unpadded(&[0u8; SPAN_SIZE - 1], &key),
+            Err(EncryptError::TooShort(SPAN_SIZE - 1))
+        );
+        assert_eq!(
+            encrypt_chunk_unpadded(&[], &key),
+            Err(EncryptError::TooShort(0))
+        );
+        let over = vec![0u8; SPAN_SIZE + CHUNK_SIZE + 1];
+        assert_eq!(
+            encrypt_chunk_unpadded(&over, &key),
+            Err(EncryptError::TooLong(SPAN_SIZE + CHUNK_SIZE + 1))
+        );
+        // Both boundaries are accepted.
+        assert_eq!(
+            encrypt_chunk_unpadded(&[0u8; SPAN_SIZE], &key)
+                .unwrap()
+                .len(),
+            SPAN_SIZE
+        );
+        let full = vec![0u8; SPAN_SIZE + CHUNK_SIZE];
+        assert_eq!(
+            encrypt_chunk_unpadded(&full, &key).unwrap().len(),
+            SPAN_SIZE + CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn decrypt_accepts_trailing_zero_truncated_chunk() {
+        let content: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        let (_addr, plain_wire) = cac_new(&content).unwrap();
+        // Find a key whose last ciphertext byte is 0 (about 1 in 256), so
+        // the encryption itself produces the zero byte, as on the network.
+        let (key, enc) = (0u32..=u32::MAX)
+            .map(|i| {
+                let mut key = [0u8; KEY_LENGTH];
+                key[..4].copy_from_slice(&i.to_le_bytes());
+                (key, encrypt_chunk(&plain_wire, &key))
+            })
+            .find(|(_, enc)| enc[SPAN_SIZE + CHUNK_SIZE - 1] == 0)
+            .unwrap();
+        let span: [u8; SPAN_SIZE] = enc[..SPAN_SIZE].try_into().unwrap();
+        let addr = crate::bmt_hash_with_span(&span, &enc[SPAN_SIZE..]).unwrap();
+
+        let stripped = &enc[..enc.len() - 1];
+        assert!(
+            crate::cac_valid(&addr, stripped),
+            "BMT accepts the shortened form"
+        );
+        assert_eq!(decrypt_chunk(stripped, &key).unwrap(), plain_wire);
+        let (dec_span, data) = decrypt_chunk_parts(stripped, &key).unwrap();
+        assert_eq!(&dec_span, &plain_wire[..SPAN_SIZE]);
+        assert_eq!(data, content);
+    }
+
+    #[test]
+    fn decrypt_rejects_oversize_wire() {
+        let key = [9u8; KEY_LENGTH];
+        let (_addr, plain_wire) = cac_new(b"payload").unwrap();
+        let mut enc = encrypt_chunk(&plain_wire, &key);
+        enc.push(0);
+        assert!(matches!(
+            decrypt_chunk_parts(&enc, &key),
+            Err(DecryptError::TooLong(n)) if n == SPAN_SIZE + CHUNK_SIZE + 1
+        ));
+        assert!(matches!(
+            decrypt_chunk(&enc, &key),
+            Err(DecryptError::TooLong(_))
         ));
     }
 
