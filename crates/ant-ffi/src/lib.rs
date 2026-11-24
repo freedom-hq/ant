@@ -235,9 +235,10 @@ pub struct AntHandle {
     /// `gnosis_rpc` URL, exactly as before.
     ///
     /// The slot itself lives for the whole life of the handle and every
-    /// chain client shares this one `Arc` — a clear/replace therefore
-    /// reaches clients built earlier (notably the gateway's, captured
-    /// once at [`ant_start_gateway`]) instead of leaving them calling a
+    /// chain client shares this one `Arc`, empty or not — an install,
+    /// replace or clear therefore reaches clients built earlier (notably
+    /// the gateway's, captured once at [`ant_start_gateway`]): a late
+    /// install isn't missed, and a clear doesn't leave them calling a
     /// `host_ctx` the host has since freed.
     #[cfg(feature = "chain")]
     chain_transport: Arc<chain_transport::HostChainTransport>,
@@ -266,19 +267,19 @@ pub struct AntHandle {
 /// in-process gateway.
 #[cfg(feature = "chain")]
 impl AntHandle {
-    /// The handle's transport slot, if a host transport is installed
-    /// right now.
+    /// The handle's transport slot, installed or not.
     ///
     /// What is handed out is the *slot*, not a snapshot of the callback:
-    /// a later [`ant_set_chain_transport`] retargets (or empties) it for
-    /// every holder, so a long-lived client — the gateway's — can never
-    /// call a `host_ctx` the host was told it may free. An empty slot
-    /// stays `None` so the common no-transport build keeps the plain
-    /// `POST <url>` path with no per-request detour.
-    pub(crate) fn host_chain_transport(&self) -> Option<ant_chain::SharedChainTransport> {
-        self.chain_transport
-            .is_installed()
-            .then(|| self.chain_transport.clone() as ant_chain::SharedChainTransport)
+    /// a later [`ant_set_chain_transport`] fills, retargets or empties it
+    /// for every holder. A long-lived client (the gateway's, built once
+    /// at [`ant_start_gateway`]) therefore reads through a transport
+    /// installed after it was built (issue #303), and can never call a
+    /// `host_ctx` the host was told it may free. It is handed out even
+    /// while empty: an empty slot answers can't-serve, which falls back
+    /// to the configured URL exactly as with no transport (one hop
+    /// through the blocking pool per request).
+    pub(crate) fn host_chain_transport(&self) -> ant_chain::SharedChainTransport {
+        self.chain_transport.clone()
     }
 
     /// A [`ant_chain::ChainClient`] for `rpc`, routed through the host
@@ -292,7 +293,7 @@ impl AntHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         ant_chain::ChainClient::new(rpc)
-            .with_transport(self.host_chain_transport())
+            .with_transport(Some(self.host_chain_transport()))
             .with_unverified_logs(unverified)
     }
 }
@@ -3903,7 +3904,9 @@ pub unsafe extern "C" fn ant_ladder_marker_id(
 /// live (issue #176). `config_json` is the [`publisher::PublisherConfig`]
 /// the broadcast would start with (only its `batch_id`, `format`,
 /// `bitrate_kbps`, `segment_ms` and `ladder` matter here; `bitrate_kbps`
-/// counts everything a segment carries, so a host adds its audio rate);
+/// counts everything a segment carries, so a host adds its audio rate; a
+/// `segment_ms` or `bitrate_kbps` past what [`ant_publisher_start`]
+/// accepts is estimated at that bound);
 /// `plan_json` is the plan as [`ant_storage_status`] reports it (its
 /// `enabled`, `batch_id`, `immutable`, `worst_case_remaining_chunks`,
 /// `usable` and `propagating` are read; pass `usable` through, since a

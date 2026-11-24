@@ -46,9 +46,13 @@ hmac = "0.12.1"
 pbkdf2 = { version = "0.12.2", default-features = false }
 scrypt = { version = "0.11.0", default-features = false }
 sha2 = "0.10.9"
+# Constant-time keystore MAC check and wiping the derived key / decrypted
+# secret (security audit DMN-02, #295). Both already in the lockfile.
+subtle = "2.6.1"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize = "1.8.2"
 
 # `RLIMIT_NOFILE` bump is Unix-only; Windows has no equivalent and the
 # `rlimit` crate's `Resource`/`getrlimit` API isn't available there.

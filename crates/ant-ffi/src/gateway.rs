@@ -113,15 +113,16 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// settlement target from the wallet's existing xBZZ (capped to what
 /// the wallet holds; nothing is swapped).
 ///
-/// The gateway's chain wiring is captured **here, once**. A host that
-/// serves chain reads itself must therefore call
-/// [`crate::ant_set_chain_transport`] *before* this; installing one
-/// later only affects the per-call `ant_storage_*` / `ant_deploy_chequebook`
-/// paths until the gateway is stopped and started again. What is
-/// captured is the handle's transport *slot*, though, so replacing or
-/// clearing a transport that was installed before the start does reach
-/// this gateway immediately — a cleared one falls back to `gnosis_rpc`
-/// rather than calling a `host_ctx` the host has been told it may free.
+/// The gateway's chain wiring (chain reader/writer, after-buy and
+/// chequebook-refused hooks, chain init) is built **here, once**, but
+/// what it captures is the handle's transport *slot*, not the callback
+/// in it. So [`crate::ant_set_chain_transport`] reaches this gateway
+/// whenever it is called: a transport installed after the start serves
+/// the gateway's next chain request (issue #303; a read that already
+/// went to `gnosis_rpc` before the install is not repeated), and a
+/// replaced or cleared one takes effect at once — a cleared one falls
+/// back to `gnosis_rpc` rather than calling a `host_ctx` the host has
+/// been told it may free.
 ///
 /// CORS: the gateway lets cross-origin pages read its responses only
 /// for the origins last set with [`ant_set_gateway_cors`]; by default
@@ -361,12 +362,12 @@ pub unsafe extern "C" fn ant_start_gateway(
                 // size theirs by the plan's depth instead
                 // (`deposit_target_for_depth`).
                 Some(ant_chain::chequebook_store::DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR),
-                // Host-provided chain transport (issue #77), if the app
-                // installed one with `ant_set_chain_transport` before
-                // starting the gateway. `None` — the default — leaves
-                // `/wallet`, `/stamps`, `/chainstate` and `/chequebook`
-                // reading the `gnosis_rpc` URL exactly as before.
-                handle.host_chain_transport(),
+                // The handle's host chain transport slot (issue #77),
+                // installed now or later with `ant_set_chain_transport`
+                // (issue #303). While it is empty, `/wallet`, `/stamps`,
+                // `/chainstate` and `/chequebook` read the `gnosis_rpc`
+                // URL exactly as before.
+                Some(handle.host_chain_transport()),
                 // The account's process-wide wallet tx lock, which the
                 // drive flows and the after-buy settlement task below
                 // hold too: a `POST /stamps` can't race their deposit
@@ -378,23 +379,14 @@ pub unsafe extern "C" fn ant_start_gateway(
         };
         #[cfg(not(feature = "chain"))]
         let _ = gnosis_rpc;
-        // One chain client, routed through the host transport like every
-        // client this crate builds, for the background chain init and
-        // the after-buy hook below.
         #[cfg(feature = "chain")]
-        let chain_client = gnosis_rpc.clone().map(|rpc| handle.chain_client(rpc));
-        #[cfg(feature = "chain")]
-        let on_batch_bought = chain_client
-            .clone()
-            .map(|client| after_buy_hook(handle, client));
+        let ChainHooks {
+            chain_client,
+            on_batch_bought,
+            on_chequebook_refused,
+        } = chain_hooks(handle, gnosis_rpc);
         #[cfg(not(feature = "chain"))]
-        let on_batch_bought = None;
-        #[cfg(feature = "chain")]
-        let on_chequebook_refused = chain_client
-            .clone()
-            .map(|client| chequebook_refused_hook(handle, client));
-        #[cfg(not(feature = "chain"))]
-        let on_chequebook_refused = None;
+        let (on_batch_bought, on_chequebook_refused) = (None, None);
 
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
@@ -468,6 +460,35 @@ pub unsafe extern "C" fn ant_start_gateway(
             spawn_chain_init(handle, chain);
         }
         true
+    }
+}
+
+/// What [`ant_start_gateway`] wires to its chain besides the chain
+/// reader: one chain client for the background chain init, and the
+/// after-buy and chequebook-refused hooks built over it. All `None`
+/// without a `gnosis_rpc`.
+#[cfg(feature = "chain")]
+pub(crate) struct ChainHooks {
+    pub(crate) chain_client: Option<ant_chain::ChainClient>,
+    pub(crate) on_batch_bought: Option<ant_gateway::BatchBoughtHook>,
+    pub(crate) on_chequebook_refused: Option<ant_gateway::ChequebookRefusedHook>,
+}
+
+/// Build [`ChainHooks`] for a gateway start. The client comes from
+/// [`AntHandle::chain_client`], like every client this crate builds, so
+/// it reads through the handle's transport slot — including a transport
+/// installed after this runs (issue #303).
+#[cfg(feature = "chain")]
+pub(crate) fn chain_hooks(handle: &AntHandle, gnosis_rpc: Option<String>) -> ChainHooks {
+    let chain_client = gnosis_rpc.map(|rpc| handle.chain_client(rpc));
+    ChainHooks {
+        on_batch_bought: chain_client
+            .clone()
+            .map(|client| after_buy_hook(handle, client)),
+        on_chequebook_refused: chain_client
+            .clone()
+            .map(|client| chequebook_refused_hook(handle, client)),
+        chain_client,
     }
 }
 

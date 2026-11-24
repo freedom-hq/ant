@@ -1086,8 +1086,10 @@ void ant_free_string(char *ptr);
  * a new or existing chequebook's deposit up to the settlement target
  * from the wallet's existing xBZZ (nothing is swapped).
  *
- * The gateway's chain wiring is captured here, once. A host serving
- * chain reads itself must call ant_set_chain_transport BEFORE this.
+ * The gateway's chain wiring is built here, once, over the handle's
+ * chain transport slot: a transport set with ant_set_chain_transport
+ * before or after this call serves the gateway's chain requests from
+ * then on, with no restart.
  *
  * CORS: the gateway allows cross-origin reads only for the origins last
  * set with ant_set_gateway_cors. By default none: it sends no CORS
@@ -1344,14 +1346,19 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * replacing call, and calling ant_set_chain_transport from *inside* the
  * callback deadlocks.
  *
- * Ordering: effective immediately for ant_storage_* / ant_settlement_* /
- * ant_deploy_chequebook, which build a chain client per call. The
- * in-process gateway captures its chain wiring at ant_start_gateway, so
- * a transport installed while no transport was installed at its start
- * is only guaranteed to reach it after a restart (ant_stop_gateway +
- * ant_start_gateway) — install it first. Replacing or clearing a
- * transport the gateway did start with takes effect in it immediately,
- * per Lifetime above.
+ * Ordering: effective immediately, for the next chain request of
+ * ant_storage_* / ant_storage_settlement_* / ant_deploy_chequebook and
+ * of a running in-process gateway alike. The gateway builds its chain
+ * wiring at ant_start_gateway over the handle's one transport slot, so
+ * a transport installed after the gateway started reaches its chain
+ * reads, its after-buy and chequebook-refused hooks and the chequebook
+ * funds watch with no restart. The background confirmation of a
+ * wallet scan read from the unverified logs source, whose backoff
+ * reaches 30 minutes, is woken to try the new transport within a
+ * minute. Requests that already went to gnosis_rpc before the install
+ * are not repeated; another background retry that already failed tries
+ * again at its next backoff step. Replacing or clearing a transport
+ * takes effect in the same way, per Lifetime above.
  *
  * Returns ANT_CHAIN_TRANSPORT_OK (0) on success,
  * ANT_CHAIN_TRANSPORT_NULL_HANDLE (-1) if `handle` is NULL, or
@@ -1473,7 +1480,9 @@ char *ant_ladder_marker_id(const char *topic_hex, uint64_t period, char **out_er
  * live (issue #176). `config_json` is the publisher config the broadcast
  * would start with (its "batch_id", "format", "bitrate_kbps",
  * "segment_ms" and "ladder" are read; "bitrate_kbps" counts everything a
- * segment carries, so a host adds its audio rate); `plan_json` is the
+ * segment carries, so a host adds its audio rate; a "segment_ms" over
+ * 60000 or "bitrate_kbps" over 100000, which ant_publisher_start
+ * refuses, is estimated at that bound); `plan_json` is the
  * plan as ant_storage_status reports it (its "enabled", "batch_id",
  * "immutable", "worst_case_remaining_chunks", "usable" and "propagating"
  * are read; pass "usable" through, since a missing one reads as true and
@@ -1536,15 +1545,15 @@ char *ant_publisher_capacity(const char *config_json,
  *     "topic":           "0x<64 hex>",            // or raw topic bytes
  *     "format":          "bzz",                   // or "solar-punk"; see above
  *     "start_index":     0,                       // override: exact first feed index; see below
- *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address
+ *     "gateway":         "http://127.0.0.1:1633", // ant_start_gateway's address; no whitespace or control characters
  *     "batch_id":        "0x<64 hex>",            // required: the storage plan
- *     "segment_ms":      2000,                    // nominal segment duration
- *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition
+ *     "segment_ms":      2000,                    // nominal segment duration; 1..60000
+ *     "bitrate_kbps":    900,                     // 360p, the stage-1 rendition; at most 100000
  *     "max_in_flight":   4,                       // measured stable window
  *     "max_backlog":     4,                       // drop-oldest past this
  *     "playlist_window": 64,                      // most segments listed; 4096 bytes binds first
  *     "notes":           "iPhone 15 Pro / LTE",
- *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default)
+ *     "reap_ms":         60000,                      // end by itself after 60 s with no media; 0 = never (default); at most 86400000 (a day)
  *     "ladder":          true,                       // master playlist + ladder time markers; false (default)
  *     "width":           640,                        // the starting size (catalog rung, master RESOLUTION); ant_publisher_set_rendition changes it
  *     "height":          360,
