@@ -1261,8 +1261,13 @@ fn check_topmost(start: u64, topmost: u64, cursor: u64, slack: u64) -> TopmostCh
 }
 
 /// [`check_topmost`], and save the resume position `(epoch, topmost + 1)`
-/// for `key` only when it checks out — an invalid `topmost` never
-/// reaches `positions`, so it can't park a replacement puller.
+/// for `key` only when it checks out against `cursor` + `slack`. A
+/// `topmost` below `start`, at `u64::MAX` or past that bound never
+/// reaches `positions`. With [`TOPMOST_CURSOR_SLACK`] against a stale
+/// cursor, though, a lying `topmost` up to `cursor + slack` is saved
+/// without a re-read: this does not guarantee a saved position is
+/// valid, only bounded. [`usable_resume`] is what keeps such an entry
+/// from parking a replacement puller (see [`Positions`]).
 fn advance_position(
     positions: &Positions,
     key: (PeerId, u8),
@@ -1834,8 +1839,11 @@ mod tests {
         );
     }
 
-    /// `topmost = u64::MAX` (and anything else past the peer's cursor)
-    /// is never persisted, so it can't park a replacement puller.
+    /// `topmost = u64::MAX`, and anything past the peer's cursor plus the
+    /// given slack, is never persisted. A `topmost` within the slack is
+    /// (last assertion), even if the bin never grew that far; that one is
+    /// dropped at respawn by `usable_resume` instead (see
+    /// `resume_above_the_cursor_is_ignored`).
     #[test]
     fn absurd_topmost_is_not_persisted() {
         let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
