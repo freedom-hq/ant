@@ -125,6 +125,125 @@ pub fn split_bytes_with_redundancy(payload: &[u8], level: u8) -> RedundantSplitR
     }
 }
 
+/// How many chunks [`split_bytes_with_redundancy`] emits for a payload
+/// of `bytes` bytes at `level` (1–4): its `chunks.len()`, counted
+/// without building or hashing anything. Replays the splitter's
+/// wrap/encode/carry rules on counts alone (the tree's shape depends
+/// only on the length), so it costs one step per leaf and no memory.
+/// Dispersed replicas of the root are not counted, as there.
+///
+/// # Panics
+///
+/// If `level` is 0 or greater than [`MAX_LEVEL`], or if `bytes` exceeds
+/// the trie capacity, like [`RedundantSplitter`].
+#[must_use]
+pub fn redundant_chunk_count(bytes: u64, level: u8) -> u64 {
+    let mut counter = ChunkCounter::new(level);
+    let leaves = bytes.div_ceil(CHUNK_SIZE as u64).max(1);
+    for _ in 0..leaves {
+        counter.push_leaf();
+    }
+    counter.finish()
+}
+
+/// [`RedundantSplitter`]'s bookkeeping without the chunks: accumulator
+/// and buffer lengths per level, and how many chunks went out.
+struct ChunkCounter {
+    level: u8,
+    max_shards: usize,
+    max_children: usize,
+    acc: [usize; TRIE_LEVELS],
+    buf: [usize; TRIE_LEVELS],
+    emitted: u64,
+    full: bool,
+}
+
+impl ChunkCounter {
+    fn new(level: u8) -> Self {
+        assert!(
+            (1..=MAX_LEVEL).contains(&level),
+            "redundancy level must be 1..=4, got {level}",
+        );
+        let shards = max_shards(level);
+        Self {
+            level,
+            max_shards: shards,
+            max_children: shards + get_parities(level, shards),
+            acc: [0; TRIE_LEVELS],
+            buf: [0; TRIE_LEVELS],
+            emitted: 0,
+            full: false,
+        }
+    }
+
+    fn push_leaf(&mut self) {
+        assert!(!self.full, "redundant trie full");
+        self.emitted += 1;
+        self.write_ref(1);
+        self.chunk_write(0);
+    }
+
+    fn write_ref(&mut self, level: usize) {
+        self.acc[level] += 1;
+        if self.acc[level] == self.max_children {
+            self.wrap_full_level(level);
+        }
+    }
+
+    fn chunk_write(&mut self, chunk_level: usize) {
+        self.buf[chunk_level] += 1;
+        if self.buf[chunk_level] == self.max_shards {
+            self.encode(chunk_level);
+        }
+    }
+
+    fn encode(&mut self, chunk_level: usize) {
+        let shards = std::mem::take(&mut self.buf[chunk_level]);
+        if shards == 0 {
+            return;
+        }
+        for _ in 0..get_parities(self.level, shards) {
+            self.emitted += 1;
+            self.write_ref(chunk_level + 1);
+        }
+    }
+
+    fn wrap_full_level(&mut self, level: usize) {
+        self.acc[level] = 0;
+        self.emitted += 1;
+        self.write_ref(level + 1);
+        self.chunk_write(level);
+        if level + 1 == TRIE_LEVELS - 1 {
+            self.full = true;
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        for level in 1..TRIE_LEVELS - 1 {
+            match self.acc[level] {
+                0 => {}
+                1 => {
+                    self.acc[level] = 0;
+                    self.acc[level + 1] += 1;
+                    self.buf[level - 1] -= 1;
+                    self.chunk_write(level);
+                }
+                n if n == self.max_children => self.wrap_full_level(level),
+                _ => {
+                    self.encode(level - 1);
+                    self.wrap_full_level(level);
+                }
+            }
+        }
+        assert_eq!(
+            self.acc[TRIE_LEVELS - 1],
+            1,
+            "trie must collapse to a single root"
+        );
+        self.emitted
+    }
+}
+
 /// Streaming redundant splitter: the level-aware counterpart of
 /// [`crate::splitter::StreamingSplitter`], with the same
 /// push-leaves-then-finish contract. Memory is bounded by the per-level
@@ -436,6 +555,49 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::error::Error;
+
+    /// The counter agrees with the real splitter at every boundary the
+    /// tree's shape changes on: empty, one leaf, a full group, a full
+    /// intermediate and one past each, at every level.
+    #[test]
+    fn redundant_chunk_count_matches_the_splitter() {
+        for level in 1..=MAX_LEVEL {
+            let shards = max_shards(level) as u64;
+            let leaf = CHUNK_SIZE as u64;
+            let mut sizes = vec![0, 1, leaf - 1, leaf, leaf + 1, 3 * leaf + 7];
+            let edge = shards * leaf;
+            sizes.extend([edge - leaf, edge - 1, edge, edge + 1, edge + leaf]);
+            sizes.push(247_500);
+            for bytes in sizes {
+                assert_counted_like_split(bytes, level);
+            }
+        }
+    }
+
+    /// The same at a full second tree level and a third one carrying a
+    /// lone leaf. Level 4's small fan-out gets there in ~6 MB, which
+    /// still takes half a minute of real splitting in a debug build:
+    /// run with `--ignored`.
+    #[test]
+    #[ignore = "slow in debug builds: ~30 s of real erasure coding"]
+    fn redundant_chunk_count_matches_the_splitter_three_levels_deep() {
+        let shards = max_shards(MAX_LEVEL) as u64;
+        let edge = shards * shards * CHUNK_SIZE as u64;
+        for bytes in [edge, edge + 1] {
+            assert_counted_like_split(bytes, MAX_LEVEL);
+        }
+    }
+
+    fn assert_counted_like_split(bytes: u64, level: u8) {
+        let real = split_bytes_with_redundancy(&vec![0u8; bytes as usize], level)
+            .chunks
+            .len() as u64;
+        assert_eq!(
+            redundant_chunk_count(bytes, level),
+            real,
+            "{bytes} bytes at level {level}"
+        );
+    }
 
     struct MapFetcher {
         chunks: HashMap<[u8; 32], Vec<u8>>,

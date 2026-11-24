@@ -363,7 +363,8 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub start_index: Option<u64>,
     /// Gateway base URL, `http://host:port` (loopback: the in-process
-    /// `ant_start_gateway` on iOS, `antd` on desktop).
+    /// `ant_start_gateway` on iOS, `antd` on desktop). No whitespace or
+    /// control characters: it goes into the raw request head.
     #[serde(default = "default_gateway")]
     pub gateway: String,
     /// Postage batch id (hex, `0x`-optional) every upload is stamped
@@ -373,11 +374,12 @@ pub struct PublisherConfig {
     /// Nominal segment duration. Only used for the playlist's
     /// `EXT-X-TARGETDURATION` and the "keeping up" budget — the real
     /// duration of each segment comes from the capture side.
+    /// 1..=[`MAX_SEGMENT_MS`].
     #[serde(default = "default_segment_ms")]
     pub segment_ms: u32,
     /// Encoder target bitrate. Echoed in the report; the publisher does
     /// not enforce it (the capture pipeline does). [`broadcast_cost`]
-    /// sizes segments from it.
+    /// sizes segments from it. At most [`MAX_BITRATE_KBPS`].
     #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
     #[serde(default = "default_max_in_flight")]
@@ -412,7 +414,7 @@ pub struct PublisherConfig {
     ///
     /// 0, the default, never reaps: a host only opts in once it handles
     /// a broadcast that ended without its stop call (the iOS app does;
-    /// the Android app does not yet).
+    /// the Android app does not yet). At most [`MAX_REAP_MS`], a day.
     #[serde(default)]
     pub reap_ms: u64,
     /// Publish the channel as a one-rung ladder too (issue #174): a
@@ -573,6 +575,23 @@ pub struct PublisherConfig {
 /// s), and the one the iOS app passes as [`PublisherConfig::reap_ms`].
 pub const ORPHAN_REAP_MS: u64 = 60_000;
 
+/// The longest [`PublisherConfig::reap_ms`] a run accepts: a day. A
+/// broadcast silent for longer is over whatever the host meant.
+pub const MAX_REAP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Where [`PublisherState::reap_deadline`] lands when the
+/// reap window itself doesn't fit the clock: about thirty years out,
+/// never in practice.
+const REAP_DEADLINE_FAR: Duration = Duration::from_hours(30 * 365 * 24);
+
+/// The longest [`PublisherConfig::segment_ms`] a run accepts: a minute,
+/// well past any HLS segment a player waits for.
+pub const MAX_SEGMENT_MS: u32 = 60_000;
+
+/// The highest [`PublisherConfig::bitrate_kbps`] a run accepts: 100
+/// Mbit/s, far above anything a phone uplink carries.
+pub const MAX_BITRATE_KBPS: u32 = 100_000;
+
 /// The shape a broadcast takes on Swarm. The two are not
 /// interchangeable for a viewer: each reads only its own.
 ///
@@ -642,8 +661,23 @@ impl PublisherConfig {
                     .into(),
             ));
         }
-        if self.segment_ms == 0 {
-            return Err(PublisherError::Config("segment_ms must be > 0".into()));
+        if self.segment_ms == 0 || self.segment_ms > MAX_SEGMENT_MS {
+            return Err(PublisherError::Config(format!(
+                "segment_ms must be 1..={MAX_SEGMENT_MS}, got {}",
+                self.segment_ms
+            )));
+        }
+        if self.bitrate_kbps > MAX_BITRATE_KBPS {
+            return Err(PublisherError::Config(format!(
+                "bitrate_kbps must be at most {MAX_BITRATE_KBPS}, got {}",
+                self.bitrate_kbps
+            )));
+        }
+        if self.reap_ms > MAX_REAP_MS {
+            return Err(PublisherError::Config(format!(
+                "reap_ms must be at most {MAX_REAP_MS} (a day; 0 never reaps), got {}",
+                self.reap_ms
+            )));
         }
         if self.max_in_flight == 0 {
             return Err(PublisherError::Config("max_in_flight must be > 0".into()));
@@ -1909,13 +1943,20 @@ impl PublisherState {
 
     /// When the reap timeout (`reap`) runs out: that long after the
     /// latest of go-live (`started`), the last media segment listed, and
-    /// the first return after it.
+    /// the first return after it. A window too long for the clock to
+    /// add (`reap_ms` is checked against [`MAX_REAP_MS`] at start, but
+    /// this must not panic whatever it is handed) saturates to a
+    /// deadline years away rather than to `since`, which would reap at
+    /// once.
     fn reap_deadline(&self, started: Instant, reap: Duration) -> Instant {
         let since = [self.last_media_at, self.returned_at]
             .into_iter()
             .flatten()
             .fold(started, Instant::max);
-        since + reap
+        since
+            .checked_add(reap)
+            .or_else(|| since.checked_add(REAP_DEADLINE_FAR))
+            .unwrap_or(since + Duration::from_millis(MAX_REAP_MS))
     }
 
     /// `#EXT-X-TARGETDURATION`, whole seconds. Run-max, not window-max:
@@ -2466,23 +2507,20 @@ const INIT_SEGMENT_BYTES: usize = 1024;
 /// chunk tree at [`UPLOAD_REDUNDANCY_LEVEL`], [`ant_retrieval::REPLICA_COUNTS`]
 /// dispersed replica SOCs of its root, and under [`StreamFormat::Bzz`]
 /// the single-file manifest's nodes with their replicas too. Every one
-/// takes a stamp from the batch. Counted on a zero buffer of the right
-/// size: the shape of the tree depends only on the length.
-fn stamped_upload_chunks(
-    format: StreamFormat,
-    bytes: usize,
-    name: &str,
-    content_type: &str,
-) -> u64 {
+/// takes a stamp from the batch. Counted, not built: the shape of the
+/// tree depends only on the length
+/// ([`ant_retrieval::redundant_chunk_count`]), and the manifest's only on
+/// the name and content type (its entry is one fixed-size reference), so
+/// no estimate allocates or hashes the bytes it sizes.
+fn stamped_upload_chunks(format: StreamFormat, bytes: u64, name: &str, content_type: &str) -> u64 {
     let level = UPLOAD_REDUNDANCY_LEVEL;
     let replicas = ant_retrieval::REPLICA_COUNTS[usize::from(level)] as u64;
-    let split = ant_retrieval::split_bytes_with_redundancy(&vec![0u8; bytes], level);
-    let mut chunks = split.chunks.len() as u64 + replicas;
+    let mut chunks = ant_retrieval::redundant_chunk_count(bytes, level) + replicas;
     if format == StreamFormat::Bzz {
         // A file name the manifest builder refuses would fail the upload
         // itself; the publisher's names never are.
         if let Ok(manifest) =
-            ant_retrieval::build_single_file_manifest(name, Some(content_type), split.root)
+            ant_retrieval::build_single_file_manifest(name, Some(content_type), [0; 32])
         {
             chunks += manifest.chunks.len() as u64 * (1 + replicas);
         }
@@ -2516,21 +2554,21 @@ pub struct BroadcastCost {
 /// whose segments also carry audio adds its rate (the iOS app does).
 /// One initialization segment is counted, in the fixed part; a writer
 /// restart adds another, a few chunks.
+///
+/// `segment_ms` and `bitrate_kbps` are clamped to what a run accepts
+/// (1..=[`MAX_SEGMENT_MS`], at most [`MAX_BITRATE_KBPS`]): a host may ask
+/// for an estimate of a config it has not validated, and a config out of
+/// those ranges never goes live.
 #[must_use]
 pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
     let format = config.format;
-    let segment_ms = u64::from(config.segment_ms.max(1));
-    let segment_bytes =
-        u64::from(config.bitrate_kbps) * segment_ms / 8 * (100 + BITRATE_HEADROOM_PERCENT) / 100;
-    let media = stamped_upload_chunks(
-        format,
-        usize::try_from(segment_bytes).unwrap_or(usize::MAX / 2),
-        "seg-0.m4s",
-        "video/iso.segment",
-    );
+    let segment_ms = u64::from(config.segment_ms.clamp(1, MAX_SEGMENT_MS));
+    let bitrate_kbps = u64::from(config.bitrate_kbps.min(MAX_BITRATE_KBPS));
+    let segment_bytes = bitrate_kbps * segment_ms / 8 * (100 + BITRATE_HEADROOM_PERCENT) / 100;
+    let media = stamped_upload_chunks(format, segment_bytes, "seg-0.m4s", "video/iso.segment");
     let playlist_upload = stamped_upload_chunks(
         format,
-        LIVE_WINDOW_MAX_BYTES,
+        LIVE_WINDOW_MAX_BYTES as u64,
         PLAYLIST_NAME,
         "application/vnd.apple.mpegurl",
     );
@@ -2550,14 +2588,17 @@ pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
     let recording = |entries: u64| {
         stamped_upload_chunks(
             format,
-            usize::try_from(entries).unwrap_or(0) * RECORDING_ENTRY_BYTES,
+            entries.saturating_mul(RECORDING_ENTRY_BYTES as u64),
             PLAYLIST_NAME,
             "application/vnd.apple.mpegurl",
         )
     };
     let recording_base = recording(1);
     let recording_growth = recording(segments_per_hour).saturating_sub(recording_base);
-    let per_hour = per_segment * segments_per_hour + markers_per_hour + recording_growth;
+    let per_hour = per_segment
+        .saturating_mul(segments_per_hour)
+        .saturating_add(markers_per_hour)
+        .saturating_add(recording_growth);
     let replicas = ant_retrieval::REPLICA_COUNTS[usize::from(UPLOAD_REDUNDANCY_LEVEL)] as u64;
     // Its shape doesn't depend on the owner or topic it names.
     let feed_manifest_nodes = ant_retrieval::build_feed_manifest(&[0; 20], &[0; 32])
@@ -2568,7 +2609,7 @@ pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
         // their replicas), the initialization segment, the closing window with
         // its update, and the recording's base with its update.
         fixed_chunks: feed_manifest_nodes * (1 + replicas)
-            + stamped_upload_chunks(format, INIT_SEGMENT_BYTES, "init-0.mp4", "video/mp4")
+            + stamped_upload_chunks(format, INIT_SEGMENT_BYTES as u64, "init-0.mp4", "video/mp4")
             + playlist
             + recording_base
             + 1,
@@ -2576,7 +2617,7 @@ pub fn broadcast_cost(config: &PublisherConfig) -> BroadcastCost {
 }
 
 /// [`broadcast_cost`], remembered per cost-relevant config: working it
-/// out builds every segment's erasure-coded tree, while a host asks for
+/// out walks every upload's erasure-coded tree shape, while a host asks for
 /// an estimate whenever its plan's room changes (on every redraw that
 /// follows a plan refresh, mid-broadcast too). The cost depends only on
 /// the format, bitrate, segment duration and ladder, so the memo stays a
@@ -5657,6 +5698,15 @@ impl Target {
                 "gateway must be an http:// URL (the publisher posts to a loopback gateway), got `{url}`",
             )
         })?;
+        // The authority and prefix go into the raw request line and
+        // `host:` header: a CR/LF there would inject headers or a second
+        // request, and any whitespace would split the request line.
+        if rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!(
+                "gateway URL must not contain whitespace or control characters: `{}`",
+                url.escape_debug()
+            ));
+        }
         let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
         if authority.is_empty() {
             return Err(format!("gateway has no host: `{url}`"));
@@ -5694,12 +5744,40 @@ impl HttpResponse {
     }
 }
 
+/// The most a [`http_get`] response may take, head and body: 64 MiB. The
+/// largest body the publisher reads on purpose is a channel's head when
+/// the previous broadcast ended with its recording, which grows by at
+/// most [`RECORDING_ENTRY_BYTES`] a segment: 64 MiB holds some 400 000
+/// entries, over nine days of 2 s segments. Anything longer is refused
+/// rather than buffered without bound.
+pub(crate) const MAX_GET_RESPONSE_BYTES: u64 = 64 << 20;
+
+/// The most a [`http_post`] response may take: 1 MiB. The gateway
+/// answers an upload with a small JSON object (a reference).
+pub(crate) const MAX_POST_RESPONSE_BYTES: u64 = 1 << 20;
+
+/// Read a `connection: close` response to EOF, refusing one longer than
+/// `cap` bytes instead of buffering it.
+async fn read_capped(stream: TcpStream, cap: u64) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    stream
+        .take(cap + 1)
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read response: {e}"))?;
+    if raw.len() as u64 > cap {
+        return Err(format!("response exceeds {cap} bytes"));
+    }
+    Ok(raw)
+}
+
 /// `GET` one resource. HTTP/1.0, so the gateway answers with the body to
 /// EOF rather than chunked (which [`parse_response`] doesn't decode).
 /// A body cut short by a mid-stream failure also ends at EOF;
 /// [`parse_response`] rejects it against its `Content-Length`, and a
 /// caller that must not act on a partial body ([`settle_feed_position`])
-/// also refuses one that declares no length.
+/// also refuses one that declares no length. A response over
+/// [`MAX_GET_RESPONSE_BYTES`] is an error.
 pub(crate) async fn http_get(target: &Target, path: &str) -> Result<HttpResponse, String> {
     let mut stream = TcpStream::connect(&target.authority)
         .await
@@ -5710,14 +5788,12 @@ pub(crate) async fn http_get(target: &Target, path: &str) -> Result<HttpResponse
         .write_all(head.as_bytes())
         .await
         .map_err(|e| format!("write request head: {e}"))?;
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| format!("read response: {e}"))?;
+    let raw = read_capped(stream, MAX_GET_RESPONSE_BYTES).await?;
     parse_response(&raw)
 }
 
+/// `POST` one upload. A response over [`MAX_POST_RESPONSE_BYTES`] is an
+/// error.
 pub(crate) async fn http_post(
     target: &Target,
     path: &str,
@@ -5756,11 +5832,7 @@ pub(crate) async fn http_post(
         .await
         .map_err(|e| format!("flush request: {e}"))?;
 
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| format!("read response: {e}"))?;
+    let raw = read_capped(stream, MAX_POST_RESPONSE_BYTES).await?;
     parse_response(&raw)
 }
 
@@ -5888,6 +5960,85 @@ mod tests {
         assert_eq!(t.authority, "example.test:80");
         assert_eq!(t.prefix, "/ant");
         assert!(Target::parse("https://example.test").is_err());
+        // An IPv6 loopback with a port still parses.
+        assert_eq!(
+            Target::parse("http://[::1]:1633").unwrap().authority,
+            "[::1]:1633"
+        );
+    }
+
+    /// The authority and prefix go into the raw request line and `host:`
+    /// header, so a CR/LF, any other control character or whitespace in
+    /// either is refused (FFI-11).
+    #[test]
+    fn target_refuses_control_characters_and_whitespace() {
+        for url in [
+            "http://a\r\nx:1/",
+            "http://a:1\r\nx-injected: 1/",
+            "http://a:1/p\r\nx-injected: 1",
+            "http://a:1/p\nGET /x HTTP/1.0",
+            "http://a b:1/",
+            "http://a:1/p q",
+            "http://a:1/p\tq",
+            "http://a\0:1/",
+        ] {
+            assert!(Target::parse(url).is_err(), "{url:?}");
+        }
+        // Surrounding whitespace is still trimmed, as before.
+        assert!(Target::parse(" http://a:1/p \n").is_ok());
+    }
+
+    /// A stub answering every request with `head` and then `body_len`
+    /// bytes of body, written in pieces so it never holds the whole body.
+    async fn oversized_gateway(body_len: u64) -> Target {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {body_len}\r\n\r\n");
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let piece = vec![b'x'; 64 * 1024];
+                    let mut left = body_len;
+                    while left > 0 {
+                        let n = left.min(piece.len() as u64) as usize;
+                        // The client hangs up once it has seen too much.
+                        if socket.write_all(&piece[..n]).await.is_err() {
+                            return;
+                        }
+                        left -= n as u64;
+                    }
+                });
+            }
+        });
+        Target::parse(&format!("http://{addr}")).unwrap()
+    }
+
+    /// A response longer than the cap is an error, not a buffer growing
+    /// without bound (FFI-08); one within it still reads.
+    #[tokio::test]
+    async fn an_oversized_response_is_refused() {
+        let post = oversized_gateway(MAX_POST_RESPONSE_BYTES).await;
+        let err = http_post(&post, "/bytes", &[], b"x").await.err().unwrap();
+        assert!(err.contains("response exceeds"), "{err}");
+        let get = oversized_gateway(MAX_GET_RESPONSE_BYTES).await;
+        let err = http_get(&get, "/feeds/x/y").await.err().unwrap();
+        assert!(err.contains("response exceeds"), "{err}");
+
+        let fits = oversized_gateway(1000).await;
+        assert_eq!(
+            http_post(&fits, "/bytes", &[], b"x")
+                .await
+                .unwrap()
+                .body
+                .len(),
+            1000
+        );
+        assert_eq!(http_get(&fits, "/x").await.unwrap().body.len(), 1000);
     }
 
     #[test]
@@ -6925,6 +7076,35 @@ mod tests {
         c.max_in_flight = 0;
         assert!(c.validate().is_err());
         assert!(config().validate().is_ok());
+    }
+
+    /// Host numbers past what a broadcast can use are refused at start
+    /// (FFI-08, FFI-14), and the bounds themselves are accepted.
+    #[test]
+    fn config_validation_bounds_the_host_numbers() {
+        let mut c = config();
+        c.reap_ms = MAX_REAP_MS + 1;
+        assert!(c.validate().is_err());
+        c.reap_ms = u64::MAX;
+        assert!(c.validate().is_err());
+        c.reap_ms = MAX_REAP_MS;
+        assert!(c.validate().is_ok());
+
+        let mut c = config();
+        c.segment_ms = MAX_SEGMENT_MS + 1;
+        assert!(c.validate().is_err());
+        c.segment_ms = u32::MAX;
+        assert!(c.validate().is_err());
+        c.segment_ms = MAX_SEGMENT_MS;
+        assert!(c.validate().is_ok());
+
+        let mut c = config();
+        c.bitrate_kbps = MAX_BITRATE_KBPS + 1;
+        assert!(c.validate().is_err());
+        c.bitrate_kbps = u32::MAX;
+        assert!(c.validate().is_err());
+        c.bitrate_kbps = MAX_BITRATE_KBPS;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -9838,6 +10018,91 @@ mod tests {
         );
     }
 
+    /// The old way of counting an upload: build the real erasure-coded
+    /// tree (and the manifest over its real root) and count it. The
+    /// counted [`stamped_upload_chunks`] must agree with it exactly.
+    fn stamped_upload_chunks_built(
+        format: StreamFormat,
+        bytes: usize,
+        name: &str,
+        content_type: &str,
+    ) -> u64 {
+        let level = UPLOAD_REDUNDANCY_LEVEL;
+        let replicas = ant_retrieval::REPLICA_COUNTS[usize::from(level)] as u64;
+        let split = ant_retrieval::split_bytes_with_redundancy(&vec![0x5a; bytes], level);
+        let mut chunks = split.chunks.len() as u64 + replicas;
+        if format == StreamFormat::Bzz {
+            let manifest =
+                ant_retrieval::build_single_file_manifest(name, Some(content_type), split.root)
+                    .unwrap();
+            chunks += manifest.chunks.len() as u64 * (1 + replicas);
+        }
+        chunks
+    }
+
+    #[test]
+    fn counted_upload_chunks_match_the_built_tree() {
+        for format in [StreamFormat::Bzz, StreamFormat::SolarPunk] {
+            for (bytes, name, content_type) in [
+                (0, PLAYLIST_NAME, "application/vnd.apple.mpegurl"),
+                (160, PLAYLIST_NAME, "application/vnd.apple.mpegurl"),
+                (INIT_SEGMENT_BYTES, "init-0.mp4", "video/mp4"),
+                (
+                    LIVE_WINDOW_MAX_BYTES,
+                    PLAYLIST_NAME,
+                    "application/vnd.apple.mpegurl",
+                ),
+                (
+                    LIVE_WINDOW_MAX_BYTES + 1,
+                    PLAYLIST_NAME,
+                    "application/vnd.apple.mpegurl",
+                ),
+                (247_500, "seg-0.m4s", "video/iso.segment"),
+                (495_000, "seg-0.m4s", "video/iso.segment"),
+                // An hour's recording at 2 s segments.
+                (
+                    1_800 * RECORDING_ENTRY_BYTES,
+                    PLAYLIST_NAME,
+                    "application/vnd.apple.mpegurl",
+                ),
+            ] {
+                assert_eq!(
+                    stamped_upload_chunks(format, bytes as u64, name, content_type),
+                    stamped_upload_chunks_built(format, bytes, name, content_type),
+                    "{format:?} {bytes} bytes",
+                );
+            }
+        }
+    }
+
+    /// Out-of-range numbers make an estimate quickly and without
+    /// allocating what they describe (FFI-08): a 1 ms segment once meant
+    /// an hour's recording of 3.6 million entries built in memory
+    /// (~576 MB), and `u32::MAX` of both overflowed the segment size.
+    #[test]
+    fn an_out_of_range_estimate_stays_cheap() {
+        for format in [StreamFormat::Bzz, StreamFormat::SolarPunk] {
+            let mut c = config();
+            c.format = format;
+            c.segment_ms = 1;
+            let tiny = broadcast_cost(&c);
+            assert!(tiny.chunks_per_minute > 60_000, "{tiny:?}");
+
+            c.bitrate_kbps = u32::MAX;
+            c.segment_ms = u32::MAX;
+            let huge = broadcast_cost(&c);
+            // Clamped to the largest config a run accepts.
+            c.bitrate_kbps = MAX_BITRATE_KBPS;
+            c.segment_ms = MAX_SEGMENT_MS;
+            assert_eq!(huge, broadcast_cost(&c));
+            assert!(huge.chunks_per_minute > 0);
+
+            c.segment_ms = 0;
+            c.bitrate_kbps = 0;
+            assert!(broadcast_cost(&c).chunks_per_minute > 0);
+        }
+    }
+
     /// The memo the estimate reads its cost from answers what
     /// [`broadcast_cost`] does, per config, without mixing them up.
     #[test]
@@ -10192,6 +10457,12 @@ mod tests {
         let started = Instant::now();
         let mut state = PublisherState::default();
         assert_eq!(state.reap_deadline(started, reap), started + reap);
+        // A window the clock can't add saturates far out instead of
+        // panicking (FFI-14), and never to "now".
+        assert!(
+            state.reap_deadline(started, Duration::MAX)
+                > started + Duration::from_millis(MAX_REAP_MS)
+        );
         let media = started + Duration::from_secs(10);
         state.last_media_at = Some(media);
         assert_eq!(state.reap_deadline(started, reap), media + reap);
