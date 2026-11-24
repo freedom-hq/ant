@@ -1604,6 +1604,42 @@ impl SwarmState {
         None
     }
 
+    /// Queue a hive hint. A hive entry's signature proves its overlay,
+    /// but nothing ties the `/p2p/<peer id>` in its underlay to the signer:
+    /// bee's libp2p key is separate from its overlay key, so anyone can
+    /// sign a record of their own that names another peer's id. A hint
+    /// whose overlay differs from the one already held for that peer id
+    /// (`verified`, from its last handshake, or the dial book's entry) is
+    /// therefore dropped whole: it neither replaces the held entry's
+    /// addresses and overlay nor gets queued, so a dial to the forged
+    /// addresses can't be charged to the real peer. An entry that is
+    /// never handshake-verified is released when a dial to it fails (see
+    /// [`note_outgoing_dial_error`]), so a forged record that got in first
+    /// doesn't lock the real one out for good.
+    fn enqueue_gossip_hint(
+        &mut self,
+        hint: sinks::PeerHint,
+        local_peer_id: PeerId,
+        verified: Option<[u8; 32]>,
+    ) {
+        let held = verified.or_else(|| {
+            self.known_dialable
+                .get(&hint.peer_id)
+                .map(|h| h.overlay)
+                .filter(|o| *o != [0u8; 32])
+        });
+        if held.is_some_and(|o| o != hint.overlay) {
+            trace!(
+                target: "ant_p2p::hive",
+                peer = %hint.peer_id,
+                overlay = %hex::encode(hint.overlay),
+                "dropping hive hint: peer id is held under another overlay",
+            );
+            return;
+        }
+        self.enqueue_hint(hint, local_peer_id);
+    }
+
     fn enqueue_hint(&mut self, mut hint: sinks::PeerHint, local_peer_id: PeerId) {
         // Record the overlay in the known-peer book *before* the
         // dial-dedup early-returns below: every hive advert counts
@@ -1643,9 +1679,11 @@ impl SwarmState {
             // peers we don't dial now (peer set full / already seen).
             // Hive hints carry a signature-verified overlay (see
             // `sinks::decode_hive_peers`): an advert can't claim an overlay
-            // without its key or re-point someone's signed record, though a
-            // peer can still mint keys and sign records of its own. Skip
-            // peers with no overlay since we can't rank those by proximity.
+            // without its key or re-point someone's signed record, and
+            // `enqueue_gossip_hint` has already dropped one naming this peer
+            // id under another overlay than the one held for it. A peer can
+            // still mint keys and sign records of its own. Skip peers with
+            // no overlay since we can't rank those by proximity.
             if hint.overlay != [0u8; 32] && !self.bzz_peers.contains(&hint.peer_id) {
                 if self.known_dialable.len() >= KNOWN_DIALABLE_CAP
                     && !self.known_dialable.contains_key(&hint.peer_id)
@@ -1741,6 +1779,17 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     }
     if was_tracked {
         state.note_dial_failure(p);
+    }
+    // A dial-book entry no handshake ever verified goes too: it may be a
+    // hive record that names `p` without being `p` (#299), and keeping it
+    // would make `enqueue_gossip_hint` refuse `p`'s real record. A live
+    // entry is re-learned from the next gossip.
+    if state
+        .known_dialable
+        .get(&p)
+        .is_some_and(|h| peerstore.verified_overlay(&p) != Some(h.overlay))
+    {
+        state.known_dialable.remove(&p);
     }
     // Stored entries that go dud get evicted after
     // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
@@ -2377,7 +2426,8 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 );
             }
             Some(hint) = hint_rx.recv() => {
-                state.enqueue_hint(hint, local_peer_id);
+                let verified = peerstore.verified_overlay(&hint.peer_id);
+                state.enqueue_gossip_hint(hint, local_peer_id, verified);
             }
             Some(addr) = bootnode_dial_rx.recv() => {
                 if let Some(peer) = crate::dial::extract_peer_id(&addr) {
@@ -10999,7 +11049,7 @@ mod tests {
         let hints = sinks::decode_hive_peers(&body, V15, 1);
         assert!(hints.is_empty());
         for hint in hints {
-            state.enqueue_hint(hint, local);
+            state.enqueue_gossip_hint(hint, local, None);
         }
         let after: HashSet<PeerId> = state.known_dialable.keys().copied().collect();
         assert_eq!(before, after);
@@ -11020,10 +11070,108 @@ mod tests {
         let hints = sinks::decode_hive_peers(&body, V15, 1);
         assert_eq!(hints.len(), 1);
         for hint in hints {
-            state.enqueue_hint(hint, local);
+            state.enqueue_gossip_hint(hint, local, None);
         }
         assert!(state.known_dialable.contains_key(&genuine_peer));
         assert_eq!(state.known_dialable.len(), KNOWN_DIALABLE_CAP);
+    }
+
+    /// A validly self-signed hive message from `secret` whose underlay
+    /// names `peer` at `ip`, through the real decoder.
+    fn signed_hive_hint(secret: &[u8; 32], peer: PeerId, ip: &str) -> sinks::PeerHint {
+        let addr: Multiaddr = format!("/ip4/{ip}/tcp/1634/p2p/{peer}").parse().unwrap();
+        let entry =
+            sinks::signed_hive_entry(secret, ant_crypto::HandshakeWireVersion::V15, 1, &[addr]);
+        let mut body = Vec::new();
+        prost::Message::encode(&sinks::PeersPb { peers: vec![entry] }, &mut body).unwrap();
+        let mut hints = sinks::decode_hive_peers(&body, ant_crypto::HandshakeWireVersion::V15, 1);
+        assert_eq!(
+            hints.len(),
+            1,
+            "a self-signed record passes the signature check"
+        );
+        hints.remove(0)
+    }
+
+    /// #299 (R1-F1): a hive record the attacker signed itself but whose
+    /// underlay names the victim's peer id passes the signature check (it
+    /// proves the overlay, not the peer id). It must not replace the
+    /// victim's dial-book entry, nor be queued to dial under the victim's
+    /// id — whether the victim's overlay comes from earlier gossip or from
+    /// the peerstore's last handshake.
+    #[tokio::test]
+    async fn hive_record_naming_another_peer_id_is_refused() {
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        let local = pid();
+        let victim = pid();
+
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        state.hint_queue.clear();
+        state.seen_hints.clear();
+
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        assert_ne!(forged.overlay, genuine.overlay);
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert_eq!(state.known_dialable[&victim].addrs, genuine.addrs);
+        assert!(state.hint_queue.is_empty());
+
+        // The victim's own newer record (same overlay) still updates it.
+        let moved = signed_hive_hint(&[7; 32], victim, "1.2.3.5");
+        state.enqueue_gossip_hint(moved.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].addrs, moved.addrs);
+
+        // With an empty book, a handshake-verified overlay held in the
+        // peerstore refuses the forgery all the same.
+        state.known_dialable.clear();
+        state.hint_queue.clear();
+        state.seen_hints.clear();
+        state.enqueue_gossip_hint(forged, local, Some(genuine.overlay));
+        assert!(!state.known_dialable.contains_key(&victim));
+        assert!(state.hint_queue.is_empty());
+    }
+
+    /// #299 (R1-F1): a forged record that reaches the book first doesn't
+    /// lock the real one out. Its dial fails (the attacker's address can't
+    /// authenticate as the victim), which releases the unverified entry,
+    /// and the victim's genuine record gets in. An entry the peerstore
+    /// verified survives a failed dial.
+    #[tokio::test]
+    async fn failed_dial_releases_an_unverified_hive_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let verified_peer = pid();
+        let mut peerstore = peerstore_with(dir.path(), &[verified_peer]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, forged.overlay);
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, forged.overlay);
+
+        fail_tracked_dial(&mut state, &mut peerstore, victim);
+        assert!(!state.known_dialable.contains_key(&victim));
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert_eq!(state.known_dialable[&victim].addrs, genuine.addrs);
+
+        // A peerstore-verified entry is kept through a failed dial.
+        let warm = peerstore
+            .warm_hints()
+            .into_iter()
+            .find(|h| h.peer_id == verified_peer)
+            .unwrap();
+        state.enqueue_hint(warm.clone(), local);
+        fail_tracked_dial(&mut state, &mut peerstore, verified_peer);
+        assert_eq!(state.known_dialable[&verified_peer].overlay, warm.overlay);
     }
 
     /// Issue #202: a peer streaming fabricated public hints must not grow

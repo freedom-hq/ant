@@ -223,6 +223,16 @@ impl PeerStore {
         self.entries.contains_key(peer_id)
     }
 
+    /// The overlay `peer_id` proved in its last successful BZZ handshake
+    /// (V14 or V15), or `None` for an unknown peer. A hive entry that
+    /// names this peer under a different overlay is not believed (#299).
+    pub fn verified_overlay(&self, peer_id: &PeerId) -> Option<[u8; 32]> {
+        self.entries
+            .get(peer_id)
+            .map(|e| e.overlay)
+            .filter(|o| *o != [0u8; 32])
+    }
+
     /// The newest signed V15 record held for `peer_id`, for the
     /// handshake's stale-timestamp check. `None` when the peer is unknown
     /// or only ever handshook over V14 (timestamp 0).
