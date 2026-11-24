@@ -71,6 +71,7 @@
 //!    the bound, and backs off after a failure. See [`run_driver`] for why
 //!    each rule matters (issue #129).
 
+use crate::log_limit::WarnLimiter;
 use crate::sinks::{HEADERS_MAX, STREAM_TIMEOUT};
 use ant_retrieval::accounting::{Accounting, HotHint};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
@@ -260,12 +261,21 @@ where
     Ok(())
 }
 
+/// How long after warning about a peer's over-ack its repeats are
+/// logged at `debug` only (see [`crate::log_limit`]).
+const PEER_WARN_INTERVAL: Duration = Duration::from_mins(10);
+static OVER_ACK_WARNS: WarnLimiter<PeerId> = WarnLimiter::new(PEER_WARN_INTERVAL);
+
 /// Outcome of one pseudosettle round trip.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshOk {
-    /// Amount bee accepted, clamped to what we offered (see
-    /// [`clamp_accepted`]). At most `lightRefreshRate * elapsed`, often
-    /// less when our debt with this peer is below the time-based budget.
+    /// Amount the peer acked, clamped to what we offered (see
+    /// [`clamp_accepted`]), so at most
+    /// `LIGHT_REFRESH_RATE_UNITS_PER_SEC * MAX_REFRESH_WINDOW_SECS`. An
+    /// honest bee also caps it at `lightRefreshRate * elapsed` and at our
+    /// debt with it (often less), but that bound is the peer's to keep:
+    /// we can't check `elapsed` against its clock, so a misbehaving peer
+    /// can ack up to the full offer at any time.
     pub accepted: u64,
     /// Bee-side Unix timestamp from the `PaymentAck`. Returned for
     /// optional logging; the driver uses local wall-clock to schedule the
@@ -319,11 +329,23 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
         )
     })?;
     if accepted > amount {
-        tracing::warn!(
-            target: "ant_p2p::pseudosettle",
-            %peer, accepted, offered = amount,
-            "peer acked more than we offered; clamping to the offered amount",
-        );
+        // A peer that over-acks will do so on every refresh; warn once
+        // per peer per interval, the repeats go to debug.
+        if OVER_ACK_WARNS.allow(peer, Instant::now()) {
+            tracing::warn!(
+                target: "ant_p2p::pseudosettle",
+                %peer, accepted, offered = amount,
+                "peer acked more than we offered; clamping to the offered amount \
+                 (repeats from this peer logged at debug for {}s)",
+                PEER_WARN_INTERVAL.as_secs(),
+            );
+        } else {
+            debug!(
+                target: "ant_p2p::pseudosettle",
+                %peer, accepted, offered = amount,
+                "peer acked more than we offered; clamping to the offered amount",
+            );
+        }
     }
     let accepted = clamp_accepted(accepted, amount);
 

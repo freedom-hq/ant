@@ -18,6 +18,7 @@
 //!   full node does when it `TryUnwrap`s every passing chunk. Callers
 //!   that only need GSOC leave `pss_secret` unset and pay nothing.
 
+use crate::log_limit::WarnLimiter;
 use crate::lurker_registry::{Delivery, SharedWatch};
 use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
@@ -248,6 +249,10 @@ const STALENESS_PROBE_ROUNDS: u32 = 3;
 /// many binIDs). A `topmost` still above a freshly read cursor is a
 /// protocol error: the puller drops without saving it.
 const TOPMOST_CURSOR_SLACK: u64 = 1 << 16;
+/// How long after warning about a (peer, bin)'s invalid `topmost` its
+/// repeats are logged at `debug` only (see [`crate::log_limit`]).
+const PEER_WARN_INTERVAL: Duration = Duration::from_mins(10);
+static BAD_TOPMOST_WARNS: WarnLimiter<(PeerId, u8)> = WarnLimiter::new(PEER_WARN_INTERVAL);
 /// How long the saved resume positions of a peer that is no longer
 /// connected are kept. Long enough that a peer that drops and redials
 /// resumes where its puller stopped (no gap), short enough that the map
@@ -256,10 +261,15 @@ const POSITION_GRACE: Duration = Duration::from_mins(10);
 
 /// Per-`(peer, bin)` resume position `(reserve_epoch, next_start)`,
 /// shared with the pullers. The epoch tag lets the driver discard a
-/// stale position after a peer wipes its reserve. Only a validated
-/// `topmost` is ever saved (see [`advance_position`]), and a disconnected
-/// peer's entries are pruned after [`POSITION_GRACE`] (see
-/// [`prune_positions`]).
+/// stale position after a peer wipes its reserve. Only a `topmost` that
+/// passes [`advance_position`] is saved: one below `start`, at
+/// `u64::MAX`, or above a freshly re-read cursor never is. One within
+/// [`TOPMOST_CURSOR_SLACK`] of the cursor the puller last read is saved
+/// *without* a re-read, so a lying peer can park an entry up to
+/// `cursor + TOPMOST_CURSOR_SLACK + 1`; that is not checked here but at
+/// respawn, where [`usable_resume`] ignores a position past the fresh
+/// cursor + 1. A disconnected peer's entries are pruned after
+/// [`POSITION_GRACE`] (see [`prune_positions`]).
 type Positions = Arc<Mutex<HashMap<(PeerId, u8), (u64, u64)>>>;
 /// Readiness map: `(peer, bin) → generation` of the puller that marked
 /// it ready (stream open, `Get` sent). Tagged with a per-puller
@@ -1190,11 +1200,24 @@ async fn pull_bin(
         match verdict {
             TopmostCheck::Advance(next) => start = next,
             bad => {
-                tracing::warn!(
-                    target: "ant_p2p::lurker",
-                    peer = %peer_id, bin, start, topmost = page.topmost, cursor, verdict = ?bad,
-                    "peer sent an invalid pullsync topmost; dropping puller without saving its position",
-                );
+                // The driver respawns a puller for this (peer, bin) on
+                // its next pass, and a lying peer lies again: warn once
+                // per (peer, bin) per interval, the repeats go to debug.
+                if BAD_TOPMOST_WARNS.allow((peer_id, bin), std::time::Instant::now()) {
+                    tracing::warn!(
+                        target: "ant_p2p::lurker",
+                        peer = %peer_id, bin, start, topmost = page.topmost, cursor, verdict = ?bad,
+                        "peer sent an invalid pullsync topmost; dropping puller without saving its position \
+                         (repeats for this peer and bin logged at debug for {}s)",
+                        PEER_WARN_INTERVAL.as_secs(),
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "ant_p2p::lurker",
+                        peer = %peer_id, bin, start, topmost = page.topmost, cursor, verdict = ?bad,
+                        "peer sent an invalid pullsync topmost; dropping puller without saving its position",
+                    );
+                }
                 return;
             }
         }
@@ -1355,9 +1378,11 @@ fn start_bin_id(resume: Option<u64>, cursor: u64) -> u64 {
 }
 
 /// A saved resume position, unless it is past `cursor + 1` (the next
-/// binID after the peer's highest one in the bin). A position saved from
-/// a validated `topmost` never is — the cursor only grows within an
-/// epoch — so one that is would park the puller above every real binID.
+/// binID after the peer's highest one in the bin). An honest peer's
+/// position never is (the cursor only grows within an epoch), but a
+/// `topmost` within [`TOPMOST_CURSOR_SLACK`] of the old cursor is saved
+/// without a re-read (see [`Positions`]), so a lying peer's can be; one
+/// that is would park the puller above every real binID.
 fn usable_resume(resume: Option<u64>, cursor: u64) -> Option<u64> {
     resume.filter(|start| *start <= cursor.saturating_add(1))
 }

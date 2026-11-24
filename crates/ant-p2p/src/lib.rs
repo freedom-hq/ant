@@ -6,6 +6,7 @@ mod dial;
 pub mod dnsaddr;
 mod handshake;
 mod liveness;
+mod log_limit;
 pub mod lurker;
 pub mod lurker_registry;
 pub mod messaging;
