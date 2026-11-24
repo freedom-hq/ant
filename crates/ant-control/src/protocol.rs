@@ -156,8 +156,10 @@ pub enum Request {
     /// state.
     UploadPause { job_id: String },
     /// Bring a paused or failed upload back to running. Spawns a
-    /// fresh driver task, which waits for the previous driver to finish
-    /// draining first; a job that is already running is left as is.
+    /// fresh driver task, which waits for the previous driver to exit
+    /// first (one that never saw the pause just carries the job on, and
+    /// the new task then has nothing left to do); a job that is already
+    /// running is left as is.
     UploadResume { job_id: String },
     /// Hard-stop an upload. Already-pushed chunks are left in the
     /// network (Swarm GCs them at postage TTL expiry — there's no

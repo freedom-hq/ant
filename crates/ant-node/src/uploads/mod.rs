@@ -846,15 +846,27 @@ struct JobHandle {
 /// Of several on-disk manifests for one job (a pre-#292 `<prefix>.json`
 /// next to `<job_id>.json`), the one to keep.
 ///
-/// First, a copy in a state no command ever leaves wins regardless of
-/// timestamps: `Completed` (it carries the reference; `resume` only
-/// re-heals it, `cancel` leaves it as is), then `Cancelled` (`resume`
-/// refuses it; an old build's driver erroring after a prefix `cancel`
-/// could still checkpoint `Failed` over it, and the cancel the user asked
-/// for is the safer of the two to keep). `last_update_unix` is wall-clock, so a clock set back
-/// between two writes can stamp the later one older; without this rank
-/// a stale `Running` stray could beat the driver's `Completed` copy and
-/// re-drive a finished job, dropping its reference and heal state.
+/// First, a copy in a state the job can't have left wins regardless of
+/// timestamps: a `Completed` copy, wherever it is (it carries the
+/// reference; `resume` only re-heals it, `cancel` leaves it as is), then
+/// a `Cancelled` *full-id* copy. `last_update_unix` is wall-clock, so a
+/// clock set back between two writes can stamp the later one older;
+/// without this rank a stale `Running` stray could beat the driver's
+/// `Completed` copy and re-drive a finished job, dropping its reference
+/// and heal state.
+///
+/// A `Cancelled` *stray* gets no such rank. On a pre-#292 build a job
+/// could leave `Cancelled`: a driver that errored before it saw the
+/// cancel flag marked the job `Failed`, and a `resume` then restarted
+/// it. Both of those writes land in `<job_id>.json` (the driver's
+/// `mark_failed`, and the resume's own save or the driver checkpoints
+/// after it), while the stray `Cancelled` from a prefix `cancel` stays
+/// behind, so ranking it first would refuse a job the user resumed. A
+/// full-id `Cancelled` has no such way out: leaving it always rewrites
+/// that same file. So a `Cancelled` stray competes on timestamps below;
+/// the cost is that a clock set back between the driver's last
+/// checkpoint and a prefix `cancel` keeps the checkpoint instead
+/// (resumable, from its cursor).
 ///
 /// Otherwise the most recently updated: a prefix copy holds the status a
 /// `pause`/`resume`/`cancel` set, the full-id copy the driver's
@@ -872,9 +884,9 @@ fn pick_manifest(
     canonical: &Path,
     mut copies: Vec<(PathBuf, UploadJobInfo)>,
 ) -> (PathBuf, UploadJobInfo, Vec<PathBuf>) {
-    let settled = |status: UploadStatus| match status {
+    let settled = |path: &Path, status: UploadStatus| match status {
         UploadStatus::Completed => 2,
-        UploadStatus::Cancelled => 1,
+        UploadStatus::Cancelled if path == canonical => 1,
         _ => 0,
     };
     let best = copies
@@ -882,7 +894,7 @@ fn pick_manifest(
         .enumerate()
         .max_by_key(|(_, (path, info))| {
             (
-                settled(info.status),
+                settled(path, info.status),
                 info.last_update_unix,
                 !info.wants_driver(),
                 path.as_path() == canonical,
@@ -1280,10 +1292,17 @@ impl UploadManager {
     /// to finish (a quick pause → resume can land while it still drains
     /// its in-flight pushes), so one job never has two drivers. A
     /// `Running`/`Pending` job whose driver is still alive is left
-    /// alone. Returns at once either way; the new driver starts once
-    /// the old one has drained, which takes about [`PUSH_TIMEOUT`]
-    /// (2 min) at worst: its in-flight pushes drain concurrently, each
-    /// a single attempt under that timeout. A `Completed` job instead
+    /// alone. Returns at once either way. When the old driver has seen
+    /// the pause, the new one starts once it has drained, which takes
+    /// about [`PUSH_TIMEOUT`] (2 min) at worst: its in-flight pushes
+    /// drain concurrently, each a single attempt under that timeout. The
+    /// old driver only checks for a pause between loop turns, though, so
+    /// a resume that lands before it got there (it was parked awaiting a
+    /// push) clears the pause unseen: the old driver just carries on and
+    /// drives the job to its end (or to a later pause, cancel or error),
+    /// and the new one, waiting behind it all that time, then finds
+    /// nothing to do and exits. Either way the job keeps moving and only
+    /// one driver works on it. A `Completed` job instead
     /// triggers a background self-heal that re-pushes only its missing
     /// chunks on the same job (see body); other terminal states error
     /// with `BadState`.
@@ -2159,7 +2178,9 @@ impl UploadManager {
     }
 
     /// Start a driver task for `handle`. If an earlier driver is still
-    /// in the slot, the new task waits for it to exit first, so two
+    /// in the slot, the new task waits for it to exit first (which, if
+    /// that driver never saw the pause this resume undoes, means after
+    /// it has run the job to its end; see [`UploadManager::resume`]), so two
     /// drivers never stamp and checkpoint the same job at once — and
     /// skips running if the job is then terminal (the earlier driver
     /// finished, failed or was cancelled meanwhile) or `Paused` again
@@ -5693,8 +5714,11 @@ mod tests {
 
     /// NODE-02: resuming a job that is already `Running` doesn't start
     /// a second driver, and a pause followed at once by resume (the old
-    /// driver still draining its in-flight pushes) doesn't run two
-    /// drivers side by side: no chunk is ever dispatched twice.
+    /// driver still parked on its in-flight pushes) doesn't run two
+    /// drivers side by side: no chunk is ever dispatched twice. Here
+    /// the resume lands before the old driver's next loop turn, so it
+    /// never sees the pause and runs the whole job itself; the chained
+    /// driver waits behind it and then exits on `Completed`.
     #[tokio::test]
     async fn double_resume_keeps_one_driver() {
         let f = write_temp_file(&distinct_leaves(600));
@@ -5884,6 +5908,24 @@ mod tests {
                     ..job("1111111111111111", UploadStatus::Paused, 200)
                 }],
                 UploadStatus::Cancelled,
+                0,
+            ),
+            // Pre-#292 build: a prefix `cancel` left a stray
+            // `Cancelled`, the driver errored before it saw the flag and
+            // marked the job `Failed`, and the user resumed it under the
+            // full id. The job left `Cancelled`; the stray doesn't pin
+            // it there.
+            (
+                Some(job("2222222222222222", UploadStatus::Running, 200)),
+                vec![job("2222222222222222", UploadStatus::Cancelled, 100)],
+                UploadStatus::Completed,
+                1,
+            ),
+            // Same, resumed and then paused again by the user.
+            (
+                Some(job("3333333333333333", UploadStatus::Paused, 200)),
+                vec![job("3333333333333333", UploadStatus::Cancelled, 100)],
+                UploadStatus::Paused,
                 0,
             ),
             // Only a stray: it moves under the full id.
