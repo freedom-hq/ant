@@ -188,6 +188,15 @@ fn remove_stale_socket(path: &Path, uid: u32) -> std::io::Result<()> {
 /// usual `.as<n>` names keep `<parent>/.as<n>/s` no longer than
 /// `<parent>/antd.sock`; shorter fallback names cover shorter socket
 /// file names near the `sun_path` limit.
+///
+/// Drop doesn't run on SIGKILL: a kill between the `mkdir` and the
+/// cleanup leaves the directory behind (holding the socket `s` if it
+/// came before the `rename`, empty after it), and nothing removes it
+/// later. Each leftover uses up one name, so binding in that parent
+/// fails once every name that fits is taken: up to 116 names (64
+/// `.as<n>` plus 52 short ones) for a typical path, but only as many
+/// as fit `sun_path` near the limit, possibly a few single-letter ones.
+/// A leftover can also be a visible single-letter directory.
 struct StagingDir {
     path: PathBuf,
 }
