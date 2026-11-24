@@ -1099,20 +1099,17 @@ mod tests {
         };
         assert_eq!(rc, ANT_CHAIN_TRANSPORT_OK);
         let seen = |needle: &str| LATE_SEEN.lock().unwrap().iter().any(|r| r.contains(needle));
-        let wait_for = |needle: &str, what: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !seen(needle) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what} never reached the host transport"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        };
 
         // Chain reader: `/wallet` is answered from the host (the URL is
         // dead, so a 200 can only come from it).
-        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut s = loop {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "gateway never served");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         write!(
             s,
             "GET /wallet HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
@@ -1129,11 +1126,20 @@ mod tests {
         // Chequebook-refused hook: its lag check reads the deploy
         // receipt through the host.
         let refused = hooks.on_chequebook_refused.expect("built with an RPC");
-        handle.runtime.spawn(refused(
-            CHEQUEBOOK,
-            ant_gateway::ChequebookRefusal::NotRegistered,
-        ));
-        wait_for(&hex::encode(DEPLOY_TX), "the chequebook-refused hook");
+        handle
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    refused(CHEQUEBOOK, ant_gateway::ChequebookRefusal::NotRegistered),
+                )
+                .await
+            })
+            .expect("the refused hook finishes");
+        assert!(
+            seen(&hex::encode(DEPLOY_TX)),
+            "the chequebook-refused hook asked the host"
+        );
 
         // After-buy hook: settlement setup checks the persisted
         // chequebook with the factory (`deployedContracts(chequebook)`).

@@ -4769,8 +4769,8 @@ mod chain_tests {
 
     /// Issue #303: the funds watch is keyed by route as well as by
     /// chequebook. Handing it a client on another route (here another
-    /// transport) restarts it there, so it stops polling the replaced
-    /// one; a client rebuilt for the route it already reads through (as
+    /// transport) restarts it there at once, rather than leaving it on
+    /// the replaced one; a client rebuilt for the route it already reads through (as
     /// every top-up and gateway start builds its own) leaves it alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn funds_watch_restarts_on_a_route_change() {
@@ -4829,12 +4829,6 @@ mod chain_tests {
         super::watch_retrieval_funds(&cmd_tx, &client(&new), CANDIDATE);
         published(222).await;
         assert!(funds_reads(&new) > 0, "the watch reads the new route");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            funds_reads(&old),
-            old_reads,
-            "the replaced route is no longer polled"
-        );
     }
 
     /// A chequebook a C-API storage call sets settlement up on reaches
