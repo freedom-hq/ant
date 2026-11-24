@@ -432,6 +432,23 @@ impl ChainClient {
         abi_word_last_u128_be(&out)
     }
 
+    /// `PostageStamp.minimumInitialBalancePerChunk()` — the contract's
+    /// floor on a batch's per-chunk balance (`minimumValidityBlocks ×
+    /// lastPrice`). `createBatch` refuses less, and `increaseDepth`
+    /// reverts (`InsufficientBalance`) when the balance left after the
+    /// resize (`remainingBalance >> depthChange`) falls below it.
+    pub async fn postage_minimum_initial_balance_per_chunk(
+        &self,
+        postage_contract: &str,
+    ) -> Result<u128, RpcError> {
+        let data = format!(
+            "0x{}",
+            hex::encode(fn_selector(b"minimumInitialBalancePerChunk()"))
+        );
+        let out = self.eth_call(postage_contract, &data).await?;
+        abi_word_last_u128_be(&out)
+    }
+
     /// `PostageStamp.currentTotalOutPayment()` — cumulative per-chunk
     /// outpayment, bee's `/chainstate.totalAmount`. Combined with a
     /// batch's `normalisedBalance` this is what TTL math is derived from.
