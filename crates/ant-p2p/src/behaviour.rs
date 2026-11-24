@@ -905,6 +905,11 @@ struct SwarmState {
     /// Their failure is never charged to the peer, even when it only
     /// arrives (OS SYN timeout, ~75-127 s) after the link is proven again.
     dial_started_unproven: HashSet<PeerId>,
+    /// The dial-book overlay a tracked hint dial was started for (see
+    /// [`SwarmState::note_hint_dial_started`]): a failed dial is charged to,
+    /// and releases, that binding, not whichever entry the dial book holds
+    /// for the peer id by the time the failure arrives (#299).
+    dialed_overlay: HashMap<PeerId, [u8; 32]>,
     /// A representative dial address for `antctl` (first hint / bootnode multiaddr).
     dial_hint_addr: HashMap<PeerId, Multiaddr>,
     /// `disconnect_peer_id` was called; connection not fully torn down yet.
@@ -1246,6 +1251,7 @@ impl SwarmState {
             dialing: HashSet::new(),
             dial_started: HashMap::new(),
             dial_started_unproven: HashSet::new(),
+            dialed_overlay: HashMap::new(),
             dial_hint_addr: HashMap::new(),
             closing: HashSet::new(),
             failed: Vec::new(),
@@ -1517,7 +1523,7 @@ impl SwarmState {
     fn addrs_for_dial(&mut self, hint: &sinks::PeerHint) -> Option<Vec<Multiaddr>> {
         let addrs = self.dialable_underlays(&hint.addrs);
         if addrs.is_empty() {
-            self.drop_binding(&hint.peer_id);
+            self.release_binding(&hint.peer_id, hint.overlay);
             return None;
         }
         Some(addrs)
@@ -1525,27 +1531,34 @@ impl SwarmState {
 
     /// Every dial-book entry: the `known_dialable` entries and their
     /// [`rivals`](Self::rivals). A peer id can appear twice, under two
-    /// overlays; a dial picks one with [`Self::select_binding`].
+    /// overlays; a dial picks one ([`Self::binding_hint`]) and records it
+    /// ([`Self::note_hint_dial_started`]).
     fn dial_book_hints(&self) -> impl Iterator<Item = &sinks::PeerHint> {
         self.known_dialable.values().chain(self.rivals.values())
     }
 
-    /// Make the dial-book entry for `peer` under `overlay` the one in
-    /// `known_dialable` (swapping it with its rival if need be), so a
-    /// failed dial releases the binding that was actually dialed.
-    fn select_binding(&mut self, peer: &PeerId, overlay: [u8; 32]) {
-        let rival_matches = self.rivals.get(peer).is_some_and(|r| r.overlay == overlay);
-        let held_matches = self
+    /// The dial-book entry for `peer` under `overlay`: its
+    /// `known_dialable` entry or its rival.
+    fn binding_hint(&self, peer: &PeerId, overlay: [u8; 32]) -> Option<sinks::PeerHint> {
+        self.known_dialable
+            .get(peer)
+            .filter(|h| h.overlay == overlay)
+            .or_else(|| self.rivals.get(peer).filter(|h| h.overlay == overlay))
+            .cloned()
+    }
+
+    /// Drop the dial-book entry for `peer` under `overlay`: its
+    /// `known_dialable` entry (promoting the rival) or its rival. Neither
+    /// matching leaves the book alone.
+    fn release_binding(&mut self, peer: &PeerId, overlay: [u8; 32]) {
+        if self
             .known_dialable
             .get(peer)
-            .is_some_and(|h| h.overlay == overlay);
-        if rival_matches && !held_matches {
-            if let (Some(held), Some(rival)) =
-                (self.known_dialable.remove(peer), self.rivals.remove(peer))
-            {
-                self.known_dialable.insert(*peer, rival);
-                self.rivals.insert(*peer, held);
-            }
+            .is_some_and(|h| h.overlay == overlay)
+        {
+            self.drop_binding(peer);
+        } else if self.rivals.get(peer).is_some_and(|h| h.overlay == overlay) {
+            self.rivals.remove(peer);
         }
     }
 
@@ -1643,12 +1656,20 @@ impl SwarmState {
     /// whether our own link was down at that moment (see
     /// [`note_outgoing_dial_error`]).
     fn note_dial_started(&mut self, peer: PeerId) {
+        self.dialed_overlay.remove(&peer);
         self.dial_started.insert(peer, Instant::now());
         if self.own_connectivity_down() {
             self.dial_started_unproven.insert(peer);
         } else {
             self.dial_started_unproven.remove(&peer);
         }
+    }
+
+    /// [`Self::note_dial_started`] for a dial to the dial-book binding of
+    /// `peer` under `overlay`, which its failure is then charged to.
+    fn note_hint_dial_started(&mut self, peer: PeerId, overlay: [u8; 32]) {
+        self.note_dial_started(peer);
+        self.dialed_overlay.insert(peer, overlay);
     }
 
     /// Clear the hint dedup and re-queue every peerstore entry. With
@@ -1894,20 +1915,18 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     // outbound dial — e.g. a libp2p-internal redial or a stray
     // address book attempt — would otherwise pollute the
     // pipeline with `Failed` rows the operator never asked for.
-    let (started, started_unproven) = clear_dial_tracking(state, p);
+    let (started, started_unproven, dialed) = clear_dial_tracking(state, p);
     let was_tracked = started.is_some();
     if was_tracked {
         record_swarm_failure(state, p);
     }
     // The binding this dial was for, if no handshake ever verified it: it
-    // may be a hive record that names `p` without being `p` (#299). Every
-    // dial site makes the dialed binding the `known_dialable` one
-    // (`select_binding`).
+    // may be a hive record that names `p` without being `p` (#299). A hint
+    // dial records the overlay it dialed; any other dial falls back to the
+    // dial book's entry.
     let verified = peerstore.verified_overlay(&p);
-    let unverified = state
-        .known_dialable
-        .get(&p)
-        .map(|h| h.overlay)
+    let unverified = dialed
+        .or_else(|| state.known_dialable.get(&p).map(|h| h.overlay))
         .filter(|o| verified != Some(*o));
     // Judge the link both now and as it was when the dial started: a SYN
     // sent during the zombie / post-`Resume` window (or before a later
@@ -1926,12 +1945,14 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
     if was_tracked {
         state.note_dial_failure_of(p, unverified);
     }
-    if unverified.is_some() {
-        // Release the unverified binding in favour of its rival, and
-        // forget the dedup so the record left (or `p`'s genuine record,
-        // gossiped next) can be queued. A live entry is re-learned from
-        // the next gossip; a dead one stays backed off under its overlay.
-        state.drop_binding(&p);
+    if let Some(overlay) = unverified {
+        // Release the unverified binding (promoting its rival if it was
+        // the held entry; leaving the book alone if it is gone already),
+        // and forget the dedup so the record left (or `p`'s genuine
+        // record, gossiped next) can be queued. A live entry is re-learned
+        // from the next gossip; a dead one stays backed off under its
+        // overlay.
+        state.release_binding(&p, overlay);
         state.seen_hints.remove(&p);
         // The peerstore's entry is a binding a handshake did verify;
         // this dial wasn't to it.
@@ -1947,12 +1968,16 @@ fn note_outgoing_dial_error(state: &mut SwarmState, peerstore: &mut PeerStore, p
 
 /// Drop `p`'s in-flight dial markers. Returns its `dial_started` time and
 /// whether that start was unproven.
-fn clear_dial_tracking(state: &mut SwarmState, p: PeerId) -> (Option<Instant>, bool) {
+fn clear_dial_tracking(
+    state: &mut SwarmState,
+    p: PeerId,
+) -> (Option<Instant>, bool, Option<[u8; 32]>) {
     let started = state.dial_started.remove(&p);
     let started_unproven = state.dial_started_unproven.remove(&p);
+    let dialed = state.dialed_overlay.remove(&p);
     state.dialing.remove(&p);
     state.dial_hint_addr.remove(&p);
-    (started, started_unproven)
+    (started, started_unproven, dialed)
 }
 
 fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
@@ -8780,7 +8805,6 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
         if swarm.is_connected(&hint.peer_id) {
             continue;
         }
-        state.select_binding(&hint.peer_id, hint.overlay);
         let Some(addrs) = state.addrs_for_dial(&hint) else {
             // Nothing dialable on the current networks (e.g. a same-LAN
             // hint after moving to cellular, before the snapshot purge
@@ -8796,7 +8820,7 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.note_dial_started(peer_id);
+                state.note_hint_dial_started(peer_id, hint.overlay);
                 state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
@@ -8885,8 +8909,7 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
     candidates.truncate(NEIGHBORHOOD_DIAL_FANOUT);
 
     for (peer_id, po, overlay) in candidates {
-        state.select_binding(&peer_id, overlay);
-        let Some(hint) = state.known_dialable.get(&peer_id).cloned() else {
+        let Some(hint) = state.binding_hint(&peer_id, overlay) else {
             continue;
         };
         if swarm.is_connected(&peer_id) {
@@ -8899,7 +8922,7 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.note_dial_started(peer_id);
+                state.note_hint_dial_started(peer_id, overlay);
                 state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
@@ -9135,8 +9158,7 @@ fn maybe_balance_bins(
         "bin balance: dialing peers into under-populated shallow bins",
     );
     for (peer_id, bin, overlay) in candidates {
-        state.select_binding(&peer_id, overlay);
-        let Some(hint) = state.known_dialable.get(&peer_id).cloned() else {
+        let Some(hint) = state.binding_hint(&peer_id, overlay) else {
             continue;
         };
         if swarm.is_connected(&peer_id) {
@@ -9149,7 +9171,7 @@ fn maybe_balance_bins(
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
-                state.note_dial_started(peer_id);
+                state.note_hint_dial_started(peer_id, overlay);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
@@ -9283,6 +9305,7 @@ fn handle_swarm_event(
                 .remove(&peer_id)
                 .map(|t| t.elapsed().as_millis() as u64);
             state.dial_started_unproven.remove(&peer_id);
+            state.dialed_overlay.remove(&peer_id);
             if state.bzz_peers.contains(&peer_id) || state.pending.contains_key(&peer_id) {
                 // Duplicate connection (race with a hint or a bootnode retry);
                 // keep the existing pipeline entry and let the new connection
@@ -11361,15 +11384,21 @@ mod tests {
         assert!(state.dial_backed_off_as(&verified_peer, warm.overlay));
     }
 
-    /// Dial `hint`'s binding the way every dial site does
-    /// (`select_binding`) and fail it through the real handler.
+    /// Start a dial to `hint`'s binding the way every hint dial site does
+    /// (`note_hint_dial_started`).
+    fn start_binding_dial(state: &mut SwarmState, hint: &sinks::PeerHint) {
+        state.dialing.insert(hint.peer_id);
+        state.note_hint_dial_started(hint.peer_id, hint.overlay);
+    }
+
+    /// Dial `hint`'s binding and fail it through the real handler.
     fn dial_binding_and_fail(
         state: &mut SwarmState,
         peerstore: &mut PeerStore,
         hint: &sinks::PeerHint,
     ) {
-        state.select_binding(&hint.peer_id, hint.overlay);
-        fail_tracked_dial(state, peerstore, hint.peer_id);
+        start_binding_dial(state, hint);
+        note_outgoing_dial_error(state, peerstore, hint.peer_id);
     }
 
     /// #299 (R2-M1): with no peerstore overlay to go by, a forged record
@@ -11411,23 +11440,25 @@ mod tests {
         let picked = bin_balance_candidates(&base, &bin_counts, state.dial_book_hints(), |_| false);
         assert_eq!(picked, vec![(victim, genuine_bin as u8, genuine.overlay)]);
 
-        // Dialing it swaps it in, so the dial's outcome lands on it.
-        state.select_binding(&victim, genuine.overlay);
-        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
-        assert_eq!(state.rivals[&victim].overlay, forged.overlay);
+        // A dial site reads the picked binding in place.
+        let picked = state.binding_hint(&victim, genuine.overlay).unwrap();
+        assert_eq!(picked.addrs, genuine.addrs);
+        assert_eq!(state.known_dialable[&victim].overlay, forged.overlay);
 
-        // A further forgery takes the rival slot (newest wins), bounded at
-        // one per peer id; the held entry stays.
-        let forged2 = signed_hive_hint(&[5; 32], victim, "5.5.5.5");
-        state.enqueue_gossip_hint(forged2.clone(), local, None);
-        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
-        assert_eq!(state.rivals[&victim].overlay, forged2.overlay);
-        assert_eq!(state.rivals.len(), 1);
-        // ... and the genuine one, gossiped again, refreshes the entry.
+        // The genuine record, gossiped again, refreshes the rival.
         let moved = signed_hive_hint(&[7; 32], victim, "1.2.3.5");
         state.enqueue_gossip_hint(moved.clone(), local, None);
-        assert_eq!(state.known_dialable[&victim].addrs, moved.addrs);
+        assert_eq!(state.rivals[&victim].addrs, moved.addrs);
+        assert_eq!(state.known_dialable[&victim].overlay, forged.overlay);
+        assert!(state.hint_queue.is_empty());
+
+        // A further forgery takes the rival slot (newest wins, at most one
+        // per peer id); the held entry stays.
+        let forged2 = signed_hive_hint(&[5; 32], victim, "5.5.5.5");
+        state.enqueue_gossip_hint(forged2.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, forged.overlay);
         assert_eq!(state.rivals[&victim].overlay, forged2.overlay);
+        assert_eq!(state.rivals.len(), 1);
 
         // Connecting drops both bindings from the dial book.
         state.forget_dialable(&victim);
@@ -11465,6 +11496,73 @@ mod tests {
         dial_binding_and_fail(&mut state, &mut peerstore, &genuine);
         assert!(state.dial_backed_off_as(&victim, genuine.overlay));
         assert_eq!(state.dial_backoff[&victim].failures, 1);
+    }
+
+    /// #299 (R2): a dial to a rival forgery doesn't move the genuine held
+    /// entry anywhere, so a second forgery arriving while that dial is in
+    /// flight only takes the rival slot; and the dial's failure, landing
+    /// after the rival slot changed hands, releases nothing and backs off
+    /// only the overlay it dialed.
+    #[tokio::test]
+    async fn in_flight_dial_to_a_rival_forgery_leaves_the_genuine_entry_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peerstore = peerstore_with(dir.path(), &[]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+        start_binding_dial(&mut state, &forged);
+
+        let forged2 = signed_hive_hint(&[5; 32], victim, "5.5.5.5");
+        state.enqueue_gossip_hint(forged2.clone(), local, None);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert_eq!(state.rivals[&victim].overlay, forged2.overlay);
+
+        note_outgoing_dial_error(&mut state, &mut peerstore, victim);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert_eq!(state.rivals[&victim].overlay, forged2.overlay);
+        assert!(state.dial_backed_off_as(&victim, forged.overlay));
+        assert!(!state.dial_backed_off_as(&victim, genuine.overlay));
+        assert!(!state.dial_backed_off_as(&victim, forged2.overlay));
+    }
+
+    /// #299 (R2): a forgery still sitting in `hint_queue` after its binding
+    /// was released (and the genuine rival promoted) is dialed again once
+    /// its backoff expires. That failure is charged to the forged overlay
+    /// it dialed, not to the genuine entry now held.
+    #[tokio::test]
+    async fn stale_queued_forgery_failing_again_spares_the_promoted_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peerstore = peerstore_with(dir.path(), &[]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        // A neighbourhood dial (not the queue) picks the forgery; it fails.
+        dial_binding_and_fail(&mut state, &mut peerstore, &forged);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+
+        // Its backoff expires; the queue still holds it and pops it.
+        state.dial_backoff.get_mut(&victim).unwrap().until = Instant::now();
+        let stale = state.pop_dialable_hint().unwrap();
+        assert_eq!(stale.overlay, forged.overlay);
+        dial_binding_and_fail(&mut state, &mut peerstore, &stale);
+        assert_eq!(state.known_dialable[&victim].overlay, genuine.overlay);
+        assert_eq!(state.known_dialable[&victim].addrs, genuine.addrs);
+        assert!(state.dial_backed_off_as(&victim, forged.overlay));
+        assert!(!state.dial_backed_off_as(&victim, genuine.overlay));
     }
 
     /// The `rivals` map never outlives its entry: a cap eviction drops
