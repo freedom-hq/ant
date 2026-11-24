@@ -74,16 +74,18 @@ struct Installed {
 ///
 /// One slot lives on the handle for its whole life and every chain
 /// client — including the one the in-process gateway captures once at
-/// `ant_start_gateway` — shares that single `Arc`. The installed
-/// callback sits behind an `RwLock` *inside* it, so
-/// [`ant_set_chain_transport`] is what makes a captured client stop
-/// calling the old `host_ctx`, not the client being rebuilt. Two
-/// properties the C contract depends on follow from that:
+/// `ant_start_gateway` — shares that single `Arc`, whether or not a
+/// callback is installed in it. The installed callback sits behind an
+/// `RwLock` *inside* it, so [`ant_set_chain_transport`] is what makes a
+/// captured client start or stop calling the host, not the client being
+/// rebuilt. Two properties the C contract depends on follow from that:
 ///
-/// * a clear/replace is effective **everywhere at once** — an
+/// * an install/replace/clear is effective **everywhere at once** — an
 ///   already-built client (gateway, in-flight `ant_storage_*`) sees the
-///   new slot contents, and a cleared slot is can't-serve, which falls
-///   back to the configured URL exactly as if none were installed; and
+///   new slot contents, so a transport installed after the gateway
+///   started serves it too (issue #303), and an empty or cleared slot is
+///   can't-serve, which falls back to the configured URL exactly as if
+///   none were installed; and
 /// * a clear/replace **drains** — [`Self::serve`] holds the read lock
 ///   across the host call, so the write lock waits for every in-flight
 ///   callback to return. Once `ant_set_chain_transport` returns, no
@@ -120,14 +122,6 @@ impl HostChainTransport {
             ctx: HostCtx(host_ctx),
         });
         slot.is_some()
-    }
-
-    /// Whether a host transport is installed right now.
-    pub(crate) fn is_installed(&self) -> bool {
-        self.installed
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
     }
 }
 
@@ -227,17 +221,18 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// thread stays inside the callback until it returns, and that refresh
 /// starts no new read until it does.
 ///
-/// **Ordering:** takes effect immediately for the storage / settlement
-/// calls (`ant_storage_*`, including `ant_storage_settlement_*`, and
-/// `ant_deploy_chequebook`),
-/// which build a chain client per call. The in-process gateway
-/// (`ant_start_gateway`) captures its chain wiring once at start, so a
-/// transport installed while none was installed at that start is only
-/// guaranteed to reach it after a restart (`ant_stop_gateway` then
-/// `ant_start_gateway`) — install it before starting the gateway.
-/// Replacing or **clearing** a transport the gateway did start with, by
-/// contrast, is effective everywhere at once, including in that running
-/// gateway; see the lifetime rule below.
+/// **Ordering:** takes effect immediately, for the next chain request
+/// of every caller: the storage / settlement calls (`ant_storage_*`,
+/// including `ant_storage_settlement_*`, and `ant_deploy_chequebook`)
+/// and the in-process gateway alike. The gateway (`ant_start_gateway`)
+/// builds its chain wiring once at start, but every client in it reads
+/// through the handle's one transport slot, so installing a transport
+/// after the gateway started reaches its chain reader, after-buy and
+/// chequebook-refused hooks and the chequebook funds watch without a
+/// restart (issue #303). Requests that already went to the configured
+/// URL before the install are not repeated through it. Replacing or
+/// **clearing** a transport is effective everywhere at once in the same
+/// way; see the lifetime rule below.
 ///
 /// **Lifetime:** this call does not return until every in-flight
 /// invocation of the *previous* callback has returned, and no new one
@@ -978,6 +973,188 @@ mod tests {
         );
         unsafe { crate::ant_stop_gateway(std::ptr::from_ref(&handle)) };
         wallet_scan_forget(&EOA);
+    }
+
+    /// Every request [`late_host`] was asked, as raw JSON.
+    static LATE_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// A host for the late-install test: a zero balance for every
+    /// `eth_getBalance` / `eth_call`, no receipt, an error for anything
+    /// else. Records each request.
+    unsafe extern "C" fn late_host(request: *const c_char, _ctx: *mut c_void) -> *mut c_char {
+        let raw = unsafe { CStr::from_ptr(request) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        LATE_SEEN.lock().unwrap().push(raw.clone());
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let reply = match req["method"].as_str().unwrap_or_default() {
+            "eth_getBalance" => {
+                serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": "0x0"})
+            }
+            "eth_call" => serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                                             "result": format!("0x{}", "00".repeat(32))}),
+            "eth_getTransactionReceipt" => {
+                serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": null})
+            }
+            _ => serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                                    "error": {"code": -32601, "message": "unscripted"}}),
+        };
+        malloc_cstr(&reply.to_string())
+    }
+
+    /// Issue #303: a transport installed *after* `ant_start_gateway`
+    /// reaches the running gateway's chain wiring — the chain reader
+    /// (`GET /wallet`), the after-buy hook and the chequebook-refused
+    /// hook — not just the per-call C API. The gateway's `gnosis_rpc` is
+    /// unroutable, so any of them still on the URL fails instead of
+    /// quietly succeeding.
+    #[test]
+    fn transport_installed_after_gateway_start_reaches_the_gateway() {
+        use ant_chain::discover::{wallet_scan_forget, wallet_scan_status, WalletScanState};
+        use std::io::{Read, Write};
+        const SECRET: [u8; 32] = [0x33; 32];
+        const CHEQUEBOOK: [u8; 20] = [0x3c; 20];
+        const DEPLOY_TX: [u8; 32] = [0x3d; 32];
+        let eth = *ant_chain::tx::Wallet::new(SECRET, crate::GNOSIS_CHAIN_ID)
+            .unwrap()
+            .address();
+        let dir = std::env::temp_dir().join(format!("ant-late-transport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("postage")).unwrap();
+        // A just-deployed chequebook (recent file, deploy tx known): a
+        // refusal of it reads the deploy receipt to rule out RPC lag.
+        ant_chain::chequebook_store::persist_chequebook(
+            &dir.join("chequebook.json"),
+            &ant_chain::chequebook_store::ChequebookFile {
+                chequebook: format!("0x{}", hex::encode(CHEQUEBOOK)),
+                issuer: format!("0x{}", hex::encode(eth)),
+                salt: String::new(),
+                deploy_tx: format!("0x{}", hex::encode(DEPLOY_TX)),
+            },
+        )
+        .unwrap();
+
+        let (mut handle, (mut cmd_rx, status_tx)) = handle_for_test();
+        handle.eth = eth;
+        handle.signing_secret = SECRET;
+        handle.data_dir.clone_from(&dir);
+        handle.chain_init = std::sync::Arc::new(crate::drive::ChainInit::new(std::sync::Arc::new(
+            ant_p2p::UploadRuntime {
+                issuers: std::sync::Mutex::new(std::collections::HashMap::new()),
+                stamp_key: [0u8; 32],
+                batch_owner: eth,
+                postage_dir: dir.join("postage"),
+            },
+        )));
+        status_tx.send_modify(|snap| {
+            snap.identity.eth_address = format!("0x{}", hex::encode(eth));
+        });
+        // An inert node that answers nothing (dropped acks fail fast).
+        handle
+            .runtime
+            .spawn(async move { while cmd_rx.recv().await.is_some() {} });
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = CString::new(format!("127.0.0.1:{port}")).unwrap();
+        let rpc = "http://127.0.0.1:1";
+        let rpc_c = CString::new(rpc).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        // No transport installed yet.
+        let ok = unsafe {
+            crate::ant_start_gateway(
+                std::ptr::from_ref(&handle),
+                addr.as_ptr(),
+                true,
+                rpc_c.as_ptr(),
+                &raw mut err,
+            )
+        };
+        assert!(ok && err.is_null(), "{:?}", unsafe {
+            (!err.is_null()).then(|| CStr::from_ptr(err).to_string_lossy().into_owned())
+        });
+        // The hooks exactly as that start built them (same helper).
+        let hooks = crate::gateway::chain_hooks(&handle, Some(rpc.to_string()));
+
+        // Let the start's own chain init fail its first pass against the
+        // dead URL: its retry is 15 s away, so the host requests below
+        // are the gateway's, not the init's.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wallet_scan_status(&eth).map(|s| s.state) != Some(WalletScanState::Retrying) {
+            assert!(std::time::Instant::now() < deadline, "chain init never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let rc = unsafe {
+            ant_set_chain_transport(
+                std::ptr::from_mut(&mut handle),
+                Some(late_host),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, ANT_CHAIN_TRANSPORT_OK);
+        let seen = |needle: &str| LATE_SEEN.lock().unwrap().iter().any(|r| r.contains(needle));
+        let wait_for = |needle: &str, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !seen(needle) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} never reached the host transport"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        // Chain reader: `/wallet` is answered from the host (the URL is
+        // dead, so a 200 can only come from it).
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "GET /wallet HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut body = String::new();
+        s.read_to_string(&mut body).unwrap();
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(
+            seen("\"eth_getBalance\""),
+            "the chain reader asked the host"
+        );
+
+        // Chequebook-refused hook: its lag check reads the deploy
+        // receipt through the host.
+        let refused = hooks.on_chequebook_refused.expect("built with an RPC");
+        handle.runtime.spawn(refused(
+            CHEQUEBOOK,
+            ant_gateway::ChequebookRefusal::NotRegistered,
+        ));
+        wait_for(&hex::encode(DEPLOY_TX), "the chequebook-refused hook");
+
+        // After-buy hook: settlement setup checks the persisted
+        // chequebook with the factory (`deployedContracts(chequebook)`).
+        let before = LATE_SEEN.lock().unwrap().len();
+        let bought = hooks.on_batch_bought.expect("built with an RPC");
+        bought([0x3e; 32]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !LATE_SEEN.lock().unwrap()[before..]
+            .iter()
+            .any(|r| r.contains("eth_call") && r.contains(&hex::encode(CHEQUEBOOK)))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the after-buy hook never reached the host transport"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        unsafe { crate::ant_stop_gateway(std::ptr::from_ref(&handle)) };
+        wallet_scan_forget(&eth);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

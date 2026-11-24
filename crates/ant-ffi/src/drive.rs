@@ -2119,10 +2119,12 @@ pub(crate) async fn setup_settlement(
 }
 
 /// The retrieval-funds watch running for this process, if any: the
-/// chequebook, the node it publishes to, and its task.
+/// chequebook, the client it reads through, the node it publishes to,
+/// and its task.
 #[cfg(feature = "chain")]
 type FundsWatch = (
     [u8; 20],
+    ant_chain::ChainClient,
     mpsc::Sender<ControlCommand>,
     tokio::task::AbortHandle,
 );
@@ -2134,7 +2136,13 @@ type FundsWatch = (
 /// over `client` (so through the host chain transport when one is
 /// installed). Started by every successful [`setup_settlement`] and
 /// every successful deposit top-up ([`refresh_retrieval_funds`]); one
-/// watch per node, replaced when its chequebook changes.
+/// watch per node, replaced when its chequebook changes or when `client`
+/// reads through a different route than the running watch's
+/// ([`ant_chain::ChainClient::same_route`]: another RPC URL, transport or
+/// unverified source), so a watch never keeps polling a route the host
+/// has since replaced (issue #303). A client rebuilt for the same route
+/// (every top-up and gateway start builds its own) leaves the running
+/// watch alone.
 ///
 /// `ant_init` reloads a persisted chequebook without an RPC, so until the
 /// first settlement setup or top-up after it (the gateway-start chain
@@ -2151,15 +2159,15 @@ fn watch_retrieval_funds(
     let mut watches = WATCHES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    watches.retain(|(_, _, task)| !task.is_finished());
+    watches.retain(|(_, _, _, task)| !task.is_finished());
     if let Some(at) = watches
         .iter()
-        .position(|(_, tx, _)| tx.same_channel(cmd_tx))
+        .position(|(_, _, tx, _)| tx.same_channel(cmd_tx))
     {
-        if watches[at].0 == chequebook {
+        if watches[at].0 == chequebook && watches[at].1.same_route(client) {
             return;
         }
-        watches.swap_remove(at).2.abort();
+        watches.swap_remove(at).3.abort();
     }
     let commands = cmd_tx.clone();
     let task = tokio::spawn(ant_chain::chequebook_store::watch_retrieval_funds(
@@ -2170,7 +2178,12 @@ fn watch_retrieval_funds(
             async move { publish_retrieval_funds(&commands, chequebook, funds).await }
         },
     ));
-    watches.push((chequebook, cmd_tx.clone(), task.abort_handle()));
+    watches.push((
+        chequebook,
+        client.clone(),
+        cmd_tx.clone(),
+        task.abort_handle(),
+    ));
 }
 
 /// Hand one read of `chequebook`'s funds to the node
@@ -4752,6 +4765,76 @@ mod chain_tests {
             Some((CANDIDATE, super::NO_PLAN_DEPOSIT_PLUR, 100_000)),
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #303: the funds watch is keyed by route as well as by
+    /// chequebook. Handing it a client on another route (here another
+    /// transport) restarts it there, so it stops polling the replaced
+    /// one; a client rebuilt for the route it already reads through (as
+    /// every top-up and gateway start builds its own) leaves it alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn funds_watch_restarts_on_a_route_change() {
+        let (_, eth) = node_wallet();
+        let route = |deposit: u128| {
+            let mut script = ChainScript::new(eth);
+            script.chequebooks.insert(CANDIDATE, (true, eth));
+            script.balances.insert(CANDIDATE, deposit);
+            std::sync::Arc::new(script)
+        };
+        let (old, new) = (route(111), route(222));
+        let (cmd_tx, node) = fake_node();
+        let funds_reads = |script: &ChainScript| {
+            script
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "eth_call")
+                .count()
+        };
+        let published = |deposit: u128| {
+            let node = std::sync::Arc::clone(&node);
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if node
+                        .lock()
+                        .unwrap()
+                        .funds
+                        .iter()
+                        .any(|&(cb, d, _)| cb == CANDIDATE && d == deposit)
+                    {
+                        return;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "no funds read of {deposit} published",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        super::watch_retrieval_funds(&cmd_tx, &client(&old), CANDIDATE);
+        published(111).await;
+        let old_reads = funds_reads(&old);
+        assert!(old_reads > 0);
+
+        // Same route, freshly built client: the running watch stays.
+        super::watch_retrieval_funds(&cmd_tx, &client(&old), CANDIDATE);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(funds_reads(&old), old_reads, "same route: no restart");
+
+        // Another route for the same chequebook: the watch moves there.
+        super::watch_retrieval_funds(&cmd_tx, &client(&new), CANDIDATE);
+        published(222).await;
+        assert!(funds_reads(&new) > 0, "the watch reads the new route");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            funds_reads(&old),
+            old_reads,
+            "the replaced route is no longer polled"
+        );
     }
 
     /// A chequebook a C-API storage call sets settlement up on reaches
