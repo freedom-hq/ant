@@ -108,10 +108,12 @@ pub struct RetrievalSwapPolicy {
 /// a peer with no entry is refused, and a peer that named a chequebook
 /// may only pay from that one (see [`crate::swap::CreditLedger`]).
 ///
-/// The map is intentionally tiny — one 20-byte EOA per peer, peers
-/// churn but never accumulate beyond `state.bzz_peers.len() ~= 100` in
-/// our peer set: `forget(peer)` from `ConnectionClosed` drops the entry,
-/// and a reconnecting peer re-records its EOA under a new session.
+/// The map is intentionally tiny — one `PeerSession` per peer (a
+/// 20-byte EOA, a `u64` session and an optional 20-byte chequebook),
+/// peers churn but never accumulate beyond `state.bzz_peers.len() ~= 100`
+/// in our peer set: `forget(peer)` from `ConnectionClosed` drops the
+/// entry, and a reconnecting peer re-records its EOA and chequebook under
+/// a new session.
 #[derive(Default, Clone)]
 pub struct PeerEthMap {
     inner: Arc<RwLock<HashMap<PeerId, PeerSession>>>,
