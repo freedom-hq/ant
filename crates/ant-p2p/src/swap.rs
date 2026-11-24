@@ -654,9 +654,15 @@ pub fn issue_cheque(
 /// `<chequebook>.confirmed:<beneficiary>` on disk and journaled like the
 /// issued figures (only growing, the larger figure wins); a release that
 /// doesn't know them reads that section as another chequebook's and
-/// leaves it alone. A beneficiary with no confirmed figure (paid before
-/// they were kept) counts as confirmed up to its issued cumulative, and
-/// its next cheque records the one it builds on in the same journal line.
+/// leaves it alone. Each cheque's journal line also records, in a
+/// third section `<chequebook>.tracked`, the issued cumulative it sets:
+/// a confirmed figure counts only while the issued cumulative is still
+/// the one tracked with it. A beneficiary with no tracked figure (paid
+/// before they were kept), or whose issued cumulative grew past it (a
+/// downgraded release paid it, and counted its cheques delivered, as
+/// every release before this one did), counts as confirmed up to its
+/// issued cumulative ([`Self::confirmed_for`]); its next cheque records
+/// the confirmed figure it builds on in the same journal line.
 ///
 /// Bare `beneficiary → cumulative` entries — a file from before the
 /// sections, or ones a downgraded release added — are adopted by the
@@ -749,10 +755,15 @@ struct OutboundState {
     /// Per beneficiary, the highest cumulative of a cheque known to have
     /// been delivered ([`OutboundLedger::confirm_delivered`]). Not part of
     /// the liability (`total`): every confirmed cheque is also issued. A
-    /// beneficiary missing here (figures written before this was kept)
-    /// counts as confirmed up to its issued cumulative
-    /// ([`OutboundLedger::confirmed_for`]).
+    /// figure here counts only while `tracked` holds the beneficiary's
+    /// issued cumulative ([`Self::confirmed`]).
     confirmed: HashMap<String, U256>,
+    /// Per beneficiary, the issued cumulative recorded with the confirmed
+    /// one, by a release that keeps confirmed figures: every cheque line
+    /// it writes carries both. An issued cumulative above it was raised
+    /// by a release that doesn't (a downgrade), which counts its cheques
+    /// delivered.
+    tracked: HashMap<String, U256>,
     /// The file couldn't be read (an I/O error, not "missing"), so the
     /// chequebook's recorded cumulatives are unknown. Nothing is written
     /// and no cheque is issued until a read succeeds
@@ -783,6 +794,39 @@ impl OutboundState {
         }
         *cur
     }
+
+    /// Raise `beneficiary`'s tracked issued cumulative to `v` (it only
+    /// grows) and return the figure it holds now.
+    fn raise_tracked(&mut self, beneficiary: String, v: U256) -> U256 {
+        let cur = self.tracked.entry(beneficiary).or_default();
+        if v > *cur {
+            *cur = v;
+        }
+        *cur
+    }
+
+    /// Highest cumulative to `beneficiary` known to have been delivered.
+    /// The recorded confirmed figure if its tracked issued cumulative is
+    /// still the issued one; otherwise the issued cumulative. That is a
+    /// beneficiary paid only before confirmed figures were kept, or one
+    /// a downgraded release paid since (it raised the issued figure past
+    /// the tracked one and counts every cheque it sent as delivered):
+    /// building on the stale confirmed figure would re-send a cumulative
+    /// the peer already holds, or pay less than the debt (PR #314 R1-F1).
+    fn confirmed(&self, beneficiary: &str) -> U256 {
+        let issued = self
+            .cumulatives
+            .get(beneficiary)
+            .copied()
+            .unwrap_or_default();
+        match self.tracked.get(beneficiary) {
+            Some(t) if *t == issued => self
+                .confirmed
+                .get(beneficiary)
+                .map_or(issued, |c| (*c).min(issued)),
+            _ => issued,
+        }
+    }
 }
 
 /// The file section holding the confirmed cumulatives of the chequebook
@@ -797,6 +841,22 @@ fn confirmed_section(chequebook: &str) -> String {
 
 /// Suffix of a [`confirmed_section`] name.
 const CONFIRMED_SUFFIX: &str = ".confirmed";
+
+/// The file section holding the tracked issued cumulatives of the
+/// chequebook whose section is `chequebook` (see [`OutboundState::tracked`]);
+/// like [`confirmed_section`], a release that doesn't know it leaves it
+/// alone.
+fn tracked_section(chequebook: &str) -> String {
+    format!("{chequebook}{TRACKED_SUFFIX}")
+}
+
+/// Suffix of a [`tracked_section`] name.
+const TRACKED_SUFFIX: &str = ".tracked";
+
+/// A section of a chequebook's side figures, not a chequebook's own.
+fn is_side_section(name: &str) -> bool {
+    name.ends_with(CONFIRMED_SUFFIX) || name.ends_with(TRACKED_SUFFIX)
+}
 
 /// Fewest journal lines that trigger a compaction; above it, the journal
 /// may grow to as many lines as the file has entries, so the cost of
@@ -1317,23 +1377,6 @@ impl JournalStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retired
-    }
-
-    /// Stage `entries` (`<chequebook>:<beneficiary>` → cumulative) as
-    /// journal lines. Returns the sequence number to wait for.
-    fn stage<'a>(&self, entries: impl IntoIterator<Item = (&'a str, &'a str, U256)>) -> u64 {
-        let mut q = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (chequebook, beneficiary, v) in entries {
-            q.buf.extend_from_slice(
-                format!("{{\"{chequebook}:{beneficiary}\":\"{v}\"}}\n").as_bytes(),
-            );
-            q.lines += 1;
-            q.staged += 1;
-        }
-        q.staged
     }
 
     /// Stage `entries` as one journal line holding them all, so they
@@ -2069,7 +2112,7 @@ fn sectioned_known(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(file
         .chequebooks
         .into_keys()
-        .filter(|k| !k.is_empty() && !k.ends_with(CONFIRMED_SUFFIX))
+        .filter(|k| !k.is_empty() && !is_side_section(k))
         .filter(|k| match &marker {
             Ok(None) => true,
             Ok(Some(m)) => m.clears(k),
@@ -2639,6 +2682,11 @@ fn load_outbound_section(
             state.raise_confirmed(k, v);
         }
     }
+    if let Some(section) = file.chequebooks.remove(&tracked_section(key)) {
+        for (k, v) in parse_cumulatives(section) {
+            state.raise_tracked(k, v);
+        }
+    }
     state.unread = None;
     Ok(entries)
 }
@@ -2929,6 +2977,9 @@ impl OutboundLedger {
                 for (k, v) in read.confirmed {
                     st.raise_confirmed(k, v);
                 }
+                for (k, v) in read.tracked {
+                    st.raise_tracked(k, v);
+                }
                 if st.unread.take().is_some() {
                     self.shared.loaded.store(true, Ordering::SeqCst);
                     info!(
@@ -3002,17 +3053,12 @@ impl OutboundLedger {
 
     /// Highest cumulative of a cheque to `beneficiary` known to have
     /// been delivered ([`Self::confirm_delivered`]). For a beneficiary
-    /// paid only before this was kept, its issued cumulative: those
-    /// cheques count as delivered, as they did then.
+    /// paid only before this was kept, or paid since by a downgraded
+    /// release that doesn't keep it, its issued cumulative: those
+    /// cheques count as delivered, as that release counted them.
     #[must_use]
     pub fn confirmed_for(&self, beneficiary: &[u8; 20]) -> U256 {
-        let key = hex::encode(beneficiary);
-        let st = self.lock_state();
-        st.confirmed
-            .get(&key)
-            .or_else(|| st.cumulatives.get(&key))
-            .copied()
-            .unwrap_or_default()
+        self.lock_state().confirmed(&hex::encode(beneficiary))
     }
 
     /// The cumulative of the next cheque to `beneficiary` paying `amount`
@@ -3024,6 +3070,12 @@ impl OutboundLedger {
     /// only once), and a larger debt supersedes it. So a peer that makes
     /// deliveries fail can't collect one debt several times (bee's
     /// `chequebook.Issue` saves the last cheque only once it was sent).
+    /// The one overpayment left: a debt that *shrank* since the
+    /// undelivered cheque (a pseudosettle refresh before the retry) is
+    /// still paid with that cheque, since a cumulative can't go back, so
+    /// the peer is credited the old, larger debt while the payer's mirror
+    /// is lowered by the new one: an overpayment of the difference (less
+    /// than stacking paid: the larger debt plus the smaller one).
     /// `None` on overflow. Hold [`Self::beneficiary_lock`] from here to
     /// recording the cheque.
     #[must_use]
@@ -3061,10 +3113,11 @@ impl OutboundLedger {
     /// [`PendingWrite`] is durable. Cheques staged together are written
     /// and fsynced together.
     ///
-    /// The first cheque to a beneficiary with no confirmed cumulative on
-    /// record ([`Self::confirmed_for`]) also records its confirmed
-    /// cumulative as the one issued before, in the same journal line, so
-    /// a restart doesn't count this cheque as delivered.
+    /// The journal line also records, for the same beneficiary, the
+    /// confirmed cumulative the cheque builds on ([`Self::confirmed_for`])
+    /// and the issued one it sets as tracked, so they reach the disk
+    /// together: a restart neither counts this cheque as delivered nor
+    /// mistakes it for a downgraded release's.
     ///
     /// The journal line is written even while the file can't be read: it
     /// only ever raises a figure, so it can't erase one this ledger
@@ -3075,40 +3128,52 @@ impl OutboundLedger {
     pub fn stage_issued(&self, beneficiary: &[u8; 20], new_cumulative: U256) -> PendingWrite {
         let key = hex::encode(beneficiary);
         let mut st = self.lock_state();
-        let pinned = if st.confirmed.contains_key(&key) {
-            None
+        let rewrite = self.shared.survived_loss.load(Ordering::SeqCst);
+        // Every beneficiary written below gets its confirmed figure made
+        // explicit and its tracked figure set to its issued one, in
+        // memory as on disk, so the two agree after a restart.
+        let mut keys: Vec<String> = if rewrite {
+            st.cumulatives
+                .keys()
+                .filter(|k| **k != key)
+                .cloned()
+                .collect()
         } else {
-            let before = st.cumulatives.get(&key).copied().unwrap_or_default();
-            Some(st.raise_confirmed(key.clone(), before))
+            Vec::new()
         };
-        let now = st.raise(key.clone(), new_cumulative);
+        keys.push(key.clone());
+        for k in &keys {
+            let c = st.confirmed(k);
+            st.raise_confirmed(k.clone(), c);
+        }
+        st.raise(key.clone(), new_cumulative);
+        let mut lines = Vec::with_capacity(keys.len());
+        for k in keys {
+            let issued = st.cumulatives.get(&k).copied().unwrap_or_default();
+            let tracked = st.raise_tracked(k.clone(), issued);
+            let confirmed = st.confirmed.get(&k).copied().unwrap_or_default();
+            lines.push((k, issued, tracked, confirmed));
+        }
         let Some(store) = &self.shared.store else {
             return PendingWrite { pending: None };
         };
         let chequebook = hex::encode(self.chequebook);
-        let confirmed = confirmed_section(&chequebook);
+        let confirmed_sec = confirmed_section(&chequebook);
+        let tracked_sec = tracked_section(&chequebook);
         // Read before the rewrite is staged: a loss flagged after this
         // point isn't covered by it.
         let generation = self.shared.loss_gen.load(Ordering::SeqCst);
-        let (seq, note_known) = if self.shared.survived_loss.load(Ordering::SeqCst) {
-            let seq = store.stage(
-                st.cumulatives
-                    .iter()
-                    .map(|(b, v)| (chequebook.as_str(), b.as_str(), *v))
-                    .chain(
-                        st.confirmed
-                            .iter()
-                            .map(|(b, v)| (confirmed.as_str(), b.as_str(), *v)),
-                    ),
-            );
-            (seq, Some((chequebook, generation)))
-        } else {
-            let mut line = vec![(chequebook.as_str(), key.as_str(), now)];
-            if let Some(c) = pinned {
-                line.push((confirmed.as_str(), key.as_str(), c));
-            }
-            (store.stage_line(&line), None)
-        };
+        // One line per beneficiary, so its three figures reach the disk
+        // together or not at all.
+        let mut seq = 0;
+        for (k, issued, tracked, confirmed) in &lines {
+            seq = store.stage_line(&[
+                (chequebook.as_str(), k.as_str(), *issued),
+                (confirmed_sec.as_str(), k.as_str(), *confirmed),
+                (tracked_sec.as_str(), k.as_str(), *tracked),
+            ]);
+        }
+        let note_known = rewrite.then_some((chequebook, generation));
         drop(st);
         PendingWrite {
             pending: Some(Pending {
@@ -5010,10 +5075,13 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap())
                 .expect("a pre-section release must parse the file");
         old.retain(|_, v| U256::from_dec_str(v).is_ok());
-        // Plus each chequebook's confirmed cumulatives, in sections of
-        // their own that the old release carries along untouched.
+        // Plus each chequebook's confirmed and tracked cumulatives, in
+        // sections of their own that the old release carries along
+        // untouched.
         assert_eq!(
-            old.keys().filter(|k| !k.contains(".confirmed:")).count(),
+            old.keys()
+                .filter(|k| !k.contains(".confirmed:") && !k.contains(".tracked:"))
+                .count(),
             3,
             "{old:?}"
         );
@@ -5103,10 +5171,11 @@ mod tests {
             4,
             "{journal}"
         );
-        // A first cheque to a beneficiary also records, in the same line,
-        // what was confirmed to it before (here nothing).
+        // A cheque also records, in the same line, what was confirmed to
+        // its beneficiary before (here nothing) and the issued cumulative
+        // it tracks.
         assert!(journal.ends_with(&format!(
-            "{{\"{cb}:{b}\":\"9\",\"{cb}.confirmed:{b}\":\"0\"}}\n#4\n",
+            "{{\"{cb}:{b}\":\"9\",\"{cb}.confirmed:{b}\":\"0\",\"{cb}.tracked:{b}\":\"9\"}}\n#4\n",
             cb = hex::encode(cb),
             b = hex::encode(beneficiary(5_000))
         )));
@@ -5351,7 +5420,7 @@ mod tests {
             compacting: AtomicBool::new(false),
             compact_failed: Mutex::new(None),
         });
-        let seq = store.stage([(
+        let seq = store.stage_line(&[(
             hex::encode(cb).as_str(),
             hex::encode(beneficiary(2)).as_str(),
             U256::from(3u64),
@@ -6012,6 +6081,60 @@ mod tests {
         assert_eq!(on_disk.chequebooks[&hex::encode(cb)].len(), 2);
     }
 
+    /// A release that doesn't keep confirmed figures (a downgrade) raises
+    /// the issued cumulative with every cheque it delivers, but never the
+    /// confirmed one. After upgrading again those cheques count as
+    /// delivered, as that release counted them: building on the stale
+    /// confirmed figure would re-send a cumulative the peer already holds
+    /// (refused as not increasing for good once the gap passes the
+    /// largest debt) or pay less than the debt (PR #314 R1-F1). Both of
+    /// the shapes an older release writes: its own section, and bare
+    /// keys from before the sections.
+    #[test]
+    fn a_downgraded_releases_cheques_count_as_delivered() {
+        for bare in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pushsync_outbound.json");
+            let cb = [0xc9u8; 20];
+            let b = beneficiary(4);
+            let n = |v: u64| U256::from(v);
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            l.record_issued(&b, n(100)).unwrap();
+            l.confirm_delivered(&b, n(100)).wait().unwrap();
+            drop(l);
+
+            // The older release delivers two more cheques.
+            let mut flat: HashMap<String, String> =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let key = if bare {
+                hex::encode(b)
+            } else {
+                format!("{}:{}", hex::encode(cb), hex::encode(b))
+            };
+            flat.insert(key, "300".into());
+            std::fs::write(&path, serde_json::to_vec(&flat).unwrap()).unwrap();
+
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            assert_eq!(l.cumulative_for(&b), n(300), "bare {bare}");
+            assert_eq!(l.confirmed_for(&b), n(300), "bare {bare}");
+            assert_eq!(l.next_cumulative(&b, n(50)), Some(n(350)), "bare {bare}");
+            assert_eq!(l.total_issued(), n(300), "bare {bare}");
+
+            // This release's own undelivered cheque on top of it still
+            // isn't counted delivered, after a crash as after a close.
+            l.record_issued(&b, n(350)).unwrap();
+            crash(&path, [l]);
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            assert_eq!(l.confirmed_for(&b), n(300), "bare {bare}");
+            assert_eq!(l.next_cumulative(&b, n(50)), Some(n(350)), "bare {bare}");
+            assert_eq!(l.next_cumulative(&b, n(80)), Some(n(380)), "bare {bare}");
+            drop(l);
+            let l = OutboundLedger::open(Some(path.clone()), cb);
+            assert_eq!(l.cumulative_for(&b), n(350), "bare {bare}");
+            assert_eq!(l.confirmed_for(&b), n(300), "bare {bare}");
+        }
+    }
+
     /// A cheque whose journal line failed to write stays issued in
     /// memory, and the retry for the same debt reissues its cumulative
     /// instead of stacking on it (issue #283).
@@ -6057,9 +6180,9 @@ mod tests {
         }
         let on_disk = read_outbound_file(&path).unwrap().unwrap();
         assert_eq!(on_disk.chequebooks[&hex::encode(cb)].len(), n as usize);
-        // Each new beneficiary's first cheque also records that nothing
-        // was confirmed to it yet.
-        assert_eq!(on_disk.entries(), 2 * n as usize);
+        // Each cheque also records its beneficiary's confirmed (here
+        // nothing yet) and tracked cumulatives.
+        assert_eq!(on_disk.entries(), 3 * n as usize);
         l.record_issued(&beneficiary(0), U256::from(99u64)).unwrap();
         crash(&path, [l]);
         let l = OutboundLedger::open(Some(path), cb);

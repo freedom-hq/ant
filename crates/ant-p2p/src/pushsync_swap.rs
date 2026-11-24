@@ -283,7 +283,7 @@ pub struct PushsyncSwap {
 /// surviving connection too (the mirror stays up; the retry reissues the
 /// same cumulative, which bee, already holding it, refuses as not
 /// increasing, and the next cheque for a grown debt credits only what
-/// is new: the peer is never paid twice, issue #283). The
+/// is new: one debt is never paid twice, issue #283). The
 /// window covers the swarm loop handling the close after the stream task
 /// woke; in the paid runs on PR #126 the two resets showed up in the same
 /// millisecond as the stream end.
@@ -351,7 +351,10 @@ impl EmitCore {
     /// connection as undelivered: the debt mirror isn't lowered, and the
     /// next cheque for that debt carries the same cumulative (see
     /// [`OutboundLedger::next_cumulative`]), which the peer, already
-    /// holding it, credits nothing for — so the peer is not paid twice.
+    /// holding it, credits nothing for — so the debt is not paid twice.
+    /// (If the debt shrank before the retry, a pseudosettle refresh, the
+    /// re-sent cheque still pays the larger undelivered amount: see
+    /// [`OutboundLedger::next_cumulative`].)
     async fn connection_held(&self, peer: PeerId, session: u64) -> Result<(), SwapError> {
         tokio::time::sleep(DELIVERY_GRACE).await;
         match self.cfg.peer_eth.session(&peer) {
@@ -384,7 +387,9 @@ impl EmitCore {
     /// the next cheque to the beneficiary builds on the last confirmed
     /// one, so a retry for the same debt carries the same cumulative
     /// and the peer can't collect it twice by making deliveries fail
-    /// (issue #283). A delivered cheque is confirmed in the ledger before
+    /// (issue #283; a debt that shrank before the retry is still paid at
+    /// the undelivered cheque's larger amount, see
+    /// [`OutboundLedger::next_cumulative`]). A delivered cheque is confirmed in the ledger before
     /// this returns. Every cheque recorded is logged with its amount,
     /// whatever its outcome, so the log adds up to the ledger.
     ///
@@ -494,7 +499,7 @@ impl EmitCore {
             // Still under the beneficiary lock. In memory at once; if it
             // can't reach the disk, a restart may reissue this
             // cumulative, which the peer refuses as not increasing until
-            // the debt grows past it — it never pays it twice.
+            // the debt grows past it, so it isn't credited twice.
             if let Err(e) = self
                 .outbound_ledger
                 .confirm_delivered(&beneficiary, new_cum)
@@ -974,6 +979,10 @@ mod tests {
         verdicts: VecDeque<Verdict>,
         /// Cumulative of every cheque read, in order.
         received: Vec<U256>,
+        /// Highest cumulative credited (bee's last received cheque).
+        credited: U256,
+        /// Cumulatives refused as not increasing, in order.
+        refused: Vec<U256>,
         /// Streams held open by [`Verdict::Stall`].
         held: Vec<Stream>,
     }
@@ -1034,7 +1043,22 @@ mod tests {
         let verdict = {
             let mut b = bee.lock().unwrap();
             b.received.push(cum);
-            b.verdicts.pop_front().unwrap_or(Verdict::Accept)
+            let verdict = b.verdicts.pop_front().unwrap_or(Verdict::Accept);
+            match verdict {
+                // Bee's `ReceiveCheque` refuses a cumulative that isn't
+                // above the last one it received ("cheque cumulative
+                // amount not increasing"), and the handler resets the
+                // stream.
+                Verdict::Accept | Verdict::CloseInGrace if cum <= b.credited => {
+                    b.refused.push(cum);
+                    Verdict::Reset
+                }
+                Verdict::Accept | Verdict::CloseInGrace => {
+                    b.credited = cum;
+                    verdict
+                }
+                Verdict::Reset | Verdict::Stall => verdict,
+            }
         };
         match verdict {
             Verdict::Reset => drop(stream),
@@ -1066,6 +1090,8 @@ mod tests {
             deduction: U256::from(deduction),
             verdicts: VecDeque::new(),
             received: Vec::new(),
+            credited: U256::zero(),
+            refused: Vec::new(),
             held: Vec::new(),
         }));
         let mut bee_swarm = stream_swarm();
@@ -1155,8 +1181,11 @@ mod tests {
     /// deadline, a connection closing in the grace window — can't collect
     /// one debt once per retry (issue #283): every retry for the same
     /// debt carries the same cumulative, and the liability stays one
-    /// cheque's worth. Once a cheque is delivered, the next debt builds on
-    /// it.
+    /// cheque's worth. A cheque the bee did credit although the payer
+    /// counted it undelivered (a connection closing in the grace window)
+    /// makes the bee refuse the retries at that cumulative as not
+    /// increasing, until the debt grows: the next cheque then builds on
+    /// the last confirmed one again and the bee credits only what is new.
     #[tokio::test]
     async fn failed_deliveries_for_one_debt_all_carry_the_same_cumulative() {
         let dir = tempfile::tempdir().unwrap();
@@ -1177,22 +1206,40 @@ mod tests {
             );
         }
         assert_eq!(bee.lock().unwrap().received, vec![cheque; 4]);
+        // The cheque that went out as a connection closed was credited.
+        assert_eq!(bee.lock().unwrap().credited, cheque);
 
-        // Delivered at last: the same cumulative, now confirmed.
+        // So the next retry for the same debt is refused as not
+        // increasing (bee resets the stream): nothing is paid twice, and
+        // it still isn't confirmed.
+        pay_with(&svc, &bee, peer, 10, Verdict::Accept)
+            .await
+            .unwrap_err();
+        assert_eq!(bee.lock().unwrap().refused, vec![cheque]);
         assert_eq!(
-            pay_with(&svc, &bee, peer, 10, Verdict::Accept)
+            svc.outbound_ledger().confirmed_for(&beneficiary),
+            U256::zero()
+        );
+        // Until the debt grows (ten more units of pushes): the cheque
+        // builds on the last confirmed cumulative, and the bee credits
+        // only the new part, which is what it is owed.
+        let grown = U256::from(20 * 1_000 + 7u64);
+        assert_eq!(
+            pay_with(&svc, &bee, peer, 20, Verdict::Accept)
                 .await
                 .unwrap(),
-            cheque
+            grown
         );
-        assert_eq!(svc.outbound_ledger().confirmed_for(&beneficiary), cheque);
+        assert_eq!(bee.lock().unwrap().credited - cheque, grown - cheque);
+        assert_eq!(svc.outbound_ledger().confirmed_for(&beneficiary), grown);
+        assert_eq!(svc.outbound_ledger().total_issued(), grown);
         // The next debt builds on the delivered cheque.
         pay_with(&svc, &bee, peer, 10, Verdict::Accept)
             .await
             .unwrap();
         assert_eq!(
             bee.lock().unwrap().received,
-            [vec![cheque; 5], vec![cheque * 2]].concat()
+            [vec![cheque; 5], vec![grown, grown + cheque]].concat()
         );
 
         // And it survives a restart: a retry after one reissues the
@@ -1201,14 +1248,14 @@ mod tests {
             .await
             .unwrap_err();
         let issued = svc.outbound_ledger().cumulative_for(&beneficiary);
-        assert_eq!(issued, cheque * 3);
+        assert_eq!(issued, grown + cheque * 2);
         drop(svc);
         let reopened = OutboundLedger::open(Some(dir.path().join("out.json")), [0xcb; 20]);
-        assert_eq!(reopened.cumulative_for(&beneficiary), cheque * 3);
-        assert_eq!(reopened.confirmed_for(&beneficiary), cheque * 2);
+        assert_eq!(reopened.cumulative_for(&beneficiary), grown + cheque * 2);
+        assert_eq!(reopened.confirmed_for(&beneficiary), grown + cheque);
         assert_eq!(
             reopened.next_cumulative(&beneficiary, cheque),
-            Some(cheque * 3)
+            Some(grown + cheque * 2)
         );
     }
 
