@@ -130,21 +130,21 @@ Optional further shrink (nightly): `cargo +nightly build -Z build-std=std,panic_
 - **Cargo.toml uses caret requirements** (e.g. `tokio = "1"`) so `cargo update` picks up non-breaking upgrades continuously.
 - **`Cargo.lock` is committed** for reproducible builds of the binary / artifact crates (`antd`, `ant-ffi`), but we never rely on it to hold us back on library upgrades.
 - **Rust toolchain:** pinned to **latest stable** in `rust-toolchain.toml`. MSRV claim is "current stable"; we do not promise old-toolchain support.
-- **Dependency-hygiene PRs:** a dedicated upgrade workflow does:
+- **Dependency-hygiene PRs** (manual for now; there is no upgrade workflow in `.github/workflows/` yet) do:
   - `cargo update` (lockfile refresh) — always applied.
   - `cargo upgrade --incompatible` (from `cargo-edit`) — reviewed, applied when green.
   - Rust toolchain bump when a new stable lands.
   - Test suite + mainnet smoke must pass before the PR merges.
-- **Dependabot / Renovate** generate PRs continuously for interim bumps.
-- **`cargo-outdated`** in CI fails the build if any dependency is more than **one minor version** behind latest stable.
+- **Dependabot / Renovate** are not set up; interim bumps are manual `cargo update` PRs.
+- **Staleness is not checked in CI.** No `cargo-outdated` job exists, so nothing fails the build when a dependency falls behind latest stable. The target is still at most **one minor version** behind, kept by the hygiene PRs above. The only version check CI enforces is cargo-deny's advisory and yanked check below.
 - **`cargo-deny`** (CI job `cargo-deny`, policy in `deny.toml`) enforces: no known-advisory versions (the RustSec database, the same one `cargo-audit` reads, so there is no separate `cargo-audit` step), no yanked versions, allowed licenses only, crates.io as the only source. Every advisory exception in `deny.toml` names one advisory ID with its reason. Duplicate versions of the same crate are reported but don't fail the check yet: the tree still carries several through upstream crates (see the single-version rule below).
 - **`cargo-vet`** is not set up. Whether to keep human-reviewed audits of new crate versions is a separate decision.
-- **Exception policy:** a dependency may be held back only with a dated `# PINNED: reason, review by YYYY-MM-DD` comment in `Cargo.toml`. Anything past its review date blocks CI.
+- **Exception policy:** a dependency may be held back only with a dated `# PINNED: reason, review by YYYY-MM-DD` comment in `Cargo.toml`. This is a review convention, not a CI check: nothing in CI reads these comments, so an expired review date has to be caught in review or in the next hygiene PR.
 - **Single version per crate:** if two transitive deps force us onto two majors of the same crate, the upgrade is itself a blocking task — we don't carry duplicate majors into release artifacts (this is both a size and a security concern).
 
 This policy is explicitly *in tension* with the §13 / §14 guidance to "pin versions." There is no contradiction: **we pin precisely to the latest stable, then we continuously rebase that pin onto new stable releases**. Pinning is for reproducibility and security review, not for freezing.
 
-**Key dependencies we will carry** (versions intentionally not listed — CI enforces "latest stable"):
+**Key dependencies we will carry** (versions intentionally not listed; the policy above is "latest stable", though CI does not check it):
 
 - `libp2p`, `tokio`, `alloy-*`, `k256`, `sha3`, `sha2`, `hmac`, `hkdf`, `chacha20poly1305`
 - `prost`, `rusqlite`, `serde`, `serde_json`, `bincode`, `alloy-rlp`
