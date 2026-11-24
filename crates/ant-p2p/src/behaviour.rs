@@ -27,6 +27,7 @@ use futures::StreamExt;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::PortUse;
 use libp2p::core::Transport as _;
 use libp2p::identify;
 use libp2p::identity::Keypair;
@@ -533,10 +534,11 @@ impl ExternalAddrSource {
 
 /// Centralized add: registers `addr` as an external on the swarm, tracks
 /// the source + insertion time in `state`, emits a single attributed
-/// `info!` line, and pushes the new set into the status snapshot. No-op
-/// when the address is already known — `UPnP` renews mappings every 30 min
-/// and we don't want flapping log lines, and re-promoting an address
-/// should not silently change its recorded source.
+/// `info!` line, and pushes the new set into the status snapshot. An
+/// address that is already known only gains `source` (no log line, no
+/// new timestamp) — `UPnP` renews mappings every 30 min and we don't want
+/// flapping log lines — so retracting it for one source later leaves it
+/// advertised while another source still vouches for it.
 fn record_external_address(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
@@ -544,7 +546,16 @@ fn record_external_address(
     addr: Multiaddr,
     source: ExternalAddrSource,
 ) {
-    if state.external_addresses.contains_key(&addr) {
+    if let Some((sources, _)) = state.external_addresses.get_mut(&addr) {
+        if !sources.contains(&source) {
+            debug!(
+                target: "ant_p2p",
+                %addr,
+                source = source.as_str(),
+                "external address also vouched for by another source",
+            );
+            sources.push(source);
+        }
         return;
     }
     info!(
@@ -557,54 +568,97 @@ fn record_external_address(
     let added_at_unix = unix_now();
     state
         .external_addresses
-        .insert(addr.clone(), (source, added_at_unix));
+        .insert(addr.clone(), (vec![source], added_at_unix));
     state.external_addresses_order.push(addr);
     sync_external_addresses_status(status, state);
 }
 
-/// Centralized remove: drops `addr` from the swarm + the tracker, emits
-/// a single `info!` line, and pushes the new set into the status
-/// snapshot. No-op when the address isn't tracked (e.g. a `UPnP` expiry
-/// for a mapping we never accepted because it failed the public-IP filter).
+/// Centralized remove: withdraws `source`'s claim on `addr`. Once no
+/// source is left, drops it from the swarm + the tracker, emits a single
+/// `info!` line, and pushes the new set into the status snapshot. While
+/// another source still vouches for it, the address stays advertised: if
+/// the withdrawing source already took it off the swarm itself
+/// (libp2p-upnp emits `ExternalAddrExpired` before its
+/// `ExpiredExternalAddr` event reaches us), it is put back. No-op when
+/// `source` has no claim (e.g. a `UPnP` expiry for a mapping we never
+/// accepted because it failed the public-IP filter).
 fn forget_external_address(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
     status: Option<&watch::Sender<StatusSnapshot>>,
     addr: &Multiaddr,
+    source: ExternalAddrSource,
 ) {
-    if state.external_addresses.remove(addr).is_none() {
+    let Some((sources, _)) = state.external_addresses.get_mut(addr) else {
+        return;
+    };
+    let before = sources.len();
+    sources.retain(|s| *s != source);
+    if sources.len() == before {
         return;
     }
+    if !sources.is_empty() {
+        debug!(
+            target: "ant_p2p",
+            %addr,
+            source = source.as_str(),
+            remaining = sources[0].as_str(),
+            "one source withdrew an external address another still vouches for",
+        );
+        if !swarm.external_addresses().any(|a| a == addr) {
+            swarm.add_external_address(addr.clone());
+        }
+        sync_external_addresses_status(status, state);
+        return;
+    }
+    state.external_addresses.remove(addr);
     state.external_addresses_order.retain(|a| a != addr);
     info!(
         target: "ant_p2p",
         %addr,
+        source = source.as_str(),
         "retracting external address",
     );
     swarm.remove_external_address(addr);
     sync_external_addresses_status(status, state);
 }
 
+/// Does `source` vouch for `addr`?
+fn external_address_has_source(
+    state: &SwarmState,
+    addr: &Multiaddr,
+    source: ExternalAddrSource,
+) -> bool {
+    state
+        .external_addresses
+        .get(addr)
+        .is_some_and(|(sources, _)| sources.contains(&source))
+}
+
 /// Bring the observed-source external addresses in line with
 /// [`crate::observed_addr::ObservedAddrs::wanted`]: advertise what reached
 /// quorum, retract what fell out of it (expired, or outranked once the
-/// cap is full). Addresses from other sources are left alone.
+/// cap is full). Only the `Observed` claim is added or withdrawn; an
+/// address another source (manual, listener, `UPnP`) also vouches for
+/// stays advertised.
 fn reconcile_observed_addresses(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
     status: Option<&watch::Sender<StatusSnapshot>>,
 ) {
-    let wanted = state
-        .observed_addrs
-        .wanted(Instant::now(), |a| state.external_addresses.contains_key(a));
+    let wanted = state.observed_addrs.wanted(Instant::now(), |a| {
+        external_address_has_source(state, a, ExternalAddrSource::Observed)
+    });
     let stale: Vec<Multiaddr> = state
         .external_addresses
         .iter()
-        .filter(|(a, (src, _))| *src == ExternalAddrSource::Observed && !wanted.contains(a))
+        .filter(|(a, (sources, _))| {
+            sources.contains(&ExternalAddrSource::Observed) && !wanted.contains(a)
+        })
         .map(|(a, _)| a.clone())
         .collect();
     for addr in &stale {
-        forget_external_address(state, swarm, status, addr);
+        forget_external_address(state, swarm, status, addr, ExternalAddrSource::Observed);
     }
     for addr in wanted {
         record_external_address(state, swarm, status, addr, ExternalAddrSource::Observed);
@@ -626,9 +680,10 @@ fn sync_external_addresses_status(
             state
                 .external_addresses
                 .get(addr)
-                .map(|(source, added_at_unix)| ExternalAddressInfo {
+                .map(|(sources, added_at_unix)| ExternalAddressInfo {
                     addr: addr.to_string(),
-                    source: source.as_str().to_string(),
+                    // The longest-standing source still vouching for it.
+                    source: sources.first().map_or("", |s| s.as_str()).to_string(),
                     added_at_unix: *added_at_unix,
                 })
         })
@@ -718,7 +773,7 @@ fn handle_upnp_event(
             }
         }
         Event::ExpiredExternalAddr(addr) => {
-            forget_external_address(state, swarm, status, &addr);
+            forget_external_address(state, swarm, status, &addr, ExternalAddrSource::Upnp);
         }
         Event::GatewayNotFound => {
             debug!(
@@ -985,11 +1040,15 @@ struct SwarmState {
     /// Live set of externally-advertised multiaddrs and how each was
     /// learned. Maintained in lockstep with `swarm.external_addresses()`
     /// via [`record_external_address`] / [`forget_external_address`] so
-    /// the status snapshot can attribute each address to a source.
+    /// the status snapshot can attribute each address to a source. Every
+    /// source vouching for an address is kept, oldest first, so one
+    /// source withdrawing it can't retract an address another still
+    /// holds (an observed quorum and a `UPnP` mapping on the same
+    /// `/ip4/<wan>/tcp/1634`).
     /// Indexed by multiaddr for O(1) duplicate suppression; insertion
     /// order is tracked separately in [`Self::external_addresses_order`]
     /// so the on-wire snapshot stays deterministic.
-    external_addresses: HashMap<Multiaddr, (ExternalAddrSource, u64)>,
+    external_addresses: HashMap<Multiaddr, (Vec<ExternalAddrSource>, u64)>,
     /// Insertion order for `external_addresses` so renders are stable.
     /// Wide enough to keep one slot per address ever advertised in this
     /// process; `UPnP` / listener churn keeps this very small in practice.
@@ -8888,30 +8947,30 @@ fn handle_swarm_event(
             // for our peerstore entry to populate.
             record_external_address(state, swarm, status, address, ExternalAddrSource::Listener);
         }
-        // rust-libp2p's identify surfaces each remote's `observed_addr` as
-        // a candidate here, right after that connection's `Received`. A
-        // globally-routable one becomes that connection's vote; it is
-        // advertised (so the next outbound identify carries our
-        // NAT-punched public multiaddr and bee's peerstore accepts it)
-        // only once enough distinct observers agree (#300, see
-        // `observed_addr`).
-        SwarmEvent::NewExternalAddrCandidate { address }
-            if is_globally_routable_multiaddr(&address) =>
-        {
-            if state.observed_addrs.on_candidate(address.clone()) {
-                reconcile_observed_addresses(state, swarm, status);
-            } else {
-                debug!(target: "ant_p2p", %address, "ignoring unattributed observed-address candidate");
-            }
-        }
+        // Identify's `observed_addr` on this connection becomes the
+        // connection's vote; a globally-routable address is advertised
+        // (so the next outbound identify carries our NAT-punched public
+        // multiaddr and bee's peerstore accepts it) only once enough
+        // distinct observers agree (#300, see `observed_addr`). The vote
+        // is taken from this report, not from the swarm's
+        // `NewExternalAddrCandidate`, which libp2p-swarm suppresses for an
+        // address that is already advertised; reconciling on every report
+        // (identify re-runs every 5 min) also restores an address the
+        // churn of its first observers retracted while others still see it.
         SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Received {
             connection_id,
             info,
             ..
         })) => {
-            state
-                .observed_addrs
-                .on_identified(connection_id, &info.observed_addr, Instant::now());
+            let listeners: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+            state.observed_addrs.on_identified(
+                connection_id,
+                &info.observed_addr,
+                &listeners,
+                is_globally_routable_multiaddr,
+                Instant::now(),
+            );
+            reconcile_observed_addresses(state, swarm, status);
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -8926,6 +8985,13 @@ fn handle_swarm_event(
                 connection_id,
                 peer_id,
                 endpoint.get_remote_address(),
+                matches!(
+                    endpoint,
+                    ConnectedPoint::Dialer {
+                        port_use: PortUse::New,
+                        ..
+                    }
+                ),
                 Instant::now(),
             );
             state.dialing.remove(&peer_id);
@@ -12068,7 +12134,9 @@ mod tests {
             (listener.clone(), ExternalAddrSource::Listener, 1200),
             (observed.clone(), ExternalAddrSource::Observed, 1300),
         ] {
-            state.external_addresses.insert(addr.clone(), (src, ts));
+            state
+                .external_addresses
+                .insert(addr.clone(), (vec![src], ts));
             state.external_addresses_order.push(addr);
         }
 
@@ -12114,7 +12182,7 @@ mod tests {
         for addr in [&a, &b, &c] {
             state
                 .external_addresses
-                .insert(addr.clone(), (ExternalAddrSource::Upnp, 1));
+                .insert(addr.clone(), (vec![ExternalAddrSource::Upnp], 1));
             state.external_addresses_order.push(addr.clone());
         }
 
@@ -13977,10 +14045,12 @@ mod tests {
             conn,
             peer,
             &format!("/ip4/{from}/tcp/1634").parse().unwrap(),
+            false,
             now,
         );
-        state.observed_addrs.on_identified(conn, addr, now);
-        assert!(state.observed_addrs.on_candidate(addr.clone()));
+        state
+            .observed_addrs
+            .on_identified(conn, addr, [], |_| true, now);
     }
 
     /// One peer's observed address is not advertised, however many
@@ -14049,7 +14119,7 @@ mod tests {
         let observed = state
             .external_addresses
             .values()
-            .filter(|(src, _)| *src == ExternalAddrSource::Observed)
+            .filter(|(sources, _)| sources.contains(&ExternalAddrSource::Observed))
             .count();
         assert_eq!(observed, MAX_OBSERVED_EXTERNAL);
         assert_eq!(
@@ -14057,6 +14127,189 @@ mod tests {
             MAX_OBSERVED_EXTERNAL + 1
         );
         assert!(state.external_addresses.contains_key(&manual));
+    }
+
+    /// R1-F1: once an observed address is advertised, libp2p-swarm drops
+    /// identify's candidate for it, so votes must come from the identify
+    /// reports themselves. With 50 live observers, the first three
+    /// leaving must not retract it.
+    #[tokio::test]
+    async fn advertised_observed_address_survives_its_first_observers_leaving() {
+        use crate::observed_addr::OBSERVED_ADDR_QUORUM;
+        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
+        let mut state = test_state();
+        let addr: Multiaddr = "/ip4/203.0.113.9/tcp/1634".parse().unwrap();
+        for n in 1..=50 {
+            observe(&mut state, n, pid(), &format!("198.51.100.{n}"), &addr);
+            reconcile_observed_addresses(&mut state, &mut swarm, None);
+        }
+        assert_eq!(
+            swarm.external_addresses().cloned().collect::<Vec<_>>(),
+            vec![addr.clone()]
+        );
+        for n in 1..=OBSERVED_ADDR_QUORUM {
+            state
+                .observed_addrs
+                .on_closed(ConnectionId::new_unchecked(n));
+            reconcile_observed_addresses(&mut state, &mut swarm, None);
+        }
+        assert_eq!(
+            swarm.external_addresses().cloned().collect::<Vec<_>>(),
+            vec![addr]
+        );
+    }
+
+    /// R1-F1 through the real event handler: identify `Received` events
+    /// alone (no `NewExternalAddrCandidate`, which the swarm suppresses
+    /// once the address is advertised) carry the votes, so 50 inbound
+    /// observers keep the address advertised when the first three go.
+    #[tokio::test]
+    async fn identify_reports_alone_keep_an_observed_address_advertised() {
+        let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
+        let mut state = test_state();
+        let mut control = swarm.behaviour().stream.new_control();
+        let hs = HandshakeParams {
+            local_peer_id: *swarm.local_peer_id(),
+            signing_secret: [7u8; SECP256K1_SECRET_LEN],
+            overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+            network_id: 1,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let mut peerstore = PeerStore::disabled();
+        let addr: Multiaddr = "/ip4/93.184.216.34/tcp/1634".parse().unwrap();
+        let mut peers = Vec::new();
+        for n in 1..=50usize {
+            let key = Keypair::generate_ed25519();
+            let peer = key.public().to_peer_id();
+            let conn = ConnectionId::new_unchecked(n);
+            let endpoint = ConnectedPoint::Listener {
+                local_addr: "/ip4/10.0.0.2/tcp/1634".parse().unwrap(),
+                send_back_addr: format!("/ip4/198.51.100.{n}/tcp/1634").parse().unwrap(),
+            };
+            peers.push((peer, conn, endpoint.clone()));
+            for ev in [
+                SwarmEvent::ConnectionEstablished {
+                    peer_id: peer,
+                    connection_id: conn,
+                    endpoint,
+                    num_established: std::num::NonZeroU32::new(1).unwrap(),
+                    concurrent_dial_errors: None,
+                    established_in: Duration::ZERO,
+                },
+                SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Received {
+                    connection_id: conn,
+                    peer_id: peer,
+                    info: identify::Info {
+                        public_key: key.public(),
+                        protocol_version: "ipfs/0.1.0".into(),
+                        agent_version: "bee".into(),
+                        listen_addrs: Vec::new(),
+                        protocols: Vec::new(),
+                        observed_addr: addr.clone(),
+                        signed_peer_record: None,
+                    },
+                })),
+            ] {
+                handle_swarm_event(
+                    &mut swarm,
+                    &mut state,
+                    None,
+                    &mut control,
+                    &hs,
+                    &result_tx,
+                    &mut peerstore,
+                    ev,
+                );
+            }
+        }
+        assert_eq!(
+            swarm.external_addresses().cloned().collect::<Vec<_>>(),
+            vec![addr.clone()]
+        );
+        for (peer, conn, endpoint) in peers.into_iter().take(3) {
+            handle_swarm_event(
+                &mut swarm,
+                &mut state,
+                None,
+                &mut control,
+                &hs,
+                &result_tx,
+                &mut peerstore,
+                SwarmEvent::ConnectionClosed {
+                    peer_id: peer,
+                    connection_id: conn,
+                    endpoint,
+                    num_established: 0,
+                    cause: None,
+                },
+            );
+        }
+        reconcile_observed_addresses(&mut state, &mut swarm, None);
+        assert_eq!(
+            swarm.external_addresses().cloned().collect::<Vec<_>>(),
+            vec![addr]
+        );
+    }
+
+    /// R1-M1: an address both an observed quorum and `UPnP` vouch for
+    /// stays advertised when either one withdraws it, whichever came
+    /// first, and goes only when both have.
+    #[tokio::test]
+    async fn shared_external_address_needs_every_source_to_withdraw() {
+        let addr: Multiaddr = "/ip4/203.0.113.9/tcp/1634".parse().unwrap();
+        let in_swarm =
+            |swarm: &Swarm<AntBehaviour>| swarm.external_addresses().cloned().collect::<Vec<_>>();
+        for observed_first in [true, false] {
+            let mut swarm = build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS).unwrap();
+            let mut state = test_state();
+            let (first, second) = if observed_first {
+                (ExternalAddrSource::Observed, ExternalAddrSource::Upnp)
+            } else {
+                (ExternalAddrSource::Upnp, ExternalAddrSource::Observed)
+            };
+            record_external_address(&mut state, &mut swarm, None, addr.clone(), first);
+            record_external_address(&mut state, &mut swarm, None, addr.clone(), second);
+            // Observed withdraws (quorum lost): UPnP's mapping is live.
+            forget_external_address(
+                &mut state,
+                &mut swarm,
+                None,
+                &addr,
+                ExternalAddrSource::Observed,
+            );
+            assert_eq!(in_swarm(&swarm), vec![addr.clone()], "{observed_first}");
+            // Observed comes back, then UPnP's mapping expires; libp2p-upnp
+            // has already taken it off the swarm before we hear of it.
+            record_external_address(
+                &mut state,
+                &mut swarm,
+                None,
+                addr.clone(),
+                ExternalAddrSource::Observed,
+            );
+            swarm.remove_external_address(&addr);
+            forget_external_address(
+                &mut state,
+                &mut swarm,
+                None,
+                &addr,
+                ExternalAddrSource::Upnp,
+            );
+            assert_eq!(in_swarm(&swarm), vec![addr.clone()], "{observed_first}");
+            assert_eq!(
+                state.external_addresses[&addr].0,
+                vec![ExternalAddrSource::Observed]
+            );
+            forget_external_address(
+                &mut state,
+                &mut swarm,
+                None,
+                &addr,
+                ExternalAddrSource::Observed,
+            );
+            assert!(in_swarm(&swarm).is_empty(), "{observed_first}");
+            assert!(state.external_addresses.is_empty());
+        }
     }
 
     /// P2P-19: `dial_backoff` entries for gossiped peers that failed once

@@ -13,12 +13,19 @@
 //! most observers; a vote that hasn't been re-confirmed for
 //! [`OBSERVATION_TTL`] stops counting.
 //!
-//! Identify only emits a fresh candidate per connection when the observed
-//! address first appears or changes, so a vote is kept alive by the
-//! periodic identify `Received` on its connection carrying the same
-//! observed address ([`ObservedAddrs::on_identified`]), not by candidate
-//! events: a stable node keeps its correct address.
+//! Votes come straight from identify `Received` reports
+//! ([`ObservedAddrs::on_identified`]), never from the swarm's
+//! `NewExternalAddrCandidate` events: identify only emits a candidate when
+//! a connection's observed address first appears or changes, and
+//! libp2p-swarm drops candidates for an address that is already a
+//! confirmed external address. Counting candidates would mean that once
+//! an address is advertised no new connection can vote for it, so the
+//! churn of one of its first voters would retract it for good. Instead
+//! each report derives the connection's candidates the way identify
+//! does ([`candidates`]), and the periodic re-identify on a live
+//! connection keeps its vote fresh: a stable node keeps its address.
 
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::ConnectionId;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
@@ -36,8 +43,8 @@ pub const OBSERVATION_TTL: Duration = Duration::from_mins(20);
 /// Most observed addresses advertised at once.
 pub const MAX_OBSERVED_EXTERNAL: usize = 4;
 /// Most distinct candidate addresses one connection's vote may carry.
-/// Identify translates one observation into one candidate per listener,
-/// so this only bites a misbehaving peer.
+/// One observation translates into at most one candidate per listener,
+/// so this only bites an unusual listener set.
 const MAX_ADDRS_PER_VOTE: usize = 4;
 
 /// IPv4 by full address, IPv6 by /56 (a typical end-site allocation), the
@@ -70,30 +77,31 @@ struct Vote {
     /// `None` for a connection whose remote isn't an IP address; such a
     /// vote never counts.
     group: Option<IpGroup>,
-    /// The raw observed address identify last reported on this
-    /// connection; a different one replaces the vote.
-    raw: Option<Multiaddr>,
-    /// The candidates identify derived from `raw`.
+    /// We dialed this connection from a fresh (ephemeral) port, so the
+    /// port the remote observes is not one we listen on and has to be
+    /// translated to a listener's port, as identify does.
+    ephemeral: bool,
+    /// The candidates derived from the observed address identify last
+    /// reported on this connection.
     addrs: Vec<Multiaddr>,
-    /// When `raw` was last reported.
+    /// When identify last reported on this connection.
     seen: Instant,
 }
 
 #[derive(Debug, Default)]
 pub struct ObservedAddrs {
     votes: HashMap<ConnectionId, Vote>,
-    /// The connection whose identify `Received` came last. Identify queues
-    /// a connection's candidate events right behind its `Received`, so this
-    /// is who a following candidate belongs to.
-    last_identified: Option<ConnectionId>,
 }
 
 impl ObservedAddrs {
+    /// A connection was established. `ephemeral` is true for one we
+    /// dialed without port reuse (`PortUse::New`).
     pub fn on_connection(
         &mut self,
         conn: ConnectionId,
         peer: PeerId,
         remote: &Multiaddr,
+        ephemeral: bool,
         now: Instant,
     ) {
         let group = remote_ip(remote).map(ip_group);
@@ -102,7 +110,7 @@ impl ObservedAddrs {
             Vote {
                 peer,
                 group,
-                raw: None,
+                ephemeral,
                 addrs: Vec::new(),
                 seen: now,
             },
@@ -111,39 +119,29 @@ impl ObservedAddrs {
 
     pub fn on_closed(&mut self, conn: ConnectionId) {
         self.votes.remove(&conn);
-        if self.last_identified == Some(conn) {
-            self.last_identified = None;
-        }
     }
 
-    /// Identify `Received` on `conn`, reporting `observed`. The same
-    /// address as before refreshes the vote; a different one starts a new
-    /// vote, which the candidate events that follow fill in.
-    pub fn on_identified(&mut self, conn: ConnectionId, observed: &Multiaddr, now: Instant) {
-        self.last_identified = Some(conn);
+    /// Identify `Received` on `conn`, reporting `observed`. Replaces the
+    /// connection's vote with the candidates `observed` translates to
+    /// against `listeners` (those `keep` accepts) and refreshes it, so a
+    /// connection that keeps reporting the same address keeps its vote
+    /// and one reporting a new address moves it.
+    pub fn on_identified<'a>(
+        &mut self,
+        conn: ConnectionId,
+        observed: &Multiaddr,
+        listeners: impl IntoIterator<Item = &'a Multiaddr>,
+        keep: impl Fn(&Multiaddr) -> bool,
+        now: Instant,
+    ) {
         let Some(vote) = self.votes.get_mut(&conn) else {
             return;
         };
-        if vote.raw.as_ref() != Some(observed) {
-            vote.raw = Some(observed.clone());
-            vote.addrs.clear();
-        }
+        let mut addrs = candidates(observed, listeners, vote.ephemeral);
+        addrs.retain(|a| keep(a));
+        addrs.truncate(MAX_ADDRS_PER_VOTE);
+        vote.addrs = addrs;
         vote.seen = now;
-    }
-
-    /// A `NewExternalAddrCandidate`. Returns `false` when it can't be tied
-    /// to a connection's identify report, in which case it is ignored.
-    pub fn on_candidate(&mut self, addr: Multiaddr) -> bool {
-        let Some(vote) = self
-            .last_identified
-            .and_then(|conn| self.votes.get_mut(&conn))
-        else {
-            return false;
-        };
-        if !vote.addrs.contains(&addr) && vote.addrs.len() < MAX_ADDRS_PER_VOTE {
-            vote.addrs.push(addr);
-        }
-        true
     }
 
     /// The addresses to advertise now: those with at least
@@ -181,8 +179,85 @@ impl ObservedAddrs {
     }
 }
 
+/// The external-address candidates one observation stands for, exactly
+/// as libp2p-identify 0.47 derives them
+/// (`emit_new_external_addr_candidate_event`): on a connection we dialed
+/// from an ephemeral port, the observed address with its port swapped for
+/// each same-transport listener's (or the observed address itself if no
+/// listener translates); otherwise the observed address as is.
+pub fn candidates<'a>(
+    observed: &Multiaddr,
+    listeners: impl IntoIterator<Item = &'a Multiaddr>,
+    ephemeral: bool,
+) -> Vec<Multiaddr> {
+    if !ephemeral {
+        return vec![observed.clone()];
+    }
+    let mut addrs: Vec<Multiaddr> = listeners
+        .into_iter()
+        .filter_map(|server| {
+            if (is_tcp_addr(server) && is_tcp_addr(observed))
+                || (is_quic_addr(server, true) && is_quic_addr(observed, true))
+                || (is_quic_addr(server, false) && is_quic_addr(observed, false))
+            {
+                libp2p::swarm::_address_translation(server, observed)
+            } else {
+                None
+            }
+        })
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    if addrs.is_empty() {
+        addrs.push(observed.clone());
+    }
+    addrs
+}
+
+/// libp2p-identify's `is_tcp_addr`.
+fn is_tcp_addr(addr: &Multiaddr) -> bool {
+    let mut iter = addr.iter();
+    matches!(
+        (iter.next(), iter.next()),
+        (
+            Some(
+                Protocol::Ip4(_)
+                    | Protocol::Ip6(_)
+                    | Protocol::Dns(_)
+                    | Protocol::Dns4(_)
+                    | Protocol::Dns6(_)
+            ),
+            Some(Protocol::Tcp(_))
+        )
+    )
+}
+
+/// libp2p-identify's `is_quic_addr`.
+fn is_quic_addr(addr: &Multiaddr, v1: bool) -> bool {
+    let mut iter = addr.iter();
+    let (Some(first), Some(second), Some(third)) = (iter.next(), iter.next(), iter.next()) else {
+        return false;
+    };
+    let fourth = iter.next();
+    let fifth = iter.next();
+    matches!(
+        first,
+        Protocol::Ip4(_)
+            | Protocol::Ip6(_)
+            | Protocol::Dns(_)
+            | Protocol::Dns4(_)
+            | Protocol::Dns6(_)
+    ) && matches!(second, Protocol::Udp(_))
+        && if v1 {
+            matches!(third, Protocol::QuicV1)
+        } else {
+            matches!(third, Protocol::Quic)
+        }
+        && matches!(fourth, Some(Protocol::P2p(_)) | None)
+        && fifth.is_none()
+}
+
 fn remote_ip(addr: &Multiaddr) -> Option<IpAddr> {
-    use libp2p::multiaddr::Protocol;
     addr.iter().find_map(|p| match p {
         Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
         Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
@@ -208,9 +283,25 @@ mod tests {
         now: Instant,
     ) {
         let conn = ConnectionId::new_unchecked(n);
-        o.on_connection(conn, peer, &ma(&format!("/ip4/{host}/tcp/1634")), now);
-        o.on_identified(conn, &ma(observed), now);
-        assert!(o.on_candidate(ma(observed)));
+        o.on_connection(
+            conn,
+            peer,
+            &ma(&format!("/ip4/{host}/tcp/1634")),
+            false,
+            now,
+        );
+        identify(o, n, observed, now);
+    }
+
+    /// Identify on connection `n` reports `observed`.
+    fn identify(o: &mut ObservedAddrs, n: usize, observed: &str, now: Instant) {
+        o.on_identified(
+            ConnectionId::new_unchecked(n),
+            &ma(observed),
+            &[ma("/ip4/0.0.0.0/tcp/1634")],
+            |_| true,
+            now,
+        );
     }
 
     const OURS: &str = "/ip4/203.0.113.7/tcp/1634";
@@ -259,11 +350,86 @@ mod tests {
         assert_eq!(o.wanted(now, |_| false), NONE, "one host");
     }
 
-    /// A candidate that no identify report precedes is ignored.
+    /// A connection we dialed from an ephemeral port reports the port the
+    /// NAT picked for it; its vote is for our listener's port instead, as
+    /// identify translates it. One dialed with port reuse, or an inbound
+    /// one, votes for the observed address as is.
     #[test]
-    fn unattributed_candidate_is_dropped() {
+    fn ephemeral_dials_vote_for_the_listener_port() {
+        let listeners = [ma("/ip4/0.0.0.0/tcp/1634"), ma("/ip6/::/tcp/1634")];
+        let observed = ma("/ip4/203.0.113.7/tcp/49152");
+        assert_eq!(candidates(&observed, &listeners, true), vec![ma(OURS)]);
+        assert_eq!(
+            candidates(&observed, &listeners, false),
+            vec![observed.clone()]
+        );
+        assert_eq!(candidates(&observed, &[], true), vec![observed]);
+
+        let now = Instant::now();
         let mut o = ObservedAddrs::default();
-        assert!(!o.on_candidate(ma(OURS)));
+        for n in 1..=OBSERVED_ADDR_QUORUM {
+            let conn = ConnectionId::new_unchecked(n);
+            o.on_connection(
+                conn,
+                PeerId::random(),
+                &ma(&format!("/ip4/198.51.100.{n}/tcp/1634")),
+                true,
+                now,
+            );
+            o.on_identified(
+                conn,
+                &ma(&format!("/ip4/203.0.113.7/tcp/{}", 40000 + n)),
+                &listeners,
+                |_| true,
+                now,
+            );
+        }
+        assert_eq!(o.wanted(now, |_| false), vec![ma(OURS)]);
+    }
+
+    /// R1-F1: the swarm swallows identify's candidate for an address that
+    /// is already advertised, so votes must not depend on candidate
+    /// events. With an address advertised, every further connection that
+    /// reports it still votes, and the churn of the first observers
+    /// doesn't retract it while others remain.
+    #[test]
+    fn later_observers_keep_an_advertised_address() {
+        let now = Instant::now();
+        let mut o = ObservedAddrs::default();
+        for n in 1..=50 {
+            vote(
+                &mut o,
+                n,
+                PeerId::random(),
+                &format!("198.51.100.{n}"),
+                OURS,
+                now,
+            );
+        }
+        assert_eq!(o.wanted(now, |a| *a == ma(OURS)), vec![ma(OURS)]);
+        for n in 1..=OBSERVED_ADDR_QUORUM {
+            o.on_closed(ConnectionId::new_unchecked(n));
+        }
+        assert_eq!(o.wanted(now, |a| *a == ma(OURS)), vec![ma(OURS)]);
+    }
+
+    /// Candidates `keep` rejects (not globally routable) carry no vote.
+    #[test]
+    fn rejected_candidates_carry_no_vote() {
+        let now = Instant::now();
+        let mut o = ObservedAddrs::default();
+        for n in 1..=OBSERVED_ADDR_QUORUM {
+            let conn = ConnectionId::new_unchecked(n);
+            o.on_connection(
+                conn,
+                PeerId::random(),
+                &ma(&format!("/ip4/198.51.100.{n}/tcp/1634")),
+                false,
+                now,
+            );
+            o.on_identified(conn, &ma(OURS), [], |_| false, now);
+        }
+        assert_eq!(o.wanted(now, |_| false), NONE);
     }
 
     /// A connection that reports a new address moves its one vote; it
@@ -282,10 +448,7 @@ mod tests {
                 now,
             );
         }
-        let other = "/ip4/203.0.113.99/tcp/1634";
-        let conn = ConnectionId::new_unchecked(1);
-        o.on_identified(conn, &ma(other), now);
-        assert!(o.on_candidate(ma(other)));
+        identify(&mut o, 1, "/ip4/203.0.113.99/tcp/1634", now);
         assert_eq!(o.wanted(now, |_| false), NONE);
         o.on_closed(ConnectionId::new_unchecked(2));
         assert_eq!(o.wanted(now, |_| false), NONE);
@@ -312,7 +475,7 @@ mod tests {
         for _ in 0..12 {
             now += Duration::from_mins(5);
             for n in 1..=OBSERVED_ADDR_QUORUM {
-                o.on_identified(ConnectionId::new_unchecked(n), &ma(OURS), now);
+                identify(&mut o, n, OURS, now);
             }
             assert_eq!(
                 o.wanted(now, |_| false),
