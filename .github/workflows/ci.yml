@@ -96,6 +96,13 @@ jobs:
         # we'll add when the bee Docker image stops drifting.
         run: cargo test --workspace --lib
 
+      - name: cargo test (binary targets)
+        # antctl/antd/antop keep their unit tests inside `src/main.rs`
+        # (e.g. the #288 regressions: `get -o` path traversal and
+        # overwrite guard, secrets hidden from `--help`), which the
+        # `--lib` run above never builds.
+        run: cargo test --workspace --bins
+
       - name: cargo test (swarmfs interop vectors)
         # Offline, seconds: BMT/SOC/Mantaray/splitter vectors from an
         # independent (non-bee) implementation, issue #62. Integration

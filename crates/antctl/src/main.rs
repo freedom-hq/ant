@@ -137,9 +137,19 @@ Examples:
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
-        /// Path to write the bytes to. Defaults to stdout.
+        /// Path to write the bytes to. Defaults to stdout. If it is an
+        /// existing directory, the file is named after the manifest's
+        /// `Filename`, reduced to its final component with any leading
+        /// dots dropped (else `data.bin`), and an existing file or
+        /// symlink of that name is refused unless `--force` is given.
+        /// An explicit file path is written as given.
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
+        /// With `--out <dir>`, overwrite an existing regular file of the
+        /// manifest-derived name. A symlink, FIFO, device node or
+        /// directory there is still refused.
+        #[arg(long, requires = "out")]
+        force: bool,
         /// Force `bytes` (multi-chunk join) mode regardless of the
         /// reference's URL scheme.
         #[arg(long, conflicts_with = "bzz")]
@@ -370,12 +380,12 @@ enum UploadCommand {
 #[derive(clap::Args, Debug)]
 struct PostageChainArgs {
     /// Gnosis RPC URL. Reads `GNOSIS_RPC_URL` if absent.
-    #[arg(long, env = "GNOSIS_RPC_URL")]
+    #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
     gnosis_rpc_url: String,
     /// Owner private key (32-byte hex, optional `0x` prefix). Reads
     /// `POSTAGE_OWNER_KEY` or `STORAGE_STAMP_PRIVATE_KEY` if absent.
     /// Used to sign the on-chain transaction.
-    #[arg(long, env = "POSTAGE_OWNER_KEY")]
+    #[arg(long, env = "POSTAGE_OWNER_KEY", hide_env_values = true)]
     owner_key: String,
     /// Address of the deployed `PostageStamp` contract on Gnosis. Reads
     /// `POSTAGE_CONTRACT` if absent. Default is the Swarm mainnet
@@ -471,7 +481,7 @@ enum PostageCommand {
     /// depth, immutable flag, owner address). Doesn't require a key.
     Show {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// `PostageStamp` contract address.
         #[arg(
@@ -488,7 +498,7 @@ enum PostageCommand {
     /// a pre-flight sanity check before `create` / `topup`.
     Balance {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Wallet to check. If omitted, derives from
         /// `POSTAGE_OWNER_KEY`. At least one of `--address` or
@@ -521,7 +531,7 @@ enum ChequebookCommand {
     /// snapshots — useful as a pre-flight before `cash-self`.
     Show {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -551,11 +561,11 @@ enum ChequebookCommand {
     /// ERC-20 transfer of BZZ).
     Deploy {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Wallet private key — pays gas + (optionally) the initial
         /// BZZ deposit. Defaults to `WALLET_PRIVATE_KEY`.
-        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        #[arg(long, env = "WALLET_PRIVATE_KEY", hide_env_values = true)]
         wallet_key: String,
         /// Issuer EOA address to bake into the chequebook. Bee
         /// recovers cheque signatures and compares to this — only
@@ -605,7 +615,7 @@ enum ChequebookCommand {
     /// gnosisscan.
     Verify {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -627,7 +637,7 @@ enum ChequebookCommand {
     /// Costs ~$0.0001 in xDAI gas at `--submit`; the dry-run is free.
     CashSelf {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -635,13 +645,13 @@ enum ChequebookCommand {
         /// Issuer private key (32-byte hex). Must derive to the
         /// address `chequebook.issuer()` returns. Reads
         /// `STORAGE_STAMP_PRIVATE_KEY` if absent.
-        #[arg(long, env = "STORAGE_STAMP_PRIVATE_KEY")]
+        #[arg(long, env = "STORAGE_STAMP_PRIVATE_KEY", hide_env_values = true)]
         issuer_key: String,
         /// Beneficiary private key (32-byte hex). Must derive to an
         /// EOA we control, because the chequebook contract bakes
         /// `msg.sender` (the submitter) into the EIP-712 digest as
         /// the beneficiary. Reads `WALLET_PRIVATE_KEY` if absent.
-        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        #[arg(long, env = "WALLET_PRIVATE_KEY", hide_env_values = true)]
         beneficiary_key: String,
         /// Optional recipient address (where the tiny BZZ payout
         /// would land). Defaults to the beneficiary itself.
@@ -787,6 +797,7 @@ fn main() -> Result<()> {
         Command::Get {
             reference,
             out,
+            force,
             bytes,
             bzz,
             bzz_path,
@@ -821,6 +832,7 @@ fn main() -> Result<()> {
                 &socket,
                 &reference,
                 out.as_deref(),
+                force,
                 opt.json,
                 mode,
                 allow_degraded_redundancy,
@@ -865,28 +877,150 @@ impl FetchMode {
     }
 }
 
+/// Fallback name for `--out <dir>` when the manifest carries no usable
+/// `Filename`.
+const DEFAULT_OUTPUT_NAME: &str = "data.bin";
+
+/// Reduce a manifest-supplied `Filename` to a single plain file name
+/// that is safe to join onto the user's `--out <dir>`. The hint comes
+/// from whoever uploaded the content, so it is untrusted: only its final
+/// path component is kept (splitting on both `/` and `\`), leading dots
+/// are dropped so it can't plant a dotfile (`.bashrc`, `.npmrc`) in a
+/// home directory, and anything that is still not exactly one normal
+/// component (empty, a drive prefix, a NUL byte) falls back to
+/// [`DEFAULT_OUTPUT_NAME`]. The result never climbs out of, or replaces,
+/// the target directory. A user who wants the dotted name passes it
+/// explicitly as `-o <dir>/.name`.
+fn safe_output_name(filename_hint: Option<&str>) -> &str {
+    let Some(hint) = filename_hint else {
+        return DEFAULT_OUTPUT_NAME;
+    };
+    let name = hint.rsplit(['/', '\\']).next().unwrap_or("");
+    let name = name.trim_start_matches('.');
+    if name.contains('\0') {
+        return DEFAULT_OUTPUT_NAME;
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => name,
+        _ => DEFAULT_OUTPUT_NAME,
+    }
+}
+
 /// Final destination for the bytes pulled back from the daemon. Stdout
 /// for raw bytes, optionally `--out` for a fixed path, or — if the
 /// daemon hands us a `Filename` from manifest metadata and the user
-/// passed `--out <dir>` rather than a file — `<dir>/<Filename>`.
+/// passed `--out <dir>` rather than a file — `<dir>/<Filename>`, with
+/// the name reduced by [`safe_output_name`] so it stays inside `<dir>`.
+///
+/// Because that name is chosen by the uploader, the directory case never
+/// replaces what is already there: an existing file (or any symlink,
+/// even a dangling one) of that name is refused, so a manifest can't
+/// silently overwrite a user's file or write through a link the user
+/// didn't make. `force` allows overwriting an existing regular file and
+/// nothing else: the target is opened without following a symlink
+/// (`O_NOFOLLOW`, so a link swapped in after any check is still refused)
+/// and without blocking (`O_NONBLOCK`, so a FIFO can't hang us), and the
+/// opened handle must be a regular file before it is truncated, so a
+/// FIFO, device node or directory is refused too. Without `force`, the
+/// file this call created is removed again if writing it fails, so a
+/// failed get (disk full) doesn't leave a truncated file that the retry
+/// then refuses to overwrite; with `force` a partial file is left, and
+/// the retry (also with `force`) replaces it. An explicit file path is
+/// the user's own choice and is written as given, as before.
 fn write_output(
     out: Option<&Path>,
     filename_hint: Option<&str>,
+    force: bool,
     data: &[u8],
 ) -> Result<Option<PathBuf>> {
     use std::io::Write;
     if let Some(p) = out {
-        // If `out` is an existing directory, append the manifest filename
+        if !p.is_dir() {
+            std::fs::write(p, data).with_context(|| format!("write to {}", p.display()))?;
+            return Ok(Some(p.to_path_buf()));
+        }
+        // `out` is an existing directory: append the manifest filename
         // (or fall back to "data.bin" if there isn't one). This lets
         // callers do `antctl get bzz://<ref>/ -o ./` and end up with
         // `./index.html` automatically.
-        let target = if p.is_dir() {
-            let name = filename_hint.unwrap_or("data.bin");
-            p.join(name)
-        } else {
-            p.to_path_buf()
+        let target = p.join(safe_output_name(filename_hint));
+        let refuse_link = || {
+            anyhow!(
+                "refusing to write {}: it is a symlink (pass an explicit file path with -o to choose the destination)",
+                target.display()
+            )
         };
-        std::fs::write(&target, data).with_context(|| format!("write to {}", target.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        if force {
+            // Truncation happens below, only once the opened handle is
+            // known to be a regular file.
+            opts.create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            #[cfg(not(unix))]
+            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(refuse_link());
+            }
+        } else {
+            // `create_new` is O_CREAT|O_EXCL: it fails on any existing
+            // entry, symlinks included, without following them.
+            opts.create_new(true);
+        }
+        let mut file = match opts.open(&target) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => bail!(
+                "refusing to overwrite existing {} (pass --force to replace a regular file, or an explicit file path with -o)",
+                target.display()
+            ),
+            // `O_NOFOLLOW` on a symlink fails, but the errno differs by
+            // platform (ELOOP on Linux/macOS/OpenBSD, EMLINK on FreeBSD,
+            // EFTYPE on NetBSD), so ask the directory entry itself
+            // rather than matching one errno.
+            #[cfg(unix)]
+            Err(_)
+                if force
+                    && std::fs::symlink_metadata(&target)
+                        .is_ok_and(|m| m.file_type().is_symlink()) =>
+            {
+                return Err(refuse_link());
+            }
+            // A FIFO with no reader, opened `O_NONBLOCK` for writing.
+            #[cfg(unix)]
+            Err(e) if force && e.raw_os_error() == Some(libc::ENXIO) => bail!(
+                "refusing to write {}: it is not a regular file",
+                target.display()
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| format!("write to {}", target.display()));
+            }
+        };
+        if force {
+            let meta = file
+                .metadata()
+                .with_context(|| format!("stat {}", target.display()))?;
+            if !meta.is_file() {
+                bail!(
+                    "refusing to write {}: it is not a regular file",
+                    target.display()
+                );
+            }
+            file.set_len(0)
+                .with_context(|| format!("truncate {}", target.display()))?;
+        }
+        if let Err(e) = file.write_all(data) {
+            drop(file);
+            if !force {
+                // We created this file (`create_new`); don't leave a
+                // partial one behind for the retry to trip over.
+                let _ = std::fs::remove_file(&target);
+            }
+            return Err(e).with_context(|| format!("write to {}", target.display()));
+        }
         return Ok(Some(target));
     }
     io::stdout().lock().write_all(data)?;
@@ -2283,7 +2417,7 @@ fn parse_reference_with_mode(
 /// line. The caller decides whether progress makes sense (TTY check,
 /// `--json`, single-chunk fetches, etc.) so this function can stay
 /// focused on plumbing.
-// Eight args is one over clippy's preferred ceiling, but every one of
+// Ten args is three over clippy's preferred ceiling of seven, but every one of
 // them is a CLI-driven knob with a distinct meaning, and bundling them
 // into a struct just for clippy would obscure the call site below.
 #[allow(clippy::too_many_arguments)]
@@ -2291,6 +2425,7 @@ fn run_get(
     socket: &Path,
     reference: &str,
     out: Option<&Path>,
+    force: bool,
     json: bool,
     mode: FetchMode,
     allow_degraded_redundancy: bool,
@@ -2332,7 +2467,7 @@ fn run_get(
         other => bail!("unexpected response: {other:?}"),
     };
 
-    let written = write_output(out, filename.as_deref(), &data)?;
+    let written = write_output(out, filename.as_deref(), force, &data)?;
 
     if json {
         let mut payload = serde_json::json!({
@@ -3289,6 +3424,282 @@ fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_output_name_keeps_only_a_plain_final_component() {
+        assert_eq!(safe_output_name(Some("index.html")), "index.html");
+        assert_eq!(safe_output_name(Some("/etc/x")), "x");
+        assert_eq!(safe_output_name(Some("../../x")), "x");
+        assert_eq!(safe_output_name(Some("a/../../b")), "b");
+        assert_eq!(safe_output_name(Some("..\\..\\x")), "x");
+        for bad in ["", ".", "..", "...", "/", "a/..", "../", "x/.", "a\0b"] {
+            assert_eq!(safe_output_name(Some(bad)), DEFAULT_OUTPUT_NAME, "{bad:?}");
+        }
+        assert_eq!(safe_output_name(None), DEFAULT_OUTPUT_NAME);
+        // An uploader can't plant a dotfile in the target dir.
+        assert_eq!(safe_output_name(Some(".bashrc")), "bashrc");
+        assert_eq!(
+            safe_output_name(Some("../.ssh/..authorized_keys")),
+            "authorized_keys"
+        );
+        assert_eq!(safe_output_name(Some("a.b.")), "a.b.");
+    }
+
+    /// A fresh, empty directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "antctl-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root.canonicalize().unwrap())
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_output_keeps_hostile_filenames_inside_the_target_dir() {
+        for (hint, expect) in [
+            ("/etc/x", "x"),
+            ("../../x", "x"),
+            ("a/../../b", "b"),
+            ("..", DEFAULT_OUTPUT_NAME),
+            ("../.bashrc", "bashrc"),
+        ] {
+            let tmp = TempDir::new("write-output");
+            let root = &tmp.0;
+            let dir = root.join("a").join("b").join("out");
+            std::fs::create_dir_all(&dir).unwrap();
+            let written = write_output(Some(&dir), Some(hint), false, b"payload")
+                .unwrap()
+                .expect("written to a file");
+            assert_eq!(written, dir.join(expect), "hint {hint:?}");
+            assert_eq!(written.parent(), Some(dir.as_path()), "hint {hint:?}");
+            assert_eq!(std::fs::read(&written).unwrap(), b"payload");
+            assert!(!root.join("a").join("x").exists(), "{hint:?} escaped");
+            assert!(
+                !root.join("a").join("b").join("b").exists(),
+                "{hint:?} escaped"
+            );
+            assert!(!dir.join(".bashrc").exists(), "{hint:?} planted a dotfile");
+        }
+    }
+
+    /// The uploader picks the name inside `--out <dir>`, so an existing
+    /// file of that name is left alone unless the user passes `--force`.
+    #[test]
+    fn write_output_refuses_to_overwrite_an_existing_file_in_the_dir() {
+        let tmp = TempDir::new("write-output-existing");
+        let dir = &tmp.0;
+        let existing = dir.join("notes.txt");
+        std::fs::write(&existing, b"mine").unwrap();
+
+        let err = write_output(Some(dir), Some("notes.txt"), false, b"theirs").unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        assert!(err.to_string().contains("--force"), "{err:#}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"mine");
+
+        let written = write_output(Some(dir), Some("notes.txt"), true, b"theirs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, existing);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"theirs");
+
+        // An explicit file path is the user's own choice and still
+        // overwrites without `--force`.
+        write_output(Some(&existing), Some("ignored"), false, b"explicit").unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"explicit");
+    }
+
+    /// A symlink at the manifest-derived name, live or dangling, is never
+    /// followed, with or without `--force`.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_never_follows_a_symlink_in_the_dir() {
+        let tmp = TempDir::new("write-output-symlink");
+        let dir = tmp.0.join("out");
+        std::fs::create_dir(&dir).unwrap();
+        let victim = tmp.0.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dangling_target = tmp.0.join("not-yet");
+        std::os::unix::fs::symlink(&victim, dir.join("live")).unwrap();
+        std::os::unix::fs::symlink(&dangling_target, dir.join("dangling")).unwrap();
+
+        for name in ["live", "dangling"] {
+            for force in [false, true] {
+                let err = write_output(Some(&dir), Some(name), force, b"evil").unwrap_err();
+                assert!(
+                    err.to_string().contains("refusing"),
+                    "{name} {force}: {err:#}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!dangling_target.exists(), "dangling symlink was followed");
+    }
+
+    /// `--force` replaces a regular file only: a FIFO must be refused
+    /// without blocking (no reader is ever attached here, so a blocking
+    /// open would hang the test), and a directory is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_force_refuses_non_regular_files() {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let tmp = TempDir::new("write-output-special");
+        let dir = &tmp.0;
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        for name in ["pipe", "sub"] {
+            let err = write_output(Some(dir), Some(name), true, b"evil").unwrap_err();
+            assert!(
+                err.to_string().contains("refusing") || format!("{err:#}").contains("directory"),
+                "{name}: {err:#}"
+            );
+        }
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert!(dir.join("sub").is_dir());
+
+        // The same FIFO with a reader attached opens fine, and is still
+        // refused by the regular-file check rather than written to.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let err = write_output(Some(dir), Some("pipe"), true, b"evil").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err:#}");
+    }
+
+    /// A write that fails partway (here: past `RLIMIT_FSIZE`, standing in
+    /// for a full disk) must not leave a partial file of its own behind,
+    /// or the retry refuses to overwrite it. `setrlimit` is per process,
+    /// so the failing write runs in a child copy of this test binary.
+    #[cfg(unix)]
+    #[test]
+    fn write_output_removes_a_partial_file_it_created() {
+        const CHILD: &str = "ANTCTL_TEST_FSIZE_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            // Lower only the soft limit, and put it back before asserting,
+            // so the harness can still write its own output afterwards.
+            let mut saved = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut saved), 0);
+                let lim = libc::rlimit {
+                    rlim_cur: 4,
+                    rlim_max: saved.rlim_max,
+                };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lim), 0);
+            }
+            let res = write_output(Some(&dir), Some("big.bin"), false, &[7u8; 4096]);
+            unsafe {
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const saved), 0);
+            }
+            let err = res.unwrap_err();
+            assert!(format!("{err:#}").contains("write to"), "{err:#}");
+            assert!(!dir.join("big.bin").exists(), "partial file left behind");
+            // Proof for the parent that this branch really ran: a child
+            // whose `--exact` filter matched nothing also exits 0.
+            std::fs::write(dir.join("child-ran"), b"").unwrap();
+            return;
+        }
+        let tmp = TempDir::new("write-output-partial");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::write_output_removes_a_partial_file_it_created",
+            ])
+            .env(CHILD, &tmp.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child: {}\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            tmp.0.join("child-ran").exists(),
+            "child ran no test (did the --exact name drift?)\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(!tmp.0.join("big.bin").exists());
+    }
+
+    /// Every argument that can carry a secret (a private key, or an RPC
+    /// URL that may embed an API key) must not echo its env value in
+    /// `--help`.
+    #[test]
+    fn secret_env_args_hide_their_values() {
+        fn walk(cmd: &clap::Command, found: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let Some(env) = arg.get_env() else { continue };
+                let env = env.to_string_lossy();
+                if env.contains("KEY") || env.contains("RPC_URL") {
+                    assert!(
+                        arg.is_hide_env_values_set(),
+                        "{} --{}: env {env} shows its value in --help",
+                        cmd.get_name(),
+                        arg.get_id()
+                    );
+                    found.push(env.into_owned());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&<Opt as clap::CommandFactory>::command(), &mut found);
+        for env in [
+            "GNOSIS_RPC_URL",
+            "POSTAGE_OWNER_KEY",
+            "WALLET_PRIVATE_KEY",
+            "STORAGE_STAMP_PRIVATE_KEY",
+        ] {
+            assert!(found.iter().any(|f| f == env), "{env} not checked");
+        }
+    }
+
+    #[test]
+    fn postage_create_help_does_not_print_the_owner_key() {
+        // Point the arg at a test-only env name so no parallel test that
+        // parses postage args can pick the value up as a real owner key;
+        // `hide_env_values` stays as declared on `owner_key`.
+        const ENV: &str = "ANT_TEST_288_POSTAGE_OWNER_KEY";
+        std::env::set_var(ENV, "deadbeefSECRET");
+        let err = <Opt as clap::CommandFactory>::command()
+            .mut_subcommand("postage", |c| {
+                c.mut_subcommand("create", |c| c.mut_arg("owner_key", |a| a.env(ENV)))
+            })
+            .try_get_matches_from(["antctl", "postage", "create", "--help"])
+            .expect_err("--help exits early");
+        std::env::remove_var(ENV);
+        let help = err.render().to_string();
+        assert!(help.contains(ENV), "{help}");
+        assert!(!help.contains("deadbeefSECRET"), "{help}");
+    }
 
     fn sample(chunks: u64, total_chunks: u64, bytes: u64, total_bytes: u64) -> GetProgress {
         GetProgress {

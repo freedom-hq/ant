@@ -164,8 +164,10 @@ struct Opt {
     /// underlays (plus private ones inside a subnet this host is attached
     /// to) are dialed, since hive gossip carries bee nodes' Docker /
     /// Kubernetes pod addresses and dialing those from a hosted server looks
-    /// like a network scan. Enable only for dev/test networks that live on
-    /// a single private network or on loopback.
+    /// like a network scan. Also keeps peers' gossiped DNS-named underlays
+    /// (`/dns4/…`), which are dropped by default because the name can
+    /// resolve to any of those. Enable only for dev/test networks that live
+    /// on a single private network or on loopback.
     #[arg(long)]
     allow_private_dials: bool,
 
@@ -271,6 +273,7 @@ struct Opt {
     #[arg(
         long,
         env = "GNOSIS_LOGS_RPC_URL",
+        hide_env_values = true,
         default_value = "https://rpc.gnosischain.com"
     )]
     gnosis_logs_rpc_url: String,
@@ -287,7 +290,7 @@ struct Opt {
     /// through the logs RPC, trying it again every 64 windows. Falls back
     /// to the `GNOSIS_UNVERIFIED_LOGS_RPC_URL` env.
     /// Unset (the default), such a span is read window by window.
-    #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL")]
+    #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL", hide_env_values = true)]
     gnosis_unverified_logs_rpc_url: Option<String>,
 
     /// `PostageStamp` contract address (mainnet default keeps matching
@@ -4101,6 +4104,32 @@ mod tests {
         let mut opt = Opt::from_arg_matches(&matches).unwrap();
         apply_config_file(&mut opt, &matches).unwrap();
         opt
+    }
+
+    /// RPC URLs can embed provider API keys, so `--help` must name their
+    /// env vars without printing the values.
+    #[test]
+    fn rpc_url_env_values_are_hidden_in_help() {
+        for id in ["gnosis_logs_rpc_url", "gnosis_unverified_logs_rpc_url"] {
+            let cmd = Opt::command();
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("no arg {id}"));
+            assert!(arg.get_env().is_some(), "{id} has no env");
+            assert!(arg.is_hide_env_values_set(), "{id} shows its env value");
+        }
+        // Point the arg at a test-only env name so no parallel test that
+        // parses `Opt` can see the value; `hide_env_values` stays as set.
+        const ENV: &str = "ANT_TEST_288_UNVERIFIED_LOGS_RPC_URL";
+        std::env::set_var(ENV, "https://rpc.example/v2/SECRETAPIKEY");
+        let help = Opt::command()
+            .mut_arg("gnosis_unverified_logs_rpc_url", |a| a.env(ENV))
+            .render_long_help()
+            .to_string();
+        std::env::remove_var(ENV);
+        assert!(help.contains(ENV), "{help}");
+        assert!(!help.contains("SECRETAPIKEY"), "{help}");
     }
 
     /// Bee's `swap-enable` is honoured as the node's settlement switch
