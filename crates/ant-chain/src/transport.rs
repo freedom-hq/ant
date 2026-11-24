@@ -54,8 +54,9 @@
 //! was given (keccak256 of the raw bytes), and an
 //! `eth_getTransactionReceipt` result must carry that hash as
 //! `transactionHash`. `tx::Wallet` waits on the hash it
-//! computed itself and fails the write on any other hash, or on a
-//! receipt without one, so a relay can't pass off another transaction's
+//! computed itself (a different `eth_sendRawTransaction` answer is
+//! logged and ignored) and fails the write on a receipt naming another
+//! hash or none, so a relay can't pass off another transaction's
 //! receipt (issue #284).
 
 use std::sync::Arc;

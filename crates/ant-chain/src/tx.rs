@@ -165,10 +165,10 @@ pub enum TxError {
     Timeout { tx_hash: String, wait_secs: u64 },
     #[error("decode: {0}")]
     Decode(String),
-    /// The RPC named a different transaction than the one we signed:
-    /// `eth_sendRawTransaction` returned another hash, or the receipt
-    /// polled for ours carries another `transactionHash`. Its receipt
-    /// would describe someone else's tx (issue #284).
+    /// The receipt polled for the transaction we signed carries another
+    /// (or no) `transactionHash`: its logs would describe someone else's
+    /// tx (issue #284). An `eth_sendRawTransaction` answering another
+    /// hash is not this error; the write waits on its own hash instead.
     #[error("{what} is {answered}, not the signed transaction 0x{sent}")]
     HashMismatch {
         what: &'static str,
@@ -898,13 +898,24 @@ impl Wallet {
         // back: a relay answering with some other mined tx's hash would
         // otherwise get that tx's receipt (and its logs: a chequebook
         // or batch that isn't ours) accepted as ours (issue #284).
+        //
+        // A different answer is not an error by itself: the signed tx
+        // is already with the relay and may still be mined. Failing
+        // here would report a write that lands as failed, and a retry
+        // would spend a second time (a top-up re-reading its shortfall
+        // before the first transfer shows) or orphan a deploy. Waiting
+        // on our own hash is as safe as failing, since
+        // `wait_for_receipt` only accepts a receipt whose
+        // `transactionHash` is that hash.
         let answered = client.eth_send_raw_transaction(&raw).await?;
         if answered != tx_hash {
-            return Err(TxError::HashMismatch {
-                what: "eth_sendRawTransaction result",
-                sent: hex::encode(tx_hash),
-                answered: format!("0x{}", hex::encode(answered)),
-            });
+            tracing::warn!(
+                target: "ant_chain::tx",
+                sent = %format!("0x{}", hex::encode(tx_hash)),
+                answered = %format!("0x{}", hex::encode(answered)),
+                "eth_sendRawTransaction answered another tx's hash; ignoring it and \
+                 waiting on the hash we signed",
+            );
         }
         client.wait_for_receipt(&tx_hash, self.default_wait).await
     }

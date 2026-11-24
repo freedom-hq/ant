@@ -907,8 +907,11 @@ char *ant_storage_discover_full(const AntHandle *handle,
  * is topped up from spare xBZZ); otherwise this signs an on-chain
  * factory.deploySimpleSwap (issuer = node EOA), checks the new
  * chequebook on-chain (factory-registered, issuer() is the node EOA;
- * a check that says no or can't be read fails the call with nothing
- * persisted or funded), persists the association, funds it with the
+ * a check that says no fails the call with nothing persisted or
+ * funded; one that still can't be read after a few retries fails the
+ * call with the association persisted but unfunded, so the next call
+ * re-checks that chequebook instead of deploying another), persists
+ * the association, funds it with the
  * settlement deposit for the account's storage plan (see
  * ant_storage_settlement_topup) so its cheques are actually backed,
  * and returns the new address. SUBMITS REAL
@@ -1276,9 +1279,10 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * Transactions: eth_sendRawTransaction must answer the hash of the
  * transaction it was given (keccak256 of the raw bytes), and an
  * eth_getTransactionReceipt result must carry that hash as
- * "transactionHash". ant waits on the hash it computed itself and
- * fails the write on any other hash, or on a receipt without one, so a
- * relay can't pass off another transaction's receipt (issue #284).
+ * "transactionHash". ant waits on the hash it computed itself (a
+ * different eth_sendRawTransaction answer is logged and ignored) and
+ * fails the write on a receipt naming another hash or none, so a relay
+ * can't pass off another transaction's receipt (issue #284).
  *
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a

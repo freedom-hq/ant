@@ -1273,11 +1273,19 @@ pub async fn check_chequebook(
 /// with the factory" and "`issuer()` is `node_eth`" (issue #284). A
 /// read that fails or doesn't see the deploy yet is retried a few
 /// times ([`DEPLOY_CHECK_ATTEMPTS`]); an `issuer()` naming another EOA
-/// fails at once. On failure nothing is persisted and nothing is sent,
-/// and the error is returned: if the deploy was genuine but stayed
-/// unreadable, it is an unfunded orphan the transfer-scan rediscovery
-/// can't see (it holds no xBZZ), so the next attempt deploys again,
-/// costing one more deploy's gas and no xBZZ.
+/// fails at once. Either way nothing is sent and an error is returned.
+/// What is persisted depends on why the check failed:
+///
+/// - The chain said no (the factory doesn't list it) on the last read:
+///   nothing is persisted. If the deploy was genuine and the backend
+///   only lagged, it is an unfunded orphan the transfer-scan
+///   rediscovery can't see (it holds no xBZZ), so the next attempt
+///   deploys again, costing one more deploy's gas and no xBZZ.
+/// - The last read failed (an RPC error, an empty `issuer()`): the
+///   association is persisted, unfunded. Otherwise a read that keeps
+///   failing would have every later trigger deploy again with no bound.
+///   The next trigger finds the record and runs its usual checks on
+///   it, and [`top_up_chequebook`] re-verifies before any deposit.
 ///
 /// A gas pre-flight runs first: a deploy we can't pay for just burns a
 /// failed-tx wait, so an underfunded wallet surfaces as
@@ -1336,10 +1344,17 @@ pub async fn auto_deploy_chequebook(
     let cb = extract_deployed_chequebook(&receipt, &GNOSIS_CHEQUEBOOK_FACTORY)
         .ok_or_else(|| ChequebookError::NoDeployLog(hex::encode(receipt.tx_hash)))?;
 
+    let record = ChequebookFile {
+        chequebook: format!("0x{}", hex::encode(cb)),
+        issuer: format!("0x{}", hex::encode(node_eth)),
+        salt: format!("0x{}", hex::encode(salt)),
+        deploy_tx: format!("0x{}", hex::encode(receipt.tx_hash)),
+    };
+
     // Verify before persisting or funding anything (issue #284).
     let mut attempt = 1;
     loop {
-        let why = match confirmed_for_deposit(client, node_eth, &cb).await {
+        let (why, unread) = match confirmed_for_deposit(client, node_eth, &cb).await {
             Ok(Ok(())) => break,
             Ok(Err(ChequebookVerdict::IssuerMismatch(issuer))) => {
                 return Err(ChequebookError::Chain(format!(
@@ -1351,9 +1366,39 @@ pub async fn auto_deploy_chequebook(
                     hex::encode(node_eth),
                 )));
             }
-            Ok(Err(_)) => "the factory does not list it as deployed".to_string(),
-            Err(e) => e.to_string(),
+            Ok(Err(_)) => (
+                "the factory does not list it as deployed".to_string(),
+                false,
+            ),
+            Err(e) => (e.to_string(), true),
         };
+        if attempt >= DEPLOY_CHECK_ATTEMPTS && unread {
+            // The chain never said no; we just couldn't read it (a
+            // failing host transport, a backend lagging past the retry
+            // window). The receipt is pinned to the tx we signed and the
+            // log to the factory, so this is most likely our genuine
+            // deploy. Dropping it would leave an orphan the
+            // transfer-scan can't see (it holds no xBZZ), and every later
+            // trigger would deploy again, with no bound. Record it so the
+            // next trigger adopts it instead (its own checks run then),
+            // but send nothing: `top_up_chequebook` re-verifies before
+            // any deposit.
+            persist_chequebook(persist_path, &record)?;
+            tracing::warn!(
+                target: "ant_chain::chequebook",
+                chequebook = %format!("0x{}", hex::encode(cb)),
+                tx = %format!("0x{}", hex::encode(receipt.tx_hash)),
+                "deployed chequebook could not be verified ({why}); recorded it unfunded so \
+                 the next attempt checks it again instead of deploying another",
+            );
+            return Err(ChequebookError::Chain(format!(
+                "could not verify the chequebook 0x{} deployed in tx 0x{} after {attempt} reads \
+                 ({why}); recorded it but did not fund it or turn settlement on (the next \
+                 attempt re-checks it before any deposit)",
+                hex::encode(cb),
+                hex::encode(receipt.tx_hash),
+            )));
+        }
         if attempt >= DEPLOY_CHECK_ATTEMPTS {
             return Err(ChequebookError::Chain(format!(
                 "could not verify the chequebook 0x{} deployed in tx 0x{} after {attempt} reads \
@@ -1382,15 +1427,7 @@ pub async fn auto_deploy_chequebook(
     // Persist before funding so a crash between the deploy and the
     // transfer still reuses this chequebook on the next start rather
     // than deploying a second one.
-    persist_chequebook(
-        persist_path,
-        &ChequebookFile {
-            chequebook: format!("0x{}", hex::encode(cb)),
-            issuer: format!("0x{}", hex::encode(node_eth)),
-            salt: format!("0x{}", hex::encode(salt)),
-            deploy_tx: format!("0x{}", hex::encode(receipt.tx_hash)),
-        },
-    )?;
+    persist_chequebook(persist_path, &record)?;
 
     if deposit_plur > 0 {
         match client
@@ -2648,9 +2685,10 @@ mod tests {
     enum Relay {
         /// Honest: answers the signed tx's own hash and receipt.
         Honest,
-        /// `eth_sendRawTransaction` answers some other mined tx's hash,
-        /// whose receipt is a genuine factory deploy of someone else's
-        /// chequebook.
+        /// `eth_sendRawTransaction` answers some other mined tx's hash
+        /// ([`FOREIGN_TX`]), whose receipt is a genuine factory deploy of
+        /// someone else's chequebook ([`FOREIGN_CHEQUEBOOK`]); our own
+        /// signed tx is still forwarded and mined.
         ForeignHash,
         /// The receipt polled for our hash carries another tx's
         /// `transactionHash`.
@@ -2676,6 +2714,8 @@ mod tests {
 
     #[cfg(feature = "chain-rpc")]
     const FOREIGN_TX: [u8; 32] = [0xf0; 32];
+    #[cfg(feature = "chain-rpc")]
+    const FOREIGN_CHEQUEBOOK: [u8; 20] = [0xee; 20];
 
     #[cfg(feature = "chain-rpc")]
     impl crate::transport::ChainTransport for DeployChain {
@@ -2758,8 +2798,13 @@ mod tests {
                     } else {
                         asked.to_string()
                     };
+                    let deployed = if asked == format!("0x{}", hex::encode(FOREIGN_TX)) {
+                        FOREIGN_CHEQUEBOOK
+                    } else {
+                        self.deployed
+                    };
                     let mut data = [0u8; 32];
-                    data[12..].copy_from_slice(&self.deployed);
+                    data[12..].copy_from_slice(&deployed);
                     ok(serde_json::json!({
                         "transactionHash": answered,
                         "status": "0x1",
@@ -2801,6 +2846,15 @@ mod tests {
         )
         .await;
         let persisted = path.exists();
+        if persisted {
+            // Whatever was recorded is the chequebook our own deploy
+            // made, issued by this node, so the next start adopts it.
+            assert_eq!(
+                load_persisted_chequebook_for(&path, wallet.address()).unwrap(),
+                Some(chain.deployed),
+                "{tag}",
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
         let sent = chain.sent.lock().unwrap().clone();
         (result, sent, persisted)
@@ -2863,26 +2917,28 @@ mod tests {
 
     /// Issue #284 (a): a relay answering `eth_sendRawTransaction` with
     /// another mined tx's hash (here a real deploy of someone else's
-    /// chequebook) fails the call; nothing is recorded or deposited.
+    /// chequebook) is ignored. The write waits on the hash it signed,
+    /// so it records and funds our own chequebook, never the one the
+    /// foreign hash's receipt names; and a deploy the relay did forward
+    /// isn't reported failed (a retry would deploy a second one).
     #[cfg(feature = "chain-rpc")]
     #[tokio::test]
-    async fn a_foreign_tx_hash_sends_no_deposit() {
+    async fn a_foreign_tx_hash_is_ignored_for_our_own() {
         let (result, sent, persisted) = deploy_against(
             DeployChain {
                 relay: Relay::ForeignHash,
-                deployed: [0xee; 20],
+                deployed: CHEQUEBOOK,
                 registered: Some(true),
-                issuer: Some([0xee; 20]),
+                issuer: Some(node_eth()),
                 lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
             "foreign-hash",
         )
         .await;
-        let e = result.unwrap_err().to_string();
-        assert!(e.contains("eth_sendRawTransaction result"), "{e}");
-        assert_eq!(sent, ["deploy"], "no deposit");
-        assert!(!persisted);
+        assert_eq!(result.unwrap(), CHEQUEBOOK, "not {FOREIGN_CHEQUEBOOK:?}");
+        assert_eq!(sent, ["deploy", "deposit"]);
+        assert!(persisted);
     }
 
     /// The same through the receipt: one polled for our hash but naming
@@ -2893,9 +2949,9 @@ mod tests {
         let (result, sent, persisted) = deploy_against(
             DeployChain {
                 relay: Relay::ForeignReceipt,
-                deployed: [0xee; 20],
+                deployed: FOREIGN_CHEQUEBOOK,
                 registered: Some(true),
-                issuer: Some([0xee; 20]),
+                issuer: Some(FOREIGN_CHEQUEBOOK),
                 lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
@@ -2933,14 +2989,17 @@ mod tests {
 
     /// A check that never reads yes (a factory "no", or a failed read)
     /// is retried a few times for a lagging backend, then fails the
-    /// deploy: nothing is persisted or transferred.
+    /// deploy with nothing transferred. A factory "no" persists nothing;
+    /// a read that kept failing records the chequebook (unfunded) so
+    /// the next attempt adopts and re-checks it instead of deploying
+    /// another one.
     #[cfg(feature = "chain-rpc")]
     #[tokio::test(start_paused = true)]
-    async fn an_unverifiable_deploy_is_not_kept() {
-        for (tag, registered, issuer) in [
-            ("unregistered", Some(false), Some(node_eth())),
-            ("unread-factory", None, Some(node_eth())),
-            ("unread-issuer", Some(true), None),
+    async fn an_unverifiable_deploy_is_not_funded() {
+        for (tag, registered, issuer, kept) in [
+            ("unregistered", Some(false), Some(node_eth()), false),
+            ("unread-factory", None, Some(node_eth()), true),
+            ("unread-issuer", Some(true), None, true),
         ] {
             let started = tokio::time::Instant::now();
             let (result, sent, persisted) = deploy_against(
@@ -2958,7 +3017,7 @@ mod tests {
             let e = result.unwrap_err().to_string();
             assert!(e.contains("could not verify"), "{tag}: {e}");
             assert_eq!(sent, ["deploy"], "{tag}: no deposit");
-            assert!(!persisted, "{tag}");
+            assert_eq!(persisted, kept, "{tag}");
             assert_eq!(
                 started.elapsed(),
                 DEPLOY_CHECK_RETRY * (DEPLOY_CHECK_ATTEMPTS - 1),
