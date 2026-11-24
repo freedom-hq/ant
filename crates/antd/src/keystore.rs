@@ -29,8 +29,42 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use serde::Deserialize;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 type Aes128Ctr = Ctr128BE<Aes128>;
+
+/// Smallest derived-key length we accept: the scheme needs 16 bytes of
+/// AES key plus 16 bytes of MAC key.
+const MIN_DKLEN: u64 = 32;
+/// Largest derived-key length we accept. Only the first 32 bytes are
+/// ever used; anything past 64 is either a corrupt or a hostile file,
+/// and an unbounded value would size the output buffer from it.
+const MAX_DKLEN: u64 = 64;
+/// Largest scrypt `n` we accept (2^20). go-ethereum's "standard"
+/// keystore uses 2^18 and bee 2^15; 2^20 leaves headroom while keeping
+/// the `ROMix` table bounded. It does not bound CPU time on its own:
+/// `p` repeats the whole `ROMix` pass, see [`MAX_SCRYPT_WORK`].
+const MAX_SCRYPT_N: u64 = 1 << 20;
+/// Largest scrypt buffer we accept, for each of the two `scrypt` sizes
+/// from the file: the `ROMix` table (`128 * n * r` bytes) and the block
+/// buffer (`128 * r * p` bytes). 1 GiB, i.e. `n = 2^20` at the usual
+/// `r = 8`. Bounding `n` alone isn't enough, since `r` and `p` size
+/// their own allocations.
+const MAX_SCRYPT_MEM: u64 = 1 << 30;
+/// Largest scrypt `n * r * p` we accept (2^23). scrypt's CPU time grows
+/// with that product (`p` sequential `ROMix` passes of `2 * n` `BlockMix`
+/// rounds over `r`-sized blocks), and the memory caps above don't bound
+/// it: `n = 2^20, r = 8, p = 2^20` passes both and then runs 2^20 full
+/// 1 GiB passes. The cap is the largest single pass the memory cap
+/// allows (`n = 2^20, r = 8, p = 1`); geth standard (2^18, 8, 1) is 2^21
+/// and bee (2^15, 8, 1) 2^18.
+const MAX_SCRYPT_WORK: u64 = 1 << 23;
+/// Largest pbkdf2 iteration count `c` we accept (2^22). go-ethereum
+/// writes 2^18 (262144); 16x that is a few seconds at most, where an
+/// unbounded `c` (up to `u32::MAX`, ~4.3e9 HMAC rounds) would hang
+/// startup for hours.
+const MAX_PBKDF2_C: u32 = 1 << 22;
 
 #[derive(Deserialize)]
 struct Keystore {
@@ -86,18 +120,22 @@ pub fn decrypt_v3(json: &str, password: &str) -> Result<[u8; 32]> {
         bail!("derived key too short ({} bytes)", derived.len());
     }
 
-    // MAC = keccak256(derived[16..32] ‖ ciphertext).
-    let mut mac_input = Vec::with_capacity(16 + ciphertext.len());
+    // MAC = keccak256(derived[16..32] ‖ ciphertext). The input holds
+    // half the derived key, so it is wiped on drop like `derived`.
+    let mut mac_input = Zeroizing::new(Vec::with_capacity(16 + ciphertext.len()));
     mac_input.extend_from_slice(&derived[16..32]);
     mac_input.extend_from_slice(&ciphertext);
     let mac = ant_crypto::keccak256(&mac_input);
     let want_mac = decode_hex(&c.mac).context("mac")?;
-    if mac.as_slice() != want_mac.as_slice() {
+    // Constant-time compare (`ct_eq` on slices of different lengths is
+    // simply false), so a timing side channel can't walk the MAC.
+    if !bool::from(mac.as_slice().ct_eq(want_mac.as_slice())) {
         bail!("keystore MAC mismatch — wrong password or corrupt keystore");
     }
 
-    // AES-128-CTR decrypt in place.
-    let mut buf = ciphertext;
+    // AES-128-CTR decrypt in place; the plaintext is the secret key, so
+    // the buffer is wiped on drop.
+    let mut buf = Zeroizing::new(ciphertext);
     let mut cipher = Aes128Ctr::new_from_slices(&derived[..16], &iv)
         .map_err(|e| anyhow!("init aes-128-ctr: {e}"))?;
     cipher.apply_keystream(&mut buf);
@@ -113,14 +151,22 @@ pub fn decrypt_v3(json: &str, password: &str) -> Result<[u8; 32]> {
 /// Derive the symmetric key from the password per the `kdf` field.
 /// Supports the two KDFs the v3 spec defines: `scrypt` and `pbkdf2`
 /// (with `hmac-sha256`).
-fn derive_key(kdf: &str, params: &serde_json::Value, password: &[u8]) -> Result<Vec<u8>> {
-    let dklen = params
-        .get("dklen")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(32) as usize;
-    if dklen < 32 {
-        bail!("kdf dklen {dklen} too small (need >= 32)");
+fn derive_key(
+    kdf: &str,
+    params: &serde_json::Value,
+    password: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let dklen = match params.get("dklen") {
+        None => MIN_DKLEN,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| anyhow!("kdfparams.dklen is not a non-negative integer"))?,
+    };
+    if !(MIN_DKLEN..=MAX_DKLEN).contains(&dklen) {
+        bail!("kdf dklen {dklen} out of range (need {MIN_DKLEN}..={MAX_DKLEN})");
     }
+    // In range above, so this can't truncate.
+    let dklen = dklen as usize;
     let salt = decode_hex(
         params
             .get("salt")
@@ -129,14 +175,34 @@ fn derive_key(kdf: &str, params: &serde_json::Value, password: &[u8]) -> Result<
     )
     .context("kdf salt")?;
 
-    let mut out = vec![0u8; dklen];
+    // `dklen` is bounded above, so this allocation is at most 64 bytes;
+    // the per-KDF parameters are all checked before any derivation runs.
+    let mut out = Zeroizing::new(vec![0u8; dklen]);
     match kdf.to_ascii_lowercase().as_str() {
         "scrypt" => {
             let n = u64_param(params, "n")?;
-            let r = u64_param(params, "r")? as u32;
-            let p = u64_param(params, "p")? as u32;
-            if !n.is_power_of_two() {
-                bail!("scrypt n={n} is not a power of two");
+            let r = u32_param(params, "r")?;
+            let p = u32_param(params, "p")?;
+            if !n.is_power_of_two() || n < 2 {
+                bail!("scrypt n={n} is not a power of two >= 2");
+            }
+            if n > MAX_SCRYPT_N {
+                bail!("scrypt n={n} too large (max {MAX_SCRYPT_N})");
+            }
+            // n <= 2^20 and r < 2^32, so this can't overflow a u64.
+            let mem = 128 * n * u64::from(r);
+            if mem > MAX_SCRYPT_MEM {
+                bail!("scrypt n={n}, r={r} needs {mem} bytes of memory (max {MAX_SCRYPT_MEM})");
+            }
+            // r, p < 2^32, so 128 * r * p < 2^71: compute in u128.
+            let blocks = 128 * u128::from(r) * u128::from(p);
+            if blocks > u128::from(MAX_SCRYPT_MEM) {
+                bail!("scrypt r={r}, p={p} needs {blocks} bytes of memory (max {MAX_SCRYPT_MEM})");
+            }
+            // n <= 2^20 and r, p < 2^32, so this fits a u128.
+            let work = u128::from(n) * u128::from(r) * u128::from(p);
+            if work > u128::from(MAX_SCRYPT_WORK) {
+                bail!("scrypt n={n}, r={r}, p={p} is too much work (n*r*p={work}, max {MAX_SCRYPT_WORK})");
             }
             let log_n = n.trailing_zeros() as u8;
             let sparams = scrypt::Params::new(log_n, r, p, dklen)
@@ -152,7 +218,10 @@ fn derive_key(kdf: &str, params: &serde_json::Value, password: &[u8]) -> Result<
             if !prf.eq_ignore_ascii_case("hmac-sha256") {
                 bail!("unsupported pbkdf2 prf {prf:?} (only hmac-sha256)");
             }
-            let c = u64_param(params, "c")? as u32;
+            let c = u32_param(params, "c")?;
+            if c > MAX_PBKDF2_C {
+                bail!("pbkdf2 c={c} is too much work (max {MAX_PBKDF2_C})");
+            }
             pbkdf2::pbkdf2_hmac::<Sha256>(password, &salt, c, &mut out);
         }
         other => bail!("unsupported kdf {other:?}"),
@@ -165,6 +234,18 @@ fn u64_param(params: &serde_json::Value, key: &str) -> Result<u64> {
         .get(key)
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow!("kdfparams.{key} missing or not an integer"))
+}
+
+/// A KDF parameter that must be a nonzero `u32`. Reads it as `u64` and
+/// rejects anything out of range instead of truncating with `as u32`,
+/// which would turn e.g. `c = 2^32` into 0.
+fn u32_param(params: &serde_json::Value, key: &str) -> Result<u32> {
+    let v = u64_param(params, key)?;
+    match u32::try_from(v) {
+        Ok(0) => bail!("kdfparams.{key} must not be 0"),
+        Ok(v) => Ok(v),
+        Err(_) => bail!("kdfparams.{key}={v} does not fit in a u32"),
+    }
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
@@ -288,6 +369,151 @@ pub(crate) mod tests {
             err.to_string().contains("MAC mismatch"),
             "expected MAC mismatch, got: {err}",
         );
+    }
+
+    /// A keystore with the given KDF and params, everything else valid
+    /// in shape. The bounds checks must reject it before any derivation,
+    /// so the MAC/ciphertext never get looked at.
+    fn with_kdfparams(kdf: &str, kdfparams: serde_json::Value) -> String {
+        serde_json::json!({
+            "version": 3,
+            "crypto": {
+                "cipher": "aes-128-ctr",
+                "cipherparams": { "iv": "6087dab2f9fdbbfaddc31a909735c1e6" },
+                "ciphertext": "5318b4d5bcd28de64ee5559e671353e16f075ecae9f99c7a79a38af5f869aa46",
+                "kdf": kdf,
+                "kdfparams": kdfparams,
+                "mac": "517ead924a9d0dc3124507e3393d175ce3ff7c1e96529c6c555ce9e51205e9b2",
+            }
+        })
+        .to_string()
+    }
+
+    const SALT: &str = "ae3cd4e7013836a3df6bd7241b12db061dbe2c6785853cce422d148a624ce0bd";
+
+    fn pbkdf2_params(c: u64, dklen: u64) -> serde_json::Value {
+        serde_json::json!({ "c": c, "dklen": dklen, "prf": "hmac-sha256", "salt": SALT })
+    }
+
+    fn scrypt_params(n: u64, r: u64, p: u64, dklen: u64) -> serde_json::Value {
+        serde_json::json!({ "n": n, "r": r, "p": p, "dklen": dklen, "salt": SALT })
+    }
+
+    fn rejected(kdf: &str, params: serde_json::Value, needle: &str) {
+        let err = decrypt_v3(&with_kdfparams(kdf, params), "testpassword").unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "expected {needle:?} in: {err}",
+        );
+    }
+
+    /// `dklen = 2^40` used to size `vec![0; dklen]` straight from the file.
+    #[test]
+    fn rejects_huge_dklen() {
+        rejected("pbkdf2", pbkdf2_params(1, 1 << 40), "dklen");
+        rejected("scrypt", scrypt_params(2, 8, 1, 1 << 40), "dklen");
+    }
+
+    #[test]
+    fn dklen_bounds() {
+        rejected("pbkdf2", pbkdf2_params(1, 31), "dklen");
+        rejected("pbkdf2", pbkdf2_params(1, 65), "dklen");
+        rejected(
+            "pbkdf2",
+            serde_json::json!({ "c": 1, "dklen": -1, "salt": SALT }),
+            "dklen",
+        );
+        // 64 is in range: it gets past the bounds to the MAC check.
+        rejected("pbkdf2", pbkdf2_params(1, 64), "MAC mismatch");
+    }
+
+    /// `c = 2^32` used to truncate to 0 iterations via `as u32`.
+    #[test]
+    fn rejects_pbkdf2_c_out_of_u32_or_zero() {
+        rejected(
+            "pbkdf2",
+            pbkdf2_params(1 << 32, 32),
+            "does not fit in a u32",
+        );
+        rejected("pbkdf2", pbkdf2_params(0, 32), "must not be 0");
+    }
+
+    /// `n = 2^40` is a power of two, so only the cap stops it.
+    #[test]
+    fn rejects_huge_scrypt_n() {
+        rejected("scrypt", scrypt_params(1 << 40, 8, 1, 32), "too large");
+        rejected(
+            "scrypt",
+            scrypt_params((1 << 20) * 2, 8, 1, 32),
+            "too large",
+        );
+        rejected("scrypt", scrypt_params(1, 8, 1, 32), "power of two");
+    }
+
+    #[test]
+    fn rejects_scrypt_r_p_out_of_u32_or_zero() {
+        rejected(
+            "scrypt",
+            scrypt_params(2, 1 << 32, 1, 32),
+            "does not fit in a u32",
+        );
+        rejected(
+            "scrypt",
+            scrypt_params(2, 8, 1 << 32, 32),
+            "does not fit in a u32",
+        );
+        rejected("scrypt", scrypt_params(2, 0, 1, 32), "must not be 0");
+        rejected("scrypt", scrypt_params(2, 8, 0, 32), "must not be 0");
+    }
+
+    /// `n` under its cap can still demand unbounded memory through `r`.
+    #[test]
+    fn rejects_scrypt_memory_over_cap() {
+        rejected("scrypt", scrypt_params(1 << 20, 16, 1, 32), "memory");
+        rejected("scrypt", scrypt_params(2, u32::MAX.into(), 1, 32), "memory");
+        // Passes the `n * r` bound but `p` sizes a 64 GiB block buffer.
+        rejected("scrypt", scrypt_params(2, 1, 1 << 29, 32), "memory");
+        rejected("scrypt", scrypt_params(2, 1, u32::MAX.into(), 32), "memory");
+    }
+
+    /// Parameters inside every memory cap can still demand days of CPU
+    /// through `p` (each one a full `ROMix` pass).
+    #[test]
+    fn rejects_scrypt_work_over_cap() {
+        // Both buffers exactly at the 1 GiB cap, then 2^20 passes.
+        rejected(
+            "scrypt",
+            scrypt_params(1 << 20, 8, 1 << 20, 32),
+            "too much work",
+        );
+        // One step past the largest single pass the memory cap allows.
+        rejected("scrypt", scrypt_params(1 << 20, 8, 2, 32), "too much work");
+        // Tiny buffers, but 2^24 passes.
+        rejected("scrypt", scrypt_params(2, 1, 1 << 23, 32), "too much work");
+        // Under the cap, the bounds pass and it reaches the MAC check.
+        rejected("scrypt", scrypt_params(16, 8, 4, 32), "MAC mismatch");
+    }
+
+    /// `c = u32::MAX` fits a u32 but is ~4.3e9 HMAC rounds.
+    #[test]
+    fn rejects_pbkdf2_c_over_work_cap() {
+        rejected(
+            "pbkdf2",
+            pbkdf2_params(u32::MAX.into(), 32),
+            "too much work",
+        );
+        rejected("pbkdf2", pbkdf2_params((1 << 22) + 1, 32), "too much work");
+    }
+
+    /// A stored MAC of the wrong length is a mismatch, not a panic.
+    #[test]
+    fn short_mac_is_mismatch() {
+        let bad = PBKDF2_KEYSTORE.replace(
+            "517ead924a9d0dc3124507e3393d175ce3ff7c1e96529c6c555ce9e51205e9b2",
+            "517ead92",
+        );
+        let err = decrypt_v3(&bad, "testpassword").unwrap_err();
+        assert!(err.to_string().contains("MAC mismatch"), "got: {err}");
     }
 
     #[test]
