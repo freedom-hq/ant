@@ -83,6 +83,20 @@ struct GetStartedView: View {
             if RootView.shotArgs.contains("-antstream-shot-getstarted-pay") {
                 selected = StoragePlanTier.all.first
                 quote = Self.screenshotSampleQuote
+                // `-antstream-shot-getstarted-refused`: a funded buy the
+                // swap cap just refused (#305), so the payment step is back
+                // with the error, the quote stale and Activate held behind
+                // a spinner until a fresh quote lands.
+                // `-antstream-shot-getstarted-requoted` is the moment after:
+                // the re-quote is in and Activate is the manual retry. A
+                // runner can't fund a wallet or move a pool price, so this
+                // is sample state, and `pollForPayment` leaves it alone.
+                if Self.shotRefused {
+                    quote = Self.screenshotFundedQuote
+                    error = Self.screenshotRefusal
+                    didAutoActivate = true
+                    quoteStale = !RootView.shotArgs.contains("-antstream-shot-getstarted-requoted")
+                }
                 step = .payment
                 // `-antstream-shot-getstarted-help` also opens the ⓘ sheet,
                 // where the deposit line and the Gnosis-only warning live.
@@ -120,6 +134,37 @@ struct GetStartedView: View {
         xdaiToSendDisplay: "0.60",
         sufficientFunds: false
     )
+
+    /// The refused-buy screenshot samples are on: the sample state stays
+    /// put (no re-quote replaces it) until the shot fires.
+    private static let shotRefused =
+        RootView.shotArgs.contains("-antstream-shot-getstarted-refused")
+
+    /// The sample quote once the payment has landed, for
+    /// `-antstream-shot-getstarted-refused`. Sample only.
+    private static let screenshotFundedQuote = StorageQuote(
+        depth: 21,
+        days: 30,
+        amountPerChunk: "0",
+        totalCostBzz: "0.0500",
+        settlementDepositPlur: "10000000000000",
+        settlementDepositBzz: "0.0010",
+        capacityBytes: 2_000_000_000,
+        accountBzzDisplay: "0.0000",
+        accountXdai: "600000000000000000",
+        accountXdaiDisplay: "0.6000",
+        neededBzzDisplay: "0.0510",
+        swapInput: "580000000000000000",
+        xdaiRequiredDisplay: "0.60",
+        xdaiToSendDisplay: "0.00",
+        sufficientFunds: true
+    )
+
+    /// What `FundingError::PriceMoved` says for the sample quote's cap.
+    static let screenshotRefusal =
+        "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is "
+        + "more xBZZ to buy): the swap now needs 0.62000000 xDAI, more than the 0.58000000 xDAI "
+        + "you approved; nothing was sent, refresh the quote and try again"
 
     @ViewBuilder private var content: some View {
         switch step {
@@ -481,7 +526,7 @@ struct GetStartedView: View {
     /// price. The `.task` driving this is cancelled when the step changes
     /// (Back / Activate), ending the loop.
     private func pollForPayment() async {
-        guard let tier = selected else { return }
+        guard let tier = selected, !Self.shotRefused else { return }
         while !Task.isCancelled {
             if !quoteStale, !didAutoActivate, quote?.sufficientFunds == true {
                 autoActivateIfFunded()
@@ -507,10 +552,6 @@ struct GetStartedView: View {
         }
     }
 
-    /// Kick off activation the instant funds are detected, but only once per
-    /// payment session — so a failed activation (which drops back to the
-    /// payment step) doesn't immediately re-trigger an infinite loop. The
-    /// Activate button remains as a manual retry.
     /// Back to the payment step after a failed activation, with the quote
     /// it used marked stale: the poll re-quotes at once and the retry
     /// uses that quote's cap (a re-selected tier re-quotes too).
@@ -520,6 +561,10 @@ struct GetStartedView: View {
         withAnimation { step = .payment }
     }
 
+    /// Kick off activation the instant funds are detected, but only once per
+    /// payment session — so a failed activation (which drops back to the
+    /// payment step) doesn't immediately re-trigger an infinite loop. The
+    /// Activate button remains as a manual retry.
     private func autoActivateIfFunded() {
         guard !didAutoActivate else { return }
         didAutoActivate = true

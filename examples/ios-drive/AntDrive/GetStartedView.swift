@@ -382,10 +382,6 @@ struct GetStartedView: View {
         (UInt64(quote.settlementDepositPlur) ?? 0) > 0
     }
 
-    /// Kick off activation the instant funds are detected, but only once per
-    /// payment session — so a failed activation (which drops back to the
-    /// payment step) doesn't immediately re-trigger an infinite loop. The
-    /// Activate button remains as a manual retry.
     /// Back to the payment step after a failed activation, with the quote
     /// it used marked stale: the poll re-quotes at once and the retry
     /// uses that quote's cap (a re-selected tier re-quotes too).
@@ -395,6 +391,10 @@ struct GetStartedView: View {
         withAnimation { step = .payment }
     }
 
+    /// Kick off activation the instant funds are detected, but only once per
+    /// payment session — so a failed activation (which drops back to the
+    /// payment step) doesn't immediately re-trigger an infinite loop. The
+    /// Activate button remains as a manual retry.
     private func autoActivateIfFunded() {
         guard !didAutoActivate else { return }
         didAutoActivate = true

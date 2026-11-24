@@ -53,6 +53,10 @@ struct RootView: View {
             // — the payment cost breakdown, including the new one-time
             // settlement-deposit line. Otherwise it sits behind a sheet.
             GetStartedView().preferredColorScheme(.dark)
+        } else if ExtendStorageSheet.shotRefused {
+            // The Storage tab's Extend sheet full-screen, on its payment
+            // step after a refused extension (#305; see the sheet).
+            ExtendStorageSheet { _ in }.preferredColorScheme(.dark)
         } else if Self.shotArgs.contains("-antstream-shot-storage") {
             // The Storage tab full-screen (settlement / plan / account
             // cards). `-antstream-shot-deposit` additionally drives it to

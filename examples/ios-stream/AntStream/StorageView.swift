@@ -681,7 +681,7 @@ private struct RestoreAccountSheet: View {
 /// (or use existing funds), and extend on-chain. Mirrors the Get Started
 /// payment flow — same quote shape, same waiting-for-payment poll and
 /// auto-execute when funds land.
-private struct ExtendStorageSheet: View {
+struct ExtendStorageSheet: View {
     @EnvironmentObject var node: AntNode
     @Environment(\.dismiss) private var dismiss
     @AppStorage("gnosisRpc") private var rpc = ""
@@ -737,8 +737,50 @@ private struct ExtendStorageSheet: View {
         }
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled(step == .extending)
-        .task { await loadQuotes() }
+        .task {
+            // antstream-visual: `-antstream-shot-extend-refused` (#305) is
+            // a funded extension the swap cap just refused: back on the
+            // payment step with the error, the quote stale and Extend
+            // disabled until a fresh quote lands;
+            // `-antstream-shot-extend-requoted` is the moment after, the
+            // re-quote in and Extend enabled as the manual retry. A runner
+            // has no plan, funds or movable pool price, so this is sample
+            // state, and `pollForPayment` leaves it alone.
+            if Self.shotRefused {
+                selectedDays = Self.options.first?.days
+                quote = Self.screenshotFundedQuote
+                error = GetStartedView.screenshotRefusal
+                didAutoExtend = true
+                quoteStale = !RootView.shotArgs.contains("-antstream-shot-extend-requoted")
+                step = .payment
+                return
+            }
+            await loadQuotes()
+        }
     }
+
+    /// The refused-extension screenshot samples are on.
+    static let shotRefused = RootView.shotArgs.contains("-antstream-shot-extend-refused")
+
+    /// A funded one-month extension quote, for
+    /// `-antstream-shot-extend-refused`. Sample only.
+    private static let screenshotFundedQuote = StorageQuote(
+        depth: 21,
+        days: 30,
+        amountPerChunk: "0",
+        totalCostBzz: "0.0500",
+        settlementDepositPlur: "0",
+        settlementDepositBzz: "0.0000",
+        capacityBytes: 2_000_000_000,
+        accountBzzDisplay: "0.0000",
+        accountXdai: "600000000000000000",
+        accountXdaiDisplay: "0.6000",
+        neededBzzDisplay: "0.0500",
+        swapInput: "580000000000000000",
+        xdaiRequiredDisplay: "0.60",
+        xdaiToSendDisplay: "0.00",
+        sufficientFunds: true
+    )
 
     @ViewBuilder private var content: some View {
         switch step {
@@ -972,7 +1014,7 @@ private struct ExtendStorageSheet: View {
     /// After the one auto-extension the loop keeps the quote fresh, so the
     /// manual Extend retry is capped at the current price.
     private func pollForPayment() async {
-        guard let days = selectedDays else { return }
+        guard let days = selectedDays, !Self.shotRefused else { return }
         while !Task.isCancelled {
             if !quoteStale, !didAutoExtend, quote?.sufficientFunds == true {
                 autoExtendIfFunded()
