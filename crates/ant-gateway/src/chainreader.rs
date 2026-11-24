@@ -734,7 +734,7 @@ mod tests {
     }
 
     /// #305: a swap the caller's cap no longer covers is the user's to
-    /// resolve (refresh the quote), not a chain fault: a `400` with the
+    /// resolve (get a new quote), not a chain fault: a `400` with the
     /// message, like a short wallet.
     #[test]
     fn a_moved_price_is_rejected() {

@@ -72,7 +72,10 @@ const SWAP_BUFFER_DEN: u128 = 100;
 /// fresh fair value by this much (the 0.3% pool fee plus a little price
 /// impact). `amountOutMin` stays the xBZZ needed, so the chain refuses
 /// a swap that would buy less, and nothing past the approved cap is
-/// ever sent.
+/// ever sent. A large swap's price impact can eat that margin, so a
+/// capped swap is dry-run (`eth_call`) before it is sent and refused
+/// with [`FundingError::PriceMoved`] if it would revert, instead of
+/// spending the gas of a reverted transaction.
 const SWAP_MIN_MARGIN_NUM: u128 = 101;
 const SWAP_MIN_MARGIN_DEN: u128 = 100;
 
@@ -183,8 +186,10 @@ pub enum FundingError {
     /// (the quote the user approved) allows: the pool price moved past
     /// what the cap still covers (see [`SWAP_MIN_MARGIN_NUM`]), the read
     /// was forged, or the call has more xBZZ to buy than when it was
-    /// quoted (the wallet's xBZZ was spent, or the deposit due grew).
-    /// Nothing was sent.
+    /// quoted (the wallet's xBZZ was spent, or the deposit due grew), or
+    /// a dry run of the capped swap reverted (the cap doesn't cover the
+    /// pool fee plus price impact). Nothing was sent, apart from possibly
+    /// the one-time swap helper deploy in that last case.
     #[error("{}", price_moved_message(*input_wei, *max_wei))]
     PriceMoved { input_wei: u128, max_wei: u128 },
     /// The wallet holds less xDAI than the swap plus the gas reserve.
@@ -237,8 +242,8 @@ fn price_moved_message(input_wei: u128, max_wei: u128) -> String {
     // it can't tell a price move from more xBZZ to buy: name both.
     format!(
         "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is \
-         more xBZZ to buy): the swap now needs {} xDAI, {approved}; nothing was sent, refresh \
-         the quote and try again",
+         more xBZZ to buy): the swap now needs {} xDAI, {approved}; nothing was sent, get a new \
+         quote and try again",
         xdai(input_wei)
     )
 }
@@ -589,7 +594,10 @@ async fn deposit_due(payer: &Payer<'_>, policy: DepositPolicy) -> u128 {
 /// refuses before sending anything (the helper deploy included) when the
 /// cap no longer covers the freshly priced swap
 /// ([`FundingError::PriceMoved`]), or when the wallet can't also keep
-/// [`GAS_RESERVE_WEI`] for the transactions that follow.
+/// [`GAS_RESERVE_WEI`] for the transactions that follow. A swap sending
+/// the cap is dry-run first (`eth_call`) and refused the same way if it
+/// would revert; by then the one-time helper deploy may have gone out,
+/// which later swaps reuse.
 async fn acquire_bzz(
     payer: &Payer<'_>,
     bzz_plur: u128,
@@ -627,6 +635,36 @@ async fn acquire_bzz(
             what: "prepare swap",
             source,
         })?;
+    if input < buffered(fair) {
+        // Capped: the cap covers fair value by as little as
+        // [`SWAP_MIN_MARGIN_NUM`], which the pool fee plus a large swap's
+        // price impact can eat. Dry-run it so a swap that would miss
+        // `amountOutMin` is refused here rather than reverting on chain
+        // and burning its gas. A failed dry run that isn't a revert
+        // fails the call too: nothing is sent on a check we couldn't make.
+        if let Err(e) = payer
+            .wallet
+            .simulate_swap_xdai_for_bzz(
+                payer.client,
+                &helper,
+                payer.owner(),
+                input,
+                U256::from(bzz_plur),
+            )
+            .await
+        {
+            return Err(match e {
+                crate::RpcError::Rpc(msg) if is_revert(&msg) => FundingError::PriceMoved {
+                    input_wei: buffered(fair),
+                    max_wei: max_xdai_wei,
+                },
+                e => FundingError::Read {
+                    what: "check the capped swap",
+                    message: e.to_string(),
+                },
+            });
+        }
+    }
     payer
         .wallet
         .swap_xdai_for_bzz(
@@ -642,6 +680,12 @@ async fn acquire_bzz(
             source,
         })?;
     Ok(())
+}
+
+/// Whether an `eth_call` error (the RPC's error JSON) is the call
+/// reverting, as opposed to the RPC failing to run it.
+fn is_revert(error_json: &str) -> bool {
+    error_json.to_ascii_lowercase().contains("revert")
 }
 
 // --- the shared orchestration steps ---
@@ -1238,6 +1282,13 @@ mod tests {
         sent: std::sync::Mutex<Vec<&'static str>>,
         /// The xDAI (wei) each swap transaction carried.
         swap_values: std::sync::Mutex<Vec<u128>>,
+        /// A dry run (`eth_call`) of the swap reverts: the pool fee plus
+        /// price impact leaves less than `amountOutMin`.
+        swap_reverts: bool,
+        /// A dry run of the swap fails without reverting (rate limit).
+        swap_dry_run_fails: bool,
+        /// The xDAI (wei) each swap dry run carried.
+        dry_run_values: std::sync::Mutex<Vec<u128>>,
     }
 
     const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
@@ -1280,6 +1331,28 @@ mod tests {
                            "error": {"code": -32603, "message": "upstream hiccup"}})
                     .to_string(),
                 );
+            }
+            let helper_hex = format!("0x{}", hex::encode(crate::tx::swap_helper_address()));
+            if req["method"] == "eth_call" && req["params"][0]["to"] == helper_hex.as_str() {
+                let call = &req["params"][0];
+                assert_eq!(call["from"], format!("0x{}", hex::encode(node_eth())));
+                assert_eq!(
+                    call["gas"],
+                    format!("0x{:x}", crate::tx::SWAP_HELPER_SWAP_GAS)
+                );
+                let value = call["value"].as_str().unwrap();
+                self.dry_run_values
+                    .lock()
+                    .unwrap()
+                    .push(u128::from_str_radix(&value[2..], 16).unwrap());
+                let error = if self.swap_reverts {
+                    json!({"code": 3, "message": "execution reverted: Too little received"})
+                } else if self.swap_dry_run_fails {
+                    json!({"code": -32005, "message": "rate limit exceeded"})
+                } else {
+                    return Some(json!({"jsonrpc": "2.0", "id": id, "result": "0x"}).to_string());
+                };
+                return Some(json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string());
             }
             let result = match req["method"].as_str().unwrap() {
                 "eth_call" => {
@@ -1793,6 +1866,18 @@ mod tests {
         max_xdai_wei: u128,
     ) -> (Result<(), FundingError>, Vec<&'static str>, Vec<u128>) {
         let chain = std::sync::Arc::new(chain);
+        let result = pay_capped_on(&chain, call, max_xdai_wei).await;
+        let sent = chain.sent.lock().unwrap().clone();
+        let values = chain.swap_values.lock().unwrap().clone();
+        (result, sent, values)
+    }
+
+    /// One paying `call` capped at `max_xdai_wei` against `chain`.
+    async fn pay_capped_on(
+        chain: &std::sync::Arc<ScriptedChain>,
+        call: &str,
+        max_xdai_wei: u128,
+    ) -> Result<(), FundingError> {
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
         let payer = Payer::gnosis(&client, &wallet);
@@ -1820,9 +1905,7 @@ mod tests {
             .map(drop),
             other => unreachable!("{other}"),
         };
-        let sent = chain.sent.lock().unwrap().clone();
-        let values = chain.swap_values.lock().unwrap().clone();
-        (result, sent, values)
+        result
     }
 
     /// The `swap_input_wei` each paying call's quote shows the user, at
@@ -1947,6 +2030,75 @@ mod tests {
                 other => panic!("{call}: expected PriceMoved, got {other:?}"),
             }
             assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
+        }
+    }
+
+    /// R3-M2: a capped swap sends the cap with as little as 1% over fair
+    /// value, which the pool fee plus a large swap's price impact can
+    /// eat. It is dry-run first, with exactly the value it would send,
+    /// and a would-be revert is refused as `PriceMoved` instead of being
+    /// sent to revert on chain and burn its gas. An uncapped swap (the
+    /// full 5% buffer) is not dry-run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_swap_that_would_revert_is_not_sent() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            // sqrtPrice +1.5%: capped, and the dry run reverts.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::PriceMoved { input_wei, max_wei }) => {
+                    assert_eq!(max_wei, quoted, "{call}");
+                    assert!(input_wei > quoted, "{call}");
+                }
+                other => panic!("{call}: expected PriceMoved, got {other:?}"),
+            }
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            let sent = chain.sent.lock().unwrap().clone();
+            assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
+
+            // A dry run that fails without reverting fails the call as a
+            // read, still sending nothing.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_dry_run_fails: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::Read { what, .. }) => {
+                    assert_eq!(what, "check the capped swap", "{call}");
+                }
+                other => panic!("{call}: expected Read, got {other:?}"),
+            }
+            assert!(chain.sent.lock().unwrap().is_empty(), "{call}");
+
+            // The same capped swap whose dry run passes is sent, at the
+            // value the dry run carried.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            pay_capped_on(&chain, call, quoted)
+                .await
+                .unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            assert_eq!(*chain.swap_values.lock().unwrap(), [quoted], "{call}");
+
+            // Uncapped (at the quoted price): no dry run, even one that
+            // would revert.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE)
+            });
+            pay_capped_on(&chain, call, quoted)
+                .await
+                .unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert!(chain.dry_run_values.lock().unwrap().is_empty(), "{call}");
+            assert_eq!(*chain.swap_values.lock().unwrap(), [quoted], "{call}");
         }
     }
 

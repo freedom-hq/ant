@@ -164,7 +164,7 @@ struct GetStartedView: View {
     static let screenshotRefusal =
         "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is "
         + "more xBZZ to buy): the swap now needs 0.62000000 xDAI, more than the 0.58000000 xDAI "
-        + "you approved; nothing was sent, refresh the quote and try again"
+        + "you approved; nothing was sent, get a new quote and try again"
 
     @ViewBuilder private var content: some View {
         switch step {

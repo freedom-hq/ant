@@ -958,6 +958,25 @@ impl Wallet {
         self.send_signed_value(client, *helper, data, SWAP_HELPER_SWAP_GAS, value)
             .await
     }
+
+    /// Dry-run [`Self::swap_xdai_for_bzz`] with `eth_call` (same sender,
+    /// value, calldata and gas limit) without sending anything. `Ok`
+    /// when the swap would go through at the latest block; a would-be
+    /// revert (`amountOutMin` not met) is an [`crate::RpcError::Rpc`].
+    pub async fn simulate_swap_xdai_for_bzz(
+        &self,
+        client: &ChainClient,
+        helper: &[u8; 20],
+        recipient: &[u8; 20],
+        value: u128,
+        amount_out_min: U256,
+    ) -> Result<(), crate::RpcError> {
+        let data = swap_helper_calldata(recipient, &amount_out_min);
+        client
+            .eth_call_value(&self.address, helper, &data, value, SWAP_HELPER_SWAP_GAS)
+            .await
+            .map(drop)
+    }
 }
 
 /// The lock every transaction signed by `address` holds from its nonce

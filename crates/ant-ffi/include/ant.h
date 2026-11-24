@@ -731,7 +731,7 @@ char *ant_storage_settlement_deposit_amount(const AntHandle *handle,
  * re-priced from the pool when it runs and never sends more than the cap:
  * a small upward move the quote's swap buffer absorbs still goes
  * through, a larger one (or a forged pool read, or more xBZZ to buy)
- * is refused with nothing sent (#305); refresh the quote and try again.
+ * is refused with nothing sent (#305); get a new quote and try again.
  * "0" forbids a swap: only xBZZ the wallet already holds is deposited.
  */
 char *ant_storage_settlement_topup(const AntHandle *handle,
@@ -755,7 +755,7 @@ char *ant_storage_settlement_topup(const AntHandle *handle,
  * re-priced from the pool when it runs and never sends more than the cap:
  * a small upward move the quote's swap buffer absorbs still goes
  * through, a larger one (or a forged pool read, or more xBZZ to buy)
- * is refused with nothing sent (#305); refresh the quote and try again.
+ * is refused with nothing sent (#305); get a new quote and try again.
  * "0" forbids a swap: only xBZZ the wallet already holds is deposited
  * (the apps' "add credit", which checked that first).
  */
@@ -1039,7 +1039,7 @@ char *ant_storage_topup_quote(const AntHandle *handle,
  * re-priced from the pool when it runs and never sends more than the cap:
  * a small upward move the quote's swap buffer absorbs still goes
  * through, a larger one (or a forged pool read, or more xBZZ to buy)
- * is refused with nothing sent (#305); refresh the quote and try again.
+ * is refused with nothing sent (#305); get a new quote and try again.
  */
 char *ant_storage_topup_xdai(const AntHandle *handle,
                              const char *gnosis_rpc,
@@ -1073,7 +1073,7 @@ char *ant_storage_buy(const AntHandle *handle,
  * re-priced from the pool when it runs and never sends more than the cap:
  * a small upward move the quote's swap buffer absorbs still goes
  * through, a larger one (or a forged pool read, or more xBZZ to buy)
- * is refused with nothing sent (#305); refresh the quote and try again.
+ * is refused with nothing sent (#305); get a new quote and try again.
  */
 char *ant_storage_buy_xdai(const AntHandle *handle,
                            const char *gnosis_rpc,
