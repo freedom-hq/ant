@@ -1539,11 +1539,20 @@ fn collect_entries<'a>(
 /// Fetch a manifest node by a 32-byte (plain) or 64-byte (encrypted)
 /// reference and unmarshal it. Encrypted nodes go through the
 /// decrypting joiner; plain nodes fetch the root chunk and join.
+///
+/// The node's joined size is capped at `max_bytes` (at most
+/// [`DEFAULT_MAX_FILE_BYTES`] makes sense): a node whose root chunk
+/// declares more fails with [`JoinError::TooLarge`] before the rest of
+/// it is fetched. Returns the node and its serialised size, for a
+/// caller (the ACT history walk) that budgets the bytes it joins across
+/// many nodes.
 pub(crate) async fn load_node_ref(
     fetcher: &dyn ChunkFetcher,
     node_ref: &[u8],
-) -> Result<Node, ManifestError> {
-    load_node_ref_with_credit(fetcher, node_ref, None, &ReplicaSweeps::new()).await
+    max_bytes: usize,
+) -> Result<(Node, usize), ManifestError> {
+    let bytes = load_node_bytes(fetcher, node_ref, None, &ReplicaSweeps::new(), max_bytes).await?;
+    Ok((Node::unmarshal(&bytes)?, bytes.len()))
 }
 
 /// [`load_node_ref`] whose root-chunk fetch (issue #130) and header
@@ -1559,10 +1568,22 @@ async fn load_node_ref_with_credit(
     credit: Option<&CreditWindow>,
     sweeps: &ReplicaSweeps,
 ) -> Result<Node, ManifestError> {
+    let bytes = load_node_bytes(fetcher, node_ref, credit, sweeps, DEFAULT_MAX_FILE_BYTES).await?;
+    Node::unmarshal(&bytes)
+}
+
+/// Fetch and join a manifest node's serialised bytes, at most
+/// `max_bytes` of them (see [`load_node_ref_with_credit`]).
+async fn load_node_bytes(
+    fetcher: &dyn ChunkFetcher,
+    node_ref: &[u8],
+    credit: Option<&CreditWindow>,
+    sweeps: &ReplicaSweeps,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
-        let bytes = join_encrypted(fetcher, enc_ref, DEFAULT_MAX_FILE_BYTES).await?;
-        return Node::unmarshal(&bytes);
+        return Ok(join_encrypted(fetcher, enc_ref, max_bytes).await?);
     }
     let Ok(addr) = <[u8; 32]>::try_from(node_ref) else {
         return Err(ManifestError::InvalidRefLength(node_ref.len() as u8));
@@ -1641,8 +1662,7 @@ async fn load_node_ref_with_credit(
     // attempt at that chunk instead of being repeated before the join's
     // own retries / erasure recovery.
     sniffed.replay();
-    let bytes = join(&sniffed, &root_chunk, DEFAULT_MAX_FILE_BYTES).await?;
-    Node::unmarshal(&bytes)
+    Ok(join(&sniffed, &root_chunk, max_bytes).await?)
 }
 
 /// Fetch error as handed out by [`ChunkFetcher::fetch`].

@@ -72,6 +72,14 @@ pub enum ActError {
     Write(#[from] ManifestWriteError),
     #[error("malformed ACT key-value store: {0}")]
     MalformedKvs(String),
+    /// The history already holds [`MAX_HISTORY_ENTRIES`] epochs, the
+    /// most ant's bounded walk reads back, so [`history_with_epoch`]
+    /// won't add another: the publisher has to start a new history.
+    #[error(
+        "access control history already has {epochs} epochs, the most it can hold is \
+         {MAX_HISTORY_ENTRIES}; start a new history"
+    )]
+    HistoryFull { epochs: usize },
 }
 
 // --- ACT key-value store (bee pkg/accesscontrol/kvs over a simple manifest) ---
@@ -219,6 +227,21 @@ const MAX_HISTORY_DEPTH: usize = 20;
 /// [`MAX_HISTORY_ENTRIES`] crafted forks could retain 256 MiB.
 const MAX_HISTORY_METADATA_BYTES: usize = ACT_MAX_BYTES;
 
+/// Most serialised node bytes one history walk fetches and joins,
+/// summed over the distinct nodes it loads (a cached node costs
+/// nothing). Every node join is capped at what is left of it, so a
+/// node too big for the rest of the budget is refused from its root
+/// chunk's span, before the rest of it is fetched. Without it each of
+/// the [`MAX_HISTORY_NODE_VISITS`] loads could join a
+/// [`crate::joiner::DEFAULT_MAX_FILE_BYTES`] (32 MiB) node: about
+/// 256 GiB of join work for one request. A real node is a header of
+/// about 130 bytes plus about 64 bytes per fork and its padded metadata:
+/// a full history of [`MAX_HISTORY_ENTRIES`] epochs, each with an
+/// `encryptedglref`, joins about 1.2 MiB of nodes in total (measured by
+/// `full_real_history_fits_every_budget`), and even one whose forks
+/// carry the full metadata budget stays under 8 MiB.
+const MAX_HISTORY_NODE_BYTES: usize = 4 * ACT_MAX_BYTES;
+
 /// Load every value entry of a history manifest, in bee's `WalkNode`
 /// order: ascending fork-byte order at every level, i.e. ascending
 /// lexicographic key order — the *newest* epoch first (keys are
@@ -231,8 +254,9 @@ const MAX_HISTORY_METADATA_BYTES: usize = ACT_MAX_BYTES;
 /// shared child is still walked, and its epochs listed, once per path,
 /// as bee does), and a manifest that needs more than
 /// [`MAX_HISTORY_NODE_VISITS`] visits, is deeper than
-/// [`MAX_HISTORY_DEPTH`], has more than [`MAX_HISTORY_ENTRIES`] epochs
-/// or more than [`MAX_HISTORY_METADATA_BYTES`] of fork metadata is
+/// [`MAX_HISTORY_DEPTH`], has more than [`MAX_HISTORY_ENTRIES`] epochs,
+/// more than [`MAX_HISTORY_METADATA_BYTES`] of fork metadata or more
+/// than [`MAX_HISTORY_NODE_BYTES`] of distinct node bytes is
 /// [`ActError::MalformedKvs`].
 pub async fn history_entries(
     fetcher: &dyn ChunkFetcher,
@@ -243,6 +267,7 @@ pub async fn history_entries(
         nodes: HashMap::new(),
         visits: 0,
         metadata_bytes: 0,
+        node_bytes: 0,
         out: Vec::new(),
     };
     let node = walk.load(&root).await?;
@@ -257,6 +282,7 @@ struct HistoryWalk<'a> {
     nodes: HashMap<Vec<u8>, Arc<crate::mantaray::Node>>,
     visits: usize,
     metadata_bytes: usize,
+    node_bytes: usize,
     out: Vec<HistoryEntry>,
 }
 
@@ -273,7 +299,19 @@ impl HistoryWalk<'_> {
         if let Some(node) = self.nodes.get(node_ref) {
             return Ok(Arc::clone(node));
         }
-        let node = Arc::new(load_node_ref(self.fetcher, node_ref).await?);
+        // Join at most what is left of the byte budget; a bigger node is
+        // refused from its root span without fetching the rest.
+        let left = MAX_HISTORY_NODE_BYTES - self.node_bytes;
+        let (node, size) = match load_node_ref(self.fetcher, node_ref, left).await {
+            Err(ManifestError::Fetch(JoinError::TooLarge { .. })) => {
+                return Err(ActError::MalformedKvs(format!(
+                    "history walk joins more than {MAX_HISTORY_NODE_BYTES} node bytes"
+                )));
+            }
+            other => other?,
+        };
+        self.node_bytes += size;
+        let node = Arc::new(node);
         // The cache keeps every fork's metadata alive for the whole
         // walk, including forks into children with no entry, which
         // never reach `out`: charge it once per distinct node.
@@ -397,10 +435,9 @@ pub fn history_with_epoch(
         return Err(ActError::DuplicateEpoch);
     }
     if entries.len() >= MAX_HISTORY_ENTRIES {
-        return Err(ActError::MalformedKvs(format!(
-            "history already has {} epochs, the most it can hold is {MAX_HISTORY_ENTRIES}",
-            entries.len()
-        )));
+        return Err(ActError::HistoryFull {
+            epochs: entries.len(),
+        });
     }
     let mut raw: Vec<RawManifestEntry> = entries
         .iter()
@@ -816,6 +853,112 @@ mod tests {
         let entries: Vec<_> = (1..=MAX_HISTORY_ENTRIES as i64).map(entry).collect();
         let err =
             history_with_epoch(&entries, history_key(0), [1; 32], BTreeMap::new()).unwrap_err();
-        assert!(matches!(err, ActError::MalformedKvs(_)), "{err:?}");
+        assert!(
+            matches!(err, ActError::HistoryFull { epochs } if epochs == MAX_HISTORY_ENTRIES),
+            "{err:?}"
+        );
+        // One under the cap still takes the new epoch.
+        history_with_epoch(&entries[1..], history_key(0), [1; 32], BTreeMap::new())
+            .expect("room for one more");
+    }
+
+    /// An empty node padded to `size` bytes; the parser ignores what
+    /// follows its fork table, so this is a valid node of that size.
+    /// `tag` keeps nodes of the same size distinct.
+    fn padded_node(size: usize, tag: u8) -> Vec<u8> {
+        let mut node = raw_node(None, &[]);
+        node.resize(size, 0);
+        node[size - 1] = tag;
+        node
+    }
+
+    /// A node bigger than the whole byte budget is refused from its root
+    /// chunk's span: only the header sniff's few chunks are fetched, not
+    /// the 17 MiB behind it (R1-M2, PR #323).
+    #[tokio::test]
+    async fn oversized_node_is_refused_from_its_span() {
+        let mut f = MapFetcher::default();
+        let big = f.put_file(&padded_node(MAX_HISTORY_NODE_BYTES + 1024 * 1024, 1));
+        let root = f.put_file(&raw_node(None, &[(b"1".to_vec(), big, None)]));
+        assert_malformed(history_entries(&f, root).await, "node bytes");
+        assert!(f.fetches() <= 8, "{} fetches", f.fetches());
+    }
+
+    /// Many distinct nodes, each well under the per-file cap, still add
+    /// up: 17 distinct 1 MiB nodes are more than the 16 MiB a walk may
+    /// join, and the 17th is refused before its chunks are fetched;
+    /// 15 of them fit.
+    #[tokio::test]
+    async fn node_byte_budget_binds_across_nodes() {
+        const MIB: usize = 1024 * 1024;
+        let mut f = MapFetcher::default();
+        let nodes: Vec<_> = (0..17u8)
+            .map(|b| f.put_file(&padded_node(MIB, b)))
+            .collect();
+        let forks = |n: usize| -> Vec<_> {
+            nodes[..n]
+                .iter()
+                .enumerate()
+                .map(|(b, node)| (vec![b as u8], *node, None))
+                .collect()
+        };
+        let fits = f.put_file(&raw_node(None, &forks(15)));
+        assert!(history_entries(&f, fits)
+            .await
+            .expect("under budget")
+            .is_empty());
+
+        let over = f.put_file(&raw_node(None, &forks(17)));
+        let stored = f.chunks.len();
+        let before = f.fetches();
+        assert_malformed(history_entries(&f, over).await, "node bytes");
+        // 16 nodes joined (about 258 chunks each, plus the sniff's
+        // re-reads), the 17th stops at its root span.
+        let per_node = MIB / 4096 + 3;
+        assert!(
+            f.fetches() - before <= 16 * per_node + 8,
+            "{} fetches for {stored} chunks",
+            f.fetches() - before
+        );
+    }
+
+    /// A real, full history (the most epochs the writer allows, each
+    /// with an `encryptedglref`, timestamps spread so the trie branches
+    /// at many digits) reads back whole under every cap.
+    #[tokio::test]
+    async fn full_real_history_fits_every_budget() {
+        let mut entries: Vec<HistoryEntry> = (0..MAX_HISTORY_ENTRIES as i64 - 1)
+            .map(|i| HistoryEntry {
+                key: history_key(1_600_000_000 + i * 7_919 + (i * i) % 1_000),
+                reference: [(i % 251) as u8 + 1; 32],
+                metadata: BTreeMap::from([(
+                    HISTORY_GRANTEE_LIST_KEY.to_string(),
+                    format!("{i:0128x}"),
+                )]),
+            })
+            .collect();
+        let last = HistoryEntry {
+            key: history_key(1_000_000_000),
+            reference: [9; 32],
+            metadata: BTreeMap::from([(HISTORY_GRANTEE_LIST_KEY.to_string(), "ab".repeat(64))]),
+        };
+        let built = history_with_epoch(
+            &entries,
+            last.key.clone(),
+            last.reference,
+            last.metadata.clone(),
+        )
+        .expect("the last epoch fits");
+        entries.push(last);
+        let mut f = MapFetcher::default();
+        for c in &built.chunks {
+            f.chunks.insert(c.address, c.wire.clone());
+        }
+        let read = history_entries(&f, built.root).await.expect("full history");
+        assert_eq!(read.len(), MAX_HISTORY_ENTRIES);
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let got: Vec<_> = read.iter().map(|e| (&e.key, e.reference)).collect();
+        let want: Vec<_> = entries.iter().map(|e| (&e.key, e.reference)).collect();
+        assert_eq!(got, want);
     }
 }
