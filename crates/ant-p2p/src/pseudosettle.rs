@@ -263,9 +263,9 @@ where
 /// Outcome of one pseudosettle round trip.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshOk {
-    /// Amount bee accepted (`<= attempted`). At most
-    /// `lightRefreshRate * elapsed`, often less when our debt with this
-    /// peer is below the time-based budget.
+    /// Amount bee accepted, clamped to what we offered (see
+    /// [`clamp_accepted`]). At most `lightRefreshRate * elapsed`, often
+    /// less when our debt with this peer is below the time-based budget.
     pub accepted: u64,
     /// Bee-side Unix timestamp from the `PaymentAck`. Returned for
     /// optional logging; the driver uses local wall-clock to schedule the
@@ -318,6 +318,14 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
             "PaymentAck.amount overflows u64",
         )
     })?;
+    if accepted > amount {
+        tracing::warn!(
+            target: "ant_p2p::pseudosettle",
+            %peer, accepted, offered = amount,
+            "peer acked more than we offered; clamping to the offered amount",
+        );
+    }
+    let accepted = clamp_accepted(accepted, amount);
 
     // Half-close so bee's `stream.FullClose()` returns promptly. Drop on
     // error path is fine — yamux sends a Reset, bee handles it.
@@ -327,6 +335,16 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
         accepted,
         timestamp: ack.timestamp,
     })
+}
+
+/// The amount a refresh really settled: the peer's `PaymentAck.amount`,
+/// never more than the `offered` amount we sent. Bee clamps its ack to
+/// the payment it received, so a larger figure is a misbehaving peer;
+/// crediting it as-is would wipe more of that peer's balance in our
+/// accounting mirror than was ever settled (so we'd under-count what we
+/// owe and overdraw it) and inflate the `/timesettlements` total.
+fn clamp_accepted(accepted: u64, offered: u64) -> u64 {
+    accepted.min(offered)
 }
 
 /// Encode a non-negative `u64` as the big-endian unsigned bytes that
@@ -805,6 +823,18 @@ pub async fn run_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer acking more than we offered is credited only the offered
+    /// amount; an honest ack (at or below the offer) passes unchanged.
+    #[test]
+    fn over_large_accepted_is_clamped_to_the_offer() {
+        let offered = LIGHT_REFRESH_RATE_UNITS_PER_SEC.saturating_mul(MAX_REFRESH_WINDOW_SECS);
+        assert_eq!(clamp_accepted(offered + 1, offered), offered);
+        assert_eq!(clamp_accepted(u64::MAX, offered), offered);
+        assert_eq!(clamp_accepted(offered, offered), offered);
+        assert_eq!(clamp_accepted(offered / 2, offered), offered / 2);
+        assert_eq!(clamp_accepted(0, offered), 0);
+    }
 
     #[test]
     fn big_int_be_round_trip() {
