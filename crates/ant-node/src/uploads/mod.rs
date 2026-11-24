@@ -33,10 +33,13 @@
 //!
 //! - **Pause / cancel.** A driver checks
 //!   [`JobHandle::pause_requested`] / [`JobHandle::cancel_requested`]
-//!   between every chunk dispatch and every chunk completion. On
-//!   pause it drains in-flight pushes, checkpoints state, and parks
-//!   on a [`Notify`]. Cancel returns immediately and lets the
-//!   future call drop in-flight work.
+//!   between loop turns (after every chunk dispatch and every chunk
+//!   completion). On pause it drains in-flight pushes, checkpoints
+//!   state, and exits; `resume` starts a fresh driver behind it. A
+//!   resume that lands before the driver's next turn clears the pause
+//!   unseen and the same driver simply carries on (see
+//!   [`UploadManager::resume`]). Cancel returns immediately and lets
+//!   the future call drop in-flight work.
 //!
 //! - **Persistence.** [`UploadJobInfo`] is rewritten atomically
 //!   (tmp → fsync → rename) every `CHECKPOINT_INTERVAL_CHUNKS`
@@ -863,10 +866,14 @@ struct JobHandle {
 /// after it), while the stray `Cancelled` from a prefix `cancel` stays
 /// behind, so ranking it first would refuse a job the user resumed. A
 /// full-id `Cancelled` has no such way out: leaving it always rewrites
-/// that same file. So a `Cancelled` stray competes on timestamps below;
-/// the cost is that a clock set back between the driver's last
-/// checkpoint and a prefix `cancel` keeps the checkpoint instead
-/// (resumable, from its cursor).
+/// that same file. So a `Cancelled` stray competes on timestamps below
+/// (in the same second it still wins, through the tie rule). The cost:
+/// a clock set back between the driver's last checkpoint and a prefix
+/// `cancel` keeps that checkpoint instead, and if it is `Running`,
+/// `Pending` or auto-paused, an auto-resuming rehydrate restarts the
+/// upload the user cancelled (pushing, and stamping, its remaining
+/// chunks). That needs a pre-#292 prefix cancel *and* a backwards clock
+/// step; refusing a job the user deliberately resumed needs neither.
 ///
 /// Otherwise the most recently updated: a prefix copy holds the status a
 /// `pause`/`resume`/`cancel` set, the full-id copy the driver's
@@ -874,7 +881,8 @@ struct JobHandle {
 /// older cursor only means re-pushing a few chunks). Those copies have
 /// nothing clock-independent to order them by, so a backwards clock step
 /// can still pick the older of two resumable states (`Paused` vs.
-/// `Running`); either one resumes from a checkpoint, nothing is lost.
+/// `Running`); either one resumes from a checkpoint, nothing is lost
+/// (unlike the stray-`Cancelled` case above, where it is the cancel).
 /// `last_update_unix` is in whole seconds, so a prefix `cancel` and the
 /// driver's last checkpoint can tie: a tie goes to the copy that doesn't
 /// restart the job (never resurrect a pause or cancel), then to the
