@@ -97,14 +97,22 @@ jobs:
 
       - name: no DNS resolver without dnsaddr
         # The point of the feature: hickory and libp2p's DNS transport
-        # are not in the graph at all, on any target.
+        # are not in the graph at all, on any target. List the whole
+        # graph and grep it, rather than `cargo tree -i <crate>`: `-i`
+        # errors with empty stdout on a spec that matches no package or
+        # more than one version (two hickory-protos mid-upgrade), which
+        # would read as "not in the graph". A failed `cargo tree` fails
+        # the step (`set -e`), and an empty listing does too.
         run: |
-          for crate in hickory-proto hickory-resolver libp2p-dns; do
-            found=$(cargo tree -p ant-node --no-default-features -e normal,build --target all -i "$crate" 2>/dev/null)
-            if [ -n "$found" ]; then
-              echo "$crate is in ant-node's graph without dnsaddr:"; echo "$found"; exit 1
-            fi
-          done
+          set -euo pipefail
+          graph=$(cargo tree -p ant-node --no-default-features -e normal,build --target all --prefix none --format '{p}')
+          if ! grep -q '^ant-node v' <<<"$graph"; then
+            echo "cargo tree printed no graph for ant-node:"; echo "$graph"; exit 1
+          fi
+          found=$(grep -E '^(hickory-[a-z-]+|libp2p-dns) v' <<<"$graph" | sed 's/ (\*)$//' | sort -u || true)
+          if [ -n "$found" ]; then
+            echo "DNS crates in ant-node's graph without dnsaddr:"; echo "$found"; exit 1
+          fi
 
       - name: cargo test (lib only)
         # Lib tests cover the unit-test surface (BMT, joiner,
