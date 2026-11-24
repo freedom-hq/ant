@@ -119,8 +119,7 @@ fn nosniff(resp: &axum::http::Response<Body>) -> bool {
 fn content_type(resp: &axum::http::Response<Body>) -> String {
     resp.headers()
         .get(header::CONTENT_TYPE)
-        .map(|v| v.to_str().unwrap().to_string())
-        .unwrap_or_default()
+        .map_or_else(String::new, |v| v.to_str().unwrap().to_string())
 }
 
 /// `GET /bytes/<ref>?filename=a.html` (and every other active
