@@ -1464,6 +1464,9 @@ fn join_encrypted_into<'a>(
         // the fixed 4096-byte encrypted payload is padding).
         if span <= CHUNK_SIZE as u64 {
             let n = span as usize;
+            // Defensive: `decrypt_chunk_parts` always returns a full
+            // CHUNK_SIZE payload, so `n <= CHUNK_SIZE` always fits. A wrong
+            // key doesn't land here either; it yields a garbage span.
             if n > payload.len() {
                 return Err(JoinError::MalformedChunk {
                     offset: out.len() as u64,
