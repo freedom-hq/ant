@@ -179,8 +179,9 @@ pub struct RunConfig {
     /// (no SSDP or HTTP to the LAN gateway, no port mapping on it); and
     /// drops underlays naming one of this node's own public IPs (its
     /// configured and listener external addresses, and an identify-observed
-    /// address once two distinct remote hosts have reported the same IP, so
-    /// one peer can neither fake nor crowd it out), since behind a NAT that
+    /// address once two distinct remote networks (IPv4 /24, IPv6 /48) have
+    /// reported the same IP, so one peer or one operator's address block
+    /// can neither fake nor crowd it out), since behind a NAT that
     /// is the router's WAN address, which hairpin NAT answers from the LAN
     /// side.
     pub public_dials_only: bool,
@@ -589,14 +590,15 @@ fn record_external_address(
 /// external addresses of its own over its life (one per network it joins).
 const OWN_PUBLIC_IPS_CAP: usize = 64;
 
-/// Upper bound on [`OwnPublicIps::reports`]: one entry per reporting host,
-/// so a node holds roughly one per live connection plus the recently closed.
+/// Upper bound on [`OwnPublicIps::reports`]: one entry per reporting
+/// network ([`reporter_net`]), so a node holds at most roughly one per live
+/// connection plus the recently closed.
 const OWN_IP_REPORTERS_CAP: usize = 64;
 
-/// Distinct reporting hosts that must name the same `observed_addr` IP
-/// before it counts as ours. One host (whatever number of peer IDs or
-/// identify pushes it sends) can then neither put an IP in the set nor
-/// crowd ours out of it.
+/// Distinct reporting networks ([`reporter_net`]: an IPv4 /24 or IPv6 /48)
+/// that must name the same `observed_addr` IP before it counts as ours.
+/// One network (whatever number of hosts, peer IDs or identify pushes it
+/// sends) can then neither put an IP in the set nor crowd ours out of it.
 const OWN_IP_CORROBORATION: usize = 2;
 
 /// The IP literals in `addr`.
@@ -609,13 +611,28 @@ fn multiaddr_ips(addr: &Multiaddr) -> impl Iterator<Item = IpAddr> + '_ {
     })
 }
 
-/// Who reported an `observed_addr`: the remote host of the connection it
-/// came in on, or the peer itself when that connection's address carries
-/// no IP literal (a DNS-dialed bootnode).
+/// Who reported an `observed_addr`: the remote network of the connection
+/// it came in on (see [`reporter_net`]), or the peer itself when that
+/// connection's address carries no IP literal (a DNS-dialed bootnode).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IpReporter {
-    Host(IpAddr),
+    Net(IpAddr),
     Peer(PeerId),
+}
+
+/// The network a reporting host's `ip` belongs to, as one operator holds
+/// it: its IPv4 /24, or its IPv6 /48. Keying reporters by the full address
+/// would let one IPv6 host count as any number of "hosts" (a single /64
+/// alone is 2^64 of them), so it could corroborate a junk IP on its own
+/// and crowd honest reporters out of the cap. An IPv4-mapped IPv6 address
+/// counts as its IPv4 address.
+fn reporter_net(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & 0xffff_ff00)),
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(
+            u128::from(v6) & !((1u128 << 80) - 1),
+        )),
+    }
 }
 
 /// The globally routable IPs this node is reachable or observed at, for
@@ -627,10 +644,11 @@ struct OwnPublicIps {
     /// operator (configured, a listener, `UPnP`): ours without further
     /// evidence. Never pruned, capped at [`OWN_PUBLIC_IPS_CAP`].
     trusted: HashSet<IpAddr>,
-    /// Each reporting host's latest global `observed_addr` IP and when it
-    /// said so. A later report replaces the earlier one (a non-global one
-    /// removes it), so a host holds one entry however many it sends.
-    /// Capped at [`OWN_IP_REPORTERS_CAP`]; a new host evicts a reporter
+    /// Each reporting network's ([`reporter_net`]) latest global
+    /// `observed_addr` IP and when it said so. A later report replaces the
+    /// earlier one (a non-global one removes it), so a network holds one
+    /// entry however many hosts, peer IDs or reports it sends.
+    /// Capped at [`OWN_IP_REPORTERS_CAP`]; a new reporter evicts one
     /// with no live connection first (oldest first), so reporters that
     /// connected and left can't push out the ones still connected.
     reports: HashMap<IpReporter, (IpAddr, Instant)>,
@@ -640,7 +658,7 @@ struct OwnPublicIps {
 
 impl OwnPublicIps {
     /// `ip` is ours: a trusted external address, or the `observed_addr`
-    /// of at least [`OWN_IP_CORROBORATION`] distinct reporting hosts.
+    /// of at least [`OWN_IP_CORROBORATION`] distinct reporting networks.
     fn contains(&self, ip: IpAddr) -> bool {
         self.trusted.contains(&ip)
             || self.reports.values().filter(|(r, _)| *r == ip).count() >= OWN_IP_CORROBORATION
@@ -674,7 +692,9 @@ impl OwnPublicIps {
         };
         let reporter = multiaddr_ips(remote)
             .next()
-            .map_or(IpReporter::Peer(peer), IpReporter::Host);
+            .map_or(IpReporter::Peer(peer), |ip| {
+                IpReporter::Net(reporter_net(ip))
+            });
         self.conns.insert(conn, reporter);
     }
 
@@ -1141,8 +1161,9 @@ struct SwarmState {
     external_addresses: HashMap<Multiaddr, (ExternalAddrSource, u64)>,
     /// This node's own public IPs: its configured, listener and `UPnP`
     /// external addresses, plus an identify `observed_addr` IP once
-    /// [`OWN_IP_CORROBORATION`] distinct remote hosts report it (one peer
-    /// can't add an IP, or crowd ours out, alone); see [`OwnPublicIps`].
+    /// [`OWN_IP_CORROBORATION`] distinct remote networks report it (one
+    /// peer, or one /24 or /48 of hosts, can't add an IP, or crowd ours
+    /// out, alone); see [`OwnPublicIps`].
     /// Fed only with `public_dials_only`. With it, an underlay naming one
     /// of them is dropped: from
     /// behind a NAT it is our own router's WAN address, which many routers
@@ -11190,7 +11211,7 @@ mod tests {
         cached.addrs = vec![dns_loopback, public.clone()];
         assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
 
-        // Our own WAN address, once two hosts reported it (identify's
+        // Our own WAN address, once two networks reported it (identify's
         // observed address), is the router's: hairpin NAT answers it from
         // the LAN side. Dropped on enqueue and at dial time; a non-global
         // candidate (behind CGNAT) adds nothing, nor does a single host.
@@ -11198,14 +11219,14 @@ mod tests {
         let observed_wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
         report_on_conn(&mut state, 1, "/ip4/5.0.3.1/tcp/1634", &observed_wan);
         let cgnat: Multiaddr = "/ip4/100.64.0.9/tcp/1634".parse().unwrap();
-        report_on_conn(&mut state, 2, "/ip4/5.0.3.2/tcp/1634", &cgnat);
+        report_on_conn(&mut state, 2, "/ip4/5.0.5.2/tcp/1634", &cgnat);
         assert!(!state.own_public_ips.contains("100.64.0.9".parse().unwrap()));
         cached.addrs = vec![wan.clone(), public.clone()];
         assert_eq!(
             state.addrs_for_dial(&cached),
             Some(vec![wan.clone(), public.clone()])
         );
-        report_on_conn(&mut state, 3, "/ip4/5.0.3.3/tcp/1634", &observed_wan);
+        report_on_conn(&mut state, 3, "/ip4/5.0.4.3/tcp/1634", &observed_wan);
         assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
         cached.addrs = vec![wan.clone()];
         assert_eq!(state.addrs_for_dial(&cached), None);
@@ -11296,15 +11317,15 @@ mod tests {
         let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
         report_on_conn(&mut state, 10, "/ip4/7.0.0.1/tcp/1634", &wan);
         assert!(!state.own_public_ips.contains(ip("81.2.69.77")));
-        report_on_conn(&mut state, 11, "/ip4/7.0.0.2/tcp/1634", &wan);
+        report_on_conn(&mut state, 11, "/ip4/7.1.0.2/tcp/1634", &wan);
         assert!(state.own_public_ips.contains(ip("81.2.69.77")));
 
         // A crowd of hosts that connect, report junk and leave evicts each
         // other, not the connected reporters of our WAN IP.
         for i in 0..(2 * OWN_IP_REPORTERS_CAP) {
             let conn = 100 + i;
-            let host = std::net::Ipv4Addr::from(0x0800_0000 + conn as u32);
-            let [_, _, hi, lo] = host.octets();
+            let host = std::net::Ipv4Addr::from(0x0800_0000 + ((conn as u32) << 8));
+            let [_, hi, lo, _] = host.octets();
             let junk: Multiaddr = format!("/ip4/9.9.{hi}.{lo}/tcp/1").parse().unwrap();
             report_on_conn(&mut state, conn, &format!("/ip4/{host}/tcp/1"), &junk);
             state
@@ -11314,11 +11335,11 @@ mod tests {
         assert!(state.own_public_ips.reports.len() <= OWN_IP_REPORTERS_CAP);
         assert!(state.own_public_ips.contains(ip("81.2.69.77")));
 
-        // After a network change, the new WAN IP takes over once two hosts
+        // After a network change, the new WAN IP takes over once two networks
         // report it from the new network.
         let new_wan: Multiaddr = "/ip4/81.2.70.1/tcp/5000".parse().unwrap();
-        report_on_conn(&mut state, 500, "/ip4/7.0.1.1/tcp/1634", &new_wan);
-        report_on_conn(&mut state, 501, "/ip4/7.0.1.2/tcp/1634", &new_wan);
+        report_on_conn(&mut state, 500, "/ip4/7.2.0.1/tcp/1634", &new_wan);
+        report_on_conn(&mut state, 501, "/ip4/7.3.0.1/tcp/1634", &new_wan);
         assert!(state.own_public_ips.contains(ip("81.2.70.1")));
 
         // A trusted (listener / configured) external address counts at once.
@@ -11326,6 +11347,53 @@ mod tests {
             .own_public_ips
             .note_trusted(&"/ip4/203.0.114.5/tcp/1634".parse().unwrap());
         assert!(state.own_public_ips.contains(ip("203.0.114.5")));
+    }
+
+    /// One IPv6 operator holds whole prefixes (a single /64 is 2^64
+    /// addresses), so reporters count per /48 (and IPv4 per /24): hosts
+    /// across one block can neither corroborate a junk IP between them
+    /// nor, with any number of live connections, evict the live reporters
+    /// of our WAN IP.
+    #[test]
+    fn own_public_ips_count_reporters_per_network() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        let wan: Multiaddr = "/ip4/81.2.69.77/tcp/41234".parse().unwrap();
+        report_on_conn(&mut state, 1, "/ip4/7.0.0.1/tcp/1634", &wan);
+        report_on_conn(&mut state, 2, "/ip6/2001:db9::1/tcp/1634", &wan);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
+
+        // Two hosts in one /64, one /48, one /24: not corroboration.
+        let junk: Multiaddr = "/ip4/5.0.3.1/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 10, "/ip6/2a01:4f8:1:2::1/tcp/1", &junk);
+        report_on_conn(&mut state, 11, "/ip6/2a01:4f8:1:2::2/tcp/1", &junk);
+        report_on_conn(&mut state, 12, "/ip6/2a01:4f8:1:ffff::9/tcp/1", &junk);
+        assert!(!state.own_public_ips.contains(ip("5.0.3.1")));
+        let junk4: Multiaddr = "/ip4/5.0.3.2/tcp/1".parse().unwrap();
+        report_on_conn(&mut state, 13, "/ip4/6.6.6.1/tcp/1", &junk4);
+        report_on_conn(&mut state, 14, "/ip4/6.6.6.200/tcp/1", &junk4);
+        report_on_conn(&mut state, 15, "/ip6/::ffff:6.6.6.7/tcp/1", &junk4);
+        assert!(!state.own_public_ips.contains(ip("5.0.3.2")));
+
+        // Many live connections from one /48 stay one reporter: the cap
+        // never fills, our WAN IP's reporters stay.
+        for i in 0..(4 * OWN_IP_REPORTERS_CAP) {
+            let host = format!("/ip6/2a01:4f8:1:{:x}::{:x}/tcp/1", i % 7, i + 1);
+            let junk: Multiaddr = format!("/ip4/9.9.{}.{}/tcp/1", i / 256, i % 256)
+                .parse()
+                .unwrap();
+            report_on_conn(&mut state, 100 + i, &host, &junk);
+        }
+        assert!(state.own_public_ips.reports.len() <= 4);
+        assert!(state.own_public_ips.contains(ip("81.2.69.77")));
     }
 
     /// `public_dials_only` turns `UPnP` off: no SSDP search or HTTP to the
