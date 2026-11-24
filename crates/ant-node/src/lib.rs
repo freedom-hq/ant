@@ -35,6 +35,11 @@ pub struct NodeConfig {
     /// private/loopback underlays even off-LAN, and gossiped DNS-named
     /// underlays. Dev/test networks only.
     pub allow_private_dials: bool,
+    /// Forwarded to `ant_p2p::RunConfig::outbound_only`: no listener, no
+    /// `UPnP`, no external address advertised. For embedders that only
+    /// fetch. `false` (the default) keeps the full node behaviour; with
+    /// `true`, non-empty [`Self::external_addrs`] make [`run_node`] fail.
+    pub outbound_only: bool,
     /// Optional live status sink written to by the node loop.
     pub status: Option<watch::Sender<StatusSnapshot>>,
     /// Where to persist the warm-restart peer snapshot. `None` disables it.
@@ -154,6 +159,7 @@ impl NodeConfig {
             libp2p_keypair,
             external_addrs: Vec::new(),
             allow_private_dials: false,
+            outbound_only: false,
             status: None,
             peerstore_path: None,
             commands: None,
@@ -197,6 +203,13 @@ impl NodeConfig {
     #[must_use]
     pub const fn with_allow_private_dials(mut self, allow: bool) -> Self {
         self.allow_private_dials = allow;
+        self
+    }
+
+    /// See [`Self::outbound_only`].
+    #[must_use]
+    pub const fn with_outbound_only(mut self, outbound_only: bool) -> Self {
+        self.outbound_only = outbound_only;
         self
     }
 
@@ -328,6 +341,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         libp2p_keypair: cfg.libp2p_keypair,
         external_addrs: cfg.external_addrs,
         allow_private_dials: cfg.allow_private_dials,
+        outbound_only: cfg.outbound_only,
         status: cfg.status,
         // `None` → 0 → `ant_p2p` falls back to `DEFAULT_TARGET_PEERS = 100`.
         // `Some(n)` is forwarded literally; values above bee's typical
@@ -481,5 +495,76 @@ async fn intercept_commands(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn node(outbound_only: bool) -> (NodeConfig, watch::Receiver<StatusSnapshot>) {
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+        let cfg = NodeConfig::mainnet_default(
+            ant_crypto::random_secp256k1_secret(),
+            ant_crypto::random_overlay_nonce(),
+            Vec::new(),
+            Keypair::generate_ed25519(),
+        )
+        .with_network_id(4020)
+        .with_status(tx)
+        .with_outbound_only(outbound_only);
+        (cfg, rx)
+    }
+
+    /// Issue #269, end to end through `run_node`: an outbound-only node
+    /// runs without opening a listener and without an external address,
+    /// and external addresses configured for one are refused at start.
+    /// (No bootnodes: nothing is dialed.)
+    ///
+    /// A default node runs alongside as the control: the outbound-only
+    /// node is only checked once the control's listeners have reached its
+    /// status snapshot (plus a margin), so a regression in the status
+    /// listener sync, or a slow first poll, fails here instead of letting
+    /// "no listeners" pass for an unrelated reason.
+    #[tokio::test]
+    async fn an_outbound_only_node_opens_no_listener() {
+        let (cfg, status) = node(true);
+        let task = tokio::spawn(run_node(cfg));
+        let (control_cfg, mut control_status) = node(false);
+        let control = tokio::spawn(run_node(control_cfg));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            control_status.wait_for(|st| !st.listeners.is_empty()),
+        )
+        .await
+        .expect("the default (control) node never published a listener")
+        .expect("the control node's status channel closed");
+        assert!(!control.is_finished(), "the control node stopped");
+        control.abort();
+        // The two nodes started together; give the outbound-only one the
+        // same time plus a margin before reading its snapshot.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(!task.is_finished(), "the node stopped");
+        let st = status.borrow().clone();
+        assert!(st.listeners.is_empty(), "listening on {:?}", st.listeners);
+        assert!(
+            st.external_addresses.is_empty(),
+            "advertising {:?}",
+            st.external_addresses
+        );
+        task.abort();
+
+        let (cfg, _status) = node(true);
+        let cfg = cfg.with_external_addrs(vec!["/ip4/203.0.113.10/tcp/1634".parse().unwrap()]);
+        let got = tokio::time::timeout(Duration::from_secs(5), run_node(cfg))
+            .await
+            .expect("refused at start");
+        assert!(
+            matches!(got, Err(NodeError::P2p(ant_p2p::RunError::Config(_)))),
+            "{got:?}"
+        );
     }
 }

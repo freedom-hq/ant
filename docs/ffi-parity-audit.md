@@ -235,6 +235,7 @@ An embedded host can set only:
 | `--cors-allowed-origins` | `antd` `cors_allowed_origins` (also gates web-page writes and WebSockets, issue #312) | `ant_set_gateway_cors` (`ffi-gw`; empty by default) | **ported** (FFI setter) |
 | `--allowed-hosts` / `allowed-hosts` (issue #312) | `antd` `allowed_hosts`, validated by `HostPolicy::check_entry`; `Gateway::serve` resolves it against the bound address and warns on a non-loopback bind without it | `ant_set_gateway_allowed_hosts` (`ffi-gw`; same validation, fixed while a gateway runs) | **shared** (`ant_gateway::HostPolicy`, checked by the router's outermost `hosts::host_guard`) |
 | `--external-address` | `antd:125`, `654` | — | not settable (n/a behind NAT) |
+| — (`NodeConfig::outbound_only`, issue #269: no listener, no UPnP, no external address advertised) | not set (antd serves) | not set | embedder option only (`ant_node::run_node`) |
 | `--allow-private-dials` | `antd:135`, `655` | — (default `false`) | not settable |
 | `--peers-file`, `--no-peerstore`, `--reset-peerstore` | `antd:141-164` | fixed path; no reset | not settable |
 | `--target-peers` | `antd:157`, `658` | — (100) | not settable (Low: battery tuning) |
