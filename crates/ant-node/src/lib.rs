@@ -34,6 +34,11 @@ pub struct NodeConfig {
     /// Forwarded to `ant_p2p::RunConfig::allow_private_dials`: dial peers'
     /// private/loopback underlays even off-LAN. Dev/test networks only.
     pub allow_private_dials: bool,
+    /// Forwarded to `ant_p2p::RunConfig::outbound_only`: no listener, no
+    /// `UPnP`, no external address advertised. For embedders that only
+    /// fetch. `false` (the default) keeps the full node behaviour; with
+    /// `true`, non-empty [`Self::external_addrs`] make [`run_node`] fail.
+    pub outbound_only: bool,
     /// Optional live status sink written to by the node loop.
     pub status: Option<watch::Sender<StatusSnapshot>>,
     /// Where to persist the warm-restart peer snapshot. `None` disables it.
@@ -151,6 +156,7 @@ impl NodeConfig {
             libp2p_keypair,
             external_addrs: Vec::new(),
             allow_private_dials: false,
+            outbound_only: false,
             status: None,
             peerstore_path: None,
             commands: None,
@@ -194,6 +200,13 @@ impl NodeConfig {
     #[must_use]
     pub const fn with_allow_private_dials(mut self, allow: bool) -> Self {
         self.allow_private_dials = allow;
+        self
+    }
+
+    /// See [`Self::outbound_only`].
+    #[must_use]
+    pub const fn with_outbound_only(mut self, outbound_only: bool) -> Self {
+        self.outbound_only = outbound_only;
         self
     }
 
@@ -325,6 +338,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         libp2p_keypair: cfg.libp2p_keypair,
         external_addrs: cfg.external_addrs,
         allow_private_dials: cfg.allow_private_dials,
+        outbound_only: cfg.outbound_only,
         status: cfg.status,
         // `None` → 0 → `ant_p2p` falls back to `DEFAULT_TARGET_PEERS = 100`.
         // `Some(n)` is forwarded literally; values above bee's typical

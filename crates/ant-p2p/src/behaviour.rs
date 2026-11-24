@@ -55,6 +55,10 @@ pub enum RunError {
     Handshake(#[from] crate::handshake::HandshakeError),
     #[error("behaviour: {0}")]
     Behaviour(#[from] libp2p::BehaviourBuilderError),
+    /// The configuration contradicts itself (for example external
+    /// addresses on an outbound-only node).
+    #[error("config: {0}")]
+    Config(String),
 }
 
 /// Postage stamping + signing key wired at daemon startup for pushsync uploads.
@@ -161,6 +165,18 @@ pub struct RunConfig {
     /// for dev/test networks that live entirely on one private network or
     /// on loopback. Same-LAN private peers are dialed regardless.
     pub allow_private_dials: bool,
+    /// Outbound-only node: no listener, no `UPnP` port mapping, and no
+    /// external address of ours registered for identify, whether from
+    /// the operator, a listener, `UPnP` or a peer's `observed_addr`. For
+    /// an embedder that only fetches (a wallet reading a few chunks) and
+    /// should neither be reachable from outside nor announce its public
+    /// address. Peers still see the address of the connection we
+    /// dial them from, which the BZZ handshake echoes back to them as
+    /// our underlay, as for any node behind NAT. `false` (the default)
+    /// keeps the full behaviour: listen on `/ip4/0.0.0.0/tcp/0`, map a port over
+    /// `UPnP`, advertise external addresses. With `true`, a non-empty
+    /// [`Self::external_addrs`] is refused at start.
+    pub outbound_only: bool,
     /// Live status view maintained by the swarm loop; read by the control
     /// socket server.
     pub status: Option<watch::Sender<StatusSnapshot>>,
@@ -324,10 +340,10 @@ mod derived {
         /// `/ip4/<wan>/tcp/<port>` multiaddr. Treated as opportunistic: on
         /// hosts without an IGD-capable router (cloud VMs, corporate NAT,
         /// CGNAT) the behaviour just emits `GatewayNotFound` /
-        /// `NonRoutableGateway` and stays quiet, so leaving it always-on is
-        /// safe — handlers in `apply_event` only ever *add* addresses, never
-        /// reject existing ones.
-        pub(super) upnp: libp2p::upnp::tokio::Behaviour,
+        /// `NonRoutableGateway` and stays quiet — handlers in `apply_event`
+        /// only ever *add* addresses, never reject existing ones. Disabled
+        /// on an outbound-only node ([`super::RunConfig::outbound_only`]).
+        pub(super) upnp: libp2p::swarm::behaviour::toggle::Toggle<libp2p::upnp::tokio::Behaviour>,
     }
 }
 
@@ -844,6 +860,8 @@ struct SwarmState {
     hint_queue: VecDeque<sinks::PeerHint>,
     /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
     allow_private_dials: bool,
+    /// [`RunConfig::outbound_only`]: never register an external address.
+    outbound_only: bool,
     /// Cached snapshot of this host's subnets for the same-LAN exception
     /// of the underlay filter, with the time it was taken.
     local_subnets: Option<(Instant, crate::underlay::LocalSubnets)>,
@@ -1123,6 +1141,7 @@ impl SwarmState {
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             allow_private_dials: false,
+            outbound_only: false,
             local_subnets: None,
             dial_backoff: HashMap::new(),
             target_peers,
@@ -1864,6 +1883,18 @@ fn local_overlay_from_secret(
     overlay_from_ethereum_address(&eth, network_id, overlay_nonce)
 }
 
+/// An outbound-only node advertises no address, so external addresses
+/// given for one are refused rather than silently dropped.
+fn check_outbound_only(outbound_only: bool, external_addrs: &[Multiaddr]) -> Result<(), RunError> {
+    if outbound_only && !external_addrs.is_empty() {
+        return Err(RunError::Config(
+            "external addresses were given for an outbound-only node, which advertises none"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Run forever. Keeps a running handshake pipeline (capacity =
 /// `target_peers`) fed by two sources: the static bootnode list (bootstrap
 /// only) and live `/swarm/hive/1.1.0/peers` gossip from every connected
@@ -1872,12 +1903,21 @@ fn local_overlay_from_secret(
 /// `target_peers` and the dialer stops pulling from the hint queue.
 pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let local_peer_id = cfg.libp2p_keypair.public().to_peer_id();
-    let mut swarm = build_swarm(cfg.libp2p_keypair.clone(), &LivenessConfig::DEFAULT)?;
+    check_outbound_only(cfg.outbound_only, &cfg.external_addrs)?;
+    let mut swarm = build_swarm(
+        cfg.libp2p_keypair.clone(),
+        &LivenessConfig::DEFAULT,
+        !cfg.outbound_only,
+    )?;
     let mut commands = cfg.commands.take();
-    let listen: Multiaddr = LISTEN.parse().unwrap();
-    swarm
-        .listen_on(listen)
-        .map_err(|e| std::io::Error::other(format!("listen_on: {e}")))?;
+    if cfg.outbound_only {
+        info!(target: "ant_p2p", "outbound-only: no listener, no UPnP, no external address");
+    } else {
+        let listen: Multiaddr = LISTEN.parse().unwrap();
+        swarm
+            .listen_on(listen)
+            .map_err(|e| std::io::Error::other(format!("listen_on: {e}")))?;
+    }
 
     // Deferred operator warning: if neither user-supplied externals, listener
     // auto-promotion, nor UPnP have produced a globally-routable address by
@@ -1886,8 +1926,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // seconds and listener-address auto-promotion happens in the run loop —
     // an eager check would always fire on home routers where UPnP would have
     // succeeded a moment later. The deadline is checked from the main loop
-    // after every event so we don't need a separate timer.
-    let mut external_address_check_deadline = Some(Instant::now() + EXTERNAL_ADDRESS_CHECK_DELAY);
+    // after every event so we don't need a separate timer. An outbound-only
+    // node has no external address by design: nothing to warn about.
+    let mut external_address_check_deadline =
+        (!cfg.outbound_only).then(|| Instant::now() + EXTERNAL_ADDRESS_CHECK_DELAY);
 
     let mut control = swarm.behaviour().stream.new_control();
     let mut peer_agents: HashMap<PeerId, String> = HashMap::new();
@@ -1937,6 +1979,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     }
     state.credit_ledger = credit_ledger;
     state.allow_private_dials = cfg.allow_private_dials;
+    state.outbound_only = cfg.outbound_only;
     state.swap_enabled = cfg.swap_enabled;
     state.status = cfg.status.clone();
     publish_settlement(&state);
@@ -8814,7 +8857,9 @@ fn handle_swarm_event(
     ev: SwarmEvent<AntBehaviourEvent>,
 ) {
     match ev {
-        SwarmEvent::NewListenAddr { address, .. } if !is_loopback_multiaddr(&address) => {
+        SwarmEvent::NewListenAddr { address, .. }
+            if !state.outbound_only && !is_loopback_multiaddr(&address) =>
+        {
             // Advertise non-loopback listeners as external addresses so that
             // our identify message carries usable `listen_addrs`. Without this
             // bee's inbound handshake handler waits 10 s in `peerMultiaddrs`
@@ -8825,8 +8870,9 @@ fn handle_swarm_event(
         // a candidate here. Promote globally-routable ones to confirmed
         // external addresses so the next outbound identify carries our
         // NAT-punched public multiaddr and bee's peerstore accepts it.
+        // Never on an outbound-only node, which announces no address.
         SwarmEvent::NewExternalAddrCandidate { address }
-            if is_globally_routable_multiaddr(&address) =>
+            if !state.outbound_only && is_globally_routable_multiaddr(&address) =>
         {
             record_external_address(state, swarm, status, address, ExternalAddrSource::Observed);
         }
@@ -9777,9 +9823,11 @@ fn resolver_config() -> dns::ResolverConfig {
     }
 }
 
+/// `upnp`: run the `UPnP` behaviour (off for an outbound-only node).
 fn build_swarm(
     keypair: Keypair,
     liveness: &LivenessConfig,
+    upnp: bool,
 ) -> Result<Swarm<AntBehaviour>, RunError> {
     // `push_listen_addr_updates` triggers an identify-push whenever our
     // listener set changes. That matters for bee: if a later listener arrives
@@ -9798,7 +9846,7 @@ fn build_swarm(
                 .with_interval(liveness.ping_interval)
                 .with_timeout(liveness.ping_timeout),
         ),
-        upnp: libp2p::upnp::tokio::Behaviour::default(),
+        upnp: upnp.then(libp2p::upnp::tokio::Behaviour::default).into(),
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -9988,7 +10036,7 @@ mod tests {
         let cfg = FAST_LIVENESS;
         let proto = StreamProtocol::new("/ant/test/sink/1.0.0");
         // Remote: a plain node of ours on loopback, frozen on demand.
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10021,7 +10069,7 @@ mod tests {
         // forwarding but keeps both sockets open. Nothing reaches either
         // side any more and nobody sees a FIN or RST: a half-open link.
         let (proxy_addr, freeze) = freezable_tcp_relay(&remote_addr).await;
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         let mut state = test_state();
         state.liveness = Liveness::new(cfg, Instant::now());
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
@@ -10142,7 +10190,8 @@ mod tests {
     /// visible as the cleared hint dedup), once per cooldown window.
     #[tokio::test]
     async fn link_failure_streak_triggers_one_self_heal_per_window() {
-        let mut swarm = build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT).unwrap();
+        let mut swarm =
+            build_swarm(Keypair::generate_ed25519(), &LivenessConfig::DEFAULT, true).unwrap();
         let mut state = test_state();
         let (dial_tx, _dial_rx) = mpsc::channel::<Multiaddr>(8);
         let (mut backoff, mut last_boot, mut last_top_up) =
@@ -10192,13 +10241,80 @@ mod tests {
         assert_eq!(backoff, MAX_BACKOFF);
     }
 
+    /// Issue #269: an outbound-only node runs no `UPnP` and registers no
+    /// external address, neither from a listener address nor from a
+    /// peer's `observed_addr`; the same events on a default node do
+    /// register both (so the assertions are not vacuous). External
+    /// addresses configured for an outbound-only node are refused.
+    #[tokio::test]
+    async fn outbound_only_node_registers_no_external_address() {
+        let public_listener: Multiaddr = "/ip4/198.51.100.30/tcp/1634".parse().unwrap();
+        // Globally routable (documentation ranges are not, so not 198.51.100.0/24).
+        let public_observed: Multiaddr = "/ip4/93.184.216.34/tcp/40312".parse().unwrap();
+        for outbound_only in [true, false] {
+            let mut ours =
+                build_swarm(Keypair::generate_ed25519(), &FAST_LIVENESS, !outbound_only).unwrap();
+            assert_eq!(ours.behaviour().upnp.is_enabled(), !outbound_only);
+            let mut state = test_state();
+            state.outbound_only = outbound_only;
+            let mut control = ours.behaviour().stream.new_control();
+            let hs = HandshakeParams {
+                local_peer_id: *ours.local_peer_id(),
+                signing_secret: [7u8; SECP256K1_SECRET_LEN],
+                overlay_nonce: [0u8; OVERLAY_NONCE_LEN],
+                network_id: 1,
+            };
+            let (result_tx, _result_rx) = mpsc::channel(8);
+            let mut peerstore = PeerStore::disabled();
+            for ev in [
+                SwarmEvent::NewListenAddr {
+                    listener_id: libp2p::core::transport::ListenerId::next(),
+                    address: public_listener.clone(),
+                },
+                SwarmEvent::NewExternalAddrCandidate {
+                    address: public_observed.clone(),
+                },
+            ] {
+                handle_swarm_event(
+                    &mut ours,
+                    &mut state,
+                    None,
+                    &mut control,
+                    &hs,
+                    &result_tx,
+                    &mut peerstore,
+                    ev,
+                );
+            }
+            let advertised: Vec<Multiaddr> = ours.external_addresses().cloned().collect();
+            if outbound_only {
+                assert!(advertised.is_empty(), "advertised {advertised:?}");
+                assert!(state.external_addresses.is_empty());
+                assert_eq!(ours.listeners().count(), 0);
+            } else {
+                assert!(
+                    advertised.contains(&public_listener),
+                    "advertised {advertised:?}"
+                );
+                assert_eq!(state.external_addresses.len(), 2);
+            }
+        }
+        let manual: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
+        assert!(matches!(
+            check_outbound_only(true, std::slice::from_ref(&manual)),
+            Err(RunError::Config(_))
+        ));
+        assert!(check_outbound_only(true, &[]).is_ok());
+        assert!(check_outbound_only(false, &[manual]).is_ok());
+    }
+
     /// A peer with a duplicate connection keeps its BZZ session, routing
     /// entry and status row when one of the two closes (liveness may close
     /// a dead duplicate next to a live one).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_one_of_two_connections_keeps_the_peer() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10213,7 +10329,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         let mut state = test_state();
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::default());
         let mut control = ours.behaviour().stream.new_control();
@@ -10290,7 +10406,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn duplicate_dialer_connection_clears_dial_start_markers() {
         let cfg = FAST_LIVENESS;
-        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut remote = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         remote
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
@@ -10305,7 +10421,7 @@ mod tests {
                 remote.select_next_some().await;
             }
         });
-        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg).unwrap();
+        let mut ours = build_swarm(Keypair::generate_ed25519(), &cfg, true).unwrap();
         let mut state = test_state();
         let mut control = ours.behaviour().stream.new_control();
         let hs = HandshakeParams {

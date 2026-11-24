@@ -233,6 +233,7 @@ An embedded host can set only:
 | `--no-http-api` | `antd:109` | don't call `ant_start_gateway` | FFI (call or not) |
 | `--cors-allowed-origins` | `antd:118` | hard-coded `["null"]` (`ffi-gw:249`) | hard-coded |
 | `--external-address` | `antd:125`, `654` | — | not settable (n/a behind NAT) |
+| — (`NodeConfig::outbound_only`, issue #269: no listener, no UPnP, no external address advertised) | not set (antd serves) | not set | embedder option only (`ant_node::run_node`) |
 | `--allow-private-dials` | `antd:135`, `655` | — (default `false`) | not settable |
 | `--peers-file`, `--no-peerstore`, `--reset-peerstore` | `antd:141-164` | fixed path; no reset | not settable |
 | `--target-peers` | `antd:157`, `658` | — (100) | not settable (Low: battery tuning) |
