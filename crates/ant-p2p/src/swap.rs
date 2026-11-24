@@ -84,9 +84,11 @@
 //! - On-chain `chequebook(Cheque.Chequebook).issuer()` validation.
 //!   The ledger pins the `(chequebook → expected_signer)` binding on
 //!   first sight; subsequent cheques must match. A peer whose handshake
-//!   named a chequebook can only pay from that one, but the handshake's
-//!   chequebook is the peer's own claim, so a peer can still name
-//!   someone else's and pin it to its own key first. A future hardening
+//!   named a chequebook can only pay from that one, but a peer that
+//!   named none (and the handshake's chequebook is only the peer's own
+//!   claim anyway) can still put a cheque on someone else's chequebook
+//!   and pin it to its own key first; only the number of new
+//!   chequebooks is capped. A future hardening
 //!   step is a one-shot RPC at first contact to confirm the signer
 //!   really controls the chequebook.
 //! - Auto-cashout. Cashing the highest-cumulative cheque on-chain
@@ -293,9 +295,9 @@ struct LedgerSnapshot {
 /// not yet on file is refused once the ledger holds this many; cheques on
 /// chequebooks already on file keep working. Without on-chain checks a
 /// self-signed cheque on a made-up chequebook is all it takes to add an
-/// entry, so this is what bounds the ledger file (about 170 bytes of
-/// JSON per entry, so about 0.7 MB at the cap) and the cost of each
-/// rewrite.
+/// entry, so this is what bounds the ledger file (at most about 240
+/// bytes of JSON per entry with a 78-digit cumulative, so under 1 MB at
+/// the cap) and the cost of each rewrite.
 pub const MAX_INBOUND_CHEQUEBOOKS: usize = 4096;
 
 /// Most chequebooks one peer (by `PeerId`, for the life of the process)
@@ -347,12 +349,13 @@ struct Checked {
 /// the ledger holds fewer than [`MAX_INBOUND_CHEQUEBOOKS`] and the peer
 /// has added fewer than [`MAX_INBOUND_CHEQUEBOOKS_PER_PEER`].
 ///
-/// None of this proves the chequebook is real: the chequebook address
-/// in a handshake is the peer's own claim, so a peer can still name
+/// None of this proves the chequebook is real. A handshaken peer that
+/// named no chequebook may pay from any, and the one a handshake names
+/// is only the peer's own claim, so a peer can still put a cheque on
 /// someone else's chequebook and pin it to its own key on first sight
-/// (rule 2). Bee closes that with an on-chain check (factory
-/// `deployedContracts` and the chequebook's `issuer()`), which this
-/// ledger doesn't do.
+/// (rule 2); the caps only bound how many. Bee closes that with an
+/// on-chain check (factory `deployedContracts` and the chequebook's
+/// `issuer()`), which this ledger doesn't do.
 ///
 /// Persistence is atomic: each accepted cheque is followed by a fresh
 /// JSON snapshot written to a temp file, fsynced, and renamed over the
@@ -4203,21 +4206,30 @@ mod tests {
             .await
             .is_err());
 
-        // In total: fill the ledger to the cap, one fresh peer per two
-        // chequebooks, as a peer-id-minting attacker would.
-        let mut n = MAX_INBOUND_CHEQUEBOOKS_PER_PEER as usize;
-        while n < MAX_INBOUND_CHEQUEBOOKS {
-            let p = PeerId::random();
-            peers.record(p, eoa(&attacker));
-            for _ in 0..MAX_INBOUND_CHEQUEBOOKS_PER_PEER {
-                if n == MAX_INBOUND_CHEQUEBOOKS {
-                    break;
-                }
-                let c = inbound_cheque(&attacker, fake_chequebook(n + 1), our_eoa, 1);
-                ledger.record_from_peer(p, &c).await.unwrap();
-                n += 1;
-            }
-        }
+        // In total. A ledger file one short of the cap, written with
+        // the widest cumulative a cheque can carry so the file size below
+        // is the worst case.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credits.json");
+        write_full_ledger(&path, MAX_INBOUND_CHEQUEBOOKS - 1, &eoa(&attacker));
+        let ledger = Arc::new(
+            CreditLedger::open(Some(path.clone()), 100, our_eoa).with_peers(peers.clone()),
+        );
+        // A fresh peer id adds the last one...
+        let fresh = PeerId::random();
+        peers.record(fresh, eoa(&attacker));
+        let last = inbound_cheque(&attacker, [0x10u8; 20], our_eoa, 1);
+        ledger.record_from_peer(fresh, &last).await.unwrap();
+        assert_eq!(ledger.snapshot().len(), MAX_INBOUND_CHEQUEBOOKS);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 1_000_000, "ledger file at the cap is {size} bytes");
+        // ...and from then on nobody adds one: not another fresh peer id,
+        // not an honest peer, not the no-peer path.
+        let another = PeerId::random();
+        peers.record(another, eoa(&attacker));
+        let fake = inbound_cheque(&attacker, [0x12u8; 20], our_eoa, 1);
+        let err = ledger.record_from_peer(another, &fake).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err}");
         let honest = make_secret();
         let honest_peer = PeerId::random();
         let honest_cb = [0x11u8; 20];
@@ -4227,7 +4239,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SwapError::Rejected(_)), "{err}");
-        let fake = inbound_cheque(&attacker, [0x12u8; 20], our_eoa, 1);
         assert!(
             ledger.record_accepted(&fake).is_err(),
             "no-peer path capped too"
@@ -4236,11 +4247,40 @@ mod tests {
         assert_eq!(ledger.snapshot().len(), MAX_INBOUND_CHEQUEBOOKS);
         assert_eq!(ledger.cumulative_for(&honest_cb), U256::zero());
         // A chequebook on file is still paid at the cap.
-        let known = inbound_cheque(&attacker, fake_chequebook(0), our_eoa, 3);
+        let known = inbound_cheque(&attacker, fake_chequebook(0), our_eoa, 2);
         assert_eq!(
-            ledger.record_from_peer(peer, &known).await.unwrap(),
-            U256::from(2u64)
+            ledger.record_from_peer(another, &known).await.unwrap(),
+            U256::from(1u64)
         );
+
+        // A ledger that loads over the cap keeps every entry and its
+        // known chequebooks working, and takes no new ones.
+        write_full_ledger(&path, MAX_INBOUND_CHEQUEBOOKS + 10, &eoa(&attacker));
+        let over = Arc::new(CreditLedger::open(Some(path), 100, our_eoa).with_peers(peers.clone()));
+        assert_eq!(over.snapshot().len(), MAX_INBOUND_CHEQUEBOOKS + 10);
+        assert!(over.record_from_peer(another, &fake).await.is_err());
+        assert_eq!(
+            over.record_from_peer(another, &known).await.unwrap(),
+            U256::from(1u64)
+        );
+        assert_eq!(over.snapshot().len(), MAX_INBOUND_CHEQUEBOOKS + 10);
+    }
+
+    /// Write a ledger file with `n` entries pinned to `issuer`:
+    /// `fake_chequebook(0)` at cumulative 1, the rest at `U256::MAX`.
+    fn write_full_ledger(path: &Path, n: usize, issuer: &[u8; 20]) {
+        let mut snap = LedgerSnapshot::default();
+        for i in 0..n {
+            let cum = if i == 0 { U256::one() } else { U256::MAX };
+            snap.cheques.insert(
+                hex::encode(fake_chequebook(i)),
+                ChequebookCredit {
+                    issuer_eoa_hex: hex::encode(issuer),
+                    cumulative_payout_dec: cum.to_string(),
+                },
+            );
+        }
+        persist_snapshot(path, &snap).unwrap();
     }
 
     /// A peer whose handshake named a chequebook can only pay from that

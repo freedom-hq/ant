@@ -95,7 +95,9 @@ pub struct NodeConfig {
     /// SWAP / chequebook configuration. When `Some`, the node
     /// participates in `/swarm/swap/1.0.0/swap` exchanges with peers
     /// — accepting their cheques (signature-verified, monotonic,
-    /// pinned to chequebook) into a persistent ledger. When `None`,
+    /// pinned to chequebook, only from handshaken peers and only on the
+    /// chequebook a peer's handshake named, new chequebooks capped) into
+    /// a persistent ledger. When `None`,
     /// the protocol is still negotiated but every received cheque is
     /// dropped silently.
     pub swap: Option<SwapConfig>,

@@ -441,8 +441,11 @@ const BIN_BALANCE_DIAL_CAP: usize = 16;
 /// Returns `None` when SWAP is unconfigured — `sinks::spawn` then
 /// installs a drain-only handler so the protocol is still
 /// negotiated.
-fn build_swap_wiring(cfg: &RunConfig) -> Option<sinks::SwapWiring> {
-    let swap = cfg.swap.as_ref()?;
+fn build_swap_wiring(
+    swap: Option<&SwapConfig>,
+    peer_eth: &crate::PeerEthMap,
+) -> Option<sinks::SwapWiring> {
+    let swap = swap?;
     // The ledger reads the swarm's handshake registry (the same map
     // `SwarmState::peer_eth` records into) to refuse cheques from peers
     // with no handshake and cheques on a chequebook other than the one
@@ -453,7 +456,7 @@ fn build_swap_wiring(cfg: &RunConfig) -> Option<sinks::SwapWiring> {
             swap.chain_id,
             swap.our_beneficiary,
         )
-        .with_peers(cfg.peer_eth.clone()),
+        .with_peers(peer_eth.clone()),
     );
     Some(sinks::SwapWiring {
         ledger,
@@ -1912,7 +1915,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // directory; otherwise we register the protocol but throw away
     // every cheque we receive (no on-chain identity to credit
     // against).
-    let swap_wiring = build_swap_wiring(&cfg);
+    let swap_wiring = build_swap_wiring(cfg.swap.as_ref(), &cfg.peer_eth);
     // Keep a handle on the inbound credit ledger for the accounting
     // snapshot (gateway `/settlements` received side) before the
     // wiring moves into the sink task.
@@ -9883,6 +9886,44 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// The inbound credit ledger the swarm wires reads the swarm's own
+    /// handshake registry: a peer recorded in `peer_eth` the way the
+    /// handshake-success branch does can pay, on the chequebook it named.
+    #[tokio::test]
+    async fn swap_wiring_reads_the_swarms_handshake_registry() {
+        use ant_chain::chequebook::{sign_cheque, Cheque};
+        let dir = tempfile::tempdir().unwrap();
+        let our = [0xaau8; 20];
+        let swap = SwapConfig {
+            our_beneficiary: our,
+            chain_id: 100,
+            ledger_path: dir.path().join("swap_credits.json"),
+            events_tx: None,
+        };
+        let peer_eth = crate::PeerEthMap::new();
+        let wiring = build_swap_wiring(Some(&swap), &peer_eth).unwrap();
+        let secret = ant_crypto::random_secp256k1_secret();
+        let cb = [0x77u8; 20];
+        let cheque = sign_cheque(
+            &secret,
+            &Cheque {
+                chequebook: cb,
+                beneficiary: our,
+                cumulative_payout: primitive_types::U256::from(5u64),
+            },
+            100,
+        )
+        .unwrap();
+        let peer = pid();
+        assert!(wiring.ledger.record_from_peer(peer, &cheque).await.is_err());
+        peer_eth.record_with_chequebook(peer, [1; 20], Some(cb));
+        wiring.ledger.record_from_peer(peer, &cheque).await.unwrap();
+        assert_eq!(
+            wiring.ledger.cumulative_for(&cb),
+            primitive_types::U256::from(5u64)
+        );
     }
 
     /// Liveness timings shrunk so a real-socket test runs in seconds.
