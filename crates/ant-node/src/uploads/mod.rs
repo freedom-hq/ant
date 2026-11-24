@@ -844,24 +844,45 @@ struct JobHandle {
 }
 
 /// Of several on-disk manifests for one job (a pre-#292 `<prefix>.json`
-/// next to `<job_id>.json`), the one to keep: the most recently updated.
-/// A prefix copy holds the status a `pause`/`resume`/`cancel` set, the
-/// full-id copy the driver's checkpoints; whichever was written last is
-/// the job's latest state (an older cursor only means re-pushing a few
-/// chunks). `last_update_unix` is in whole seconds, so a prefix `cancel`
-/// and the driver's last checkpoint can tie: a tie goes to the copy that
-/// doesn't restart the job (never resurrect a pause or cancel), then to
-/// the full-id file. Returns the kept path and manifest plus every other
+/// next to `<job_id>.json`), the one to keep.
+///
+/// First, a copy in a state no command ever leaves wins regardless of
+/// timestamps: `Completed` (it carries the reference; `resume` only
+/// re-heals it, `cancel` leaves it as is), then `Cancelled` (`resume`
+/// refuses it; an old build's driver erroring after a prefix `cancel`
+/// could still checkpoint `Failed` over it, and the cancel the user asked
+/// for is the safer of the two to keep). `last_update_unix` is wall-clock, so a clock set back
+/// between two writes can stamp the later one older; without this rank
+/// a stale `Running` stray could beat the driver's `Completed` copy and
+/// re-drive a finished job, dropping its reference and heal state.
+///
+/// Otherwise the most recently updated: a prefix copy holds the status a
+/// `pause`/`resume`/`cancel` set, the full-id copy the driver's
+/// checkpoints; whichever was written last is the job's latest state (an
+/// older cursor only means re-pushing a few chunks). Those copies have
+/// nothing clock-independent to order them by, so a backwards clock step
+/// can still pick the older of two resumable states (`Paused` vs.
+/// `Running`); either one resumes from a checkpoint, nothing is lost.
+/// `last_update_unix` is in whole seconds, so a prefix `cancel` and the
+/// driver's last checkpoint can tie: a tie goes to the copy that doesn't
+/// restart the job (never resurrect a pause or cancel), then to the
+/// full-id file. Returns the kept path and manifest plus every other
 /// path.
 fn pick_manifest(
     canonical: &Path,
     mut copies: Vec<(PathBuf, UploadJobInfo)>,
 ) -> (PathBuf, UploadJobInfo, Vec<PathBuf>) {
+    let settled = |status: UploadStatus| match status {
+        UploadStatus::Completed => 2,
+        UploadStatus::Cancelled => 1,
+        _ => 0,
+    };
     let best = copies
         .iter()
         .enumerate()
         .max_by_key(|(_, (path, info))| {
             (
+                settled(info.status),
                 info.last_update_unix,
                 !info.wants_driver(),
                 path.as_path() == canonical,
@@ -1373,7 +1394,10 @@ impl UploadManager {
     /// Manifests a pre-#292 build left under an id prefix
     /// (`<prefix>.json` beside `<job_id>.json`) are folded into one per
     /// job (see [`pick_manifest`]) and the strays deleted, so a job
-    /// never gets two handles or two drivers.
+    /// never gets two handles or two drivers. If a job's `<job_id>.json`
+    /// is present but can't be read (permissions, I/O), its strays are
+    /// left alone and the job isn't loaded this boot, rather than a stray
+    /// being written over what may be the newer state.
     ///
     /// `auto_resume` controls whether `Running`/`Pending` jobs
     /// found on disk get a fresh driver task. Operators who want
@@ -1389,13 +1413,33 @@ impl UploadManager {
         // one job, so each job keeps exactly one copy (see
         // `pick_manifest`) and the strays are folded away below.
         let mut by_job: HashMap<String, Vec<(PathBuf, UploadJobInfo)>> = HashMap::new();
+        // Manifests whose *read* failed (permissions, I/O), as opposed to
+        // ones read fine but corrupt. Such a file may be a job's current
+        // `<job_id>.json`, so it must not count as absent: folding a
+        // stray over it would persist an older state (a rollback).
+        let mut unreadable: HashSet<PathBuf> = HashSet::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            match UploadJobInfo::load(&path) {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(
+                        target: "ant_node::uploads",
+                        path = %path.display(),
+                        "skipping unreadable job manifest: {e}",
+                    );
+                    // Gone since `read_dir` listed it: genuinely absent.
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        unreadable.insert(path);
+                    }
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<UploadJobInfo>(&bytes) {
                 Ok(info) => by_job
                     .entry(info.job_id.clone())
                     .or_default()
@@ -1404,13 +1448,27 @@ impl UploadManager {
                     warn!(
                         target: "ant_node::uploads",
                         path = %path.display(),
-                        "skipping unreadable job manifest: {e}",
+                        "skipping corrupt job manifest: {e}",
                     );
                 }
             }
         }
         for (job_id, copies) in by_job {
             let canonical = UploadJobInfo::manifest_path(dir, &job_id);
+            if unreadable.contains(&canonical) {
+                // Only strays loaded; the job's own manifest exists but
+                // couldn't be read this boot. It may well be newer (a
+                // `Completed` with its reference), so don't pick a stray
+                // over it, write anything or delete anything. Leave the
+                // job unregistered and every file in place; the next boot
+                // folds it once the full-id file reads again.
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id,
+                    "job manifest unreadable; not loading this job or its stray copies until it reads",
+                );
+                continue;
+            }
             let (kept_path, mut info, others) = pick_manifest(&canonical, copies);
             if kept_path != canonical || !others.is_empty() {
                 // Write the kept copy under the full id before deleting
@@ -5758,6 +5816,12 @@ mod tests {
             stalled: false,
             auto_paused: false,
         };
+        let done = |info: UploadJobInfo| UploadJobInfo {
+            reference: Some("ab".repeat(32)),
+            heal_verified: true,
+            heal_finished: true,
+            ..info
+        };
         let manifests = |dir: &Path| {
             let mut names: Vec<String> = std::fs::read_dir(dir)
                 .expect("read_dir")
@@ -5799,6 +5863,26 @@ mod tests {
             (
                 Some(job("eeeeeeeeeeeeeeee", UploadStatus::Running, 100)),
                 vec![job("eeeeeeeeeeeeeeee", UploadStatus::Cancelled, 100)],
+                UploadStatus::Cancelled,
+                0,
+            ),
+            // The clock went back after the stray was written: the
+            // driver's later `Completed` copy carries an older stamp. A
+            // finished job is never re-driven by a stale stray.
+            (
+                Some(done(job("ffffffffffffffff", UploadStatus::Completed, 100))),
+                vec![job("ffffffffffffffff", UploadStatus::Running, 200)],
+                UploadStatus::Completed,
+                0,
+            ),
+            // Same for a cancel against a newer-stamped `Paused` stray
+            // with `auto_paused` (which auto-resume would restart).
+            (
+                Some(job("1111111111111111", UploadStatus::Cancelled, 100)),
+                vec![UploadJobInfo {
+                    auto_paused: true,
+                    ..job("1111111111111111", UploadStatus::Paused, 200)
+                }],
                 UploadStatus::Cancelled,
                 0,
             ),
@@ -5844,7 +5928,85 @@ mod tests {
             let on_disk = UploadJobInfo::load(&UploadJobInfo::manifest_path(state_dir.path(), &id))
                 .expect("load");
             assert_eq!(on_disk.job_id, id);
+            assert_eq!(on_disk.status, want, "{id}");
+            if want == UploadStatus::Completed && drivers == 0 {
+                assert!(on_disk.reference.is_some(), "{id}: reference dropped");
+            }
         }
+    }
+
+    /// A `<job_id>.json` that exists but can't be read at boot is not
+    /// "absent": rehydrate must not write an older stray over it and
+    /// delete the stray. The job waits for a boot where it reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rehydrate_keeps_strays_when_full_id_manifest_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = write_temp_file(&distinct_leaves(8));
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+        let done = wait_terminal(&mgr, &id).await;
+        assert_eq!(done.status, UploadStatus::Completed);
+        assert!(done.reference.is_some());
+        let handle = mgr.resolve(&id).expect("handle");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.driver_alive() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("driver never exited");
+        drop(handle);
+        drop(mgr);
+
+        let canonical = UploadJobInfo::manifest_path(state_dir.path(), &id);
+        let completed = UploadJobInfo::load(&canonical).expect("load");
+        // An older prefix copy from a pre-#292 `pause`.
+        let stray_path = state_dir.path().join(format!("{}.json", &id[..8]));
+        UploadJobInfo {
+            status: UploadStatus::Paused,
+            reference: None,
+            last_update_unix: completed.last_update_unix.saturating_sub(100),
+            ..completed.clone()
+        }
+        .save(&stray_path)
+        .expect("save stray");
+
+        std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&canonical).is_ok() {
+            // Running as root: permissions don't bite, nothing to test.
+            std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+            return;
+        }
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        assert_eq!(mgr.rehydrate_from_disk(true).expect("rehydrate"), 0);
+        assert!(mgr.list().is_empty());
+        assert!(
+            stray_path.exists(),
+            "stray deleted over an unreadable manifest"
+        );
+        std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+        let on_disk = UploadJobInfo::load(&canonical).expect("load");
+        assert_eq!(on_disk.status, UploadStatus::Completed, "rolled back");
+        assert_eq!(on_disk.reference, completed.reference);
+
+        // Once it reads again, the next boot folds the stray away and
+        // keeps the newer `Completed` copy.
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        assert_eq!(mgr.rehydrate_from_disk(true).expect("rehydrate"), 1);
+        assert!(!stray_path.exists());
+        let snap = mgr.resolve(&id).expect("handle").snapshot();
+        assert_eq!(snap.status, UploadStatus::Completed);
+        assert_eq!(snap.reference, completed.reference);
     }
 
     /// A job left `Running` with no live driver (its task died without
