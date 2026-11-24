@@ -148,21 +148,27 @@ fn remove_stale_socket(path: &Path, uid: u32) -> std::io::Result<()> {
 
 /// A freshly created, owner-only (`0700`) directory the socket is bound
 /// in before being moved into place. Removed on drop, so a failed bind
-/// leaves nothing behind. Named `.antd-s<n>` with `n` counting up until
-/// `mkdir` succeeds, which claims the name atomically; the staged path
-/// `<parent>/.antd-s<n>/s` stays no longer than `<parent>/antd.sock` for
-/// single-digit `n`, so a path that fits `sun_path` at its final name
-/// still fits while staged.
+/// leaves nothing behind. Named `.as<n>` with `n` counting up (at most
+/// [`STAGING_ATTEMPTS`] tries) until `mkdir` succeeds, which claims the
+/// name atomically. The staged path `<parent>/.as<n>/s` is never longer
+/// than `<parent>/antd.sock`, so a data dir whose default socket fits
+/// `sun_path` still fits while staged.
 struct StagingDir {
     path: PathBuf,
+}
+
+const STAGING_ATTEMPTS: u32 = 64;
+
+fn staging_name(n: u32) -> String {
+    format!(".as{n}")
 }
 
 impl StagingDir {
     fn create(parent: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         let mut last = None;
-        for n in 0..64u32 {
-            let path = parent.join(format!(".antd-s{n}"));
+        for n in 0..STAGING_ATTEMPTS {
+            let path = parent.join(staging_name(n));
             match std::fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
@@ -835,7 +841,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -871,27 +877,34 @@ mod tests {
         let path = dir.join("antd.sock");
 
         let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicU64::new(0));
         let watcher = {
             let path = path.clone();
             let stop = stop.clone();
+            let seen = seen.clone();
             std::thread::spawn(move || {
-                let mut seen = 0u64;
                 let mut loose = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                        seen += 1;
+                        seen.fetch_add(1, Ordering::Relaxed);
                         if meta.mode() & 0o077 != 0 {
                             loose.push(meta.mode() & 0o777);
                         }
                     }
                 }
-                (seen, loose)
+                loose
             })
         };
 
         let old = rustix::process::umask(rustix::fs::Mode::empty());
         let mut result = Ok(());
-        for _ in 0..200 {
+        // At least 200 binds, and keep going (bounded) until the watcher
+        // has actually sampled the path a fair number of times, so a slow
+        // runner can't pass this by never looking.
+        for i in 0..100_000u32 {
+            if i >= 200 && seen.load(Ordering::Relaxed) >= 200 {
+                break;
+            }
             match bind(path.clone()) {
                 Ok(bound) => drop(bound),
                 Err(e) => {
@@ -902,9 +915,12 @@ mod tests {
         }
         rustix::process::umask(old);
         stop.store(true, Ordering::Relaxed);
-        let (seen, loose) = watcher.join().unwrap();
+        let loose = watcher.join().unwrap();
         result.unwrap();
-        assert!(seen > 0, "watcher never saw the socket");
+        assert!(
+            seen.load(Ordering::Relaxed) > 0,
+            "watcher never saw the socket"
+        );
         assert!(
             loose.is_empty(),
             "socket seen {} time(s) with group/world bits, e.g. mode {:o}",
@@ -933,6 +949,34 @@ mod tests {
     }
 
     use std::os::unix::fs::FileTypeExt;
+
+    /// Staging must not make a path that fits `sun_path` at its final
+    /// name fail: `<parent>/.as<n>/s` is never longer than
+    /// `<parent>/antd.sock`.
+    #[test]
+    fn staged_path_is_no_longer_than_the_default_socket_name() {
+        for n in 0..STAGING_ATTEMPTS {
+            let staged = format!("{}/s", staging_name(n));
+            assert!(staged.len() <= "antd.sock".len(), "{staged}");
+        }
+    }
+
+    /// The same, end to end: a data dir sized so `<dir>/antd.sock` is
+    /// exactly the longest path Linux's `sun_path` (108 bytes incl. the
+    /// NUL) accepts still binds there.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_at_the_sun_path_limit_still_binds() {
+        let base = scratch_dir("sunlen");
+        let room = 107 - base.as_os_str().len() - "/antd.sock".len() - 1;
+        let dir = base.join("d".repeat(room));
+        let path = dir.join("antd.sock");
+        assert_eq!(path.as_os_str().len(), 107);
+        let bound = bind(path.clone()).unwrap();
+        assert_eq!(bound.socket_path(), path);
+        assert_eq!(entries(&dir), vec!["antd.sock".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// A file already sitting at the socket path that belongs to another
     /// user (a squatter in a shared directory) is refused, not removed.
