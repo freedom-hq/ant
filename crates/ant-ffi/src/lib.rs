@@ -5803,6 +5803,49 @@ mod tests {
         std::net::TcpListener::bind(addr).expect("port is free after the second stop");
     }
 
+    /// `ant_stop_gateway` waits for the old socket to close while still
+    /// holding the guard `ant_start_gateway` takes, so a start racing the
+    /// stop on the same port waits it out instead of binding against the
+    /// still-open socket. The runtime's only worker is kept busy so the
+    /// aborted serve task can't be dropped at once, holding the stop in
+    /// its wait while the racing start comes in.
+    #[test]
+    fn gateway_start_racing_a_stop_waits_for_the_old_socket() {
+        let h = gateway_test_handle("gw-stop-start-race");
+        let addr = start_test_gateway(&h);
+
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let blocker = h.runtime.spawn(async move {
+            busy_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        busy_rx.recv().unwrap();
+
+        let ptr = std::ptr::from_ref(&h) as usize;
+        let stopper =
+            std::thread::spawn(move || unsafe { ant_stop_gateway(ptr as *const AntHandle) });
+        // Wait until the stop has taken the task: either it still holds
+        // the guard (waiting), or it has already let go of it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match h.gateway_task.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(slot) if slot.is_none() => break,
+                Ok(_) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => panic!("poisoned"),
+            }
+            assert!(std::time::Instant::now() < deadline, "stop never ran");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let started = start_gateway_on(&h, addr);
+        assert!(stopper.join().unwrap(), "a running gateway was stopped");
+        started.expect("a start racing the stop binds once the old socket is closed");
+        let status = status_for_host(addr, "localhost");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+        h.runtime.block_on(blocker).unwrap();
+    }
+
     /// A keep-alive connection opened before `ant_stop_gateway` must not
     /// outlive the stop: axum serves each connection on its own task, so
     /// it would otherwise keep answering through the old router (old

@@ -1260,8 +1260,14 @@ bool ant_set_gateway_allowed_hosts(const AntHandle *handle,
  * Stop the in-process HTTP gateway started by ant_start_gateway.
  * Returns true if a gateway was running and was stopped, false if none
  * was running (or `handle` is NULL). Waits (up to 2 s) for the
- * gateway's task to end, so on return its port is free for a next
- * ant_start_gateway. Safe to call repeatedly. A
+ * gateway's task to end, which closes its socket, so on return its port
+ * is normally free for a next ant_start_gateway. The wait holds the lock
+ * ant_start_gateway takes, so a start racing this stop (any thread, same
+ * port) waits for it too. If the runtime is too busy to drop the task
+ * within 2 s, this still returns true (logging a warning) and the port
+ * is freed a moment later; a start in that moment fails with
+ * "bind <addr>: Address in use" and can simply be retried. Safe to call
+ * repeatedly. A
  * background rediscovery retry stops with it, before its next attempt;
  * the next start with a `gnosis_rpc` tries again. An unfinished
  * /health.walletScan (pending, scanning, retrying) is dropped with it,

@@ -887,8 +887,15 @@ const GATEWAY_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2)
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
 /// Returns `true` if a gateway was running and was aborted, `false` if
 /// none was running (or `handle` is null). Waits (up to 2 s) for the
-/// serve task to end, so on return the port is free for a next
-/// [`ant_start_gateway`] to bind. Safe to call repeatedly. A
+/// serve task to end, which closes its listening socket, so on return
+/// the port is normally free for a next [`ant_start_gateway`] to bind.
+/// The wait holds the same lock `ant_start_gateway` takes, so a start
+/// racing this stop (any thread, same port) waits for it too rather
+/// than binding against the old socket. If the runtime is too busy to
+/// drop the task within 2 s, this still returns `true` (logging a
+/// warning) and the port is freed a moment later; a start in that
+/// moment fails with `bind <addr>: Address in use` and can simply be
+/// retried. Safe to call repeatedly. A
 /// background rediscovery retry stops with it, before its next attempt;
 /// the next start with a `gnosis_rpc` tries again. An unfinished
 /// `/health.walletScan` (`pending`, `scanning`, `retrying`) is dropped with it,
@@ -924,22 +931,31 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
         // freshly served gateway would run with its retry loop suppressed.
         #[cfg(feature = "chain")]
         handle.chain_init.stop_retrying();
-        drop(slot);
-        match task {
+        let stopped = match task {
             Some(task) => {
                 task.abort();
                 // `abort` only flags the task: its future, and the
                 // listener inside it, is dropped by a runtime worker
-                // shortly after. Wait for that (bounded, off the slot
-                // guard) so stop-then-start on the same port doesn't
-                // race the old socket's close.
+                // shortly after. Wait for that (bounded) still holding
+                // the slot guard, so a concurrent `ant_start_gateway`
+                // (which takes the same guard for its whole start)
+                // can't bind the port while the old socket is open.
                 let deadline = std::time::Instant::now() + GATEWAY_STOP_WAIT;
                 while !task.is_finished() && std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
+                if !task.is_finished() {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "ant_stop_gateway: the gateway task was not dropped within {GATEWAY_STOP_WAIT:?}; \
+                         its port is freed once the runtime gets to it",
+                    );
+                }
                 true
             }
             None => false,
-        }
+        };
+        drop(slot);
+        stopped
     }
 }
