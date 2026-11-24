@@ -553,7 +553,7 @@ async fn main() -> Result<()> {
 
     // Bind the control socket NOW, before anything else spawns: a bad
     // path (deep data dirs exceed `sun_path`'s ~104-byte limit) must
-    // surface here — with a temp-dir fallback and, failing that, a
+    // surface here — with a private per-user fallback and, failing that, a
     // warning — never as a fatal error seconds after the node started
     // serving (issue #39). The accept loop is spawned after the node
     // task below; connections made in between just wait in the backlog.
@@ -1234,7 +1234,8 @@ async fn main() -> Result<()> {
 }
 
 /// Bind the control socket at its intended path, falling back to a
-/// short per-data-dir path in the system temp dir when that fails
+/// short per-data-dir path in a private per-user directory
+/// ([`ant_control::private_runtime_socket`]) when that fails
 /// (deep data dirs — Electron `userData`, containers, CI workspaces —
 /// routinely exceed `sun_path`'s ~104-byte limit; issue #39). On
 /// fallback, a [`ant_control::SOCKET_POINTER_FILE`] in the data dir
@@ -1261,7 +1262,20 @@ fn bind_control_socket(
             Some(bound)
         }
         Err(primary) => {
-            let fallback = fallback_control_socket_path(data_dir);
+            let fallback = match fallback_control_socket_path(data_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "antd",
+                        "control socket disabled: bind failed at {} ({primary}) and no \
+                         private fallback directory is available ({e}); antctl/antop will \
+                         be unavailable, the node and HTTP API are unaffected",
+                        intended.display(),
+                    );
+                    let _ = std::fs::remove_file(&pointer);
+                    return None;
+                }
+            };
             match ant_control::bind(fallback.clone()) {
                 Ok(bound) => {
                     tracing::warn!(
@@ -1300,16 +1314,22 @@ fn bind_control_socket(
     }
 }
 
-/// Short, deterministic-per-run fallback socket path in the system
-/// temp dir: `antd-<hash-of-data-dir>.sock` stays under `sun_path`
-/// limits on every platform we ship. Clients don't need to recompute
-/// the hash — the pointer file carries the actual path.
+/// Short, deterministic-per-run fallback socket path:
+/// `antd-<hash-of-data-dir>.sock` in a directory only this user can
+/// reach (`$XDG_RUNTIME_DIR`, else `<temp>/antd-<uid>`, `0700`; issue
+/// #307 — a bare name in the shared temp dir could be pre-created or
+/// squatted by another local user). `$XDG_RUNTIME_DIR` is skipped when
+/// the socket wouldn't fit `sun_path` there; `<temp>/antd-<uid>` fits
+/// on every platform we ship unless `$TMPDIR` itself is very long, in
+/// which case the fallback bind fails with `SUN_LEN` like the primary one.
+/// Clients don't need to recompute the hash — the pointer file carries
+/// the actual path.
 #[cfg(unix)]
-fn fallback_control_socket_path(data_dir: &Path) -> PathBuf {
+fn fallback_control_socket_path(data_dir: &Path) -> std::io::Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data_dir.hash(&mut h);
-    std::env::temp_dir().join(format!("antd-{:016x}.sock", h.finish()))
+    ant_control::private_runtime_socket(&format!("antd-{:016x}.sock", h.finish()))
 }
 
 /// Flatten the spawned node loop's `JoinHandle` outcome into the

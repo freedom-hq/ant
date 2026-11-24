@@ -137,6 +137,7 @@ name = "ant-control"
 version = "0.5.79"
 dependencies = [
  "hex",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

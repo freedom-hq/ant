@@ -13,5 +13,16 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# Control-socket hardening (issue #307): `geteuid` for the owner checks
+# on the socket / fallback dir and the peer-UID gate. Already in the
+# dependency graph (fs4, crossterm).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the
+# control socket's idle-read timeout test.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
