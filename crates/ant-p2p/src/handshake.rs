@@ -415,12 +415,11 @@ async fn handshake_outbound_inner(
         .ok_or(HandshakeError::IncompleteSynAck)?;
 
     let observed = deserialize_underlays(&resp_syn.observed_underlay)?;
+    // The peer id an address names is its *last* `/p2p/` (a circuit's
+    // destination, not its relay), the same rule `check_remote_underlay`
+    // and the hive hint use.
     for o in &observed {
-        let info = o.iter().find_map(|p| match p {
-            Protocol::P2p(pid) => Some(pid),
-            _ => None,
-        });
-        if info != Some(local_peer_id) {
+        if crate::dial::extract_peer_id(o) != Some(local_peer_id) {
             return Err(HandshakeError::SynPeerId);
         }
     }
@@ -924,6 +923,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HandshakeError::UnderlayPeerId), "{err}");
+    }
+
+    /// Our observed underlay names us by its *last* `/p2p/`: a circuit
+    /// address through a relay to us is accepted, one through us to a
+    /// third peer is not.
+    #[tokio::test]
+    async fn observed_underlay_peer_id_is_the_last_p2p_component() {
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let relay = PeerId::random();
+        let ts = unix_now_i64();
+        let (mut syn_ack, _) = signed_syn_ack(local, underlay_for(remote), ts);
+        let with_observed = |syn_ack: &mut SynAck, a: String| {
+            let a: Multiaddr = a.parse().unwrap();
+            syn_ack.syn.as_mut().unwrap().observed_underlay = serialize_underlays(&[a]);
+        };
+
+        with_observed(
+            &mut syn_ack,
+            format!("/ip4/5.6.7.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{local}"),
+        );
+        outbound_between(syn_ack.clone(), local, remote, None)
+            .await
+            .expect("a circuit to us is our observed underlay");
+
+        with_observed(
+            &mut syn_ack,
+            format!("/ip4/5.6.7.8/tcp/4001/p2p/{local}/p2p-circuit/p2p/{relay}"),
+        );
+        let err = outbound_between(syn_ack, local, remote, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::SynPeerId), "{err}");
     }
 
     /// #299 (P2P-03): a signed record whose underlay is empty or not a
