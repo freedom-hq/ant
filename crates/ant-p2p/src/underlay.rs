@@ -498,6 +498,40 @@ pub(crate) fn filter_dialable_underlays(
         .collect()
 }
 
+/// Keep only the peer underlays that name a globally routable IP literal:
+/// the filter behind `RunConfig::public_dials_only`.
+///
+/// Stricter than [`filter_dialable_underlays`] with an empty
+/// [`LocalSubnets`] in one more way: an address must carry at least one IP
+/// component, and none of `/dns`, `/dns4`, `/dns6` or `/dnsaddr`. The
+/// transport resolves those at dial time, so a gossiped
+/// `/dns4/localhost/…` or a name the peer points at `192.168.1.1` would
+/// otherwise reach loopback or the LAN with no IP check ever seeing it.
+pub(crate) fn filter_public_underlays(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    addrs
+        .iter()
+        .filter(|addr| {
+            let mut has_ip = false;
+            let ok = addr.iter().all(|p| match p {
+                Protocol::Ip4(ip) => {
+                    has_ip = true;
+                    ip_scope(IpAddr::V4(ip)) == IpScope::Global
+                }
+                Protocol::Ip6(ip) => {
+                    has_ip = true;
+                    ip_scope(IpAddr::V6(ip)) == IpScope::Global
+                }
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                    false
+                }
+                _ => true,
+            });
+            ok && has_ip
+        })
+        .cloned()
+        .collect()
+}
+
 /// Does `addr` carry an IP component in [`IpScope::Private`] space? Such an
 /// address was only admitted by [`filter_dialable_underlays`] because it
 /// matched the host's subnets *at the time*; it has to be re-checked (or
@@ -605,6 +639,26 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn public_underlays_need_a_global_ip_literal() {
+        let addrs = vec![
+            ma("/ip4/1.2.3.4/tcp/1634"),
+            ma("/ip6/2a01:4f8::1/tcp/1634"),
+            ma("/ip4/192.168.1.20/tcp/1634"),
+            ma("/ip4/127.0.0.1/tcp/1634"),
+            ma("/dns4/localhost/tcp/22"),
+            ma("/dns/192-168-1-1.nip.io/tcp/80"),
+            ma("/dns6/example.com/tcp/1634"),
+            ma("/dnsaddr/example.com"),
+            ma("/ip4/1.2.3.4/tcp/1634/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA"),
+        ];
+        let kept = filter_public_underlays(&addrs);
+        assert_eq!(
+            kept,
+            vec![addrs[0].clone(), addrs[1].clone(), addrs[8].clone()]
+        );
     }
 
     #[test]

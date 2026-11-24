@@ -159,12 +159,14 @@ pub struct RunConfig {
     /// full of Docker/Kubernetes pod addresses, and dialing them from a
     /// hosted server trips provider netscan detection (issue #88). Only
     /// for dev/test networks that live entirely on one private network or
-    /// on loopback. Same-LAN private peers are dialed regardless.
+    /// on loopback. Same-LAN private peers are dialed regardless, unless
+    /// [`Self::public_dials_only`] is set, which overrides this flag.
     pub allow_private_dials: bool,
     /// Dial globally routable underlays only: no private underlay, not
     /// even one inside this host's own subnets (the same-LAN exception of
-    /// the underlay filter), and the host's interfaces are never read for
-    /// it. Hive gossip is signed only by the peer it describes, so any peer
+    /// the underlay filter), no DNS underlay (`/dns`, `/dns4`, `/dns6`,
+    /// `/dnsaddr` are resolved at dial time and could name loopback or a
+    /// LAN host), and the host's interfaces are never read for it. Hive gossip is signed only by the peer it describes, so any peer
     /// can name a private address on this host's LAN and have the node
     /// open TCP connections there, on a port the peer picks. For an
     /// embedder that has no use for a bee node on its LAN (a wallet reading
@@ -852,9 +854,12 @@ struct SwarmState {
     /// FIFO of hints waiting to be dialed, at most [`KNOWN_DIALABLE_CAP`]
     /// long (the oldest is evicted).
     hint_queue: VecDeque<sinks::PeerHint>,
-    /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter.
+    /// [`RunConfig::allow_private_dials`]: skip the peer-underlay filter
+    /// (ignored when `public_dials_only` is set).
     allow_private_dials: bool,
-    /// [`RunConfig::public_dials_only`]: no same-LAN exception either.
+    /// [`RunConfig::public_dials_only`]: global IP literals only, no
+    /// same-LAN exception, no DNS underlays; wins over
+    /// `allow_private_dials`.
     public_dials_only: bool,
     /// Cached snapshot of this host's subnets for the same-LAN exception
     /// of the underlay filter, with the time it was taken.
@@ -1245,9 +1250,9 @@ impl SwarmState {
     /// Wi-Fi must not be dialed after the host moved to cellular.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
         if self.public_dials_only {
-            // No subnet is local: no private underlay passes.
-            let none = crate::underlay::LocalSubnets::default();
-            return crate::underlay::filter_dialable_underlays(addrs, &none, false);
+            // Global IP literals only: no private underlay passes, and no
+            // DNS name either (it is resolved at dial time, past any check).
+            return crate::underlay::filter_public_underlays(addrs);
         }
         if self.allow_private_dials {
             return addrs.to_vec();
@@ -10861,6 +10866,21 @@ mod tests {
         cached.addrs = vec![lan.clone()];
         assert_eq!(state.addrs_for_dial(&cached), None);
         cached.addrs = vec![lan, public.clone()];
+        assert_eq!(state.addrs_for_dial(&cached), Some(vec![public.clone()]));
+
+        // A DNS underlay is resolved at dial time, past every IP check: a
+        // gossiped name for loopback or a LAN host is never dialed.
+        let dns_loopback: Multiaddr = "/dns4/localhost/tcp/22".parse().unwrap();
+        let dns_lan: Multiaddr = "/dns/192-168-1-1.nip.io/tcp/80".parse().unwrap();
+        let dns_only = PeerId::random();
+        let mut hint = hint_in_bin(dns_only, 0x20, 3);
+        hint.addrs = vec![dns_loopback.clone(), dns_lan.clone()];
+        state.enqueue_hint(hint, local);
+        assert!(state.hint_queue.iter().all(|h| h.peer_id != dns_only));
+        assert!(!state.known_dialable.contains_key(&dns_only));
+        cached.addrs = vec![dns_loopback.clone(), dns_lan];
+        assert_eq!(state.addrs_for_dial(&cached), None);
+        cached.addrs = vec![dns_loopback, public.clone()];
         assert_eq!(state.addrs_for_dial(&cached), Some(vec![public]));
     }
 

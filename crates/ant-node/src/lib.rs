@@ -33,10 +33,12 @@ pub struct NodeConfig {
     pub external_addrs: Vec<Multiaddr>,
     /// Forwarded to `ant_p2p::RunConfig::allow_private_dials`: dial peers'
     /// private/loopback underlays even off-LAN. Dev/test networks only.
+    /// Ignored when [`Self::public_dials_only`] is set.
     pub allow_private_dials: bool,
     /// Forwarded to `ant_p2p::RunConfig::public_dials_only`: dial globally
-    /// routable underlays only, never a private one, not even on this
-    /// host's own LAN. For embedders that only fetch. `false` (the
+    /// routable IP underlays only, never a private one (not even on this
+    /// host's own LAN) and never a DNS one (resolved at dial time, it could
+    /// name loopback or a LAN host). For embedders that only fetch. `false` (the
     /// default) keeps the same-LAN exception.
     pub public_dials_only: bool,
     /// Optional live status sink written to by the node loop.

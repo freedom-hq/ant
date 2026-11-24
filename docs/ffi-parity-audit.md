@@ -234,7 +234,7 @@ An embedded host can set only:
 | `--cors-allowed-origins` | `antd:118` | hard-coded `["null"]` (`ffi-gw:249`) | hard-coded |
 | `--external-address` | `antd:125`, `654` | — | not settable (n/a behind NAT) |
 | `--allow-private-dials` | `antd:135`, `655` | — (default `false`) | not settable |
-| — (`NodeConfig::public_dials_only`: no private underlay dialed, not even a same-LAN one) | not set (default `false`) | not set | embedder option only (`ant_node::run_node`) |
+| — (`NodeConfig::public_dials_only`: no private underlay dialed, not even a same-LAN one, and no DNS underlay) | not set (default `false`) | not set | embedder option only (`ant_node::run_node`) |
 | `--peers-file`, `--no-peerstore`, `--reset-peerstore` | `antd:141-164` | fixed path; no reset | not settable |
 | `--target-peers` | `antd:157`, `658` | — (100) | not settable (Low: battery tuning) |
 | `--per-request-chunk-cache`, `--record-chunks` | `antd:172-183` | — | not settable (debug) |
