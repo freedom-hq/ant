@@ -164,8 +164,7 @@ impl StampEntry {
     /// signature. Batches reloaded from disk have no registration age
     /// and are checked immediately.
     fn may_be_not_on_chain(&self) -> bool {
-        self.registered_secs_ago
-            .is_none_or(|age| age >= FRESH_BATCH_GRACE.as_secs())
+        !within_fresh_grace(self.registered_secs_ago)
     }
 
     /// Still on chain but `remainingBalance` reads `0`: expired, just
@@ -260,6 +259,38 @@ fn batch_ttl_secs(remaining: u128, price: u128) -> i64 {
 /// by a few blocks (5 s each on Gnosis); five minutes is far past that
 /// while still surfacing a genuinely vanished batch promptly.
 const FRESH_BATCH_GRACE: Duration = Duration::from_secs(300);
+
+/// Whether a batch registered `registered_secs_ago` seconds ago (`None`:
+/// reloaded from disk, never registered at runtime) is still inside
+/// [`FRESH_BATCH_GRACE`], where a chain read saying it doesn't exist is
+/// more likely a lagging RPC backend than the truth.
+fn within_fresh_grace(registered_secs_ago: Option<u64>) -> bool {
+    registered_secs_ago.is_some_and(|age| age < FRESH_BATCH_GRACE.as_secs())
+}
+
+/// The node's own view of `batch_id` when this node bought it itself
+/// (the buy's block is known) within [`FRESH_BATCH_GRACE`]; `None`
+/// otherwise. A write route that reads such a batch's owner as zero is
+/// most likely talking to an RPC backend that hasn't seen the buy's
+/// block yet, and can trust this view (the node wallet owns every batch
+/// it buys; its depth follows each dilute) instead. A failed postage-list
+/// request is the error response, not `None`.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn just_bought_batch(
+    handle: &GatewayHandle,
+    batch_id: [u8; 32],
+) -> Result<Option<PostageStatusView>, Response> {
+    let id = hex::encode(batch_id);
+    Ok(fetch_postage_list(handle).await?.into_iter().find(|v| {
+        v.block_number.is_some()
+            && within_fresh_grace(v.registered_secs_ago)
+            && v.batch_id
+                .strip_prefix("0x")
+                .or_else(|| v.batch_id.strip_prefix("0X"))
+                .unwrap_or(&v.batch_id)
+                .eq_ignore_ascii_case(&id)
+    }))
+}
 
 /// How long the per-batch chain enrichment may take before `/stamps`
 /// gives up and returns the placeholder `amount` / `batchTTL`. The
