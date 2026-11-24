@@ -250,6 +250,7 @@ struct Opt {
     #[arg(
         long,
         env = "GNOSIS_LOGS_RPC_URL",
+        hide_env_values = true,
         default_value = "https://rpc.gnosischain.com"
     )]
     gnosis_logs_rpc_url: String,
@@ -266,7 +267,7 @@ struct Opt {
     /// through the logs RPC, trying it again every 64 windows. Falls back
     /// to the `GNOSIS_UNVERIFIED_LOGS_RPC_URL` env.
     /// Unset (the default), such a span is read window by window.
-    #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL")]
+    #[arg(long, env = "GNOSIS_UNVERIFIED_LOGS_RPC_URL", hide_env_values = true)]
     gnosis_unverified_logs_rpc_url: Option<String>,
 
     /// `PostageStamp` contract address (mainnet default keeps matching
@@ -3929,6 +3930,29 @@ mod tests {
         let mut opt = Opt::from_arg_matches(&matches).unwrap();
         apply_config_file(&mut opt, &matches).unwrap();
         opt
+    }
+
+    /// RPC URLs can embed provider API keys, so `--help` must name their
+    /// env vars without printing the values.
+    #[test]
+    fn rpc_url_env_values_are_hidden_in_help() {
+        for id in ["gnosis_logs_rpc_url", "gnosis_unverified_logs_rpc_url"] {
+            let cmd = Opt::command();
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("no arg {id}"));
+            assert!(arg.get_env().is_some(), "{id} has no env");
+            assert!(arg.is_hide_env_values_set(), "{id} shows its env value");
+        }
+        std::env::set_var(
+            "GNOSIS_UNVERIFIED_LOGS_RPC_URL",
+            "https://rpc.example/v2/SECRETAPIKEY",
+        );
+        let help = Opt::command().render_long_help().to_string();
+        std::env::remove_var("GNOSIS_UNVERIFIED_LOGS_RPC_URL");
+        assert!(help.contains("GNOSIS_UNVERIFIED_LOGS_RPC_URL"), "{help}");
+        assert!(!help.contains("SECRETAPIKEY"), "{help}");
     }
 
     /// Bee's `swap-enable` is honoured as the node's settlement switch

@@ -370,12 +370,12 @@ enum UploadCommand {
 #[derive(clap::Args, Debug)]
 struct PostageChainArgs {
     /// Gnosis RPC URL. Reads `GNOSIS_RPC_URL` if absent.
-    #[arg(long, env = "GNOSIS_RPC_URL")]
+    #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
     gnosis_rpc_url: String,
     /// Owner private key (32-byte hex, optional `0x` prefix). Reads
     /// `POSTAGE_OWNER_KEY` or `STORAGE_STAMP_PRIVATE_KEY` if absent.
     /// Used to sign the on-chain transaction.
-    #[arg(long, env = "POSTAGE_OWNER_KEY")]
+    #[arg(long, env = "POSTAGE_OWNER_KEY", hide_env_values = true)]
     owner_key: String,
     /// Address of the deployed `PostageStamp` contract on Gnosis. Reads
     /// `POSTAGE_CONTRACT` if absent. Default is the Swarm mainnet
@@ -471,7 +471,7 @@ enum PostageCommand {
     /// depth, immutable flag, owner address). Doesn't require a key.
     Show {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// `PostageStamp` contract address.
         #[arg(
@@ -488,7 +488,7 @@ enum PostageCommand {
     /// a pre-flight sanity check before `create` / `topup`.
     Balance {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Wallet to check. If omitted, derives from
         /// `POSTAGE_OWNER_KEY`. At least one of `--address` or
@@ -521,7 +521,7 @@ enum ChequebookCommand {
     /// snapshots — useful as a pre-flight before `cash-self`.
     Show {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -551,11 +551,11 @@ enum ChequebookCommand {
     /// ERC-20 transfer of BZZ).
     Deploy {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Wallet private key — pays gas + (optionally) the initial
         /// BZZ deposit. Defaults to `WALLET_PRIVATE_KEY`.
-        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        #[arg(long, env = "WALLET_PRIVATE_KEY", hide_env_values = true)]
         wallet_key: String,
         /// Issuer EOA address to bake into the chequebook. Bee
         /// recovers cheque signatures and compares to this — only
@@ -605,7 +605,7 @@ enum ChequebookCommand {
     /// gnosisscan.
     Verify {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -627,7 +627,7 @@ enum ChequebookCommand {
     /// Costs ~$0.0001 in xDAI gas at `--submit`; the dry-run is free.
     CashSelf {
         /// Gnosis RPC URL.
-        #[arg(long, env = "GNOSIS_RPC_URL")]
+        #[arg(long, env = "GNOSIS_RPC_URL", hide_env_values = true)]
         gnosis_rpc_url: String,
         /// Chequebook contract address.
         #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
@@ -635,13 +635,13 @@ enum ChequebookCommand {
         /// Issuer private key (32-byte hex). Must derive to the
         /// address `chequebook.issuer()` returns. Reads
         /// `STORAGE_STAMP_PRIVATE_KEY` if absent.
-        #[arg(long, env = "STORAGE_STAMP_PRIVATE_KEY")]
+        #[arg(long, env = "STORAGE_STAMP_PRIVATE_KEY", hide_env_values = true)]
         issuer_key: String,
         /// Beneficiary private key (32-byte hex). Must derive to an
         /// EOA we control, because the chequebook contract bakes
         /// `msg.sender` (the submitter) into the EIP-712 digest as
         /// the beneficiary. Reads `WALLET_PRIVATE_KEY` if absent.
-        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        #[arg(long, env = "WALLET_PRIVATE_KEY", hide_env_values = true)]
         beneficiary_key: String,
         /// Optional recipient address (where the tiny BZZ payout
         /// would land). Defaults to the beneficiary itself.
@@ -865,10 +865,37 @@ impl FetchMode {
     }
 }
 
+/// Fallback name for `--out <dir>` when the manifest carries no usable
+/// `Filename`.
+const DEFAULT_OUTPUT_NAME: &str = "data.bin";
+
+/// Reduce a manifest-supplied `Filename` to a single plain file name
+/// that is safe to join onto the user's `--out <dir>`. The hint comes
+/// from whoever uploaded the content, so it is untrusted: only its final
+/// path component is kept (splitting on both `/` and `\`), and anything
+/// that is still not exactly one normal component (`..`, `.`, empty, a
+/// drive prefix, a NUL byte) falls back to [`DEFAULT_OUTPUT_NAME`]. The
+/// result never climbs out of, or replaces, the target directory.
+fn safe_output_name(filename_hint: Option<&str>) -> &str {
+    let Some(hint) = filename_hint else {
+        return DEFAULT_OUTPUT_NAME;
+    };
+    let name = hint.rsplit(['/', '\\']).next().unwrap_or("");
+    if name.contains('\0') {
+        return DEFAULT_OUTPUT_NAME;
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => name,
+        _ => DEFAULT_OUTPUT_NAME,
+    }
+}
+
 /// Final destination for the bytes pulled back from the daemon. Stdout
 /// for raw bytes, optionally `--out` for a fixed path, or — if the
 /// daemon hands us a `Filename` from manifest metadata and the user
-/// passed `--out <dir>` rather than a file — `<dir>/<Filename>`.
+/// passed `--out <dir>` rather than a file — `<dir>/<Filename>`, with
+/// the name reduced by [`safe_output_name`] so it stays inside `<dir>`.
 fn write_output(
     out: Option<&Path>,
     filename_hint: Option<&str>,
@@ -881,8 +908,7 @@ fn write_output(
         // callers do `antctl get bzz://<ref>/ -o ./` and end up with
         // `./index.html` automatically.
         let target = if p.is_dir() {
-            let name = filename_hint.unwrap_or("data.bin");
-            p.join(name)
+            p.join(safe_output_name(filename_hint))
         } else {
             p.to_path_buf()
         };
@@ -3289,6 +3315,97 @@ fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_output_name_keeps_only_a_plain_final_component() {
+        assert_eq!(safe_output_name(Some("index.html")), "index.html");
+        assert_eq!(safe_output_name(Some("/etc/x")), "x");
+        assert_eq!(safe_output_name(Some("../../x")), "x");
+        assert_eq!(safe_output_name(Some("a/../../b")), "b");
+        assert_eq!(safe_output_name(Some("..\\..\\x")), "x");
+        for bad in ["", ".", "..", "/", "a/..", "../", "x/.", "a\0b"] {
+            assert_eq!(safe_output_name(Some(bad)), DEFAULT_OUTPUT_NAME, "{bad:?}");
+        }
+        assert_eq!(safe_output_name(None), DEFAULT_OUTPUT_NAME);
+    }
+
+    #[test]
+    fn write_output_keeps_hostile_filenames_inside_the_target_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "antctl-write-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join("a").join("b").join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let outside = root.join("x");
+        for (hint, expect) in [
+            ("/etc/x", "x"),
+            ("../../x", "x"),
+            ("a/../../b", "b"),
+            ("..", DEFAULT_OUTPUT_NAME),
+        ] {
+            let written = write_output(Some(&dir), Some(hint), b"payload")
+                .unwrap()
+                .expect("written to a file");
+            assert_eq!(written, dir.join(expect), "hint {hint:?}");
+            assert_eq!(written.parent(), Some(dir.as_path()), "hint {hint:?}");
+            assert_eq!(std::fs::read(&written).unwrap(), b"payload");
+        }
+        assert!(!outside.exists(), "../../x escaped the target dir");
+        assert!(!root.join("a").join("b").join("b").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every argument that can carry a secret (a private key, or an RPC
+    /// URL that may embed an API key) must not echo its env value in
+    /// `--help`.
+    #[test]
+    fn secret_env_args_hide_their_values() {
+        fn walk(cmd: &clap::Command, found: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let Some(env) = arg.get_env() else { continue };
+                let env = env.to_string_lossy();
+                if env.contains("KEY") || env.contains("RPC_URL") {
+                    assert!(
+                        arg.is_hide_env_values_set(),
+                        "{} --{}: env {env} shows its value in --help",
+                        cmd.get_name(),
+                        arg.get_id()
+                    );
+                    found.push(env.into_owned());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&<Opt as clap::CommandFactory>::command(), &mut found);
+        for env in [
+            "GNOSIS_RPC_URL",
+            "POSTAGE_OWNER_KEY",
+            "WALLET_PRIVATE_KEY",
+            "STORAGE_STAMP_PRIVATE_KEY",
+        ] {
+            assert!(found.iter().any(|f| f == env), "{env} not checked");
+        }
+    }
+
+    #[test]
+    fn postage_create_help_does_not_print_the_owner_key() {
+        std::env::set_var("POSTAGE_OWNER_KEY", "deadbeefSECRET");
+        let err = <Opt as clap::Parser>::try_parse_from(["antctl", "postage", "create", "--help"])
+            .expect_err("--help exits early");
+        std::env::remove_var("POSTAGE_OWNER_KEY");
+        let help = err.render().to_string();
+        assert!(help.contains("POSTAGE_OWNER_KEY"), "{help}");
+        assert!(!help.contains("deadbeefSECRET"), "{help}");
+    }
 
     fn sample(chunks: u64, total_chunks: u64, bytes: u64, total_bytes: u64) -> GetProgress {
         GetProgress {
