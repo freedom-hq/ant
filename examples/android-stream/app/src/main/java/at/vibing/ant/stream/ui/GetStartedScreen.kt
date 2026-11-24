@@ -94,8 +94,9 @@ fun GetStartedScreen(node: AntNode, onClose: () -> Unit) {
                 .onFailure {
                     error = it.message
                     // The cap this used may be what was refused (the price
-                    // moved): drop the cached quote so the picker re-prices
-                    // and a re-selected tier never resubmits it.
+                    // moved): drop it from the picker, which then shows no
+                    // price for this tier. A re-selected tier re-quotes
+                    // before it activates (the poll below).
                     quotes.remove(tier.id)
                 }
             activating = false
