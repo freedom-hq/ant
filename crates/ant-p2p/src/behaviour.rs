@@ -1736,10 +1736,15 @@ impl SwarmState {
     }
 
     /// [`Self::note_dial_started`] for a dial to the dial-book binding of
-    /// `peer` under `overlay`, which its failure is then charged to.
+    /// `peer` under `overlay`, which its failure is then charged to. Clears
+    /// only that binding's earlier failure: a peer-id (`None`) failure and
+    /// other bindings' failures stay, so a dial to one binding can't free
+    /// the rest back into bin balancing before [`FAIL_TTL`] (#299).
     fn note_hint_dial_started(&mut self, peer: PeerId, overlay: [u8; 32]) {
         self.note_dial_started(peer);
         self.dialed_overlay.insert(peer, overlay);
+        self.failed
+            .retain(|f| f.peer != peer || f.binding != Some(overlay));
     }
 
     /// Clear the hint dedup and re-queue every peerstore entry. With
@@ -8903,7 +8908,6 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.note_hint_dial_started(peer_id, hint.overlay);
-                state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
@@ -9005,7 +9009,6 @@ fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, t
             Ok(()) => {
                 state.dialing.insert(peer_id);
                 state.note_hint_dial_started(peer_id, overlay);
-                state.failed.retain(|f| f.peer != peer_id);
                 if let Some(a) = addrs.first() {
                     state.dial_hint_addr.insert(peer_id, a.clone());
                 }
@@ -11607,7 +11610,8 @@ mod tests {
     }
 
     /// #299 (R3-M1): per-binding entries for one peer id stay bounded; the
-    /// one whose window ends first goes.
+    /// binding entry whose window ends first goes (never the peer-id one,
+    /// see `per_binding_cap_keeps_the_peer_id_backoff`).
     #[test]
     fn per_binding_backoffs_are_capped() {
         let mut state = test_state();
@@ -11660,6 +11664,43 @@ mod tests {
 
         record_swarm_failure(&mut state, victim);
         assert_eq!(state.failed.iter().filter(|f| f.peer == victim).count(), 1);
+    }
+
+    /// #299 (R5-M1): starting a dial to one binding clears only that
+    /// binding's earlier failure. The peer id's own failure survives the
+    /// dial and its failure, so the other bindings stay out of bin
+    /// balancing until [`FAIL_TTL`].
+    #[tokio::test]
+    async fn binding_dial_keeps_the_peer_id_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peerstore = peerstore_with(dir.path(), &[]);
+        let mut state = backoff_test_state();
+        state.local_subnets = Some((Instant::now(), crate::underlay::LocalSubnets::default()));
+        connect_answering(&mut state, pid());
+        let local = pid();
+        let victim = pid();
+
+        let genuine = signed_hive_hint(&[7; 32], victim, "1.2.3.4");
+        state.enqueue_gossip_hint(genuine.clone(), local, None);
+        let forged = signed_hive_hint(&[6; 32], victim, "6.6.6.6");
+        state.enqueue_gossip_hint(forged.clone(), local, None);
+
+        record_swarm_failure_of(&mut state, victim, Some(forged.overlay));
+        record_swarm_failure(&mut state, victim);
+        record_swarm_failure_of(&mut state, victim, Some(forged.overlay));
+        assert_eq!(state.failed.iter().filter(|f| f.peer == victim).count(), 2);
+
+        start_binding_dial(&mut state, &forged);
+        assert!(state
+            .failed
+            .iter()
+            .all(|f| f.peer != victim || f.binding.is_none()));
+        assert!(state.failed.iter().any(|f| f.peer == victim));
+
+        note_outgoing_dial_error(&mut state, &mut peerstore, victim);
+        assert!(state.bin_balance_skips(&genuine));
+        let held = state.binding_hint(&victim, genuine.overlay).unwrap();
+        assert!(state.bin_balance_skips(&held));
     }
 
     /// #299 (R3-M2): a forged binding's failed dial lands in `failed`, but
