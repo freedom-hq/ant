@@ -978,13 +978,6 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::error::Error;
 
-    /// Golden references produced by bee itself (via the beemock
-    /// conformance oracle) for identical inputs. If these drift, ant's
-    /// manifests are no longer byte-compatible with bee's and the same
-    /// upload yields a different /bzz reference on each client. The
-    /// historical bug here was the path-separator fork flag: bee only
-    /// sets it for '/' at index > 0, so the synthetic "/" fork must
-    /// stay unflagged (caught by the differential conformance runner).
     /// Fork metadata whose padded length overflows the node format's
     /// u16 length field must be refused, not truncated into a corrupt
     /// manifest (audit RET-10).
@@ -1021,6 +1014,13 @@ mod tests {
         assert_eq!(bytes.len(), at + 2 + 65_534);
     }
 
+    /// Golden references produced by bee itself (via the beemock
+    /// conformance oracle) for identical inputs. If these drift, ant's
+    /// manifests are no longer byte-compatible with bee's and the same
+    /// upload yields a different /bzz reference on each client. The
+    /// historical bug here was the path-separator fork flag: bee only
+    /// sets it for '/' at index > 0, so the synthetic "/" fork must
+    /// stay unflagged (caught by the differential conformance runner).
     #[test]
     fn single_file_manifest_reference_matches_bee() {
         let split = crate::splitter::split_bytes(b"hello differential world\n");
