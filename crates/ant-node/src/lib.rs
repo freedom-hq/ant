@@ -515,15 +515,35 @@ mod tests {
     }
 
     /// Issue #269, end to end through `run_node`: an outbound-only node
-    /// runs without opening a listener (a listener shows up in the
-    /// status snapshot within milliseconds of the swarm's first poll) and
-    /// without an external address, and external addresses configured
-    /// for one are refused at start. (No bootnodes: nothing is dialed.)
+    /// runs without opening a listener and without an external address,
+    /// and external addresses configured for one are refused at start.
+    /// (No bootnodes: nothing is dialed.)
+    ///
+    /// A default node runs alongside as the control: the outbound-only
+    /// node is only checked once the control's listeners have reached its
+    /// status snapshot (plus a margin), so a regression in the status
+    /// listener sync, or a slow first poll, fails here instead of letting
+    /// "no listeners" pass for an unrelated reason.
     #[tokio::test]
     async fn an_outbound_only_node_opens_no_listener() {
         let (cfg, status) = node(true);
         let task = tokio::spawn(run_node(cfg));
+        let (control_cfg, mut control_status) = node(false);
+        let control = tokio::spawn(run_node(control_cfg));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            control_status.wait_for(|st| !st.listeners.is_empty()),
+        )
+        .await
+        .expect("the default (control) node never published a listener")
+        .expect("the control node's status channel closed");
+        assert!(!control.is_finished(), "the control node stopped");
+        control.abort();
+        // The two nodes started together; give the outbound-only one the
+        // same time plus a margin before reading its snapshot.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
         assert!(!task.is_finished(), "the node stopped");
         let st = status.borrow().clone();
         assert!(st.listeners.is_empty(), "listening on {:?}", st.listeners);
