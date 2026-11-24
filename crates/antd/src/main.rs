@@ -2624,7 +2624,19 @@ fn open_recovered_issuer(
     store_path: &Path,
     b: &ant_chain::discover::DiscoveredBatch,
 ) -> Result<ant_postage::StampIssuer> {
-    let want = 1usize << u32::from(b.bucket_depth);
+    // The bucket depth comes from the chain, where anyone can create a
+    // batch owned by this node with any depth: bound it before sizing
+    // anything from it (the issuer refuses the batch on its own too).
+    if b.bucket_depth > ant_postage::MAX_BUCKET_DEPTH {
+        return Err(anyhow!(
+            "batch bucket depth {} exceeds the maximum {}",
+            b.bucket_depth,
+            ant_postage::MAX_BUCKET_DEPTH
+        ));
+    }
+    let want = 1usize
+        .checked_shl(u32::from(b.bucket_depth))
+        .ok_or_else(|| anyhow!("batch bucket depth {} too large", b.bucket_depth))?;
     let fresh = || {
         ant_postage::StampIssuer::open_or_new(
             store_path.to_path_buf(),
@@ -2635,7 +2647,12 @@ fn open_recovered_issuer(
         )
         .map_err(|e| anyhow!("{e}"))
     };
-    match ant_postage::beestore::recover_bee_buckets(stamperstore, &b.batch_id) {
+    match ant_postage::beestore::recover_bee_buckets(
+        stamperstore,
+        &b.batch_id,
+        b.depth,
+        b.bucket_depth,
+    ) {
         Ok(Some(rec)) if rec.bucket_depth == b.bucket_depth && rec.buckets.len() == want => {
             let issued: u64 = rec.buckets.iter().map(|&c| u64::from(c)).sum();
             tracing::info!(

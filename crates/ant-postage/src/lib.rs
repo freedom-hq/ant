@@ -259,8 +259,31 @@ impl StampIssuer {
         bucket_depth: u8,
         immutable: bool,
     ) -> Result<Self, PostageError> {
+        // Lock before looking at the file: checking `path.exists()` first
+        // leaves a window where a concurrent creator writes and fills the
+        // store, and we then "create" it again with zeroed counters over
+        // the indices it already issued.
+        let store_lock = acquire_store_lock(&path)?;
+        Self::open_or_new_locked(
+            path,
+            store_lock,
+            batch_id,
+            batch_depth,
+            bucket_depth,
+            immutable,
+        )
+    }
+
+    /// [`Self::open_or_new`] with the store lock already held.
+    fn open_or_new_locked(
+        path: PathBuf,
+        store_lock: std::fs::File,
+        batch_id: [u8; 32],
+        batch_depth: u8,
+        bucket_depth: u8,
+        immutable: bool,
+    ) -> Result<Self, PostageError> {
         if path.exists() {
-            let store_lock = acquire_store_lock(&path)?;
             let bytes = std::fs::read(&path)
                 .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
             let header = decode_header(&bytes)?;
@@ -279,7 +302,7 @@ impl StampIssuer {
                     expected: format!("depth={batch_depth} bucket_depth={bucket_depth}"),
                 });
             }
-            let buckets = decode_buckets(&bytes, bucket_depth)?;
+            let buckets = decode_buckets(&bytes, batch_depth, bucket_depth)?;
             let mut issuer = Self {
                 batch_id,
                 batch_depth,
@@ -296,9 +319,16 @@ impl StampIssuer {
                 _store_lock: Some(store_lock),
             };
             issuer.attach_stamp_store();
+            issuer.reconcile_with_sidecar()?;
             return Ok(issuer);
         }
-        let issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
+        let issuer = Self::build(
+            batch_id,
+            batch_depth,
+            bucket_depth,
+            immutable,
+            Some((path, store_lock)),
+        )?;
         issuer.persist()?;
         Ok(issuer)
     }
@@ -323,19 +353,42 @@ impl StampIssuer {
         immutable: bool,
         buckets: &[u32],
     ) -> Result<Self, PostageError> {
+        // Lock first, as in `open_or_new`: the existence check decides
+        // whether the seed overwrites the file, so it must not race a
+        // concurrent creator.
+        let store_lock = acquire_store_lock(&path)?;
         if path.exists() {
-            return Self::open_or_new(path, batch_id, batch_depth, bucket_depth, immutable);
+            return Self::open_or_new_locked(
+                path,
+                store_lock,
+                batch_id,
+                batch_depth,
+                bucket_depth,
+                immutable,
+            );
         }
-        let n = 1usize
-            .checked_shl(u32::from(bucket_depth))
-            .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
+        check_depths(batch_depth, bucket_depth)?;
+        let n = 1usize << u32::from(bucket_depth);
         if buckets.len() != n {
             return Err(PostageError::Msg(format!(
                 "seed buckets len {} != 2^bucket_depth {n}",
                 buckets.len(),
             )));
         }
-        let mut issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
+        let upper =
+            bucket_capacity(batch_depth, bucket_depth).expect("check_depths bounds the span");
+        if let Some((i, &c)) = buckets.iter().enumerate().find(|(_, &c)| c > upper) {
+            return Err(PostageError::Msg(format!(
+                "seed bucket {i} counter {c} exceeds bucket capacity {upper}"
+            )));
+        }
+        let mut issuer = Self::build(
+            batch_id,
+            batch_depth,
+            bucket_depth,
+            immutable,
+            Some((path, store_lock)),
+        )?;
         issuer.buckets = buckets.to_vec();
         issuer.persist()?;
         Ok(issuer)
@@ -352,7 +405,7 @@ impl StampIssuer {
         let bytes = std::fs::read(&path)
             .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
         let header = decode_header(&bytes)?;
-        let buckets = decode_buckets(&bytes, header.bucket_depth)?;
+        let buckets = decode_buckets(&bytes, header.batch_depth, header.bucket_depth)?;
         let mut issuer = Self {
             batch_id: header.batch_id,
             batch_depth: header.batch_depth,
@@ -369,6 +422,7 @@ impl StampIssuer {
             _store_lock: Some(store_lock),
         };
         issuer.attach_stamp_store();
+        issuer.reconcile_with_sidecar()?;
         Ok(issuer)
     }
 
@@ -408,26 +462,13 @@ impl StampIssuer {
         batch_depth: u8,
         bucket_depth: u8,
         immutable: bool,
-        persist_path: Option<PathBuf>,
+        persist: Option<(PathBuf, std::fs::File)>,
     ) -> Result<Self, PostageError> {
-        if bucket_depth == 0 || bucket_depth >= batch_depth {
-            return Err(PostageError::Msg(
-                "bucketDepth must be >0 and < batchDepth".into(),
-            ));
-        }
-        if batch_depth - bucket_depth > MAX_BUCKET_SPAN {
-            return Err(PostageError::Msg(format!(
-                "batchDepth {batch_depth} exceeds bucketDepth {bucket_depth} \
-                 by more than {MAX_BUCKET_SPAN}"
-            )));
-        }
-        let n = 1usize
-            .checked_shl(u32::from(bucket_depth))
-            .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
-        let store_lock = persist_path
-            .as_deref()
-            .map(acquire_store_lock)
-            .transpose()?;
+        check_depths(batch_depth, bucket_depth)?;
+        // `check_depths` caps `bucket_depth` at `MAX_BUCKET_DEPTH`, so
+        // this allocation is at most 64 MiB.
+        let n = 1usize << u32::from(bucket_depth);
+        let (persist_path, store_lock) = persist.unzip();
         let mut issuer = Self {
             batch_id,
             batch_depth,
@@ -497,6 +538,50 @@ impl StampIssuer {
                 }
             }
         }
+    }
+
+    /// Bring loaded counters up to what the `.stamps` sidecar proves was
+    /// already issued. A record is appended only after its counter was
+    /// persisted, so in a consistent store every recorded index is below
+    /// its bucket's counter. A counter file restored from an older backup
+    /// next to a newer sidecar breaks that, and the next stamp would
+    /// reissue a slot the network has already seen.
+    ///
+    /// On an immutable batch each bucket is raised to at least its
+    /// highest recorded index + 1 and the result persisted. A mutable
+    /// batch is left alone: its counters wrap at capacity, so a recorded
+    /// index above the counter is normal there. A record whose index
+    /// can't belong to this batch (bucket or index out of range) means
+    /// the sidecar can't be trusted to bound the counters, so the issuer
+    /// fails closed like any other unusable sidecar.
+    fn reconcile_with_sidecar(&mut self) -> Result<(), PostageError> {
+        if !self.immutable || self.seen.is_empty() {
+            return Ok(());
+        }
+        let upper = self.bucket_upper_bound();
+        let mut raised = false;
+        for stamp in self.seen.values() {
+            let bucket = read_u32_be(&stamp[32..36]) as usize;
+            let within = read_u32_be(&stamp[36..40]);
+            let Some(slot) = self.buckets.get_mut(bucket).filter(|_| within < upper) else {
+                self.stamp_persistence_failed =
+                    Some("sidecar records an index outside this batch's buckets");
+                return Ok(());
+            };
+            if *slot <= within {
+                *slot = within + 1;
+                raised = true;
+            }
+        }
+        if raised {
+            tracing::warn!(
+                batch = %hex::encode(self.batch_id),
+                "postage counter file is behind its stamp sidecar (restored from an older \
+                 copy?); raised the counters to the sidecar's highest issued indices",
+            );
+            self.persist()?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -819,7 +904,10 @@ impl StampIssuer {
     fn reserve_index(&mut self, addr: &[u8; 32]) -> Result<[u8; INDEX_SIZE], PostageError> {
         let b_idx = collision_bucket_from_addr(self.bucket_depth, addr);
         let mut cnt = self.buckets.get(b_idx as usize).copied().unwrap_or(0);
-        if cnt == self.bucket_upper_bound() {
+        // `>=`, not `==`: a counter loaded past capacity (corrupt or
+        // foreign state that slipped through) must still read as full,
+        // never be incremented further out of range.
+        if cnt >= self.bucket_upper_bound() {
             if self.immutable {
                 return Err(PostageError::BucketFull);
             }
@@ -846,7 +934,7 @@ impl StampIssuer {
         let upper = self.bucket_upper_bound();
 
         let mut cnt = cnt;
-        if cnt == upper {
+        if cnt >= upper {
             if self.immutable {
                 return Err(PostageError::BucketFull);
             }
@@ -948,25 +1036,14 @@ fn decode_header(bytes: &[u8]) -> Result<StoreHeader, PostageError> {
     }
     let batch_depth = bytes[6];
     let bucket_depth = bytes[7];
-    // Same bounds `build` enforces, plus a ceiling at 32 (bucket indices
-    // are u32). Without this a corrupt or crafted header with a huge
-    // `bucket_depth` reaches `decode_buckets` and its `1 << bucket_depth`
-    // sizing, which aborts the process instead of failing the load. The
-    // span `batch_depth - bucket_depth` is bounded too: it sizes each
-    // bucket's `u32` capacity in `bucket_upper_bound`, where an
-    // oversized span would overflow the shift (a panic in debug, a
-    // silently masked bogus capacity in release).
-    if bucket_depth == 0
-        || bucket_depth >= batch_depth
-        || bucket_depth > 32
-        || batch_depth - bucket_depth > MAX_BUCKET_SPAN
-    {
-        return Err(PostageError::Load(format!(
-            "invalid depths: bucket_depth {bucket_depth}, batch_depth {batch_depth} \
-             (need 0 < bucket_depth < batch_depth, bucket_depth <= 32 and \
-             batch_depth - bucket_depth <= {MAX_BUCKET_SPAN})"
-        )));
-    }
+    // Same bounds `build` enforces (see `check_depths`). Without this a
+    // corrupt or crafted header with a huge `bucket_depth` reaches
+    // `decode_buckets` and its `1 << bucket_depth` sizing, which
+    // allocates gigabytes or aborts the process instead of failing the
+    // load. The span `batch_depth - bucket_depth` is bounded too: it
+    // sizes each bucket's `u32` capacity in `bucket_upper_bound`, where
+    // an oversized span would overflow the shift.
+    check_depths(batch_depth, bucket_depth).map_err(|e| PostageError::Load(e.to_string()))?;
     let immutable = bytes[8] != 0;
     let mut batch_id = [0u8; 32];
     batch_id.copy_from_slice(&bytes[16..48]);
@@ -978,7 +1055,13 @@ fn decode_header(bytes: &[u8]) -> Result<StoreHeader, PostageError> {
     })
 }
 
-fn decode_buckets(bytes: &[u8], bucket_depth: u8) -> Result<Vec<u32>, PostageError> {
+fn decode_buckets(
+    bytes: &[u8],
+    batch_depth: u8,
+    bucket_depth: u8,
+) -> Result<Vec<u32>, PostageError> {
+    let upper = bucket_capacity(batch_depth, bucket_depth)
+        .ok_or_else(|| PostageError::Load("invalid depth span".into()))?;
     let n = 1usize
         .checked_shl(u32::from(bucket_depth))
         .ok_or_else(|| PostageError::Load("bucket_depth overflow".into()))?;
@@ -1014,12 +1097,16 @@ fn decode_buckets(bytes: &[u8], bucket_depth: u8) -> Result<Vec<u32>, PostageErr
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = STORE_HEADER_LEN + 4 * i;
-        out.push(u32::from_le_bytes([
-            body[off],
-            body[off + 1],
-            body[off + 2],
-            body[off + 3],
-        ]));
+        let c = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        // A counter can never legitimately pass its bucket's capacity
+        // (`increment` stops or wraps there). One that does is corrupt
+        // or foreign: refuse it rather than issue out-of-range indices.
+        if c > upper {
+            return Err(PostageError::Load(format!(
+                "bucket {i} counter {c} exceeds bucket capacity {upper}"
+            )));
+        }
+        out.push(c);
     }
     Ok(out)
 }
@@ -1060,10 +1147,16 @@ pub fn unix_now_nanos_be() -> [u8; TIMESTAMP_SIZE] {
 
 /// Matches bee `pkg/postage/stampissuer.go::toBucket`: top `depth` bits of address as BE u32,
 /// masked to collision bucket slots.
+///
+/// Defined for every `bucket_depth`: depth 0 maps every address to bucket
+/// 0 and a depth above 32 uses all 32 bits, instead of shifting by 32 or
+/// more (a panic in debug, a silently wrapped bucket in release). Issuers
+/// and [`verify_stamp_owner`] reject such depths before getting here.
 #[must_use]
 pub fn collision_bucket_from_addr(bucket_depth: u8, addr: &[u8; 32]) -> u32 {
     let top = u32::from_be_bytes(addr[0..4].try_into().unwrap());
-    top >> (32 - u32::from(bucket_depth))
+    let depth = u32::from(bucket_depth).min(32);
+    top.checked_shr(32 - depth).unwrap_or(0)
 }
 
 fn index_bytes(bucket: u32, within_bucket: u32) -> [u8; INDEX_SIZE] {
@@ -1765,11 +1858,14 @@ pub fn verify_stamp_owner(
     let ts: &[u8; 8] = stamp[40..48].try_into().unwrap();
     let sig: &[u8; 65] = stamp[48..113].try_into().unwrap();
 
+    // Depths and index range first: they come from the caller's batch
+    // record, and a bad `bucket_depth` must be rejected before it is
+    // used to compute a bucket.
+    bucket_check(chunk_addr, *index, bucket_depth, depth)?;
+
     let digest_arr = postage_sign_digest(chunk_addr, batch_id, index, ts);
     let digest_slice: &[u8] = digest_arr.as_ref();
     let vk = recover_public_key(sig, digest_slice)?;
-
-    bucket_check(chunk_addr, *index, bucket_depth, depth)?;
 
     let eth = ethereum_address_from_public_key(&vk);
     if eth != *expected_eth {
@@ -1784,6 +1880,16 @@ fn bucket_check(
     bucket_depth: u8,
     depth: u8,
 ) -> Result<(), PostageError> {
+    // `depth`/`bucket_depth` come from the caller's batch record, not a
+    // validated issuer, so they are checked before any shift uses them.
+    let max_idx = (bucket_depth > 0 && bucket_depth <= 32)
+        .then(|| bucket_capacity(depth, bucket_depth))
+        .flatten()
+        .ok_or_else(|| {
+            PostageError::Msg(format!(
+                "invalid depths: depth {depth}, bucket_depth {bucket_depth}"
+            ))
+        })?;
     let bucket = collision_bucket_from_addr(bucket_depth, chunk_addr);
     let exp_bucket = read_u32_be(&index[0..4]);
     if bucket != exp_bucket {
@@ -1791,13 +1897,6 @@ fn bucket_check(
     }
 
     let within = read_u32_be(&index[4..8]);
-    // `depth`/`bucket_depth` come from the caller's batch record, not a
-    // validated issuer, so the span is checked rather than shifted raw.
-    let max_idx = bucket_capacity(depth, bucket_depth).ok_or_else(|| {
-        PostageError::Msg(format!(
-            "invalid depths: depth {depth}, bucket_depth {bucket_depth}"
-        ))
-    })?;
     if within >= max_idx {
         return Err(PostageError::Msg("invalid stamp index".into()));
     }
@@ -1808,10 +1907,40 @@ fn bucket_check(
 /// `2^span` still fits the `u32` bucket counters and stamp indices.
 const MAX_BUCKET_SPAN: u8 = 31;
 
+/// Largest bucket depth an issuer accepts. The counter table holds
+/// `2^bucket_depth` `u32`s in memory and on disk: 24 is 64 MiB, while the
+/// `< batch_depth` bound alone would let a batch's on-chain bucket depth
+/// (anyone can create a batch owned by someone else) ask for gigabytes or
+/// an allocation abort. Bee's own batches use 16.
+pub const MAX_BUCKET_DEPTH: u8 = 24;
+
+/// The depth bounds every issuer path enforces: `0 < bucket_depth <
+/// batch_depth`, `bucket_depth <= MAX_BUCKET_DEPTH` and a span of at most
+/// [`MAX_BUCKET_SPAN`].
+fn check_depths(batch_depth: u8, bucket_depth: u8) -> Result<(), PostageError> {
+    if bucket_depth == 0 || bucket_depth >= batch_depth {
+        return Err(PostageError::Msg(format!(
+            "bucketDepth {bucket_depth} must be >0 and < batchDepth {batch_depth}"
+        )));
+    }
+    if bucket_depth > MAX_BUCKET_DEPTH {
+        return Err(PostageError::Msg(format!(
+            "bucketDepth {bucket_depth} exceeds the maximum {MAX_BUCKET_DEPTH}"
+        )));
+    }
+    if batch_depth - bucket_depth > MAX_BUCKET_SPAN {
+        return Err(PostageError::Msg(format!(
+            "batchDepth {batch_depth} exceeds bucketDepth {bucket_depth} \
+             by more than {MAX_BUCKET_SPAN}"
+        )));
+    }
+    Ok(())
+}
+
 /// Per-bucket capacity `2^(batch_depth - bucket_depth)`, or `None` when
 /// `bucket_depth > batch_depth` or the span exceeds [`MAX_BUCKET_SPAN`].
 /// (Issuers additionally require `bucket_depth < batch_depth`.)
-fn bucket_capacity(batch_depth: u8, bucket_depth: u8) -> Option<u32> {
+pub(crate) fn bucket_capacity(batch_depth: u8, bucket_depth: u8) -> Option<u32> {
     batch_depth
         .checked_sub(bucket_depth)
         .filter(|span| *span <= MAX_BUCKET_SPAN)
@@ -2825,6 +2954,239 @@ mod tests {
     /// handle's append in an unlinked inode — the store lock refuses the
     /// second issuer outright.
     #[test]
+    fn build_rejects_bucket_depth_above_max() {
+        let id = [0x31u8; 32];
+        // At the cap is fine (64 MiB of counters) ...
+        assert!(StampIssuer::new(id, MAX_BUCKET_DEPTH + 1, MAX_BUCKET_DEPTH, true).is_ok());
+        // ... one above it, and the depths that used to allocate 1 GiB
+        // (28) or abort (40, 254), are refused before any allocation.
+        for bucket_depth in [MAX_BUCKET_DEPTH + 1, 28, 40, 254] {
+            let batch_depth = bucket_depth + 1;
+            let err = StampIssuer::new(id, batch_depth, bucket_depth, true).unwrap_err();
+            assert!(
+                matches!(&err, PostageError::Msg(m) if m.contains("maximum")),
+                "bucket depth {bucket_depth}: {err:?}"
+            );
+        }
+        let dir = tmpdir();
+        // The persistent and seeded constructors share the bound, and
+        // leave nothing on disk behind a refusal.
+        let path = dir.join("deep.bin");
+        assert!(StampIssuer::open_or_new(path.clone(), id, 30, 28, true).is_err());
+        assert!(StampIssuer::open_or_new_seeded(path.clone(), id, 30, 28, true, &[]).is_err());
+        assert!(!path.exists());
+        // A crafted counter file with an over-deep header is a load error.
+        let bytes = encode_store(&id, 30, 25, true, &[]);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = StampIssuer::open_existing(path.clone()).unwrap_err();
+        assert!(matches!(err, PostageError::Load(_)), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collision_bucket_tolerates_out_of_range_depths() {
+        let a = [0xffu8; 32];
+        assert_eq!(collision_bucket_from_addr(0, &a), 0);
+        assert_eq!(collision_bucket_from_addr(32, &a), u32::MAX);
+        assert_eq!(collision_bucket_from_addr(40, &a), u32::MAX);
+        assert_eq!(collision_bucket_from_addr(16, &a), 0xffff);
+        // `verify_stamp_owner` rejects such depths before computing a
+        // bucket, with an error rather than a panic.
+        let stamp = [0u8; STAMP_SIZE];
+        for (depth, bucket_depth) in [(20u8, 0u8), (60, 40), (255, 254)] {
+            let err = verify_stamp_owner(&a, &stamp, &[0u8; 20], depth, bucket_depth).unwrap_err();
+            assert!(
+                matches!(&err, PostageError::Msg(m) if m.contains("invalid depths")),
+                "({depth}, {bucket_depth}): {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_above_capacity_on_disk_is_load_error() {
+        let dir = tmpdir();
+        let path = dir.join("over.bin");
+        let id = [0x32u8; 32];
+        // depth 10 / bucket depth 8: capacity 4 per bucket.
+        let mut buckets = vec![0u32; 256];
+        buckets[7] = 4; // full is fine
+        std::fs::write(&path, encode_store(&id, 10, 8, true, &buckets)).unwrap();
+        drop(StampIssuer::open_or_new(path.clone(), id, 10, 8, true).unwrap());
+        drop(StampIssuer::open_existing(path.clone()).unwrap());
+        // One past it (with a valid checksum, so only the bound catches
+        // it), and a counter near `u32::MAX` that would overflow.
+        for bad in [5u32, u32::MAX] {
+            buckets[7] = bad;
+            std::fs::write(&path, encode_store(&id, 10, 8, true, &buckets)).unwrap();
+            let err = StampIssuer::open_or_new(path.clone(), id, 10, 8, true).unwrap_err();
+            assert!(
+                matches!(&err, PostageError::Load(m) if m.contains("exceeds bucket capacity")),
+                "{bad}: {err:?}"
+            );
+            let err = StampIssuer::open_existing(path.clone()).unwrap_err();
+            assert!(matches!(err, PostageError::Load(_)), "{bad}: {err:?}");
+        }
+        // Seeding past capacity is refused the same way.
+        let seeded = dir.join("seeded.bin");
+        let err =
+            StampIssuer::open_or_new_seeded(seeded.clone(), id, 10, 8, true, &buckets).unwrap_err();
+        assert!(matches!(&err, PostageError::Msg(m) if m.contains("exceeds bucket capacity")));
+        assert!(!seeded.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn full_bucket_with_overflowed_counter_is_bucket_full() {
+        let secret = random_secp256k1_secret();
+        let chunk = addr(1);
+        let b = collision_bucket_from_addr(8, &chunk) as usize;
+        for over in [5u32, u32::MAX] {
+            // Immutable: a counter past capacity is full, never bumped.
+            let mut issuer = StampIssuer::new([0x33; 32], 10, 8, true).unwrap();
+            issuer.buckets[b] = over;
+            assert!(matches!(
+                issuer.increment(&chunk),
+                Err(PostageError::BucketFull)
+            ));
+            let out = sign_stamps_batch(&secret, &mut issuer, &[chunk]);
+            assert!(
+                matches!(out[0], Err(PostageError::BucketFull)),
+                "{:?}",
+                out[0]
+            );
+            assert_eq!(issuer.buckets[b], over, "counter left untouched");
+            // Mutable: it wraps to index 0 instead of issuing `over`.
+            let mut issuer = StampIssuer::new([0x33; 32], 10, 8, false).unwrap();
+            issuer.buckets[b] = over;
+            let (idx, _) = issuer.increment(&chunk).unwrap();
+            assert_eq!(read_u32_be(&idx[4..8]), 0);
+            issuer.buckets[b] = over;
+            let stamp = sign_stamps_batch(&secret, &mut issuer, &[chunk])
+                .remove(0)
+                .unwrap();
+            assert_eq!(read_u32_be(&stamp[36..40]), 0);
+        }
+    }
+
+    #[test]
+    fn open_or_new_locks_before_existence_check() {
+        // Two issuers race to open (and so create) one store. While both
+        // are held exactly one may win; and once the winner has issued
+        // and let go, a late opener must load its counters rather than
+        // "create" the store again over them.
+        for round in 0..50u32 {
+            let dir = tmpdir();
+            let path = dir.join("race.bin");
+            let id = [0x34u8; 32];
+            let chunk = addr(round);
+            let start = std::sync::Barrier::new(2);
+            let held = std::sync::Barrier::new(2);
+            let wins: Vec<bool> = std::thread::scope(|s| {
+                let run = || {
+                    start.wait();
+                    let issuer = StampIssuer::open_or_new(path.clone(), id, 12, 8, true);
+                    match issuer {
+                        Ok(mut issuer) => {
+                            for _ in 0..3 {
+                                issuer.increment(&chunk).unwrap();
+                            }
+                            held.wait();
+                            true
+                        }
+                        Err(e) => {
+                            assert!(matches!(&e, PostageError::Persist(m) if m.contains("locked")));
+                            held.wait();
+                            false
+                        }
+                    }
+                };
+                let a = s.spawn(run);
+                let b = s.spawn(run);
+                vec![a.join().unwrap(), b.join().unwrap()]
+            });
+            assert_eq!(wins.iter().filter(|w| **w).count(), 1, "round {round}");
+
+            // Second phase: one issuer opens, issues and drops while the
+            // other opens; neither holds on. Whatever the interleaving,
+            // no issued counter may be lost.
+            let issued = std::sync::atomic::AtomicU32::new(3);
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        if let Ok(mut issuer) =
+                            StampIssuer::open_or_new(path.clone(), id, 12, 8, true)
+                        {
+                            issuer.increment(&chunk).unwrap();
+                            issued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            let issuer = StampIssuer::open_existing(path.clone()).unwrap();
+            let b = collision_bucket_from_addr(8, &chunk) as usize;
+            assert_eq!(
+                issuer.buckets[b],
+                issued.load(std::sync::atomic::Ordering::SeqCst),
+                "round {round}: counters lost"
+            );
+            drop(issuer);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn stale_bin_with_newer_sidecar_does_not_reissue() {
+        let dir = tmpdir();
+        let path = dir.join("stale.bin");
+        let id = [0x35u8; 32];
+        let secret = random_secp256k1_secret();
+        let chunks: Vec<[u8; 32]> = (0..40).map(addr).collect();
+        let mut issued = std::collections::HashSet::new();
+
+        let mut issuer = StampIssuer::open_or_new(path.clone(), id, 12, 2, true).unwrap();
+        for c in &chunks[..10] {
+            let st = sign_stamp_bytes(&secret, &mut issuer, c).unwrap();
+            assert!(issued.insert(st[32..40].to_vec()));
+        }
+        let old_bin = std::fs::read(&path).unwrap();
+        for c in &chunks[10..20] {
+            let st = sign_stamp_bytes(&secret, &mut issuer, c).unwrap();
+            assert!(issued.insert(st[32..40].to_vec()));
+        }
+        drop(issuer);
+
+        // Restore the older counter file next to the newer sidecar.
+        std::fs::write(&path, &old_bin).unwrap();
+        let mut issuer = StampIssuer::open_or_new(path.clone(), id, 12, 2, true).unwrap();
+        for c in &chunks[20..] {
+            let st = sign_stamp_bytes(&secret, &mut issuer, c).unwrap();
+            assert!(
+                issued.insert(st[32..40].to_vec()),
+                "slot {} reissued",
+                hex::encode(&st[32..40])
+            );
+        }
+        drop(issuer);
+        // The raised counters were persisted, and `open_existing` takes
+        // the same path.
+        std::fs::write(&path, &old_bin).unwrap();
+        let issuer = StampIssuer::open_existing(path.clone()).unwrap();
+        assert_eq!(issuer.issued_count(), 40);
+        drop(issuer);
+
+        // A sidecar index that can't belong to the batch fails closed.
+        let sidecar = stamps_sidecar_path(&path);
+        let mut bogus = [0u8; STAMP_SIZE];
+        bogus[0..32].copy_from_slice(&id);
+        bogus[32..40].copy_from_slice(&index_bytes(0, 4096));
+        append_stamp_record(&sidecar, &id, &addr(999), &bogus).unwrap();
+        let mut issuer = StampIssuer::open_or_new(path.clone(), id, 12, 2, true).unwrap();
+        assert!(issuer.stamp_records_unavailable().is_some());
+        assert!(sign_stamp_bytes(&secret, &mut issuer, &addr(1000)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn second_issuer_on_the_same_store_is_refused() {
         let dir = tmpdir();
         let path = dir.join("c.bin");
@@ -3047,7 +3409,7 @@ mod tests {
             );
             // The sizing in `decode_buckets` must hold on its own too,
             // even if a header check ever lets such a depth through.
-            let err = decode_buckets(&bytes, bucket_depth).unwrap_err();
+            let err = decode_buckets(&bytes, batch_depth, bucket_depth).unwrap_err();
             assert!(
                 matches!(err, PostageError::Load(_)),
                 "decode_buckets({bucket_depth}): expected Load, got {err:?}",
