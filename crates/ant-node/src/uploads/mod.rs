@@ -875,6 +875,19 @@ struct JobHandle {
 /// chunks). That needs a pre-#292 prefix cancel *and* a backwards clock
 /// step; refusing a job the user deliberately resumed needs neither.
 ///
+/// One exception: a stray `Cancelled` beats a full-id `Failed` copy
+/// whatever their stamps. That pair is what the same pre-#292 race
+/// leaves when the user does nothing more: the prefix `cancel` writes
+/// the stray, then the driver, erroring before it saw the flag, runs
+/// `mark_failed` on the full id (usually in the same second, where the
+/// tie rule below would hand it to the full-id file). On timestamps
+/// alone the job would come back as a resumable failure with an error
+/// text, though the user had cancelled it. The cost: a user who did
+/// resume that `Failed` job, only for it to fail again, sees it
+/// `Cancelled` instead of `Failed`. Neither state is driven on boot, so
+/// either way only the listing is affected, and the cancel is the
+/// user's own last word on the job.
+///
 /// Otherwise the most recently updated: a prefix copy holds the status a
 /// `pause`/`resume`/`cancel` set, the full-id copy the driver's
 /// checkpoints; whichever was written last is the job's latest state (an
@@ -910,6 +923,18 @@ fn pick_manifest(
         })
         .map(|(i, _)| i)
         .expect("at least one manifest per job");
+    // A full-id `Failed` that beat every stray on time still yields to
+    // a stray `Cancelled` (newest first): see the doc above.
+    let best = if copies[best].0 == canonical && copies[best].1.status == UploadStatus::Failed {
+        copies
+            .iter()
+            .enumerate()
+            .filter(|(_, (path, info))| path != canonical && info.status == UploadStatus::Cancelled)
+            .max_by_key(|(_, (_, info))| info.last_update_unix)
+            .map_or(best, |(i, _)| i)
+    } else {
+        best
+    };
     let (kept_path, kept) = copies.swap_remove(best);
     let others = copies.into_iter().map(|(p, _)| p).collect();
     (kept_path, kept, others)
@@ -5934,6 +5959,31 @@ mod tests {
                 Some(job("3333333333333333", UploadStatus::Paused, 200)),
                 vec![job("3333333333333333", UploadStatus::Cancelled, 100)],
                 UploadStatus::Paused,
+                0,
+            ),
+            // Same race, but the user did nothing after the cancel: the
+            // driver's `mark_failed` (here a second later) doesn't turn
+            // the cancelled job into a resumable failure.
+            (
+                Some(job("4444444444444444", UploadStatus::Failed, 101)),
+                vec![job("4444444444444444", UploadStatus::Cancelled, 100)],
+                UploadStatus::Cancelled,
+                0,
+            ),
+            // ... nor in the same second, where the tie rule alone would
+            // keep the full-id file.
+            (
+                Some(job("5555555555555555", UploadStatus::Failed, 100)),
+                vec![job("5555555555555555", UploadStatus::Cancelled, 100)],
+                UploadStatus::Cancelled,
+                0,
+            ),
+            // With no `Cancelled` stray, a full-id `Failed` competes on
+            // time like any other copy: the newer one wins.
+            (
+                Some(job("6666666666666666", UploadStatus::Failed, 200)),
+                vec![job("6666666666666666", UploadStatus::Paused, 100)],
+                UploadStatus::Failed,
                 0,
             ),
             // Only a stray: it moves under the full id.
