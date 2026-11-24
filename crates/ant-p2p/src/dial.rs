@@ -18,15 +18,22 @@ pub fn endpoint_host(ma: &Multiaddr) -> String {
     String::new()
 }
 
-/// Extract the `/p2p/<peer_id>` component from a multiaddr, if present.
-/// Addresses without one are skipped by the bootnode dial path: a returning
-/// `ConnectionEstablished` carries the remote peer id and we need it to
+/// Extract the destination `/p2p/<peer_id>` from a multiaddr, if present:
+/// the *last* `/p2p/` component, past any relay hop of a circuit address
+/// (`/../p2p/<relay>/p2p-circuit/p2p/<target>`), which is the peer a dial
+/// reaches and the one a returning `ConnectionEstablished` names. The
+/// handshake binds a `BzzAddress` to its connection by this same
+/// component, so a hive hint keyed by it is attributed to the peer its
+/// record was signed for, not to the relay in front of it. Addresses
+/// without one are skipped by the bootnode dial path: we need the id to
 /// match back to the in-flight dial.
 pub fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|p| match p {
-        Protocol::P2p(id) => Some(id),
-        _ => None,
-    })
+    addr.iter()
+        .filter_map(|p| match p {
+            Protocol::P2p(id) => Some(id),
+            _ => None,
+        })
+        .last()
 }
 
 #[cfg(test)]
@@ -52,6 +59,17 @@ mod tests {
                 .parse()
                 .unwrap();
         assert!(extract_peer_id(&a).is_some());
+    }
+
+    /// A circuit address names the relay first and the destination last;
+    /// the destination is the peer.
+    #[test]
+    fn extract_peer_id_takes_circuit_destination() {
+        let (relay, target) = (PeerId::random(), PeerId::random());
+        let a: Multiaddr = format!("/ip4/1.2.3.4/tcp/1634/p2p/{relay}/p2p-circuit/p2p/{target}")
+            .parse()
+            .unwrap();
+        assert_eq!(extract_peer_id(&a), Some(target));
     }
 
     #[test]

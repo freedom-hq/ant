@@ -757,7 +757,9 @@ fn verified_hint(
 ) -> Option<PeerHint> {
     let addrs = deserialize_underlays(&p.underlay).ok()?;
     // All underlays of a single BzzAddress describe the same peer, so
-    // pull the peer id from the first one that has it.
+    // pull the peer id from the first one that has it — its destination
+    // (last `/p2p/`), the component the handshake binds the record to,
+    // not a circuit address's relay hop.
     let peer_id = addrs.iter().find_map(extract_peer_id)?;
     let overlay: [u8; 32] = p.overlay.as_slice().try_into().ok()?;
     let signature: [u8; 65] = p.signature.as_slice().try_into().ok()?;
@@ -1034,6 +1036,27 @@ mod tests {
         assert_eq!(hints[0].peer_id, peer);
         assert_eq!(hints[0].addrs, vec![addr]);
         assert_eq!(hints[0].overlay.as_slice(), overlay.as_slice());
+    }
+
+    /// R1-M1: a circuit underlay names its relay first; the hint belongs
+    /// to the destination the record was signed for, the same peer the
+    /// handshake binds it to, never to the relay.
+    #[test]
+    fn circuit_underlay_hint_keys_the_destination_not_the_relay() {
+        let (relay, target) = (PeerId::random(), PeerId::random());
+        let addr: Multiaddr = format!("/ip4/1.2.3.4/tcp/1634/p2p/{relay}/p2p-circuit/p2p/{target}")
+            .parse()
+            .unwrap();
+        let entry = signed_hive_entry(
+            &[5; 32],
+            HandshakeWireVersion::V15,
+            NET,
+            std::slice::from_ref(&addr),
+        );
+        let hints = decode_hive_peers(&encode(vec![entry]), HandshakeWireVersion::V15, NET);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].peer_id, target);
+        assert_eq!(hints[0].addrs, vec![addr]);
     }
 
     #[test]

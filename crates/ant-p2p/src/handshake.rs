@@ -599,23 +599,12 @@ fn check_remote_underlay(underlay: &[u8], remote_peer_id: PeerId) -> Result<(), 
     let addrs = deserialize_underlays(underlay)?;
     if addrs
         .iter()
-        .any(|a| last_peer_id(a) == Some(remote_peer_id))
+        .any(|a| crate::dial::extract_peer_id(a) == Some(remote_peer_id))
     {
         Ok(())
     } else {
         Err(HandshakeError::UnderlayPeerId)
     }
-}
-
-/// The last `/p2p/` component of `addr` — the destination peer, past any
-/// relay hop of a circuit address.
-fn last_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter()
-        .filter_map(|p| match p {
-            Protocol::P2p(id) => Some(id),
-            _ => None,
-        })
-        .last()
 }
 
 /// Bee's `CheckTimestamp(.., TimestampSourceHandshake)`: a V15 record
