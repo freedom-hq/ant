@@ -2126,7 +2126,8 @@ pub unsafe extern "C" fn ant_stream_open(
 ///
 /// * `stream` must come from [`ant_stream_open`] and must not have been
 ///   passed to [`ant_stream_close`].
-/// * `dst` must point at a writable buffer of at least `len` bytes.
+/// * `dst` must point at a writable buffer of at least `len` bytes. It
+///   may be null when `len` is 0 (the call then returns 0).
 /// * `out_err` may be null to opt out of error reporting.
 #[no_mangle]
 pub unsafe extern "C" fn ant_stream_read(
@@ -2140,7 +2141,12 @@ pub unsafe extern "C" fn ant_stream_read(
         clear_out_err(out_err);
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<usize, FfiError> {
             let stream = stream.as_ref().ok_or(FfiError::NullPointer)?;
-            if dst.is_null() && len > 0 {
+            if len == 0 {
+                // Nothing to read, and `dst` may be null:
+                // `from_raw_parts_mut(NULL, 0)` is undefined behaviour.
+                return Ok(0);
+            }
+            if dst.is_null() {
                 return Err(FfiError::NullPointer);
             }
             let dst_slice = std::slice::from_raw_parts_mut(dst, len);
@@ -2165,16 +2171,19 @@ pub unsafe extern "C" fn ant_stream_read(
 /// Pull a contiguous byte range and deliver each joiner-produced
 /// chunk to `on_chunk` as it arrives. Unlike [`ant_stream_read`] —
 /// which holds the calling thread until the entire `len` bytes have
-/// been buffered — this drives a single `StreamBzz` request all the
-/// way to its terminal `StreamDone`, invoking the callback for every
-/// `BytesChunk` ack along the way. That matches the
+/// been buffered — this drives a single `StreamBzz` request,
+/// invoking the callback for each `BytesChunk` ack as it lands, until
+/// the terminal `StreamDone`, an error, or the callback asks to stop
+/// (see below). That matches the
 /// `AVAssetResourceLoaderDelegate` shape on the Swift side: a long-
 /// lived `dataRequest` that wants `respond(with:)` called as soon as
 /// each piece of body lands, not after the whole window has buffered.
 ///
 /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value asks
 /// the FFI to stop pulling early (e.g. `AVPlayer` canceled the
-/// `dataRequest`). The remaining acks are drained for clean shutdown.
+/// `dataRequest`). The call then returns the bytes delivered so far
+/// at once, the callback is not invoked again, and the node stops
+/// fetching the rest of the range.
 /// The callback runs on a tokio runtime worker thread and must be
 /// non-blocking and Send-safe.
 ///
@@ -5869,6 +5878,25 @@ mod tests {
         h.disk_cache = Some(cache::open_disk_cache(&dir, cap).expect("open disk cache"));
         h.memory_cache = Arc::new(InMemoryChunkCache::with_default_capacity());
         (Box::into_raw(Box::new(h)), dir)
+    }
+
+    /// `ant_stream_read` with `len == 0` returns 0 without building a
+    /// slice over `dst`, so a null `dst` is fine (audit FFI-03, issue
+    /// #289). Before the fix this reached `from_raw_parts_mut(NULL, 0)`.
+    #[test]
+    fn stream_read_of_zero_bytes_into_null_returns_zero() {
+        let runtime = Runtime::new().expect("runtime");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let stream = Box::into_raw(Box::new(AntStream::for_test(
+            runtime.handle().clone(),
+            cmd_tx,
+            100,
+        )));
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let n = unsafe { ant_stream_read(stream, 0, 0, std::ptr::null_mut(), &raw mut err) };
+        assert_eq!(n, 0);
+        assert!(err.is_null());
+        unsafe { ant_stream_close(stream) };
     }
 
     /// A handle over `runtime` with everything else inert — enough for

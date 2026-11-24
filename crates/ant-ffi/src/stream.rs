@@ -96,12 +96,37 @@ pub(crate) enum StreamError {
 }
 
 impl AntStream {
+    /// A stream over `cmd_tx` whose head is already known, for tests
+    /// that script the node side of the command channel.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime: Handle,
+        cmd_tx: mpsc::Sender<ControlCommand>,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            runtime,
+            cmd_tx,
+            reference: [0u8; 32],
+            path: String::new(),
+            total_bytes,
+            content_type: None,
+            filename: None,
+            progress: Mutex::new(StreamProgress::default()),
+            bytes_downloaded: AtomicU64::new(0),
+            started_at: Instant::now(),
+        }
+    }
+
     /// Issue `StreamBzz { head_only: true }` and capture the resulting
     /// `BzzStreamStart` to learn `total_bytes` + `content_type`. The
     /// returned `AntStream` borrows the handle's mpsc sender + runtime
-    /// handle but does *not* keep the handle alive; closing the handle
-    /// while a stream is open will fail subsequent reads with an
-    /// "ack channel closed" error rather than crash.
+    /// handle but does *not* keep the handle alive. Using the stream
+    /// after `ant_shutdown` is undefined behaviour, exactly as `ant.h`
+    /// says: once the runtime is shut down, `block_on` with the read
+    /// deadline's timer panics, and with the release profile's
+    /// `panic = "abort"` that aborts the process. Always close the
+    /// stream before shutting the handle down.
     pub(crate) fn open(
         runtime: Handle,
         cmd_tx: mpsc::Sender<ControlCommand>,
@@ -168,13 +193,14 @@ impl AntStream {
         if len == 0 || offset >= self.total_bytes {
             return Ok(0);
         }
-        let bound_len = u64::try_from(len)
-            .ok()
-            .and_then(|len| len.checked_add(offset))
-            .map(|end| end.min(self.total_bytes) - offset)
-            .map_or(len, |n| usize::try_from(n).unwrap_or(len));
-        let dst = &mut dst[..bound_len];
-        let end_inclusive = offset.saturating_add(bound_len as u64).saturating_sub(1);
+        let bound_len = bounded_len(
+            u64::try_from(len).unwrap_or(u64::MAX),
+            offset,
+            self.total_bytes,
+        );
+        // `bound_len <= len`, so it fits a `usize`.
+        let dst = &mut dst[..usize::try_from(bound_len).unwrap_or(len)];
+        let end_inclusive = offset + bound_len - 1;
         let cmd_tx = self.cmd_tx.clone();
         let reference = self.reference;
         let path = self.path.clone();
@@ -217,7 +243,10 @@ impl AntStream {
     ///
     /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value
     /// requests early termination (e.g. the consumer was cancelled);
-    /// the call returns `Ok(bytes_delivered_so_far)` in that case.
+    /// the call returns `Ok(bytes_delivered_so_far)` at once, without
+    /// invoking the callback again. Dropping the ack receiver makes
+    /// the node's `StreamBzz` task stop fetching (its next ack send
+    /// fails and `unless_client_gone` sees the closed channel).
     /// The callback runs on a runtime worker thread; it must be
     /// non-blocking and Send-safe.
     ///
@@ -229,12 +258,7 @@ impl AntStream {
         if len == 0 || offset >= self.total_bytes {
             return Ok(0);
         }
-        let bound_len = len
-            .checked_add(offset)
-            .map_or(len, |end| end.min(self.total_bytes).saturating_sub(offset));
-        if bound_len == 0 {
-            return Ok(0);
-        }
+        let bound_len = bounded_len(len, offset, self.total_bytes);
         let end_inclusive = offset + bound_len - 1;
         let cmd_tx = self.cmd_tx.clone();
         let reference = self.reference;
@@ -474,11 +498,13 @@ async fn range_pull(
                         bytes_downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         delivered += take as u64;
                         if on_chunk(&data[..take]) {
-                            // Consumer asked us to stop; drain remaining
-                            // acks until StreamDone so the node loop's
-                            // sender finishes cleanly rather than seeing
-                            // an abrupt receiver drop.
-                            canceled = true;
+                            // Consumer asked us to stop: return now and
+                            // drop `ack_rx`. The node's `StreamBzz` task
+                            // treats a closed ack channel as "client
+                            // gone" and stops fetching, so there is
+                            // nothing to drain, and the callback must not
+                            // run again after it asked to stop.
+                            return Ok(delivered);
                         }
                     }
                 }
@@ -532,6 +558,14 @@ async fn range_pull(
     }
 }
 
+/// How many bytes of `len` starting at `offset` exist in a body of
+/// `total` bytes: `min(len, total - offset)`, with no overflow for any
+/// input. Callers have already returned early for `len == 0` and
+/// `offset >= total`, so the result is at least 1 for them.
+fn bounded_len(len: u64, offset: u64, total: u64) -> u64 {
+    len.min(total.saturating_sub(offset))
+}
+
 async fn drain_until_done(rx: &mut mpsc::Receiver<ControlAck>) {
     while let Ok(Some(ack)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
         if matches!(
@@ -580,4 +614,130 @@ pub(crate) fn snapshot_progress(stream: &AntStream) -> (u64, u64, u64, u64, u64,
         p.in_flight,
         p.cache_hits,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime")
+    }
+
+    fn start_ack(total_bytes: u64) -> ControlAck {
+        ControlAck::BzzStreamStart {
+            total_bytes,
+            reference: vec![0u8; 32],
+            content_type: None,
+            filename: None,
+            feed: None,
+        }
+    }
+
+    #[test]
+    fn bounded_len_never_overflows() {
+        assert_eq!(bounded_len(u64::MAX, 10, 100), 90);
+        assert_eq!(bounded_len(u64::MAX, u64::MAX - 1, u64::MAX), 1);
+        assert_eq!(bounded_len(5, 10, 100), 5);
+        assert_eq!(bounded_len(90, 10, 100), 90);
+        assert_eq!(bounded_len(1, 100, 100), 0);
+    }
+
+    /// A consumer that asks to stop on its first chunk is called once,
+    /// gets `Ok(first_len)` right away (not at `StreamDone` or the 60 s
+    /// deadline), and the node sees the ack channel close so it stops
+    /// fetching (audit FFI-02, issue #289).
+    #[test]
+    fn pull_stops_at_once_when_the_callback_asks_to() {
+        const CHUNK: usize = 4096;
+        const TOTAL: u64 = 16 * CHUNK as u64;
+        let rt = runtime();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(4);
+        let (closed_tx, closed_rx) = oneshot::channel::<bool>();
+        rt.spawn(async move {
+            let Some(ControlCommand::StreamBzz { ack, .. }) = cmd_rx.recv().await else {
+                panic!("expected StreamBzz");
+            };
+            ack.send(start_ack(TOTAL)).await.expect("start");
+            // More chunks than the 64-deep channel holds would block,
+            // so stay well under it; then never send StreamDone.
+            for _ in 0..8 {
+                if ack
+                    .send(ControlAck::BytesChunk {
+                        data: vec![7u8; CHUNK],
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let closed = tokio::time::timeout(Duration::from_secs(5), ack.closed())
+                .await
+                .is_ok();
+            let _ = closed_tx.send(closed);
+        });
+        let stream = AntStream::for_test(rt.handle().clone(), cmd_tx, TOTAL);
+        let mut calls = 0usize;
+        let started = Instant::now();
+        let out = stream.pull(0, TOTAL, |chunk| {
+            calls += 1;
+            assert_eq!(chunk.len(), CHUNK);
+            true
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(out.expect("pull"), CHUNK as u64);
+        assert_eq!(
+            calls, 1,
+            "callback must not run again after it asked to stop"
+        );
+        assert!(elapsed < Duration::from_secs(5), "pull took {elapsed:?}");
+        assert!(
+            rt.block_on(closed_rx).expect("node task"),
+            "the node must see the ack channel close"
+        );
+    }
+
+    /// `pull(10, u64::MAX)` asks the node for `10..=total-1`, not a
+    /// wrapped (inverted) range that would serve the body from byte 0
+    /// (audit FFI-04, issue #289).
+    #[test]
+    fn pull_with_huge_len_requests_offset_to_end() {
+        const TOTAL: u64 = 100;
+        let rt = runtime();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(4);
+        let (range_tx, range_rx) = oneshot::channel::<Option<StreamRange>>();
+        rt.spawn(async move {
+            let Some(ControlCommand::StreamBzz { ack, range, .. }) = cmd_rx.recv().await else {
+                panic!("expected StreamBzz");
+            };
+            let _ = range_tx.send(range);
+            let _ = ack.send(start_ack(TOTAL)).await;
+            let _ = ack
+                .send(ControlAck::BytesChunk {
+                    data: vec![1u8; 90],
+                })
+                .await;
+            let _ = ack.send(ControlAck::StreamDone).await;
+        });
+        let stream = AntStream::for_test(rt.handle().clone(), cmd_tx, TOTAL);
+        let mut got = 0u64;
+        let out = stream.pull(10, u64::MAX, |chunk| {
+            got += chunk.len() as u64;
+            false
+        });
+        assert_eq!(out.expect("pull"), 90);
+        assert_eq!(got, 90);
+        let range = rt
+            .block_on(range_rx)
+            .expect("node task")
+            .expect("a ranged request");
+        assert_eq!(range.start, 10);
+        assert_eq!(range.end_inclusive, TOTAL - 1);
+    }
 }
