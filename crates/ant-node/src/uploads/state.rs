@@ -72,7 +72,7 @@ pub struct UploadJobInfo {
     /// restarts.
     pub job_id: String,
     /// Absolute path to the source file on the daemon's filesystem.
-    /// The daemon mmaps this — it must stay in place and unchanged
+    /// The daemon re-reads this — it must stay in place and unchanged
     /// for the upload's life. Resume refuses if the size or mtime
     /// changed.
     pub source_path: PathBuf,
@@ -234,6 +234,14 @@ pub struct UploadJobInfo {
 }
 
 impl UploadJobInfo {
+    /// Whether a daemon restart gives this job a driver: it was
+    /// `Running`/`Pending`, or the *system* paused it (an app suspended
+    /// mid-upload that never woke). A user pause is never restarted.
+    pub(crate) fn wants_driver(&self) -> bool {
+        matches!(self.status, UploadStatus::Running | UploadStatus::Pending)
+            || (self.status == UploadStatus::Paused && self.auto_paused)
+    }
+
     /// Path of the on-disk manifest for `state_dir/<job_id>.json`.
     #[must_use]
     pub fn manifest_path(state_dir: &Path, job_id: &str) -> PathBuf {
