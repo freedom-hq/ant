@@ -74,18 +74,20 @@ impl ChainReader for FakeChain {
         match batch_id {
             EXPIRED_BATCH => Ok(0),
             MISSING_BATCH => Err("execution reverted".into()),
+            NEAR_FLOOR_BATCH => Ok(601_000),
             _ => Ok(1_000_000),
         }
     }
     /// [`FAKE_MIN_BALANCE`]: the `1_000_000` left on a batch covers a
-    /// dilute of up to two levels (`250_000` per chunk), not three.
+    /// dilute of up to two levels (`250_000` per chunk, `178_000` once
+    /// the gateway takes 12 blocks of payout at `24_000` off), not three.
     async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
         Ok(FAKE_MIN_BALANCE)
     }
 }
 
 /// [`FakeChain`]'s `minimumInitialBalancePerChunk`.
-const FAKE_MIN_BALANCE: u128 = 200_000;
+const FAKE_MIN_BALANCE: u128 = 150_000;
 
 /// [`FakeChain`]'s node-wallet xBZZ balance.
 const FAKE_BZZ_BALANCE: u128 = 1_500_000_000_000_000_000;
@@ -94,6 +96,10 @@ const FAKE_BATCH_DEPTH: u8 = 20;
 const FOREIGN_BATCH: [u8; 32] = [0xF0; 32];
 const MISSING_BATCH: [u8; 32] = [0x0E; 32];
 const EXPIRED_BATCH: [u8; 32] = [0xE1; 32];
+/// A batch whose balance (`601_000`) halved twice (`150_250`) clears
+/// [`FAKE_MIN_BALANCE`] as of the read, but not once a few blocks of
+/// payout have come off it by the time the dilute would execute.
+const NEAR_FLOOR_BATCH: [u8; 32] = [0x5E; 32];
 
 fn chain_ctx(chequebook: Option<[u8; 20]>) -> Arc<ChainContext> {
     Arc::new(ChainContext {
@@ -746,6 +752,7 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
     let foreign = hex::encode(FOREIGN_BATCH);
     let missing = hex::encode(MISSING_BATCH);
     let expired = hex::encode(EXPIRED_BATCH);
+    let near_floor = hex::encode(NEAR_FLOOR_BATCH);
     for (uri, want) in [
         (
             format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH - 1),
@@ -773,6 +780,12 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
             format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + 3),
             StatusCode::BAD_REQUEST,
         ),
+        // Clears the floor at the read's block by 250 PLUR, which a
+        // block or two of payout before the transaction lands eats.
+        (
+            format!("/stamps/dilute/{near_floor}/{}", FAKE_BATCH_DEPTH + 2),
+            StatusCode::BAD_REQUEST,
+        ),
         (format!("/stamps/dilute/{ours}/60"), StatusCode::BAD_REQUEST),
         // A shift past the balance's width leaves nothing, not a panic.
         (
@@ -798,8 +811,9 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
     assert_eq!(
         json["message"],
         format!(
-            "insufficient balance: diluting to depth {} leaves 125000 PLUR per chunk, under \
-             the contract's minimum of {FAKE_MIN_BALANCE}; top the batch up first",
+            "insufficient balance: diluting to depth {} leaves 125000 PLUR per chunk, too \
+             close to the contract's minimum of {FAKE_MIN_BALANCE} to still clear it once the \
+             transaction lands; top the batch up first",
             FAKE_BATCH_DEPTH + 3
         )
     );

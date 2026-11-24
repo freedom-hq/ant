@@ -1118,7 +1118,10 @@ pub async fn topup_stamp(
 /// doesn't own, an expired one (`remainingBalance` `0`), or one whose
 /// balance after the resize (`remainingBalance >> (depth - batchDepth)`)
 /// would fall under the contract's `minimumInitialBalancePerChunk` is a
-/// `400` (a batch not on chain a `404`) and nothing is sent. A batch this
+/// `400` (a batch not on chain a `404`) and nothing is sent. The floor
+/// check keeps a margin ([`DILUTE_MARGIN_BLOCKS`] of storage rent off the
+/// balance, [`DILUTE_FLOOR_HEADROOM`] on the floor), since the
+/// transaction executes a few blocks after the read. A batch this
 /// node bought within the last few minutes that the chain read can't
 /// see yet (a lagging RPC backend) is checked against the node's own
 /// view of it instead of answering `404`.
@@ -1196,13 +1199,24 @@ pub async fn dilute_stamp(
             Ok(f) => f,
             Err(r) => return r,
         };
-        let after = diluted_balance(remaining, depth - current_depth);
-        if after < floor {
+        // Both reads are as of the block the backend answered at;
+        // `increaseDepth` runs a few blocks later, after each block's
+        // payout (`lastPrice` per chunk) has come off the balance and
+        // possibly after an oracle price update has raised the floor.
+        // Check against that later state, not the read's.
+        let price = match guarded(chain.reader.current_price()).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let levels = depth - current_depth;
+        let after = diluted_balance(remaining, levels);
+        if !dilute_clears_floor(remaining, levels, floor, price) {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 format!(
                     "insufficient balance: diluting to depth {depth} leaves {after} PLUR per \
-                     chunk, under the contract's minimum of {floor}; top the batch up first"
+                     chunk, too close to the contract's minimum of {floor} to still clear it \
+                     once the transaction lands; top the batch up first"
                 ),
             );
         }
@@ -1226,6 +1240,31 @@ pub async fn dilute_stamp(
 /// shift passes the value's width).
 fn diluted_balance(remaining: u128, levels: u8) -> u128 {
     remaining.checked_shr(u32::from(levels)).unwrap_or(0)
+}
+
+/// Blocks of storage rent (`lastPrice` per chunk each) [`dilute_stamp`]
+/// takes off a batch's balance before checking the floor: the
+/// `increaseDepth` transaction executes after the balance read, by
+/// which time per-block payout has lowered `remainingBalance`. Twelve
+/// Gnosis blocks is a minute, room for a slow inclusion.
+const DILUTE_MARGIN_BLOCKS: u128 = 12;
+
+/// Headroom [`dilute_stamp`] adds on the contract's floor, as a divisor
+/// (`floor / 256`, about 0.4%): `minimumInitialBalancePerChunk` is
+/// `minimumValidityBlocks × lastPrice`, so an oracle price update
+/// between the read and the transaction raises it. One update moves
+/// the price by well under that, and fewer than one lands in
+/// [`DILUTE_MARGIN_BLOCKS`].
+const DILUTE_FLOOR_HEADROOM: u128 = 256;
+
+/// Whether raising a batch by `levels` still clears the contract's
+/// per-chunk `floor` once the transaction lands: the balance less
+/// [`DILUTE_MARGIN_BLOCKS`] of payout at `price`, halved per level,
+/// against the floor plus [`DILUTE_FLOOR_HEADROOM`].
+fn dilute_clears_floor(remaining: u128, levels: u8, floor: u128, price: u128) -> bool {
+    let at_execution = remaining.saturating_sub(price.saturating_mul(DILUTE_MARGIN_BLOCKS));
+    let floor = floor.saturating_add(floor / DILUTE_FLOOR_HEADROOM);
+    diluted_balance(at_execution, levels) >= floor
 }
 
 /// Waits before each re-read of a wallet balance that reads short of a
@@ -1755,5 +1794,27 @@ pub async fn settlement_fund_deposit(
         }
         Ok(Err(f)) => failure_response(f),
         Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "chain transaction timed out"),
+    }
+}
+
+#[cfg(test)]
+mod dilute_floor_tests {
+    use super::*;
+
+    /// The margin binds exactly at its boundary: the balance less
+    /// twelve blocks of payout, halved per level, must reach the floor
+    /// plus its headroom.
+    #[test]
+    fn dilute_floor_check_keeps_a_payout_and_price_margin() {
+        let (floor, price) = (256_000u128, 1_000u128);
+        let need = (floor + floor / DILUTE_FLOOR_HEADROOM) * 4 + price * DILUTE_MARGIN_BLOCKS;
+        assert!(dilute_clears_floor(need, 2, floor, price));
+        assert!(!dilute_clears_floor(need - 1, 2, floor, price));
+        // Clearing the bare floor at the read's block is not enough.
+        assert!(diluted_balance(floor * 4, 2) >= floor);
+        assert!(!dilute_clears_floor(floor * 4, 2, floor, price));
+        // No underflow or overflow at the extremes.
+        assert!(!dilute_clears_floor(0, 1, floor, u128::MAX));
+        assert!(!dilute_clears_floor(u128::MAX, 255, floor, price));
     }
 }
