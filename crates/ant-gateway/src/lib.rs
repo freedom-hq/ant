@@ -95,11 +95,14 @@ use std::net::SocketAddr;
 #[cfg(feature = "http-api")]
 use thiserror::Error;
 
-/// Errors raised by [`Gateway::serve`].
+/// Errors raised by [`Gateway::serve`] and [`Gateway::serve_listener`].
 ///
-/// `Bind` and `Serve` are kept distinct so a startup failure (port already
-/// in use) shows up differently from a runtime failure (hyper graceful
-/// shutdown error after a long uptime).
+/// `Bind` (only from [`Gateway::serve`], which binds for the caller) is
+/// kept distinct from `Serve` so a port already in use shows up
+/// differently from a failure on a listener that did bind: reading its
+/// local address at startup, or a hyper error after a long uptime. An
+/// embedder that binds itself ([`Gateway::serve_listener`]) reports its
+/// own bind error.
 #[cfg(feature = "http-api")]
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -114,8 +117,8 @@ pub enum GatewayError {
 }
 
 /// HTTP gateway entry point. Holds no state of its own; everything is
-/// driven by the [`GatewayHandle`] passed to [`Gateway::serve`], which
-/// owns the live status receiver and the command sender into the node
+/// driven by the [`GatewayHandle`] passed to [`Gateway::serve`] or
+/// [`Gateway::serve_listener`], which owns the live status receiver and the command sender into the node
 /// loop.
 #[cfg(feature = "http-api")]
 pub struct Gateway;
@@ -134,11 +137,28 @@ impl Gateway {
     /// the caller is expected to race this future against the node
     /// loop with `tokio::select!` so a node-side fatal still tears the
     /// process down.
-    pub async fn serve(mut handle: GatewayHandle, addr: SocketAddr) -> Result<(), GatewayError> {
+    pub async fn serve(handle: GatewayHandle, addr: SocketAddr) -> Result<(), GatewayError> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| GatewayError::Bind { addr, source: e })?;
-        let local = listener.local_addr().unwrap_or(addr);
+        Self::serve_listener(handle, listener).await
+    }
+
+    /// Serve the bee-shaped HTTP API on a listener the caller already
+    /// bound, until it errors. Same as [`Gateway::serve`] otherwise:
+    /// this is where the `allowed-hosts` policy is resolved against the
+    /// real bound address and the non-loopback / `null`-origin warnings
+    /// are logged, for both entry points.
+    ///
+    /// For an embedder that must report a bind failure synchronously
+    /// (ant-ffi's `ant_start_gateway`): it binds once, up front, and
+    /// hands that socket over, so nothing rebinds the port later and
+    /// another process can't take it in between.
+    pub async fn serve_listener(
+        mut handle: GatewayHandle,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), GatewayError> {
+        let local = listener.local_addr().map_err(GatewayError::Serve)?;
         // The Host allowlist needs the real port (a `:0` bind picks one).
         handle.hosts = std::sync::Arc::new(handle.hosts.bound_to(local));
         if !handle.hosts.configured() && !local.ip().to_canonical().is_loopback() {

@@ -18,7 +18,7 @@ fn router(cors: CorsConfig, hosts: HostPolicy) -> axum::Router {
 }
 
 /// A policy resolved against a loopback listener on `:1633`, as
-/// `Gateway::serve` does.
+/// `Gateway::serve_listener` does.
 fn loopback(extra: &[&str]) -> HostPolicy {
     HostPolicy::new(extra.iter().copied()).bound_to("127.0.0.1:1633".parse().unwrap())
 }

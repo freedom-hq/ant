@@ -26,7 +26,9 @@
 //!   `10.0.0.2`). `*` turns the check off.
 //! - A listener bound to a non-loopback address with no `allowed-hosts`
 //!   is not checked (clients reach it under names the node can't know);
-//!   [`crate::Gateway::serve`] warns at startup.
+//!   [`crate::Gateway::serve_listener`] (behind both
+//!   [`crate::Gateway::serve`] and ant-ffi's `ant_start_gateway`) warns at
+//!   startup.
 //! - A request without any `Host` (HTTP/1.0, in-process callers) passes:
 //!   browsers always send one. Several `Host` values are refused.
 //!
@@ -43,7 +45,7 @@ use crate::handle::GatewayHandle;
 
 /// Parsed `allowed-hosts` entries plus the address the listener is bound
 /// to. Built with [`HostPolicy::new`] from config and resolved against
-/// the real listener address by [`crate::Gateway::serve`]
+/// the real listener address by [`crate::Gateway::serve_listener`]
 /// ([`HostPolicy::bound_to`]). An unbound policy (a router built without
 /// a listener, as tests do) enforces the loopback names on any port.
 #[derive(Debug, Clone, Default)]

@@ -121,8 +121,9 @@ pub struct GatewayHandle {
     pub cors: Arc<CorsConfig>,
     /// `Host` allowlist (`allowed-hosts`, issue #312), checked before
     /// anything else. Build it with [`HostPolicy::new`] from config;
-    /// [`crate::Gateway::serve`] resolves it against the listener's real
-    /// address. The default accepts only the loopback names.
+    /// [`crate::Gateway::serve_listener`] (which [`crate::Gateway::serve`]
+    /// and ant-ffi's `ant_start_gateway` both go through) resolves it
+    /// against the listener's real address. The default accepts only the loopback names.
     pub hosts: Arc<HostPolicy>,
     /// The node's secp256k1 signing secret, used as the ACT
     /// **publisher** identity — exactly bee, whose access-control

@@ -666,6 +666,11 @@ const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
     "pushsync_outbound.json.lost",
     "pushsync_outbound.json.journal",
     "pushsync_outbound.json.journal.old",
+    // The ledger's list of chequebooks deployed fresh next to it
+    // (`swap::note_fresh_chequebook`): left behind, it would tell the
+    // next account's ledger that one of the previous account's
+    // chequebooks is fresh, or keep its own from being recorded.
+    "pushsync_outbound.json.fresh",
 ];
 
 /// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
@@ -5492,6 +5497,14 @@ mod tests {
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .expect("pick a free port");
+        if let Err(e) = start_gateway_on(h, addr) {
+            panic!("ant_start_gateway failed: {e}");
+        }
+        addr
+    }
+
+    /// `ant_start_gateway` on `addr`; its error message on failure.
+    fn start_gateway_on(h: &AntHandle, addr: std::net::SocketAddr) -> Result<(), String> {
         let c_addr = std::ffi::CString::new(addr.to_string()).unwrap();
         let mut err: *mut c_char = std::ptr::null_mut();
         let ok = unsafe {
@@ -5503,8 +5516,12 @@ mod tests {
                 &raw mut err,
             )
         };
-        assert!(ok, "ant_start_gateway failed: {}", unsafe { take_err(err) });
-        addr
+        let msg = unsafe { take_err(err) };
+        if ok {
+            Ok(())
+        } else {
+            Err(msg)
+        }
     }
 
     unsafe fn take_err(err: *mut c_char) -> String {
@@ -5520,7 +5537,7 @@ mod tests {
 
     /// Raw HTTP/1.1 request against the gateway; returns the status
     /// line + lowercased headers (the body isn't needed here). Retries
-    /// the connect while the spawned serve task is still binding.
+    /// a refused connect for a while.
     fn gateway_request(
         addr: std::net::SocketAddr,
         method: &str,
@@ -5853,6 +5870,145 @@ mod tests {
         unsafe { ant_stop_gateway(&raw const h) };
     }
 
+    /// The gateway binds its port once, inside `ant_start_gateway`, and
+    /// keeps that socket: nothing else can take the port after start
+    /// returns, a second start on it fails synchronously, and
+    /// `ant_stop_gateway` frees it for an immediate restart (FFI-07,
+    /// issue #304).
+    #[test]
+    fn gateway_holds_its_port_from_start_to_stop() {
+        let first = gateway_test_handle("gw-bind-once-1");
+        let second = gateway_test_handle("gw-bind-once-2");
+        let addr = start_test_gateway(&first);
+
+        // Held from the moment start returns: no probe-then-rebind
+        // window in which another app could squat the port.
+        assert!(
+            std::net::TcpListener::bind(addr).is_err(),
+            "the port must already be held when ant_start_gateway returns",
+        );
+
+        // A second gateway on the same port is refused at once, with
+        // the bind error, and the first one keeps serving.
+        let err = start_gateway_on(&second, addr).expect_err("port is taken");
+        assert!(err.contains(&format!("bind {addr}")), "{err}");
+        // The text `ant_stop_gateway`'s docs tell hosts to match on.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        assert!(err.contains("already in use"), "{err}");
+        assert!(second.gateway_task.lock().unwrap().is_none());
+        let status = status_for_host(addr, "localhost");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+
+        // Stop frees the port before it returns: the next start binds
+        // it straight away, with no retry.
+        assert!(unsafe { ant_stop_gateway(&raw const first) });
+        start_gateway_on(&second, addr).expect("port is free after stop");
+        let status = status_for_host(addr, "localhost");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        assert!(unsafe { ant_stop_gateway(&raw const second) });
+        std::net::TcpListener::bind(addr).expect("port is free after the second stop");
+    }
+
+    /// `ant_stop_gateway` waits for the old socket to close while still
+    /// holding the guard `ant_start_gateway` takes, so a start racing the
+    /// stop on the same port waits it out instead of binding against the
+    /// still-open socket. The runtime's only worker is kept busy so the
+    /// aborted serve task can't be dropped at once, holding the stop in
+    /// its wait while the racing start comes in.
+    #[test]
+    fn gateway_start_racing_a_stop_waits_for_the_old_socket() {
+        let h = gateway_test_handle("gw-stop-start-race");
+        let addr = start_test_gateway(&h);
+
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let blocker = h.runtime.spawn(async move {
+            busy_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        busy_rx.recv().unwrap();
+
+        let ptr = std::ptr::from_ref(&h) as usize;
+        let stopper =
+            std::thread::spawn(move || unsafe { ant_stop_gateway(ptr as *const AntHandle) });
+        // Wait until the stop has taken the task: either it still holds
+        // the guard (waiting), or it has already let go of it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match h.gateway_task.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(slot) if slot.is_none() => break,
+                Ok(_) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => panic!("poisoned"),
+            }
+            assert!(std::time::Instant::now() < deadline, "stop never ran");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let started = start_gateway_on(&h, addr);
+        assert!(stopper.join().unwrap(), "a running gateway was stopped");
+        started.expect("a start racing the stop binds once the old socket is closed");
+        let status = status_for_host(addr, "localhost");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+        h.runtime.block_on(blocker).unwrap();
+    }
+
+    /// A keep-alive connection opened before `ant_stop_gateway` must not
+    /// outlive the stop: axum serves each connection on its own task, so
+    /// it would otherwise keep answering through the old router (old
+    /// CORS list, old allowed hosts) after a restart with new settings.
+    #[test]
+    fn gateway_stop_closes_open_keep_alive_connections() {
+        use std::io::{Read, Write};
+        let h = gateway_test_handle("gw-stop-keepalive");
+        set_cors(&raw const h, &["https://app.example"]).expect("set cors");
+        let addr = start_test_gateway(&h);
+
+        let request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                       Origin: https://app.example\r\n\r\n";
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).expect("first response");
+        let first = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+        assert!(first.starts_with("http/1.1 200"), "{first}");
+        assert!(
+            first.contains("access-control-allow-origin: https://app.example"),
+            "{first}"
+        );
+
+        // Stop closes the idle connection (dropping the serve future
+        // starts hyper's graceful shutdown on every connection task, a
+        // scheduler hop after stop returns): the old socket reads EOF.
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("unexpected bytes after stop: {:?}", &buf[..n]),
+            Err(e) => assert!(
+                e.kind() == std::io::ErrorKind::ConnectionReset,
+                "old connection not closed after stop: {e}"
+            ),
+        }
+
+        // Narrow the CORS list across a restart on the same port.
+        set_cors(&raw const h, &[]).expect("clear cors");
+        start_gateway_on(&h, addr).expect("restart on the same port");
+
+        // The old connection is gone: a second request on it gets no
+        // answer from the old router (EOF, or a reset/broken pipe).
+        let _ = stream.write_all(request.as_bytes());
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+        let rest = String::from_utf8_lossy(&rest).to_ascii_lowercase();
+        assert!(
+            !rest.contains("http/1.1"),
+            "a pre-stop keep-alive connection answered after the restart:\n{rest}"
+        );
+        assert!(unsafe { ant_stop_gateway(&raw const h) });
+    }
+
     #[test]
     fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
         let h = gateway_test_handle("gw-cors-bad-input");
@@ -5888,9 +6044,12 @@ mod tests {
         let a = [0xaau8; 20];
         let b = [0xbbu8; 20];
 
-        // Account A runs once and leaves a plan + chequebook behind.
+        // Account A runs once and leaves a plan + chequebook behind,
+        // plus its ledger's fresh-chequebook list (FFI-06, issue #304).
         bind_account_state(&dir, &a).expect("bind A");
         seed_account_state(&dir);
+        let fresh = "pushsync_outbound.json.fresh";
+        std::fs::write(dir.join(fresh), b"A's fresh chequebook").expect("write fresh");
 
         // Account B is restored onto the same device. None of A's state
         // may still be at the canonical paths B's node reads.
@@ -5909,18 +6068,27 @@ mod tests {
             .join(format!("0x{}", hex::encode(a)));
         assert!(parked.join("postage").join("batch.bin").exists());
         assert!(parked.join("chequebook.json").exists());
+        assert_eq!(
+            std::fs::read(parked.join(fresh)).expect("A's fresh list is parked"),
+            b"A's fresh chequebook",
+        );
 
         // Switching back hands A its own state again, and parks B's.
+        // B never wrote a fresh list, so it has none to park.
         seed_account_state(&dir);
         bind_account_state(&dir, &a).expect("bind A again");
         assert!(dir.join("postage").join("batch.bin").exists());
         assert!(dir.join("chequebook.json").exists());
+        assert_eq!(
+            std::fs::read(dir.join(fresh)).expect("A's fresh list is restored"),
+            b"A's fresh chequebook",
+        );
         assert!(!parked.exists(), "A's park dir is emptied on adopt");
-        assert!(dir
+        let parked_b = dir
             .join(ACCOUNT_PARK_DIR)
-            .join(format!("0x{}", hex::encode(b)))
-            .join("chequebook.json")
-            .exists());
+            .join(format!("0x{}", hex::encode(b)));
+        assert!(parked_b.join("chequebook.json").exists());
+        assert!(!parked_b.join(fresh).exists(), "B had no fresh list");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

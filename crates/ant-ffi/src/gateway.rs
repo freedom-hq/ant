@@ -140,7 +140,10 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
-/// (free with [`crate::ant_free_string`]). Idempotent: a second call
+/// (free with [`crate::ant_free_string`]). `api_addr` is bound before
+/// this returns — a port already in use is reported here, not logged
+/// later — and that one socket is served until [`ant_stop_gateway`];
+/// nothing rebinds it in between. Idempotent: a second call
 /// while one is live is a success that leaves the running gateway
 /// untouched — it keeps the CORS and allowed-hosts lists and chain
 /// wiring it started with (a changed [`ant_set_gateway_cors`] or
@@ -221,15 +224,14 @@ pub unsafe extern "C" fn ant_start_gateway(
         };
 
         // Idempotent: if a gateway is already live, do nothing. A task
-        // that has finished (bind error / aborted) is cleared so a
-        // retry can rebind.
+        // that has finished (serve error / aborted) is cleared so a
+        // retry can bind again.
         //
         // Hold this guard across the whole start (check → bind → build →
         // spawn → store): releasing it after the check would let two
-        // concurrent starts both pass, both spawn `Gateway::serve` (the
-        // loser hits the bind race), and the dead `JoinHandle` overwrite
-        // the live one — leaving a gateway that `ant_stop_gateway` can't
-        // abort. Poison-tolerant (`into_inner`) so a panic elsewhere
+        // concurrent starts both pass, so the second one's bind fails on
+        // the first one's socket: an error for what is documented as an
+        // idempotent success. Poison-tolerant (`into_inner`) so a panic elsewhere
         // doesn't unwind out of this `extern "C"` fn and abort the host.
         let mut slot = handle
             .gateway_task
@@ -247,8 +249,8 @@ pub unsafe extern "C" fn ant_start_gateway(
             }
             return true;
         }
-        // A finished task (bind error / aborted) is cleared so a retry
-        // can rebind.
+        // A finished task (serve error / aborted) is cleared so a retry
+        // can bind again.
         *slot = None;
 
         // Identity surface for `/addresses`. Overlay + peer-id come from
@@ -285,7 +287,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 .iter(),
         );
         // Likewise the extra `Host` names (`ant_set_gateway_allowed_hosts`);
-        // `Gateway::serve` resolves them against the bound address.
+        // `Gateway::serve_listener` resolves them against the bound address.
         let hosts = HostPolicy::new(
             handle
                 .gateway_allowed_hosts
@@ -294,14 +296,19 @@ pub unsafe extern "C" fn ant_start_gateway(
                 .iter(),
         );
 
-        // Probe-bind synchronously so a port clash surfaces as a clean
-        // FFI error instead of a silently-dead background task. There's
-        // a tiny TOCTOU window before `Gateway::serve` rebinds, but on
-        // iOS this process is the only thing touching the port.
-        if let Err(e) = std::net::TcpListener::bind(addr) {
-            write_out_err(out_err, &format!("ant_start_gateway: bind {addr}: {e}"));
-            return false;
-        }
+        // Bind here, once, and hand this socket to the serve task: a port
+        // clash surfaces as a clean FFI error instead of a silently-dead
+        // background task, and nothing rebinds the port later, so no
+        // other process on the device can take it in between and be
+        // talked to as if it were our gateway. The tokio conversion
+        // needs the runtime's reactor, hence `enter()`.
+        let listener = match bind_listener(&handle.runtime, addr) {
+            Ok(l) => l,
+            Err(e) => {
+                write_out_err(out_err, &format!("ant_start_gateway: bind {addr}: {e}"));
+                return false;
+            }
+        };
 
         // On-chain context for `/wallet` / `/stamps` / `/chequebook`.
         // Built only when the `chain` feature is on AND a Gnosis RPC was
@@ -445,7 +452,7 @@ pub unsafe extern "C" fn ant_start_gateway(
             handle.chain_init.note_pending();
         }
         let task = handle.runtime.spawn(async move {
-            if let Err(e) = Gateway::serve(gw, addr).await {
+            if let Err(e) = Gateway::serve_listener(gw, listener).await {
                 tracing::error!(target: "ant-ffi", "in-process gateway ended: {e}");
             }
         });
@@ -882,9 +889,37 @@ unsafe fn set_gateway_list(
     }
 }
 
+/// Bind `addr` with a non-blocking std listener and register it with
+/// `runtime`'s reactor. One bind, kept for the gateway's whole life.
+fn bind_listener(
+    runtime: &tokio::runtime::Runtime,
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let _ctx = runtime.enter();
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// How long [`ant_stop_gateway`] waits for the aborted serve task to be
+/// dropped, which closes its listening socket.
+const GATEWAY_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Stop the in-process HTTP gateway started by [`ant_start_gateway`].
 /// Returns `true` if a gateway was running and was aborted, `false` if
-/// none was running (or `handle` is null). Safe to call repeatedly. A
+/// none was running (or `handle` is null). Waits (up to 2 s) for the
+/// serve task to end, which closes its listening socket, so on return
+/// the port is normally free for a next [`ant_start_gateway`] to bind.
+/// The wait holds the same lock `ant_start_gateway` takes, so a start
+/// racing this stop (any thread, same port) waits for it too rather
+/// than binding against the old socket. If the runtime is too busy to
+/// drop the task within 2 s, this still returns `true` (logging a
+/// warning) and the port is freed a moment later; a start in that
+/// moment fails with the OS's address-in-use error, e.g.
+/// `ant_start_gateway: bind 127.0.0.1:1633: Address already in use (os
+/// error 98)` (os error 48 on Apple platforms), and can simply be
+/// retried; match on `bind <addr>` plus "already in use", not the
+/// exact OS text. Safe to call repeatedly. A
 /// background rediscovery retry stops with it, before its next attempt;
 /// the next start with a `gnosis_rpc` tries again. An unfinished
 /// `/health.walletScan` (`pending`, `scanning`, `retrying`) is dropped with it,
@@ -920,13 +955,31 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
         // freshly served gateway would run with its retry loop suppressed.
         #[cfg(feature = "chain")]
         handle.chain_init.stop_retrying();
-        drop(slot);
-        match task {
+        let stopped = match task {
             Some(task) => {
                 task.abort();
+                // `abort` only flags the task: its future, and the
+                // listener inside it, is dropped by a runtime worker
+                // shortly after. Wait for that (bounded) still holding
+                // the slot guard, so a concurrent `ant_start_gateway`
+                // (which takes the same guard for its whole start)
+                // can't bind the port while the old socket is open.
+                let deadline = std::time::Instant::now() + GATEWAY_STOP_WAIT;
+                while !task.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                if !task.is_finished() {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "ant_stop_gateway: the gateway task was not dropped within {GATEWAY_STOP_WAIT:?}; \
+                         its port is freed once the runtime gets to it",
+                    );
+                }
                 true
             }
             None => false,
-        }
+        };
+        drop(slot);
+        stopped
     }
 }
