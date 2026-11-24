@@ -105,8 +105,8 @@ pub enum HandshakeError {
 /// The newest signed `BzzAddress` we already hold for a peer (from the
 /// peerstore). A V15 handshake presenting an older record for the same
 /// overlay is rejected, like bee's `CheckTimestamp` with
-/// `TimestampSourceHandshake`: equal is accepted (bee mints its record
-/// per handshake, and a re-presented one is benign).
+/// `TimestampSourceHandshake`: equal is accepted (a peer re-presenting
+/// its current record on reconnect is benign).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KnownBzzRecord {
     pub overlay: [u8; 32],

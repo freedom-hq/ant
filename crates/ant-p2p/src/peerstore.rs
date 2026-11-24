@@ -675,6 +675,32 @@ mod tests {
         assert_eq!(e.chequebook, Some(cb));
     }
 
+    /// #299: the handshake's stale-timestamp check reads the held V15
+    /// record, across a restart; a V14-only peer or an unknown one has
+    /// none (so nothing blocks it).
+    #[test]
+    fn known_bzz_record_is_the_held_v15_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut store = PeerStore::load(path.clone());
+        let v15 = fake_peer(70);
+        let v14 = fake_peer(71);
+        store.record_success(v15, vec![fake_addr(1)], [0xab; 32], 1_715_000_000, None);
+        store.record_success(v14, vec![fake_addr(2)], [0xac; 32], 0, None);
+        store.flush();
+
+        let reloaded = PeerStore::load(path);
+        assert_eq!(
+            reloaded.known_bzz_record(&v15),
+            Some(KnownBzzRecord {
+                overlay: [0xab; 32],
+                timestamp: 1_715_000_000,
+            })
+        );
+        assert_eq!(reloaded.known_bzz_record(&v14), None);
+        assert_eq!(reloaded.known_bzz_record(&fake_peer(72)), None);
+    }
+
     #[test]
     fn bootnode_flag_round_trips_and_survives_record_success() {
         // A bootnode tagged in one run must still be known as one on the

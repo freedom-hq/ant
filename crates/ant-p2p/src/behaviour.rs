@@ -1641,10 +1641,11 @@ impl SwarmState {
             // Retain the full dial info (addrs + overlay) so we can dial
             // *toward a chunk's neighbourhood* on demand later — even for
             // peers we don't dial now (peer set full / already seen).
-            // Hive hints carry a signature-verified overlay (forged
-            // entries never become hints, see `sinks::decode_hive_peers`),
-            // so a fake advert can't evict a real entry here. Skip peers
-            // with no overlay since we can't rank those by proximity.
+            // Hive hints carry a signature-verified overlay (see
+            // `sinks::decode_hive_peers`): an advert can't claim an overlay
+            // without its key or re-point someone's signed record, though a
+            // peer can still mint keys and sign records of its own. Skip
+            // peers with no overlay since we can't rank those by proximity.
             if hint.overlay != [0u8; 32] && !self.bzz_peers.contains(&hint.peer_id) {
                 if self.known_dialable.len() >= KNOWN_DIALABLE_CAP
                     && !self.known_dialable.contains_key(&hint.peer_id)

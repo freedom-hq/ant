@@ -571,6 +571,7 @@ async fn run_hive(
                         target: "ant_p2p::hive",
                         %peer_id,
                         headers,
+                        ?version,
                         body = body_len,
                         peers = hints.len(),
                         "drained",
