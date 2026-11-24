@@ -1273,6 +1273,13 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * URL's error instead of the real one. Map any failure that is not a
  * coverage gap to a different error code, or answer authoritatively.
  *
+ * Transactions: eth_sendRawTransaction must answer the hash of the
+ * transaction it was given (keccak256 of the raw bytes), and an
+ * eth_getTransactionReceipt result must carry that hash as
+ * "transactionHash". ant waits on the hash it computed itself and
+ * fails the write on any other hash, or on a receipt without one, so a
+ * relay can't pass off another transaction's receipt (issue #284).
+ *
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a
  * nested event loop). It may be invoked concurrently from several such

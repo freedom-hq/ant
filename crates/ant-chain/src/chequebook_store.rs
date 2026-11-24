@@ -2667,6 +2667,10 @@ mod tests {
         deployed: [u8; 20],
         registered: Option<bool>,
         issuer: Option<[u8; 20]>,
+        /// How many factory and `issuer()` reads still answer like a
+        /// backend that hasn't seen the deploy yet: the factory "no",
+        /// `issuer()` empty.
+        lagging: std::sync::Mutex<(usize, usize)>,
         sent: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -2704,9 +2708,21 @@ mod tests {
                         ok(word(DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR * 10))
                     } else if data[2..].starts_with(&deployed_sel) {
                         assert!(data.ends_with(&hex::encode(self.deployed)));
+                        let mut lagging = self.lagging.lock().unwrap();
+                        if lagging.0 > 0 {
+                            lagging.0 -= 1;
+                            return ok(word(0));
+                        }
+                        drop(lagging);
                         self.registered
                             .map_or_else(err, |r| ok(word(u128::from(r))))
                     } else if data[2..].starts_with(&hex::encode(chequebook_issuer_selector())) {
+                        let mut lagging = self.lagging.lock().unwrap();
+                        if lagging.1 > 0 {
+                            lagging.1 -= 1;
+                            return ok(serde_json::json!("0x"));
+                        }
+                        drop(lagging);
                         self.issuer.map_or_else(err, |i| {
                             ok(serde_json::json!(format!(
                                 "0x{}{}",
@@ -2808,6 +2824,7 @@ mod tests {
                 deployed: CHEQUEBOOK,
                 registered: Some(true),
                 issuer: Some(node_eth()),
+                lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
             "ok",
@@ -2816,6 +2833,32 @@ mod tests {
         assert_eq!(result.unwrap(), CHEQUEBOOK);
         assert_eq!(sent, ["deploy", "deposit"]);
         assert!(persisted);
+    }
+
+    /// A backend still behind our deploy (the factory says no, then
+    /// `issuer()` comes back empty) only delays the check: once it
+    /// catches up, the chequebook is recorded and funded as usual.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(start_paused = true)]
+    async fn a_lagging_backend_only_delays_the_deploy_check() {
+        let started = tokio::time::Instant::now();
+        let (result, sent, persisted) = deploy_against(
+            DeployChain {
+                relay: Relay::Honest,
+                deployed: CHEQUEBOOK,
+                registered: Some(true),
+                issuer: Some(node_eth()),
+                // Read 1: factory "no". Read 2: registered, issuer() empty.
+                lagging: std::sync::Mutex::new((1, 1)),
+                sent: std::sync::Mutex::default(),
+            },
+            "lagging",
+        )
+        .await;
+        assert_eq!(result.unwrap(), CHEQUEBOOK);
+        assert_eq!(sent, ["deploy", "deposit"]);
+        assert!(persisted);
+        assert_eq!(started.elapsed(), DEPLOY_CHECK_RETRY * 2);
     }
 
     /// Issue #284 (a): a relay answering `eth_sendRawTransaction` with
@@ -2830,6 +2873,7 @@ mod tests {
                 deployed: [0xee; 20],
                 registered: Some(true),
                 issuer: Some([0xee; 20]),
+                lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
             "foreign-hash",
@@ -2852,6 +2896,7 @@ mod tests {
                 deployed: [0xee; 20],
                 registered: Some(true),
                 issuer: Some([0xee; 20]),
+                lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
             "foreign-receipt",
@@ -2874,6 +2919,7 @@ mod tests {
                 deployed: CHEQUEBOOK,
                 registered: Some(true),
                 issuer: Some([0xee; 20]),
+                lagging: std::sync::Mutex::default(),
                 sent: std::sync::Mutex::default(),
             },
             "issuer",
@@ -2903,6 +2949,7 @@ mod tests {
                     deployed: CHEQUEBOOK,
                     registered,
                     issuer,
+                    lagging: std::sync::Mutex::default(),
                     sent: std::sync::Mutex::default(),
                 },
                 tag,
