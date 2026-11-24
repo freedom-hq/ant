@@ -3024,8 +3024,11 @@ async fn resolve_chequebook(
     wallet.note_deploy_attempt(&deployed);
     // Brand new, so it has issued no cheques: a lost outbound ledger on
     // record doesn't apply to it (PR #126 R1-M3). That holds too for one
-    // recorded unverified (`RecordedUnverified`): the next start adopts
-    // it from `chequebook.json`, a path that never marks it fresh.
+    // recorded unverified (`RecordedUnverified`): the next
+    // `resolve_chequebook` run adopts it from `chequebook.json` (step 2),
+    // a path that never marks it fresh. That run is either the next start
+    // or, in this same process, `SettlementOnBuy::enable` on a
+    // `POST /stamps` buy while settlement is off.
     let fresh = match &deployed {
         Ok(cb) => Some(*cb),
         Err(e) => e.recorded_fresh(),
