@@ -2716,10 +2716,7 @@ pub async fn bytes(
         GoRanges::Single { start, length } => {
             if length == 0 {
                 started.cancel();
-                let content_type = query
-                    .filename()
-                    .and_then(content_type_from_extension)
-                    .unwrap_or("application/octet-stream");
+                let content_type = bytes_type_from_filename(query.filename());
                 let mut resp = zero_length_partial_response(start, total, content_type);
                 set_etag(&mut resp, reference);
                 return resp;
@@ -2732,7 +2729,7 @@ pub async fn bytes(
             // the underlying reader. `parse_go_ranges_streamed` only
             // lets a resource of at most `MULTI_RANGE_MAX_BUFFER_BYTES`
             // reach this arm; anything larger streams as a 200.
-            let content_type = sniff_content_type(&started.first_bytes, query.filename());
+            let content_type = bytes_content_type(&started.first_bytes, query.filename());
             let full = match started.collect_body().await {
                 Ok(b) => b,
                 Err(message) => return map_retrieval_error(message),
@@ -2749,7 +2746,7 @@ pub async fn bytes(
     // (an ant extension) earns one. GET carries bee's quoted `ETag`;
     // bee's `bytesHeadHandler` sets none on HEAD.
     if parsed_range.is_none() {
-        let content_type = sniff_content_type(&started.first_bytes, query.filename());
+        let content_type = bytes_content_type(&started.first_bytes, query.filename());
         let mut resp = streaming_response(
             head_only,
             total,
@@ -2796,12 +2793,9 @@ pub async fn bytes(
     // Use the filename hint when it's a partial response and the leading
     // bytes don't start at offset 0.
     let content_type = if start == 0 {
-        sniff_content_type(&ranged.first_bytes, query.filename())
+        bytes_content_type(&ranged.first_bytes, query.filename())
     } else {
-        query
-            .filename()
-            .and_then(content_type_from_extension)
-            .unwrap_or("application/octet-stream")
+        bytes_type_from_filename(query.filename())
     };
     let body_len = end - start + 1;
     let mut resp = partial_content_response(
@@ -2886,9 +2880,7 @@ async fn serve_encrypted_bytes(
         GoRanges::Full => None,
         GoRanges::Single { start, length } => {
             if length == 0 {
-                let content_type = filename
-                    .and_then(content_type_from_extension)
-                    .unwrap_or("application/octet-stream");
+                let content_type = bytes_type_from_filename(filename);
                 let mut resp = zero_length_partial_response(start, total, content_type);
                 set_etag(&mut resp, enc_ref);
                 return resp;
@@ -2896,7 +2888,7 @@ async fn serve_encrypted_bytes(
             Some((start, start + length - 1))
         }
         GoRanges::Multi(ranges) => {
-            let content_type = sniff_content_type(&data, filename);
+            let content_type = bytes_content_type(&data, filename);
             let mut resp = multipart_byteranges_response(&ranges, total, content_type, &data, None);
             set_etag(&mut resp, enc_ref);
             return resp;
@@ -2905,7 +2897,7 @@ async fn serve_encrypted_bytes(
 
     match parsed_range {
         None => {
-            let content_type = sniff_content_type(&data, filename);
+            let content_type = bytes_content_type(&data, filename);
             let body = Body::from(data);
             let mut resp = streaming_response(head_only, total, body, content_type, filename);
             if !head_only {
@@ -2915,11 +2907,9 @@ async fn serve_encrypted_bytes(
         }
         Some((start, end)) => {
             let content_type = if start == 0 {
-                sniff_content_type(&data, filename)
+                bytes_content_type(&data, filename)
             } else {
-                filename
-                    .and_then(content_type_from_extension)
-                    .unwrap_or("application/octet-stream")
+                bytes_type_from_filename(filename)
             };
             let body_len = end - start + 1;
             let slice = data[start as usize..=end as usize].to_vec();
@@ -3189,6 +3179,11 @@ async fn bzz_inner(
         .content_type
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
+    // A collection entry with an unknown extension is stored with an
+    // EMPTY type (bee's tar reader) and served without one; leave it for
+    // the browser to sniff, as bee does, by opting out of the router's
+    // `nosniff` (with it, the browser would refuse to render or load it).
+    let sniffable = content_type.is_empty();
     let filename = started.filename.clone();
     // Resolved data reference for the quoted `ETag` (bee's
     // `downloadHandler` sets it on GET and HEAD alike).
@@ -3214,6 +3209,7 @@ async fn bzz_inner(
             if length == 0 {
                 started.cancel();
                 let mut resp = zero_length_partial_response(start, total, &content_type);
+                allow_sniffing_if(&mut resp, sniffable);
                 if let Some(r) = data_ref {
                     set_etag(&mut resp, r);
                 }
@@ -3236,6 +3232,7 @@ async fn bzz_inner(
                 &full,
                 filename.as_deref(),
             );
+            allow_sniffing_if(&mut resp, sniffable);
             if let Some(r) = data_ref {
                 set_etag(&mut resp, r);
             }
@@ -3254,6 +3251,7 @@ async fn bzz_inner(
             &content_type,
             filename.as_deref(),
         );
+        allow_sniffing_if(&mut resp, sniffable);
         if let Some(r) = data_ref {
             set_etag(&mut resp, r);
         }
@@ -3303,6 +3301,7 @@ async fn bzz_inner(
         &content_type,
         filename.as_deref(),
     );
+    allow_sniffing_if(&mut resp, sniffable);
     if let Some(r) = ranged_ref {
         set_etag(&mut resp, r);
     }
@@ -3356,6 +3355,11 @@ impl From<ant_control::ManifestListPage> for ManifestListing {
     }
 }
 
+/// `?filename=` (or `?name=`) on `GET /bytes`: an ant extension that
+/// names the download (`Content-Disposition`) and hints its type by
+/// extension. The hint never yields an active type (HTML, SVG, XML,
+/// JavaScript); those are served as `application/octet-stream`, see
+/// [`bytes_content_type`].
 #[derive(Debug, Default, Deserialize)]
 pub struct BytesQuery {
     #[serde(default, alias = "name")]
@@ -4146,6 +4150,20 @@ fn note_redundancy_headers(headers: &HeaderMap) {
 #[derive(Clone, Copy)]
 pub(crate) struct VerbatimContentType;
 
+/// Response-extension marker: leave this response without
+/// `X-Content-Type-Options: nosniff`. The router stamps `nosniff` on
+/// every response (issue #297, as bee does since ethersphere/bee#5651)
+/// except one carrying this marker: a `/bzz` entry stored with an empty
+/// content type, which is served without one and must stay sniffable.
+#[derive(Clone, Copy)]
+pub(crate) struct AllowSniffing;
+
+fn allow_sniffing_if(resp: &mut Response, sniffable: bool) {
+    if sniffable {
+        resp.extensions_mut().insert(AllowSniffing);
+    }
+}
+
 /// Build a `200 OK` (or empty `200 OK` for `HEAD`) response for a full
 /// streaming GET. `body` should already be `Body::empty()` when
 /// `head_only`; we set headers identically either way so HEAD and GET
@@ -4337,6 +4355,51 @@ fn html_escape_go(s: &str) -> String {
         }
     }
     out
+}
+
+/// `Content-Type` for a `/bytes` response: [`sniff_content_type`], but
+/// never a type a browser would run or render as a document. `/bytes`
+/// is served from the API's own origin, so `?filename=x.html` (or
+/// `.svg`, `.xml`, `.js`) must not turn arbitrary uploaded bytes into a
+/// page with script access to the wallet/stamps/pins API (issue #297).
+/// Such names fall back to `application/octet-stream`, which is what
+/// bee serves for every `/bytes` download.
+fn bytes_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
+    passive_or_octet_stream(sniff_content_type(bytes, filename))
+}
+
+/// [`bytes_content_type`] for a range that doesn't start at offset 0,
+/// where only the filename hint is available.
+fn bytes_type_from_filename(filename: Option<&str>) -> &'static str {
+    passive_or_octet_stream(
+        filename
+            .and_then(content_type_from_extension)
+            .unwrap_or("application/octet-stream"),
+    )
+}
+
+fn passive_or_octet_stream(content_type: &'static str) -> &'static str {
+    if is_active_content_type(content_type) {
+        "application/octet-stream"
+    } else {
+        content_type
+    }
+}
+
+/// Whether a browser navigating to (or loading) a response of this type
+/// could run script from it on the serving origin: HTML/XHTML, SVG, any
+/// XML (XSLT, `<html:script>` in XML) and JavaScript.
+fn is_active_content_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence.contains("html")
+        || essence.contains("xml")
+        || essence.contains("javascript")
+        || essence.contains("ecmascript")
 }
 
 fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
