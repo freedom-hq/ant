@@ -3723,3 +3723,174 @@ async fn swarm_cache_header_sets_bypass_cache() {
         assert!(seen.lock().await.is_empty(), "{method} {uri} dispatched");
     }
 }
+
+// =====================================================================
+// Resource-exhaustion guards (#282, audit GW-06/GW-08/GW-10).
+// =====================================================================
+
+/// GW-06: a ~1.5 KiB tar whose header declares a base-256 entry size of
+/// 2^62 used to pre-size a `Vec` from that field and abort the process
+/// on the allocation. It must be a plain 400 instead.
+#[tokio::test]
+async fn post_bzz_collection_rejects_an_entry_larger_than_the_archive() {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("index.html").unwrap();
+        // Above 8^11, `set_size` switches to the GNU base-256 encoding.
+        header.set_size(1u64 << 62);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &b"<h1>hi</h1>"[..]).unwrap();
+        builder.finish().unwrap();
+    }
+    assert!(tar_bytes.len() <= 3 * 1024, "{} bytes", tar_bytes.len());
+
+    let pushed = Arc::new(Mutex::new(0usize));
+    let seen = pushed.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let seen = seen.clone();
+        async move {
+            if let ControlCommand::PushChunk { ack, .. } = cmd {
+                *seen.lock().await += 1;
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", "00".repeat(32)),
+                });
+            }
+        }
+    });
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bzz")
+            .header("swarm-collection", "true")
+            .header("swarm-postage-batch-id", "aa".repeat(32))
+            .body(Body::from(tar_bytes))
+            .unwrap(),
+    )
+    .await;
+    let status = resp.status();
+    let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("declared size"), "{text}");
+    assert_eq!(*pushed.lock().await, 0, "nothing may be pushed");
+}
+
+/// GW-10: `Swarm-Chunk-Retrieval-Timeout: u64::MAX` used to overflow
+/// `start + mine_timeout` in `/pss/send` and panic. It is clamped now,
+/// and the request completes normally.
+#[tokio::test]
+async fn pss_send_with_a_u64_max_timeout_returns_normally() {
+    use ant_control::PostageStatusView;
+    let batch_hex = "22".repeat(32);
+    let batch_id = format!("0x{batch_hex}");
+    let router = router_with_dispatcher(move |cmd| {
+        let batch_id = batch_id.clone();
+        async move {
+            match cmd {
+                ControlCommand::PostageList { ack } => {
+                    let _ = ack.send(ControlAck::PostageList(vec![PostageStatusView {
+                        enabled: true,
+                        usable: true,
+                        batch_id,
+                        batch_depth: 20,
+                        bucket_depth: 16,
+                        ..PostageStatusView::default()
+                    }]));
+                }
+                ControlCommand::PushChunk { ack, .. } => {
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", "00".repeat(32)),
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/pss/send/test-topic/aa")
+            .header("swarm-postage-batch-id", batch_hex.as_str())
+            .header("swarm-chunk-retrieval-timeout", u64::MAX.to_string())
+            .body(Body::from("hello"))
+            .unwrap(),
+    )
+    .await;
+    let status = resp.status();
+    let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+}
+
+/// GW-08a: a multi-range request on a resource too big to buffer must
+/// not collect the whole body in RAM. The fake node announces a 1 GiB
+/// resource, sends one body chunk and then stalls without ever ending
+/// the stream: collecting the body would hang, while the fix ignores
+/// Range and streams a plain 200 straight away.
+#[tokio::test]
+async fn multi_range_on_a_large_resource_streams_instead_of_buffering() {
+    const TOTAL: u64 = 1 << 30;
+    let reference = "ab".repeat(32);
+    let router = router_with_dispatcher(move |cmd| async move {
+        let (prologue, ack) = match cmd {
+            ControlCommand::StreamBytes { ack, .. } => {
+                (ControlAck::BytesStreamStart { total_bytes: TOTAL }, ack)
+            }
+            ControlCommand::StreamBzz { reference, ack, .. } => (
+                ControlAck::BzzStreamStart {
+                    total_bytes: TOTAL,
+                    reference,
+                    content_type: Some("video/mp4".to_string()),
+                    filename: Some("big.mp4".to_string()),
+                    feed: None,
+                },
+                ack,
+            ),
+            _ => return,
+        };
+        let _ = ack.send(prologue).await;
+        let _ = ack
+            .send(ControlAck::BytesChunk {
+                data: vec![7u8; 4096],
+            })
+            .await;
+        // Never finish: hold the stream open past the test's deadline.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        drop(ack);
+    });
+    for uri in [
+        format!("/bytes/{reference}"),
+        format!("/bzz/{reference}/big.mp4"),
+    ] {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send(
+                router.clone(),
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .header(header::RANGE, "bytes=0-99,200-299")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{uri}: multi-range buffered the whole resource"));
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+            &TOTAL.to_string(),
+            "{uri}"
+        );
+        assert!(resp.headers().get(header::CONTENT_RANGE).is_none(), "{uri}");
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(!ct.starts_with("multipart/"), "{uri}: {ct}");
+    }
+}
