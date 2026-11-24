@@ -1947,7 +1947,7 @@ impl PublisherState {
     /// add (`reap_ms` is checked against [`MAX_REAP_MS`] at start, but
     /// this must not panic whatever it is handed) saturates to a
     /// deadline years away rather than to `since`, which would reap at
-    /// once.
+    /// once; `since` only for a clock that can't reach a day past it.
     fn reap_deadline(&self, started: Instant, reap: Duration) -> Instant {
         let since = [self.last_media_at, self.returned_at]
             .into_iter()
@@ -1956,7 +1956,8 @@ impl PublisherState {
         since
             .checked_add(reap)
             .or_else(|| since.checked_add(REAP_DEADLINE_FAR))
-            .unwrap_or(since + Duration::from_millis(MAX_REAP_MS))
+            .or_else(|| since.checked_add(Duration::from_millis(MAX_REAP_MS)))
+            .unwrap_or(since)
     }
 
     /// `#EXT-X-TARGETDURATION`, whole seconds. Run-max, not window-max:
