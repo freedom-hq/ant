@@ -521,6 +521,12 @@ private struct ExtendStorageSheet: View {
     /// One-shot guard so funds-detected auto-extension fires only once
     /// per payment session (a failure must not re-trigger a loop).
     @State private var didAutoExtend = false
+    /// `quote` may be out of date: it came from the picker's cache, or an
+    /// extension with it just failed (a `PriceMoved` refusal is final for
+    /// that quote's `swapInput`). Extending waits for the poll's next
+    /// fresh quote, so a retry is capped at the current price rather than
+    /// resubmitting the refused cap.
+    @State private var quoteStale = false
 
     var body: some View {
         NavigationStack {
@@ -646,12 +652,12 @@ private struct ExtendStorageSheet: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .glassEffect(.regular.tint(.blue.opacity(quote.sufficientFunds ? 0.6 : 0.2)),
+                        .glassEffect(.regular.tint(.blue.opacity(canExtend(quote) ? 0.6 : 0.2)),
                                      in: .capsule)
-                        .foregroundStyle(.white.opacity(quote.sufficientFunds ? 1 : 0.5))
+                        .foregroundStyle(.white.opacity(canExtend(quote) ? 1 : 0.5))
                 }
                 .buttonStyle(.plain)
-                .disabled(!quote.sufficientFunds)
+                .disabled(!canExtend(quote))
 
                 if let error {
                     Text(error)
@@ -753,6 +759,7 @@ private struct ExtendStorageSheet: View {
         didAutoExtend = false
         if let cached = quotes[days] {
             quote = cached
+            quoteStale = true
             withAnimation { step = .payment }
         } else {
             Task {
@@ -760,6 +767,7 @@ private struct ExtendStorageSheet: View {
                     let q = try await node.quoteTopUp(rpc: activeRpc, days: days)
                     quote = q
                     quotes[days] = q
+                    quoteStale = false
                     withAnimation { step = .payment }
                 } catch {
                     self.error = error.localizedDescription
@@ -768,23 +776,41 @@ private struct ExtendStorageSheet: View {
         }
     }
 
-    /// While the payment step is on screen and unfunded, re-quote every
-    /// few seconds; when the incoming transfer lands, extend
-    /// automatically — no tap needed.
+    /// While the payment step is on screen, re-quote every few seconds;
+    /// when the incoming transfer lands, extend automatically — no tap
+    /// needed. A stale quote (from the picker's cache, or one an extension
+    /// just failed with) is re-quoted at once, and nothing extends on it.
+    /// After the one auto-extension the loop keeps the quote fresh, so the
+    /// manual Extend retry is capped at the current price.
     private func pollForPayment() async {
         guard let days = selectedDays else { return }
         while !Task.isCancelled {
-            if quote?.sufficientFunds == true { autoExtendIfFunded(); return }
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            if Task.isCancelled { return }
+            if !quoteStale, !didAutoExtend, quote?.sufficientFunds == true {
+                autoExtendIfFunded()
+                return
+            }
+            if !quoteStale {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                if Task.isCancelled { return }
+            }
             guard let fresh = try? await node.quoteTopUp(rpc: activeRpc, days: days)
-            else { continue }
+            else {
+                if quoteStale { try? await Task.sleep(nanoseconds: 6_000_000_000) }
+                continue
+            }
+            if Task.isCancelled { return }
             withAnimation {
                 quote = fresh
                 quotes[days] = fresh
+                quoteStale = false
             }
-            if fresh.sufficientFunds { autoExtendIfFunded(); return }
         }
+    }
+
+    /// The Extend button's gate, and `extend()`'s: funded, on a quote
+    /// fresh enough to cap the swap with.
+    private func canExtend(_ quote: StorageQuote) -> Bool {
+        quote.sufficientFunds && !quoteStale
     }
 
     private func autoExtendIfFunded() {
@@ -794,17 +820,22 @@ private struct ExtendStorageSheet: View {
     }
 
     private func extend() {
-        guard let quote else { return }
+        guard let quote, let days = selectedDays, canExtend(quote) else { return }
         error = nil
         withAnimation { step = .extending }
         Task {
             do {
-                try await node.topUpStorage(rpc: activeRpc, amountPerChunk: quote.amountPerChunk)
+                try await node.topUpStorage(rpc: activeRpc, amountPerChunk: quote.amountPerChunk,
+                                            maxXdaiWei: quote.swapInput)
                 let until = node.validity.map { " — valid until \($0.expiryDateLabel)" } ?? ""
                 dismiss()
                 onDone("Storage extended\(until)")
             } catch {
+                // Back to payment with this quote marked stale: the poll
+                // re-quotes at once and a retry uses that quote's cap.
                 self.error = error.localizedDescription
+                quotes[days] = nil
+                quoteStale = true
                 withAnimation { step = .payment }
             }
         }

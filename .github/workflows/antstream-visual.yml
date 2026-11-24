@@ -413,6 +413,38 @@ jobs:
             -antstream-shot-info -antstream-shot-info-edit -antstream-shot-info-announcing
           sleep 25
           xcrun simctl io booted screenshot shots/37-stream-info-announcing.png
+          # --- A refused buy/extend (#305) ---
+          # The swap is capped at the quote the user saw; a price that moved
+          # since is refused with nothing sent, and the screen marks that
+          # quote stale. A runner can't fund a wallet or move a pool price,
+          # so these are sample states (no re-quote replaces them).
+          # 39: Get Started back on the payment step with the refusal,
+          # Activate held behind a spinner until a fresh quote lands.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-getstarted -antstream-shot-getstarted-pay \
+            -antstream-shot-getstarted-refused
+          sleep 20
+          xcrun simctl io booted screenshot shots/39-getstarted-refused-stale.png
+          # 40: the fresh quote is in; Activate is the manual retry.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-getstarted -antstream-shot-getstarted-pay \
+            -antstream-shot-getstarted-refused -antstream-shot-getstarted-requoted
+          sleep 20
+          xcrun simctl io booted screenshot shots/40-getstarted-refused-requoted.png
+          # 41: the Extend sheet after a refused extension, Extend disabled
+          # on the stale quote.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream -antstream-shot-extend-refused
+          sleep 20
+          xcrun simctl io booted screenshot shots/41-extend-refused-stale.png
+          # 42: re-quoted, Extend enabled again.
+          xcrun simctl terminate booted baby.freedom.antstream || true
+          xcrun simctl launch booted baby.freedom.antstream \
+            -antstream-shot-extend-refused -antstream-shot-extend-requoted
+          sleep 20
+          xcrun simctl io booted screenshot shots/42-extend-refused-requoted.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true

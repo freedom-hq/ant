@@ -1207,9 +1207,10 @@ impl ChainWriter for FundingWriter {
         depth: u8,
         amount: u128,
         immutable: bool,
+        max_xdai: u128,
     ) -> Result<NewBatch, FundingFailure> {
         self.record(format!(
-            "buy_with_xdai({depth}, {amount}, immutable={immutable})"
+            "buy_with_xdai({depth}, {amount}, immutable={immutable}, max={max_xdai})"
         ));
         if self.short_of_xdai {
             return Err(FundingFailure::Rejected(
@@ -1230,14 +1231,18 @@ impl ChainWriter for FundingWriter {
         batch_id: [u8; 32],
         new_depth: Option<u8>,
         amount: u128,
+        max_xdai: u128,
     ) -> Result<u8, FundingFailure> {
         self.record(format!(
-            "extend_with_xdai({:02x}, {new_depth:?}, {amount})",
+            "extend_with_xdai({:02x}, {new_depth:?}, {amount}, max={max_xdai})",
             batch_id[0]
         ));
         Ok(new_depth.unwrap_or(20))
     }
-    async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+    async fn deposit_status(&self, amount: Option<u128>) -> Result<DepositView, FundingFailure> {
+        if let Some(a) = amount {
+            self.record(format!("deposit_status amount={a}"));
+        }
         if let Some(d) = self.deposit {
             return Ok(d);
         }
@@ -1253,10 +1258,11 @@ impl ChainWriter for FundingWriter {
     async fn fund_deposit_with_xdai(
         &self,
         amount: Option<u128>,
+        max_xdai: u128,
     ) -> Result<DepositView, FundingFailure> {
         self.record(match amount {
-            None => "fund_deposit_with_xdai".into(),
-            Some(a) => format!("fund_deposit_with_xdai amount={a}"),
+            None => format!("fund_deposit_with_xdai max={max_xdai}"),
+            Some(a) => format!("fund_deposit_with_xdai amount={a} max={max_xdai}"),
         });
         if let Some(refusal) = self.refuse_deposit {
             return Err(FundingFailure::ChequebookRefused {
@@ -1393,7 +1399,7 @@ async fn v0_buy_defaults_to_immutable_and_runs_the_after_buy_hook() {
     let (status, json) = req(
         router.clone(),
         Method::POST,
-        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -1402,15 +1408,15 @@ async fn v0_buy_defaults_to_immutable_and_runs_the_after_buy_hook() {
     let (status, _) = req(
         router,
         Method::POST,
-        "/v0/storage/buy?depth=20&amountPerChunk=1000&immutable=false",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500&immutable=false",
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(
         writer.calls(),
         [
-            "buy_with_xdai(20, 1000, immutable=true)",
-            "buy_with_xdai(20, 1000, immutable=false)"
+            "buy_with_xdai(20, 1000, immutable=true, max=500)",
+            "buy_with_xdai(20, 1000, immutable=false, max=500)"
         ]
     );
 }
@@ -1431,7 +1437,7 @@ async fn v0_buy_short_of_xdai_is_a_400_with_the_amount() {
     let (status, json) = req(
         router,
         Method::POST,
-        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1450,7 +1456,7 @@ async fn v0_extend_with_a_depth_resizes() {
     let (status, json) = req(
         router.clone(),
         Method::POST,
-        &format!("/v0/storage/extend?batchId={id}&amountPerChunk=7"),
+        &format!("/v0/storage/extend?batchId={id}&amountPerChunk=7&maxXdaiWei=500"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1458,15 +1464,15 @@ async fn v0_extend_with_a_depth_resizes() {
     let (status, _) = req(
         router,
         Method::POST,
-        &format!("/v0/storage/extend?batchId={id}&amountPerChunk=7&depth=22"),
+        &format!("/v0/storage/extend?batchId={id}&amountPerChunk=7&maxXdaiWei=500&depth=22"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         writer.calls(),
         [
-            "extend_with_xdai(ab, None, 7)",
-            "extend_with_xdai(ab, Some(22), 7)"
+            "extend_with_xdai(ab, None, 7, max=500)",
+            "extend_with_xdai(ab, Some(22), 7, max=500)"
         ]
     );
 }
@@ -1484,11 +1490,16 @@ async fn v0_settlement_deposit_reports_and_tops_up() {
     assert_eq!(json["shortfallPlur"], "10000000000000");
     assert_eq!(json["needsTopUp"], true);
     assert_eq!(json["xdaiToSendWei"], "410");
-    let (status, json) = req(router, Method::POST, "/v0/settlement/deposit").await;
+    let (status, json) = req(
+        router,
+        Method::POST,
+        "/v0/settlement/deposit?maxXdaiWei=500",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["needsTopUp"], false);
     assert_eq!(json["xdaiToSendWei"], "0");
-    assert_eq!(writer.calls(), ["fund_deposit_with_xdai"]);
+    assert_eq!(writer.calls(), ["fund_deposit_with_xdai max=500"]);
 }
 
 /// #241: a deposit at its target still reports what the node wallet
@@ -1562,6 +1573,71 @@ async fn v0_quote_reports_an_unread_balance_as_null() {
     assert_eq!(json["xdaiToSendWei"], "410");
 }
 
+/// #305: every xDAI-swapping write takes the most xDAI its swap may
+/// send (`maxXdaiWei`, the quote's `swapInputWei`). Without it, or with
+/// a value that isn't a number, the route is a `400` and the writer is
+/// never called; with it, the cap reaches the writer unchanged.
+#[tokio::test]
+async fn v0_xdai_writes_require_the_quoted_cap() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let id = hex::encode([0xAB; 32]);
+    let extend = format!("/v0/storage/extend?batchId={id}&amountPerChunk=7");
+    for uri in [
+        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        extend.as_str(),
+        "/v0/settlement/deposit",
+        "/v0/settlement/deposit?amount=5",
+    ] {
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        for bad in [String::new(), format!("{sep}maxXdaiWei=lots")] {
+            let (status, json) = req(router.clone(), Method::POST, &format!("{uri}{bad}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}{bad}: {json}");
+            assert!(
+                json["message"].as_str().unwrap().contains("maxXdaiWei"),
+                "{uri}{bad}: {json}"
+            );
+        }
+        let (status, json) = req(
+            router.clone(),
+            Method::POST,
+            &format!("{uri}{sep}maxXdaiWei=400"),
+        )
+        .await;
+        assert!(status.is_success(), "{uri}: {status} {json}");
+    }
+    assert_eq!(
+        writer.calls(),
+        [
+            "buy_with_xdai(20, 1000, immutable=true, max=400)",
+            "extend_with_xdai(ab, None, 7, max=400)",
+            "fund_deposit_with_xdai max=400",
+            "fund_deposit_with_xdai amount=5 max=400",
+        ]
+    );
+}
+
+/// `GET /v0/settlement/deposit?amount=` asks the writer to price that
+/// explicit deposit: the quote whose `swapInputWei` caps the matching
+/// `POST`. A zero or non-numeric amount is refused.
+#[tokio::test]
+async fn v0_settlement_deposit_quotes_an_amount() {
+    let writer = Arc::new(FundingWriter::default());
+    let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+    let (status, json) = get(router.clone(), "/v0/settlement/deposit?amount=5").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["swapInputWei"], "400");
+    for bad in ["0", "lots"] {
+        let (status, json) = get(
+            router.clone(),
+            &format!("/v0/settlement/deposit?amount={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "amount={bad}: {json}");
+    }
+    assert_eq!(writer.calls(), ["deposit_status amount=5"]);
+}
+
 /// `?amount=` (Freedom's "add browsing credit") reaches the writer as
 /// an explicit deposit; a zero or non-numeric amount is refused before
 /// the writer is called, and the web-page guard still applies.
@@ -1572,7 +1648,7 @@ async fn v0_settlement_deposit_takes_an_optional_amount() {
     let (status, _) = req(
         router.clone(),
         Method::POST,
-        "/v0/settlement/deposit?amount=50000000000000",
+        "/v0/settlement/deposit?amount=50000000000000&maxXdaiWei=500",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1580,21 +1656,21 @@ async fn v0_settlement_deposit_takes_an_optional_amount() {
         let (status, json) = req(
             router.clone(),
             Method::POST,
-            &format!("/v0/settlement/deposit?amount={bad}"),
+            &format!("/v0/settlement/deposit?amount={bad}&maxXdaiWei=500"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "amount={bad}: {json}");
     }
     let page = Request::builder()
         .method(Method::POST)
-        .uri("/v0/settlement/deposit?amount=50000000000000")
+        .uri("/v0/settlement/deposit?amount=50000000000000&maxXdaiWei=500")
         .header("origin", "null")
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(router, page).await.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         writer.calls(),
-        ["fund_deposit_with_xdai amount=50000000000000"]
+        ["fund_deposit_with_xdai amount=50000000000000 max=500"]
     );
 }
 
@@ -1613,14 +1689,17 @@ async fn v0_writes_are_one_at_a_time() {
     let first = tokio::spawn(req(
         router.clone(),
         Method::POST,
-        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
     ));
     started.notified().await;
 
     for (method, uri) in [
-        (Method::POST, "/v0/storage/buy?depth=20&amountPerChunk=1000"),
+        (
+            Method::POST,
+            "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
+        ),
         (Method::POST, "/stamps/1000000/20"),
-        (Method::POST, "/v0/settlement/deposit"),
+        (Method::POST, "/v0/settlement/deposit?maxXdaiWei=500"),
         (Method::POST, "/chequebook/deposit?amount=5"),
         (Method::POST, "/chequebook/withdraw?amount=5"),
     ] {
@@ -1649,7 +1728,10 @@ async fn v0_routes_501_without_funding_support() {
         let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
         for (method, uri) in [
             (Method::GET, "/v0/storage/quote?depth=20&days=30"),
-            (Method::POST, "/v0/storage/buy?depth=20&amountPerChunk=1"),
+            (
+                Method::POST,
+                "/v0/storage/buy?depth=20&amountPerChunk=1&maxXdaiWei=500",
+            ),
             (Method::GET, "/v0/settlement/deposit"),
         ] {
             let (status, _) = req(router.clone(), method, uri).await;
@@ -1718,11 +1800,11 @@ async fn buy_stamp_is_immutable_unless_the_header_or_query_says_not() {
 #[tokio::test]
 async fn v0_writes_wait_for_the_wallet_tx_lock() {
     let batch = hex::encode([0xAB; 32]);
-    let extend = format!("/v0/storage/extend?batchId={batch}&amountPerChunk=1");
+    let extend = format!("/v0/storage/extend?batchId={batch}&amountPerChunk=1&maxXdaiWei=500");
     for uri in [
-        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
         extend.as_str(),
-        "/v0/settlement/deposit",
+        "/v0/settlement/deposit?maxXdaiWei=500",
     ] {
         let writer = Arc::new(FundingWriter::default());
         let ctx = funding_ctx(writer.clone());
@@ -1796,7 +1878,12 @@ async fn v0_deposit_refusal_goes_to_the_embedder_hook() {
             None,
             Some(hook),
         );
-        let (status, json) = req(router, Method::POST, "/v0/settlement/deposit").await;
+        let (status, json) = req(
+            router,
+            Method::POST,
+            "/v0/settlement/deposit?maxXdaiWei=500",
+        )
+        .await;
         assert_eq!(status, want, "{json}");
         if stands {
             assert!(json["message"]
@@ -1817,7 +1904,12 @@ async fn v0_deposit_refusal_goes_to_the_embedder_hook() {
         ..FundingWriter::default()
     });
     let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer));
-    let (status, _) = req(router, Method::POST, "/v0/settlement/deposit").await;
+    let (status, _) = req(
+        router,
+        Method::POST,
+        "/v0/settlement/deposit?maxXdaiWei=500",
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1908,9 +2000,9 @@ async fn postage_and_chequebook_writes_refuse_web_pages() {
 #[tokio::test]
 async fn v0_wallet_spending_routes_refuse_web_pages() {
     const WRITES: [&str; 4] = [
-        "/v0/storage/buy?depth=24&amountPerChunk=1000",
-        "/v0/storage/extend?batchId=abababababababababababababababababababababababababababababababab&amountPerChunk=1000",
-        "/v0/settlement/deposit",
+        "/v0/storage/buy?depth=24&amountPerChunk=1000&maxXdaiWei=500",
+        "/v0/storage/extend?batchId=abababababababababababababababababababababababababababababababab&amountPerChunk=1000&maxXdaiWei=500",
+        "/v0/settlement/deposit?maxXdaiWei=500",
         "/chequebook/withdraw?amount=5",
     ];
     let browser_headers: [&[(&str, &str)]; 5] = [
@@ -1979,7 +2071,7 @@ async fn v0_wallet_spending_routes_refuse_web_pages() {
         None,
         CorsConfig::new(["https://App.Example", "null"]),
     );
-    let buy = "/v0/storage/buy?depth=24&amountPerChunk=1000";
+    let buy = "/v0/storage/buy?depth=24&amountPerChunk=1000&maxXdaiWei=500";
     for h in [
         &[][..],
         &[("sec-fetch-site", "none")][..],
@@ -2010,7 +2102,7 @@ async fn buys_register_the_batch_with_its_creation_block() {
     let (status, _) = req(
         router.clone(),
         Method::POST,
-        "/v0/storage/buy?depth=20&amountPerChunk=1000",
+        "/v0/storage/buy?depth=20&amountPerChunk=1000&maxXdaiWei=500",
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);

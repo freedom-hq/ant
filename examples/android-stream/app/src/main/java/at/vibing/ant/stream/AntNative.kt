@@ -34,9 +34,18 @@ object AntNative {
     @JvmStatic external fun nativeStorageDiscover(handle: Long, rpc: String): String
     @JvmStatic external fun nativeStorageValidity(handle: Long, rpc: String): String
     @JvmStatic external fun nativeSettlementDeposit(handle: Long, rpc: String): String
-    @JvmStatic external fun nativeSettlementTopup(handle: Long, rpc: String): String
-    /** Spends real funds: moves `amountPlur` xBZZ from the wallet into the chequebook. */
-    @JvmStatic external fun nativeSettlementTopupAmount(handle: Long, rpc: String, amountPlur: String): String
+    /** Spends real funds; the swap sends at most `maxXdaiWei` (the deposit card's `swap_input`). */
+    @JvmStatic external fun nativeSettlementTopup(handle: Long, rpc: String, maxXdaiWei: String): String
+    /**
+     * Spends real funds: moves `amountPlur` xBZZ from the wallet into the
+     * chequebook, swapping at most `maxXdaiWei` of xDAI for any it lacks.
+     */
+    @JvmStatic external fun nativeSettlementTopupAmount(
+        handle: Long,
+        rpc: String,
+        amountPlur: String,
+        maxXdaiWei: String,
+    ): String
     /** Sends a real transaction: moves `amountPlur` xBZZ from the chequebook back to the wallet. */
     @JvmStatic external fun nativeSettlementWithdrawAmount(handle: Long, rpc: String, amountPlur: String): String
     @JvmStatic external fun nativeWalletBalance(handle: Long, rpc: String): String
@@ -47,6 +56,8 @@ object AntNative {
         depth: Int,
         amountPerChunk: String,
         immutable: Boolean,
+        /** The quote's `swap_input`: the swap never sends more (#305). */
+        maxXdaiWei: String,
     ): String
 
     @JvmStatic external fun nativePublisherStart(handle: Long, configJson: String)

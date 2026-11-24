@@ -320,12 +320,16 @@ final class AntNode: ObservableObject {
 
     /// Buy + activate a plan funding only with xDAI: the node swaps the
     /// xBZZ shortfall on-chain itself, then buys the plan. Spends real funds.
-    func buyStorage(rpc: String, depth: UInt8, amountPerChunk: String, immutable: Bool) async throws {
+    /// `maxXdaiWei` is the quote's `swapInput`: the swap never sends more.
+    func buyStorage(rpc: String, depth: UInt8, amountPerChunk: String, maxXdaiWei: String,
+                    immutable: Bool) async throws {
         guard let h = handle else { throw AntError.notReady }
         let json = try await Self.string(name: "activate storage") { errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
-                    ant_storage_buy_xdai(h, crpc, depth, camt, immutable ? 1 : 0, errPtr)
+                    maxXdaiWei.withCString { cmax in
+                        ant_storage_buy_xdai(h, crpc, depth, camt, immutable ? 1 : 0, cmax, errPtr)
+                    }
                 }
             }
         }
@@ -350,12 +354,15 @@ final class AntNode: ObservableObject {
     /// Extend the connected plan's lifetime, funding only with xDAI: the
     /// node swaps the xBZZ shortfall itself, then tops the batch up
     /// on-chain. Spends real funds. Publishes the refreshed validity.
-    func topUpStorage(rpc: String, amountPerChunk: String) async throws {
+    /// `maxXdaiWei` is the quote's `swapInput`: the swap never sends more.
+    func topUpStorage(rpc: String, amountPerChunk: String, maxXdaiWei: String) async throws {
         guard let h = handle else { throw AntError.notReady }
         let json = try await Self.string(name: "extend storage") { errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
-                    ant_storage_topup_xdai(h, crpc, camt, errPtr)
+                    maxXdaiWei.withCString { cmax in
+                        ant_storage_topup_xdai(h, crpc, camt, cmax, errPtr)
+                    }
                 }
             }
         }
@@ -644,11 +651,23 @@ final class AntNode: ObservableObject {
 
     /// Fund the chequebook up to the settlement deposit, paying with xDAI
     /// (the node swaps for the xBZZ it needs). Spends real funds. Publishes
-    /// the refreshed deposit so the card updates in place.
+    /// the refreshed deposit so the card updates in place. The swap is
+    /// capped at the card's own `swapInput` (the price the user saw); a
+    /// failure (e.g. the price moved) re-reads the card, so a retry is
+    /// shown, and capped at, the current price.
     func topUpSettlementDeposit(rpc: String) async throws {
         guard let h = handle else { throw AntError.notReady }
-        let json = try await Self.string(name: "top up settlement deposit") { errPtr in
-            rpc.withCString { ant_storage_settlement_topup(h, $0, errPtr) }
+        let maxXdaiWei = settlementDeposit?.swapInput ?? "0"
+        let json: String
+        do {
+            json = try await Self.string(name: "top up settlement deposit") { errPtr in
+                rpc.withCString { r in
+                    maxXdaiWei.withCString { ant_storage_settlement_topup(h, r, $0, errPtr) }
+                }
+            }
+        } catch {
+            await refreshSettlementDeposit(rpc: rpc)
+            throw error
         }
         if let d = DriveDecoder.settlementDeposit(from: json) { settlementDeposit = d }
         await refreshAll()

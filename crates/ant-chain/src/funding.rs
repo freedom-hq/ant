@@ -10,6 +10,18 @@
 //! `createBatch` didn't) only asks for, and only swaps, what is still
 //! missing.
 //!
+//! Every paying call takes a `max_xdai_wei`: the most xDAI the caller
+//! lets the swap send, normally the `swap_input_wei` of the quote the
+//! user approved. The swap input is re-priced from the pool's `slot0()`
+//! at execution time, and nothing else ties it to that quote, so a
+//! forged or moved price (a sandwich, an untrusted fallback read) is
+//! refused with [`FundingError::PriceMoved`] before anything is sent
+//! (audit MY-03, #305). A small upward tick that the quote's swap buffer
+//! still absorbs goes through, sending at most the cap
+//! ([`capped_swap_value`]), once a dry run of it passes; a dry run that
+//! reverts is refused the same way, after the one-time helper deploy
+//! may have gone out (the refusal then says so).
+//!
 //! One orchestration, two sequencers (AGENTS.md): `ant-ffi`'s C API
 //! (`ant_storage_quote`, `ant_storage_buy_xdai`, …) and the gateway's
 //! `/v0/storage/*` routes (served by `antd` and by `ant-ffi`'s
@@ -54,6 +66,20 @@ pub const GAS_RESERVE_WEI: u128 = 15_000_000_000_000_000;
 /// in the wallet as a little extra xBZZ.
 const SWAP_BUFFER_NUM: u128 = 105;
 const SWAP_BUFFER_DEN: u128 = 100;
+
+/// The least margin over fair value a capped swap still goes through
+/// with: when the price ticked up since the quote and the re-priced
+/// input (fresh price + [`SWAP_BUFFER_NUM`]) is over the caller's cap,
+/// the swap sends the cap itself as long as the cap still covers the
+/// fresh fair value by this much (the 0.3% pool fee plus a little price
+/// impact). `amountOutMin` stays the xBZZ needed, so the chain refuses
+/// a swap that would buy less, and nothing past the approved cap is
+/// ever sent. A large swap's price impact can eat that margin, so a
+/// capped swap is dry-run (`eth_call`) before it is sent and refused
+/// with [`FundingError::PriceMoved`] if it would revert, instead of
+/// spending the gas of a reverted transaction.
+const SWAP_MIN_MARGIN_NUM: u128 = 101;
+const SWAP_MIN_MARGIN_DEN: u128 = 100;
 
 /// What a storage purchase funds besides the plan itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +184,21 @@ pub enum FundingError {
     /// cost that overflows.
     #[error("{0}")]
     Invalid(String),
+    /// The swap would send more xDAI than the caller's `max_xdai_wei`
+    /// (the quote the user approved) allows: the pool price moved past
+    /// what the cap still covers (see [`SWAP_MIN_MARGIN_NUM`]), the read
+    /// was forged, or the call has more xBZZ to buy than when it was
+    /// quoted (the wallet's xBZZ was spent, or the deposit due grew), or
+    /// a dry run of the capped swap reverted (the cap doesn't cover the
+    /// pool fee plus price impact). Nothing was sent, apart from the
+    /// one-time swap helper deploy in that last case when
+    /// `helper_deployed` (later swaps reuse it).
+    #[error("{}", price_moved_message(*input_wei, *max_wei, *helper_deployed))]
+    PriceMoved {
+        input_wei: u128,
+        max_wei: u128,
+        helper_deployed: bool,
+    },
     /// The wallet holds less xDAI than the swap plus the gas reserve.
     #[error(
         "not enough xDAI: send {} more xDAI to your account, then try again",
@@ -188,6 +229,35 @@ pub enum FundingError {
     /// ([`crate::chequebook_store::top_up_chequebook`]).
     #[error("deposit into chequebook: {0}")]
     Deposit(ChequebookError),
+}
+
+/// [`FundingError::PriceMoved`] for the user. The figures carry 8
+/// decimals, so a small move doesn't read as "needs 0.0035, more than
+/// the 0.0035 you approved".
+fn price_moved_message(input_wei: u128, max_wei: u128, helper_deployed: bool) -> String {
+    let xdai = |wei: u128| {
+        let step = WEI_PER_XDAI / 100_000_000;
+        let steps = wei.div_ceil(step);
+        format!("{}.{:08}", steps / 100_000_000, steps % 100_000_000)
+    };
+    let approved = if max_wei == 0 {
+        "no swap was approved".to_string()
+    } else {
+        format!("more than the {} xDAI you approved", xdai(max_wei))
+    };
+    let sent = if helper_deployed {
+        "only the one-time swap helper setup was sent (later swaps reuse it)"
+    } else {
+        "nothing was sent"
+    };
+    // `acquire_bzz` only sees the cap, not the quote's xBZZ amount, so
+    // it can't tell a price move from more xBZZ to buy: name both.
+    format!(
+        "the cost of the xBZZ swap changed since your quote (the xBZZ price moved, or there is \
+         more xBZZ to buy): the swap now needs {} xDAI, {approved}; {sent}, get a new quote and \
+         try again",
+        xdai(input_wei)
+    )
 }
 
 /// Why a chequebook refused by the chain can't take a deposit, for the
@@ -274,7 +344,33 @@ fn bzz_to_acquire(plan_plur: u128, deposit_due_plur: u128, wallet_bzz: u128) -> 
 /// `(sqrtPriceX96 / 2^96)^2` is WXDAI-wei per BZZ-PLUR (token1 has 18
 /// decimals, token0 16), so `plur × price` is the WXDAI to send. `None`
 /// when the result doesn't fit a `u128`.
+#[cfg(test)]
 fn swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
+    Some(buffered(fair_swap_input_for(sqrt_price_x96, bzz_plur)?))
+}
+
+/// The swap buffer on a fair-value input.
+fn buffered(fair: u128) -> u128 {
+    fair.saturating_mul(SWAP_BUFFER_NUM) / SWAP_BUFFER_DEN
+}
+
+/// What a capped swap sends: the buffered input when the cap allows it,
+/// else the cap itself when it still covers `fair` by
+/// [`SWAP_MIN_MARGIN_NUM`], else `None` (refuse).
+fn capped_swap_value(fair: u128, max_xdai_wei: u128) -> Option<u128> {
+    let input = buffered(fair);
+    if input <= max_xdai_wei {
+        return Some(input);
+    }
+    let least = fair
+        .saturating_mul(SWAP_MIN_MARGIN_NUM)
+        .div_ceil(SWAP_MIN_MARGIN_DEN);
+    (least <= max_xdai_wei).then_some(max_xdai_wei)
+}
+
+/// Fair-value xDAI (wei) for `bzz_plur` of xBZZ at the pool's
+/// `sqrtPriceX96`, without the swap buffer.
+fn fair_swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
     use primitive_types::U512;
     let sp = U512::from_big_endian(sqrt_price_x96);
     let fair = sp
@@ -284,7 +380,7 @@ fn swap_input_for(sqrt_price_x96: &[u8; 32], bzz_plur: u128) -> Option<u128> {
     if fair > U512::from(u128::MAX) {
         return None;
     }
-    Some(fair.low_u128().saturating_mul(SWAP_BUFFER_NUM) / SWAP_BUFFER_DEN)
+    Some(fair.low_u128())
 }
 
 /// The `topUp` per chunk that lets a batch holding `remaining` per chunk
@@ -426,6 +522,11 @@ async fn chequebook_deposit(
 
 /// xDAI (wei, buffered) the swap helper needs for `bzz_plur` of xBZZ.
 async fn swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingError> {
+    Ok(buffered(fair_swap_input(payer, bzz_plur).await?))
+}
+
+/// [`swap_input`] without the buffer.
+async fn fair_swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingError> {
     if bzz_plur == 0 {
         return Ok(0);
     }
@@ -437,7 +538,7 @@ async fn swap_input(payer: &Payer<'_>, bzz_plur: u128) -> Result<u128, FundingEr
             what: "read swap price",
             message: e.to_string(),
         })?;
-    swap_input_for(&word, bzz_plur)
+    fair_swap_input_for(&word, bzz_plur)
         .ok_or_else(|| FundingError::Invalid("swap amount too large".into()))
 }
 
@@ -501,9 +602,22 @@ async fn deposit_due(payer: &Payer<'_>, policy: DepositPolicy) -> u128 {
 }
 
 /// Swap enough xDAI for `bzz_plur` of xBZZ, delivered to the node
-/// wallet. Refuses before sending anything when the wallet can't also
-/// keep [`GAS_RESERVE_WEI`] for the transactions that follow.
-async fn acquire_bzz(payer: &Payer<'_>, bzz_plur: u128) -> Result<(), FundingError> {
+/// wallet. Sends at most `max_xdai_wei` ([`capped_swap_value`]), and
+/// refuses before sending anything (the helper deploy included) when the
+/// cap no longer covers the freshly priced swap
+/// ([`FundingError::PriceMoved`]), or when the wallet can't also keep
+/// [`GAS_RESERVE_WEI`] for the transactions that follow. A swap sending
+/// the cap is dry-run first (`eth_call`) and refused the same way if it
+/// would revert; by then the one-time helper deploy may have gone out,
+/// which later swaps reuse, and the refusal says so
+/// (`helper_deployed`). A dry run that passes without the swap's
+/// `bzzOut` answer (a lagging RPC backend that doesn't see the helper
+/// yet) fails the call as a read, sending nothing more.
+async fn acquire_bzz(
+    payer: &Payer<'_>,
+    bzz_plur: u128,
+    max_xdai_wei: u128,
+) -> Result<(), FundingError> {
     if bzz_plur == 0 {
         return Ok(());
     }
@@ -515,14 +629,21 @@ async fn acquire_bzz(payer: &Payer<'_>, bzz_plur: u128) -> Result<(), FundingErr
             what: "read xDAI balance",
             message: e.to_string(),
         })?;
-    let input = swap_input(payer, bzz_plur).await?;
+    let fair = fair_swap_input(payer, bzz_plur).await?;
+    let Some(input) = capped_swap_value(fair, max_xdai_wei) else {
+        return Err(FundingError::PriceMoved {
+            input_wei: buffered(fair),
+            max_wei: max_xdai_wei,
+            helper_deployed: false,
+        });
+    };
     let required = input.saturating_add(GAS_RESERVE_WEI);
     if xdai < required {
         return Err(FundingError::InsufficientXdai {
             short_wei: required - xdai,
         });
     }
-    let helper = payer
+    let (helper, helper_deployed) = payer
         .wallet
         .ensure_swap_helper(payer.client)
         .await
@@ -530,6 +651,39 @@ async fn acquire_bzz(payer: &Payer<'_>, bzz_plur: u128) -> Result<(), FundingErr
             what: "prepare swap",
             source,
         })?;
+    if input < buffered(fair) {
+        // Capped: the cap covers fair value by as little as
+        // [`SWAP_MIN_MARGIN_NUM`], which the pool fee plus a large swap's
+        // price impact can eat. Dry-run it so a swap that would miss
+        // `amountOutMin` is refused here rather than reverting on chain
+        // and burning its gas. A failed dry run that isn't a revert
+        // fails the call too (an empty answer included, see
+        // `simulate_swap_xdai_for_bzz`): the swap isn't sent on a check
+        // we couldn't make.
+        if let Err(e) = payer
+            .wallet
+            .simulate_swap_xdai_for_bzz(
+                payer.client,
+                &helper,
+                payer.owner(),
+                input,
+                U256::from(bzz_plur),
+            )
+            .await
+        {
+            return Err(match e {
+                crate::RpcError::Rpc(msg) if is_revert(&msg) => FundingError::PriceMoved {
+                    input_wei: buffered(fair),
+                    max_wei: max_xdai_wei,
+                    helper_deployed,
+                },
+                e => FundingError::Read {
+                    what: "check the capped swap",
+                    message: e.to_string(),
+                },
+            });
+        }
+    }
     payer
         .wallet
         .swap_xdai_for_bzz(
@@ -545,6 +699,12 @@ async fn acquire_bzz(payer: &Payer<'_>, bzz_plur: u128) -> Result<(), FundingErr
             source,
         })?;
     Ok(())
+}
+
+/// Whether an `eth_call` error (the RPC's error JSON) is the call
+/// reverting, as opposed to the RPC failing to run it.
+fn is_revert(error_json: &str) -> bool {
+    error_json.to_ascii_lowercase().contains("revert")
 }
 
 // --- the shared orchestration steps ---
@@ -639,32 +799,38 @@ fn resize_delta(depth: u8, new_depth: u8) -> Result<u8, FundingError> {
 /// xBZZ acquired here.
 ///
 /// Recomputes the shortfall from current balances, so a retry after a
-/// partial failure only swaps what is still missing.
+/// partial failure only swaps what is still missing. The swap sends at
+/// most `max_xdai_wei` (the quote's `swap_input_wei`); a swap the cap no
+/// longer covers is refused without swapping, at most after the one-time
+/// helper deploy ([`FundingError::PriceMoved`]).
 pub async fn buy_plan_with_xdai(
     payer: &Payer<'_>,
     policy: DepositPolicy,
     depth: u8,
     amount_per_chunk: u128,
     immutable: bool,
+    max_xdai_wei: u128,
 ) -> Result<NewBatch, FundingError> {
     validate_depth(depth)?;
     let plan = checked_cost(amount_per_chunk, depth, "plan")?;
     let deposit = deposit_due(payer, policy).await;
     let to_acquire = bzz_to_acquire(plan, deposit, wallet_bzz_for_spend(payer).await?);
-    acquire_bzz(payer, to_acquire).await?;
+    acquire_bzz(payer, to_acquire, max_xdai_wei).await?;
     buy_batch(payer, amount_per_chunk, depth, immutable).await
 }
 
 /// Extend batch `batch_id` (currently `depth`) paying only with xDAI:
 /// swap any xBZZ shortfall, `approve`, `topUp(amount_per_chunk)`. With
 /// `new_depth`, then `increaseDepth` too; the caller re-registers the
-/// batch at the new depth.
+/// batch at the new depth. The swap sends at most `max_xdai_wei` (the
+/// quote's `swap_input_wei`), as in [`buy_plan_with_xdai`].
 pub async fn extend_with_xdai(
     payer: &Payer<'_>,
     batch_id: &[u8; 32],
     depth: u8,
     new_depth: Option<u8>,
     amount_per_chunk: u128,
+    max_xdai_wei: u128,
 ) -> Result<(), FundingError> {
     if let Some(new_depth) = new_depth {
         resize_delta(depth, new_depth)?;
@@ -673,6 +839,7 @@ pub async fn extend_with_xdai(
     acquire_bzz(
         payer,
         cost.saturating_sub(wallet_bzz_for_spend(payer).await?),
+        max_xdai_wei,
     )
     .await?;
     top_up_batch(payer, batch_id, depth, amount_per_chunk).await?;
@@ -794,14 +961,21 @@ fn checked_cost(amount_per_chunk: u128, depth: u8, what: &str) -> Result<u128, F
 /// topping it up to `target` would take. No transaction is sent.
 /// `wallet` says whether the wallet's balances are read at the target
 /// too (see [`WalletRead`]).
+///
+/// With `add`, [`DepositStatus::funding`] prices growing the deposit by
+/// that many PLUR instead (what [`fund_deposit_with_xdai`] with the same
+/// `add` would swap), so the quote for an explicit amount carries the
+/// `swap_input_wei` that call takes as its cap. The other fields still
+/// describe the deposit against `target`. `Some(0)` prices nothing.
 pub async fn deposit_status(
     payer: &Payer<'_>,
     chequebook: &[u8; 20],
     target: u128,
+    add: Option<u128>,
     wallet: WalletRead,
 ) -> Result<DepositStatus, FundingError> {
     let deposited = chequebook_deposit(payer, chequebook).await?;
-    status_for(payer, chequebook, deposited, target, wallet).await
+    status_for(payer, chequebook, deposited, target, add, wallet).await
 }
 
 async fn status_for(
@@ -809,13 +983,16 @@ async fn status_for(
     chequebook: &[u8; 20],
     deposited: u128,
     target: u128,
+    add: Option<u128>,
     wallet: WalletRead,
 ) -> Result<DepositStatus, FundingError> {
     let shortfall_plur = target.saturating_sub(deposited);
+    // What the priced top-up deposits: the shortfall, or `add`.
+    let deposit_plur = add.unwrap_or(shortfall_plur);
     // With `WalletRead::Always` the wallet's balances are reported
     // either way: a deposit at its target still has a wallet behind it
     // (#241). Only the top-up figures stay 0 when nothing is missing.
-    let funding = if shortfall_plur == 0 {
+    let funding = if deposit_plur == 0 {
         match wallet {
             WalletRead::Always => wallet_funding(payer).await,
             WalletRead::WhenShort => Funding {
@@ -826,7 +1003,7 @@ async fn status_for(
         }
     } else {
         let (bzz, xdai) = tokio::join!(wallet_bzz(payer), wallet_xdai(payer));
-        let to_acquire = shortfall_plur.saturating_sub(bzz.unwrap_or(0));
+        let to_acquire = deposit_plur.saturating_sub(bzz.unwrap_or(0));
         price_funding(payer, to_acquire, bzz, xdai, true).await?
     };
     Ok(DepositStatus {
@@ -852,6 +1029,12 @@ async fn status_for(
 /// browsing credit than the node's default deposit target (Freedom's
 /// wallet UI). `Some(0)` is refused.
 ///
+/// The swap sends at most `max_xdai_wei`: the `swap_input_wei` of the
+/// [`deposit_status`] the user approved (priced with the same `add`),
+/// or `0` when the wallet already holds the xBZZ and no swap may happen.
+/// A swap the cap no longer covers is refused without swapping, at most
+/// after the one-time helper deploy ([`FundingError::PriceMoved`]).
+///
 /// Nothing is spent on a chequebook the chain rejects: before a swap
 /// the chequebook's checks (factory registration, `issuer()` is the
 /// node wallet) must both read "yes", and `top_up_chequebook` runs them
@@ -873,6 +1056,7 @@ pub async fn fund_deposit_with_xdai(
     target: u128,
     add: Option<u128>,
     wallet: WalletRead,
+    max_xdai_wei: u128,
 ) -> Result<DepositStatus, FundingError> {
     let deposited = chequebook_deposit(payer, chequebook).await?;
     let goal = match add {
@@ -888,12 +1072,12 @@ pub async fn fund_deposit_with_xdai(
     };
     let short = goal.saturating_sub(deposited);
     if short == 0 {
-        return status_for(payer, chequebook, deposited, target, wallet).await;
+        return status_for(payer, chequebook, deposited, target, None, wallet).await;
     }
     let to_acquire = short.saturating_sub(wallet_bzz_for_spend(payer).await?);
     if to_acquire > 0 {
         verify_for_deposit(payer, chequebook).await?;
-        acquire_bzz(payer, to_acquire).await?;
+        acquire_bzz(payer, to_acquire, max_xdai_wei).await?;
     }
     match crate::chequebook_store::top_up_chequebook(
         payer.client,
@@ -919,7 +1103,7 @@ pub async fn fund_deposit_with_xdai(
         Err(e) => return Err(FundingError::Deposit(e)),
     }
     // Re-read rather than assume: report what the chain says now.
-    deposit_status(payer, chequebook, target, wallet).await
+    deposit_status(payer, chequebook, target, None, wallet).await
 }
 
 /// The chequebook checks [`top_up_chequebook`] runs before its transfer,
@@ -1053,6 +1237,33 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_price_names_both_figures_apart() {
+        let m = FundingError::PriceMoved {
+            input_wei: 3_500_000_000_000_001,
+            max_wei: 3_500_000_000_000_000,
+            helper_deployed: false,
+        }
+        .to_string();
+        assert!(
+            m.contains("needs 0.00350001 xDAI, more than the 0.00350000 xDAI"),
+            "{m}"
+        );
+        // R1-M2: a larger xBZZ amount at an unchanged price is refused
+        // the same way, so the message doesn't blame the price alone.
+        assert!(m.contains("or there is more xBZZ to buy"), "{m}");
+        let m = FundingError::PriceMoved {
+            input_wei: WEI_PER_XDAI,
+            max_wei: 0,
+            helper_deployed: false,
+        }
+        .to_string();
+        assert!(
+            m.contains("needs 1.00000000 xDAI, no swap was approved"),
+            "{m}"
+        );
+    }
+
+    #[test]
     fn depth_must_exceed_the_bucket_depth() {
         assert!(validate_depth(POSTAGE_BUCKET_DEPTH).is_err());
         assert!(validate_depth(POSTAGE_BUCKET_DEPTH + 1).is_ok());
@@ -1080,15 +1291,36 @@ mod tests {
         /// fallback RPC URL (a server that never answers): a read that
         /// stalls rather than errors.
         wallet_xdai_stalls: bool,
+        /// `slot0()`'s `sqrtPriceX96` when set (a forged or moved pool
+        /// price); [`HONEST_SQRT_PRICE`] otherwise.
+        sqrt_price: Option<u128>,
+        /// The swap helper isn't deployed yet (`eth_getCode` is empty), so
+        /// a swap starts with its deploy transaction.
+        no_helper: bool,
         /// Wallet balance reads served or refused: `balanceOf` the node
         /// wallet and `eth_getBalance`.
         wallet_reads: std::sync::atomic::AtomicUsize,
         sent: std::sync::Mutex<Vec<&'static str>>,
+        /// The xDAI (wei) each swap transaction carried.
+        swap_values: std::sync::Mutex<Vec<u128>>,
+        /// A dry run (`eth_call`) of the swap reverts: the pool fee plus
+        /// price impact leaves less than `amountOutMin`.
+        swap_reverts: bool,
+        /// A dry run of the swap fails without reverting (rate limit).
+        swap_dry_run_fails: bool,
+        /// The swap dry run succeeds with empty output (a lagging RPC
+        /// backend that doesn't see the helper's code yet).
+        swap_dry_run_empty: bool,
+        /// The xDAI (wei) each swap dry run carried.
+        dry_run_values: std::sync::Mutex<Vec<u128>>,
     }
 
     const CHEQUEBOOK: [u8; 20] = [0xcb; 20];
 
     const BATCH: [u8; 32] = [0xba; 32];
+
+    /// The scripted pool's `sqrtPriceX96`: about 0.06 xDAI per xBZZ.
+    const HONEST_SQRT_PRICE: u128 = 193_688_776_437_782_838_521_006_693_800;
 
     impl crate::ChainTransport for ScriptedChain {
         fn serve(&self, request_json: &str) -> Option<String> {
@@ -1124,6 +1356,35 @@ mod tests {
                     .to_string(),
                 );
             }
+            let helper_hex = format!("0x{}", hex::encode(crate::tx::swap_helper_address()));
+            if req["method"] == "eth_call" && req["params"][0]["to"] == helper_hex.as_str() {
+                let call = &req["params"][0];
+                assert_eq!(call["from"], format!("0x{}", hex::encode(node_eth())));
+                assert_eq!(
+                    call["gas"],
+                    format!("0x{:x}", crate::tx::SWAP_HELPER_SWAP_GAS)
+                );
+                let value = call["value"].as_str().unwrap();
+                self.dry_run_values
+                    .lock()
+                    .unwrap()
+                    .push(u128::from_str_radix(&value[2..], 16).unwrap());
+                let error = if self.swap_reverts {
+                    json!({"code": 3, "message": "execution reverted: Too little received"})
+                } else if self.swap_dry_run_fails {
+                    json!({"code": -32005, "message": "rate limit exceeded"})
+                } else if self.swap_dry_run_empty {
+                    // What a backend that doesn't see the helper's code
+                    // answers.
+                    return Some(json!({"jsonrpc": "2.0", "id": id, "result": "0x"}).to_string());
+                } else {
+                    // `bzzOut`: exactly the `amountOutMin` asked for.
+                    let data = call["data"].as_str().unwrap();
+                    let out = format!("0x{}", &data[2 + 8 + 64..]);
+                    return Some(json!({"jsonrpc": "2.0", "id": id, "result": out}).to_string());
+                };
+                return Some(json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string());
+            }
             let result = match req["method"].as_str().unwrap() {
                 "eth_call" => {
                     let data = req["params"][0]["data"].as_str().unwrap();
@@ -1154,10 +1415,10 @@ mod tests {
                         sel if sel == issuer_sel => {
                             json!(format!("0x{}{}", "00".repeat(12), hex::encode(self.issuer)))
                         }
-                        // slot0(): about 0.06 xDAI per xBZZ, then padding.
+                        // slot0(): the price, then padding.
                         "0x3850c7bd" => json!(format!(
                             "{}{}",
-                            word(193_688_776_437_782_838_521_006_693_800),
+                            word(self.sqrt_price.unwrap_or(HONEST_SQRT_PRICE)),
                             "0".repeat(64 * 6)
                         )),
                         // lastPrice()
@@ -1165,6 +1426,7 @@ mod tests {
                     }
                 }
                 "eth_getBalance" => json!(format!("0x{:x}", self.wallet_xdai)),
+                "eth_getCode" if self.no_helper => json!("0x"),
                 "eth_getCode" => json!("0x6080"),
                 "eth_getTransactionCount" => json!("0x0"),
                 "eth_sendRawTransaction" => {
@@ -1172,7 +1434,16 @@ mod tests {
                     let to: Vec<u8> = rlp::Rlp::new(&raw).at(3).unwrap().data().unwrap().to_vec();
                     let input: Vec<u8> =
                         rlp::Rlp::new(&raw).at(5).unwrap().data().unwrap().to_vec();
-                    let kind = if to == crate::tx::swap_helper_address() {
+                    let kind = if hex::encode(&to) == crate::CREATE2_DEPLOYER[2..].to_lowercase() {
+                        "deploy"
+                    } else if to == crate::tx::swap_helper_address() {
+                        let value = rlp::Rlp::new(&raw).at(4).unwrap().data().unwrap().to_vec();
+                        let mut word = [0u8; 16];
+                        word[16 - value.len()..].copy_from_slice(&value);
+                        self.swap_values
+                            .lock()
+                            .unwrap()
+                            .push(u128::from_be_bytes(word));
                         "swap"
                     } else if to == crate::chequebook::GNOSIS_BZZ_TOKEN_BYTES {
                         // transfer(address,uint256) vs approve.
@@ -1224,7 +1495,7 @@ mod tests {
             target: TARGET,
         };
         let amount = amount_per_chunk_for(24_000, 30);
-        let result = buy_plan_with_xdai(&payer, policy, 20, amount, true).await;
+        let result = buy_plan_with_xdai(&payer, policy, 20, amount, true, u128::MAX).await;
         let sent = chain.sent.lock().unwrap().clone();
         (result, sent)
     }
@@ -1279,8 +1550,15 @@ mod tests {
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
         let payer = Payer::gnosis(&client, &wallet);
-        let result =
-            fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, add, WalletRead::Always).await;
+        let result = fund_deposit_with_xdai(
+            &payer,
+            &CHEQUEBOOK,
+            TARGET,
+            add,
+            WalletRead::Always,
+            u128::MAX,
+        )
+        .await;
         let sent = chain.sent.lock().unwrap().clone();
         (result, sent)
     }
@@ -1367,9 +1645,15 @@ mod tests {
     ) -> DepositStatus {
         let client = ChainClient::new(fallback_url).with_transport(Some(chain));
         let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
-        deposit_status(&Payer::gnosis(&client, &wallet), &CHEQUEBOOK, TARGET, read)
-            .await
-            .unwrap()
+        deposit_status(
+            &Payer::gnosis(&client, &wallet),
+            &CHEQUEBOOK,
+            TARGET,
+            None,
+            read,
+        )
+        .await
+        .unwrap()
     }
 
     /// The C API's deposit card carries no wallet balances: with
@@ -1565,26 +1849,445 @@ mod tests {
             chequebook: None,
             target: TARGET,
         };
-        let r = buy_plan_with_xdai(&payer, policy, 20, amount, true).await;
+        let r = buy_plan_with_xdai(&payer, policy, 20, amount, true, u128::MAX).await;
         assert!(matches!(r, Err(FundingError::Read { .. })), "buy: {r:?}");
         assert!(c.sent.lock().unwrap().is_empty(), "buy sent something");
 
         let c = chain();
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
         let payer = Payer::gnosis(&client, &wallet);
-        let r = extend_with_xdai(&payer, &BATCH, 20, None, amount).await;
+        let r = extend_with_xdai(&payer, &BATCH, 20, None, amount, u128::MAX).await;
         assert!(matches!(r, Err(FundingError::Read { .. })), "extend: {r:?}");
         assert!(c.sent.lock().unwrap().is_empty(), "extend sent something");
 
         let c = chain();
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(c.clone()));
         let payer = Payer::gnosis(&client, &wallet);
-        let r = fund_deposit_with_xdai(&payer, &CHEQUEBOOK, TARGET, None, WalletRead::Always).await;
+        let r = fund_deposit_with_xdai(
+            &payer,
+            &CHEQUEBOOK,
+            TARGET,
+            None,
+            WalletRead::Always,
+            u128::MAX,
+        )
+        .await;
         assert!(
             matches!(r, Err(FundingError::Read { .. })),
             "deposit: {r:?}"
         );
         assert!(c.sent.lock().unwrap().is_empty(), "deposit sent something");
+    }
+
+    /// One of the three paying calls against `chain`, capped at
+    /// `max_xdai_wei`, and what it sent.
+    async fn pay_capped(
+        chain: ScriptedChain,
+        call: &str,
+        max_xdai_wei: u128,
+    ) -> (Result<(), FundingError>, Vec<&'static str>) {
+        let (result, sent, _) = pay_capped_valued(chain, call, max_xdai_wei).await;
+        (result, sent)
+    }
+
+    /// [`pay_capped`], plus the xDAI each swap carried.
+    async fn pay_capped_valued(
+        chain: ScriptedChain,
+        call: &str,
+        max_xdai_wei: u128,
+    ) -> (Result<(), FundingError>, Vec<&'static str>, Vec<u128>) {
+        let chain = std::sync::Arc::new(chain);
+        let result = pay_capped_on(&chain, call, max_xdai_wei).await;
+        let sent = chain.sent.lock().unwrap().clone();
+        let values = chain.swap_values.lock().unwrap().clone();
+        (result, sent, values)
+    }
+
+    /// One paying `call` capped at `max_xdai_wei` against `chain`.
+    async fn pay_capped_on(
+        chain: &std::sync::Arc<ScriptedChain>,
+        call: &str,
+        max_xdai_wei: u128,
+    ) -> Result<(), FundingError> {
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let payer = Payer::gnosis(&client, &wallet);
+        let amount = amount_per_chunk_for(24_000, 30);
+        let result = match call {
+            "buy" => {
+                let policy = DepositPolicy::Managed {
+                    chequebook: None,
+                    target: TARGET,
+                };
+                buy_plan_with_xdai(&payer, policy, 20, amount, true, max_xdai_wei)
+                    .await
+                    .map(drop)
+            }
+            "extend" => extend_with_xdai(&payer, &BATCH, 20, None, amount, max_xdai_wei).await,
+            "deposit" => fund_deposit_with_xdai(
+                &payer,
+                &CHEQUEBOOK,
+                TARGET,
+                None,
+                WalletRead::Always,
+                max_xdai_wei,
+            )
+            .await
+            .map(drop),
+            other => unreachable!("{other}"),
+        };
+        result
+    }
+
+    /// The `swap_input_wei` each paying call's quote shows the user, at
+    /// the honest pool price.
+    async fn quoted_swap_input(call: &str) -> u128 {
+        let chain = std::sync::Arc::new(ScriptedChain {
+            wallet_xdai: WEI_PER_XDAI,
+            ..ScriptedChain::default()
+        });
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain));
+        let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let payer = Payer::gnosis(&client, &wallet);
+        let funding = match call {
+            "buy" => {
+                let policy = DepositPolicy::Managed {
+                    chequebook: None,
+                    target: TARGET,
+                };
+                quote_plan(&payer, policy, 20, 30).await.unwrap().funding
+            }
+            "extend" => {
+                quote_extend(&payer, &BATCH, 20, None, 30)
+                    .await
+                    .unwrap()
+                    .funding
+            }
+            "deposit" => {
+                deposit_status(&payer, &CHEQUEBOOK, TARGET, None, WalletRead::Always)
+                    .await
+                    .unwrap()
+                    .funding
+            }
+            other => unreachable!("{other}"),
+        };
+        assert!(funding.swap_input_wei > 0, "{call}: the quote swaps");
+        funding.swap_input_wei
+    }
+
+    fn payable(sqrt_price: u128) -> ScriptedChain {
+        ScriptedChain {
+            wallet_xdai: 1_000_000 * WEI_PER_XDAI,
+            registered: true,
+            issuer: node_eth(),
+            sqrt_price: Some(sqrt_price),
+            no_helper: true,
+            ..ScriptedChain::default()
+        }
+    }
+
+    /// #305 (audit MY-03): the swap is re-priced from `slot0()` when it
+    /// runs. A forged (or sandwiched) high price would make it send far
+    /// more xDAI than the quote the user approved; capped at that quote,
+    /// every paying call refuses before sending anything, not even the
+    /// one-time helper deploy, however much xDAI the wallet holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forged_high_price_is_refused_before_anything_is_sent() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            let (result, sent) = pay_capped(payable(HONEST_SQRT_PRICE * 10), call, quoted).await;
+            match result {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
+                    assert_eq!(max_wei, quoted, "{call}");
+                    assert!(input_wei > 50 * quoted, "{call}: {input_wei} vs {quoted}");
+                }
+                other => panic!("{call}: expected PriceMoved, got {other:?}"),
+            }
+            assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
+        }
+    }
+
+    /// At the price the user was quoted, the swap sends exactly the
+    /// quote (deploying the helper first). A cap a little under the quote
+    /// is still covered by the swap buffer, so it goes through sending
+    /// the cap itself, never more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_quoted_swap_input_is_what_is_sent() {
+        for (call, rest) in [
+            ("buy", &["approve", "createBatch"][..]),
+            ("extend", &["approve", "createBatch"][..]),
+            ("deposit", &["transfer"][..]),
+        ] {
+            let quoted = quoted_swap_input(call).await;
+            let (result, sent, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE), call, quoted).await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            let mut want = vec!["deploy", "swap"];
+            want.extend_from_slice(rest);
+            assert_eq!(sent, want, "{call}");
+            assert_eq!(values, [quoted], "{call}");
+
+            let (result, _, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE), call, quoted - 1).await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(values, [quoted - 1], "{call}: never past the cap");
+        }
+    }
+
+    /// R1-M1: a small upward tick between the quote and the call (here
+    /// the price up 3%) is absorbed by the quote's 5% swap buffer: the
+    /// swap goes through sending exactly the cap, with `amountOutMin`
+    /// still the xBZZ needed. A move the cap no longer covers by
+    /// [`SWAP_MIN_MARGIN_NUM`] (here about 6%) is refused with nothing
+    /// sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_small_price_tick_is_absorbed_by_the_cap() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            // sqrtPrice +1.5% is the price +3.02%.
+            let (result, _, values) =
+                pay_capped_valued(payable(HONEST_SQRT_PRICE / 1000 * 1015), call, quoted).await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(values, [quoted], "{call}: the cap, not the re-priced input");
+
+            // sqrtPrice +3% is the price +6.09%: past buffer and margin.
+            let (result, sent) =
+                pay_capped(payable(HONEST_SQRT_PRICE / 100 * 103), call, quoted).await;
+            match result {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
+                    assert_eq!(max_wei, quoted, "{call}");
+                    assert!(input_wei > quoted, "{call}");
+                }
+                other => panic!("{call}: expected PriceMoved, got {other:?}"),
+            }
+            assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
+        }
+    }
+
+    /// R3-M2: a capped swap sends the cap with as little as 1% over fair
+    /// value, which the pool fee plus a large swap's price impact can
+    /// eat. It is dry-run first, with exactly the value it would send,
+    /// and a would-be revert is refused as `PriceMoved` instead of being
+    /// sent to revert on chain and burn its gas. An uncapped swap (the
+    /// full 5% buffer) is not dry-run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_swap_that_would_revert_is_not_sent() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            // sqrtPrice +1.5%: capped, and the dry run reverts.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::PriceMoved {
+                    input_wei,
+                    max_wei,
+                    helper_deployed,
+                }) => {
+                    assert!(!helper_deployed, "{call}");
+                    assert_eq!(max_wei, quoted, "{call}");
+                    assert!(input_wei > quoted, "{call}");
+                }
+                other => panic!("{call}: expected PriceMoved, got {other:?}"),
+            }
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            let sent = chain.sent.lock().unwrap().clone();
+            assert!(sent.is_empty(), "{call}: nothing may be sent: {sent:?}");
+
+            // A dry run that fails without reverting fails the call as a
+            // read, still sending nothing.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_dry_run_fails: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::Read { what, .. }) => {
+                    assert_eq!(what, "check the capped swap", "{call}");
+                }
+                other => panic!("{call}: expected Read, got {other:?}"),
+            }
+            assert!(chain.sent.lock().unwrap().is_empty(), "{call}");
+
+            // The same capped swap whose dry run passes is sent, at the
+            // value the dry run carried.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            pay_capped_on(&chain, call, quoted)
+                .await
+                .unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            assert_eq!(*chain.swap_values.lock().unwrap(), [quoted], "{call}");
+
+            // Uncapped (at the quoted price): no dry run, even one that
+            // would revert.
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                no_helper: false,
+                ..payable(HONEST_SQRT_PRICE)
+            });
+            pay_capped_on(&chain, call, quoted)
+                .await
+                .unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert!(chain.dry_run_values.lock().unwrap().is_empty(), "{call}");
+            assert_eq!(*chain.swap_values.lock().unwrap(), [quoted], "{call}");
+        }
+    }
+
+    /// R4-M1: a fresh wallet's capped swap deploys the helper before its
+    /// dry run, so a dry run that then reverts has sent that deploy. The
+    /// refusal says so instead of "nothing was sent".
+    /// R4-M2: a dry run answering `0x` (an `eth_call` to an address with
+    /// no code, e.g. a backend that doesn't see the just-deployed helper
+    /// yet) is not a pass: the call fails as a read and the swap isn't
+    /// sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capped_swap_after_the_helper_deploy() {
+        for call in ["buy", "extend", "deposit"] {
+            let quoted = quoted_swap_input(call).await;
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_reverts: true,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(
+                    e @ FundingError::PriceMoved {
+                        helper_deployed: true,
+                        ..
+                    },
+                ) => {
+                    let m = e.to_string();
+                    assert!(!m.contains("nothing was sent"), "{call}: {m}");
+                    assert!(
+                        m.contains("only the one-time swap helper setup was sent"),
+                        "{call}: {m}"
+                    );
+                }
+                other => panic!("{call}: expected PriceMoved after a deploy, got {other:?}"),
+            }
+            assert_eq!(*chain.sent.lock().unwrap(), ["deploy"], "{call}");
+
+            let chain = std::sync::Arc::new(ScriptedChain {
+                swap_dry_run_empty: true,
+                ..payable(HONEST_SQRT_PRICE / 1000 * 1015)
+            });
+            match pay_capped_on(&chain, call, quoted).await {
+                Err(FundingError::Read { what, message }) => {
+                    assert_eq!(what, "check the capped swap", "{call}");
+                    assert!(message.contains("returned 0 bytes"), "{call}: {message}");
+                }
+                other => panic!("{call}: expected Read, got {other:?}"),
+            }
+            assert_eq!(*chain.dry_run_values.lock().unwrap(), [quoted], "{call}");
+            assert_eq!(*chain.sent.lock().unwrap(), ["deploy"], "{call}: no swap");
+        }
+    }
+
+    #[test]
+    fn a_capped_swap_never_sends_past_the_cap() {
+        let fair = 1_000_000u128;
+        // Within the cap: the buffered input.
+        assert_eq!(capped_swap_value(fair, 1_050_000), Some(1_050_000));
+        assert_eq!(capped_swap_value(fair, 2_000_000), Some(1_050_000));
+        // Under the buffered input but still 1% over fair: the cap.
+        assert_eq!(capped_swap_value(fair, 1_049_999), Some(1_049_999));
+        assert_eq!(capped_swap_value(fair, 1_010_000), Some(1_010_000));
+        // Less than 1% over fair: refused.
+        assert_eq!(capped_swap_value(fair, 1_009_999), None);
+        assert_eq!(capped_swap_value(fair, 0), None);
+        assert_eq!(capped_swap_value(0, 0), Some(0));
+    }
+
+    /// A cap of 0 forbids any swap but doesn't stand in the way of a call
+    /// whose xBZZ the wallet already holds (a retry after the swap landed,
+    /// or the apps' "add credit" from wallet xBZZ), whatever the pool
+    /// reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_cap_still_pays_from_held_xbzz() {
+        let plan = plan_cost_plur(amount_per_chunk_for(24_000, 30), 20).unwrap();
+        for (call, want) in [
+            ("buy", &["approve", "createBatch"][..]),
+            ("extend", &["approve", "createBatch"][..]),
+            ("deposit", &["transfer"][..]),
+        ] {
+            let (result, sent) = pay_capped(
+                ScriptedChain {
+                    wallet_bzz: plan + TARGET,
+                    ..payable(HONEST_SQRT_PRICE * 10)
+                },
+                call,
+                0,
+            )
+            .await;
+            result.unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(sent, want, "{call}");
+        }
+    }
+
+    /// An explicit deposit amount is quoted by `deposit_status` with the
+    /// same `add`, and that quote is exactly the cap the funding call
+    /// with that `add` needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deposit_amount_has_its_own_quote() {
+        let add = 5 * TARGET;
+        let full = || ScriptedChain {
+            chequebook_bzz: TARGET,
+            ..payable(HONEST_SQRT_PRICE)
+        };
+        let chain = std::sync::Arc::new(full());
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain));
+        let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let payer = Payer::gnosis(&client, &wallet);
+        let at_target = deposit_status(&payer, &CHEQUEBOOK, TARGET, None, WalletRead::Always)
+            .await
+            .unwrap();
+        assert_eq!(at_target.funding.swap_input_wei, 0);
+        let quote = deposit_status(&payer, &CHEQUEBOOK, TARGET, Some(add), WalletRead::Always)
+            .await
+            .unwrap();
+        assert!(!quote.needs_top_up(), "still described against the target");
+        assert_eq!(quote.funding.bzz_to_acquire, add);
+        let quoted = quote.funding.swap_input_wei;
+        assert!(quoted > 0);
+
+        let pay = |max| async move {
+            let chain = std::sync::Arc::new(full());
+            let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+            let wallet = Wallet::new([5u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+            let payer = Payer::gnosis(&client, &wallet);
+            let r = fund_deposit_with_xdai(
+                &payer,
+                &CHEQUEBOOK,
+                TARGET,
+                Some(add),
+                WalletRead::Always,
+                max,
+            )
+            .await;
+            let sent = chain.sent.lock().unwrap().clone();
+            (r, sent)
+        };
+        // Under what the quote's buffer absorbs: refused.
+        let (r, sent) = pay(quoted / 106 * 100).await;
+        assert!(matches!(r, Err(FundingError::PriceMoved { .. })), "{r:?}");
+        assert!(sent.is_empty(), "{sent:?}");
+        let (r, sent) = pay(quoted).await;
+        r.unwrap();
+        assert_eq!(sent, ["deploy", "swap", "transfer"]);
     }
 
     /// R1-M1 (refuted): a resize priced from `remaining` at quote time and

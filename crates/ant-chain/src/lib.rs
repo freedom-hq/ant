@@ -348,6 +348,42 @@ impl ChainClient {
         decode_hex_prefixed_bytes(rpc_result_str(&v)?).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
+    /// `eth_call` of a payable transaction: `from`, `to`, `data`, the
+    /// xDAI `value` (wei) and the `gas` limit the real send would carry,
+    /// so a call that would revert on chain fails here first, for free.
+    /// Errors like [`Self::eth_call_from`]: a revert is the **full** RPC
+    /// error JSON in [`RpcError::Rpc`].
+    pub async fn eth_call_value(
+        &self,
+        from: &[u8; 20],
+        to: &[u8; 20],
+        data: &[u8],
+        value: u128,
+        gas: u64,
+    ) -> Result<Vec<u8>, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_call",
+            "params": [
+                {
+                    "from":  format!("0x{}", hex::encode(from)),
+                    "to":    format!("0x{}", hex::encode(to)),
+                    "data":  format!("0x{}", hex::encode(data)),
+                    "value": format!("0x{value:x}"),
+                    "gas":   format!("0x{gas:x}"),
+                },
+                "latest",
+            ],
+        });
+
+        let v = self.rpc(&body).await?;
+        if let Some(err) = rpc_error_json(&v) {
+            return Err(RpcError::Rpc(err));
+        }
+        decode_hex_prefixed_bytes(rpc_result_str(&v)?).map_err(|e| RpcError::Decode(e.to_string()))
+    }
+
     /// Native xDAI balance for `addr` (lower 128 bits — that's
     /// 2^128 ≈ 3.4 × 10^38 wei, well above any reasonable wallet).
     pub async fn eth_get_balance_lower128(&self, addr: &[u8; 20]) -> Result<u128, RpcError> {

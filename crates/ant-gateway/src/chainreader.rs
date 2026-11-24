@@ -259,9 +259,9 @@ fn failure(e: FundingError) -> FundingFailure {
             },
             message: e.to_string(),
         },
-        FundingError::Invalid(_) | FundingError::InsufficientXdai { .. } => {
-            FundingFailure::Rejected(e.to_string())
-        }
+        FundingError::Invalid(_)
+        | FundingError::InsufficientXdai { .. }
+        | FundingError::PriceMoved { .. } => FundingFailure::Rejected(e.to_string()),
         _ => FundingFailure::Chain(e.to_string()),
     }
 }
@@ -425,6 +425,7 @@ impl ChainWriter for AntChainWriter {
         depth: u8,
         amount_per_chunk: u128,
         immutable: bool,
+        max_xdai_wei: u128,
     ) -> Result<NewBatch, FundingFailure> {
         funding::buy_plan_with_xdai(
             &self.payer(),
@@ -432,6 +433,7 @@ impl ChainWriter for AntChainWriter {
             depth,
             amount_per_chunk,
             immutable,
+            max_xdai_wei,
         )
         .await
         .map(new_batch)
@@ -443,15 +445,23 @@ impl ChainWriter for AntChainWriter {
         batch_id: [u8; 32],
         new_depth: Option<u8>,
         amount_per_chunk: u128,
+        max_xdai_wei: u128,
     ) -> Result<u8, FundingFailure> {
         let depth = self.batch_depth(&batch_id, new_depth.is_some()).await?;
-        funding::extend_with_xdai(&self.payer(), &batch_id, depth, new_depth, amount_per_chunk)
-            .await
-            .map_err(failure)?;
+        funding::extend_with_xdai(
+            &self.payer(),
+            &batch_id,
+            depth,
+            new_depth,
+            amount_per_chunk,
+            max_xdai_wei,
+        )
+        .await
+        .map_err(failure)?;
         Ok(new_depth.unwrap_or(depth))
     }
 
-    async fn deposit_status(&self) -> Result<DepositView, FundingFailure> {
+    async fn deposit_status(&self, amount: Option<u128>) -> Result<DepositView, FundingFailure> {
         let Some(cb) = self.chequebook.get() else {
             let wallet = funding::wallet_funding(&self.payer()).await;
             return Ok(self.deposit_view(None, wallet));
@@ -460,6 +470,7 @@ impl ChainWriter for AntChainWriter {
             &self.payer(),
             &cb,
             self.deposit_target_or_default(),
+            amount,
             funding::WalletRead::Always,
         )
         .await
@@ -470,6 +481,7 @@ impl ChainWriter for AntChainWriter {
     async fn fund_deposit_with_xdai(
         &self,
         amount: Option<u128>,
+        max_xdai_wei: u128,
     ) -> Result<DepositView, FundingFailure> {
         if let Some(cb) = self.chequebook.refused() {
             return Err(FundingFailure::Rejected(format!(
@@ -489,6 +501,7 @@ impl ChainWriter for AntChainWriter {
             self.deposit_target_or_default(),
             amount,
             funding::WalletRead::Always,
+            max_xdai_wei,
         )
         .await
         .map_err(failure)?;
@@ -720,6 +733,25 @@ mod tests {
         assert!(ctx.writer.is_none());
     }
 
+    /// #305: a swap the caller's cap no longer covers is the user's to
+    /// resolve (get a new quote), not a chain fault: a `400` with the
+    /// message, like a short wallet.
+    #[test]
+    fn a_moved_price_is_rejected() {
+        let e = FundingError::PriceMoved {
+            input_wei: 2 * ant_chain::funding::WEI_PER_XDAI,
+            max_wei: ant_chain::funding::WEI_PER_XDAI / 10,
+            helper_deployed: false,
+        };
+        match failure(e) {
+            FundingFailure::Rejected(m) => {
+                assert!(m.contains("price moved"), "{m}");
+                assert!(m.contains("nothing was sent"), "{m}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
     /// A chequebook the embedder recorded as refused (the chain check
     /// disqualified it) is neither priced into a new plan nor funded:
     /// both answer without a chain call (the RPC is unroutable).
@@ -742,13 +774,13 @@ mod tests {
         )
         .expect("context built");
         let writer = ctx.writer.clone().expect("writer");
-        match writer.fund_deposit_with_xdai(None).await {
+        match writer.fund_deposit_with_xdai(None, u128::MAX).await {
             Err(FundingFailure::Rejected(m)) => {
                 assert!(m.contains("failed its on-chain checks"), "{m}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
-        let status = writer.deposit_status().await.expect("status");
+        let status = writer.deposit_status(None).await.expect("status");
         assert_eq!(status.chequebook, None);
         assert_eq!(status.shortfall_plur, 0);
         assert_eq!(ctx.chequebook.get(), None);

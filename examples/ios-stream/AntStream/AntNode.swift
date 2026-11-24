@@ -539,11 +539,15 @@ final class AntNode: ObservableObject {
 
     /// Buy + activate a plan funding only with xDAI: the node swaps the
     /// xBZZ shortfall on-chain itself, then buys the plan. Spends real funds.
-    func buyStorage(rpc: String, depth: UInt8, amountPerChunk: String, immutable: Bool) async throws {
+    /// `maxXdaiWei` is the quote's `swapInput`: the swap never sends more.
+    func buyStorage(rpc: String, depth: UInt8, amountPerChunk: String, maxXdaiWei: String,
+                    immutable: Bool) async throws {
         let json = try await ffiString(name: "activate storage") { h, errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
-                    ant_storage_buy_xdai(h, crpc, depth, camt, immutable ? 1 : 0, errPtr)
+                    maxXdaiWei.withCString { cmax in
+                        ant_storage_buy_xdai(h, crpc, depth, camt, immutable ? 1 : 0, cmax, errPtr)
+                    }
                 }
             }
         }
@@ -564,11 +568,14 @@ final class AntNode: ObservableObject {
 
     /// Extend the connected plan's lifetime, funding only with xDAI.
     /// Spends real funds. Publishes the refreshed validity.
-    func topUpStorage(rpc: String, amountPerChunk: String) async throws {
+    /// `maxXdaiWei` is the quote's `swapInput`: the swap never sends more.
+    func topUpStorage(rpc: String, amountPerChunk: String, maxXdaiWei: String) async throws {
         let json = try await ffiString(name: "extend storage") { h, errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
-                    ant_storage_topup_xdai(h, crpc, camt, errPtr)
+                    maxXdaiWei.withCString { cmax in
+                        ant_storage_topup_xdai(h, crpc, camt, cmax, errPtr)
+                    }
                 }
             }
         }
@@ -1422,10 +1429,22 @@ final class AntNode: ObservableObject {
 
     /// Fund the chequebook up to the settlement deposit, paying with xDAI
     /// (the node swaps for the xBZZ it needs). Spends real funds. Publishes
-    /// the refreshed deposit so the card updates in place.
+    /// the refreshed deposit so the card updates in place. The swap is
+    /// capped at the card's own `swapInput` (the price the user saw); a
+    /// failure (e.g. the price moved) re-reads the card, so a retry is
+    /// shown, and capped at, the current price.
     func topUpSettlementDeposit(rpc: String) async throws {
-        let json = try await ffiString(name: "top up settlement deposit") { h, errPtr in
-            rpc.withCString { ant_storage_settlement_topup(h, $0, errPtr) }
+        let maxXdaiWei = settlementDeposit?.swapInput ?? "0"
+        let json: String
+        do {
+            json = try await ffiString(name: "top up settlement deposit") { h, errPtr in
+                rpc.withCString { r in
+                    maxXdaiWei.withCString { ant_storage_settlement_topup(h, r, $0, errPtr) }
+                }
+            }
+        } catch {
+            await refreshSettlementDeposit(rpc: rpc)
+            throw error
         }
         if let d = StreamDecoder.settlementDeposit(from: json) { settlementDeposit = d }
         await refreshAll()
@@ -1485,9 +1504,13 @@ final class AntNode: ObservableObject {
                     "your wallet now holds \(formatBzz(w.bzzPlur)), less than \(formatBzz(plur)); nothing was sent"
                 )
             }
+            // The wallet holds `plur`: a cap of 0 makes the node refuse
+            // rather than swap if that changed in between.
             return try await Self.string(name: "add to credit") { errPtr in
                 rpc.withCString { r in
-                    amount.withCString { ant_storage_settlement_topup_amount(h, r, $0, errPtr) }
+                    amount.withCString { a in
+                        "0".withCString { ant_storage_settlement_topup_amount(h, r, a, $0, errPtr) }
+                    }
                 }
             }
         }) else {
@@ -1629,6 +1652,7 @@ final class AntNode: ObservableObject {
             targetBzz: "0.0010",
             shortfallBzz: "0.0010",
             needsTopUp: true,
+            swapInput: "0",
             xdaiToSendDisplay: "0.0150",
             sufficientFunds: false
         )

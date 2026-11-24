@@ -2575,7 +2575,7 @@ pub unsafe extern "C" fn ant_storage_settlement_status(
 
 /// Settlement-deposit status as JSON `{"enabled","chequebook",
 /// "deposit_plur","deposit_bzz","target_plur","target_bzz",
-/// "shortfall_plur","shortfall_bzz","needs_top_up","xdai_required",
+/// "shortfall_plur","shortfall_bzz","needs_top_up","swap_input","xdai_required",
 /// "xdai_required_display","xdai_to_send","xdai_to_send_display",
 /// "sufficient_funds"}`.
 ///
@@ -2613,7 +2613,7 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
                 if rpc.trim().is_empty() {
                     return Err("ant_storage_settlement_deposit: gnosis_rpc required".to_string());
                 }
-                drive::settlement_deposit(h, rpc).map_err(|e| e.to_string())
+                drive::settlement_deposit(h, rpc, None).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
@@ -2624,6 +2624,65 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
                 )
             }
         })
+    }
+}
+
+/// Like [`ant_storage_settlement_deposit`], but its top-up figures
+/// (`swap_input`, `xdai_required`, `xdai_to_send`, `sufficient_funds`)
+/// price depositing `amount_plur` more (a decimal PLUR string), as
+/// [`ant_storage_settlement_topup_amount`] with the same amount would:
+/// its `swap_input` is that call's `max_xdai_wei`. The other fields
+/// still describe the deposit against its target. Mirrors the gateway's
+/// `GET /v0/settlement/deposit?amount=`. No transaction is sent.
+/// Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_plur` must be valid
+/// NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_deposit_amount(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    amount_plur: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_deposit_amount", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = parse_deposit_amount(
+                "ant_storage_settlement_deposit_amount",
+                &cstr_to_string(amount_plur)?,
+            )?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err(
+                        "ant_storage_settlement_deposit_amount: gnosis_rpc required".to_string()
+                    );
+                }
+                drive::settlement_deposit(h, rpc, Some(amount)).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, amount);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// A positive PLUR amount for the `*_amount` settlement calls.
+fn parse_deposit_amount(call: &str, amount: &str) -> Result<u128, String> {
+    match amount.trim().parse::<u128>() {
+        Ok(a) if a > 0 => Ok(a),
+        _ => Err(format!(
+            "{call}: amount_plur must be a positive integer, got {amount:?}"
+        )),
     }
 }
 
@@ -2653,30 +2712,42 @@ pub unsafe extern "C" fn ant_storage_settlement_deposit(
 /// gates it behind explicit confirmation. Requires the `chain` build
 /// feature.
 ///
+/// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+/// send: the `swap_input` of the [`ant_storage_settlement_deposit`] the user approved. The swap
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
+/// `"0"` forbids a swap: only xBZZ the wallet already holds is deposited.
+///
 /// # Safety
 ///
-/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
-/// UTF-8 string.
+/// See [`ant_upload_start`]. `gnosis_rpc` and `max_xdai_wei` must be
+/// valid NUL-terminated UTF-8 strings.
 #[no_mangle]
 pub unsafe extern "C" fn ant_storage_settlement_topup(
     handle: *const AntHandle,
     gnosis_rpc: *const c_char,
+    max_xdai_wei: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
     unsafe {
         run_string_call(out_err, "ant_storage_settlement_topup", || {
             let h = handle.as_ref().ok_or_else(null_handle)?;
             let rpc = cstr_to_string(gnosis_rpc)?;
+            let max_xdai = cstr_to_string(max_xdai_wei)?;
             #[cfg(feature = "chain")]
             {
                 if rpc.trim().is_empty() {
                     return Err("ant_storage_settlement_topup: gnosis_rpc required".to_string());
                 }
-                drive::settlement_topup_xdai(h, rpc, None).map_err(|e| e.to_string())
+                let max_xdai = drive::parse_max_xdai(&max_xdai).map_err(|e| e.to_string())?;
+                drive::settlement_topup_xdai(h, rpc, None, max_xdai).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
-                let _ = (h, rpc);
+                let _ = (h, rpc, max_xdai);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -2698,31 +2769,37 @@ pub unsafe extern "C" fn ant_storage_settlement_topup(
 /// and spends real funds** and **blocks** until they confirm. Requires
 /// the `chain` build feature.
 ///
+/// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+/// send: the `swap_input` of the [`ant_storage_settlement_deposit_amount`] (same amount) the user approved. The swap
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
+/// `"0"` forbids a swap: the call then only deposits xBZZ the wallet
+/// already holds (the apps' "add credit", which checked that first).
+///
 /// # Safety
 ///
-/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_plur` must be valid
-/// NUL-terminated UTF-8 strings.
+/// See [`ant_upload_start`]. `gnosis_rpc`, `amount_plur` and
+/// `max_xdai_wei` must be valid NUL-terminated UTF-8 strings.
 #[no_mangle]
 pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
     handle: *const AntHandle,
     gnosis_rpc: *const c_char,
     amount_plur: *const c_char,
+    max_xdai_wei: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
     unsafe {
         run_string_call(out_err, "ant_storage_settlement_topup_amount", || {
             let h = handle.as_ref().ok_or_else(null_handle)?;
             let rpc = cstr_to_string(gnosis_rpc)?;
-            let amount = cstr_to_string(amount_plur)?;
-            let amount = match amount.trim().parse::<u128>() {
-                Ok(a) if a > 0 => a,
-                _ => {
-                    return Err(format!(
-                        "ant_storage_settlement_topup_amount: amount_plur must be a positive \
-                         integer, got {amount:?}"
-                    ))
-                }
-            };
+            let amount = parse_deposit_amount(
+                "ant_storage_settlement_topup_amount",
+                &cstr_to_string(amount_plur)?,
+            )?;
+            let max_xdai = cstr_to_string(max_xdai_wei)?;
             #[cfg(feature = "chain")]
             {
                 if rpc.trim().is_empty() {
@@ -2730,11 +2807,13 @@ pub unsafe extern "C" fn ant_storage_settlement_topup_amount(
                         "ant_storage_settlement_topup_amount: gnosis_rpc required".to_string()
                     );
                 }
-                drive::settlement_topup_xdai(h, rpc, Some(amount)).map_err(|e| e.to_string())
+                let max_xdai = drive::parse_max_xdai(&max_xdai).map_err(|e| e.to_string())?;
+                drive::settlement_topup_xdai(h, rpc, Some(amount), max_xdai)
+                    .map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
-                let _ = (h, rpc, amount);
+                let _ = (h, rpc, amount, max_xdai);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -3198,7 +3277,9 @@ pub unsafe extern "C" fn ant_deploy_chequebook(
 /// the lot — the "payment information" the Get Started flow shows before
 /// activating. The all-in figures (`needed_bzz`, `xdai_required`,
 /// `xdai_to_send`, `sufficient_funds`) include the deposit, because
-/// activating a plan is also what deploys and funds the chequebook. No
+/// activating a plan is also what deploys and funds the chequebook.
+/// `swap_input` (wei) is what the xDAI->xBZZ swap sends at this price:
+/// pass it back as [`ant_storage_buy_xdai`]'s `max_xdai_wei`. No
 /// transaction is sent. Requires the `chain` build feature.
 ///
 /// # Safety
@@ -3317,15 +3398,24 @@ pub unsafe extern "C" fn ant_storage_topup_quote(
 /// transactions and spends real funds. Requires the `chain` build
 /// feature.
 ///
+/// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+/// send: the `swap_input` of the [`ant_storage_topup_quote`] the user approved. The swap
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
+///
 /// # Safety
 ///
-/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_per_chunk` must be
-/// valid NUL-terminated UTF-8 strings.
+/// See [`ant_upload_start`]. `gnosis_rpc`, `amount_per_chunk` and
+/// `max_xdai_wei` must be valid NUL-terminated UTF-8 strings.
 #[no_mangle]
 pub unsafe extern "C" fn ant_storage_topup_xdai(
     handle: *const AntHandle,
     gnosis_rpc: *const c_char,
     amount_per_chunk: *const c_char,
+    max_xdai_wei: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
     unsafe {
@@ -3333,13 +3423,14 @@ pub unsafe extern "C" fn ant_storage_topup_xdai(
             let h = handle.as_ref().ok_or_else(null_handle)?;
             let rpc = cstr_to_string(gnosis_rpc)?;
             let amount = cstr_to_string(amount_per_chunk)?;
+            let max_xdai = cstr_to_string(max_xdai_wei)?;
             #[cfg(feature = "chain")]
             {
-                drive::storage_topup_xdai(h, rpc, amount).map_err(|e| e.to_string())
+                drive::storage_topup_xdai(h, rpc, amount, max_xdai).map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
-                let _ = (h, rpc, amount);
+                let _ = (h, rpc, amount, max_xdai);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -3399,10 +3490,18 @@ pub unsafe extern "C" fn ant_storage_buy(
 /// [`ant_storage_status`] JSON. Submits real transactions and spends real
 /// funds. Requires the `chain` build feature.
 ///
+/// `max_xdai_wei` (a decimal wei string) is the most xDAI the swap may
+/// send: the `swap_input` of the [`ant_storage_quote`] the user approved. The swap
+/// is re-priced from the pool when it runs and never sends more than the cap:
+/// a small upward move the quote's swap buffer absorbs still goes
+/// through, a larger one (or a forged pool read, or more xBZZ to buy)
+/// is refused without swapping (#305; at most the one-time swap helper
+/// setup has gone out, and the error says so); get a new quote and try again.
+///
 /// # Safety
 ///
-/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_per_chunk` must be
-/// valid NUL-terminated UTF-8 strings.
+/// See [`ant_upload_start`]. `gnosis_rpc`, `amount_per_chunk` and
+/// `max_xdai_wei` must be valid NUL-terminated UTF-8 strings.
 #[no_mangle]
 pub unsafe extern "C" fn ant_storage_buy_xdai(
     handle: *const AntHandle,
@@ -3410,6 +3509,7 @@ pub unsafe extern "C" fn ant_storage_buy_xdai(
     depth: u8,
     amount_per_chunk: *const c_char,
     immutable: c_int,
+    max_xdai_wei: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
     unsafe {
@@ -3418,13 +3518,15 @@ pub unsafe extern "C" fn ant_storage_buy_xdai(
             let rpc = cstr_to_string(gnosis_rpc)?;
             let amount = cstr_to_string(amount_per_chunk)?;
             let imm = immutable != 0;
+            let max_xdai = cstr_to_string(max_xdai_wei)?;
             #[cfg(feature = "chain")]
             {
-                drive::storage_buy_xdai(h, rpc, depth, amount, imm).map_err(|e| e.to_string())
+                drive::storage_buy_xdai(h, rpc, depth, amount, imm, max_xdai)
+                    .map_err(|e| e.to_string())
             }
             #[cfg(not(feature = "chain"))]
             {
-                let _ = (h, rpc, depth, amount, imm);
+                let _ = (h, rpc, depth, amount, imm, max_xdai);
                 Err(
                     "this build has no chain support (rebuild ant-ffi with --features chain)"
                         .to_string(),
@@ -6093,6 +6195,13 @@ mod tests {
         assert_eq!(v["chequebook"], "0xcb");
 
         let rpc = CString::new("http://127.0.0.1:1").unwrap();
+        let take_err = |raw: *mut c_char, err: *mut c_char, what: &str| {
+            assert!(raw.is_null(), "{what} accepted");
+            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+            unsafe { ant_free_string(err) };
+            msg
+        };
+        let zero = CString::new("0").unwrap();
         for bad in ["0", "abc", "-5", ""] {
             let amount = CString::new(bad).unwrap();
             let mut err = std::ptr::null_mut();
@@ -6101,13 +6210,46 @@ mod tests {
                     handle,
                     rpc.as_ptr(),
                     amount.as_ptr(),
+                    zero.as_ptr(),
                     &raw mut err,
                 )
             };
-            assert!(raw.is_null(), "{bad:?} accepted");
-            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
-            unsafe { ant_free_string(err) };
+            let msg = take_err(raw, err, bad);
             assert!(msg.contains("positive integer"), "{bad:?}: {msg}");
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe {
+                ant_storage_settlement_deposit_amount(
+                    handle,
+                    rpc.as_ptr(),
+                    amount.as_ptr(),
+                    &raw mut err,
+                )
+            };
+            let msg = take_err(raw, err, bad);
+            assert!(msg.contains("positive integer"), "{bad:?}: {msg}");
+        }
+        // #305: the swap cap must be a wei amount, or nothing runs.
+        #[cfg(feature = "chain")]
+        for bad in ["lots", "-1", ""] {
+            let (amount, max) = (CString::new("5").unwrap(), CString::new(bad).unwrap());
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe {
+                ant_storage_settlement_topup_amount(
+                    handle,
+                    rpc.as_ptr(),
+                    amount.as_ptr(),
+                    max.as_ptr(),
+                    &raw mut err,
+                )
+            };
+            let msg = take_err(raw, err, bad);
+            assert!(msg.contains("invalid max_xdai_wei"), "{bad:?}: {msg}");
+            let mut err = std::ptr::null_mut();
+            let raw = unsafe {
+                ant_storage_settlement_topup(handle, rpc.as_ptr(), max.as_ptr(), &raw mut err)
+            };
+            let msg = take_err(raw, err, bad);
+            assert!(msg.contains("invalid max_xdai_wei"), "{bad:?}: {msg}");
         }
         unsafe { ant_shutdown(handle) };
         let _ = std::fs::remove_dir_all(&dir);

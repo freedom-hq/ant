@@ -104,6 +104,13 @@ data class SettlementDeposit(
     val needsTopUp: Boolean,
     val xdaiToSendDisplay: String,
     val sufficientFunds: Boolean,
+    /**
+     * xDAI (wei) the top-up's swap sends at this card's price: passed back
+     * as the top-up's cap, so a price that moved since is refused without
+     * swapping (#305), at most after a fresh wallet's one-time swap helper
+     * deploy.
+     */
+    val swapInput: String = "0",
 ) {
     companion object {
         fun parse(json: String): SettlementDeposit? = runCatching {
@@ -116,6 +123,7 @@ data class SettlementDeposit(
                 needsTopUp = o.optBoolean("needs_top_up"),
                 xdaiToSendDisplay = o.optString("xdai_to_send_display"),
                 sufficientFunds = o.optBoolean("sufficient_funds", true),
+                swapInput = o.optString("swap_input", "0"),
             )
         }.getOrNull()
     }
@@ -210,6 +218,13 @@ data class StorageQuote(
     val accountXdaiDisplay: String,
     val xdaiToSendDisplay: String,
     val sufficientFunds: Boolean,
+    /**
+     * xDAI (wei) the buy's swap sends at this quote's price: passed back as
+     * the buy's cap, so a price that moved since is refused without
+     * swapping (#305), at most after a fresh wallet's one-time swap helper
+     * deploy.
+     */
+    val swapInput: String = "0",
 ) {
     companion object {
         fun parse(json: String): StorageQuote? = runCatching {
@@ -224,6 +239,7 @@ data class StorageQuote(
                 accountXdaiDisplay = o.optString("account_xdai_display"),
                 xdaiToSendDisplay = o.optString("xdai_to_send_display"),
                 sufficientFunds = o.optBoolean("sufficient_funds"),
+                swapInput = o.optString("swap_input", "0"),
             )
         }.getOrNull()
     }

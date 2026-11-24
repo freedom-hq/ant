@@ -296,6 +296,11 @@ struct SettlementDeposit: Codable, Equatable {
     /// the card and its button both read.
     let shortfallBzz: String
     let needsTopUp: Bool
+    /// xDAI (wei) the top-up's swap sends at this card's price: passed
+    /// back as the top-up's cap, so a price that moved since is refused
+    /// without swapping (#305), at most after a fresh wallet's one-time
+    /// swap helper deploy.
+    let swapInput: String
     /// Extra xDAI the account must receive before the top-up can run.
     let xdaiToSendDisplay: String
     let sufficientFunds: Bool
@@ -307,6 +312,7 @@ struct SettlementDeposit: Codable, Equatable {
         case targetBzz = "target_bzz"
         case shortfallBzz = "shortfall_bzz"
         case needsTopUp = "needs_top_up"
+        case swapInput = "swap_input"
         case xdaiToSendDisplay = "xdai_to_send_display"
         case sufficientFunds = "sufficient_funds"
     }
@@ -454,6 +460,11 @@ struct StorageQuote: Codable, Equatable {
     let accountXdai: String
     let accountXdaiDisplay: String
     let neededBzzDisplay: String
+    /// xDAI (wei) the buy's swap sends at this quote's price: passed back
+    /// as the buy's cap, so a price that moved since is refused without
+    /// swapping (#305), at most after a fresh wallet's one-time swap
+    /// helper deploy.
+    let swapInput: String
     let xdaiRequiredDisplay: String
     let xdaiToSendDisplay: String
     let sufficientFunds: Bool
@@ -470,6 +481,7 @@ struct StorageQuote: Codable, Equatable {
         case accountXdai = "account_xdai"
         case accountXdaiDisplay = "account_xdai_display"
         case neededBzzDisplay = "needed_bzz_display"
+        case swapInput = "swap_input"
         case xdaiRequiredDisplay = "xdai_required_display"
         case xdaiToSendDisplay = "xdai_to_send_display"
         case sufficientFunds = "sufficient_funds"
