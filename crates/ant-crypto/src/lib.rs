@@ -18,7 +18,7 @@ pub use bmt::{
 };
 pub use encryption::{
     decrypt_chunk, decrypt_chunk_parts, encrypt_chunk_unpadded, random_encryption_key,
-    stream_xor_in_place, DecryptError, KEY_LENGTH, REFERENCE_SIZE,
+    stream_xor_in_place, DecryptError, EncryptError, KEY_LENGTH, REFERENCE_SIZE,
 };
 pub use error::CryptoError;
 pub use soc::{soc_valid, SOC_HEADER_SIZE, SOC_ID_SIZE, SOC_MIN_CHUNK_SIZE, SOC_SIG_SIZE};

@@ -534,7 +534,8 @@ AntStream *ant_stream_open(AntHandle *handle,
  * Read `len` bytes starting at `offset` into `dst`. Blocks until the
  * range is delivered (or the per-read timeout fires). Returns the
  * number of bytes written on success (<= len; truncated near EOF), or
- * -1 on failure with an allocated error in *out_err.
+ * -1 on failure with an allocated error in *out_err. `dst` may be
+ * NULL when `len` is 0; the call then returns 0.
  *
  * Safe to call from any thread, but callers should serialise reads on
  * the same stream - concurrent reads issue independent range requests
@@ -550,13 +551,15 @@ ssize_t ant_stream_read(AntStream *stream,
  * Pull a contiguous byte range and deliver each joiner-produced chunk
  * to `on_chunk` as soon as it arrives. Unlike ant_stream_read, which
  * blocks until the entire `len` window has buffered, this drives one
- * StreamBzz request through to its terminal StreamDone and invokes
- * the callback for every BytesChunk along the way - matching the
- * shape of AVAssetResourceLoaderDelegate's dataRequest.
+ * StreamBzz request and invokes the callback for each BytesChunk as it
+ * lands, until the terminal StreamDone, an error, or the callback asks
+ * to stop (see below) - matching the shape of
+ * AVAssetResourceLoaderDelegate's dataRequest.
  *
  * The callback returns 0 to keep pulling, non-zero to ask the FFI to
- * stop early (e.g. AVPlayer canceled the dataRequest). The FFI then
- * drains the remaining acks for clean shutdown.
+ * stop early (e.g. AVPlayer canceled the dataRequest). The call then
+ * returns the bytes delivered so far at once, the callback is not
+ * invoked again, and the node stops fetching the rest of the range.
  *
  * Returns the total bytes delivered, or -1 on error (with *out_err
  * set if non-null).
@@ -905,10 +908,16 @@ char *ant_storage_discover_full(const AntHandle *handle,
  * Idempotent: if this device already deployed a chequebook it's returned
  * as-is (no redeploy — though one still short of its settlement deposit
  * is topped up from spare xBZZ); otherwise this signs an on-chain
- * factory.deploySimpleSwap (issuer = node EOA), funds it with the
+ * factory.deploySimpleSwap (issuer = node EOA), checks the new
+ * chequebook on-chain (factory-registered, issuer() is the node EOA;
+ * a check that says no fails the call with nothing persisted or
+ * funded; one that still can't be read after a few retries fails the
+ * call with the association persisted but unfunded, so the next call
+ * re-checks that chequebook instead of deploying another), persists
+ * the association, funds it with the
  * settlement deposit for the account's storage plan (see
  * ant_storage_settlement_topup) so its cheques are actually backed,
- * persists the association, and returns the new address. SUBMITS REAL
+ * and returns the new address. SUBMITS REAL
  * ON-CHAIN TRANSACTIONS: spends gas (xDAI) plus the deposit (xBZZ, capped
  * to the wallet's balance) and BLOCKS until they confirm. Light-mode only (requires the `chain` cargo feature;
  * otherwise returns NULL + an error). Returns
@@ -1085,16 +1094,27 @@ void ant_free_string(char *ptr);
  * headers, so no page from another origin can read its responses.
  * (Up to 0.5.48 it always allowed the `null` origin; hosts that relied
  * on that must now call ant_set_gateway_cors explicitly.)
- * CORS only stops reads: any page can still send CORS-simple requests,
- * which execute — including the spending routes POST
- * /stamps/{amount}/{depth} (which, as above, may also deploy a
- * chequebook for xDAI gas and transfer the wallet's xBZZ into a new or
- * under-funded one; no swap) and POST /chequebook/deposit (see
- * ant_set_gateway_cors; issue #105). The gateway also serves the
- * xDAI-swapping routes POST /v0/storage/buy, POST /v0/storage/extend
- * and POST /v0/settlement/deposit; those refuse (403) any request from
- * a web page unless its origin is listed exactly (not "*" or "null")
- * with ant_set_gateway_cors.
+ * The same list gates writes (after 0.5.79, issue #312): a request
+ * other than GET, HEAD or OPTIONS from a web page is refused (403)
+ * unless its origin is in the list, and one from a page this gateway
+ * serves itself (Sec-Fetch-Site: same-origin) unless its origin is
+ * listed exactly. The wallet-spending routes (POST
+ * /stamps/{amount}/{depth}, which as above may also deploy a chequebook
+ * and fund it; PATCH /stamps/topup and /stamps/dilute; POST
+ * /chequebook/deposit and /chequebook/withdraw; the xDAI-swapping POST
+ * /v0/storage/buy, POST /v0/storage/extend and POST
+ * /v0/settlement/deposit) and the WebSocket routes (/chunks/stream,
+ * /pss/subscribe, /gsoc/subscribe) refuse any web page whose origin is
+ * not listed exactly ("*", "null" and wildcard entries don't count).
+ * Requests with neither Origin nor Sec-Fetch-Site (the host app) are
+ * never refused.
+ *
+ * Host: the gateway answers only requests whose Host is localhost,
+ * 127.0.0.1, [::1], a subdomain of localhost, or the bound IP, with or
+ * without its own port, plus the names set with
+ * ant_set_gateway_allowed_hosts; others get 421 (after 0.5.79). This
+ * stops DNS-rebinding pages. A wildcard api_addr (0.0.0.0, [::]) has no
+ * single bound IP: list any IP literal clients use there as well.
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
@@ -1176,24 +1196,22 @@ int ant_chain_init(const AntHandle *handle, const char *gnosis_rpc, char **out_e
  * "null"), and "*" matches every page — allow them only if that is
  * acceptable.
  *
- * This list protects READS only; an empty list does not block writes.
- * A CORS-simple request needs no preflight, so any page can still
- * fetch(url, {method: "POST", mode: "no-cors"}) against
- * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
- * gateway executes it, spending the wallet's xBZZ (for /stamps both the
- * batch and a transfer into a new or under-funded chequebook's deposit)
- * and xDAI gas for every transaction it sends — the batch purchase and,
- * for /stamps, deploying a chequebook if there is none yet and the
- * deposit transfer into a new or under-funded one (nothing is swapped)
- * — even though the page cannot read the reply. Do not rely on this
- * call to protect funds.
+ * The list also gates writes (after 0.5.79, issue #312). A CORS-simple
+ * request (fetch(url, {method: "POST", mode: "no-cors"})) needs no
+ * preflight, so the gateway refuses it itself: a request other than
+ * GET, HEAD or OPTIONS from a web page gets 403 unless the page's
+ * origin is in this list (so "*" and "null" admit cross-site uploads
+ * too), and one from a page this gateway serves itself
+ * (Sec-Fetch-Site: same-origin) unless its origin is listed exactly.
  *
- * The routes that DO swap xDAI (POST /v0/storage/buy, POST
- * /v0/storage/extend, POST /v0/settlement/deposit) are guarded
- * separately: they refuse (403) requests from web pages whatever this
- * list says, except from an origin listed here exactly — "*" and
- * "null" never unlock them. Listing an exact origin therefore also
- * lets that site spend the wallet's xDAI.
+ * The routes that spend the wallet (POST /stamps/{amount}/{depth},
+ * PATCH /stamps/topup and /stamps/dilute, POST /chequebook/deposit and
+ * /chequebook/withdraw, and the xDAI-swapping POST /v0/storage/buy,
+ * POST /v0/storage/extend, POST /v0/settlement/deposit) and the
+ * WebSocket upgrades are stricter: they refuse (403) requests from web
+ * pages except from an origin listed here exactly — "*", "null" and
+ * wildcard entries never unlock them. Listing an exact origin therefore
+ * also lets that site spend the wallet's funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL, non-UTF-8 or malformed-wildcard entry) returns false, leaves the stored list
@@ -1204,6 +1222,36 @@ bool ant_set_gateway_cors(const AntHandle *handle,
                           const char *const *origins,
                           size_t origins_len,
                           char **out_err);
+
+/*
+ * Set the extra Host names the in-process gateway answers (new after
+ * 0.5.79, issue #312; the twin of antd's allowed-hosts). Takes effect at
+ * the next ant_start_gateway; like ant_set_gateway_cors it fails while a
+ * gateway is running and then changes nothing.
+ *
+ * Without it the gateway answers only requests whose Host is localhost,
+ * 127.0.0.1, [::1], a subdomain of localhost (abc.bzz.localhost) or the
+ * bound IP, each with or without the bound port; anything else gets 421
+ * (a wildcard api_addr, 0.0.0.0 / [::], has no single bound IP, so list
+ * any IP literal clients use). That stops a DNS-rebinding page (evil.example re-pointed at 127.0.0.1)
+ * from using the API as its own origin. `hosts` points at `hosts_len`
+ * NUL-terminated UTF-8 entries that extend the list: "host" (any port)
+ * or "host:port" (that port only; :443/:80 also match a Host without
+ * a port, as browsers send it), a DNS name or IP literal (IPv6 in
+ * brackets), matched case-insensitively. "*" turns the check off.
+ * NULL / hosts_len == 0 clears the list (the default); blank entries
+ * are ignored. A gateway bound to a non-loopback address with no
+ * entries does not check Host (and logs a warning).
+ *
+ * Returns true on success. On failure (NULL handle, gateway running,
+ * NULL, non-UTF-8 or malformed entry: a scheme, path or wildcard)
+ * returns false, leaves the stored list unchanged and writes an
+ * allocated message to *out_err (free with ant_free_string).
+ */
+bool ant_set_gateway_allowed_hosts(const AntHandle *handle,
+                                   const char *const *hosts,
+                                   size_t hosts_len,
+                                   char **out_err);
 
 /*
  * Stop the in-process HTTP gateway started by ant_start_gateway.
@@ -1269,6 +1317,14 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * already-signed transaction, and the caller then sees the fallback
  * URL's error instead of the real one. Map any failure that is not a
  * coverage gap to a different error code, or answer authoritatively.
+ *
+ * Transactions: eth_sendRawTransaction must answer the hash of the
+ * transaction it was given (keccak256 of the raw bytes), and an
+ * eth_getTransactionReceipt result must carry that hash as
+ * "transactionHash". ant waits on the hash it computed itself (a
+ * different eth_sendRawTransaction answer is logged and ignored) and
+ * fails the write on a receipt naming another hash or none, so a relay
+ * can't pass off another transaction's receipt (issue #284).
  *
  * Threading: the callback runs on ant's runtime blocking pool, so
  * blocking inside it is fine and expected (verified reads, locks, a

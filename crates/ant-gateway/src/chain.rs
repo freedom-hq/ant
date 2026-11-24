@@ -62,6 +62,15 @@ pub trait ChainReader: Send + Sync {
     async fn batch_remaining_balance(&self, _batch_id: [u8; 32]) -> Result<u128, String> {
         Err("batch_remaining_balance unsupported".to_string())
     }
+    /// `PostageStamp.minimumInitialBalancePerChunk()` — the per-chunk
+    /// balance floor (`minimumValidityBlocks × lastPrice`) a batch must
+    /// keep after `increaseDepth` halves its balance per level, or the
+    /// dilute reverts. Defaulted to "unsupported" like
+    /// [`Self::batch_remaining_balance`]; the dilute route then fails
+    /// (`502`) rather than send a resize it couldn't check.
+    async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
+        Err("minimum_balance_per_chunk unsupported".to_string())
+    }
     /// `PostageStamp.batchOwner/batchDepth/batchBucketDepth/
     /// batchImmutableFlag` — the on-chain views backing the light
     /// `GET /batches/{id}` lookup. Defaulted to "unsupported" like
@@ -862,6 +871,28 @@ fn writer(
         })
 }
 
+/// The owner rule for a batch about to be changed: a zero owner is a
+/// batch the contract doesn't have (`404`); a resize (`increaseDepth`,
+/// owner-only) needs `node` to own it (`400`). A plain extension
+/// (`topUp`) is open to any payer, so it passes `resize = false`.
+pub(crate) fn check_batch_owner(
+    owner: [u8; 20],
+    node: &[u8; 20],
+    resize: bool,
+) -> Result<(), FundingFailure> {
+    if owner == [0u8; 20] {
+        return Err(FundingFailure::NotFound("batch not found on chain".into()));
+    }
+    if resize && &owner != node {
+        return Err(FundingFailure::Rejected(format!(
+            "batch is owned by 0x{}, not this node (0x{}); only its owner can resize it",
+            hex::encode(owner),
+            hex::encode(node),
+        )));
+    }
+    Ok(())
+}
+
 /// The `409` a write route answers while another write holds the
 /// [`WriteGate`].
 fn busy() -> Response {
@@ -1082,7 +1113,18 @@ pub async fn topup_stamp(
 }
 
 /// `PATCH /stamps/dilute/{id}/{depth}`. Increases a batch's depth
-/// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3).
+/// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3). The batch
+/// is read first: a depth that doesn't raise it, a batch the node
+/// doesn't own, an expired one (`remainingBalance` `0`), or one whose
+/// balance after the resize (`remainingBalance >> (depth - batchDepth)`)
+/// would fall under the contract's `minimumInitialBalancePerChunk` is a
+/// `400` (a batch not on chain a `404`) and nothing is sent. The floor
+/// check keeps a margin ([`DILUTE_MARGIN_BLOCKS`] of storage rent off the
+/// balance, [`DILUTE_FLOOR_HEADROOM`] on the floor), since the
+/// transaction executes a few blocks after the read. A batch this
+/// node bought within the last few minutes that the chain read can't
+/// see yet (a lagging RPC backend) is checked against the node's own
+/// view of it instead of answering `404`.
 pub async fn dilute_stamp(
     State(handle): State<GatewayHandle>,
     Path((id, depth)): Path<(String, u8)>,
@@ -1099,6 +1141,86 @@ pub async fn dilute_stamp(
         Err(r) => return r,
     };
     let tx = chain.tx_lock.lock().await;
+    // `increaseDepth` is owner-only and must raise the depth; anything
+    // else reverts and burns the gas. Read the batch first and refuse
+    // it the bee way (`400`), sending nothing. A failed read fails the
+    // route (`502`/`504`) rather than letting the transaction through.
+    let meta = match guarded(chain.reader.batch_meta(batch_id)).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    // A zero owner is "not on chain", unless this node bought the batch
+    // moments ago: then the RPC backend that answered most likely
+    // hasn't seen the buy's block yet (the `/stamps` grace), and the
+    // node's own view stands in for it (the node wallet owns what it
+    // buys, and the view's depth follows each dilute).
+    let just_bought = if meta.owner == [0u8; 20] {
+        match crate::stamps::just_bought_batch(&handle, batch_id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        }
+    } else {
+        None
+    };
+    let current_depth = if let Some(view) = &just_bought {
+        view.batch_depth
+    } else {
+        if let Err(f) = check_batch_owner(meta.owner, &chain.wallet_eth, true) {
+            return failure_response(f);
+        }
+        meta.depth
+    };
+    if depth <= current_depth {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid depth: the batch is already depth {current_depth}; a dilute must raise it"
+            ),
+        );
+    }
+    // `increaseDepth` also reverts on an expired batch (its balance is
+    // used up: `remainingBalance` reads `0`), and on one whose balance,
+    // halved per level gained, would fall under the contract's
+    // per-chunk floor (`InsufficientBalance`). A just-bought batch
+    // can't be expired, and a backend that hasn't seen it would revert
+    // the read; its floor is left to the chain.
+    if just_bought.is_none() {
+        let remaining = match guarded(chain.reader.batch_remaining_balance(batch_id)).await {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        if remaining == 0 {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "batch expired: its balance is used up, so it can't be diluted",
+            );
+        }
+        let floor = match guarded(chain.reader.minimum_balance_per_chunk()).await {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+        // Both reads are as of the block the backend answered at;
+        // `increaseDepth` runs a few blocks later, after each block's
+        // payout (`lastPrice` per chunk) has come off the balance and
+        // possibly after an oracle price update has raised the floor.
+        // Check against that later state, not the read's.
+        let price = match guarded(chain.reader.current_price()).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let levels = depth - current_depth;
+        let after = diluted_balance(remaining, levels);
+        if !dilute_clears_floor(remaining, levels, floor, price) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "insufficient balance: diluting to depth {depth} leaves {after} PLUR per \
+                     chunk, too close to the contract's minimum of {floor} to still clear it \
+                     once the transaction lands; top the batch up first"
+                ),
+            );
+        }
+    }
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
         return r;
     }
@@ -1113,9 +1235,52 @@ pub async fn dilute_stamp(
     Json(BatchIdBody { batch_id: id }).into_response()
 }
 
+/// The per-chunk balance `increaseDepth` leaves a batch raised by
+/// `levels`: the contract's `remainingBalance / 2^levels` (`0` once the
+/// shift passes the value's width).
+fn diluted_balance(remaining: u128, levels: u8) -> u128 {
+    remaining.checked_shr(u32::from(levels)).unwrap_or(0)
+}
+
+/// Blocks of storage rent (`lastPrice` per chunk each) [`dilute_stamp`]
+/// takes off a batch's balance before checking the floor: the
+/// `increaseDepth` transaction executes after the balance read, by
+/// which time per-block payout has lowered `remainingBalance`. Twelve
+/// Gnosis blocks is a minute, room for a slow inclusion.
+const DILUTE_MARGIN_BLOCKS: u128 = 12;
+
+/// Headroom [`dilute_stamp`] adds on the contract's floor, as a divisor
+/// (`floor / 256`, about 0.4%): `minimumInitialBalancePerChunk` is
+/// `minimumValidityBlocks × lastPrice`, so an oracle price update
+/// between the read and the transaction raises it. One update moves
+/// the price by well under that, and fewer than one lands in
+/// [`DILUTE_MARGIN_BLOCKS`].
+const DILUTE_FLOOR_HEADROOM: u128 = 256;
+
+/// Whether raising a batch by `levels` still clears the contract's
+/// per-chunk `floor` once the transaction lands: the balance less
+/// [`DILUTE_MARGIN_BLOCKS`] of payout at `price`, halved per level,
+/// against the floor plus [`DILUTE_FLOOR_HEADROOM`].
+fn dilute_clears_floor(remaining: u128, levels: u8, floor: u128, price: u128) -> bool {
+    let at_execution = remaining.saturating_sub(price.saturating_mul(DILUTE_MARGIN_BLOCKS));
+    let floor = floor.saturating_add(floor / DILUTE_FLOOR_HEADROOM);
+    diluted_balance(at_execution, levels) >= floor
+}
+
+/// Waits before each re-read of a wallet balance that reads short of a
+/// chequebook deposit: about two Gnosis blocks (5s each) in all, so a
+/// backend a block or two behind the one that credited the wallet
+/// catches up before the deposit is refused.
+const DEPOSIT_BALANCE_RECHECKS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(5)];
+
 /// `POST /chequebook/deposit?amount=`. Funds the chequebook by
 /// transferring xBZZ into it; returns the `transactionHash` (PLAN.md
-/// D3). Freedom auto-deposits post-purchase.
+/// D3). Freedom auto-deposits post-purchase. An amount of `0`, no
+/// chequebook to deposit into, or an amount above the wallet's xBZZ
+/// balance is a `400` and nothing is sent. A balance that reads short
+/// is re-read for about two blocks first, so a lagging RPC backend
+/// that hasn't seen the xBZZ just credited (a swap moments earlier)
+/// doesn't refuse a deposit the chain would take.
 pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1128,6 +1293,9 @@ pub async fn chequebook_deposit(
         return busy();
     };
     let amount: u128 = match q.get("amount").map(|a| a.parse()) {
+        Some(Ok(0)) => {
+            return json_error(StatusCode::BAD_REQUEST, "amount must be more than 0 PLUR");
+        }
         Some(Ok(a)) => a,
         Some(Err(_)) => {
             return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer")
@@ -1139,7 +1307,37 @@ pub async fn chequebook_deposit(
             )
         }
     };
+    // Same answer as `/chequebook/withdraw` without one; checked before
+    // the balance so it isn't masked by an "out of funds". (The writer
+    // checks again: the slot can change.)
+    if chain.chequebook.get().is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "no chequebook configured to deposit into",
+        );
+    }
+    // Held from the balance check through the receipt, so another
+    // wallet transaction can't spend the xBZZ counted here (like the
+    // buy's guard). An unaffordable transfer would revert on chain.
     let _tx = chain.tx_lock.lock().await;
+    // A short read may only be a lagging RPC backend that hasn't seen
+    // the block crediting the wallet (Freedom deposits right after a
+    // swap/purchase), so read again across a block or two before the
+    // definitive "out of funds".
+    let mut rechecks = DEPOSIT_BALANCE_RECHECKS.iter();
+    loop {
+        let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        if amount <= balance {
+            break;
+        }
+        match rechecks.next() {
+            Some(wait) => tokio::time::sleep(*wait).await,
+            None => return json_error(StatusCode::BAD_REQUEST, "out of funds"),
+        }
+    }
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,
         Err(r) => return r,
@@ -1596,5 +1794,27 @@ pub async fn settlement_fund_deposit(
         }
         Ok(Err(f)) => failure_response(f),
         Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "chain transaction timed out"),
+    }
+}
+
+#[cfg(test)]
+mod dilute_floor_tests {
+    use super::*;
+
+    /// The margin binds exactly at its boundary: the balance less
+    /// twelve blocks of payout, halved per level, must reach the floor
+    /// plus its headroom.
+    #[test]
+    fn dilute_floor_check_keeps_a_payout_and_price_margin() {
+        let (floor, price) = (256_000u128, 1_000u128);
+        let need = (floor + floor / DILUTE_FLOOR_HEADROOM) * 4 + price * DILUTE_MARGIN_BLOCKS;
+        assert!(dilute_clears_floor(need, 2, floor, price));
+        assert!(!dilute_clears_floor(need - 1, 2, floor, price));
+        // Clearing the bare floor at the read's block is not enough.
+        assert!(diluted_balance(floor * 4, 2) >= floor);
+        assert!(!dilute_clears_floor(floor * 4, 2, floor, price));
+        // No underflow or overflow at the extremes.
+        assert!(!dilute_clears_floor(0, 1, floor, u128::MAX));
+        assert!(!dilute_clears_floor(u128::MAX, 255, floor, price));
     }
 }

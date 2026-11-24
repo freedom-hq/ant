@@ -216,7 +216,11 @@ async fn read_varint_len(r: &mut (impl AsyncReadExt + Unpin)) -> Result<usize, H
         r.read_exact(&mut b).await?;
         buf.push(b[0]);
         match unsigned_varint::decode::u64(&buf) {
-            Ok((v, [])) => return Ok(v as usize),
+            // Checked, not `as usize`: on a 32-bit target a truncated
+            // length could slip under `MAX_PROTO_MESSAGE` (#279 sweep).
+            Ok((v, [])) => {
+                return usize::try_from(v).map_err(|_| HandshakeError::MessageTooLarge);
+            }
             Ok(_) => {
                 return Err(HandshakeError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -682,5 +686,79 @@ mod tests {
         let e = HandshakeError::TimestampInFuture(2, 1);
         let s = format!("{e}");
         assert!(s.contains('2') && s.contains('1'));
+    }
+
+    /// Run our outbound handshake against a "remote" that has already
+    /// answered with `syn_ack`, and return how it ended.
+    async fn outbound_against(syn_ack: SynAck) -> Result<HandshakeInfo, HandshakeError> {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut buf = Vec::new();
+        syn_ack.encode_length_delimited(&mut buf).unwrap();
+        theirs.write_all(&buf).await.unwrap();
+
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let res = handshake_outbound_with_role(
+            ours.compat(),
+            local,
+            remote,
+            &[7u8; SECP256K1_SECRET_LEN],
+            &[0u8; OVERLAY_NONCE_LEN],
+            1,
+            &["/ip4/1.2.3.4/tcp/1634".parse().unwrap()],
+            Vec::new(),
+            false,
+            HandshakeWireVersion::V15,
+        )
+        .await;
+        drop(theirs);
+        res
+    }
+
+    /// #279: a `SynAck` whose `observed_underlay` is a bare list prefix
+    /// (`[0x99]`) used to decode to an empty list, so the "observed
+    /// underlay carries our peer id" loop ran zero times. It must now
+    /// fail exactly like a missing observed underlay does.
+    #[tokio::test]
+    async fn synack_with_empty_underlay_list_is_rejected() {
+        for observed in [vec![crate::underlay::UNDERLAY_LIST_PREFIX], Vec::new()] {
+            let syn_ack = SynAck {
+                syn: Some(Syn {
+                    observed_underlay: observed.clone(),
+                }),
+                ack: Some(Ack::default()),
+            };
+            let err = outbound_against(syn_ack).await.unwrap_err();
+            assert!(
+                matches!(err, HandshakeError::Underlay(UnderlayError::Empty)),
+                "{observed:?}: {err}"
+            );
+        }
+    }
+
+    /// #279: the audit's 11-byte payload in a real `SynAck` fails the
+    /// handshake with an error instead of aborting the process.
+    #[tokio::test]
+    async fn synack_with_overflowing_underlay_length_is_rejected() {
+        let mut observed = vec![crate::underlay::UNDERLAY_LIST_PREFIX];
+        let mut enc = unsigned_varint::encode::u64_buffer();
+        observed.extend_from_slice(unsigned_varint::encode::u64(u64::MAX, &mut enc));
+        let syn_ack = SynAck {
+            syn: Some(Syn {
+                observed_underlay: observed,
+            }),
+            ack: Some(Ack::default()),
+        };
+        let err = outbound_against(syn_ack).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HandshakeError::Underlay(UnderlayError::Truncated(u64::MAX))
+            ),
+            "{err}"
+        );
     }
 }

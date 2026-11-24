@@ -47,6 +47,17 @@
 //! caller then sees the fallback URL's error instead of the real one.
 //! Map any failure that is not a coverage gap to a different error code,
 //! or answer authoritatively.
+//!
+//! # Transactions are checked against their own hash
+//!
+//! `eth_sendRawTransaction` must answer the hash of the transaction it
+//! was given (keccak256 of the raw bytes), and an
+//! `eth_getTransactionReceipt` result must carry that hash as
+//! `transactionHash`. `tx::Wallet` waits on the hash it
+//! computed itself (a different `eth_sendRawTransaction` answer is
+//! logged and ignored) and fails the write on a receipt naming another
+//! hash or none, so a relay can't pass off another transaction's
+//! receipt (issue #284).
 
 use std::sync::Arc;
 

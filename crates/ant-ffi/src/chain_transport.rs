@@ -203,6 +203,14 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// fallback URL's error instead of the real one. Map any non-coverage
 /// failure to a different code, or answer authoritatively.
 ///
+/// **Transactions:** `eth_sendRawTransaction` must answer the hash of
+/// the transaction it was given (keccak256 of the raw bytes), and an
+/// `eth_getTransactionReceipt` result must carry that hash as
+/// `transactionHash`. ant waits on the hash it computed itself (a
+/// different `eth_sendRawTransaction` answer is logged and ignored) and
+/// fails the write on a receipt naming another hash or none, so a relay
+/// can't pass off another transaction's receipt (issue #284).
+///
 /// Pass `NULL` for `transport` to clear a previously-installed one.
 /// `host_ctx` is opaque and simply handed back on every call.
 ///
@@ -451,6 +459,7 @@ mod tests {
             memory_cache: std::sync::Arc::new(ant_retrieval::InMemoryChunkCache::new(8)),
             gateway_task: std::sync::Mutex::new(None),
             gateway_cors: std::sync::Mutex::new(Vec::new()),
+            gateway_allowed_hosts: std::sync::Mutex::new(Vec::new()),
             bench: std::sync::Mutex::new(None),
             publisher: std::sync::Mutex::new(None),
             announcing: std::sync::atomic::AtomicBool::new(false),
@@ -946,8 +955,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let body = loop {
             if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .unwrap();
+                write!(
+                    s,
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
                 let mut out = String::new();
                 s.read_to_string(&mut out).unwrap();
                 break out;

@@ -46,8 +46,8 @@ struct Opt {
     /// override the built-in defaults. Recognised keys: `api-addr`,
     /// `data-dir`, `password` / `password-file`, `mainnet` /
     /// `network-id`, `blockchain-rpc-endpoint`, `cors-allowed-origins`,
-    /// `verbosity`, `swap-enable`, `cache-capacity`; other bee keys are
-    /// accepted and ignored.
+    /// `allowed-hosts`, `verbosity`, `swap-enable`, `cache-capacity`;
+    /// other bee keys are accepted and ignored.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -124,12 +124,33 @@ struct Opt {
     /// scheme, without port; `host` needs at least two labels, and any
     /// other entry containing `*` is rejected at startup. Empty
     /// (default) disables CORS, matching a bee node started without the
-    /// option. The xDAI-spending `POST /v0/storage/*` and
-    /// `POST /v0/settlement/deposit` refuse web pages except an origin
-    /// listed here exactly (`*`, `null` and wildcard entries don't unlock
-    /// them).
+    /// option. The list also gates writes (issue #312): a non-GET
+    /// request from a web page is refused (`403`) unless its origin is
+    /// in this list, and one from a page this API serves itself
+    /// (`Sec-Fetch-Site: same-origin`) unless its origin is listed
+    /// exactly. The wallet-spending routes (`POST /stamps/...`,
+    /// `PATCH /stamps/topup|dilute/...`, `POST /chequebook/deposit|withdraw`,
+    /// `POST /v0/storage/*`, `POST /v0/settlement/deposit`) and WebSocket
+    /// upgrades accept a web page only when its origin is listed here
+    /// exactly (`*`, `null` and wildcard entries don't unlock them).
+    /// `null` matches every sandboxed or redirected page on the web;
+    /// a startup warning says so.
     #[arg(long, value_delimiter = ',')]
     cors_allowed_origins: Vec<String>,
+
+    /// Extra `Host` names the HTTP API answers (ant extension, issue
+    /// #312), comma-separated: `host` (any port) or `host:port`
+    /// (`host:443`/`host:80` also match a bare `host`), e.g. the public
+    /// name a reverse proxy forwards. On a loopback
+    /// `--api-addr` only `localhost`, `127.0.0.1`, `[::1]`, subdomains of
+    /// `localhost` and the bound IP are answered without it (others get
+    /// `421`), which stops DNS-rebinding pages. `*` turns the check off.
+    /// On a non-loopback `--api-addr` with no entries the check is off
+    /// and a warning is logged. With entries on a wildcard `--api-addr`
+    /// (`0.0.0.0`, `[::]`) there is no single bound IP, so list any IP
+    /// literal clients use (`192.168.1.5`) as well.
+    #[arg(long, value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
 
     /// Externally reachable multiaddrs to advertise via libp2p-identify.
     /// Bee bootnodes stall our handshake by 10 s when their peerstore lacks a
@@ -449,6 +470,7 @@ async fn main() -> Result<()> {
     };
     let (resolved_password, ignored_config_keys) = apply_config_file(&mut opt, &matches)?;
     validate_cors_origins(&opt.cors_allowed_origins)?;
+    validate_allowed_hosts(&opt.allowed_hosts)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -473,6 +495,11 @@ async fn main() -> Result<()> {
     // advisory `flock`. Bound at function scope (not in a helper) so it stays
     // alive until `main` returns.
     let _instance_lock = acquire_instance_lock(&data_dir.join("antd.lock"))?;
+
+    // Under the instance lock, before any rediscovery copies bee's
+    // stamperstore: a copy left by an earlier run that was killed mid-copy
+    // can't be in use by anyone now.
+    remove_stale_bee_copies(&data_dir).await;
 
     raise_nofile_soft_limit();
 
@@ -849,6 +876,8 @@ async fn main() -> Result<()> {
             cors: Arc::new(ant_gateway::CorsConfig::new(
                 opt.cors_allowed_origins.iter(),
             )),
+            // `Gateway::serve` resolves it against the bound address.
+            hosts: Arc::new(ant_gateway::HostPolicy::new(opt.allowed_hosts.iter())),
             // ACT publisher identity = the node's swarm key, exactly
             // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
             act_secret: Arc::new(signing_secret),
@@ -1467,6 +1496,16 @@ fn validate_cors_origins(origins: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Reject a malformed `allowed-hosts` entry (CLI or config file) rather
+/// than letting [`ant_gateway::HostPolicy::new`] drop it, which would
+/// leave the name refused with no hint why.
+fn validate_allowed_hosts(hosts: &[String]) -> Result<()> {
+    for h in hosts {
+        ant_gateway::HostPolicy::check_entry(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
 /// Bee counts `cache-capacity` in chunks and sizes it at 4096 bytes
 /// each ("multiply by 4096 to get approximate capacity in bytes").
 const BEE_CACHE_CHUNK_BYTES: u64 = 4096;
@@ -1535,6 +1574,12 @@ fn apply_config_file(
             let origins = cfg.cors_origins_vec();
             if !origins.is_empty() {
                 opt.cors_allowed_origins = origins;
+            }
+        }
+        if !from_cli("allowed_hosts") {
+            let hosts = cfg.allowed_hosts_vec();
+            if !hosts.is_empty() {
+                opt.allowed_hosts = hosts;
             }
         }
         if !from_cli("log_level") {
@@ -2425,15 +2470,72 @@ async fn rediscover_batches(
     };
     *full_rescan = false;
     let found = ant_chain::discover::owned_batches_in(client, postage_contract, &scan).await?;
-    let stamperstore = data_dir.join("stamperstore");
+    // Already reloaded / pre-registered. A batch registered while the
+    // blocking open below runs is caught by the caller's `or_insert`.
+    let found: Vec<_> = found.into_iter().filter(|b| !known(&b.batch_id)).collect();
+    let out = if found.is_empty() {
+        Vec::new()
+    } else {
+        // Copying bee's stamperstore (one record per stamped chunk, can be
+        // GBs) and opening the counter files is blocking I/O: keep it off
+        // the runtime's worker threads.
+        let data_dir = data_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || open_rediscovered(found, &data_dir)).await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    "opening rediscovered batches failed: {e}; continuing without them",
+                );
+                Vec::new()
+            }
+        }
+    };
+    Ok((out, scan.provisional_since))
+}
+
+/// Remove the private stamperstore copies an earlier, killed run left in
+/// `data_dir` ([`ant_postage::beestore::remove_stale_copies`]). Must run
+/// under the instance lock and before any rediscovery. Best effort: a
+/// copy that can't be removed is logged, not fatal.
+async fn remove_stale_bee_copies(data_dir: &Path) {
+    let dir = data_dir.to_path_buf();
+    let swept =
+        tokio::task::spawn_blocking(move || ant_postage::beestore::remove_stale_copies(&dir)).await;
+    match swept {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => tracing::info!(
+            target: "antd",
+            removed = n,
+            "removed bee stamperstore copies left by an interrupted run",
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            target: "antd",
+            "could not remove a stale bee stamperstore copy: {e}",
+        ),
+        Err(e) => tracing::warn!(
+            target: "antd",
+            "sweeping stale bee stamperstore copies failed: {e}",
+        ),
+    }
+}
+
+/// Open the rediscovered batches as issuers. Bee's `stamperstore` is
+/// copied (into `data_dir`) at most once for the whole pass, and only if
+/// some batch actually needs its counters. A batch that can't be opened is
+/// logged and skipped. Blocking (file copy, `LevelDB` reads): run it on a
+/// blocking thread, as [`rediscover_batches`] does. The `LevelDB` handle
+/// isn't `Send`, so it lives and dies inside this call.
+fn open_rediscovered(
+    found: Vec<ant_chain::discover::DiscoveredBatch>,
+    data_dir: &Path,
+) -> Vec<([u8; 32], ant_postage::StampIssuer)> {
+    let mut bee = BeeCounters::new(data_dir);
     let postage_dir = data_dir.join("postage");
     let mut out = Vec::new();
     for b in found {
-        if known(&b.batch_id) {
-            continue; // already reloaded / pre-registered
-        }
         let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
-        match open_recovered_issuer(&stamperstore, &store_path, &b) {
+        match open_recovered_issuer(&mut bee, &store_path, &b) {
             Ok(iss) => {
                 tracing::info!(
                     target: "antd",
@@ -2453,7 +2555,43 @@ async fn rediscover_batches(
             ),
         }
     }
-    Ok((out, scan.provisional_since))
+    out
+}
+
+/// Bee's `<data-dir>/stamperstore`, copied and opened on first use and
+/// shared by every batch of one rediscovery pass. A failed copy/open is
+/// remembered for the pass (the next pass tries again).
+struct BeeCounters {
+    stamperstore: PathBuf,
+    scratch: PathBuf,
+    opened: Option<std::result::Result<Option<ant_postage::beestore::BeeStamperStore>, String>>,
+}
+
+impl BeeCounters {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            stamperstore: data_dir.join("stamperstore"),
+            scratch: data_dir.to_path_buf(),
+            opened: None,
+        }
+    }
+
+    fn recover(
+        &mut self,
+        b: &ant_chain::discover::DiscoveredBatch,
+    ) -> std::result::Result<Option<ant_postage::beestore::RecoveredIssuer>, String> {
+        let opened = self.opened.get_or_insert_with(|| {
+            ant_postage::beestore::BeeStamperStore::open(&self.stamperstore, &self.scratch)
+                .map_err(|e| e.to_string())
+        });
+        match opened {
+            Err(e) => Err(e.clone()),
+            Ok(None) => Ok(None),
+            Ok(Some(store)) => store
+                .recover(&b.batch_id, b.depth, b.bucket_depth)
+                .map_err(|e| e.to_string()),
+        }
+    }
 }
 
 /// One background batch rediscovery: register the batches the saved
@@ -2615,16 +2753,30 @@ async fn confirm_unverified_scan(
 /// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on
 /// chain, carrying over bee's per-bucket counters from a
 /// `stamperstore` when one is present (option a) and falling back to a
-/// fresh issuer with all-zero counters otherwise (option b). The
+/// fresh issuer with all-zero counters when there is no store or it
+/// holds nothing for the batch (option b). A store that is present but
+/// can't be read is an error, not option b. The
 /// counters are the only batch state not on-chain; seeding them keeps
 /// the node from re-stamping `(batchId, bucket, index)` slots the
 /// network has already seen.
 fn open_recovered_issuer(
-    stamperstore: &Path,
+    bee: &mut BeeCounters,
     store_path: &Path,
     b: &ant_chain::discover::DiscoveredBatch,
 ) -> Result<ant_postage::StampIssuer> {
-    let want = 1usize << u32::from(b.bucket_depth);
+    // The bucket depth comes from the chain, where anyone can create a
+    // batch owned by this node with any depth: bound it before sizing
+    // anything from it (the issuer refuses the batch on its own too).
+    if b.bucket_depth > ant_postage::MAX_BUCKET_DEPTH {
+        return Err(anyhow!(
+            "batch bucket depth {} exceeds the maximum {}",
+            b.bucket_depth,
+            ant_postage::MAX_BUCKET_DEPTH
+        ));
+    }
+    let want = 1usize
+        .checked_shl(u32::from(b.bucket_depth))
+        .ok_or_else(|| anyhow!("batch bucket depth {} too large", b.bucket_depth))?;
     let fresh = || {
         ant_postage::StampIssuer::open_or_new(
             store_path.to_path_buf(),
@@ -2635,7 +2787,12 @@ fn open_recovered_issuer(
         )
         .map_err(|e| anyhow!("{e}"))
     };
-    match ant_postage::beestore::recover_bee_buckets(stamperstore, &b.batch_id) {
+    // An existing counter file wins over any seed (`open_or_new_seeded`
+    // ignores it), so there's nothing to read from bee for it.
+    if store_path.exists() {
+        return fresh();
+    }
+    match bee.recover(b) {
         Ok(Some(rec)) if rec.bucket_depth == b.bucket_depth && rec.buckets.len() == want => {
             let issued: u64 = rec.buckets.iter().map(|&c| u64::from(c)).sum();
             tracing::info!(
@@ -2672,14 +2829,18 @@ fn open_recovered_issuer(
             );
             fresh()
         }
-        Err(e) => {
-            tracing::warn!(
-                target: "antd",
-                batch = %format!("0x{}", hex::encode(b.batch_id)),
-                "bee stamperstore recovery failed: {e}; fresh issuer at 0 (recovery option b)",
-            );
-            fresh()
-        }
+        // A store that is there but couldn't be read (copy failed, scratch
+        // space full, corrupt records) says nothing about what bee issued:
+        // zeroed counters would reissue slots the network has already
+        // seen. Leave the batch unregistered (logged by the caller); antd
+        // rediscovers at every start, so a restart after fixing the cause
+        // retries it. Moving `stamperstore` aside is the deliberate way to
+        // start the batch at 0.
+        Err(e) => Err(anyhow!(
+            "bee stamperstore recovery failed: {e}; not starting the issuer at 0 \
+             over counters bee may have used (fix the store, or move it aside to \
+             accept a fresh issuer)"
+        )),
     }
 }
 
@@ -3022,16 +3183,27 @@ async fn resolve_chequebook(
         .await
     };
     wallet.note_deploy_attempt(&deployed);
+    // Brand new, so it has issued no cheques: a lost outbound ledger on
+    // record doesn't apply to it (PR #126 R1-M3). That holds too for one
+    // recorded unverified (`RecordedUnverified`): the next
+    // `resolve_chequebook` run adopts it from `chequebook.json` (step 2),
+    // a path that never marks it fresh. That run is either the next start
+    // or, in this same process, `SettlementOnBuy::enable` on a
+    // `POST /stamps` buy while settlement is off.
+    let fresh = match &deployed {
+        Ok(cb) => Some(*cb),
+        Err(e) => e.recorded_fresh(),
+    };
+    if let Some(cb) = fresh {
+        if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
+            tracing::warn!(
+                target: "antd",
+                "new chequebook not fully recorded: {e}",
+            );
+        }
+    }
     match deployed {
         Ok(cb) => {
-            // Brand new, so it has issued no cheques: a lost outbound
-            // ledger on record doesn't apply to it (PR #126 R1-M3).
-            if let Err(e) = ant_p2p::swap::note_fresh_chequebook(&ledger_path, cb) {
-                tracing::warn!(
-                    target: "antd",
-                    "new chequebook not fully recorded: {e}",
-                );
-            }
             // Freshly factory-deployed, so it's registered by construction
             // — skip the redundant `deployedContracts` round-trip.
             let pushsync = ant_p2p::PushsyncSwapConfig::new(
@@ -4230,6 +4402,95 @@ mod tests {
             .await;
         assert_eq!(slot.get(), None);
         assert_eq!(slot.refused(), Some(CB));
+    }
+}
+
+#[cfg(test)]
+mod allowed_hosts_tests {
+    use super::validate_allowed_hosts;
+
+    #[test]
+    fn accepts_hosts_and_star_rejects_urls() {
+        let ok: Vec<String> = ["*", "vibing.at", "node.lan:1633", "[fd00::1]:1633", ""]
+            .map(String::from)
+            .to_vec();
+        assert!(validate_allowed_hosts(&ok).is_ok());
+        for bad in ["https://vibing.at", "vibing.at/ant", "*.vibing.at"] {
+            let err = validate_allowed_hosts(&[bad.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("allowed-hosts"), "{bad}: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bee_recovery_tests {
+    use super::*;
+
+    fn batch(id: u8) -> ant_chain::discover::DiscoveredBatch {
+        ant_chain::discover::DiscoveredBatch {
+            batch_id: [id; 32],
+            depth: 6,
+            bucket_depth: 2,
+            immutable: true,
+            remaining_balance: 1,
+        }
+    }
+
+    /// A `stamperstore` that is there but can't be read must not turn
+    /// into a fresh issuer at 0 (which would reissue slots bee already
+    /// used): the batch is refused and no counter file is created. With
+    /// no store at all, the fresh issuer is the right answer.
+    #[test]
+    fn unreadable_stamperstore_refuses_instead_of_zeroing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        // Not a LevelDB (no CURRENT/MANIFEST): opening the copy fails.
+        let store = data_dir.join("stamperstore");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("000001.log"), b"not a leveldb").unwrap();
+        let b = batch(0x51);
+        let bin = data_dir
+            .join("postage")
+            .join(format!("{}.bin", hex::encode(b.batch_id)));
+        let mut bee = BeeCounters::new(data_dir);
+        let err = open_recovered_issuer(&mut bee, &bin, &b).unwrap_err();
+        assert!(
+            err.to_string().contains("not starting the issuer at 0"),
+            "{err}"
+        );
+        assert!(!bin.exists(), "a zeroed counter file was written");
+        assert!(open_rediscovered(vec![b.clone()], data_dir).is_empty());
+        assert!(!bin.exists());
+        // Only bee's store is left in the data dir: no private copy.
+        let left: Vec<_> = std::fs::read_dir(data_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("stamperstore")]);
+
+        // Moved aside: nothing to recover, so a fresh issuer at 0.
+        std::fs::rename(&store, data_dir.join("stamperstore.bad")).unwrap();
+        let found = open_rediscovered(vec![b], data_dir);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.issued_count(), 0);
+        assert!(bin.exists());
+    }
+
+    /// A stamperstore copy a killed run left in the data dir is gone after
+    /// the startup sweep; the node's own files stay.
+    #[tokio::test]
+    async fn startup_sweeps_stamperstore_copies_left_by_a_killed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let leaked = data_dir.join(".ant-bee-stamperstore-copy-4242-1-0");
+        std::fs::create_dir(&leaked).unwrap();
+        std::fs::write(leaked.join("000005.ldb"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir(data_dir.join("stamperstore")).unwrap();
+        std::fs::create_dir(data_dir.join("postage")).unwrap();
+        remove_stale_bee_copies(data_dir).await;
+        assert!(!leaked.exists());
+        assert!(data_dir.join("stamperstore").exists());
+        assert!(data_dir.join("postage").exists());
     }
 }
 

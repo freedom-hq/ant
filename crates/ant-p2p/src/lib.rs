@@ -9,6 +9,7 @@ mod liveness;
 pub mod lurker;
 pub mod lurker_registry;
 pub mod messaging;
+mod observed_addr;
 mod peerstore;
 pub mod pseudosettle;
 pub mod pullsync;
