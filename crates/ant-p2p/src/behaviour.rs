@@ -813,10 +813,12 @@ struct SwarmState {
     /// [`serving_peer_count`].
     bootnode_peers: HashSet<PeerId>,
     /// The operator's configured bootnode multiaddrs, as written (before
-    /// `/dnsaddr/` resolution). A DNS-named underlay is only dialed from
-    /// the hint queue when it is one of these — the peerstore re-queues a
-    /// `/dns4/…` bootnode's dialed address on warm start — never when a
-    /// peer gossiped it (#301, see [`Self::dialable_underlays`]).
+    /// `/dnsaddr/` resolution). A hint address that is exactly one of these
+    /// skips the underlay filter: the peerstore re-queues a `/dns4/…`
+    /// bootnode's dialed address on warm start, and a DNS name is otherwise
+    /// only ever dropped (#301, see [`Self::dialable_underlays`]). Leaves
+    /// of a `/dnsaddr/` bootnode aren't in here; they are re-dialed by the
+    /// bootnode dial at every start.
     bootnode_addrs: HashSet<Multiaddr>,
     /// When each routing-table entry was admitted. Removed with the entry
     /// on `ConnectionClosed`.
@@ -1240,10 +1242,10 @@ impl SwarmState {
     /// hint-driven dial: a same-LAN private underlay admitted on the home
     /// Wi-Fi must not be dialed after the host moved to cellular.
     ///
-    /// An address that is exactly one of the configured bootnodes
-    /// ([`Self::bootnode_addrs`]) is kept as is, so a `/dns4/…` bootnode
-    /// stored in the peerstore still warm-dials; the filter would drop it
-    /// for being a DNS name.
+    /// An address that is exactly one of the configured bootnode addresses
+    /// ([`Self::bootnode_addrs`]) is kept as is: the operator chose it, so a
+    /// `/dns4/…` bootnode stored in the peerstore still warm-dials instead
+    /// of being dropped for being a DNS name.
     fn dialable_underlays(&mut self, addrs: &[Multiaddr]) -> Vec<Multiaddr> {
         if self.allow_private_dials {
             return addrs.to_vec();
@@ -10862,25 +10864,31 @@ mod tests {
         // The dial-time re-filter drops it too, whatever got cached.
         assert_eq!(state.addrs_for_dial(&hint), Some(ip_only));
 
-        // A configured `/dns4/…` bootnode, re-queued from the peerstore on
-        // warm start, is still dialed — but only that exact address.
+        // A configured `/dns4/…` bootnode, recorded in the peerstore under
+        // the address we dialed (libp2p reports the dialed multiaddr, `/p2p`
+        // included, as `ConnectedPoint::Dialer.address`) and re-queued from
+        // it on warm start, is still dialed.
+        let dir = tempfile::tempdir().unwrap();
         let boot = PeerId::random();
         let boot_addr: Multiaddr = format!("/dns4/boot.example.org/tcp/1634/p2p/{boot}")
             .parse()
             .unwrap();
-        seed_bootnode_tags(
-            &mut state,
-            &PeerStore::disabled(),
-            std::slice::from_ref(&boot_addr),
-        );
+        let mut store = PeerStore::load(dir.path().join("peers.json"));
+        store.record_success(boot, vec![boot_addr.clone()], [3u8; 32], 0, None);
+        seed_bootnode_tags(&mut state, &store, std::slice::from_ref(&boot_addr));
+        for hint in store.warm_hints() {
+            state.enqueue_hint(hint, local);
+        }
+        assert_eq!(state.hint_queue.len(), 2);
+        assert_eq!(state.hint_queue[1].peer_id, boot);
+        assert_eq!(state.hint_queue[1].addrs, vec![boot_addr.clone()]);
+        // … but only that exact address: a gossiped DNS name for the same
+        // peer is still dropped.
         let mut hint = hint_in_bin(boot, 0x20, 3);
         hint.addrs = vec![
             boot_addr.clone(),
             "/dns4/localhost/tcp/1634".parse().unwrap(),
         ];
-        state.enqueue_hint(hint.clone(), local);
-        assert_eq!(state.hint_queue.len(), 2);
-        assert_eq!(state.hint_queue[1].addrs, vec![boot_addr.clone()]);
         assert_eq!(state.addrs_for_dial(&hint), Some(vec![boot_addr]));
     }
 

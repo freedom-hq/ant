@@ -94,14 +94,17 @@ where
             out.push(addr);
             continue;
         }
-        let mut budget = MAX_DNS_QUERIES;
+        let mut budget = Budget {
+            left: MAX_DNS_QUERIES,
+            skipped: false,
+        };
         let res = resolve_recursive(resolver, &addr, &mut seen, 0, &mut budget).await;
-        if budget == 0 {
+        if budget.skipped {
             warn!(
                 target: "ant_p2p::dnsaddr",
                 %addr,
                 max = MAX_DNS_QUERIES,
-                "dnsaddr tree used the whole query budget; the rest is skipped",
+                "dnsaddr query budget exhausted; rest of the tree skipped",
             );
         }
         match res {
@@ -133,15 +136,23 @@ fn extract_domain(addr: &Multiaddr) -> Option<String> {
     })
 }
 
-/// Walk one `/dnsaddr/` tree. `budget` is the number of TXT queries this
-/// walk may still send; once it hits zero the remaining sub-trees are
-/// skipped (with a warning) and the leaves found so far are returned.
+/// TXT queries one top-level entry may still send, and whether any name
+/// was skipped for lack of them.
+struct Budget {
+    left: usize,
+    skipped: bool,
+}
+
+/// Walk one `/dnsaddr/` tree. `budget.left` is the number of TXT queries
+/// this walk may still send; once it hits zero the remaining sub-trees are
+/// skipped (`budget.skipped`, warned once by the caller) and the leaves
+/// found so far are returned.
 fn resolve_recursive<'a, L: TxtLookup>(
     resolver: &'a L,
     addr: &'a Multiaddr,
     seen: &'a mut HashSet<String>,
     depth: usize,
-    budget: &'a mut usize,
+    budget: &'a mut Budget,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Multiaddr>, ResolveError>> + Send + 'a>> {
     Box::pin(async move {
         if depth > MAX_RECURSION_DEPTH {
@@ -160,11 +171,12 @@ fn resolve_recursive<'a, L: TxtLookup>(
         // Checked before marking the name seen: a name skipped here was
         // never walked, so a later top-level entry (with its own budget)
         // that references it must still resolve it.
-        if *budget == 0 {
+        if budget.left == 0 {
+            budget.skipped = true;
             debug!(target: "ant_p2p::dnsaddr", name = %key, "query budget exhausted; skipping");
             return Ok(Vec::new());
         }
-        *budget -= 1;
+        budget.left -= 1;
         seen.insert(key.clone());
 
         debug!(target: "ant_p2p::dnsaddr", name = %key, "TXT query");
