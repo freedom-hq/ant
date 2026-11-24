@@ -52,6 +52,7 @@ async fn preflight_from_null_origin_is_allowed() {
         "swarm-postage-batch-id",
         "content-type",
         "swarm-only-root-chunk",
+        "ant-ack-when-stored",
     ] {
         assert!(names.contains(&want), "{want} missing: {allowed}");
     }

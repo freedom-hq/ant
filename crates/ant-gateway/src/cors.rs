@@ -53,7 +53,8 @@ const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS";
 /// `Access-Control-Allow-Headers` returned on every allowed preflight.
 /// Static, like bee's `allowedHeaders`: the requested headers are not
 /// reflected (issue #312), so this has to name every request header a
-/// handler reads. Bee's list plus ant's `Swarm-Act-*` / `Gas-*` set;
+/// handler reads. Bee's list plus ant's `Swarm-Act-*` / `Gas-*` set
+/// and `Ant-Ack-When-Stored` (ack an upload once stored, issue #212);
 /// `Swarm-Cache` (cache bypass on `/bytes`, `/bzz` and `/chunks`
 /// downloads) and `Swarm-Postage-Stamp` (pre-signed stamp on uploads)
 /// match bee's list (<https://github.com/ethersphere/bee/pull/5698>).
@@ -66,7 +67,7 @@ Swarm-Redundancy-Level, Swarm-Redundancy-Strategy, Swarm-Redundancy-Fallback-Mod
 Swarm-Chunk-Retrieval-Timeout, Swarm-Lookahead-Buffer-Size, Swarm-Cache, \
 Swarm-Cache-Wrapped-Chunk, Swarm-Only-Root-Chunk, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
 Swarm-Soc-Signature, Swarm-Soc-Fields, Swarm-Act, Swarm-Act-Timestamp, Swarm-Act-Publisher, \
-Swarm-Act-History-Address, Gas-Price, Gas-Limit, Fee-Priority, Immutable";
+Swarm-Act-History-Address, Gas-Price, Gas-Limit, Fee-Priority, Immutable, Ant-Ack-When-Stored";
 
 /// `Access-Control-Expose-Headers`: the response headers cross-origin
 /// JS would otherwise be unable to read. Modern bee-js reads

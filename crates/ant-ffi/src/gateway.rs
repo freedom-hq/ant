@@ -753,7 +753,8 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
 /// (`http://evil.example:<port>` re-pointed at `127.0.0.1`) from
 /// talking to the API as its own origin. `hosts` points at `hosts_len`
 /// NUL-terminated UTF-8 entries that extend the list: `host` (any port)
-/// or `host:port` (that port only), a DNS name or IP literal (IPv6 in
+/// or `host:port` (that port only; `:443`/`:80` also match a `Host`
+/// without a port, as browsers send it), a DNS name or IP literal (IPv6 in
 /// brackets), matched case-insensitively. `*` turns the check off. A
 /// null `hosts` or `hosts_len == 0` clears the list (the default);
 /// blank entries are ignored. A gateway on a non-loopback address with

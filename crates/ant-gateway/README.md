@@ -243,7 +243,9 @@ https://github.com/ethersphere/bee/pull/5651):
   anything else is `421`. This stops DNS rebinding. `allowed-hosts`
   (`--allowed-hosts`, `ant_set_gateway_allowed_hosts`) adds names
   (`host` or `host:port`, e.g. the public name a reverse proxy
-  forwards); `*` turns the check off. On a non-loopback `api-addr`
+  forwards; `host:443` and `host:80` also match a bare `host`, since
+  browsers leave the default port out of `Host`); `*` turns the check
+  off. On a non-loopback `api-addr`
   with no `allowed-hosts`, nothing is checked and a warning is logged.
   **This differs from bee**, which has no `Host` check.
 - **Writes.** Any request other than `GET`/`HEAD`/`OPTIONS` from a web

@@ -16,7 +16,9 @@
 //! - Extra names come from `allowed-hosts` (antd) /
 //!   `ant_set_gateway_allowed_hosts` (ant-ffi), e.g. the public name a
 //!   reverse proxy forwards. An entry without a port matches that name
-//!   on any port; `name:port` only that port. `*` turns the check off.
+//!   on any port; `name:port` only that port. Browsers and proxies leave
+//!   a default port out of `Host`, so `name:443` and `name:80` also
+//!   match a bare `name`. `*` turns the check off.
 //! - A listener bound to a non-loopback address with no `allowed-hosts`
 //!   is not checked (clients reach it under names the node can't know);
 //!   [`crate::Gateway::serve`] warns at startup.
@@ -140,7 +142,18 @@ impl HostPolicy {
         }
         self.hosts
             .iter()
-            .any(|(h, p)| *h == host && (p.is_none() || *p == port))
+            .any(|(h, p)| *h == host && entry_port_matches(*p, port))
+    }
+}
+
+/// Whether an entry's port accepts a `Host`'s port. A bare `Host` is
+/// what browsers and proxies send for the scheme's default port, so an
+/// entry naming `443` or `80` takes it too (the scheme isn't known here).
+fn entry_port_matches(entry: Option<u16>, host: Option<u16>) -> bool {
+    match (entry, host) {
+        (None, _) => true,
+        (Some(e), Some(h)) => e == h,
+        (Some(e), None) => e == 443 || e == 80,
     }
 }
 
@@ -321,6 +334,17 @@ mod tests {
         assert!(!p.allows("node.lan"));
         assert!(p.allows("[fd00::1]:1633"));
         assert!(!p.allows("sub.vibing.at"));
+    }
+
+    #[test]
+    fn default_port_entries_match_a_bare_host() {
+        let p = loopback(&["vibing.at:443", "plain.example:80", "node.lan:8080"]);
+        assert!(p.allows("vibing.at"));
+        assert!(p.allows("vibing.at:443"));
+        assert!(!p.allows("vibing.at:8443"));
+        assert!(p.allows("plain.example"));
+        assert!(!p.allows("plain.example:443"));
+        assert!(!p.allows("node.lan"));
     }
 
     #[test]

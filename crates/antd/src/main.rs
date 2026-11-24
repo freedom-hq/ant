@@ -139,8 +139,9 @@ struct Opt {
     cors_allowed_origins: Vec<String>,
 
     /// Extra `Host` names the HTTP API answers (ant extension, issue
-    /// #312), comma-separated: `host` (any port) or `host:port`, e.g.
-    /// the public name a reverse proxy forwards. On a loopback
+    /// #312), comma-separated: `host` (any port) or `host:port`
+    /// (`host:443`/`host:80` also match a bare `host`), e.g. the public
+    /// name a reverse proxy forwards. On a loopback
     /// `--api-addr` only `localhost`, `127.0.0.1`, `[::1]`, subdomains of
     /// `localhost` and the bound IP are answered without it (others get
     /// `421`), which stops DNS-rebinding pages. `*` turns the check off.
