@@ -1085,16 +1085,26 @@ void ant_free_string(char *ptr);
  * headers, so no page from another origin can read its responses.
  * (Up to 0.5.48 it always allowed the `null` origin; hosts that relied
  * on that must now call ant_set_gateway_cors explicitly.)
- * CORS only stops reads: any page can still send CORS-simple requests,
- * which execute — including the spending routes POST
- * /stamps/{amount}/{depth} (which, as above, may also deploy a
- * chequebook for xDAI gas and transfer the wallet's xBZZ into a new or
- * under-funded one; no swap) and POST /chequebook/deposit (see
- * ant_set_gateway_cors; issue #105). The gateway also serves the
- * xDAI-swapping routes POST /v0/storage/buy, POST /v0/storage/extend
- * and POST /v0/settlement/deposit; those refuse (403) any request from
- * a web page unless its origin is listed exactly (not "*" or "null")
- * with ant_set_gateway_cors.
+ * The same list gates writes (after 0.5.79, issue #312): a request
+ * other than GET, HEAD or OPTIONS from a web page is refused (403)
+ * unless its origin is in the list, and one from a page this gateway
+ * serves itself (Sec-Fetch-Site: same-origin) unless its origin is
+ * listed exactly. The wallet-spending routes (POST
+ * /stamps/{amount}/{depth}, which as above may also deploy a chequebook
+ * and fund it; PATCH /stamps/topup and /stamps/dilute; POST
+ * /chequebook/deposit and /chequebook/withdraw; the xDAI-swapping POST
+ * /v0/storage/buy, POST /v0/storage/extend and POST
+ * /v0/settlement/deposit) and the WebSocket routes (/chunks/stream,
+ * /pss/subscribe, /gsoc/subscribe) refuse any web page whose origin is
+ * not listed exactly ("*", "null" and wildcard entries don't count).
+ * Requests with neither Origin nor Sec-Fetch-Site (the host app) are
+ * never refused.
+ *
+ * Host: the gateway answers only requests whose Host is localhost,
+ * 127.0.0.1, [::1], a subdomain of localhost, or the bound IP, with or
+ * without its own port, plus the names set with
+ * ant_set_gateway_allowed_hosts; others get 421 (after 0.5.79). This
+ * stops DNS-rebinding pages.
  *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
@@ -1176,24 +1186,22 @@ int ant_chain_init(const AntHandle *handle, const char *gnosis_rpc, char **out_e
  * "null"), and "*" matches every page — allow them only if that is
  * acceptable.
  *
- * This list protects READS only; an empty list does not block writes.
- * A CORS-simple request needs no preflight, so any page can still
- * fetch(url, {method: "POST", mode: "no-cors"}) against
- * POST /stamps/{amount}/{depth} or POST /chequebook/deposit and the
- * gateway executes it, spending the wallet's xBZZ (for /stamps both the
- * batch and a transfer into a new or under-funded chequebook's deposit)
- * and xDAI gas for every transaction it sends — the batch purchase and,
- * for /stamps, deploying a chequebook if there is none yet and the
- * deposit transfer into a new or under-funded one (nothing is swapped)
- * — even though the page cannot read the reply. Do not rely on this
- * call to protect funds.
+ * The list also gates writes (after 0.5.79, issue #312). A CORS-simple
+ * request (fetch(url, {method: "POST", mode: "no-cors"})) needs no
+ * preflight, so the gateway refuses it itself: a request other than
+ * GET, HEAD or OPTIONS from a web page gets 403 unless the page's
+ * origin is in this list (so "*" and "null" admit cross-site uploads
+ * too), and one from a page this gateway serves itself
+ * (Sec-Fetch-Site: same-origin) unless its origin is listed exactly.
  *
- * The routes that DO swap xDAI (POST /v0/storage/buy, POST
- * /v0/storage/extend, POST /v0/settlement/deposit) are guarded
- * separately: they refuse (403) requests from web pages whatever this
- * list says, except from an origin listed here exactly — "*" and
- * "null" never unlock them. Listing an exact origin therefore also
- * lets that site spend the wallet's xDAI.
+ * The routes that spend the wallet (POST /stamps/{amount}/{depth},
+ * PATCH /stamps/topup and /stamps/dilute, POST /chequebook/deposit and
+ * /chequebook/withdraw, and the xDAI-swapping POST /v0/storage/buy,
+ * POST /v0/storage/extend, POST /v0/settlement/deposit) and the
+ * WebSocket upgrades are stricter: they refuse (403) requests from web
+ * pages except from an origin listed here exactly — "*", "null" and
+ * wildcard entries never unlock them. Listing an exact origin therefore
+ * also lets that site spend the wallet's funds.
  *
  * Returns true on success. On failure (NULL handle, gateway running,
  * NULL, non-UTF-8 or malformed-wildcard entry) returns false, leaves the stored list
@@ -1204,6 +1212,34 @@ bool ant_set_gateway_cors(const AntHandle *handle,
                           const char *const *origins,
                           size_t origins_len,
                           char **out_err);
+
+/*
+ * Set the extra Host names the in-process gateway answers (new after
+ * 0.5.79, issue #312; the twin of antd's allowed-hosts). Takes effect at
+ * the next ant_start_gateway; like ant_set_gateway_cors it fails while a
+ * gateway is running and then changes nothing.
+ *
+ * Without it the gateway answers only requests whose Host is localhost,
+ * 127.0.0.1, [::1], a subdomain of localhost (abc.bzz.localhost) or the
+ * bound IP, each with or without the bound port; anything else gets 421.
+ * That stops a DNS-rebinding page (evil.example re-pointed at 127.0.0.1)
+ * from using the API as its own origin. `hosts` points at `hosts_len`
+ * NUL-terminated UTF-8 entries that extend the list: "host" (any port)
+ * or "host:port" (that port only), a DNS name or IP literal (IPv6 in
+ * brackets), matched case-insensitively. "*" turns the check off.
+ * NULL / hosts_len == 0 clears the list (the default); blank entries
+ * are ignored. A gateway bound to a non-loopback address with no
+ * entries does not check Host (and logs a warning).
+ *
+ * Returns true on success. On failure (NULL handle, gateway running,
+ * NULL, non-UTF-8 or malformed entry: a scheme, path or wildcard)
+ * returns false, leaves the stored list unchanged and writes an
+ * allocated message to *out_err (free with ant_free_string).
+ */
+bool ant_set_gateway_allowed_hosts(const AntHandle *handle,
+                                   const char *const *hosts,
+                                   size_t hosts_len,
+                                   char **out_err);
 
 /*
  * Stop the in-process HTTP gateway started by ant_start_gateway.

@@ -23,7 +23,7 @@
 //!   caches.
 //! - A CORS **preflight** (`OPTIONS` carrying
 //!   `Access-Control-Request-Method`) is answered directly with `204`
-//!   and the allow-method / allow-header / max-age headers — it never
+//!   and the allow-method / static allow-header / max-age headers — it never
 //!   reaches the route handlers.
 //! - Actual responses also advertise `Access-Control-Expose-Headers`
 //!   for the `Swarm-*` response headers bee-js reads (tag uid, feed
@@ -31,6 +31,12 @@
 //!
 //! When no origins are configured the middleware is a no-op (no CORS
 //! headers), matching a bee node started without `cors-allowed-origins`.
+//!
+//! The allow-list also decides which web pages may *write*
+//! ([`cross_origin_write_guard`], issue #312), spend the wallet
+//! ([`wallet_spend_guard`]) or open a WebSocket
+//! ([`websocket_origin_guard`]); those run whether or not CORS headers
+//! are enabled.
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
@@ -44,21 +50,23 @@ use crate::handle::GatewayHandle;
 /// preflight for any routed endpoint passes.
 const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS";
 
-/// Default `Access-Control-Allow-Headers` returned on a preflight that
-/// doesn't enumerate its own `Access-Control-Request-Headers`. Includes
-/// the bee upload-control headers (`Swarm-*`) plus the usual content /
-/// auth set so bee-js never trips the browser's preflight check.
-/// `Swarm-Cache` (cache bypass on `/bytes`, `/bzz` and `/chunks` downloads)
-/// and `Swarm-Postage-Stamp` (pre-signed stamp on uploads) match bee's list
-/// (<https://github.com/ethersphere/bee/pull/5698>).
-const DEFAULT_ALLOW_HEADERS: &str = "Origin, Accept, Authorization, Content-Type, \
-X-Requested-With, Range, \
+/// `Access-Control-Allow-Headers` returned on every allowed preflight.
+/// Static, like bee's `allowedHeaders`: the requested headers are not
+/// reflected (issue #312), so this has to name every request header a
+/// handler reads. Bee's list plus ant's `Swarm-Act-*` / `Gas-*` set;
+/// `Swarm-Cache` (cache bypass on `/bytes`, `/bzz` and `/chunks`
+/// downloads) and `Swarm-Postage-Stamp` (pre-signed stamp on uploads)
+/// match bee's list (<https://github.com/ethersphere/bee/pull/5698>).
+const ALLOW_HEADERS: &str = "Origin, Accept, Accept-Encoding, Accept-Ranges, Authorization, \
+Content-Type, Content-Disposition, Content-Encoding, User-Agent, X-Requested-With, Range, \
+Access-Control-Request-Headers, Access-Control-Request-Method, \
 Swarm-Tag, Swarm-Pin, Swarm-Encrypt, Swarm-Collection, Swarm-Index-Document, \
 Swarm-Error-Document, Swarm-Postage-Batch-Id, Swarm-Postage-Stamp, Swarm-Deferred-Upload, \
 Swarm-Redundancy-Level, Swarm-Redundancy-Strategy, Swarm-Redundancy-Fallback-Mode, \
-Swarm-Chunk-Retrieval-Timeout, Swarm-Cache, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
-Swarm-Soc-Signature, Swarm-Act, Swarm-Act-Publisher, Swarm-Act-History-Address, \
-Gas-Price, Gas-Limit";
+Swarm-Chunk-Retrieval-Timeout, Swarm-Lookahead-Buffer-Size, Swarm-Cache, \
+Swarm-Cache-Wrapped-Chunk, Swarm-Only-Root-Chunk, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
+Swarm-Soc-Signature, Swarm-Soc-Fields, Swarm-Act, Swarm-Act-Timestamp, Swarm-Act-Publisher, \
+Swarm-Act-History-Address, Gas-Price, Gas-Limit, Fee-Priority, Immutable";
 
 /// `Access-Control-Expose-Headers`: the response headers cross-origin
 /// JS would otherwise be unable to read. Modern bee-js reads
@@ -138,6 +146,27 @@ impl CorsConfig {
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         !self.allow_all && !self.allow_null && self.origins.is_empty() && self.suffixes.is_empty()
+    }
+
+    /// Whether the opaque `null` origin was configured (`antd` and the
+    /// FFI gateway warn about it at startup).
+    #[must_use]
+    pub fn allows_null(&self) -> bool {
+        self.allow_null
+    }
+
+    /// Whether `origin` is in the CORS allow-list at all: listed
+    /// exactly, matched by a wildcard-subdomain entry, `null` when
+    /// `null` is configured, or anything under `*`.
+    fn allows(&self, origin: &str) -> bool {
+        self.allow_origin_value(origin.trim()).is_some()
+    }
+
+    /// Whether `origin` is listed *exactly* (not via `*`, `null` or a
+    /// wildcard-subdomain entry).
+    fn lists_exactly(&self, origin: &str) -> bool {
+        let o = origin.trim().to_ascii_lowercase();
+        !o.is_empty() && o != "null" && self.origins.iter().any(|a| a == &o)
     }
 
     /// Validate one configured entry. `*`, `null` and exact origins are
@@ -243,7 +272,6 @@ const ACA_HEADERS: HeaderName = HeaderName::from_static("access-control-allow-he
 const ACA_EXPOSE: HeaderName = HeaderName::from_static("access-control-expose-headers");
 const ACA_MAX_AGE: HeaderName = HeaderName::from_static("access-control-max-age");
 const ACR_METHOD: HeaderName = HeaderName::from_static("access-control-request-method");
-const ACR_HEADERS: HeaderName = HeaderName::from_static("access-control-request-headers");
 
 /// axum middleware applying [`CorsConfig`]. Mounted via
 /// `from_fn_with_state` so it sees the same [`GatewayHandle`] state the
@@ -272,7 +300,7 @@ pub async fn cors_middleware(
     let is_preflight = req.method() == Method::OPTIONS && req.headers().contains_key(&ACR_METHOD);
 
     if is_preflight {
-        return preflight_response(&req, allow_origin.as_deref());
+        return preflight_response(allow_origin.as_deref());
     }
 
     let mut resp = next.run(req).await;
@@ -280,18 +308,143 @@ pub async fn cors_middleware(
     resp
 }
 
-/// Guard for the routes that spend the node wallet's **xDAI**
-/// (`POST /v0/storage/buy`, `POST /v0/storage/extend`,
-/// `POST /v0/settlement/deposit`) or move its chequebook's xBZZ
-/// (`POST /chequebook/withdraw`): refuse any request a web page made,
-/// unless the page's origin is listed exactly in `cors-allowed-origins`.
+/// Global guard for state-changing requests a web page makes (issue
+/// #312, a port of bee's `isForbiddenCrossOriginRequest`, ethersphere/bee
+/// PR 5651). CORS headers only stop a page from *reading* a reply; a
+/// CORS-simple write (a form `POST`, `fetch(url, {method: 'POST', mode:
+/// 'no-cors'})`) is sent without a preflight and runs anyway. So every
+/// request other than `GET`, `HEAD` and `OPTIONS` is checked here,
+/// whether or not CORS is configured:
 ///
-/// These routes take only query parameters, so a page can send them as
-/// CORS-*simple* requests (`fetch(url, {method: 'POST', mode:
+/// - `Sec-Fetch-Site: none` (typed by the user), or neither
+///   `Sec-Fetch-Site` nor `Origin` (curl, Freedom's main process, an
+///   ant-ffi host app): allowed, as in bee.
+/// - `Sec-Fetch-Site: cross-site` / `same-site`: allowed only when the
+///   `Origin` is in `cors-allowed-origins` (exact, wildcard subdomain,
+///   configured `null`, or `*`), as in bee.
+/// - `Sec-Fetch-Site: same-origin`: allowed only when the `Origin` is
+///   listed *exactly*. Beyond bee: `/bzz` content is served on the API's
+///   own origin, so any uploaded page is "same-origin" with the API and
+///   must not get write access just for that.
+/// - No `Sec-Fetch-Site` but an `Origin` (older browsers): an `Origin`
+///   naming the request's own `Host` is treated as same-origin (exact
+///   listing needed), any other as cross-site.
+///
+/// The spending routes add [`wallet_spend_guard`] on top, which also
+/// refuses `null`, `*` and wildcard matches.
+pub async fn cross_origin_write_guard(
+    State(handle): State<GatewayHandle>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match write_refusal(&handle.cors, req.method(), req.headers()) {
+        None => next.run(req).await,
+        Some(message) => {
+            tracing::debug!(
+                target: "ant_gateway",
+                method = %req.method(),
+                path = %req.uri().path(),
+                origin = ?req.headers().get(header::ORIGIN),
+                sec_fetch_site = ?req.headers().get(SEC_FETCH_SITE),
+                "write refused: {message}"
+            );
+            crate::error::json_error(StatusCode::FORBIDDEN, message)
+        }
+    }
+}
+
+/// The decision behind [`cross_origin_write_guard`]: `None` to let the
+/// request through, else the refusal message.
+pub(crate) fn write_refusal(
+    cfg: &CorsConfig,
+    method: &Method,
+    h: &axum::http::HeaderMap,
+) -> Option<&'static str> {
+    const CROSS: &str = "cross origin request not allowed; list the page's origin in \
+                         cors-allowed-origins to allow it";
+    const SAME: &str = "write requests from pages served by this API are not allowed; list \
+                        the origin exactly in cors-allowed-origins to allow them";
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return None;
+    }
+    // A header that isn't valid text reads as an unknown value, which
+    // can't be trusted as "absent".
+    let origin = h
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or("\u{0}").trim());
+    let site = h
+        .get(SEC_FETCH_SITE)
+        .map(|v| v.to_str().unwrap_or("").trim().to_ascii_lowercase());
+    match site.as_deref() {
+        Some("none") => None,
+        Some("same-origin") => (!origin.is_some_and(|o| cfg.lists_exactly(o))).then_some(SAME),
+        Some("same-site" | "cross-site") => {
+            (!origin.is_some_and(|o| cfg.allows(o))).then_some(CROSS)
+        }
+        // Absent, or a value this code doesn't know: decide on `Origin`.
+        _ => {
+            let o = origin?;
+            let host = h.get(header::HOST).and_then(|v| v.to_str().ok());
+            if origin_names_host(o, host) {
+                (!cfg.lists_exactly(o)).then_some(SAME)
+            } else {
+                (!cfg.allows(o)).then_some(CROSS)
+            }
+        }
+    }
+}
+
+/// Whether `origin`'s `host[:port]` is the request's `Host` (scheme
+/// ignored, like bee: a TLS-terminating proxy makes a same-origin page
+/// send an `https` origin to a plain-HTTP API).
+fn origin_names_host(origin: &str, host: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    origin
+        .split_once("://")
+        .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host.trim()))
+}
+
+/// Guard for the WebSocket routes (`/chunks/stream`, `/pss/subscribe`,
+/// `/gsoc/subscribe`), a port of bee's `checkOrigin` made stricter
+/// (issue #312): the upgrade is a `GET`, so [`cross_origin_write_guard`]
+/// never sees it, yet a socket lets a page stamp chunks or read the PSS
+/// inbox, and browsers don't apply CORS to web sockets at all. The
+/// `Origin` must be absent or listed exactly in `cors-allowed-origins`;
+/// `null`, `*` and wildcard-subdomain matches are refused, and so is a
+/// page served by the API itself (bee accepts its own host).
+pub async fn websocket_origin_guard(
+    State(handle): State<GatewayHandle>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if browser_request_allowed(&handle.cors, req.headers()) {
+        next.run(req).await
+    } else {
+        crate::error::json_error(
+            StatusCode::FORBIDDEN,
+            "websocket origin not allowed; list the page's origin exactly in \
+             cors-allowed-origins to allow it",
+        )
+    }
+}
+
+/// Guard for the routes that spend the node wallet's funds: the xDAI
+/// swaps (`POST /v0/storage/buy`, `POST /v0/storage/extend`,
+/// `POST /v0/settlement/deposit`), the on-chain postage writes
+/// (`POST /stamps/{amount}/{depth}`, `PATCH /stamps/topup/...`,
+/// `PATCH /stamps/dilute/...`), and the chequebook moves
+/// (`POST /chequebook/deposit`, `POST /chequebook/withdraw`): refuse
+/// any request a web page made, unless the page's origin is listed
+/// exactly in `cors-allowed-origins`.
+///
+/// These routes take only query or path parameters, so a page can send
+/// them as CORS-*simple* requests (`fetch(url, {method: 'POST', mode:
 /// 'no-cors'})`): the browser sends them without a preflight and only
 /// hides the response, which is too late — the swap and the buy have
 /// already happened. So the policy can't live in the CORS headers; the
-/// request itself has to be refused.
+/// request itself has to be refused. [`cross_origin_write_guard`]
+/// already refuses origins outside the CORS list; this one also refuses
+/// `null`, `*` and wildcard-subdomain matches.
 ///
 /// A browser always sends `Origin` on a `POST` (and `Sec-Fetch-Site` on
 /// any request); the intended callers — Freedom desktop's main process,
@@ -315,8 +468,8 @@ pub async fn wallet_spend_guard(
     } else {
         crate::error::json_error(
             StatusCode::FORBIDDEN,
-            "this route spends the node wallet's xDAI and does not accept requests from web pages; \
-             list the page's origin explicitly in cors-allowed-origins to allow it",
+            "this route spends the node wallet's funds and does not accept requests from web \
+             pages; list the page's origin explicitly in cors-allowed-origins to allow it",
         )
     }
 }
@@ -348,11 +501,8 @@ pub async fn settlement_switch_guard(
 pub(crate) fn browser_request_allowed(cfg: &CorsConfig, h: &axum::http::HeaderMap) -> bool {
     let origin = h.get(header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
     match origin {
-        Some(o) => {
-            // Only an exact listed origin; `*` and `null` don't count.
-            let o = o.trim().to_ascii_lowercase();
-            !o.is_empty() && o != "null" && cfg.origins.iter().any(|a| a == &o)
-        }
+        // Only an exact listed origin; `*` and `null` don't count.
+        Some(o) => cfg.lists_exactly(o),
         None => h
             .get(SEC_FETCH_SITE)
             .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"none")),
@@ -365,7 +515,7 @@ const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 /// origin is disallowed we still return `204` (matching bee/gorilla) but
 /// without the allow-origin header, so the browser cleanly blocks the
 /// real request rather than erroring on a malformed preflight.
-fn preflight_response(req: &Request, allow_origin: Option<&str>) -> Response {
+fn preflight_response(allow_origin: Option<&str>) -> Response {
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = StatusCode::NO_CONTENT;
     let h = resp.headers_mut();
@@ -374,16 +524,9 @@ fn preflight_response(req: &Request, allow_origin: Option<&str>) -> Response {
             h.insert(ACA_ORIGIN, v);
         }
         h.insert(ACA_METHODS, HeaderValue::from_static(ALLOW_METHODS));
-        // Echo the requested headers verbatim when present (so a custom
-        // bee-js header always passes); otherwise advertise our default
-        // bee header set.
-        let allow_headers = req
-            .headers()
-            .get(&ACR_HEADERS)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| HeaderValue::from_str(s).ok())
-            .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ALLOW_HEADERS));
-        h.insert(ACA_HEADERS, allow_headers);
+        // The static list, whatever the preflight asked for: echoing
+        // `Access-Control-Request-Headers` would allow any header name.
+        h.insert(ACA_HEADERS, HeaderValue::from_static(ALLOW_HEADERS));
         h.insert(ACA_MAX_AGE, HeaderValue::from_static(MAX_AGE_SECS));
         append_vary_origin(h);
     }

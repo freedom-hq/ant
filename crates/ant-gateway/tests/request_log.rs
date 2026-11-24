@@ -270,7 +270,8 @@ async fn complete_body_over_real_connection_is_not_aborted() {
 
     let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
     conn.write_all(
-        format!("GET /bytes/{REF} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET /bytes/{REF} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )
     .await
     .unwrap();

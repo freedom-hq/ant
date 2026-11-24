@@ -63,6 +63,10 @@ pub struct BeeConfig {
     pub blockchain_rpc_endpoint: Option<String>,
     #[serde(rename = "cors-allowed-origins")]
     pub cors_allowed_origins: Option<CorsOrigins>,
+    /// Extra `Host` names the HTTP API answers (ant extension, issue
+    /// #312); scalar or list like `cors-allowed-origins`.
+    #[serde(rename = "allowed-hosts")]
+    pub allowed_hosts: Option<CorsOrigins>,
     pub verbosity: Option<String>,
     #[serde(rename = "nat-addr")]
     pub nat_addr: Option<String>,
@@ -174,6 +178,12 @@ impl BeeConfig {
             .clone()
             .map_or_default(CorsOrigins::into_vec)
     }
+
+    pub fn allowed_hosts_vec(&self) -> Vec<String> {
+        self.allowed_hosts
+            .clone()
+            .map_or_default(CorsOrigins::into_vec)
+    }
 }
 
 /// Parse a bee config from a YAML string (test helper).
@@ -252,6 +262,21 @@ storage-incentives-enable: false
                 "https://a.example".to_string(),
                 "https://b.example".to_string()
             ],
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_accepts_scalar_and_list() {
+        let cfg = parse_str("allowed-hosts: vibing.at").unwrap();
+        assert_eq!(cfg.allowed_hosts_vec(), vec!["vibing.at".to_string()]);
+        let cfg = parse_str("allowed-hosts:\n  - vibing.at\n  - node.lan:1633").unwrap();
+        assert_eq!(
+            cfg.allowed_hosts_vec(),
+            vec!["vibing.at".to_string(), "node.lan:1633".to_string()],
+        );
+        assert_eq!(
+            parse_str("").unwrap().allowed_hosts_vec(),
+            Vec::<String>::new()
         );
     }
 

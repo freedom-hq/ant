@@ -28,7 +28,7 @@ async fn preflight_from_null_origin_is_allowed() {
             .header("access-control-request-method", "POST")
             .header(
                 "access-control-request-headers",
-                "swarm-postage-batch-id, content-type",
+                "swarm-postage-batch-id, content-type, x-made-up",
             )
             .body(Body::empty())
             .unwrap(),
@@ -39,11 +39,23 @@ async fn preflight_from_null_origin_is_allowed() {
     let h = resp.headers();
     assert_eq!(h.get("access-control-allow-origin").unwrap(), "null");
     assert!(h.contains_key("access-control-allow-methods"));
-    // Requested headers are echoed verbatim so any bee-js header passes.
-    assert_eq!(
-        h.get("access-control-allow-headers").unwrap(),
-        "swarm-postage-batch-id, content-type",
-    );
+    // The static list, not the requested headers echoed back (issue
+    // #312): the bee headers are in it, a made-up one is not.
+    let allowed = h
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    let names: Vec<&str> = allowed.split(',').map(str::trim).collect();
+    for want in [
+        "swarm-postage-batch-id",
+        "content-type",
+        "swarm-only-root-chunk",
+    ] {
+        assert!(names.contains(&want), "{want} missing: {allowed}");
+    }
+    assert!(!names.contains(&"x-made-up"), "{allowed}");
     assert!(h.contains_key("access-control-max-age"));
     assert!(h
         .get("vary")

@@ -283,6 +283,13 @@ cargo run -p antd -- \
   succeeds the flag is unnecessary, but corporate / cloud / CGNAT
   environments will need it set explicitly.
 - `--no-http-api` disables the HTTP gateway for headless deployments.
+- The gateway answers only `localhost`, `127.0.0.1`, `[::1]` and
+  `*.localhost` as `Host` on a loopback `--api-addr` (anything else is
+  `421`, against DNS rebinding). Behind a reverse proxy that forwards
+  its own `Host`, list that name with `--allowed-hosts` (or
+  `allowed-hosts:` in a `--config` file); `*` turns the check off.
+  Web pages can only write through the API, or open its WebSockets,
+  from origins in `--cors-allowed-origins`; see the gateway README.
 - `--no-disk-cache` falls back to memory-only caching.
 - `--cache-capacity <chunks>` (or `cache-capacity:` in a bee `--config`
   file) sizes the disk cache the way bee does: a chunk count, × 4096
