@@ -100,6 +100,13 @@ impl ChainReader for AntChainReader {
             .map_err(|e| e.to_string())
     }
 
+    async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
+        self.client
+            .postage_minimum_initial_balance_per_chunk(&self.postage_contract)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn batch_owner(&self, batch_id: [u8; 32]) -> Result<[u8; 20], String> {
         ant_chain::fetch_postage_batch_owner(&self.client, &self.postage_contract, &batch_id)
             .await

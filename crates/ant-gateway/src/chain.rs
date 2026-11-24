@@ -62,6 +62,15 @@ pub trait ChainReader: Send + Sync {
     async fn batch_remaining_balance(&self, _batch_id: [u8; 32]) -> Result<u128, String> {
         Err("batch_remaining_balance unsupported".to_string())
     }
+    /// `PostageStamp.minimumInitialBalancePerChunk()` — the per-chunk
+    /// balance floor (`minimumValidityBlocks × lastPrice`) a batch must
+    /// keep after `increaseDepth` halves its balance per level, or the
+    /// dilute reverts. Defaulted to "unsupported" like
+    /// [`Self::batch_remaining_balance`]; the dilute route then fails
+    /// (`502`) rather than send a resize it couldn't check.
+    async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
+        Err("minimum_balance_per_chunk unsupported".to_string())
+    }
     /// `PostageStamp.batchOwner/batchDepth/batchBucketDepth/
     /// batchImmutableFlag` — the on-chain views backing the light
     /// `GET /batches/{id}` lookup. Defaulted to "unsupported" like
@@ -1106,8 +1115,10 @@ pub async fn topup_stamp(
 /// `PATCH /stamps/dilute/{id}/{depth}`. Increases a batch's depth
 /// (doubling capacity per +1) — bee's "dilute" (PLAN.md B3). The batch
 /// is read first: a depth that doesn't raise it, a batch the node
-/// doesn't own, or an expired one (`remainingBalance` `0`) is a `400`
-/// (a batch not on chain a `404`) and nothing is sent. A batch this
+/// doesn't own, an expired one (`remainingBalance` `0`), or one whose
+/// balance after the resize (`remainingBalance >> (depth - batchDepth)`)
+/// would fall under the contract's `minimumInitialBalancePerChunk` is a
+/// `400` (a batch not on chain a `404`) and nothing is sent. A batch this
 /// node bought within the last few minutes that the chain read can't
 /// see yet (a lagging RPC backend) is checked against the node's own
 /// view of it instead of answering `404`.
@@ -1165,8 +1176,11 @@ pub async fn dilute_stamp(
         );
     }
     // `increaseDepth` also reverts on an expired batch (its balance is
-    // used up: `remainingBalance` reads `0`). A just-bought batch can't
-    // be, and a backend that hasn't seen it would revert the read.
+    // used up: `remainingBalance` reads `0`), and on one whose balance,
+    // halved per level gained, would fall under the contract's
+    // per-chunk floor (`InsufficientBalance`). A just-bought batch
+    // can't be expired, and a backend that hasn't seen it would revert
+    // the read; its floor is left to the chain.
     if just_bought.is_none() {
         let remaining = match guarded(chain.reader.batch_remaining_balance(batch_id)).await {
             Ok(r) => r,
@@ -1176,6 +1190,20 @@ pub async fn dilute_stamp(
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "batch expired: its balance is used up, so it can't be diluted",
+            );
+        }
+        let floor = match guarded(chain.reader.minimum_balance_per_chunk()).await {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+        let after = diluted_balance(remaining, depth - current_depth);
+        if after < floor {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "insufficient balance: diluting to depth {depth} leaves {after} PLUR per \
+                     chunk, under the contract's minimum of {floor}; top the batch up first"
+                ),
             );
         }
     }
@@ -1193,11 +1221,27 @@ pub async fn dilute_stamp(
     Json(BatchIdBody { batch_id: id }).into_response()
 }
 
+/// The per-chunk balance `increaseDepth` leaves a batch raised by
+/// `levels`: the contract's `remainingBalance / 2^levels` (`0` once the
+/// shift passes the value's width).
+fn diluted_balance(remaining: u128, levels: u8) -> u128 {
+    remaining.checked_shr(u32::from(levels)).unwrap_or(0)
+}
+
+/// Waits before each re-read of a wallet balance that reads short of a
+/// chequebook deposit: about two Gnosis blocks (5s each) in all, so a
+/// backend a block or two behind the one that credited the wallet
+/// catches up before the deposit is refused.
+const DEPOSIT_BALANCE_RECHECKS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(5)];
+
 /// `POST /chequebook/deposit?amount=`. Funds the chequebook by
 /// transferring xBZZ into it; returns the `transactionHash` (PLAN.md
 /// D3). Freedom auto-deposits post-purchase. An amount of `0`, no
 /// chequebook to deposit into, or an amount above the wallet's xBZZ
-/// balance is a `400` and nothing is sent.
+/// balance is a `400` and nothing is sent. A balance that reads short
+/// is re-read for about two blocks first, so a lagging RPC backend
+/// that hasn't seen the xBZZ just credited (a swap moments earlier)
+/// doesn't refuse a deposit the chain would take.
 pub async fn chequebook_deposit(
     State(handle): State<GatewayHandle>,
     Query(q): Query<HashMap<String, String>>,
@@ -1237,12 +1281,23 @@ pub async fn chequebook_deposit(
     // wallet transaction can't spend the xBZZ counted here (like the
     // buy's guard). An unaffordable transfer would revert on chain.
     let _tx = chain.tx_lock.lock().await;
-    let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    if amount > balance {
-        return json_error(StatusCode::BAD_REQUEST, "out of funds");
+    // A short read may only be a lagging RPC backend that hasn't seen
+    // the block crediting the wallet (Freedom deposits right after a
+    // swap/purchase), so read again across a block or two before the
+    // definitive "out of funds".
+    let mut rechecks = DEPOSIT_BALANCE_RECHECKS.iter();
+    loop {
+        let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        if amount <= balance {
+            break;
+        }
+        match rechecks.next() {
+            Some(wait) => tokio::time::sleep(*wait).await,
+            None => return json_error(StatusCode::BAD_REQUEST, "out of funds"),
+        }
     }
     let tx = match guarded_tx(w.deposit_chequebook(amount)).await {
         Ok(h) => h,

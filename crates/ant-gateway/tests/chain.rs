@@ -77,7 +77,15 @@ impl ChainReader for FakeChain {
             _ => Ok(1_000_000),
         }
     }
+    /// [`FAKE_MIN_BALANCE`]: the `1_000_000` left on a batch covers a
+    /// dilute of up to two levels (`250_000` per chunk), not three.
+    async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
+        Ok(FAKE_MIN_BALANCE)
+    }
 }
+
+/// [`FakeChain`]'s `minimumInitialBalancePerChunk`.
+const FAKE_MIN_BALANCE: u128 = 200_000;
 
 /// [`FakeChain`]'s node-wallet xBZZ balance.
 const FAKE_BZZ_BALANCE: u128 = 1_500_000_000_000_000_000;
@@ -598,7 +606,7 @@ async fn write_endpoints_wait_for_the_wallet_tx_lock() {
 /// `POST /chequebook/deposit` refuses, with a `400` and no transaction,
 /// a deposit of nothing and one the wallet can't cover (it would
 /// revert on chain and burn the gas). Exactly the balance goes through.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deposit_refuses_zero_and_more_than_the_wallet_holds() {
     let over = format!("/chequebook/deposit?amount={}", FAKE_BZZ_BALANCE + 1);
     for (uri, message) in [
@@ -648,6 +656,86 @@ async fn deposit_refuses_zero_and_more_than_the_wallet_holds() {
     );
 }
 
+/// A deposit whose balance read comes back short is read again for
+/// about two blocks before the "out of funds": a lagging RPC backend
+/// that catches up within them lets the deposit through, and one that
+/// never shows the xBZZ still refuses it, with nothing sent either way.
+#[tokio::test(start_paused = true)]
+async fn deposit_rereads_a_short_balance_before_refusing() {
+    /// [`FakeChain`], but the wallet's xBZZ balance reads `0` for the
+    /// first `stale_reads` reads (a backend behind the crediting block).
+    struct LaggingBalance {
+        stale_reads: usize,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ChainReader for LaggingBalance {
+        async fn block_number(&self) -> Result<u64, String> {
+            FakeChain.block_number().await
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            FakeChain.current_price().await
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            FakeChain.total_amount().await
+        }
+        async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.stale_reads {
+                Ok(0)
+            } else {
+                FakeChain.bzz_balance(who).await
+            }
+        }
+        async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.native_balance(who).await
+        }
+        async fn chequebook_balance(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_balance(cb).await
+        }
+        async fn chequebook_total_paid_out(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_total_paid_out(cb).await
+        }
+    }
+    for (stale_reads, want, reads) in [
+        (1, StatusCode::CREATED, 2),
+        (2, StatusCode::CREATED, 3),
+        (usize::MAX, StatusCode::BAD_REQUEST, 3),
+    ] {
+        let reader = Arc::new(LaggingBalance {
+            stale_reads,
+            reads: std::sync::atomic::AtomicUsize::default(),
+        });
+        let writer = Arc::new(FundingWriter::default());
+        let ctx = Arc::new(ChainContext {
+            reader: reader.clone(),
+            wallet_eth: [0x11; 20],
+            chequebook: ChequebookSlot::new(Some([0xCD; 20])),
+            chain_id: 100,
+            writer: Some(writer.clone()),
+            writes: WriteGate::default(),
+            tx_lock: WalletTxLock::default(),
+        });
+        let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+        let started = tokio::time::Instant::now();
+        let (status, json) = req(router, Method::POST, "/chequebook/deposit?amount=1000").await;
+        assert_eq!(status, want, "{stale_reads}: {json}");
+        assert_eq!(
+            reader.reads.load(std::sync::atomic::Ordering::SeqCst),
+            reads,
+            "{stale_reads}"
+        );
+        // Bounded: never more than the two re-read waits.
+        assert!(started.elapsed() <= std::time::Duration::from_secs(10));
+        if want == StatusCode::CREATED {
+            assert_eq!(writer.calls(), ["deposit_chequebook(1000)"]);
+        } else {
+            assert_eq!(json["message"], "out of funds");
+            assert!(writer.calls().is_empty(), "{:?}", writer.calls());
+        }
+    }
+}
+
 /// `PATCH /stamps/dilute` reads the batch first and refuses, with a
 /// `400` and no `increaseDepth`, a depth that doesn't raise it, a batch
 /// the node doesn't own and an expired one (all would revert on chain). A batch the
@@ -679,6 +767,18 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
             format!("/stamps/dilute/{expired}/{}", FAKE_BATCH_DEPTH + 1),
             StatusCode::BAD_REQUEST,
         ),
+        // `1_000_000 >> 3` is under the contract's floor:
+        // `increaseDepth` would revert with `InsufficientBalance`.
+        (
+            format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + 3),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("/stamps/dilute/{ours}/60"), StatusCode::BAD_REQUEST),
+        // A shift past the balance's width leaves nothing, not a panic.
+        (
+            format!("/stamps/dilute/{ours}/255"),
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         let writer = Arc::new(FundingWriter::default());
         let (router, seen) = status_router_recording_registrations(
@@ -691,15 +791,88 @@ async fn dilute_refuses_a_shallower_depth_and_a_foreign_batch() {
         assert!(seen.lock().unwrap().is_empty(), "{uri} re-registered");
     }
 
+    let uri = format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + 3);
     let writer = Arc::new(FundingWriter::default());
     let router = status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
-    let uri = format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + 1);
-    let (status, _) = req(router, Method::PATCH, &uri).await;
-    assert_eq!(status, StatusCode::OK);
+    let (_, json) = req(router, Method::PATCH, &uri).await;
     assert_eq!(
-        writer.calls(),
-        [format!("dilute_batch(ab, {})", FAKE_BATCH_DEPTH + 1)]
+        json["message"],
+        format!(
+            "insufficient balance: diluting to depth {} leaves 125000 PLUR per chunk, under \
+             the contract's minimum of {FAKE_MIN_BALANCE}; top the batch up first",
+            FAKE_BATCH_DEPTH + 3
+        )
     );
+
+    // One and two levels up (the most the balance covers) go through.
+    for levels in [1, 2] {
+        let writer = Arc::new(FundingWriter::default());
+        let router =
+            status_router_with_chain(snapshot_with_one_peer(), funding_ctx(writer.clone()));
+        let uri = format!("/stamps/dilute/{ours}/{}", FAKE_BATCH_DEPTH + levels);
+        let (status, _) = req(router, Method::PATCH, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            writer.calls(),
+            [format!("dilute_batch(ab, {})", FAKE_BATCH_DEPTH + levels)]
+        );
+    }
+}
+
+/// A failed `minimumInitialBalancePerChunk` read fails the dilute
+/// (`502`) instead of sending it unchecked.
+#[tokio::test]
+async fn dilute_fails_when_the_minimum_read_fails() {
+    struct NoMinimumReads;
+    #[async_trait]
+    impl ChainReader for NoMinimumReads {
+        async fn block_number(&self) -> Result<u64, String> {
+            FakeChain.block_number().await
+        }
+        async fn current_price(&self) -> Result<u128, String> {
+            FakeChain.current_price().await
+        }
+        async fn total_amount(&self) -> Result<u128, String> {
+            FakeChain.total_amount().await
+        }
+        async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.bzz_balance(who).await
+        }
+        async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String> {
+            FakeChain.native_balance(who).await
+        }
+        async fn chequebook_balance(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_balance(cb).await
+        }
+        async fn chequebook_total_paid_out(&self, cb: [u8; 20]) -> Result<u128, String> {
+            FakeChain.chequebook_total_paid_out(cb).await
+        }
+        async fn batch_meta(&self, id: [u8; 32]) -> Result<ant_gateway::BatchMetaView, String> {
+            FakeChain.batch_meta(id).await
+        }
+        async fn batch_remaining_balance(&self, id: [u8; 32]) -> Result<u128, String> {
+            FakeChain.batch_remaining_balance(id).await
+        }
+    }
+    let writer = Arc::new(FundingWriter::default());
+    let ctx = Arc::new(ChainContext {
+        reader: Arc::new(NoMinimumReads),
+        wallet_eth: [0x11; 20],
+        chequebook: ChequebookSlot::new(None),
+        chain_id: 100,
+        writer: Some(writer.clone()),
+        writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
+    });
+    let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+    let uri = format!(
+        "/stamps/dilute/{}/{}",
+        hex::encode([0xAB; 32]),
+        FAKE_BATCH_DEPTH + 1
+    );
+    let (status, _) = req(router, Method::PATCH, &uri).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(writer.calls().is_empty(), "{:?}", writer.calls());
 }
 
 /// A failed batch read fails the dilute (`502`) instead of sending it
