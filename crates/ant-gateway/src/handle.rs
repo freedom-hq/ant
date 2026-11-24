@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::chain::ChainContext;
 use crate::cors::CorsConfig;
+use crate::hosts::HostPolicy;
 use crate::tags::TagRegistry;
 
 /// Static identity surface used by `/addresses`. All fields are owned
@@ -118,6 +119,11 @@ pub struct GatewayHandle {
     /// (`null`) origin. With the default (deny) config no CORS headers
     /// are emitted, matching a bee node started without the option.
     pub cors: Arc<CorsConfig>,
+    /// `Host` allowlist (`allowed-hosts`, issue #312), checked before
+    /// anything else. Build it with [`HostPolicy::new`] from config;
+    /// [`crate::Gateway::serve`] resolves it against the listener's real
+    /// address. The default accepts only the loopback names.
+    pub hosts: Arc<HostPolicy>,
     /// The node's secp256k1 signing secret, used as the ACT
     /// **publisher** identity — exactly bee, whose access-control
     /// session is `accesscontrol.NewDefaultSession(swarmPrivateKey)`

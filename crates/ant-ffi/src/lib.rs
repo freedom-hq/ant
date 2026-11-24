@@ -46,7 +46,10 @@ pub use chain_transport::{
     ant_set_chain_transport, AntChainTransportFn, ANT_CHAIN_TRANSPORT_NULL_HANDLE,
     ANT_CHAIN_TRANSPORT_OK, ANT_CHAIN_TRANSPORT_UNSUPPORTED,
 };
-pub use gateway::{ant_chain_init, ant_set_gateway_cors, ant_start_gateway, ant_stop_gateway};
+pub use gateway::{
+    ant_chain_init, ant_set_gateway_allowed_hosts, ant_set_gateway_cors, ant_start_gateway,
+    ant_stop_gateway,
+};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
@@ -202,6 +205,11 @@ pub struct AntHandle {
     /// (the setter checks under the `gateway_task` lock), so a live
     /// gateway always serves exactly the list it started with.
     gateway_cors: Mutex<Vec<String>>,
+    /// Extra `Host` names the next [`ant_start_gateway`] answers, set by
+    /// [`ant_set_gateway_allowed_hosts`] (issue #312). Empty by default:
+    /// only the loopback names. Written under the same rule as
+    /// `gateway_cors`.
+    gateway_allowed_hosts: Mutex<Vec<String>>,
     /// The `AntStream` publisher throughput benchmark currently running
     /// on this handle, if any (issue #67 stage 1). `None` until
     /// [`ant_bench_start`]; cleared by [`ant_bench_stop`]. Exactly one
@@ -1067,6 +1075,7 @@ fn init_inner(
         memory_cache,
         gateway_task: Mutex::new(None),
         gateway_cors: Mutex::new(Vec::new()),
+        gateway_allowed_hosts: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
         publisher: Mutex::new(None),
         announcing: AtomicBool::new(false),
@@ -5641,6 +5650,104 @@ mod tests {
         );
     }
 
+    fn set_allowed_hosts(h: *const AntHandle, hosts: &[&str]) -> Result<(), String> {
+        let owned: Vec<std::ffi::CString> = hosts
+            .iter()
+            .map(|o| std::ffi::CString::new(*o).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let ok =
+            unsafe { ant_set_gateway_allowed_hosts(h, ptrs.as_ptr(), ptrs.len(), &raw mut err) };
+        let msg = unsafe { take_err(err) };
+        if ok {
+            Ok(())
+        } else {
+            Err(msg)
+        }
+    }
+
+    /// `GET /health` with the given `Host` header; the status line.
+    fn status_for_host(addr: std::net::SocketAddr, host: &str) -> String {
+        use std::io::{Read, Write};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("connect {addr}: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        let text = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+        text.lines().next().unwrap_or("").to_string()
+    }
+
+    /// Issue #312: the in-process gateway answers only loopback `Host`
+    /// names on its own port (no DNS rebinding), plus what the host
+    /// adds with `ant_set_gateway_allowed_hosts`, which follows the
+    /// CORS setter's rules (validated, fixed while running).
+    #[test]
+    fn gateway_checks_the_host_header() {
+        let h = gateway_test_handle("gw-allowed-hosts");
+        let addr = start_test_gateway(&h);
+        let port = addr.port();
+        for ok in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("abc.bzz.localhost:{port}"),
+            "localhost".to_string(),
+        ] {
+            let status = status_for_host(addr, &ok);
+            assert!(status.starts_with("http/1.1 200"), "{ok}: {status}");
+        }
+        for bad in [
+            format!("evil.example:{port}"),
+            format!("localhost:{}", port.wrapping_add(1)),
+            "vibing.at".to_string(),
+        ] {
+            let status = status_for_host(addr, &bad);
+            assert!(status.starts_with("http/1.1 421"), "{bad}: {status}");
+        }
+
+        let err = set_allowed_hosts(&raw const h, &["vibing.at"]).expect_err("running");
+        assert!(err.contains("gateway is running"), "{err}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        for bad in ["https://vibing.at", "vibing.at/ant", "*.vibing.at"] {
+            let err = set_allowed_hosts(&raw const h, &[bad]).expect_err(bad);
+            assert!(err.contains("host 0"), "{bad}: {err}");
+        }
+        set_allowed_hosts(&raw const h, &["vibing.at", " "]).expect("set after stop");
+        assert_eq!(
+            *h.gateway_allowed_hosts.lock().unwrap(),
+            vec!["vibing.at".to_string()]
+        );
+        let addr = start_test_gateway(&h);
+        let status = status_for_host(addr, "vibing.at");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        let status = status_for_host(addr, "evil.example");
+        assert!(status.starts_with("http/1.1 421"), "{status}");
+        unsafe { ant_stop_gateway(&raw const h) };
+
+        set_allowed_hosts(&raw const h, &["*"]).expect("star");
+        let addr = start_test_gateway(&h);
+        let status = status_for_host(addr, "evil.example");
+        assert!(status.starts_with("http/1.1 200"), "{status}");
+        unsafe { ant_stop_gateway(&raw const h) };
+    }
+
     #[test]
     fn set_gateway_cors_rejects_bad_input_without_changing_the_list() {
         let h = gateway_test_handle("gw-cors-bad-input");
@@ -5919,6 +6026,7 @@ mod tests {
             memory_cache: Arc::new(InMemoryChunkCache::new(8)),
             gateway_task: Mutex::new(None),
             gateway_cors: Mutex::new(Vec::new()),
+            gateway_allowed_hosts: Mutex::new(Vec::new()),
             bench: Mutex::new(None),
             publisher: Mutex::new(None),
             announcing: AtomicBool::new(false),

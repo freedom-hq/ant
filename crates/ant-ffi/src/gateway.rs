@@ -21,34 +21,34 @@
 //! `/stamps`, … A host whose own pages need cross-origin access opts
 //! in with [`ant_set_gateway_cors`] before starting (issue #101).
 //!
-//! CORS only governs whether a page may *read* a response. It does not
-//! stop a page from *sending* a request: a CORS-simple request (a
-//! `POST` with no body or a form/text body and no custom headers) needs
-//! no preflight, so any page can still fire the state-changing routes —
+//! CORS headers only govern whether a page may *read* a response; a
+//! CORS-simple request (a `POST` with no body or a form/text body and no
+//! custom headers) is sent without a preflight. So the gateway also
+//! refuses writes itself (issue #312, a port of bee's cross-origin
+//! write block): any request other than `GET`/`HEAD`/`OPTIONS` from a
+//! web page gets `403` unless the page's origin is in the
+//! [`ant_set_gateway_cors`] list, and one from a page the gateway serves
+//! itself (`Sec-Fetch-Site: same-origin`, e.g. a `/bzz` site) unless
+//! the origin is listed exactly. The routes that spend the wallet —
 //! `POST /stamps/{amount}/{depth}` (buys a batch and, with a
-//! `gnosis_rpc`, then deploys a chequebook if the account has none and
-//! funds it, or tops up an existing one below the settlement-deposit
-//! target, by transferring the wallet's existing xBZZ — every one of
-//! those transactions costs xDAI gas; nothing is swapped),
-//! `POST /chequebook/deposit` (moves xBZZ, paying xDAI gas) —
-//! with `mode: 'no-cors'`, whatever
-//! the allow-list says. Those routes are unprotected against
-//! cross-site requests; see issue #105.
+//! `gnosis_rpc`, may deploy and fund a chequebook), `PATCH
+//! /stamps/topup|dilute/...`, `POST /chequebook/deposit|withdraw`, and
+//! the xDAI-swapping `POST /v0/storage/buy`, `POST /v0/storage/extend`
+//! and `POST /v0/settlement/deposit` — and the WebSocket upgrades
+//! (`/chunks/stream`, `/pss/subscribe`, `/gsoc/subscribe`) go further:
+//! a web page needs an origin listed exactly (`*`, `null` and wildcard
+//! entries don't count). The host itself (no `Origin`, no
+//! `Sec-Fetch-Site`) is never refused.
 //!
-//! The gateway also serves the xDAI storage-funding routes,
-//! `POST /v0/storage/buy`, `POST /v0/storage/extend` and
-//! `POST /v0/settlement/deposit`, which **do** swap the wallet's xDAI
-//! into xBZZ (and then buy/extend a batch or fund the chequebook
-//! deposit). Those refuse (`403`) any request carrying a browser
-//! `Origin` or cross-origin `Sec-Fetch-Site`, unless the origin is listed
-//! exactly in [`ant_set_gateway_cors`] — `*` and `null` don't count. So
-//! a page can't spend xDAI through them, but an exactly listed origin
-//! can; the host itself (no `Origin`) always can.
+//! The gateway answers only loopback `Host` names (`localhost`,
+//! `127.0.0.1`, `[::1]`, `*.localhost`) on its own port, plus what
+//! [`ant_set_gateway_allowed_hosts`] adds, so a DNS-rebinding page
+//! can't reach it under its own name.
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
 use ant_gateway::{
-    CorsConfig, Gateway, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry,
+    CorsConfig, Gateway, GatewayChainState, GatewayHandle, GatewayIdentity, HostPolicy, TagRegistry,
 };
 use k256::ecdsa::SigningKey;
 use std::ffi::{c_char, CStr};
@@ -126,22 +126,24 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// CORS: the gateway lets cross-origin pages read its responses only
 /// for the origins last set with [`ant_set_gateway_cors`]; by default
 /// none, so it sends no CORS headers and no page from another origin can
-/// read its responses. That does not stop a page from *sending*
-/// CORS-simple requests, which still execute — including spending ones
-/// like `POST /stamps/{amount}/{depth}` (which may also deploy a
-/// chequebook and move xBZZ into a new or under-funded one, above) and
-/// `POST /chequebook/deposit` (see the module docs). The xDAI-swapping
-/// `/v0/storage/buy`, `/v0/storage/extend` and `POST
-/// /v0/settlement/deposit` routes it also serves refuse any request
-/// from a web page unless its origin is listed exactly (not `*` or
-/// `null`) in [`ant_set_gateway_cors`].
+/// read its responses. The same list gates writes: a non-`GET` request
+/// from a page whose origin isn't in it is refused (`403`), and the
+/// wallet-spending routes (`POST /stamps/{amount}/{depth}`, which may
+/// also deploy a chequebook and move xBZZ into a new or under-funded
+/// one, above; the stamp top-up/dilute and chequebook routes; the
+/// xDAI-swapping `/v0/storage/buy`, `/v0/storage/extend` and `POST
+/// /v0/settlement/deposit`) and the WebSocket routes refuse any web page
+/// whose origin isn't listed exactly (not `*` or `null`); see the module
+/// docs. `Host` is checked against the loopback names plus
+/// [`ant_set_gateway_allowed_hosts`].
 ///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
 /// (free with [`crate::ant_free_string`]). Idempotent: a second call
 /// while one is live is a success that leaves the running gateway
-/// untouched — it keeps the CORS list and chain wiring it started with
-/// (a changed [`ant_set_gateway_cors`] list only applies after
+/// untouched — it keeps the CORS and allowed-hosts lists and chain
+/// wiring it started with (a changed [`ant_set_gateway_cors`] or
+/// [`ant_set_gateway_allowed_hosts`] list only applies after
 /// [`ant_stop_gateway`] + start). With a `gnosis_rpc` it re-runs the
 /// chain startup work above, retrying only what hasn't succeeded yet: a
 /// batch whose check failed or is still pending is re-read, and a
@@ -281,6 +283,15 @@ pub unsafe extern "C" fn ant_start_gateway(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter(),
         );
+        // Likewise the extra `Host` names (`ant_set_gateway_allowed_hosts`);
+        // `Gateway::serve` resolves them against the bound address.
+        let hosts = HostPolicy::new(
+            handle
+                .gateway_allowed_hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter(),
+        );
 
         // Probe-bind synchronously so a port clash surfaces as a clean
         // FFI error instead of a silently-dead background task. There's
@@ -406,6 +417,8 @@ pub unsafe extern "C" fn ant_start_gateway(
             // fetch that is redirected after a cross-origin hop carries
             // `Origin: null` (issue #101).
             cors: Arc::new(cors),
+            // Loopback names plus the host's extra ones (issue #312).
+            hosts: Arc::new(hosts),
             // The FFI path resolves its chain wiring before starting
             // the gateway, so the slot is preset — no chain-init 503
             // window here. On-chain reader/writer when built with the
@@ -677,24 +690,22 @@ pub unsafe extern "C" fn ant_chain_init(
 /// page whose request was redirected across origins (the Fetch spec
 /// taints the origin to `null`), and `*` matches every page.
 ///
-/// This list protects *reads* only. An empty list does not block
-/// writes: a CORS-simple request needs no preflight, so any page can
-/// still `POST /stamps/{amount}/{depth}` or `POST /chequebook/deposit`
-/// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) and the gateway
-/// executes it — spending the wallet's xBZZ (for `/stamps` both the
-/// batch and a transfer into a new or under-funded chequebook's
-/// deposit) and xDAI gas for every transaction it sends — the batch
-/// purchase and, for `/stamps`, deploying a chequebook if there is none
-/// yet and the deposit transfer into a new or under-funded one; nothing
-/// is swapped — even though the page cannot read the reply. Don't rely
-/// on this call to protect the wallet's funds.
+/// The list also gates writes (issue #312). A CORS-simple request
+/// (`fetch(url, {method: 'POST', mode: 'no-cors'})`) needs no
+/// preflight, so the gateway refuses it itself: any request other than
+/// `GET`/`HEAD`/`OPTIONS` from a web page gets `403` unless the page's
+/// origin is in this list (so `*` and `null` admit cross-site uploads
+/// too), and one from a page the gateway serves itself
+/// (`Sec-Fetch-Site: same-origin`) unless its origin is listed exactly.
 ///
-/// The routes that *do* swap xDAI (`POST /v0/storage/buy`,
-/// `POST /v0/storage/extend`, `POST /v0/settlement/deposit`) are
-/// guarded separately: they refuse (`403`) requests from web pages
-/// whatever this list says, except from an origin listed here exactly —
-/// `*` and `null` never unlock them. Listing an exact origin therefore
-/// also lets that site spend the wallet's xDAI.
+/// The routes that spend the wallet (`POST /stamps/{amount}/{depth}`,
+/// `PATCH /stamps/topup|dilute/...`, `POST /chequebook/deposit|withdraw`,
+/// and the xDAI-swapping `POST /v0/storage/buy`,
+/// `POST /v0/storage/extend`, `POST /v0/settlement/deposit`) and the
+/// WebSocket upgrades are stricter: they refuse (`403`) requests from
+/// web pages except from an origin listed here exactly — `*`, `null` and
+/// wildcard entries never unlock them. Listing an exact origin therefore
+/// also lets that site spend the wallet's funds.
 ///
 /// Returns `true` on success; `false` with an allocated message in
 /// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a
@@ -718,40 +729,111 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
     out_err: *mut *mut c_char,
 ) -> bool {
     unsafe {
+        set_gateway_list(
+            handle,
+            origins,
+            origins_len,
+            out_err,
+            ("ant_set_gateway_cors", "origin"),
+            CorsConfig::check_entry,
+            |h| &h.gateway_cors,
+        )
+    }
+}
+
+/// Set the extra `Host` names the in-process gateway answers (the FFI
+/// twin of antd's `allowed-hosts`, issue #312). Takes effect at the next
+/// [`ant_start_gateway`]; like [`ant_set_gateway_cors`], it fails while a
+/// gateway is running on `handle`.
+///
+/// The gateway binds loopback and answers only requests whose `Host` is
+/// `localhost`, `127.0.0.1` or `[::1]`, a subdomain of `localhost`
+/// (`abc.bzz.localhost`), or the bound IP, each with or without the
+/// bound port; anything else gets `421` (a wildcard `api_addr`,
+/// `0.0.0.0`/`[::]`, has no single bound IP, so list any IP literal
+/// clients use). That stops a DNS-rebinding page
+/// (`http://evil.example:<port>` re-pointed at `127.0.0.1`) from
+/// talking to the API as its own origin. `hosts` points at `hosts_len`
+/// NUL-terminated UTF-8 entries that extend the list: `host` (any port)
+/// or `host:port` (that port only; `:443`/`:80` also match a `Host`
+/// without a port, as browsers send it), a DNS name or IP literal (IPv6 in
+/// brackets), matched case-insensitively. `*` turns the check off. A
+/// null `hosts` or `hosts_len == 0` clears the list (the default);
+/// blank entries are ignored. A gateway on a non-loopback address with
+/// no entries doesn't check `Host` (and logs a warning).
+///
+/// Returns `true` on success; `false` with an allocated message in
+/// `out_err` (free with [`crate::ant_free_string`]) on a null handle, a
+/// running gateway, or a null/non-UTF-8/malformed entry (a scheme,
+/// path or wildcard) — the stored list is then left unchanged.
+///
+/// # Safety
+///
+/// `handle` must come from [`crate::ant_init`] and must not have been
+/// passed to [`crate::ant_shutdown`]. If `hosts_len > 0` and `hosts` is
+/// non-null, `hosts` must point to `hosts_len` readable
+/// `*const c_char`s, each a NUL-terminated string (a null entry is
+/// reported as an error). `out_err`, if non-null, must point to a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_set_gateway_allowed_hosts(
+    handle: *const AntHandle,
+    hosts: *const *const c_char,
+    hosts_len: usize,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        set_gateway_list(
+            handle,
+            hosts,
+            hosts_len,
+            out_err,
+            ("ant_set_gateway_allowed_hosts", "host"),
+            HostPolicy::check_entry,
+            |h| &h.gateway_allowed_hosts,
+        )
+    }
+}
+
+/// The body shared by [`ant_set_gateway_cors`] and
+/// [`ant_set_gateway_allowed_hosts`]: read and validate a C string list,
+/// then store it in `slot(handle)` if no gateway is running. `names` is
+/// `(function name, entry noun)` for the error messages.
+unsafe fn set_gateway_list(
+    handle: *const AntHandle,
+    items: *const *const c_char,
+    items_len: usize,
+    out_err: *mut *mut c_char,
+    (name, noun): (&str, &str),
+    check: fn(&str) -> Result<(), String>,
+    slot: fn(&AntHandle) -> &std::sync::Mutex<Vec<String>>,
+) -> bool {
+    unsafe {
         clear_out_err(out_err);
         let Some(handle) = handle.as_ref() else {
-            write_out_err(out_err, "ant_set_gateway_cors: null handle");
+            write_out_err(out_err, &format!("{name}: null handle"));
             return false;
         };
 
         let mut list = Vec::new();
-        if !origins.is_null() {
-            for i in 0..origins_len {
-                let ptr = *origins.add(i);
+        if !items.is_null() {
+            for i in 0..items_len {
+                let ptr = *items.add(i);
                 if ptr.is_null() {
-                    write_out_err(
-                        out_err,
-                        &format!("ant_set_gateway_cors: origin {i} is null"),
-                    );
+                    write_out_err(out_err, &format!("{name}: {noun} {i} is null"));
                     return false;
                 }
                 match CStr::from_ptr(ptr).to_str().map(str::trim) {
                     Ok("") => {}
                     Ok(o) => {
-                        if let Err(e) = CorsConfig::check_entry(o) {
-                            write_out_err(
-                                out_err,
-                                &format!("ant_set_gateway_cors: origin {i}: {e}"),
-                            );
+                        if let Err(e) = check(o) {
+                            write_out_err(out_err, &format!("{name}: {noun} {i}: {e}"));
                             return false;
                         }
                         list.push(o.to_string());
                     }
                     Err(_) => {
-                        write_out_err(
-                            out_err,
-                            &format!("ant_set_gateway_cors: origin {i} is not valid UTF-8"),
-                        );
+                        write_out_err(out_err, &format!("{name}: {noun} {i} is not valid UTF-8"));
                         return false;
                     }
                 }
@@ -768,12 +850,11 @@ pub unsafe extern "C" fn ant_set_gateway_cors(
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
             write_out_err(
                 out_err,
-                "ant_set_gateway_cors: gateway is running; call ant_stop_gateway first",
+                &format!("{name}: gateway is running; call ant_stop_gateway first"),
             );
             return false;
         }
-        *handle
-            .gateway_cors
+        *slot(handle)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = list;
         true

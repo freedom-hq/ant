@@ -82,6 +82,11 @@
 //!   (`decodeChunkWithStamp`).
 //! * Each successfully stored chunk is acked with an **empty binary
 //!   message** (bee's `successWsMsg = []byte{}`).
+//! * A message over a stamp plus a maximum-size SOC
+//!   ([`LEGACY_MAX_MESSAGE`], bee's `chunkStreamMaxMessageSize` from
+//!   ethersphere/bee PR 5651) is refused by the WebSocket layer, which
+//!   closes the socket without buffering it; 15 minutes without a client
+//!   frame drops the connection (bee's `streamReadTimeout`).
 //! * Errors close the socket with a Close frame: `1003` ("invalid
 //!   message") for a non-binary message, `1011` with bee's message for
 //!   decode/validation/store failures ("message too small for stamp +
@@ -129,6 +134,15 @@ const CLOSE_INTERNAL: u16 = 1011;
 const STAMP_SIZE: usize = 113;
 /// `span(8) ‖ payload(≤4096)`.
 const MAX_CHUNK_WIRE: usize = 8 + 4096;
+/// Bee's `swarm.SocMaxChunkSize`: `id(32) ‖ signature(65)` ahead of the
+/// largest chunk wire.
+const SOC_MAX_CHUNK_SIZE: usize = 32 + 65 + MAX_CHUNK_WIRE;
+/// Bee's `chunkStreamMaxMessageSize` (ethersphere/bee PR 5651): the
+/// largest message the legacy stream reads, a stamp followed by a
+/// maximum-size single owner chunk. Anything larger is refused by the
+/// WebSocket layer before it is buffered (issue #312); the library's
+/// default would buffer up to 64 MiB per message.
+const LEGACY_MAX_MESSAGE: usize = STAMP_SIZE + SOC_MAX_CHUNK_SIZE;
 
 /// Bee's `chunkStreamSubprotocol`: offered by the client, selected by
 /// the node, and the switch between the two protocols on this path.
@@ -225,7 +239,11 @@ fn legacy_handshake(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_upload_stream(handle, socket, batch_id, tag))
+    ws.max_message_size(LEGACY_MAX_MESSAGE)
+        .max_frame_size(LEGACY_MAX_MESSAGE)
+        .on_upgrade(move |socket| {
+            handle_upload_stream(handle, socket, batch_id, tag, STREAM_READ_TIMEOUT)
+        })
 }
 
 /// v1 pre-upgrade checks, in bee's order: upgrade request, header
@@ -853,6 +871,7 @@ async fn handle_upload_stream(
     mut socket: WebSocket,
     batch_id: Option<[u8; 32]>,
     tag: Option<u32>,
+    read_timeout: Duration,
 ) {
     // Close the socket with bee's `sendErrorClose` shape.
     async fn error_close(socket: &mut WebSocket, code: u16, reason: &str) {
@@ -865,8 +884,10 @@ async fn handle_upload_stream(
     }
 
     loop {
-        // Client gone / transport error: nothing more to do.
-        let Some(Ok(msg)) = socket.recv().await else {
+        // Client gone / transport error (an over-long message
+        // included): nothing more to do. A client that sends nothing for
+        // `read_timeout` is dropped too, like bee's `streamReadTimeout`.
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(read_timeout, socket.recv()).await else {
             return;
         };
         let data = match msg {
@@ -1293,6 +1314,7 @@ mod tests {
             activity: GatewayActivity::new(),
             tags: Arc::new(crate::tags::TagRegistry::new()),
             cors: Arc::new(crate::cors::CorsConfig::default()),
+            hosts: Arc::default(),
             chain_state: crate::handle::GatewayChainState {
                 light_mode: true,
                 chain: None,
@@ -2022,6 +2044,82 @@ mod tests {
             }
             other => panic!("expected the legacy tag 404, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// What a legacy client reads once the node has dropped the socket:
+    /// a bare close (no application code) or the end of the stream.
+    async fn expect_dropped(ws: &mut Ws) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("socket ends in time")
+            {
+                Some(Ok(WsMsg::Ping(_) | WsMsg::Pong(_))) => {}
+                Some(Ok(WsMsg::Close(cf))) => {
+                    // Not one of the handler's own error closes.
+                    assert!(
+                        cf.as_ref().is_none_or(|cf| cf.reason.is_empty()),
+                        "unexpected close {cf:?}"
+                    );
+                    return;
+                }
+                None | Some(Err(_)) => return,
+                Some(Ok(other)) => panic!("expected the socket to drop, got {other:?}"),
+            }
+        }
+    }
+
+    /// The legacy stream reads at most a stamp plus a maximum-size SOC
+    /// per message (bee's `chunkStreamMaxMessageSize`, issue #312): a
+    /// message of exactly that size still reaches the handler (which
+    /// closes it as invalid chunk data), one byte more is refused by
+    /// the WebSocket layer and the socket is closed.
+    #[tokio::test]
+    async fn legacy_stream_caps_the_message_size() {
+        let (base, node, _) = serve(HashMap::new()).await;
+
+        let (mut ws, _) = connect(&base, "", &[], false).await.unwrap();
+        ws.send(WsMsg::Binary(vec![0u8; LEGACY_MAX_MESSAGE].into()))
+            .await
+            .unwrap();
+        expect_close(&mut ws, CloseCode::Error, "invalid chunk data").await;
+
+        let (mut ws, _) = connect(&base, "", &[], false).await.unwrap();
+        // A write error is fine: the node may hang up mid-message.
+        let _ = ws
+            .send(WsMsg::Binary(vec![0u8; LEGACY_MAX_MESSAGE + 1].into()))
+            .await;
+        expect_dropped(&mut ws).await;
+        assert!(node.seen().is_empty(), "{:?}", node.seen());
+    }
+
+    /// A legacy client that sends nothing for the read timeout is
+    /// dropped (bee's `streamReadTimeout`).
+    #[tokio::test]
+    async fn legacy_stream_drops_an_idle_client() {
+        let (handle, _node) = fake_node(HashMap::new());
+        let router = axum::Router::new().route(
+            "/chunks/stream",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let handle = handle.clone();
+                async move {
+                    ws.on_upgrade(move |socket| {
+                        handle_upload_stream(
+                            handle,
+                            socket,
+                            Some(BATCH_A),
+                            None,
+                            Duration::from_millis(200),
+                        )
+                    })
+                }
+            }),
+        );
+        let base = listen(router).await;
+        let (mut ws, _) = connect(&base, "", &[], false).await.unwrap();
+        let started = std::time::Instant::now();
+        expect_dropped(&mut ws).await;
+        assert!(started.elapsed() >= Duration::from_millis(150));
     }
 
     /// The messages' bytes, worked out by hand from bee's
