@@ -2998,9 +2998,11 @@ pub(crate) async fn chequebook_refused(
 /// if `<data_dir>/chequebook.json` already records a chequebook, it's
 /// returned without a redeploy (though a chequebook still short of its
 /// settlement deposit is topped up); otherwise this signs an on-chain
-/// `factory.deploySimpleSwap`, funds it with the account's
-/// [`plan_deposit_target`] xBZZ so its cheques are backed, persists the association, and returns
-/// the new address. Blocks on the handle's tokio runtime.
+/// `factory.deploySimpleSwap`, verifies the new chequebook on-chain
+/// (factory-registered, `issuer()` is the node EOA; see
+/// `chequebook_store::auto_deploy_chequebook`), persists the association,
+/// funds it with the account's [`plan_deposit_target`] xBZZ so its
+/// cheques are backed, and returns the new address. Blocks on the handle's tokio runtime.
 ///
 /// It also switches outbound settlement on in the running node, so a
 /// chequebook deployed now is used this session rather than from the
@@ -4933,12 +4935,12 @@ mod chain_tests {
                     } else {
                         panic!("unscripted transaction to 0x{}", hex::encode(&to));
                     };
-                    let mut sent = self.sent.lock().unwrap();
-                    sent.push(kind);
-                    word(sent.len() as u128)
+                    self.sent.lock().unwrap().push(kind);
+                    json!(format!("0x{}", hex::encode(ant_crypto::keccak256(&raw))))
                 }
                 "eth_getTransactionReceipt" => {
-                    json!({"status": "0x1", "blockNumber": "0x10", "logs": []})
+                    json!({"transactionHash": req["params"][0], "status": "0x1",
+                        "blockNumber": "0x10", "logs": []})
                 }
                 other => panic!("unscripted method {other}"),
             };

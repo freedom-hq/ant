@@ -418,6 +418,49 @@ pub enum TopUp {
     Refused(ChequebookVerdict),
 }
 
+/// The pre-deposit check shared by [`top_up_chequebook`] and
+/// [`auto_deploy_chequebook`]: [`check_chequebook`], then `Ok(Ok(()))`
+/// only when both checks were actually read and said yes.
+/// `Ok(Err(verdict))` is a "no" the chain gave; `Err` is a read that
+/// failed (a usable verdict resting on an unread check is unverified,
+/// not a yes). Either way nothing may be sent.
+#[cfg(feature = "chain-rpc")]
+async fn confirmed_for_deposit(
+    client: &crate::ChainClient,
+    node_eth: &[u8; 20],
+    chequebook: &[u8; 20],
+) -> Result<Result<(), ChequebookVerdict>, ChequebookError> {
+    let checks = check_chequebook(client, chequebook, IssuerRead::UnlessUnregistered).await;
+    match checks.verdict(node_eth) {
+        ChequebookVerdict::Usable => {}
+        refused => return Ok(Err(refused)),
+    }
+    let unread = [
+        checks.registered.err(),
+        checks.issuer.map_or_else(
+            || Some(ChequebookError::Chain("issuer() not read".into())),
+            Result::err,
+        ),
+    ];
+    if let Some(e) = unread.into_iter().flatten().next() {
+        return Err(ChequebookError::Chain(format!(
+            "could not verify the chequebook before depositing into it: {e}"
+        )));
+    }
+    Ok(Ok(()))
+}
+
+/// How often [`auto_deploy_chequebook`] reads the checks on the
+/// chequebook it just deployed before giving up, and how long it waits
+/// between reads. A load-balanced RPC can trail our own deploy by a
+/// block or two (an `issuer()` that isn't there yet, a factory "no"), so
+/// the first read right after the receipt may not see it: four reads
+/// three seconds apart cover about two Gnosis blocks.
+#[cfg(feature = "chain-rpc")]
+const DEPLOY_CHECK_ATTEMPTS: u32 = 4;
+#[cfg(feature = "chain-rpc")]
+const DEPLOY_CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Top `chequebook`'s xBZZ deposit up to `target_plur` from the node
 /// wallet. The transfer is capped to what the wallet holds: a thin
 /// wallet gives a partial deposit rather than a failed transfer (some
@@ -464,23 +507,8 @@ pub async fn top_up_chequebook(
     if amount == 0 {
         return Ok(TopUp::WalletEmpty { shortfall });
     }
-    let checks = check_chequebook(client, chequebook, IssuerRead::UnlessUnregistered).await;
-    match checks.verdict(node_eth) {
-        ChequebookVerdict::Usable => {}
-        refused => return Ok(TopUp::Refused(refused)),
-    }
-    // Usable with a read that failed is unverified, not a "yes".
-    let unread = [
-        checks.registered.err(),
-        checks.issuer.map_or_else(
-            || Some(ChequebookError::Chain("issuer() not read".into())),
-            Result::err,
-        ),
-    ];
-    if let Some(e) = unread.into_iter().flatten().next() {
-        return Err(ChequebookError::Chain(format!(
-            "could not verify the chequebook before depositing into it: {e}"
-        )));
+    if let Err(refused) = confirmed_for_deposit(client, node_eth, chequebook).await? {
+        return Ok(TopUp::Refused(refused));
     }
     let receipt = wallet
         .erc20_transfer(
@@ -612,10 +640,10 @@ async fn read_raw_retrieval_funds_unbounded(
         }
         Ok(u128::from_be_bytes(w[16..].try_into().expect("16 bytes")))
     };
-    let balance = client
-        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, chequebook)
-        .await
-        .map_err(|e| ChequebookError::Chain(format!("read chequebook balance: {e}")))?;
+    // `totalPaidOut` before `balanceOf`: the two are separate "latest"
+    // reads, and a cashout landing between them then shows up in
+    // neither (an undercount for one refresh) instead of in both (an
+    // overcount of the funds, issue #284 / MY-12).
     let paid_out = client
         .eth_call(
             &format!("0x{}", hex::encode(chequebook)),
@@ -624,6 +652,10 @@ async fn read_raw_retrieval_funds_unbounded(
         .await
         .map_err(|e| ChequebookError::Chain(format!("chequebook.totalPaidOut eth_call: {e}")))?;
     let paid_out = word(&paid_out, 0, "chequebook.totalPaidOut")?;
+    let balance = client
+        .erc20_balance_of_lower128(crate::GNOSIS_BZZ_TOKEN, chequebook)
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("read chequebook balance: {e}")))?;
     let price = client
         .eth_call(
             &format!("0x{}", hex::encode(GNOSIS_SWAP_PRICE_ORACLE)),
@@ -1229,11 +1261,23 @@ pub async fn check_chequebook(
 }
 
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
-/// gas paid by `wallet`), persist the association at `persist_path`,
-/// then optionally fund it with up to `deposit_plur` xBZZ (capped to
-/// the wallet's balance; `0` deploys it unfunded — bee still accepts
-/// the cheques, cashing waits for a later deposit). Returns the
-/// deployed chequebook address.
+/// gas paid by `wallet`), verify it, persist the association at
+/// `persist_path`, then optionally fund it with up to `deposit_plur`
+/// xBZZ (capped to the wallet's balance; `0` deploys it unfunded — bee
+/// still accepts the cheques, cashing waits for a later deposit).
+/// Returns the deployed chequebook address.
+///
+/// The address read off the deploy receipt is not trusted on its own:
+/// before anything is persisted or transferred, the same check
+/// [`top_up_chequebook`] runs before a deposit must read "registered
+/// with the factory" and "`issuer()` is `node_eth`" (issue #284). A
+/// read that fails or doesn't see the deploy yet is retried a few
+/// times ([`DEPLOY_CHECK_ATTEMPTS`]); an `issuer()` naming another EOA
+/// fails at once. On failure nothing is persisted and nothing is sent,
+/// and the error is returned: if the deploy was genuine but stayed
+/// unreadable, it is an unfunded orphan the transfer-scan rediscovery
+/// can't see (it holds no xBZZ), so the next attempt deploys again,
+/// costing one more deploy's gas and no xBZZ.
 ///
 /// A gas pre-flight runs first: a deploy we can't pay for just burns a
 /// failed-tx wait, so an underfunded wallet surfaces as
@@ -1289,14 +1333,50 @@ pub async fn auto_deploy_chequebook(
         )
         .await
         .map_err(|e| ChequebookError::Chain(format!("factory.deploySimpleSwap: {e}")))?;
-    let cb = extract_deployed_chequebook(&receipt)
+    let cb = extract_deployed_chequebook(&receipt, &GNOSIS_CHEQUEBOOK_FACTORY)
         .ok_or_else(|| ChequebookError::NoDeployLog(hex::encode(receipt.tx_hash)))?;
+
+    // Verify before persisting or funding anything (issue #284).
+    let mut attempt = 1;
+    loop {
+        let why = match confirmed_for_deposit(client, node_eth, &cb).await {
+            Ok(Ok(())) => break,
+            Ok(Err(ChequebookVerdict::IssuerMismatch(issuer))) => {
+                return Err(ChequebookError::Chain(format!(
+                    "deploy tx 0x{} names chequebook 0x{} whose issuer() is 0x{}, not this node's 0x{}; \
+                     not recording or funding it",
+                    hex::encode(receipt.tx_hash),
+                    hex::encode(cb),
+                    hex::encode(issuer),
+                    hex::encode(node_eth),
+                )));
+            }
+            Ok(Err(_)) => "the factory does not list it as deployed".to_string(),
+            Err(e) => e.to_string(),
+        };
+        if attempt >= DEPLOY_CHECK_ATTEMPTS {
+            return Err(ChequebookError::Chain(format!(
+                "could not verify the chequebook 0x{} deployed in tx 0x{} after {attempt} reads \
+                 ({why}); not recording or funding it",
+                hex::encode(cb),
+                hex::encode(receipt.tx_hash),
+            )));
+        }
+        tracing::debug!(
+            target: "ant_chain::chequebook",
+            chequebook = %format!("0x{}", hex::encode(cb)),
+            attempt,
+            "deployed chequebook not verified yet ({why}); reading again",
+        );
+        attempt += 1;
+        tokio::time::sleep(DEPLOY_CHECK_RETRY).await;
+    }
     tracing::info!(
         target: "ant_chain::chequebook",
         chequebook = %format!("0x{}", hex::encode(cb)),
         tx = %format!("0x{}", hex::encode(receipt.tx_hash)),
         block = receipt.block_number,
-        "auto-deployed chequebook",
+        "auto-deployed chequebook (factory-registered, issuer verified)",
     );
 
     // Persist before funding so a crash between the deploy and the
@@ -1654,6 +1734,46 @@ mod tests {
         read_retrieval_funds(&client, &CHEQUEBOOK).await
     }
 
+    /// Issue #284 (MY-12): `totalPaidOut` is read before `balanceOf`, so
+    /// a cashout landing between the two "latest" reads is missed by both
+    /// (an undercount for one refresh) rather than counted in both.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn retrieval_funds_read_paid_out_before_the_balance() {
+        struct Recorded {
+            chain: FundsChain,
+            order: std::sync::Mutex<Vec<&'static str>>,
+        }
+        impl crate::transport::ChainTransport for Recorded {
+            fn serve(&self, request_json: &str) -> Option<String> {
+                let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+                let data = req["params"][0]["data"].as_str().unwrap_or_default();
+                let paid_out = hex::encode(crate::chequebook::chequebook_total_paid_out_selector());
+                if data.starts_with("0x70a08231") {
+                    self.order.lock().unwrap().push("balanceOf");
+                } else if data[2..].starts_with(&paid_out) {
+                    self.order.lock().unwrap().push("totalPaidOut");
+                }
+                self.chain.serve(request_json)
+            }
+        }
+        let recorded = std::sync::Arc::new(Recorded {
+            chain: FundsChain {
+                balance: Some(1),
+                paid_out: Some(2),
+                price: Some((100_000, 100)),
+            },
+            order: std::sync::Mutex::default(),
+        });
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(recorded.clone()));
+        read_retrieval_funds(&client, &CHEQUEBOOK).await.unwrap();
+        assert_eq!(
+            *recorded.order.lock().unwrap(),
+            ["totalPaidOut", "balanceOf"]
+        );
+    }
+
     /// The funds are the deposit ever made (balance + cashed out), at the
     /// oracle's rates; any read that fails is an error, never a zero
     /// (issue #121).
@@ -1774,11 +1894,12 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((amount, withdrawing(&self.cb)));
-                    word(1)
+                    format!("0x{}", hex::encode(ant_crypto::keccak256(&raw)))
                 }
                 "eth_getTransactionReceipt" => {
                     let result = self.receipt.lock().unwrap().map(|status| {
-                        serde_json::json!({"status": status, "blockNumber": "0x1", "logs": []})
+                        serde_json::json!({"transactionHash": req["params"][0],
+                            "status": status, "blockNumber": "0x1", "logs": []})
                     });
                     return Some(
                         serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
@@ -2519,5 +2640,283 @@ mod tests {
             DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR * 1_000,
             10_000_000_000_000_000
         );
+    }
+
+    /// What the relay does with the deploy in [`DeployChain`].
+    #[cfg(feature = "chain-rpc")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Relay {
+        /// Honest: answers the signed tx's own hash and receipt.
+        Honest,
+        /// `eth_sendRawTransaction` answers some other mined tx's hash,
+        /// whose receipt is a genuine factory deploy of someone else's
+        /// chequebook.
+        ForeignHash,
+        /// The receipt polled for our hash carries another tx's
+        /// `transactionHash`.
+        ForeignReceipt,
+    }
+
+    /// A scripted chain for [`auto_deploy_chequebook`]: a funded node
+    /// wallet, a factory deploy of `deployed` (`registered`, `issuer()`
+    /// as given; `None` answers an RPC error), and a log of every
+    /// transaction sent.
+    #[cfg(feature = "chain-rpc")]
+    struct DeployChain {
+        relay: Relay,
+        deployed: [u8; 20],
+        registered: Option<bool>,
+        issuer: Option<[u8; 20]>,
+        sent: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    const FOREIGN_TX: [u8; 32] = [0xf0; 32];
+
+    #[cfg(feature = "chain-rpc")]
+    impl crate::transport::ChainTransport for DeployChain {
+        fn serve(&self, request_json: &str) -> Option<String> {
+            use crate::chequebook::{
+                chequebook_issuer_selector, factory_deployed_contracts_calldata,
+                GNOSIS_BZZ_TOKEN_BYTES, GNOSIS_CHEQUEBOOK_FACTORY, SIMPLE_SWAP_DEPLOYED_TOPIC,
+            };
+            let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+            let id = req["id"].clone();
+            let ok = |r: serde_json::Value| {
+                Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}).to_string())
+            };
+            let err = || {
+                Some(
+                    serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32603, "message": "backend unavailable"}})
+                    .to_string(),
+                )
+            };
+            let word = |w: u128| serde_json::json!(format!("0x{w:064x}"));
+            match req["method"].as_str().unwrap() {
+                "eth_getBalance" => ok(serde_json::json!("0xde0b6b3a7640000")),
+                "eth_getTransactionCount" => ok(serde_json::json!("0x0")),
+                "eth_call" => {
+                    let data = req["params"][0]["data"].as_str().unwrap();
+                    let deployed_sel =
+                        hex::encode(&factory_deployed_contracts_calldata(&self.deployed)[..4]);
+                    if data.starts_with("0x70a08231") {
+                        ok(word(DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR * 10))
+                    } else if data[2..].starts_with(&deployed_sel) {
+                        assert!(data.ends_with(&hex::encode(self.deployed)));
+                        self.registered
+                            .map_or_else(err, |r| ok(word(u128::from(r))))
+                    } else if data[2..].starts_with(&hex::encode(chequebook_issuer_selector())) {
+                        self.issuer.map_or_else(err, |i| {
+                            ok(serde_json::json!(format!(
+                                "0x{}{}",
+                                "00".repeat(12),
+                                hex::encode(i)
+                            )))
+                        })
+                    } else {
+                        panic!("unscripted eth_call {data}")
+                    }
+                }
+                "eth_sendRawTransaction" => {
+                    let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
+                    let to: Vec<u8> = rlp::Rlp::new(&raw).at(3).unwrap().data().unwrap().to_vec();
+                    let hash = if to == GNOSIS_CHEQUEBOOK_FACTORY {
+                        self.sent.lock().unwrap().push("deploy");
+                        if self.relay == Relay::ForeignHash {
+                            FOREIGN_TX
+                        } else {
+                            ant_crypto::keccak256(&raw)
+                        }
+                    } else {
+                        assert_eq!(to, GNOSIS_BZZ_TOKEN_BYTES);
+                        self.sent.lock().unwrap().push("deposit");
+                        ant_crypto::keccak256(&raw)
+                    };
+                    ok(serde_json::json!(format!("0x{}", hex::encode(hash))))
+                }
+                "eth_getTransactionReceipt" => {
+                    let asked = req["params"][0].as_str().unwrap();
+                    let answered = if self.relay == Relay::ForeignReceipt {
+                        format!("0x{}", hex::encode(FOREIGN_TX))
+                    } else {
+                        asked.to_string()
+                    };
+                    let mut data = [0u8; 32];
+                    data[12..].copy_from_slice(&self.deployed);
+                    ok(serde_json::json!({
+                        "transactionHash": answered,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [{
+                            "address": format!("0x{}", hex::encode(GNOSIS_CHEQUEBOOK_FACTORY)),
+                            "topics": [format!("0x{}", hex::encode(SIMPLE_SWAP_DEPLOYED_TOPIC))],
+                            "data": format!("0x{}", hex::encode(data)),
+                        }],
+                    }))
+                }
+                other => panic!("unscripted method {other}"),
+            }
+        }
+    }
+
+    /// Run [`auto_deploy_chequebook`] (with a deposit) against `chain`;
+    /// returns its result, the transactions sent, and whether the
+    /// association was persisted.
+    #[cfg(feature = "chain-rpc")]
+    async fn deploy_against(
+        chain: DeployChain,
+        tag: &str,
+    ) -> (Result<[u8; 20], ChequebookError>, Vec<&'static str>, bool) {
+        let chain = std::sync::Arc::new(chain);
+        let client =
+            crate::ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
+        let wallet = crate::tx::Wallet::new([7u8; 32], crate::tx::GNOSIS_CHAIN_ID).unwrap();
+        let dir = std::env::temp_dir().join(format!("ant-cb-deploy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chequebook.json");
+        let result = auto_deploy_chequebook(
+            &client,
+            &wallet,
+            wallet.address(),
+            DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR,
+            &path,
+        )
+        .await;
+        let persisted = path.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sent = chain.sent.lock().unwrap().clone();
+        (result, sent, persisted)
+    }
+
+    #[cfg(feature = "chain-rpc")]
+    fn node_eth() -> [u8; 20] {
+        *crate::tx::Wallet::new([7u8; 32], crate::tx::GNOSIS_CHAIN_ID)
+            .unwrap()
+            .address()
+    }
+
+    /// The happy path still deploys, records and funds the chequebook
+    /// once both checks read yes.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn auto_deploy_records_and_funds_a_verified_chequebook() {
+        let (result, sent, persisted) = deploy_against(
+            DeployChain {
+                relay: Relay::Honest,
+                deployed: CHEQUEBOOK,
+                registered: Some(true),
+                issuer: Some(node_eth()),
+                sent: std::sync::Mutex::default(),
+            },
+            "ok",
+        )
+        .await;
+        assert_eq!(result.unwrap(), CHEQUEBOOK);
+        assert_eq!(sent, ["deploy", "deposit"]);
+        assert!(persisted);
+    }
+
+    /// Issue #284 (a): a relay answering `eth_sendRawTransaction` with
+    /// another mined tx's hash (here a real deploy of someone else's
+    /// chequebook) fails the call; nothing is recorded or deposited.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn a_foreign_tx_hash_sends_no_deposit() {
+        let (result, sent, persisted) = deploy_against(
+            DeployChain {
+                relay: Relay::ForeignHash,
+                deployed: [0xee; 20],
+                registered: Some(true),
+                issuer: Some([0xee; 20]),
+                sent: std::sync::Mutex::default(),
+            },
+            "foreign-hash",
+        )
+        .await;
+        let e = result.unwrap_err().to_string();
+        assert!(e.contains("eth_sendRawTransaction result"), "{e}");
+        assert_eq!(sent, ["deploy"], "no deposit");
+        assert!(!persisted);
+    }
+
+    /// The same through the receipt: one polled for our hash but naming
+    /// another tx is not ours.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn a_receipt_for_another_tx_sends_no_deposit() {
+        let (result, sent, persisted) = deploy_against(
+            DeployChain {
+                relay: Relay::ForeignReceipt,
+                deployed: [0xee; 20],
+                registered: Some(true),
+                issuer: Some([0xee; 20]),
+                sent: std::sync::Mutex::default(),
+            },
+            "foreign-receipt",
+        )
+        .await;
+        let e = result.unwrap_err().to_string();
+        assert!(e.contains("receipt transactionHash"), "{e}");
+        assert_eq!(sent, ["deploy"], "no deposit");
+        assert!(!persisted);
+    }
+
+    /// Issue #284 (b): a factory log naming a chequebook issued by
+    /// another EOA — nothing is persisted or transferred.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test]
+    async fn a_deployed_chequebook_with_another_issuer_is_not_kept() {
+        let (result, sent, persisted) = deploy_against(
+            DeployChain {
+                relay: Relay::Honest,
+                deployed: CHEQUEBOOK,
+                registered: Some(true),
+                issuer: Some([0xee; 20]),
+                sent: std::sync::Mutex::default(),
+            },
+            "issuer",
+        )
+        .await;
+        let e = result.unwrap_err().to_string();
+        assert!(e.contains("issuer()"), "{e}");
+        assert_eq!(sent, ["deploy"], "no deposit");
+        assert!(!persisted);
+    }
+
+    /// A check that never reads yes (a factory "no", or a failed read)
+    /// is retried a few times for a lagging backend, then fails the
+    /// deploy: nothing is persisted or transferred.
+    #[cfg(feature = "chain-rpc")]
+    #[tokio::test(start_paused = true)]
+    async fn an_unverifiable_deploy_is_not_kept() {
+        for (tag, registered, issuer) in [
+            ("unregistered", Some(false), Some(node_eth())),
+            ("unread-factory", None, Some(node_eth())),
+            ("unread-issuer", Some(true), None),
+        ] {
+            let started = tokio::time::Instant::now();
+            let (result, sent, persisted) = deploy_against(
+                DeployChain {
+                    relay: Relay::Honest,
+                    deployed: CHEQUEBOOK,
+                    registered,
+                    issuer,
+                    sent: std::sync::Mutex::default(),
+                },
+                tag,
+            )
+            .await;
+            let e = result.unwrap_err().to_string();
+            assert!(e.contains("could not verify"), "{tag}: {e}");
+            assert_eq!(sent, ["deploy"], "{tag}: no deposit");
+            assert!(!persisted, "{tag}");
+            assert_eq!(
+                started.elapsed(),
+                DEPLOY_CHECK_RETRY * (DEPLOY_CHECK_ATTEMPTS - 1),
+                "{tag}: bounded retries",
+            );
+        }
     }
 }

@@ -905,10 +905,13 @@ char *ant_storage_discover_full(const AntHandle *handle,
  * Idempotent: if this device already deployed a chequebook it's returned
  * as-is (no redeploy — though one still short of its settlement deposit
  * is topped up from spare xBZZ); otherwise this signs an on-chain
- * factory.deploySimpleSwap (issuer = node EOA), funds it with the
+ * factory.deploySimpleSwap (issuer = node EOA), checks the new
+ * chequebook on-chain (factory-registered, issuer() is the node EOA;
+ * a check that says no or can't be read fails the call with nothing
+ * persisted or funded), persists the association, funds it with the
  * settlement deposit for the account's storage plan (see
  * ant_storage_settlement_topup) so its cheques are actually backed,
- * persists the association, and returns the new address. SUBMITS REAL
+ * and returns the new address. SUBMITS REAL
  * ON-CHAIN TRANSACTIONS: spends gas (xDAI) plus the deposit (xBZZ, capped
  * to the wallet's balance) and BLOCKS until they confirm. Light-mode only (requires the `chain` cargo feature;
  * otherwise returns NULL + an error). Returns

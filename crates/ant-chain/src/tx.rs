@@ -165,6 +165,16 @@ pub enum TxError {
     Timeout { tx_hash: String, wait_secs: u64 },
     #[error("decode: {0}")]
     Decode(String),
+    /// The RPC named a different transaction than the one we signed:
+    /// `eth_sendRawTransaction` returned another hash, or the receipt
+    /// polled for ours carries another `transactionHash`. Its receipt
+    /// would describe someone else's tx (issue #284).
+    #[error("{what} is {answered}, not the signed transaction 0x{sent}")]
+    HashMismatch {
+        what: &'static str,
+        sent: String,
+        answered: String,
+    },
 }
 
 /// Parameters that fully describe an EIP-155 legacy transaction.
@@ -408,9 +418,11 @@ impl ChainClient {
         u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
-    /// Submit a pre-signed raw transaction. Returns the canonical
-    /// 32-byte tx hash (the same one `sign_legacy_tx` already
-    /// computed locally).
+    /// Submit a pre-signed raw transaction. Returns the 32-byte tx hash
+    /// the RPC answered with. That should be the one `sign_legacy_tx`
+    /// already computed locally, but a broken or malicious relay can
+    /// answer with any hash; [`Wallet`] compares the two and waits on
+    /// its own (issue #284).
     pub async fn eth_send_raw_transaction(&self, raw: &[u8]) -> Result<[u8; 32], RpcError> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -470,7 +482,10 @@ impl ChainClient {
     /// Poll `eth_getTransactionReceipt` until the receipt arrives or
     /// `wait` elapses. Returns the receipt as a structured `TxReceipt`;
     /// reverted txs become `TxError::Reverted` so a successful return
-    /// always means the EVM accepted the tx.
+    /// always means the EVM accepted the tx. A receipt whose
+    /// `transactionHash` is missing or isn't `tx_hash` is an error
+    /// ([`TxError::HashMismatch`]), checked before its status: its logs
+    /// would describe some other transaction (issue #284).
     pub async fn wait_for_receipt(
         &self,
         tx_hash: &[u8; 32],
@@ -490,6 +505,17 @@ impl ChainClient {
                 return Err(RpcError::Rpc(err).into());
             }
             if let Some(receipt) = v.get("result").filter(|r| !r.is_null()) {
+                let answered = receipt
+                    .get("transactionHash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("");
+                if !answered.eq_ignore_ascii_case(&format!("0x{}", hex::encode(tx_hash))) {
+                    return Err(TxError::HashMismatch {
+                        what: "receipt transactionHash",
+                        sent: hex::encode(tx_hash),
+                        answered: answered.to_string(),
+                    });
+                }
                 let status = receipt.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 let block_number = receipt
                     .get("blockNumber")
@@ -589,16 +615,18 @@ pub struct TxReceipt {
 
 /// Pull the new `batchId` out of a `createBatch` receipt by matching
 /// the `BatchCreated` event topic and reading the batch id from
-/// topic[1] (it's an indexed parameter). Returns `None` if no such
-/// event is in the receipt.
+/// topic[1] (it's an indexed parameter). Only a log emitted by
+/// `postage` (the `PostageStamp` contract the batch was bought from)
+/// counts: any contract can emit a look-alike event in the same tx.
+/// Returns `None` if no such event is in the receipt.
 #[must_use]
-pub fn extract_created_batch_id(receipt: &TxReceipt) -> Option<[u8; 32]> {
+pub fn extract_created_batch_id(receipt: &TxReceipt, postage: &[u8; 20]) -> Option<[u8; 32]> {
     let topic = batch_created_event_topic();
     receipt
         .logs
         .iter()
-        .find(|l| l.topics.first() == Some(&topic))
-        .and_then(|l| l.topics.get(1).copied())
+        .find(|l| &l.address == postage && l.topics.first() == Some(&topic) && l.topics.len() > 1)
+        .map(|l| l.topics[1])
 }
 
 /// One-shot helper that holds a signing key + chain id and submits
@@ -680,7 +708,8 @@ impl Wallet {
     }
 
     /// `PostageStamp.createBatch(...)`. Returns the receipt; pull the
-    /// new batch id with [`extract_created_batch_id`].
+    /// new batch id with [`extract_created_batch_id`], passing the same
+    /// `postage` address.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_batch(
         &self,
@@ -761,7 +790,8 @@ impl Wallet {
 
     /// `SimpleSwapFactory.deploySimpleSwap(issuer, defaultHardDepositTimeoutDuration, salt)`.
     /// Returns the receipt; pull the new chequebook address with
-    /// [`crate::chequebook::extract_deployed_chequebook`]. The
+    /// [`crate::chequebook::extract_deployed_chequebook`], passing the
+    /// same `factory`. The
     /// wallet (`self`) just pays gas — the *issuer* baked into the
     /// chequebook is the `issuer` argument, which can be any EOA
     /// (so the operator can run cold-storage issuer keys without
@@ -863,8 +893,19 @@ impl Wallet {
             data,
             chain_id: self.chain_id,
         };
-        let (raw, _hash_local) = sign_legacy_tx(&self.secret, &tx)?;
-        let tx_hash = client.eth_send_raw_transaction(&raw).await?;
+        let (raw, tx_hash) = sign_legacy_tx(&self.secret, &tx)?;
+        // Wait on the hash we computed, never on the one the RPC hands
+        // back: a relay answering with some other mined tx's hash would
+        // otherwise get that tx's receipt (and its logs: a chequebook
+        // or batch that isn't ours) accepted as ours (issue #284).
+        let answered = client.eth_send_raw_transaction(&raw).await?;
+        if answered != tx_hash {
+            return Err(TxError::HashMismatch {
+                what: "eth_sendRawTransaction result",
+                sent: hex::encode(tx_hash),
+                answered: format!("0x{}", hex::encode(answered)),
+            });
+        }
         client.wait_for_receipt(&tx_hash, self.default_wait).await
     }
 
@@ -1124,9 +1165,11 @@ mod tests {
         assert_eq!(recovered_addr, want_addr);
     }
 
-    /// `extract_created_batch_id` pulls topic[1] when the topic[0] matches.
+    /// `extract_created_batch_id` pulls topic[1] when the topic[0] matches
+    /// and the postage contract emitted the log.
     #[test]
     fn extract_batch_id_from_synthetic_receipt() {
+        let postage = [0x45; 20];
         let mut topics = vec![batch_created_event_topic()];
         let mut want_batch = [0u8; 32];
         want_batch[0] = 0xab;
@@ -1136,12 +1179,38 @@ mod tests {
             tx_hash: [0u8; 32],
             block_number: 1,
             logs: vec![EventLog {
-                address: [0u8; 20],
+                address: postage,
                 topics,
                 data: vec![],
             }],
         };
-        assert_eq!(extract_created_batch_id(&receipt), Some(want_batch));
+        assert_eq!(
+            extract_created_batch_id(&receipt, &postage),
+            Some(want_batch)
+        );
+    }
+
+    /// Issue #284 (d): a `BatchCreated` log some other contract emitted
+    /// in the same tx is not our batch, even ahead of the real one.
+    #[test]
+    fn batch_id_from_a_non_postage_emitter_is_none() {
+        let postage = [0x45; 20];
+        let log = |address, batch| EventLog {
+            address,
+            topics: vec![batch_created_event_topic(), batch],
+            data: vec![],
+        };
+        let decoy = TxReceipt {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            logs: vec![log([0x66; 20], [0xee; 32])],
+        };
+        assert_eq!(extract_created_batch_id(&decoy, &postage), None);
+        let both = TxReceipt {
+            logs: vec![log([0x66; 20], [0xee; 32]), log(postage, [0x11; 32])],
+            ..decoy
+        };
+        assert_eq!(extract_created_batch_id(&both, &postage), Some([0x11; 32]));
     }
 
     /// Two transactions from one key started at the same moment go out
@@ -1177,22 +1246,23 @@ mod tests {
                         json!(format!("0x{nonce:x}"))
                     }
                     "eth_sendRawTransaction" => {
-                        let mut sent = self.sent.lock().unwrap();
-                        *sent += 1;
+                        let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
+                        *self.sent.lock().unwrap() += 1;
                         self.events.lock().unwrap().push("send".into());
-                        json!(format!("0x{:064x}", *sent))
+                        json!(format!("0x{}", hex::encode(ant_crypto::keccak256(&raw))))
                     }
                     "eth_getTransactionReceipt" => {
                         let hash = req["params"][0].as_str().unwrap().to_string();
                         let mut polls = self.polls.lock().unwrap();
-                        let n = polls.entry(hash).or_default();
+                        let n = polls.entry(hash.clone()).or_default();
                         *n += 1;
                         if *n < 2 {
                             serde_json::Value::Null
                         } else {
                             *self.mined.lock().unwrap() += 1;
                             self.events.lock().unwrap().push("mined".into());
-                            json!({"status": "0x1", "blockNumber": "0x1", "logs": []})
+                            json!({"transactionHash": hash, "status": "0x1",
+                                "blockNumber": "0x1", "logs": []})
                         }
                     }
                     other => panic!("unscripted method {other}"),
