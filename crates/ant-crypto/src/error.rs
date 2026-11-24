@@ -23,4 +23,6 @@ pub enum CryptoError {
     PssInvalidTargets,
     #[error("PSS nonce mining was cancelled")]
     PssMiningCancelled,
+    #[error("handshake chequebook must be empty or exactly 20 bytes, got {0}")]
+    BadChequebookLen(usize),
 }
