@@ -11611,8 +11611,10 @@ mod tests {
         assert_eq!(state.dialable_underlays(&[plain]), Vec::<Multiaddr>::new());
     }
 
-    /// `reporter_net` and #300's observer grouping agree on what one IPv6
-    /// operator is, so tuning one can't silently leave the other behind.
+    /// `reporter_net` groups an IPv6 reporter by its own /48
+    /// ([`REPORTER_IPV6_PREFIX_BYTES`]), deliberately coarser than #300's
+    /// /56 observer grouping in `observed_addr` (the two are tuned
+    /// separately), and an embedded-IPv4 form by the IPv4 /24 it dials.
     #[test]
     fn reporter_net_groups_by_operator_and_dial_target() {
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
