@@ -171,8 +171,10 @@ Differences from bee on the v1 protocol:
 The HTTP surface above gets bee-js's read path working unchanged.
 The table gives today's status of the endpoints in the **drop-in**
 gap of [PLAN.md "Drop-in light-node gap — prioritised
-follow-on"][drop-in]: `drop-in #N` is row N there, and the other
-classes follow its out-of-scope list. On-chain writes need an
+follow-on"][drop-in]. The gap class says where an endpoint was
+tracked: `drop-in #N` is row N of that section; the other classes
+come from its out-of-scope list, from `PLAN.md` J.5 or from an
+issue. On-chain writes need an
 explicit Gnosis RPC endpoint and a wallet key (in `antd`,
 `--gnosis-rpc-url` and the node's own key; the read-only fallback
 RPC does not sign), and answer `501` without them.
@@ -188,8 +190,8 @@ RPC does not sign), and answer `501` without them.
 | `/chequebook/address`              | GET        | served; `0x000…` without a chequebook | drop-in #2 |
 | `/chequebook/balance`              | GET        | served; zeros without a chequebook | drop-in #2 |
 | `/chequebook/cheque[/{peer}]`      | GET        | served              | drop-in #2   |
-| `/chequebook/deposit?amount=`      | POST       | served (on-chain write) | drop-in #2 |
-| `/chequebook/withdraw?amount=`     | POST       | served (on-chain write) | drop-in #2 |
+| `/chequebook/deposit?amount=`      | POST       | served (on-chain write) | PLAN.md J.5 D3 |
+| `/chequebook/withdraw?amount=`     | POST       | served (on-chain write) | #165 |
 | `/stamps`                          | GET        | served              | drop-in #3   |
 | `/stamps/{batch-id}`               | GET        | served              | drop-in #3   |
 | `/stamps/{amount}/{depth}`         | POST       | served (on-chain write) | drop-in #3 |

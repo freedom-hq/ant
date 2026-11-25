@@ -220,7 +220,7 @@ the still-open items.
 | [`ant-node`](crates/ant-node) | High-level orchestrator wiring `ant-p2p`, `ant-retrieval`, caches, gateway, `UploadRuntime`, and `SwapConfig`. |
 | [`ant-p2p`](crates/ant-p2p) | libp2p host, BZZ handshake (now exposing peer EOA + welcome), Hive peer exchange, pseudosettle driver, `/swarm/swap/1.0.0/swap` listener + dialer with `CreditLedger` + `OutboundLedger`. |
 | [`ant-retrieval`](crates/ant-retrieval) | Fetcher, ordered joiner with ranges, mantaray walker + recursive trie writer, splitter, pushsync client, in-memory + SQLite caches, bee-parity accounting mirror. |
-| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status endpoints and the chain-backed `/wallet`, `/stamps` and `/chequebook` routes, plus `POST /chunks` and `POST /bzz` upload endpoints, plus PSS/GSOC messaging: `/pss/send` and the `/gsoc/subscribe` + `/pss/subscribe` WebSockets). |
+| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status endpoints and the `/wallet`, `/stamps` and `/chequebook` routes, plus `POST /chunks` and `POST /bzz` upload endpoints, plus PSS/GSOC messaging: `/pss/send` and the `/gsoc/subscribe` + `/pss/subscribe` WebSockets). |
 | [`ant-control`](crates/ant-control) | Wire types for the `antd` ↔ `antctl` Unix-socket control protocol. |
 | [`ant-crypto`](crates/ant-crypto) | secp256k1, keccak256, BMT, CAC/SOC validation, overlay derivation. |
 | [`ant-postage`](crates/ant-postage) | EIP-191 stamp issuer with crash-safe bucket-counter persistence. |
