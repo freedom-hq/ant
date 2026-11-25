@@ -171,15 +171,15 @@ the still-open items.
   socket; browsers hitting the HTTP gateway get true byte streaming
   (Appendix E Phase 5 is the last read-path gap).
 - **HTTP-API drop-in coverage.** The gateway covers bee's read path
-  end-to-end and the upload primitives (`POST /chunks`,
-  `POST /bzz`); the long tail bee-js touches —
-  `/wallet` / `/balances` / `/settlements` / `/chequebook/*` reads,
-  `/stamps` reads + writes, `/tags`, `/feeds`, `/soc`,
-  `/stewardship`, `/envelope` — still answers `501`. The
-  prioritised order to close that gap lives in
-  [`PLAN.md` §9.0 "Drop-in light-node gap"](PLAN.md), and the
-  per-endpoint matrix is in
-  [`crates/ant-gateway/README.md`](crates/ant-gateway/README.md).
+  end-to-end, the upload primitives (`POST /chunks`, `POST /bytes`,
+  `POST /bzz`) and the long tail bee-js touches: `/wallet`,
+  `/balances`, `/settlements`, the `/chequebook` reads, deposit and
+  withdraw, `/stamps` reads + writes, `/tags`, `/pins`, `/feeds`,
+  `/soc`, `/stewardship`, `/envelope` and `/grantee`. Routes it does
+  not implement, such as `/transactions` and
+  `/chequebook/cashout/{peer}`, still answer `501`;
+  [`crates/ant-gateway/README.md`](crates/ant-gateway/README.md) gives
+  the status of each endpoint on the drop-in list.
 
 ## Known issues
 
@@ -220,7 +220,7 @@ the still-open items.
 | [`ant-node`](crates/ant-node) | High-level orchestrator wiring `ant-p2p`, `ant-retrieval`, caches, gateway, `UploadRuntime`, and `SwapConfig`. |
 | [`ant-p2p`](crates/ant-p2p) | libp2p host, BZZ handshake (now exposing peer EOA + welcome), Hive peer exchange, pseudosettle driver, `/swarm/swap/1.0.0/swap` listener + dialer with `CreditLedger` + `OutboundLedger`. |
 | [`ant-retrieval`](crates/ant-retrieval) | Fetcher, ordered joiner with ranges, mantaray walker + recursive trie writer, splitter, pushsync client, in-memory + SQLite caches, bee-parity accounting mirror. |
-| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status / stub endpoints, plus `POST /chunks` and `POST /bzz` upload endpoints, plus PSS/GSOC messaging: `/pss/send` and the `/gsoc/subscribe` + `/pss/subscribe` WebSockets). |
+| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status endpoints and the `/wallet`, `/stamps` and `/chequebook` routes, plus `POST /chunks` and `POST /bzz` upload endpoints, plus PSS/GSOC messaging: `/pss/send` and the `/gsoc/subscribe` + `/pss/subscribe` WebSockets). |
 | [`ant-control`](crates/ant-control) | Wire types for the `antd` ↔ `antctl` Unix-socket control protocol. |
 | [`ant-crypto`](crates/ant-crypto) | secp256k1, keccak256, BMT, CAC/SOC validation, overlay derivation. |
 | [`ant-postage`](crates/ant-postage) | EIP-191 stamp issuer with crash-safe bucket-counter persistence. |
