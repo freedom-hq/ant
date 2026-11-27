@@ -475,9 +475,10 @@ pub struct ChainContext {
 /// that deadline: 130 s. The reads a route makes inside this bound count
 /// too, each up to 30 s (a deposit-funds read, three calls, up to 60 s):
 /// a buy is two txs (260 s); a top-up one batch-depth read (a single
-/// `eth_call`, not the batch's four-call metadata) and two txs (290 s); a withdrawal the issuer, funds and liquid-balance reads, one
-/// tx, then the funds re-read (30 + 60 + 30 + 130 + 60 = 310 s). Bound
-/// the handler at 6 minutes.
+/// `eth_call`, not the batch's four-call metadata) and two txs (290 s);
+/// a withdrawal the issuer, funds and liquid-balance reads, one tx, then
+/// the funds re-read (30 + 60 + 30 + 130 + 60 = 310 s). Bound the
+/// handler at 6 minutes.
 const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(6);
 
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
