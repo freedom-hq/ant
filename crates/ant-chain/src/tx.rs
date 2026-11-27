@@ -566,6 +566,7 @@ impl ChainClient {
         /// One receipt poll still waiting for its answer.
         struct Open<'a> {
             id: u64,
+            sent_at: Instant,
             asking_host: Arc<AtomicBool>,
             answer: Pin<Box<dyn Future<Output = Answer> + Send + 'a>>,
         }
@@ -633,6 +634,7 @@ impl ChainClient {
                 let body = &body;
                 open.push(Open {
                     id: sent,
+                    sent_at: now,
                     asking_host,
                     answer: Box::pin(async move { self.rpc_noting_host(body, &flag).await }),
                 });
@@ -640,20 +642,21 @@ impl ChainClient {
                 newest_sent = now;
                 next_poll = None;
             }
-            // A poll still open at the deadline is heard for up to
+            // Any poll still open at the deadline is heard for up to
             // `RECEIPT_POLL_TIMEOUT` past it, however long ago it went
-            // out: a slow host's answer landing just after the deadline
-            // is still taken (R2-F1). Once the newest has answered
-            // "not yet", the deadline is the end.
-            let end = match next_poll {
-                Some(_) => deadline,
-                None => deadline + RECEIPT_POLL_TIMEOUT,
+            // out and whether or not a newer one has answered since: a
+            // slow answer landing just after the deadline is still taken
+            // (R2-F1, R3-M1). With nothing open, the deadline is the end.
+            let end = if open.is_empty() {
+                deadline
+            } else {
+                deadline + RECEIPT_POLL_TIMEOUT
             };
             if now >= end {
-                if next_poll.is_none() {
+                if let Some(latest) = open.iter().map(|p| p.sent_at).max() {
                     last_error = Some(format!(
                         "no answer within {}s",
-                        now.saturating_duration_since(newest_sent).as_secs()
+                        now.saturating_duration_since(latest).as_secs()
                     ));
                 }
                 return Err(TxError::Timeout {
@@ -663,6 +666,9 @@ impl ChainClient {
                 });
             }
             let wake = match next_poll {
+                // No poll goes out past the deadline: only the open
+                // ones' answers (or the end) are left to wait for.
+                _ if now >= deadline => end,
                 Some(at) => at,
                 None if now < newest_sent + RECEIPT_POLL_TIMEOUT => {
                     newest_sent + RECEIPT_POLL_TIMEOUT
@@ -1573,6 +1579,8 @@ mod receipt_wait_tests {
         Drop,
         /// Read the request and never answer.
         Hang,
+        /// Answer with this `result`, but only after this long.
+        After(Duration, serde_json::Value),
     }
 
     /// A scripted JSON-RPC server. `script` gets the request and, for a
@@ -1619,6 +1627,21 @@ mod receipt_wait_tests {
                     Reply::Drop => None,
                     Reply::Hang => {
                         hung.push(sock);
+                        continue;
+                    }
+                    Reply::After(after, result) => {
+                        let answer = json!({"jsonrpc": "2.0", "id": req["id"], "result": result});
+                        tokio::spawn(async move {
+                            tokio::time::sleep(after).await;
+                            let body = answer.to_string();
+                            let out = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len(),
+                            );
+                            let _ = sock.write_all(out.as_bytes()).await;
+                            let _ = sock.flush().await;
+                        });
                         continue;
                     }
                 };
@@ -1830,6 +1853,37 @@ mod receipt_wait_tests {
             "{took:?}"
         );
         assert_eq!(stub.polls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A poll still open at the deadline is heard past it even when a
+    /// newer poll has answered "not yet" since (R3-M1): the first poll
+    /// is silent until 14 s, a second goes out beside it at 10 s and it
+    /// and every later one says "pending", and the first's receipt,
+    /// landing 2 s past a 12 s deadline, is taken. Real time (~14 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_early_poll_open_at_the_deadline_is_heard_past_it() {
+        let stub = spawn_stub(chain(|req, n| match n {
+            0 => match mined(req) {
+                Reply::Result(r) => Reply::After(Duration::from_secs(14), r),
+                _ => unreachable!(),
+            },
+            _ => Reply::Result(serde_json::Value::Null),
+        }))
+        .await;
+        let started = std::time::Instant::now();
+        let receipt = ChainClient::new(&stub.url)
+            .wait_for_receipt(&[0x49u8; 32], Duration::from_secs(12))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(receipt.block_number, 0x10);
+        assert!(took >= Duration::from_secs(14), "{took:?}");
+        assert!(
+            took < Duration::from_secs(12) + RECEIPT_POLL_TIMEOUT,
+            "{took:?}"
+        );
+        // The newest poll answered before the deadline: more than one went out.
+        assert!(stub.polls.load(Ordering::SeqCst) >= 2);
     }
 
     /// A host transport whose receipt answers block until released,
