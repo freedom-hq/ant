@@ -1406,8 +1406,8 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * waiting after 60 s, but the thread stays inside the callback until it
  * returns, and that refresh starts no new read until it does. A
  * transaction's receipt wait takes a slow answer whenever it comes
- * before its deadline (60 s by default) and asks no more while a call
- * is parked in the callback.
+ * before its deadline (60 s by default) or up to 10 s past it, and asks
+ * no more while a call is parked in the callback.
  *
  * Lifetime: `transport` must stay callable and `host_ctx` valid until
  * the transport is replaced/cleared or ant_shutdown is called. Both of

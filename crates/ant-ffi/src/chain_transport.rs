@@ -221,7 +221,8 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// thread stays inside the callback until it returns, and that refresh
 /// starts no new read until it does. A transaction's receipt wait takes
 /// a slow answer whenever it comes before its deadline (60 s by
-/// default) and asks no more while a call is parked here.
+/// default) or up to 10 s past it, and asks no more while a call is
+/// parked here.
 ///
 /// **Ordering:** takes effect immediately, for the next chain request
 /// of every caller: the storage / settlement calls (`ant_storage_*`,

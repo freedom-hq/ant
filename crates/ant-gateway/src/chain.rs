@@ -469,9 +469,9 @@ pub struct ChainContext {
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
 /// Gnosis block and confirm; the `Wallet` waits up to 60 s per tx, plus
-/// up to `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for its last
-/// receipt poll, so 70 s, and a buy is two txs (140 s): bound the
-/// handler at 3 minutes.
+/// up to `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a receipt
+/// poll still open at that deadline, so 70 s, and a buy is two txs
+/// (140 s): bound the handler at 3 minutes.
 const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(3);
 
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -1432,9 +1432,9 @@ const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on an xDAI-funded write: up to four transactions (swap,
 /// approve, `createBatch` or `topUp`, `increaseDepth`), each waiting up
 /// to 70 s (the `Wallet`'s 60 s plus
-/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for its last receipt poll),
-/// possibly queued behind one more the node is already sending: 5 × 70 s
-/// = 350 s, inside 6 minutes.
+/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a receipt poll still open
+/// at that deadline), possibly queued behind one more the node is
+/// already sending: 5 × 70 s = 350 s, inside 6 minutes.
 const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(6);
 
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs

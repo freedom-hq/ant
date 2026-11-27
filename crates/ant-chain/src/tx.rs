@@ -543,9 +543,11 @@ impl ChainClient {
     /// more than one host call in flight. At most
     /// [`RECEIPT_POLLS_OPEN_MAX`] polls are open at once.
     ///
-    /// No poll goes out after the deadline, the back-off sleep never
-    /// passes it, and the newest poll is heard for at most
-    /// [`RECEIPT_POLL_TIMEOUT`] past it, so this returns within
+    /// No poll goes out after the deadline and the back-off sleep never
+    /// passes it. A poll still open at the deadline (however early it
+    /// went out) is heard for up to [`RECEIPT_POLL_TIMEOUT`] past it,
+    /// so a slow host's answer that lands just after the deadline is
+    /// still taken, and this returns within
     /// `wait + RECEIPT_POLL_TIMEOUT` whatever the RPC does. It only
     /// reads: nothing is ever sent again from here, and a
     /// [`TxError::Timeout`] means "sent, outcome unknown".
@@ -638,11 +640,14 @@ impl ChainClient {
                 newest_sent = now;
                 next_poll = None;
             }
-            // Past the deadline, the newest poll is heard out to its
-            // own `RECEIPT_POLL_TIMEOUT`, older ones no further.
+            // A poll still open at the deadline is heard for up to
+            // `RECEIPT_POLL_TIMEOUT` past it, however long ago it went
+            // out: a slow host's answer landing just after the deadline
+            // is still taken (R2-F1). Once the newest has answered
+            // "not yet", the deadline is the end.
             let end = match next_poll {
                 Some(_) => deadline,
-                None => deadline.max(newest_sent + RECEIPT_POLL_TIMEOUT),
+                None => deadline + RECEIPT_POLL_TIMEOUT,
             };
             if now >= end {
                 if next_poll.is_none() {
@@ -712,8 +717,8 @@ impl ChainClient {
 /// How long the newest receipt poll in
 /// [`ChainClient::wait_for_receipt`] may stay silent before a fresh one
 /// goes out alongside it (never thrown away while the wait has time
-/// left). Also how far past its `wait` a receipt wait can run: the
-/// poll sent at the deadline is heard this long.
+/// left). Also how far past its `wait` a receipt wait can run: a poll
+/// still open at the deadline is heard this much longer.
 #[cfg(feature = "chain-rpc")]
 pub const RECEIPT_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1833,6 +1838,8 @@ mod receipt_wait_tests {
         entered: AtomicUsize,
         in_flight: AtomicUsize,
         most_in_flight: AtomicUsize,
+        /// Calls left to answer "not mined yet" before the receipt.
+        pending: AtomicUsize,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
@@ -1845,6 +1852,13 @@ mod receipt_wait_tests {
             self.most_in_flight.fetch_max(now, Ordering::SeqCst);
             let _ = self.release.lock().unwrap().recv();
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            // One call at a time (asserted), so load-then-sub is fine.
+            if self.pending.load(Ordering::SeqCst) > 0 {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                return Some(
+                    json!({"jsonrpc": "2.0", "id": req["id"], "result": null}).to_string(),
+                );
+            }
             let Reply::Result(result) = mined(&req) else {
                 unreachable!()
             };
@@ -1858,6 +1872,7 @@ mod receipt_wait_tests {
             entered: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             most_in_flight: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
             release: Mutex::new(rx),
         });
         (host, tx)
@@ -1933,8 +1948,45 @@ mod receipt_wait_tests {
         }
     }
 
-    /// A host call still parked at the deadline ends the wait there
-    /// (it started at 0, so it has had its [`RECEIPT_POLL_TIMEOUT`]), with
+    /// A host that takes 30 s per call, under the default 60 s wait:
+    /// the first poll says "not yet" at 30 s, the second goes out at
+    /// ~31 s and answers mined at 61 s, past the deadline. That answer
+    /// is taken (R2-F1), not cut off at 60 s because the poll went out
+    /// more than [`RECEIPT_POLL_TIMEOUT`] before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_host_answer_just_past_the_deadline_is_taken() {
+        let (host, release) = slow_host();
+        host.pending.store(1, Ordering::SeqCst);
+        let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(host.clone()));
+        let wait = Duration::from_secs(60);
+        let started = tokio::time::Instant::now();
+        let waiting =
+            tokio::spawn(async move { client.wait_for_receipt(&[0x48u8; 32], wait).await });
+        settle(|| host.entered.load(Ordering::SeqCst) == 1).await;
+        advance(Duration::from_secs(30)).await;
+        release.send(()).unwrap();
+        settle(|| host.in_flight.load(Ordering::SeqCst) == 0).await;
+        // The back-off (500 ms) sends the second poll.
+        while host.entered.load(Ordering::SeqCst) < 2 {
+            assert!(!waiting.is_finished());
+            advance(Duration::from_secs(1)).await;
+            settle(|| host.entered.load(Ordering::SeqCst) == 2).await;
+        }
+        while started.elapsed() < wait + Duration::from_secs(1) {
+            advance(Duration::from_secs(1)).await;
+        }
+        assert!(!waiting.is_finished(), "cut off at the deadline");
+        release.send(()).unwrap();
+        settle(|| waiting.is_finished()).await;
+        drop(release);
+        let receipt = waiting.await.unwrap().unwrap();
+        assert_eq!(receipt.block_number, 0x10);
+        assert_eq!(host.entered.load(Ordering::SeqCst), 2);
+        assert_eq!(host.most_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    /// A host call still parked at the deadline is heard
+    /// [`RECEIPT_POLL_TIMEOUT`] past it and then ends the wait, with
     /// that one call the only one ever made.
     #[tokio::test(start_paused = true)]
     async fn a_host_parked_past_the_deadline_times_out_once() {
@@ -1954,10 +2006,11 @@ mod receipt_wait_tests {
         let TxError::Timeout { ref last_error, .. } = err else {
             panic!("expected a timeout, got {err}");
         };
-        assert_eq!(last_error.as_deref(), Some("no answer within 25s"), "{err}");
+        assert_eq!(last_error.as_deref(), Some("no answer within 35s"), "{err}");
         // Seen at the next one-second step.
+        let end = wait + RECEIPT_POLL_TIMEOUT;
         assert!(
-            took >= wait && took <= wait + Duration::from_secs(1),
+            took >= end && took <= end + Duration::from_secs(1),
             "{took:?}"
         );
         assert_eq!(host.entered.load(Ordering::SeqCst), 1);
