@@ -19,7 +19,9 @@
 //! what RLP-encoded EIP-155 expects.
 
 #[cfg(feature = "chain-rpc")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "chain-rpc")]
+use tokio::time::Instant;
 
 use ant_crypto::{sign_prehash, SECP256K1_SECRET_LEN};
 use primitive_types::U256;
@@ -184,8 +186,21 @@ pub enum TxError {
     Rlp(String),
     #[error("transaction reverted: {receipt_status}")]
     Reverted { receipt_status: String },
-    #[error("transaction never mined: {tx_hash} (timeout {wait_secs}s)")]
-    Timeout { tx_hash: String, wait_secs: u64 },
+    /// No receipt for a transaction that was sent, within the wait. It
+    /// may still be mined: not a "nothing happened" answer, so a caller
+    /// must not send the same write again on this error alone.
+    /// `last_error` is the last receipt poll's transport error (without
+    /// the RPC URL), when the RPC wasn't answering at the end (#253).
+    #[error(
+        "transaction 0x{tx_hash} was sent but no receipt arrived within {wait_secs}s; it may \
+         still be mined{}",
+        last_error.as_ref().map_or_else(String::new, |e| format!(" (last receipt poll: {e})"))
+    )]
+    Timeout {
+        tx_hash: String,
+        wait_secs: u64,
+        last_error: Option<String>,
+    },
     #[error("decode: {0}")]
     Decode(String),
     /// The receipt polled for the transaction we signed carries another
@@ -509,13 +524,27 @@ impl ChainClient {
     /// `transactionHash` is missing or isn't `tx_hash` is an error
     /// ([`TxError::HashMismatch`]), checked before its status: its logs
     /// would describe some other transaction (issue #284).
+    ///
+    /// The receipt read is idempotent and the transaction is already
+    /// out, so a poll the RPC didn't answer (a transport error: a
+    /// dropped keep-alive connection, a refused connect, an unreadable
+    /// body) says nothing about it: it is logged and counted as "not
+    /// mined yet", and polling goes on until `wait` runs out (#253). A
+    /// JSON-RPC error answer still fails at once. Each poll is cut off
+    /// at the time left until the deadline, but never below
+    /// [`RECEIPT_POLL_MIN`], and the back-off sleep never passes the
+    /// deadline, so this returns within `wait + RECEIPT_POLL_MIN` (plus
+    /// one poll's JSON parsing) whatever the RPC does. It only reads:
+    /// nothing is ever sent again from here, and a
+    /// [`TxError::Timeout`] means "sent, outcome unknown".
     pub async fn wait_for_receipt(
         &self,
         tx_hash: &[u8; 32],
         wait: Duration,
     ) -> Result<TxReceipt, TxError> {
-        let started = Instant::now();
+        let deadline = Instant::now() + wait;
         let mut delay = Duration::from_millis(500);
+        let mut last_error = None;
         loop {
             let body = json!({
                 "jsonrpc": "2.0",
@@ -523,52 +552,91 @@ impl ChainClient {
                 "method": "eth_getTransactionReceipt",
                 "params": [format!("0x{}", hex::encode(tx_hash))],
             });
-            let v = self.rpc(&body).await?;
-            if let Some(err) = crate::rpc_error_json(&v) {
-                return Err(RpcError::Rpc(err).into());
-            }
-            if let Some(receipt) = v.get("result").filter(|r| !r.is_null()) {
-                let answered = receipt
-                    .get("transactionHash")
-                    .and_then(|h| h.as_str())
-                    .unwrap_or("");
-                if !answered.eq_ignore_ascii_case(&format!("0x{}", hex::encode(tx_hash))) {
-                    return Err(TxError::HashMismatch {
-                        what: "receipt transactionHash",
-                        sent: hex::encode(tx_hash),
-                        answered: answered.to_string(),
-                    });
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .max(RECEIPT_POLL_MIN);
+            let answer = match tokio::time::timeout(budget, self.rpc(&body)).await {
+                Ok(Ok(v)) => Some(v),
+                Ok(Err(RpcError::Http(e))) => {
+                    last_error = Some(e.without_url().to_string());
+                    None
                 }
-                let status = receipt.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                let block_number = receipt
-                    .get("blockNumber")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                if status != "0x1" {
-                    return Err(TxError::Reverted {
-                        receipt_status: status.to_string(),
-                    });
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    last_error = Some(format!("no answer within {}s", budget.as_secs()));
+                    None
                 }
-                let logs = receipt.get("logs").and_then(|l| l.as_array()).map_or_else(
-                    || Ok(Vec::new()),
-                    |arr| arr.iter().map(parse_log).collect::<Result<Vec<_>, _>>(),
-                )?;
-                return Ok(TxReceipt {
-                    tx_hash: *tx_hash,
-                    block_number: parse_hex_u64(block_number).unwrap_or(0),
-                    logs,
-                });
+            };
+            if let Some(v) = answer {
+                last_error = None;
+                if let Some(err) = crate::rpc_error_json(&v) {
+                    return Err(RpcError::Rpc(err).into());
+                }
+                if let Some(receipt) = v.get("result").filter(|r| !r.is_null()) {
+                    return receipt_for(tx_hash, receipt);
+                }
+            } else {
+                tracing::warn!(
+                    target: "ant_chain::tx",
+                    tx = %format!("0x{}", hex::encode(tx_hash)),
+                    error = last_error.as_deref().unwrap_or(""),
+                    "receipt poll got no answer; the transaction is already sent, polling on",
+                );
             }
-            if started.elapsed() >= wait {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(TxError::Timeout {
                     tx_hash: hex::encode(tx_hash),
                     wait_secs: wait.as_secs(),
+                    last_error,
                 });
             }
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(delay.min(left)).await;
             delay = (delay * 2).min(Duration::from_secs(8));
         }
     }
+}
+
+/// The floor of one receipt poll's time cut-off in
+/// [`ChainClient::wait_for_receipt`]: the poll sent at the deadline
+/// still gets this long to answer.
+#[cfg(feature = "chain-rpc")]
+pub const RECEIPT_POLL_MIN: Duration = Duration::from_secs(10);
+
+/// Check a `eth_getTransactionReceipt` result for `tx_hash` and turn it
+/// into a [`TxReceipt`] (see [`ChainClient::wait_for_receipt`]).
+#[cfg(feature = "chain-rpc")]
+fn receipt_for(tx_hash: &[u8; 32], receipt: &serde_json::Value) -> Result<TxReceipt, TxError> {
+    let answered = receipt
+        .get("transactionHash")
+        .and_then(|h| h.as_str())
+        .unwrap_or("");
+    if !answered.eq_ignore_ascii_case(&format!("0x{}", hex::encode(tx_hash))) {
+        return Err(TxError::HashMismatch {
+            what: "receipt transactionHash",
+            sent: hex::encode(tx_hash),
+            answered: answered.to_string(),
+        });
+    }
+    let status = receipt.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    let block_number = receipt
+        .get("blockNumber")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if status != "0x1" {
+        return Err(TxError::Reverted {
+            receipt_status: status.to_string(),
+        });
+    }
+    let logs = receipt.get("logs").and_then(|l| l.as_array()).map_or_else(
+        || Ok(Vec::new()),
+        |arr| arr.iter().map(parse_log).collect::<Result<Vec<_>, _>>(),
+    )?;
+    Ok(TxReceipt {
+        tx_hash: *tx_hash,
+        block_number: parse_hex_u64(block_number).unwrap_or(0),
+        logs,
+    })
 }
 
 #[cfg(feature = "chain-rpc")]
@@ -1354,6 +1422,306 @@ mod tests {
             events,
             ["nonce 0", "send", "mined", "nonce 1", "send", "mined"],
             "the second transaction must read its nonce after the first is mined",
+        );
+    }
+}
+
+/// Receipt waits against a real HTTP stub for the configured RPC URL
+/// (issue #253): a transport error on one receipt poll is "no answer
+/// yet", never the end of the wait, and never a reason to send again.
+#[cfg(all(test, feature = "chain-rpc"))]
+mod receipt_wait_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// What the stub does with one request.
+    enum Reply {
+        /// Answer with this `result`.
+        Result(serde_json::Value),
+        /// Answer with this JSON-RPC `error`.
+        Error(serde_json::Value),
+        /// Read the request, then close the connection without a word:
+        /// a keep-alive connection the server dropped under the client.
+        Drop,
+        /// Read the request and never answer.
+        Hang,
+    }
+
+    /// A scripted JSON-RPC server. `script` gets the request and, for a
+    /// receipt poll, how many receipt polls came before it.
+    struct Stub {
+        url: String,
+        sends: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+        methods: Arc<Mutex<Vec<String>>>,
+    }
+
+    type Script = dyn Fn(&serde_json::Value, usize) -> Reply + Send + Sync;
+
+    async fn spawn_stub(script: Arc<Script>) -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/rpc/secret-key", listener.local_addr().unwrap());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let (s, p, m) = (sends.clone(), polls.clone(), methods.clone());
+        tokio::spawn(async move {
+            let mut hung = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let Some(req) = read_request(&mut sock).await else {
+                    continue;
+                };
+                let method = req["method"].as_str().unwrap_or("?").to_string();
+                m.lock().unwrap().push(method.clone());
+                let reply = match method.as_str() {
+                    "eth_sendRawTransaction" => {
+                        s.fetch_add(1, Ordering::SeqCst);
+                        script(&req, 0)
+                    }
+                    "eth_getTransactionReceipt" => script(&req, p.fetch_add(1, Ordering::SeqCst)),
+                    _ => script(&req, 0),
+                };
+                let answer = match reply {
+                    Reply::Result(result) => {
+                        Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+                    }
+                    Reply::Error(error) => {
+                        Some(json!({"jsonrpc": "2.0", "id": req["id"], "error": error}))
+                    }
+                    Reply::Drop => None,
+                    Reply::Hang => {
+                        hung.push(sock);
+                        continue;
+                    }
+                };
+                // `Drop`: the socket closes here, unanswered.
+                if let Some(answer) = answer {
+                    let body = answer.to_string();
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        Stub {
+            url,
+            sends,
+            polls,
+            methods,
+        }
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<serde_json::Value> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let body_at = loop {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..body_at]).to_lowercase();
+        let len: usize = head
+            .split("content-length:")
+            .nth(1)
+            .and_then(|s| s.split("\r\n").next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < body_at + len {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        serde_json::from_slice(&buf[body_at..body_at + len]).ok()
+    }
+
+    fn mined(req: &serde_json::Value) -> Reply {
+        Reply::Result(json!({
+            "transactionHash": req["params"][0],
+            "status": "0x1",
+            "blockNumber": "0x10",
+            "logs": [],
+        }))
+    }
+
+    /// Answers the nonce and send reads a funding step makes before
+    /// its receipt wait; `receipt` scripts the polls.
+    fn chain(
+        receipt: impl Fn(&serde_json::Value, usize) -> Reply + Send + Sync + 'static,
+    ) -> Arc<Script> {
+        Arc::new(move |req, n| match req["method"].as_str().unwrap() {
+            "eth_getTransactionCount" => Reply::Result(json!("0x0")),
+            "eth_sendRawTransaction" => {
+                let raw = hex::decode(&req["params"][0].as_str().unwrap()[2..]).unwrap();
+                Reply::Result(json!(format!("0x{}", hex::encode(keccak256(&raw)))))
+            }
+            "eth_getTransactionReceipt" => receipt(req, n),
+            other => panic!("unscripted method {other}"),
+        })
+    }
+
+    /// Freedom's keep-alive race (#253): pending, then a dropped
+    /// connection, then the receipt. The wait carries on through the
+    /// dropped poll and returns the receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_receipt_poll_is_not_the_end_of_the_wait() {
+        let stub = spawn_stub(chain(|req, n| match n {
+            0 => Reply::Result(serde_json::Value::Null),
+            1 | 2 => Reply::Drop,
+            _ => mined(req),
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url);
+        let hash = [0x11u8; 32];
+        let receipt = client
+            .wait_for_receipt(&hash, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(receipt.tx_hash, hash);
+        assert_eq!(receipt.block_number, 0x10);
+        assert_eq!(stub.polls.load(Ordering::SeqCst), 4);
+    }
+
+    /// A JSON-RPC error answer still fails at once: only a missing
+    /// answer is retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_json_rpc_error_answer_still_fails_at_once() {
+        let stub = spawn_stub(chain(|_, _| {
+            Reply::Error(json!({"code": -32601, "message": "nope"}))
+        }))
+        .await;
+        let err = ChainClient::new(&stub.url)
+            .wait_for_receipt(&[0x22u8; 32], Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TxError::Rpc(RpcError::Rpc(_))), "{err}");
+        assert_eq!(stub.polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An RPC that is gone for the whole wait ends it at the deadline
+    /// with [`TxError::Timeout`]: it names the hash, says the
+    /// transaction may still be mined, and carries the last transport
+    /// error without the RPC URL (which can hold an API key).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_rpc_times_out_at_the_deadline() {
+        let stub = spawn_stub(chain(|_, _| Reply::Drop)).await;
+        let client = ChainClient::new(&stub.url);
+        let wait = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let err = client
+            .wait_for_receipt(&[0x33u8; 32], wait)
+            .await
+            .unwrap_err();
+        let took = started.elapsed();
+        let TxError::Timeout {
+            ref tx_hash,
+            wait_secs,
+            ref last_error,
+        } = err
+        else {
+            panic!("expected a timeout, got {err}");
+        };
+        assert_eq!(tx_hash, &hex::encode([0x33u8; 32]));
+        assert_eq!(wait_secs, 2);
+        assert!(last_error.is_some());
+        let shown = err.to_string();
+        assert!(shown.contains("may still be mined"), "{shown}");
+        assert!(!shown.contains("secret-key"), "{shown}");
+        assert!(!shown.contains("127.0.0.1"), "{shown}");
+        assert!(took >= wait, "{took:?}");
+        assert!(took < wait + Duration::from_secs(2), "{took:?}");
+        // Polled more than once: the first dropped poll didn't end it.
+        assert!(stub.polls.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// A poll the RPC never answers is cut off, so the wait still ends
+    /// within `wait + RECEIPT_POLL_MIN` (and with it the sender lock
+    /// it runs under).
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_receipt_poll_is_cut_off() {
+        let stub = spawn_stub(chain(|_, _| Reply::Hang)).await;
+        let client = ChainClient::new(&stub.url);
+        let wait = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let err = client
+            .wait_for_receipt(&[0x44u8; 32], wait)
+            .await
+            .unwrap_err();
+        let took = started.elapsed();
+        assert!(matches!(err, TxError::Timeout { .. }), "{err}");
+        assert!(took >= wait, "{took:?}");
+        assert!(took <= wait + RECEIPT_POLL_MIN, "{took:?}");
+    }
+
+    /// Through a real funding step (`top_up_batch`: approve, then
+    /// `topUp`): dropped receipt polls under both transactions still
+    /// complete the step, and each transaction is sent exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_funding_step_survives_dropped_polls_and_sends_each_tx_once() {
+        let stub = spawn_stub(chain(|req, n| {
+            // Per transaction: pending, dropped, dropped, mined.
+            match n % 4 {
+                0 => Reply::Result(serde_json::Value::Null),
+                1 | 2 => Reply::Drop,
+                _ => mined(req),
+            }
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url);
+        let wallet = Wallet::new([0x53u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        let payer = crate::funding::Payer::gnosis(&client, &wallet);
+        crate::funding::top_up_batch(&payer, &[7u8; 32], 17, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(stub.polls.load(Ordering::SeqCst), 8);
+    }
+
+    /// The same step when the receipt never shows (the RPC drops every
+    /// poll): it fails at the first transaction with a timeout, after
+    /// sending it once, and never sends it again nor goes on to `topUp`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_funding_step_never_sends_again() {
+        let stub = spawn_stub(chain(|_, _| Reply::Drop)).await;
+        let client = ChainClient::new(&stub.url);
+        let wallet = Wallet::new([0x54u8; 32], GNOSIS_CHAIN_ID)
+            .unwrap()
+            .wait_for(Duration::from_secs(2));
+        let payer = crate::funding::Payer::gnosis(&client, &wallet);
+        let err = crate::funding::top_up_batch(&payer, &[7u8; 32], 17, 1_000)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::funding::FundingError::Tx {
+                    what: "authorise payment",
+                    source: TxError::Timeout { .. },
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 1);
+        let methods = stub.methods.lock().unwrap().clone();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() != "eth_getTransactionReceipt")
+                .collect::<Vec<_>>(),
+            ["eth_getTransactionCount", "eth_sendRawTransaction"],
         );
     }
 }
