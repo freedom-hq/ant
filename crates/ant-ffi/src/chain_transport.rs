@@ -185,17 +185,19 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// covered window in `data`) also counts as can't-serve and falls back.
 /// It is never surfaced to callers as an empty result — that would
 /// silently truncate postage-batch discovery. Any other `error` is
-/// treated as a genuine answer and returned to the caller.
+/// treated as a genuine answer and returned to the caller. A -32000 on
+/// `eth_sendRawTransaction` is the exception: it is returned to the
+/// caller as is, never replayed against `gnosis_rpc`, so a signed
+/// transaction never reaches a second endpoint that way.
 ///
 /// **Emit -32000 only for a coverage gap.** geth and Nethermind also use
 /// it as a catch-all for genuine failures (`nonce too low`, `already
 /// known`, `insufficient funds …`, `replacement transaction
 /// underpriced`, `execution reverted`), so a host forwarding backend
 /// replies verbatim turns those into can't-serve and ant replays them
-/// against `gnosis_rpc` — for `eth_sendRawTransaction` that is a second
-/// broadcast of an already-signed transaction, and the caller sees the
-/// fallback URL's error instead of the real one. Map any non-coverage
-/// failure to a different code, or answer authoritatively.
+/// against `gnosis_rpc`, where the caller sees the fallback URL's answer
+/// instead of the real one. Map any non-coverage failure to a different
+/// code, or answer authoritatively.
 ///
 /// **Transactions:** `eth_sendRawTransaction` must answer the hash of
 /// the transaction it was given (keccak256 of the raw bytes), and an

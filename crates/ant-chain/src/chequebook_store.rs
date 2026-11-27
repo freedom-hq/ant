@@ -619,8 +619,10 @@ fn with_withdrawals_applied(chequebook: &[u8; 20], raw: RetrievalFunds) -> Retri
 /// covers a read taken while a withdrawal's [`Landed`] entry still
 /// exists: a read stalled for longer than [`LANDED_WITHDRAWAL_TTL`]
 /// could carry the pre-withdrawal deposit past the entry's expiry and
-/// be published unadjusted. The RPC client has no timeout of its own,
-/// so this bound is what keeps every read well inside the TTL.
+/// be published unadjusted. The RPC client bounds each request to the
+/// configured URL ([`crate::RPC_REQUEST_TIMEOUT`]) but not the three
+/// together, nor a host transport's `serve`, so this bound is what keeps
+/// every read well inside the TTL.
 #[cfg(feature = "chain-rpc")]
 const FUNDS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -2386,7 +2388,10 @@ mod tests {
                 held.push(listener.accept().await.unwrap().0);
             }
         });
-        let client = crate::ChainClient::new(url);
+        // A request timeout past the funds bound, so this checks the
+        // bound itself (a host transport's `serve`, which ant can't cut,
+        // stalls the same way).
+        let client = crate::ChainClient::new(url).with_request_timeout(FUNDS_READ_TIMEOUT * 2);
         let cb = [0xcd; 20];
         let started = tokio::time::Instant::now();
         let published = std::sync::Mutex::new(Vec::new());

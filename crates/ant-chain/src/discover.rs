@@ -29,7 +29,7 @@ use serde_json::json;
 
 use crate::chequebook::{chequebook_issuer_selector, factory_deployed_contracts_calldata};
 use crate::tx::batch_created_event_topic;
-use crate::{ChainClient, RpcError};
+use crate::{without_urls, ChainClient, RpcError};
 
 /// `keccak256("Transfer(address,address,uint256)")` — topic[0] of the
 /// ERC-20 `Transfer(address indexed from, address indexed to, uint256
@@ -50,6 +50,42 @@ pub const GNOSIS_XBZZ_DEPLOY_BLOCK: u64 = 16_514_506;
 /// `from` filter matches almost nothing; range-capped RPCs cause the
 /// scanner to shrink the window adaptively.
 const INITIAL_SCAN_CHUNK: u64 = 50_000_000;
+
+/// Request timeouts in a row a log scan answers by halving its window;
+/// the next one fails the scan. Each costs up to
+/// [`crate::RPC_REQUEST_TIMEOUT`], so a hung RPC fails on its 7th
+/// timeout, after at most about 3.5 minutes (210 s). A slow one gets a
+/// window 64× narrower than the one it couldn't answer (~450k blocks for
+/// the ~29M-block xBZZ history), which an indexed `from` filter serves
+/// fast. With a `min_window` above one block (a pass that may fall back
+/// to an unverified source), the halving stops at that floor instead:
+/// the scan then returns the unread rest, as for a range limit, which
+/// can come before the 7th timeout. The count is kept per source across
+/// a pass's tries ([`LogPace`]), so a source that already hung fails a
+/// later try on its first timeout, not after seven more.
+const MAX_SLOW_WINDOW_HALVINGS: u32 = 6;
+
+/// How a log scan's window has fared against one RPC so far: the widest
+/// window to ask it for, and the request timeouts since it last served
+/// one. A pass keeps one per source across its tries, so a retry of a
+/// source that answered too slowly neither starts again from
+/// [`INITIAL_SCAN_CHUNK`] nor gets a fresh [`MAX_SLOW_WINDOW_HALVINGS`]
+/// budget: a hung unverified source costs one request timeout per retry,
+/// not seven.
+#[derive(Debug, Clone, Copy)]
+struct LogPace {
+    ceiling: u64,
+    slow: u32,
+}
+
+impl LogPace {
+    const fn new() -> Self {
+        Self {
+            ceiling: INITIAL_SCAN_CHUNK,
+            slow: 0,
+        }
+    }
+}
 
 /// One decoded `eth_getLogs` entry. Richer than [`crate::tx::EventLog`]
 /// (which is receipt-shaped): the scan needs the originating tx hash
@@ -566,34 +602,6 @@ pub fn wallet_scan_failed(node_eoa: &[u8; 20], error: &str) {
     });
 }
 
-/// `error` with every URL replaced by `<url>`. RPC URLs often carry an
-/// API key, and `/health` is readable by any origin the CORS list
-/// allows; the logs keep the full text.
-fn without_urls(error: &str) -> String {
-    error
-        .split(' ')
-        .map(|word| match word.find("://") {
-            Some(scheme_end) => {
-                // Slice after the matched char, not one byte past its
-                // start: a non-ASCII neighbour (`“https://…”`, a trailing
-                // `…`) is several bytes long.
-                let start = word[..scheme_end]
-                    .char_indices()
-                    .rfind(|&(_, c)| !c.is_ascii_alphanumeric())
-                    .map_or(0, |(i, c)| i + c.len_utf8());
-                let end = word
-                    .char_indices()
-                    .rfind(|&(_, c)| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
-                    .map_or(word.len(), |(i, c)| i + c.len_utf8())
-                    .max(scheme_end + 3);
-                format!("{}<url>{}", &word[..start], &word[end..])
-            }
-            None => word.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Stop tracking `node_eoa`'s rediscovery: an embedder whose node for it
 /// shut down (ant-ffi's `ant_shutdown`) calls this, so a later node for
 /// the same account doesn't serve the old one's `scanning`/`retrying`.
@@ -895,6 +903,9 @@ async fn scan_transfers(
     };
     let read_to = reuse.as_ref().map_or(head, |r| r.after);
     let mut windows = 0u64;
+    // One per source for the whole pass; see `LogPace`.
+    let mut verified_pace = LogPace::new();
+    let mut unverified_pace = LogPace::new();
     let mut verified = if start <= read_to {
         client
             .scan_logs_with(
@@ -904,6 +915,7 @@ async fn scan_transfers(
                 read_to,
                 min_window,
                 max_windows,
+                &mut verified_pace,
                 |end, logs| {
                     windows += 1;
                     take(&mut scan, end, logs, true);
@@ -925,6 +937,7 @@ async fn scan_transfers(
                 head,
                 min_window,
                 max_windows.saturating_sub(windows),
+                &mut verified_pace,
                 |end, logs| {
                     take(&mut scan, end, logs, true);
                 },
@@ -949,7 +962,9 @@ async fn scan_transfers(
                 // for as long as it stays down — but only a stretch at a
                 // time, then try it again, so one transient error (a 429)
                 // costs about a minute of verified windows, not the rest
-                // of the hour-long crawl.
+                // of the hour-long crawl. Each source keeps its `LogPace`
+                // across the tries: a hung unverified source costs its
+                // seven request timeouts once, then one per try.
                 let mut next = rest;
                 loop {
                     let unverified_read = unverified
@@ -960,6 +975,7 @@ async fn scan_transfers(
                             head,
                             1,
                             u64::MAX,
+                            &mut unverified_pace,
                             |end, logs| {
                                 next = end.saturating_add(1);
                                 take(&mut scan, end, logs, false);
@@ -985,6 +1001,7 @@ async fn scan_transfers(
                             head,
                             1,
                             MAX_VERIFIED_WINDOWS,
+                            &mut verified_pace,
                             |end, logs| {
                                 next = end.saturating_add(1);
                                 take(&mut scan, end, logs, true);
@@ -1484,8 +1501,10 @@ impl ChainClient {
     }
 
     /// Scan a contract's logs across `[from_block, to_block]`, shrinking
-    /// the window on a range-limit RPC error and growing it again after
-    /// a success. Public Gnosis RPCs cap `eth_getLogs` ranges (Alchemy's
+    /// the window on a range-limit RPC error, a request timeout or an
+    /// oversized answer, and growing it again after a success (after a
+    /// timeout or oversized answer, no wider than the window that
+    /// worked). Public Gnosis RPCs cap `eth_getLogs` ranges (Alchemy's
     /// free tier at 10 blocks, others at 50 000, etc.); the indexed
     /// `from` filter keeps each window cheap so this stays bounded.
     pub async fn scan_logs(
@@ -1503,6 +1522,7 @@ impl ChainClient {
             to_block,
             1,
             u64::MAX,
+            &mut LogPace::new(),
             |_, mut logs| {
                 out.append(&mut logs);
             },
@@ -1516,7 +1536,9 @@ impl ChainClient {
     /// its progress. A range limit that would shrink the window below
     /// `min_window` blocks, or a range left after `max_windows` windows,
     /// stops the scan: `Ok(Some(block))` is the first block not read.
-    /// `Ok(None)` read it all.
+    /// `Ok(None)` read it all. `pace` carries this source's window
+    /// ceiling and timeouts in a row in and out, so a later call on the
+    /// same source goes on from them.
     #[allow(clippy::too_many_arguments)]
     async fn scan_logs_with(
         &self,
@@ -1526,14 +1548,20 @@ impl ChainClient {
         to_block: u64,
         min_window: u64,
         max_windows: u64,
+        pace: &mut LogPace,
         mut window: impl FnMut(u64, Vec<LogEntry>),
     ) -> Result<Option<u64>, RpcError> {
         let mut start = from_block;
         let mut windows = 0u64;
         // The whole range fits one window: `to - from + 1` blocks, not
         // `to - from`, or the last block costs a request of its own.
-        let mut chunk =
-            INITIAL_SCAN_CHUNK.min(to_block.saturating_sub(from_block).saturating_add(1).max(1));
+        // `pace.ceiling`: a window the RPC answered too slowly or too
+        // fully earlier; the scan doesn't grow back up past half of it.
+        // `pace.slow`: request timeouts since the last window read.
+        let mut chunk = pace
+            .ceiling
+            .min(to_block.saturating_sub(from_block).saturating_add(1))
+            .max(1);
         while start <= to_block {
             if windows >= max_windows {
                 return Ok(Some(start));
@@ -1549,13 +1577,46 @@ impl ChainClient {
                         return Ok(None);
                     }
                     start = end + 1;
-                    chunk = chunk.saturating_mul(2).min(INITIAL_SCAN_CHUNK);
+                    pace.slow = 0;
+                    chunk = chunk.saturating_mul(2).min(pace.ceiling);
                 }
                 Err(RpcError::Rpc(msg)) if chunk > 1 && is_range_limit_error(&msg) => {
                     if chunk / 2 < min_window {
                         return Ok(Some(start));
                     }
                     chunk = (chunk / 2).max(1);
+                }
+                // Cut at `RPC_REQUEST_TIMEOUT`, or more than
+                // `RPC_MAX_RESPONSE_BYTES` of logs: the window asked too
+                // much of this RPC (a full-history first window on a slow
+                // node), so ask for half, like a range limit, rather than
+                // repeating the same window on every try. Timeouts in a
+                // row are capped: a hung RPC fails on the timeout after
+                // `MAX_SLOW_WINDOW_HALVINGS` halvings, not after halving
+                // down to one block.
+                Err(e)
+                    if chunk > 1
+                        && (matches!(e, RpcError::TooLarge(_))
+                            || (e.is_request_timeout()
+                                && pace.slow < MAX_SLOW_WINDOW_HALVINGS)) =>
+                {
+                    if e.is_request_timeout() {
+                        pace.slow += 1;
+                    }
+                    tracing::debug!(
+                        target: "ant_chain",
+                        from_block = start,
+                        to_block = end,
+                        error = %e,
+                        "eth_getLogs window too heavy for the RPC; halving it",
+                    );
+                    // Kept before a stop at `min_window`, so the next call
+                    // on this source doesn't ask for the same window again.
+                    pace.ceiling = (chunk / 2).max(1);
+                    if chunk / 2 < min_window {
+                        return Ok(Some(start));
+                    }
+                    chunk = pace.ceiling;
                 }
                 Err(e) => return Err(e),
             }
@@ -3551,6 +3612,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Issue #296 R2-M3: a hung unverified source costs its
+    /// `MAX_SLOW_WINDOW_HALVINGS + 1` request timeouts once per pass, then
+    /// one per retry between verified stretches, not seven every time:
+    /// each source keeps its [`LogPace`] across the pass's tries.
+    #[tokio::test]
+    async fn a_hung_unverified_source_is_not_rehalved_on_every_retry() {
+        const EOA: [u8; 20] = [0x5d; 20];
+        let found = [to_cb(45_000_000, [1; 32])];
+        let (mut client, v, _) = verified_with_unverified(Some(200_000), &found, &found);
+        let (url, hung) = spawn_slow_logs(0, std::time::Duration::from_secs(5), None).await;
+        client.unverified_logs = Some(std::sync::Arc::new(
+            ChainClient::new(url).with_request_timeout(std::time::Duration::from_millis(200)),
+        ));
+        let dir = scratch_dir("scan-unverified-hung");
+
+        let scan = refresh_transfer_scan(&client, crate::GNOSIS_BZZ_TOKEN, &EOA, &dir)
+            .await
+            .expect("the verified crawl finishes the scan");
+        assert_eq!(scan.transfers.len(), 1);
+        assert_eq!(scan.scanned_through, HEAD - RESCAN_TAIL);
+        let stretches = (v.ranges.lock().unwrap().len() as u64).div_ceil(MAX_VERIFIED_WINDOWS);
+        assert!(stretches >= 2, "the source was retried: {stretches}");
+        assert_eq!(
+            hung.lock().unwrap().len() as u64,
+            u64::from(MAX_SLOW_WINDOW_HALVINGS) + 1 + (stretches - 1),
+            "seven timeouts on the first try, then one per retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// R3-M4: when the unverified source fails part-way through a first
     /// scan, the blocks the scan then reads through the verified route are
     /// kept as confirmed: a later confirmation reads only the blocks the
@@ -4085,7 +4176,16 @@ mod tests {
         let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(chain.clone()));
         let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
         let rest = client
-            .scan_logs_with(crate::GNOSIS_BZZ_TOKEN, &topics, 1, 1_000, 1, 3, |_, _| {})
+            .scan_logs_with(
+                crate::GNOSIS_BZZ_TOKEN,
+                &topics,
+                1,
+                1_000,
+                1,
+                3,
+                &mut LogPace::new(),
+                |_, _| {},
+            )
             .await
             .unwrap();
         assert_eq!(chain.ranges.lock().unwrap().len(), 3);
@@ -4443,5 +4543,169 @@ mod tests {
         assert_eq!(found, None);
         assert_eq!(chain.ranges.lock().unwrap().len(), 1, "one scan");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An `eth_getLogs` RPC URL that answers a window of more than `wide`
+    /// blocks only after `delay` (or with a body of `huge` bytes, if set),
+    /// and a narrower one at once with no logs. Records every range asked.
+    async fn spawn_slow_logs(
+        wide: u64,
+        delay: std::time::Duration,
+        huge: Option<usize>,
+    ) -> (String, std::sync::Arc<Mutex<Vec<(u64, u64)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let ranges = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = ranges.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (body_at, len) = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                            let len: usize = head
+                                .split("content-length:")
+                                .nth(1)
+                                .and_then(|s| s.split("\r\n").next())
+                                .and_then(|s| s.trim().parse().ok())
+                                .unwrap_or(0);
+                            break (i + 4, len);
+                        }
+                    };
+                    while buf.len() < body_at + len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req: serde_json::Value =
+                        serde_json::from_slice(&buf[body_at..body_at + len]).unwrap();
+                    let block = |k: &str| {
+                        u64::from_str_radix(
+                            req["params"][0][k]
+                                .as_str()
+                                .unwrap()
+                                .trim_start_matches("0x"),
+                            16,
+                        )
+                        .unwrap()
+                    };
+                    let (from, to) = (block("fromBlock"), block("toBlock"));
+                    seen.lock().unwrap().push((from, to));
+                    let mut body = br#"{"jsonrpc":"2.0","id":1,"result":[]}"#.to_vec();
+                    if to - from + 1 > wide {
+                        match huge {
+                            Some(n) => {
+                                let mut padded = vec![b' '; n];
+                                padded.extend_from_slice(&body);
+                                body = padded;
+                            }
+                            None => tokio::time::sleep(delay).await,
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (url, ranges)
+    }
+
+    /// Issue #296 R1-F1: a configured RPC too slow to answer the
+    /// full-history first window inside the request timeout gets a
+    /// narrower one, like a range limit, instead of the same window on
+    /// every try; and the window doesn't grow back to the slow width.
+    #[tokio::test]
+    async fn a_timed_out_window_is_halved() {
+        let full = (GNOSIS_XBZZ_DEPLOY_BLOCK, 45_000_000);
+        let width = full.1 - full.0 + 1;
+        let wide = width / 4;
+        let (url, ranges) = spawn_slow_logs(wide, std::time::Duration::from_secs(5), None).await;
+        let client =
+            ChainClient::new(url).with_request_timeout(std::time::Duration::from_millis(300));
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        let logs = client
+            .scan_logs(crate::GNOSIS_BZZ_TOKEN, &topics, full.0, full.1)
+            .await
+            .expect("a slow RPC still completes the scan");
+        assert!(logs.is_empty());
+        let ranges = ranges.lock().unwrap().clone();
+        assert_eq!(ranges[0], full, "full window first");
+        assert!(ranges.len() <= 3 + 5, "{ranges:?}");
+        let read: Vec<_> = ranges.iter().filter(|r| r.1 - r.0 < wide).collect();
+        assert_eq!(read.first().unwrap().0, full.0);
+        assert_eq!(read.last().unwrap().1, full.1);
+        for pair in read.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + 1, "contiguous: {ranges:?}");
+        }
+        assert_eq!(
+            ranges.iter().filter(|r| r.1 - r.0 >= wide).count(),
+            2,
+            "two slow windows, then no growing back into one: {ranges:?}"
+        );
+    }
+
+    /// A hung RPC still fails, on the timeout after
+    /// [`MAX_SLOW_WINDOW_HALVINGS`] halved windows (7 requests), rather
+    /// than halving down to a single block.
+    #[tokio::test]
+    async fn a_hung_rpc_fails_after_a_few_halvings() {
+        let (url, ranges) = spawn_slow_logs(0, std::time::Duration::from_secs(5), None).await;
+        let client =
+            ChainClient::new(url).with_request_timeout(std::time::Duration::from_millis(200));
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        let err = client
+            .scan_logs(
+                crate::GNOSIS_BZZ_TOKEN,
+                &topics,
+                GNOSIS_XBZZ_DEPLOY_BLOCK,
+                45_000_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_request_timeout(), "{err}");
+        assert_eq!(
+            ranges.lock().unwrap().len(),
+            MAX_SLOW_WINDOW_HALVINGS as usize + 1
+        );
+    }
+
+    /// An answer over [`crate::RPC_MAX_RESPONSE_BYTES`] halves the window
+    /// too: a narrower one carries fewer logs.
+    #[tokio::test]
+    async fn an_oversized_window_is_halved() {
+        let full = (GNOSIS_XBZZ_DEPLOY_BLOCK, 45_000_000);
+        let wide = (full.1 - full.0 + 1) / 3;
+        let (url, ranges) = spawn_slow_logs(
+            wide,
+            std::time::Duration::ZERO,
+            Some(crate::RPC_MAX_RESPONSE_BYTES + 1),
+        )
+        .await;
+        let topics = json!([format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC))]);
+        ChainClient::new(url)
+            .scan_logs(crate::GNOSIS_BZZ_TOKEN, &topics, full.0, full.1)
+            .await
+            .expect("completes with narrower windows");
+        let ranges = ranges.lock().unwrap().clone();
+        assert_eq!(ranges[0], full);
+        assert_eq!(ranges.last().unwrap().1, full.1);
+        assert!(ranges.len() <= 8, "{ranges:?}");
     }
 }

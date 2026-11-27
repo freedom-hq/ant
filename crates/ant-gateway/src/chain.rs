@@ -468,11 +468,18 @@ pub struct ChainContext {
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
-/// Gnosis block and confirm; the `Wallet` waits up to 60 s per tx, plus
-/// up to `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a receipt
-/// poll still open at that deadline, so 70 s, and a buy is two txs
-/// (140 s): bound the handler at 3 minutes.
-const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(3);
+/// Gnosis block and confirm. One tx is a nonce read and a send, each
+/// bounded by `ant_chain::RPC_REQUEST_TIMEOUT` (30 s) on the configured
+/// URL, then the `Wallet`'s receipt wait of up to 60 s plus
+/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a poll still open at
+/// that deadline: 130 s. The reads a route makes inside this bound count
+/// too, each up to 30 s (a deposit-funds read, three calls, up to 60 s):
+/// a buy is two txs (260 s); a top-up one batch-depth read (a single
+/// `eth_call`, not the batch's four-call metadata) and two txs (290 s);
+/// a withdrawal the issuer, funds and liquid-balance reads, one tx, then
+/// the funds re-read (30 + 60 + 30 + 130 + 60 = 310 s). Bound the
+/// handler at 6 minutes.
+const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(6);
 
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
@@ -487,7 +494,7 @@ where
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(json_error(
             StatusCode::BAD_GATEWAY,
-            format!("chain rpc: {e}"),
+            format!("chain rpc: {}", ant_chain::without_urls(&e)),
         )),
         Err(_) => Err(json_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -699,7 +706,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => (v, None),
         Err(e) => {
             tracing::warn!(target: "ant_gateway", "chequebook availableBalance: {e}");
-            (bal, Some(e))
+            (bal, Some(ant_chain::without_urls(&e)))
         }
     };
     Json(ChequebookBalanceBody {
@@ -846,7 +853,7 @@ where
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(json_error(
             StatusCode::BAD_GATEWAY,
-            format!("chain tx: {e}"),
+            format!("chain tx: {}", ant_chain::without_urls(&e)),
         )),
         Err(_) => Err(json_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -1429,13 +1436,30 @@ pub async fn chequebook_withdraw(
 /// balances, chequebook), so longer than one [`CHAIN_RPC_TIMEOUT`].
 const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on an xDAI-funded write: up to four transactions (swap,
-/// approve, `createBatch` or `topUp`, `increaseDepth`), each waiting up
-/// to 70 s (the `Wallet`'s 60 s plus
+/// Bound on an xDAI-funded write. Each transaction takes up to 130 s
+/// (a nonce read and a send of up to `ant_chain::RPC_REQUEST_TIMEOUT`,
+/// 30 s, each, then the `Wallet`'s 60 s receipt wait plus
 /// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a receipt poll still open
 /// at that deadline), possibly queued behind one more the node is
-/// already sending: 5 × 70 s = 350 s, inside 6 minutes.
-const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(6);
+/// already sending; each of the flow's own reads (balances, pool price,
+/// swap-helper code, the capped-swap dry run, chequebook checks) takes
+/// up to 30 s, one after another. Worst cases:
+///
+/// - buy: 6 reads, then helper deploy, swap, approve, `createBatch`
+///   (+1 queued): 180 s + 5 × 130 s = 830 s;
+/// - extend: 7 reads (the batch's owner and depth, one `eth_call`
+///   each, then the five before the swap), then helper deploy, swap,
+///   approve, `topUp`, `increaseDepth` (+1 queued):
+///   210 s + 6 × 130 s = 990 s;
+/// - deposit top-up: 15 reads (deposit, wallet xBZZ, the chequebook
+///   checks before the swap and again before the transfer, the swap's
+///   four, the transfer's two balances, the closing deposit status),
+///   then helper deploy, swap, transfer (+1 queued):
+///   450 s + 4 × 130 s = 970 s.
+///
+/// 17 minutes (1020 s) holds the largest, so a slow-but-answering RPC
+/// isn't cut mid-flow (#102).
+const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(17);
 
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn funding_call<F, T>(limit: Duration, timed_out: &str, fut: F) -> Result<T, Response>
@@ -1459,7 +1483,10 @@ fn failure_response(f: FundingFailure) -> Response {
             json_error(StatusCode::BAD_REQUEST, m)
         }
         FundingFailure::NotFound(m) => json_error(StatusCode::NOT_FOUND, m),
-        FundingFailure::Chain(m) => json_error(StatusCode::BAD_GATEWAY, m),
+        // Chain error text may quote an RPC URL (and its API key).
+        FundingFailure::Chain(m) => {
+            json_error(StatusCode::BAD_GATEWAY, ant_chain::without_urls(&m))
+        }
         FundingFailure::Unavailable(m) => json_error(StatusCode::SERVICE_UNAVAILABLE, m),
     }
 }

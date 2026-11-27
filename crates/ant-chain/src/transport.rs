@@ -31,6 +31,11 @@
 //! Any other JSON-RPC `error` member is a genuine answer (an `eth_call`
 //! revert, say) and is surfaced to the caller unchanged.
 //!
+//! `eth_sendRawTransaction` is the exception to (2): a `-32000` on it is
+//! always surfaced, never replayed. It can't be a coverage gap, and
+//! geth/Nethermind use the code there for `nonce too low`, `already
+//! known` and the like (MY-06).
+//!
 //! # `-32000` is for coverage gaps only
 //!
 //! **A host must emit `-32000` only when its index cannot cover the
@@ -42,11 +47,12 @@
 //! `execution reverted`. A host whose verified ladder bottoms out at an
 //! RPC-quorum stage and forwards backend replies verbatim therefore
 //! turns every one of those into can't-serve, and ant replays the
-//! request against the configured URL: for `eth_sendRawTransaction` that
-//! is a *second broadcast* of an already-signed transaction, and the
-//! caller then sees the fallback URL's error instead of the real one.
-//! Map any failure that is not a coverage gap to a different error code,
-//! or answer authoritatively.
+//! request against the configured URL, where the caller then sees the
+//! fallback URL's answer instead of the real one. (Not for
+//! `eth_sendRawTransaction`: ant surfaces a `-32000` on a send as is, so
+//! a signed transaction never reaches a second endpoint that way.) Map
+//! any failure that is not a coverage gap to a different error code, or
+//! answer authoritatively.
 //!
 //! # Transactions are checked against their own hash
 //!
@@ -83,16 +89,18 @@ pub const RETRYABLE_ERROR_CODE: i64 = -32000;
 ///
 /// Return the JSON-RPC response body for `request_json`, or `None` to
 /// signal can't-serve — see the [module docs](self). Implementations
-/// must not panic; a panic is caught and treated as can't-serve, but it
-/// costs a fallback round trip.
+/// must not panic: ant's release profile sets `panic = "abort"`, so a
+/// panic in `serve` ends the process. (Only where panics unwind, in
+/// debug and test builds, is it caught and treated as can't-serve.)
 ///
 /// An implementation that wraps other backends must not pass their
 /// `-32000` errors through: here that code means "coverage gap, try
 /// elsewhere" and nothing else, while geth/Nethermind also use it for
 /// genuine failures (`nonce too low`, `already known`, `insufficient
 /// funds …`, `execution reverted`). Forwarding those verbatim gets the
-/// request replayed against the configured URL — a second broadcast for
-/// `eth_sendRawTransaction`. Re-code them, or answer authoritatively.
+/// request replayed against the configured URL. (A `-32000` on
+/// `eth_sendRawTransaction` is surfaced instead, never replayed.)
+/// Re-code them, or answer authoritatively.
 pub trait ChainTransport: Send + Sync + 'static {
     /// Answer a single JSON-RPC request. `request_json` is a complete
     /// request object (`{"jsonrpc":"2.0","id":…,"method":…,"params":…}`).
@@ -113,14 +121,19 @@ pub(crate) enum HostAnswer {
     CantServe(&'static str),
 }
 
-/// Classify a host transport's raw response body.
+/// Classify a host transport's raw response body to a `method` request.
 ///
 /// Anything ant cannot use as a JSON-RPC response — unparseable, not an
 /// object, carrying neither `result` nor `error` — is can't-serve
 /// rather than an error, so a buggy host degrades to today's behaviour
 /// instead of breaking chequebook / postage flows.
+///
+/// A `-32000` is can't-serve except on `eth_sendRawTransaction`, where
+/// it is the backend's real answer (`nonce too low`, `already known`):
+/// replaying a signed transaction to the fallback URL would hand it to
+/// a second endpoint and hide that answer.
 #[cfg(feature = "chain-rpc")]
-pub(crate) fn classify(raw: &str) -> HostAnswer {
+pub(crate) fn classify(raw: &str, method: &str) -> HostAnswer {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return HostAnswer::CantServe("response is not valid JSON");
     };
@@ -128,7 +141,9 @@ pub(crate) fn classify(raw: &str) -> HostAnswer {
         return HostAnswer::CantServe("response is not a JSON-RPC object");
     }
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-        if err.get("code").and_then(serde_json::Value::as_i64) == Some(RETRYABLE_ERROR_CODE) {
+        if err.get("code").and_then(serde_json::Value::as_i64) == Some(RETRYABLE_ERROR_CODE)
+            && method != "eth_sendRawTransaction"
+        {
             return HostAnswer::CantServe("retryable -32000 (range not covered yet)");
         }
         // Any other error is a real answer from the host's backend.
@@ -145,7 +160,11 @@ mod tests {
     use super::*;
 
     fn reason(raw: &str) -> Option<&'static str> {
-        match classify(raw) {
+        reason_for(raw, "eth_getLogs")
+    }
+
+    fn reason_for(raw: &str, method: &str) -> Option<&'static str> {
+        match classify(raw, method) {
             HostAnswer::Served(_) => None,
             HostAnswer::CantServe(r) => Some(r),
         }
@@ -153,7 +172,7 @@ mod tests {
 
     #[test]
     fn plain_result_is_served() {
-        match classify(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#) {
+        match classify(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#, "eth_call") {
             HostAnswer::Served(v) => assert_eq!(v["result"], "0x2a"),
             HostAnswer::CantServe(r) => panic!("unexpected can't-serve: {r}"),
         }
@@ -181,6 +200,16 @@ mod tests {
             reason(raw),
             Some("retryable -32000 (range not covered yet)")
         );
+    }
+
+    /// On a send, `-32000` is the backend's real answer (`nonce too
+    /// low`), never a coverage gap: served, so it is surfaced rather
+    /// than replayed to the fallback URL (MY-06).
+    #[test]
+    fn minus_32000_on_a_send_is_served() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#;
+        assert!(reason_for(raw, "eth_sendRawTransaction").is_none());
+        assert!(reason_for(raw, "eth_getTransactionReceipt").is_some());
     }
 
     /// A revert / bad-params error is a genuine answer, not a

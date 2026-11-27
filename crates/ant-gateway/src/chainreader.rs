@@ -175,14 +175,19 @@ impl AntChainWriter {
     /// batch must also be the node wallet's: `increaseDepth` is
     /// owner-only, so resizing anyone else's batch would pay the swap
     /// and the `topUp` and then revert. A plain extension (`topUp`) is
-    /// open to any payer, so it isn't checked.
+    /// open to any payer, so it isn't checked. Two `eth_call`s (owner,
+    /// then depth), not `fetch_postage_batch_meta`'s four: each counts a
+    /// request timeout against the write's bound (`FUNDING_TX_TIMEOUT`).
     async fn batch_depth(&self, batch_id: &[u8; 32], resize: bool) -> Result<u8, FundingFailure> {
         let postage_hex = format!("0x{}", hex::encode(self.postage_contract));
-        let meta = ant_chain::fetch_postage_batch_meta(&self.client, &postage_hex, batch_id)
+        let read = |e: ant_chain::RpcError| FundingFailure::Chain(format!("read batch: {e}"));
+        let owner = ant_chain::fetch_postage_batch_owner(&self.client, &postage_hex, batch_id)
             .await
-            .map_err(|e| FundingFailure::Chain(format!("read batch: {e}")))?;
-        check_batch_owner(meta.batch_owner_eth, self.wallet.address(), resize)?;
-        Ok(meta.depth)
+            .map_err(read)?;
+        check_batch_owner(owner, self.wallet.address(), resize)?;
+        ant_chain::fetch_postage_batch_depth(&self.client, &postage_hex, batch_id)
+            .await
+            .map_err(read)
     }
 
     /// `wallet` is the node wallet's balances for when there is no
@@ -346,12 +351,13 @@ impl ChainWriter for AntChainWriter {
         // topUp pulls `amount_per_chunk × 2^depth` BZZ via transferFrom, so
         // it needs an allowance just like createBatch. The batch's depth
         // lives on-chain (the gateway doesn't carry it), so read it back to
-        // size the approval exactly.
+        // size the approval exactly. One `eth_call`: each read counts a
+        // request timeout against `CHAIN_TX_TIMEOUT`.
         let postage_hex = format!("0x{}", hex::encode(self.postage_contract));
-        let meta = ant_chain::fetch_postage_batch_meta(&self.client, &postage_hex, &batch_id)
+        let depth = ant_chain::fetch_postage_batch_depth(&self.client, &postage_hex, &batch_id)
             .await
             .map_err(|e| format!("read batch depth: {e}"))?;
-        funding::top_up_batch(&self.payer(), &batch_id, meta.depth, amount_per_chunk)
+        funding::top_up_batch(&self.payer(), &batch_id, depth, amount_per_chunk)
             .await
             .map_err(|e| e.to_string())
     }
