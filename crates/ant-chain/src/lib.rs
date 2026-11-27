@@ -742,22 +742,36 @@ pub async fn fetch_postage_batch_meta(
     postage_contract: &str,
     batch_id: &[u8; 32],
 ) -> Result<PostageBatchMeta, RpcError> {
-    let sel_depth = encode_word32_call("44beae8e", batch_id);
     let sel_buck = encode_word32_call("32ac57dd", batch_id);
     let sel_imm = encode_word32_call("d968f44b", batch_id);
 
     let batch_owner_eth = fetch_postage_batch_owner(client, postage_contract, batch_id).await?;
 
-    let d = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_depth).await?)?;
+    let depth = fetch_postage_batch_depth(client, postage_contract, batch_id).await?;
     let b = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_buck).await?)?;
     let im = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_imm).await?)?;
 
     Ok(PostageBatchMeta {
-        depth: u8::try_from(d).map_err(|_| RpcError::Decode("batchDepth".into()))?,
+        depth,
         bucket_depth: u8::try_from(b).map_err(|_| RpcError::Decode("bucketDepth".into()))?,
         immutable: im != 0,
         batch_owner_eth,
     })
+}
+
+/// `PostageStamp.batchDepth(bytes32)` alone — one `eth_call`, for a
+/// write that only sizes its approval by the depth: the other three
+/// [`fetch_postage_batch_meta`] views would add three more request
+/// timeouts to the write's worst case. A batch not on chain reads `0`.
+#[cfg(feature = "chain-rpc")]
+pub async fn fetch_postage_batch_depth(
+    client: &ChainClient,
+    postage_contract: &str,
+    batch_id: &[u8; 32],
+) -> Result<u8, RpcError> {
+    let sel_depth = encode_word32_call("44beae8e", batch_id);
+    let d = abi_word_tail_u256_as_u64(&client.eth_call(postage_contract, &sel_depth).await?)?;
+    u8::try_from(d).map_err(|_| RpcError::Decode("batchDepth".into()))
 }
 
 /// `PostageStamp.batchOwner(bytes32)` alone — one `eth_call`, for

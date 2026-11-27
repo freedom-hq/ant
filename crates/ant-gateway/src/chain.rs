@@ -474,8 +474,8 @@ pub struct ChainContext {
 /// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a poll still open at
 /// that deadline: 130 s. The reads a route makes inside this bound count
 /// too, each up to 30 s (a deposit-funds read, three calls, up to 60 s):
-/// a buy is two txs (260 s); a top-up one batch-depth read and two txs
-/// (290 s); a withdrawal the issuer, funds and liquid-balance reads, one
+/// a buy is two txs (260 s); a top-up one batch-depth read (a single
+/// `eth_call`, not the batch's four-call metadata) and two txs (290 s); a withdrawal the issuer, funds and liquid-balance reads, one
 /// tx, then the funds re-read (30 + 60 + 30 + 130 + 60 = 310 s). Bound
 /// the handler at 6 minutes.
 const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(6);
@@ -1446,8 +1446,10 @@ const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// - buy: 6 reads, then helper deploy, swap, approve, `createBatch`
 ///   (+1 queued): 180 s + 5 × 130 s = 830 s;
-/// - extend: 5 reads, then helper deploy, swap, approve, `topUp`,
-///   `increaseDepth` (+1 queued): 150 s + 6 × 130 s = 930 s;
+/// - extend: 7 reads (the batch's owner and depth, one `eth_call`
+///   each, then the five before the swap), then helper deploy, swap,
+///   approve, `topUp`, `increaseDepth` (+1 queued):
+///   210 s + 6 × 130 s = 990 s;
 /// - deposit top-up: 15 reads (deposit, wallet xBZZ, the chequebook
 ///   checks before the swap and again before the transfer, the swap's
 ///   four, the transfer's two balances, the closing deposit status),

@@ -2351,3 +2351,140 @@ async fn a_real_rpc_failure_502_body_carries_no_url() {
     assert!(!body.contains("SECRET-KEY"), "{body}");
     assert!(!body.contains("/v2/"), "{body}");
 }
+
+/// A JSON-RPC stub for the real writer: `batchOwner` answers the owner
+/// `owner_of` picks for the batch id, `batchDepth` answers 20, every
+/// other call fails. Records each request as `method` or
+/// `eth_call:<selector>`.
+#[cfg(feature = "chain")]
+async fn spawn_batch_rpc(
+    owner_of: fn(&str) -> [u8; 20],
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::routing::post;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let router = axum::Router::new().route(
+        "/",
+        post(move |axum::Json(req): axum::Json<Value>| {
+            let log = log.clone();
+            async move {
+                let method = req["method"].as_str().unwrap_or_default().to_string();
+                let data = req["params"][0]["data"]
+                    .as_str()
+                    .or_else(|| req["params"][0]["input"].as_str())
+                    .unwrap_or_default()
+                    .trim_start_matches("0x")
+                    .to_string();
+                let answer = if method == "eth_call" {
+                    let selector = data.get(..8).unwrap_or_default().to_string();
+                    log.lock().unwrap().push(format!("eth_call:{selector}"));
+                    match selector.as_str() {
+                        "2182ddb1" => Some(format!(
+                            "0x{}{}",
+                            "00".repeat(12),
+                            hex::encode(owner_of(data.get(8..).unwrap_or_default()))
+                        )),
+                        "44beae8e" => Some(format!("0x{:064x}", 20)),
+                        _ => None,
+                    }
+                } else {
+                    log.lock().unwrap().push(method);
+                    None
+                };
+                axum::Json(match answer {
+                    Some(result) => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": result})
+                    }
+                    None => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "error": {"code": -32601, "message": "stub: not served"},
+                    }),
+                })
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, seen)
+}
+
+/// Issue #296 R2-M1: a top-up and an extend read only what they use from
+/// the batch (one `eth_call` for a top-up's depth; owner then depth for
+/// an extend), never the four-call metadata (bucket depth, immutable
+/// flag), since each read adds a request timeout to the write's bound.
+/// The owner checks still hold: a batch not on chain is `404` and a
+/// resize of someone else's batch `400`, both before any other read.
+#[cfg(feature = "chain")]
+#[tokio::test]
+async fn batch_writes_read_only_the_owner_and_depth() {
+    const BUCKET_DEPTH: &str = "eth_call:32ac57dd";
+    const IMMUTABLE: &str = "eth_call:d968f44b";
+    const OWNER: &str = "eth_call:2182ddb1";
+    const DEPTH: &str = "eth_call:44beae8e";
+    // Batch 00…: not on chain. Any other: owned by a stranger.
+    let (url, seen) = spawn_batch_rpc(|id| {
+        if id.bytes().all(|b| b == b'0') {
+            [0; 20]
+        } else {
+            [0x22; 20]
+        }
+    })
+    .await;
+    let ctx = ant_gateway::chainreader::build(
+        Some(url),
+        None,
+        ant_chain::GNOSIS_POSTAGE_STAMP.into(),
+        [0x11; 20],
+        None,
+        100,
+        Some([0x42; 32]),
+        None,
+    )
+    .unwrap();
+    let router = status_router_with_chain(snapshot_with_one_peer(), ctx);
+    let run = |method, uri: String| {
+        let router = router.clone();
+        let seen = seen.clone();
+        async move {
+            seen.lock().unwrap().clear();
+            let (status, json) = req(router, method, &uri).await;
+            let calls = seen.lock().unwrap().clone();
+            assert!(
+                !calls.iter().any(|c| c == BUCKET_DEPTH || c == IMMUTABLE),
+                "{uri}: {calls:?}"
+            );
+            (status, json, calls)
+        }
+    };
+    let stranger = hex::encode([0xAB; 32]);
+    let missing = hex::encode([0; 32]);
+
+    // Top-up: the depth, then the approval's nonce read (which fails).
+    let (status, json, calls) = run(Method::PATCH, format!("/stamps/topup/{stranger}/500")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{json}");
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("eth_call")).count(),
+        1,
+        "{calls:?}"
+    );
+    assert_eq!(calls[0], DEPTH, "{calls:?}");
+
+    let extend = |id: &str, depth: &str| {
+        format!("/v0/storage/extend?batchId={id}&amountPerChunk=7&maxXdaiWei=500{depth}")
+    };
+    let (status, json, calls) = run(Method::POST, extend(&missing, "")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(calls, [OWNER]);
+
+    let (status, json, calls) = run(Method::POST, extend(&stranger, "&depth=22")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(calls, [OWNER]);
+
+    // A plain extend is open to any payer: owner, depth, then the
+    // funding reads (the first of which fails here).
+    let (status, json, calls) = run(Method::POST, extend(&stranger, "")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{json}");
+    assert_eq!(calls[..2], [OWNER, DEPTH], "{calls:?}");
+}
