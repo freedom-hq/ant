@@ -1404,7 +1404,10 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * threads, so `host_ctx` must be safe to use from any thread. Return
  * within a minute: some reads (the chequebook funds refresh) stop
  * waiting after 60 s, but the thread stays inside the callback until it
- * returns, and that refresh starts no new read until it does.
+ * returns, and that refresh starts no new read until it does. A
+ * transaction's receipt wait takes a slow answer whenever it comes
+ * before its deadline (60 s by default) and asks no more while a call
+ * is parked in the callback.
  *
  * Lifetime: `transport` must stay callable and `host_ctx` valid until
  * the transport is replaced/cleared or ant_shutdown is called. Both of

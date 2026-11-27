@@ -219,7 +219,9 @@ impl ant_chain::ChainTransport for HostChainTransport {
 /// concurrently from several such threads. Return within a minute: some
 /// reads (the chequebook funds refresh) stop waiting after 60 s, but the
 /// thread stays inside the callback until it returns, and that refresh
-/// starts no new read until it does.
+/// starts no new read until it does. A transaction's receipt wait takes
+/// a slow answer whenever it comes before its deadline (60 s by
+/// default) and asks no more while a call is parked here.
 ///
 /// **Ordering:** takes effect immediately, for the next chain request
 /// of every caller: the storage / settlement calls (`ant_storage_*`,
