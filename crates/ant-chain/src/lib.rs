@@ -237,8 +237,24 @@ impl ChainClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
+        self.rpc_noting_host(body, &std::sync::atomic::AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::rpc`], with `asking_host` set while the request waits on
+    /// the host transport (a blocking call that dropping this future
+    /// can't stop) and clear again once it moves on to the URL or ends.
+    pub(crate) async fn rpc_noting_host(
+        &self,
+        body: &serde_json::Value,
+        asking_host: &std::sync::atomic::AtomicBool,
+    ) -> Result<serde_json::Value, RpcError> {
+        use std::sync::atomic::Ordering;
         if let Some(t) = self.transport.clone() {
-            match Self::ask_host(t, body.to_string(), self.host_calls.clone()).await {
+            asking_host.store(true, Ordering::SeqCst);
+            let answer = Self::ask_host(t, body.to_string(), self.host_calls.clone()).await;
+            asking_host.store(false, Ordering::SeqCst);
+            match answer {
                 Ok(v) => return Ok(v),
                 Err(reason) => tracing::debug!(
                     target: "ant-chain",
