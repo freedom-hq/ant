@@ -186,9 +186,11 @@ pub enum TxError {
     Rlp(String),
     #[error("transaction reverted: {receipt_status}")]
     Reverted { receipt_status: String },
-    /// No receipt for a transaction that was sent, within the wait. It
-    /// may still be mined: not a "nothing happened" answer, so a caller
-    /// must not send the same write again on this error alone.
+    /// No receipt for a transaction that was sent, within the wait. "Sent"
+    /// includes a send the RPC never answered (timed out, dropped): it
+    /// may have reached a node all the same. It may still be mined: not a
+    /// "nothing happened" answer, so a caller must not send the same
+    /// write again on this error alone.
     /// `last_error` is the last receipt poll's transport error (without
     /// the RPC URL), when the RPC wasn't answering at the end (#253).
     /// `wait_secs` is the wait asked for; `waited_secs` how long it
@@ -1124,7 +1126,8 @@ impl Wallet {
     /// and ends in the receipt or [`TxError::Timeout`] ("may still be
     /// mined"), never in a plain error a caller could take as "nothing
     /// happened" and buy or deposit again on. Only a JSON-RPC error
-    /// answer or a failed connect returns at once.
+    /// answer (the node's own verdict on it) or a failed connect returns
+    /// at once.
     async fn send_signed_value(
         &self,
         client: &ChainClient,
@@ -1254,11 +1257,11 @@ impl Wallet {
     }
 }
 
-/// Whether an `eth_sendRawTransaction` that failed with `e` may still
-/// have handed the transaction to a node. Only a JSON-RPC error answer
-/// (the node refused it) and a connect that never got through say it
-/// didn't; a timeout, a dropped connection, or an answer ant couldn't
-/// read or decode all may follow a node accepting it.
+/// Whether an `eth_sendRawTransaction` that failed with `e` should be
+/// waited on as possibly sent. A JSON-RPC error answer is the node's own
+/// verdict and is returned as is (as before #296), and a connect that
+/// never got through sent nothing; a timeout, a dropped connection, or an
+/// answer ant couldn't read or decode may all follow a node accepting it.
 #[cfg(feature = "chain-rpc")]
 fn send_may_have_landed(e: &RpcError) -> bool {
     match e {
@@ -2353,6 +2356,31 @@ mod receipt_wait_tests {
             .unwrap_err();
         assert!(err.to_string().contains("nonce too low"), "{err}");
         assert_eq!(stub.polls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Only a failed connect (nothing left) and a JSON-RPC answer skip the
+    /// receipt wait after a failed send; a timed-out request may have
+    /// reached the node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_failed_connect_or_an_answer_reads_as_unsent() {
+        let refused = ChainClient::new("http://127.0.0.1:1/rpc")
+            .eth_send_raw_transaction(&[0u8; 8])
+            .await
+            .unwrap_err();
+        assert!(!send_may_have_landed(&refused), "{refused}");
+
+        let stub = spawn_stub(Arc::new(|_, _| Reply::Hang)).await;
+        let timed_out = ChainClient::new(&stub.url)
+            .with_request_timeout(Duration::from_secs(1))
+            .eth_send_raw_transaction(&[0u8; 8])
+            .await
+            .unwrap_err();
+        assert!(send_may_have_landed(&timed_out), "{timed_out}");
+
+        assert!(!send_may_have_landed(&RpcError::Rpc(
+            "nonce too low".into()
+        )));
+        assert!(send_may_have_landed(&RpcError::Body("not JSON".into())));
     }
 
     /// A buy step whose send times out and whose receipt never shows
