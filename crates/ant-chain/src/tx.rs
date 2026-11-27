@@ -549,12 +549,12 @@ impl ChainClient {
     /// its answer is taken whenever it comes, so a host transport that
     /// uses its full one-minute allowance still gets its receipt
     /// accepted. (A poll to the configured URL ends by itself at
-    /// [`crate::RPC_REQUEST_TIMEOUT`], as a transport error.) Once the newest poll has been silent for
-    /// [`RECEIPT_POLL_TIMEOUT`], a fresh one goes out *alongside* it
-    /// (a hung keep-alive connection doesn't eat the whole wait), but
-    /// only while no poll is parked in the host transport: that call
-    /// runs on a blocking thread nothing can stop, so a wait never has
-    /// more than one host call in flight. At most
+    /// [`crate::RPC_REQUEST_TIMEOUT`], as a transport error.) Once the
+    /// newest poll has been silent for [`RECEIPT_POLL_TIMEOUT`], a fresh
+    /// one goes out *alongside* it (a hung keep-alive connection doesn't
+    /// eat the whole wait), but only while no poll is parked in the host
+    /// transport: that call runs on a blocking thread nothing can stop,
+    /// so a wait never has more than one host call in flight. At most
     /// [`RECEIPT_POLLS_OPEN_MAX`] polls are open at once.
     ///
     /// No poll goes out after the deadline and the back-off sleep never
@@ -1266,7 +1266,7 @@ impl Wallet {
 fn send_may_have_landed(e: &RpcError) -> bool {
     match e {
         RpcError::Http(e) => !e.is_connect(),
-        RpcError::Body(_) | RpcError::Decode(_) => true,
+        RpcError::Body(_) | RpcError::TooLarge(_) | RpcError::Decode(_) => true,
         RpcError::Rpc(_) => false,
     }
 }

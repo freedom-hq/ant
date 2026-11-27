@@ -43,12 +43,18 @@ pub enum RpcError {
     #[error("http: {}", http_error_text(.0))]
     Http(reqwest::Error),
     /// The configured RPC URL answered, but not with a JSON-RPC body ant
-    /// can use: a redirect (never followed), a body over
-    /// [`RPC_MAX_RESPONSE_BYTES`], or one that isn't JSON (an HTML error
-    /// page from a load balancer).
+    /// can use: a redirect (never followed), or one that isn't JSON (an
+    /// HTML error page from a load balancer).
     #[cfg(feature = "chain-rpc")]
     #[error("http: {0}")]
     Body(String),
+    /// The configured RPC URL's answer is larger than the cap given
+    /// ([`RPC_MAX_RESPONSE_BYTES`]); read no further. Its own variant so
+    /// a ranged read (`eth_getLogs`) can tell "this window asked for too
+    /// much" from a broken answer and ask for a narrower one.
+    #[cfg(feature = "chain-rpc")]
+    #[error("http: the RPC's answer is larger than {0} bytes")]
+    TooLarge(usize),
     #[error("rpc: {0}")]
     Rpc(String),
     #[error("decode: {0}")]
@@ -78,7 +84,8 @@ fn http_error_text(e: &reqwest::Error) -> String {
 }
 
 impl RpcError {
-    /// The RPC gave no usable answer ([`Self::Http`], [`Self::Body`]), as
+    /// The RPC gave no usable answer ([`Self::Http`], [`Self::Body`],
+    /// [`Self::TooLarge`]), as
     /// opposed to answering with a JSON-RPC error or a result ant can't
     /// decode. Says nothing about whether the request reached a node, so
     /// an idempotent read may be retried on it, but a write must not be
@@ -87,9 +94,19 @@ impl RpcError {
     pub const fn is_transport(&self) -> bool {
         match self {
             #[cfg(feature = "chain-rpc")]
-            Self::Http(_) | Self::Body(_) => true,
+            Self::Http(_) | Self::Body(_) | Self::TooLarge(_) => true,
             Self::Rpc(_) | Self::Decode(_) => false,
         }
+    }
+
+    /// The request reached the RPC but was cut at
+    /// [`RPC_REQUEST_TIMEOUT`] before the answer was read: the RPC may
+    /// just be slow at what it was asked (a wide `eth_getLogs` window),
+    /// not gone. A connect that timed out is not one: nothing was asked.
+    #[cfg(feature = "chain-rpc")]
+    #[must_use]
+    pub fn is_request_timeout(&self) -> bool {
+        matches!(self, Self::Http(e) if e.is_timeout() && !e.is_connect())
     }
 }
 
@@ -110,7 +127,7 @@ pub const RPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub const RPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Largest response body ant reads from the configured RPC URL. A
-/// bigger one is an [`RpcError::Body`], read no further than the cap.
+/// bigger one is an [`RpcError::TooLarge`], read no further than the cap.
 #[cfg(feature = "chain-rpc")]
 pub const RPC_MAX_RESPONSE_BYTES: usize = 16 << 20;
 
@@ -670,8 +687,8 @@ fn http_client(connect: std::time::Duration, request: std::time::Duration) -> re
 }
 
 /// `response`'s body as JSON, read no further than `limit` bytes. A
-/// redirect, a bigger body, or one that isn't JSON is an
-/// [`RpcError::Body`] (a transport-class error, see
+/// redirect or a body that isn't JSON is an [`RpcError::Body`], a bigger
+/// body an [`RpcError::TooLarge`] (both transport-class errors, see
 /// [`RpcError::is_transport`]); other non-2xx statuses are parsed like a
 /// 200, since JSON-RPC servers put their `error` in such bodies too.
 #[cfg(feature = "chain-rpc")]
@@ -685,7 +702,7 @@ async fn read_json_capped(
             "the RPC answered a redirect ({status}); redirects are not followed"
         )));
     }
-    let too_large = || RpcError::Body(format!("the RPC's answer is larger than {limit} bytes"));
+    let too_large = || RpcError::TooLarge(limit);
     if response.content_length().is_some_and(|n| n > limit as u64) {
         return Err(too_large());
     }
@@ -1153,8 +1170,12 @@ mod transport_seam_tests {
                 .eth_block_number()
                 .await
                 .unwrap_err();
-            assert!(matches!(err, RpcError::Body(_)), "{err}");
+            assert!(
+                matches!(err, RpcError::TooLarge(RPC_MAX_RESPONSE_BYTES)),
+                "{err}"
+            );
             assert!(err.to_string().contains("larger than"), "{err}");
+            assert!(err.is_transport());
         }
         // Exactly at the cap is fine (and is valid JSON with no result).
         let stub = spawn_raw(

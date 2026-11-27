@@ -472,9 +472,13 @@ pub struct ChainContext {
 /// bounded by `ant_chain::RPC_REQUEST_TIMEOUT` (30 s) on the configured
 /// URL, then the `Wallet`'s receipt wait of up to 60 s plus
 /// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a poll still open at
-/// that deadline: 130 s. A buy is two txs (260 s): bound the handler at
-/// 5 minutes.
-const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(5);
+/// that deadline: 130 s. The reads a route makes inside this bound count
+/// too, each up to 30 s (a deposit-funds read, three calls, up to 60 s):
+/// a buy is two txs (260 s); a top-up one batch-depth read and two txs
+/// (290 s); a withdrawal the issuer, funds and liquid-balance reads, one
+/// tx, then the funds re-read (30 + 60 + 30 + 130 + 60 = 310 s). Bound
+/// the handler at 6 minutes.
+const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(6);
 
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
@@ -1431,15 +1435,28 @@ pub async fn chequebook_withdraw(
 /// balances, chequebook), so longer than one [`CHAIN_RPC_TIMEOUT`].
 const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on an xDAI-funded write: up to four transactions (swap,
-/// approve, `createBatch` or `topUp`, `increaseDepth`), each taking up
-/// to 130 s (a nonce read and a send of up to
-/// `ant_chain::RPC_REQUEST_TIMEOUT`, 30 s, each, then the `Wallet`'s
-/// 60 s receipt wait plus `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a
-/// receipt poll still open at that deadline), possibly queued behind one
-/// more the node is already sending: 5 × 130 s = 650 s, inside 11
-/// minutes.
-const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(11);
+/// Bound on an xDAI-funded write. Each transaction takes up to 130 s
+/// (a nonce read and a send of up to `ant_chain::RPC_REQUEST_TIMEOUT`,
+/// 30 s, each, then the `Wallet`'s 60 s receipt wait plus
+/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a receipt poll still open
+/// at that deadline), possibly queued behind one more the node is
+/// already sending; each of the flow's own reads (balances, pool price,
+/// swap-helper code, the capped-swap dry run, chequebook checks) takes
+/// up to 30 s, one after another. Worst cases:
+///
+/// - buy: 6 reads, then helper deploy, swap, approve, `createBatch`
+///   (+1 queued): 180 s + 5 × 130 s = 830 s;
+/// - extend: 5 reads, then helper deploy, swap, approve, `topUp`,
+///   `increaseDepth` (+1 queued): 150 s + 6 × 130 s = 930 s;
+/// - deposit top-up: 15 reads (deposit, wallet xBZZ, the chequebook
+///   checks before the swap and again before the transfer, the swap's
+///   four, the transfer's two balances, the closing deposit status),
+///   then helper deploy, swap, transfer (+1 queued):
+///   450 s + 4 × 130 s = 970 s.
+///
+/// 17 minutes (1020 s) holds the largest, so a slow-but-answering RPC
+/// isn't cut mid-flow (#102).
+const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(17);
 
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn funding_call<F, T>(limit: Duration, timed_out: &str, fut: F) -> Result<T, Response>
