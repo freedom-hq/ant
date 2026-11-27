@@ -530,12 +530,12 @@ impl ChainClient {
     /// dropped keep-alive connection, a refused connect, an unreadable
     /// body) says nothing about it: it is logged and counted as "not
     /// mined yet", and polling goes on until `wait` runs out (#253). A
-    /// JSON-RPC error answer still fails at once. Each poll is cut off
-    /// at the time left until the deadline, but never below
-    /// [`RECEIPT_POLL_MIN`], and the back-off sleep never passes the
-    /// deadline, so this returns within `wait + RECEIPT_POLL_MIN` (plus
-    /// one poll's JSON parsing) whatever the RPC does. It only reads:
-    /// nothing is ever sent again from here, and a
+    /// JSON-RPC error answer still fails at once. A poll still
+    /// unanswered after [`RECEIPT_POLL_TIMEOUT`] is cut off and counts
+    /// the same (the next one goes out on a fresh request), and the
+    /// back-off sleep never passes the deadline, so this returns within
+    /// `wait + RECEIPT_POLL_TIMEOUT` whatever the RPC does. It only
+    /// reads: nothing is ever sent again from here, and a
     /// [`TxError::Timeout`] means "sent, outcome unknown".
     pub async fn wait_for_receipt(
         &self,
@@ -552,10 +552,7 @@ impl ChainClient {
                 "method": "eth_getTransactionReceipt",
                 "params": [format!("0x{}", hex::encode(tx_hash))],
             });
-            let budget = deadline
-                .saturating_duration_since(Instant::now())
-                .max(RECEIPT_POLL_MIN);
-            let answer = match tokio::time::timeout(budget, self.rpc(&body)).await {
+            let answer = match tokio::time::timeout(RECEIPT_POLL_TIMEOUT, self.rpc(&body)).await {
                 Ok(Ok(v)) => Some(v),
                 Ok(Err(RpcError::Http(e))) => {
                     last_error = Some(e.without_url().to_string());
@@ -563,7 +560,10 @@ impl ChainClient {
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {
-                    last_error = Some(format!("no answer within {}s", budget.as_secs()));
+                    last_error = Some(format!(
+                        "no answer within {}s",
+                        RECEIPT_POLL_TIMEOUT.as_secs()
+                    ));
                     None
                 }
             };
@@ -597,11 +597,12 @@ impl ChainClient {
     }
 }
 
-/// The floor of one receipt poll's time cut-off in
-/// [`ChainClient::wait_for_receipt`]: the poll sent at the deadline
-/// still gets this long to answer.
+/// How long one receipt poll in [`ChainClient::wait_for_receipt`] may
+/// go unanswered before it is cut off and counted as "not mined yet".
+/// Also how far past its `wait` a receipt wait can run: the poll sent
+/// at the deadline still gets this long.
 #[cfg(feature = "chain-rpc")]
-pub const RECEIPT_POLL_MIN: Duration = Duration::from_secs(10);
+pub const RECEIPT_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Check a `eth_getTransactionReceipt` result for `tx_hash` and turn it
 /// into a [`TxReceipt`] (see [`ChainClient::wait_for_receipt`]).
@@ -737,7 +738,8 @@ pub struct Wallet {
     chain_id: u64,
     /// Default per-tx confirmation cap. 60 s comfortably covers
     /// Gnosis's ~5 s block time even when the mempool is busy; bigger
-    /// callers can override with [`Wallet::wait_for`].
+    /// callers can override with [`Wallet::wait_for`]. A wait can run
+    /// up to [`RECEIPT_POLL_TIMEOUT`] past it (its last poll).
     pub default_wait: Duration,
     /// Default gas price (wei). Set to [`DEFAULT_GAS_PRICE_WEI`]
     /// unless the operator has a reason to bid higher (chain
@@ -1647,23 +1649,41 @@ mod receipt_wait_tests {
         assert!(stub.polls.load(Ordering::SeqCst) >= 3);
     }
 
-    /// A poll the RPC never answers is cut off, so the wait still ends
-    /// within `wait + RECEIPT_POLL_MIN` (and with it the sender lock
-    /// it runs under).
+    /// A poll the RPC never answers is cut off after
+    /// [`RECEIPT_POLL_TIMEOUT`] and polled again, and the wait still
+    /// ends within `wait + RECEIPT_POLL_TIMEOUT` (and with it the
+    /// sender lock it runs under).
     #[tokio::test(start_paused = true)]
-    async fn a_hung_receipt_poll_is_cut_off() {
+    async fn a_hung_receipt_poll_is_cut_off_and_polled_again() {
         let stub = spawn_stub(chain(|_, _| Reply::Hang)).await;
         let client = ChainClient::new(&stub.url);
-        let wait = Duration::from_secs(30);
-        let started = tokio::time::Instant::now();
-        let err = client
-            .wait_for_receipt(&[0x44u8; 32], wait)
-            .await
-            .unwrap_err();
-        let took = started.elapsed();
-        assert!(matches!(err, TxError::Timeout { .. }), "{err}");
-        assert!(took >= wait, "{took:?}");
-        assert!(took <= wait + RECEIPT_POLL_MIN, "{took:?}");
+        for wait in [Duration::ZERO, Duration::from_secs(30)] {
+            let before = stub.polls.load(Ordering::SeqCst);
+            let started = tokio::time::Instant::now();
+            let err = client
+                .wait_for_receipt(&[0x44u8; 32], wait)
+                .await
+                .unwrap_err();
+            let took = started.elapsed();
+            let TxError::Timeout { ref last_error, .. } = err else {
+                panic!("expected a timeout, got {err}");
+            };
+            assert!(
+                last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("no answer")),
+                "{err}"
+            );
+            assert!(took >= wait, "{took:?}");
+            assert!(took <= wait + RECEIPT_POLL_TIMEOUT, "{took:?}");
+            let polls = stub.polls.load(Ordering::SeqCst) - before;
+            if wait.is_zero() {
+                assert_eq!(took, RECEIPT_POLL_TIMEOUT);
+                assert_eq!(polls, 1);
+            } else {
+                assert!(polls >= 3, "{polls} polls");
+            }
+        }
     }
 
     /// Through a real funding step (`top_up_batch`: approve, then
