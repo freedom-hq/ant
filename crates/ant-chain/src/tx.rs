@@ -191,14 +191,18 @@ pub enum TxError {
     /// must not send the same write again on this error alone.
     /// `last_error` is the last receipt poll's transport error (without
     /// the RPC URL), when the RPC wasn't answering at the end (#253).
+    /// `wait_secs` is the wait asked for; `waited_secs` how long it
+    /// actually ran (up to `wait + RECEIPT_POLL_TIMEOUT` when a poll
+    /// was still open at the deadline), which is what the message says.
     #[error(
-        "transaction 0x{tx_hash} was sent but no receipt arrived within {wait_secs}s; it may \
+        "transaction 0x{tx_hash} was sent but no receipt arrived within {waited_secs}s; it may \
          still be mined{}",
         last_error.as_ref().map_or_else(String::new, |e| format!(" (last receipt poll: {e})"))
     )]
     Timeout {
         tx_hash: String,
         wait_secs: u64,
+        waited_secs: u64,
         last_error: Option<String>,
     },
     #[error("decode: {0}")]
@@ -544,7 +548,8 @@ impl ChainClient {
     /// [`RECEIPT_POLLS_OPEN_MAX`] polls are open at once.
     ///
     /// No poll goes out after the deadline and the back-off sleep never
-    /// passes it. A poll still open at the deadline (however early it
+    /// passes it: a back-off that would has its poll sent at the
+    /// deadline itself, so the end of the wait is polled too. A poll still open at the deadline (however early it
     /// went out) is heard for up to [`RECEIPT_POLL_TIMEOUT`] past it,
     /// so a slow host's answer that lands just after the deadline is
     /// still taken, and this returns within
@@ -607,7 +612,12 @@ impl ChainClient {
                 Some(at) => now >= at,
                 None => now >= newest_sent + RECEIPT_POLL_TIMEOUT && !host_busy,
             };
-            if due && (sent == 0 || now < deadline) {
+            // The back-off clamps the last poll to the deadline itself
+            // (`now + delay.min(left)`), so a poll scheduled for it still
+            // goes out once woken there (R5-F1); a silent poll is only
+            // re-sent before the deadline.
+            let in_time = next_poll.map_or(now < deadline, |at| at <= deadline);
+            if due && (sent == 0 || in_time) {
                 if next_poll.is_none() {
                     last_error = Some(format!(
                         "no answer within {}s",
@@ -662,6 +672,7 @@ impl ChainClient {
                 return Err(TxError::Timeout {
                     tx_hash: hex::encode(tx_hash),
                     wait_secs: wait.as_secs(),
+                    waited_secs: now.saturating_duration_since(started).as_secs(),
                     last_error,
                 });
             }
@@ -1777,6 +1788,7 @@ mod receipt_wait_tests {
         let TxError::Timeout {
             ref tx_hash,
             wait_secs,
+            waited_secs,
             ref last_error,
         } = err
         else {
@@ -1784,6 +1796,7 @@ mod receipt_wait_tests {
         };
         assert_eq!(tx_hash, &hex::encode([0x33u8; 32]));
         assert_eq!(wait_secs, 2);
+        assert!(waited_secs >= 2, "{waited_secs}");
         assert!(last_error.is_some());
         let shown = err.to_string();
         assert!(shown.contains("may still be mined"), "{shown}");
@@ -2061,6 +2074,11 @@ mod receipt_wait_tests {
             panic!("expected a timeout, got {err}");
         };
         assert_eq!(last_error.as_deref(), Some("no answer within 35s"), "{err}");
+        // One duration in the message, the one the wait actually ran
+        // (R5-M1), not the 25 s asked for beside the poll's 35 s.
+        let shown = err.to_string();
+        assert!(shown.contains("no receipt arrived within 35s"), "{shown}");
+        assert!(!shown.contains("25s"), "{shown}");
         // Seen at the next one-second step.
         let end = wait + RECEIPT_POLL_TIMEOUT;
         assert!(
@@ -2069,6 +2087,52 @@ mod receipt_wait_tests {
         );
         assert_eq!(host.entered.load(Ordering::SeqCst), 1);
         release.send(()).unwrap();
+    }
+
+    /// A host that answers every receipt poll at once: the back-off
+    /// clamps the last poll to the deadline, and that poll goes out
+    /// (R5-F1). Default 60 s wait polls at 0, 0.5, ..., 47.5, 55.5 and
+    /// then at 60; a transaction mined at 57 s is taken there instead
+    /// of timing out with the last 4.5 s unpolled. Same for a 10 s
+    /// wait mined at 8 s. The wait still ends by the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_clamped_to_the_deadline_goes_out() {
+        struct AtOnceHost {
+            started: tokio::time::Instant,
+            mined_at: Duration,
+            polls: AtomicUsize,
+        }
+        impl crate::ChainTransport for AtOnceHost {
+            fn serve(&self, request_json: &str) -> Option<String> {
+                let req: serde_json::Value = serde_json::from_str(request_json).unwrap();
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                let result = if self.started.elapsed() >= self.mined_at {
+                    let Reply::Result(r) = mined(&req) else {
+                        unreachable!()
+                    };
+                    r
+                } else {
+                    serde_json::Value::Null
+                };
+                Some(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string())
+            }
+        }
+        for (wait, mined_at) in [(60, 57), (10, 8)] {
+            let started = tokio::time::Instant::now();
+            let host = Arc::new(AtOnceHost {
+                started,
+                mined_at: Duration::from_secs(mined_at),
+                polls: AtomicUsize::new(0),
+            });
+            let client = ChainClient::new("http://127.0.0.1:1").with_transport(Some(host.clone()));
+            let receipt = client
+                .wait_for_receipt(&[0x4au8; 32], Duration::from_secs(wait))
+                .await
+                .unwrap_or_else(|e| panic!("wait {wait}s, mined at {mined_at}s: {e}"));
+            assert_eq!(receipt.block_number, 0x10);
+            assert_eq!(started.elapsed(), Duration::from_secs(wait), "wait {wait}s");
+            assert!(host.polls.load(Ordering::SeqCst) >= 2);
+        }
     }
 
     /// Through a real funding step (`top_up_batch`: approve, then
