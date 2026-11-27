@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-ant-chain = { path = "../ant-chain", optional = true }
+# Without `chain-rpc` (the `chain` feature turns it on) this is only the
+# offline helpers, here `without_urls` for chain error bodies.
+ant-chain = { path = "../ant-chain", default-features = false, optional = true }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto", optional = true }
 ant-postage = { path = "../ant-postage", optional = true }
@@ -65,6 +67,7 @@ tracing-subscriber.workspace = true
 [features]
 default = ["http-api"]
 http-api = [
+  "dep:ant-chain",
   "dep:axum",
   "dep:hyper",
   "dep:k256",
@@ -73,7 +76,7 @@ http-api = [
   "dep:ant-postage",
   "dep:prost",
 ]
-chain = ["http-api", "dep:ant-chain", "dep:anyhow", "dep:primitive-types"]
+chain = ["http-api", "ant-chain/chain-rpc", "dep:anyhow", "dep:primitive-types"]
 
 [lints]
 workspace = true

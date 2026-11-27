@@ -476,7 +476,12 @@ impl ChainClient {
         if let Some(err) = crate::rpc_error_json(&v) {
             return Err(RpcError::Rpc(err));
         }
-        let s = crate::rpc_result_str(&v)?;
+        // Answered, but with no hash: not a refusal, so a `Decode` (the
+        // transaction may be out), not the `Rpc` "missing result".
+        let s = v
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RpcError::Decode("eth_sendRawTransaction answered no hash".into()))?;
         let s = s.strip_prefix("0x").unwrap_or(s);
         let mut out = [0u8; 32];
         hex::decode_to_slice(s, &mut out).map_err(|e| RpcError::Decode(e.to_string()))?;
@@ -530,16 +535,19 @@ impl ChainClient {
     /// would describe some other transaction (issue #284).
     ///
     /// The receipt read is idempotent and the transaction is already
-    /// out, so a poll the RPC didn't answer (a transport error: a
-    /// dropped keep-alive connection, a refused connect, an unreadable
-    /// body) says nothing about it: it is logged and counted as "not
-    /// mined yet", and polling goes on until `wait` runs out (#253). A
-    /// JSON-RPC error answer still fails at once.
+    /// out, so a poll the RPC didn't answer (a transport error,
+    /// [`RpcError::is_transport`]: a dropped keep-alive connection, a
+    /// refused connect, a request cut at [`crate::RPC_REQUEST_TIMEOUT`],
+    /// an unreadable or oversized body) says nothing about it: it is
+    /// logged and counted as "not mined yet", and polling goes on until
+    /// `wait` runs out (#253). A JSON-RPC error answer still fails at
+    /// once.
     ///
     /// A slow poll is never thrown away while the wait has time left:
     /// its answer is taken whenever it comes, so a host transport that
     /// uses its full one-minute allowance still gets its receipt
-    /// accepted. Once the newest poll has been silent for
+    /// accepted. (A poll to the configured URL ends by itself at
+    /// [`crate::RPC_REQUEST_TIMEOUT`], as a transport error.) Once the newest poll has been silent for
     /// [`RECEIPT_POLL_TIMEOUT`], a fresh one goes out *alongside* it
     /// (a hung keep-alive connection doesn't eat the whole wait), but
     /// only while no poll is parked in the host transport: that call
@@ -709,8 +717,9 @@ impl ChainClient {
                         last_error = None;
                     }
                 }
-                Err(RpcError::Http(e)) => {
-                    let e = e.without_url().to_string();
+                Err(e) if e.is_transport() => {
+                    // URL-free already (`RpcError::Http` drops it).
+                    let e = e.to_string();
                     tracing::warn!(
                         target: "ant_chain::tx",
                         tx = %hash,
@@ -1103,7 +1112,19 @@ impl Wallet {
     ///
     /// Holds [`sender_lock`] for this address from the nonce read until
     /// the receipt, so every transaction this process signs with one key
-    /// goes out one after the other.
+    /// goes out one after the other. Every request to the configured
+    /// URL is bounded ([`crate::RPC_REQUEST_TIMEOUT`]), so a hung RPC
+    /// releases the lock with an error; a host transport's `serve` is
+    /// bounded by the host.
+    ///
+    /// Once the signed transaction has been handed to the RPC, the only
+    /// outcomes are its receipt or an error that doesn't say "not sent":
+    /// a send that got no usable answer (timed out, dropped, unreadable)
+    /// may have reached a node, so it is waited on like an answered one
+    /// and ends in the receipt or [`TxError::Timeout`] ("may still be
+    /// mined"), never in a plain error a caller could take as "nothing
+    /// happened" and buy or deposit again on. Only a JSON-RPC error
+    /// answer or a failed connect returns at once.
     async fn send_signed_value(
         &self,
         client: &ChainClient,
@@ -1140,15 +1161,23 @@ impl Wallet {
         // on our own hash is as safe as failing, since
         // `wait_for_receipt` only accepts a receipt whose
         // `transactionHash` is that hash.
-        let answered = client.eth_send_raw_transaction(&raw).await?;
-        if answered != tx_hash {
-            tracing::warn!(
+        match client.eth_send_raw_transaction(&raw).await {
+            Ok(answered) if answered != tx_hash => tracing::warn!(
                 target: "ant_chain::tx",
                 sent = %format!("0x{}", hex::encode(tx_hash)),
                 answered = %format!("0x{}", hex::encode(answered)),
                 "eth_sendRawTransaction answered another tx's hash; ignoring it and \
                  waiting on the hash we signed",
-            );
+            ),
+            Ok(_) => {}
+            Err(e) if send_may_have_landed(&e) => tracing::warn!(
+                target: "ant_chain::tx",
+                tx = %format!("0x{}", hex::encode(tx_hash)),
+                error = %e,
+                "eth_sendRawTransaction got no usable answer; the transaction may be out, \
+                 waiting on its receipt rather than reporting it unsent",
+            ),
+            Err(e) => return Err(e.into()),
         }
         client.wait_for_receipt(&tx_hash, self.default_wait).await
     }
@@ -1222,6 +1251,20 @@ impl Wallet {
             .eth_call_value(&self.address, helper, &data, value, SWAP_HELPER_SWAP_GAS)
             .await?;
         check_swap_dry_run(&out, amount_out_min)
+    }
+}
+
+/// Whether an `eth_sendRawTransaction` that failed with `e` may still
+/// have handed the transaction to a node. Only a JSON-RPC error answer
+/// (the node refused it) and a connect that never got through say it
+/// didn't; a timeout, a dropped connection, or an answer ant couldn't
+/// read or decode all may follow a node accepting it.
+#[cfg(feature = "chain-rpc")]
+fn send_may_have_landed(e: &RpcError) -> bool {
+    match e {
+        RpcError::Http(e) => !e.is_connect(),
+        RpcError::Body(_) | RpcError::Decode(_) => true,
+        RpcError::Rpc(_) => false,
     }
 }
 
@@ -2192,5 +2235,188 @@ mod receipt_wait_tests {
                 .collect::<Vec<_>>(),
             ["eth_getTransactionCount", "eth_sendRawTransaction"],
         );
+    }
+
+    /// Issue #296: a request the RPC never answers ends at the request
+    /// timeout as a transport error, so a write stuck on its nonce read
+    /// fails in bounded time and releases the per-key sender lock: the
+    /// next transaction from the same key goes out and confirms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_request_fails_bounded_and_releases_the_sender_lock() {
+        let nonce_reads = Arc::new(AtomicUsize::new(0));
+        let reads = nonce_reads.clone();
+        let receipts = chain(|req, _| mined(req));
+        let stub = spawn_stub(Arc::new(move |req, n| {
+            if req["method"] == "eth_getTransactionCount"
+                && reads.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Reply::Hang;
+            }
+            receipts(req, n)
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url).with_request_timeout(Duration::from_secs(1));
+        let wallet = Wallet::new([0x61u8; 32], GNOSIS_CHAIN_ID).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = wallet
+            .erc20_transfer(&client, &[1u8; 20], &[2u8; 20], U256::one())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TxError::Rpc(RpcError::Http(ref e)) if e.is_timeout()),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!err.to_string().contains("secret-key"), "{err}");
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+
+        // The lock is free again: the same key's next transaction runs.
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(10),
+            Wallet::new([0x61u8; 32], GNOSIS_CHAIN_ID)
+                .unwrap()
+                .erc20_transfer(&client, &[1u8; 20], &[2u8; 20], U256::one()),
+        )
+        .await
+        .expect("the sender lock was not released")
+        .unwrap();
+        assert_eq!(receipt.block_number, 0x10);
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 1);
+    }
+
+    /// A send whose answer never comes (cut at the request timeout) may
+    /// still have reached a node: the write waits on the hash it signed
+    /// and returns the receipt, having sent once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_send_is_waited_on_not_reported_unsent() {
+        let receipts = chain(|req, _| mined(req));
+        let stub = spawn_stub(Arc::new(move |req, n| {
+            if req["method"] == "eth_sendRawTransaction" {
+                return Reply::Hang;
+            }
+            receipts(req, n)
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url).with_request_timeout(Duration::from_secs(1));
+        let wallet = Wallet::new([0x62u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        let receipt = wallet
+            .erc20_transfer(&client, &[1u8; 20], &[2u8; 20], U256::one())
+            .await
+            .unwrap();
+        assert_eq!(receipt.block_number, 0x10);
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 1);
+        assert!(stub.polls.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// The same with a connection dropped instead of answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_send_is_waited_on_not_reported_unsent() {
+        let receipts = chain(|req, _| mined(req));
+        let stub = spawn_stub(Arc::new(move |req, n| {
+            if req["method"] == "eth_sendRawTransaction" {
+                return Reply::Drop;
+            }
+            receipts(req, n)
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url);
+        let wallet = Wallet::new([0x63u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        wallet
+            .erc20_transfer(&client, &[1u8; 20], &[2u8; 20], U256::one())
+            .await
+            .unwrap();
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 1);
+    }
+
+    /// A send refused with a JSON-RPC error answer still fails at once,
+    /// without a receipt wait: the node said it didn't take it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_send_fails_at_once() {
+        let receipts = chain(|req, _| mined(req));
+        let stub = spawn_stub(Arc::new(move |req, n| {
+            if req["method"] == "eth_sendRawTransaction" {
+                return Reply::Error(json!({"code": -32000, "message": "nonce too low"}));
+            }
+            receipts(req, n)
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url);
+        let wallet = Wallet::new([0x64u8; 32], GNOSIS_CHAIN_ID).unwrap();
+        let err = wallet
+            .erc20_transfer(&client, &[1u8; 20], &[2u8; 20], U256::one())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonce too low"), "{err}");
+        assert_eq!(stub.polls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A buy step whose send times out and whose receipt never shows
+    /// ends in [`TxError::Timeout`] ("may still be mined") after one
+    /// send, and goes no further: never a plain error a caller could
+    /// take as "nothing happened" and buy again on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_send_with_no_receipt_never_sends_again() {
+        let stub = spawn_stub(Arc::new(|req, _| match req["method"].as_str().unwrap() {
+            "eth_getTransactionCount" => Reply::Result(json!("0x0")),
+            "eth_sendRawTransaction" => Reply::Hang,
+            _ => Reply::Result(serde_json::Value::Null),
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url).with_request_timeout(Duration::from_secs(1));
+        let wallet = Wallet::new([0x65u8; 32], GNOSIS_CHAIN_ID)
+            .unwrap()
+            .wait_for(Duration::from_secs(2));
+        let payer = crate::funding::Payer::gnosis(&client, &wallet);
+        let err = crate::funding::buy_batch(&payer, 1_000, 17, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::funding::FundingError::Tx {
+                    what: "authorise payment",
+                    source: TxError::Timeout { .. },
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(stub.sends.load(Ordering::SeqCst), 1);
+        let methods = stub.methods.lock().unwrap().clone();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() != "eth_getTransactionReceipt")
+                .collect::<Vec<_>>(),
+            ["eth_getTransactionCount", "eth_sendRawTransaction"],
+        );
+    }
+
+    /// A receipt poll the RPC never answers is cut at the request
+    /// timeout and polled again, well before the 10 s "poll alongside"
+    /// would have kicked in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_receipt_poll_is_cut_at_the_request_timeout() {
+        let stub = spawn_stub(chain(|req, n| match n {
+            0 => Reply::Hang,
+            _ => mined(req),
+        }))
+        .await;
+        let client = ChainClient::new(&stub.url).with_request_timeout(Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        client
+            .wait_for_receipt(&[0x66u8; 32], Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < RECEIPT_POLL_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(stub.polls.load(Ordering::SeqCst), 2);
     }
 }

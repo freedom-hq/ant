@@ -2211,3 +2211,143 @@ async fn withdraw_501_without_support() {
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 }
+
+// --- chain error bodies carry no RPC URL (issue #296, GW-11) ---
+
+/// Error text as an RPC client would quote it, API key in the path.
+const URL_ERROR: &str =
+    "error sending request for url (https://rpc.example/v2/SECRET-KEY): operation timed out";
+
+/// A reader whose every read fails quoting the RPC URL.
+struct UrlQuotingChain;
+
+#[async_trait]
+impl ChainReader for UrlQuotingChain {
+    async fn block_number(&self) -> Result<u64, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn current_price(&self) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn total_amount(&self) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn bzz_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn native_balance(&self, _who: [u8; 20]) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn chequebook_balance(&self, _cb: [u8; 20]) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn chequebook_total_paid_out(&self, _cb: [u8; 20]) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn batch_meta(&self, _id: [u8; 32]) -> Result<ant_gateway::BatchMetaView, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn batch_remaining_balance(&self, _id: [u8; 32]) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn minimum_balance_per_chunk(&self) -> Result<u128, String> {
+        Err(URL_ERROR.into())
+    }
+}
+
+/// A writer whose every write fails quoting the RPC URL.
+struct UrlQuotingWriter;
+
+#[async_trait]
+impl ChainWriter for UrlQuotingWriter {
+    async fn buy_batch(&self, _a: u128, _d: u8, _i: bool) -> Result<NewBatch, String> {
+        Err(URL_ERROR.into())
+    }
+    async fn topup_batch(&self, _id: [u8; 32], _a: u128) -> Result<(), String> {
+        Err(URL_ERROR.into())
+    }
+    async fn dilute_batch(&self, _id: [u8; 32], _d: u8) -> Result<(), String> {
+        Err(URL_ERROR.into())
+    }
+    async fn deposit_chequebook(&self, _a: u128) -> Result<[u8; 32], String> {
+        Err(URL_ERROR.into())
+    }
+}
+
+fn assert_no_url(status: StatusCode, json: &Value) {
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{json}");
+    let body = json.to_string();
+    assert!(!body.contains("SECRET-KEY"), "{body}");
+    assert!(!body.contains("rpc.example"), "{body}");
+    assert!(body.contains("<url>"), "{body}");
+}
+
+/// `guarded` (every chain read route) scrubs the URL from its 502 body.
+#[tokio::test]
+async fn a_chain_read_502_body_carries_no_url() {
+    let ctx = Arc::new(ChainContext {
+        reader: Arc::new(UrlQuotingChain),
+        wallet_eth: [0x11; 20],
+        chequebook: ChequebookSlot::new(None),
+        chain_id: 100,
+        writer: None,
+        writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
+    });
+    let (status, json) = get(
+        status_router_with_chain(snapshot_with_one_peer(), ctx),
+        "/chainstate",
+    )
+    .await;
+    assert_no_url(status, &json);
+}
+
+/// `guarded_tx` (the bee write routes) scrubs it too.
+#[tokio::test]
+async fn a_chain_write_502_body_carries_no_url() {
+    let ctx = Arc::new(ChainContext {
+        reader: Arc::new(FakeChain),
+        wallet_eth: [0x11; 20],
+        chequebook: ChequebookSlot::new(None),
+        chain_id: 100,
+        writer: Some(Arc::new(UrlQuotingWriter)),
+        writes: WriteGate::default(),
+        tx_lock: WalletTxLock::default(),
+    });
+    let (status, json) = req(
+        status_router_with_chain(snapshot_with_one_peer(), ctx),
+        Method::POST,
+        "/stamps/1000000/20?immutable=true",
+    )
+    .await;
+    assert_no_url(status, &json);
+}
+
+/// End to end through the real `ant-chain` reader: an unreachable RPC
+/// whose URL carries a key answers `/chainstate` with a 502 that doesn't
+/// quote it.
+#[cfg(feature = "chain")]
+#[tokio::test]
+async fn a_real_rpc_failure_502_body_carries_no_url() {
+    let ctx = ant_gateway::chainreader::build(
+        // Nothing listens on port 1: a refused connect.
+        Some("http://127.0.0.1:1/v2/SECRET-KEY".into()),
+        None,
+        ant_chain::GNOSIS_POSTAGE_STAMP.into(),
+        [0x11; 20],
+        None,
+        100,
+        None,
+        None,
+    )
+    .unwrap();
+    let (status, json) = get(
+        status_router_with_chain(snapshot_with_one_peer(), ctx),
+        "/chainstate",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{json}");
+    let body = json.to_string();
+    assert!(!body.contains("SECRET-KEY"), "{body}");
+    assert!(!body.contains("/v2/"), "{body}");
+}

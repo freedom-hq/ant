@@ -29,7 +29,7 @@ use serde_json::json;
 
 use crate::chequebook::{chequebook_issuer_selector, factory_deployed_contracts_calldata};
 use crate::tx::batch_created_event_topic;
-use crate::{ChainClient, RpcError};
+use crate::{without_urls, ChainClient, RpcError};
 
 /// `keccak256("Transfer(address,address,uint256)")` — topic[0] of the
 /// ERC-20 `Transfer(address indexed from, address indexed to, uint256
@@ -564,34 +564,6 @@ pub fn wallet_scan_failed(node_eoa: &[u8; 20], error: &str) {
             s.error = Some(without_urls(error));
         }
     });
-}
-
-/// `error` with every URL replaced by `<url>`. RPC URLs often carry an
-/// API key, and `/health` is readable by any origin the CORS list
-/// allows; the logs keep the full text.
-fn without_urls(error: &str) -> String {
-    error
-        .split(' ')
-        .map(|word| match word.find("://") {
-            Some(scheme_end) => {
-                // Slice after the matched char, not one byte past its
-                // start: a non-ASCII neighbour (`“https://…”`, a trailing
-                // `…`) is several bytes long.
-                let start = word[..scheme_end]
-                    .char_indices()
-                    .rfind(|&(_, c)| !c.is_ascii_alphanumeric())
-                    .map_or(0, |(i, c)| i + c.len_utf8());
-                let end = word
-                    .char_indices()
-                    .rfind(|&(_, c)| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
-                    .map_or(word.len(), |(i, c)| i + c.len_utf8())
-                    .max(scheme_end + 3);
-                format!("{}<url>{}", &word[..start], &word[end..])
-            }
-            None => word.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Stop tracking `node_eoa`'s rediscovery: an embedder whose node for it

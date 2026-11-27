@@ -468,11 +468,13 @@ pub struct ChainContext {
 }
 
 /// Write txs (approve + createBatch, topUp, transfer) must clear a
-/// Gnosis block and confirm; the `Wallet` waits up to 60 s per tx, plus
-/// up to `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a receipt
-/// poll still open at that deadline, so 70 s, and a buy is two txs
-/// (140 s): bound the handler at 3 minutes.
-const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(3);
+/// Gnosis block and confirm. One tx is a nonce read and a send, each
+/// bounded by `ant_chain::RPC_REQUEST_TIMEOUT` (30 s) on the configured
+/// URL, then the `Wallet`'s receipt wait of up to 60 s plus
+/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` (10 s) for a poll still open at
+/// that deadline: 130 s. A buy is two txs (260 s): bound the handler at
+/// 5 minutes.
+const CHAIN_TX_TIMEOUT: Duration = Duration::from_mins(5);
 
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
@@ -487,7 +489,7 @@ where
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(json_error(
             StatusCode::BAD_GATEWAY,
-            format!("chain rpc: {e}"),
+            format!("chain rpc: {}", ant_chain::without_urls(&e)),
         )),
         Err(_) => Err(json_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -699,7 +701,7 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         Ok(v) => (v, None),
         Err(e) => {
             tracing::warn!(target: "ant_gateway", "chequebook availableBalance: {e}");
-            (bal, Some(e))
+            (bal, Some(ant_chain::without_urls(&e)))
         }
     };
     Json(ChequebookBalanceBody {
@@ -846,7 +848,7 @@ where
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(json_error(
             StatusCode::BAD_GATEWAY,
-            format!("chain tx: {e}"),
+            format!("chain tx: {}", ant_chain::without_urls(&e)),
         )),
         Err(_) => Err(json_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -1430,12 +1432,14 @@ pub async fn chequebook_withdraw(
 const FUNDING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bound on an xDAI-funded write: up to four transactions (swap,
-/// approve, `createBatch` or `topUp`, `increaseDepth`), each waiting up
-/// to 70 s (the `Wallet`'s 60 s plus
-/// `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a receipt poll still open
-/// at that deadline), possibly queued behind one more the node is
-/// already sending: 5 × 70 s = 350 s, inside 6 minutes.
-const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(6);
+/// approve, `createBatch` or `topUp`, `increaseDepth`), each taking up
+/// to 130 s (a nonce read and a send of up to
+/// `ant_chain::RPC_REQUEST_TIMEOUT`, 30 s, each, then the `Wallet`'s
+/// 60 s receipt wait plus `ant_chain::tx::RECEIPT_POLL_TIMEOUT` for a
+/// receipt poll still open at that deadline), possibly queued behind one
+/// more the node is already sending: 5 × 130 s = 650 s, inside 11
+/// minutes.
+const FUNDING_TX_TIMEOUT: Duration = Duration::from_mins(11);
 
 #[allow(clippy::result_large_err)] // axum Response-as-Err, see lib.rs
 async fn funding_call<F, T>(limit: Duration, timed_out: &str, fut: F) -> Result<T, Response>
@@ -1459,7 +1463,10 @@ fn failure_response(f: FundingFailure) -> Response {
             json_error(StatusCode::BAD_REQUEST, m)
         }
         FundingFailure::NotFound(m) => json_error(StatusCode::NOT_FOUND, m),
-        FundingFailure::Chain(m) => json_error(StatusCode::BAD_GATEWAY, m),
+        // Chain error text may quote an RPC URL (and its API key).
+        FundingFailure::Chain(m) => {
+            json_error(StatusCode::BAD_GATEWAY, ant_chain::without_urls(&m))
+        }
         FundingFailure::Unavailable(m) => json_error(StatusCode::SERVICE_UNAVAILABLE, m),
     }
 }

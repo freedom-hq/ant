@@ -1375,7 +1375,9 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  *     in error.data. Ant never surfaces that as an empty result, which
  *     would silently truncate postage-batch discovery.
  * Any other JSON-RPC error (an eth_call revert, say) is a genuine answer
- * and is passed through to the caller.
+ * and is passed through to the caller. So is a -32000 on
+ * eth_sendRawTransaction: it is never replayed against gnosis_rpc, so a
+ * signed transaction never reaches a second endpoint that way.
  *
  * WARNING — emit -32000 ONLY for a coverage gap, never as a generic
  * failure code. geth and Nethermind use -32000 as a catch-all for
@@ -1384,11 +1386,10 @@ typedef char *(*ant_chain_transport)(const char *request_json, void *host_ctx);
  * underpriced", and on some backends "execution reverted". A host whose
  * verified ladder bottoms out at an RPC quorum and forwards backend
  * replies verbatim therefore reclassifies every one of those as
- * can't-serve, and ant replays the request against gnosis_rpc: for
- * eth_sendRawTransaction that is a SECOND BROADCAST of an
- * already-signed transaction, and the caller then sees the fallback
- * URL's error instead of the real one. Map any failure that is not a
- * coverage gap to a different error code, or answer authoritatively.
+ * can't-serve, and ant replays the request against gnosis_rpc, where
+ * the caller then sees the fallback URL's answer instead of the real
+ * one. Map any failure that is not a coverage gap to a different error
+ * code, or answer authoritatively.
  *
  * Transactions: eth_sendRawTransaction must answer the hash of the
  * transaction it was given (keccak256 of the raw bytes), and an

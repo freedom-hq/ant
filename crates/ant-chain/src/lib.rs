@@ -35,13 +35,112 @@ pub use transport::{ChainTransport, SharedChainTransport, RETRYABLE_ERROR_CODE};
 
 #[derive(Debug, Error)]
 pub enum RpcError {
+    /// The request to the configured RPC URL failed in transport
+    /// (connect, timeout, a dropped connection). Stored without the URL
+    /// (`reqwest::Error::without_url`): an RPC URL often carries an API
+    /// key, and this text reaches logs and gateway error bodies.
+    #[cfg(feature = "chain-rpc")]
+    #[error("http: {}", http_error_text(.0))]
+    Http(reqwest::Error),
+    /// The configured RPC URL answered, but not with a JSON-RPC body ant
+    /// can use: a redirect (never followed), a body over
+    /// [`RPC_MAX_RESPONSE_BYTES`], or one that isn't JSON (an HTML error
+    /// page from a load balancer).
     #[cfg(feature = "chain-rpc")]
     #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
+    Body(String),
     #[error("rpc: {0}")]
     Rpc(String),
     #[error("decode: {0}")]
     Decode(String),
+}
+
+#[cfg(feature = "chain-rpc")]
+impl From<reqwest::Error> for RpcError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(e.without_url())
+    }
+}
+
+/// `e` and its causes (`error sending request: client error (Connect):
+/// tcp connect error: Connection refused`), so a timeout or refusal says
+/// which; `reqwest`'s own text names only the outermost. Any URL a cause
+/// quotes is replaced by `<url>`.
+#[cfg(feature = "chain-rpc")]
+fn http_error_text(e: &reqwest::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        let _ = write!(text, ": {c}");
+        cause = c.source();
+    }
+    without_urls(&text)
+}
+
+impl RpcError {
+    /// The RPC gave no usable answer ([`Self::Http`], [`Self::Body`]), as
+    /// opposed to answering with a JSON-RPC error or a result ant can't
+    /// decode. Says nothing about whether the request reached a node, so
+    /// an idempotent read may be retried on it, but a write must not be
+    /// taken as "not sent".
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        match self {
+            #[cfg(feature = "chain-rpc")]
+            Self::Http(_) | Self::Body(_) => true,
+            Self::Rpc(_) | Self::Decode(_) => false,
+        }
+    }
+}
+
+/// How long connecting to the configured RPC URL may take.
+#[cfg(feature = "chain-rpc")]
+pub const RPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one request to the configured RPC URL may take, from
+/// connecting until the whole answer is read. A hung request then ends
+/// in an [`RpcError::Http`] instead of holding its caller (and, inside a
+/// transaction, the per-key sender lock) forever. Longer than
+/// [`tx::RECEIPT_POLL_TIMEOUT`], so a receipt wait still sends a fresh
+/// poll alongside a silent one before the silent one is cut.
+///
+/// Only the URL leg is bounded here: a host transport's `serve` runs on
+/// a blocking thread ant can't interrupt, and is bounded by the host.
+#[cfg(feature = "chain-rpc")]
+pub const RPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Largest response body ant reads from the configured RPC URL. A
+/// bigger one is an [`RpcError::Body`], read no further than the cap.
+#[cfg(feature = "chain-rpc")]
+pub const RPC_MAX_RESPONSE_BYTES: usize = 16 << 20;
+
+/// `error` with every URL in it replaced by `<url>`. For error text that
+/// may quote an RPC URL (which often carries an API key) on its way to a
+/// log, a status report or an HTTP response body.
+#[must_use]
+pub fn without_urls(error: &str) -> String {
+    error
+        .split(' ')
+        .map(|word| match word.find("://") {
+            Some(scheme_end) => {
+                // Slice after the matched char, not one byte past its
+                // start: a non-ASCII neighbour (`“https://…”`, a trailing
+                // `…`) is several bytes long.
+                let start = word[..scheme_end]
+                    .char_indices()
+                    .rfind(|&(_, c)| !c.is_ascii_alphanumeric())
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                let end = word
+                    .char_indices()
+                    .rfind(|&(_, c)| !matches!(c, ')' | ']' | ',' | '.' | ';' | '"' | '\''))
+                    .map_or(word.len(), |(i, c)| i + c.len_utf8())
+                    .max(scheme_end + 3);
+                format!("{}<url>{}", &word[..start], &word[end..])
+            }
+            None => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The JSON-RPC `error` member of `v`, if it carries one. A literal
@@ -127,14 +226,20 @@ impl ChainClient {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            http: reqwest::Client::builder()
-                .user_agent("ant-chain/1")
-                .build()
-                .expect("reqwest client"),
+            http: http_client(RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT),
             transport: None,
             unverified_logs: None,
             host_calls: std::sync::Arc::default(),
         }
+    }
+
+    /// This client with a shorter request timeout than
+    /// [`RPC_REQUEST_TIMEOUT`], so a test of a hung RPC takes seconds.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = http_client(RPC_CONNECT_TIMEOUT.min(timeout), timeout);
+        self
     }
 
     /// This client with a count of host transport calls of its own
@@ -251,27 +356,25 @@ impl ChainClient {
     ) -> Result<serde_json::Value, RpcError> {
         use std::sync::atomic::Ordering;
         if let Some(t) = self.transport.clone() {
+            let method = body
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
             asking_host.store(true, Ordering::SeqCst);
-            let answer = Self::ask_host(t, body.to_string(), self.host_calls.clone()).await;
+            let answer = Self::ask_host(t, body.to_string(), method, self.host_calls.clone()).await;
             asking_host.store(false, Ordering::SeqCst);
             match answer {
                 Ok(v) => return Ok(v),
                 Err(reason) => tracing::debug!(
                     target: "ant-chain",
-                    method = body.get("method").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                    method,
                     reason,
                     "host chain transport can't serve; falling back to the configured RPC URL",
                 ),
             }
         }
-        Ok(self
-            .http
-            .post(&self.url)
-            .json(body)
-            .send()
-            .await?
-            .json()
-            .await?)
+        let response = self.http.post(&self.url).json(body).send().await?;
+        read_json_capped(response, RPC_MAX_RESPONSE_BYTES).await
     }
 
     /// Run the host transport on the runtime's blocking pool (the
@@ -280,6 +383,7 @@ impl ChainClient {
     async fn ask_host(
         transport: SharedChainTransport,
         request: String,
+        method: &str,
         in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<serde_json::Value, &'static str> {
         /// Counts the call until the blocking closure ends, not until the
@@ -298,11 +402,13 @@ impl ChainClient {
         })
         .await
         {
-            // A panicking host must not take the node down with it —
-            // treat it like any other can't-serve and use the URL.
+            // Where panics unwind (debug and test builds), a panicking
+            // host is treated like any other can't-serve and the URL is
+            // used. The release profile sets `panic = "abort"`: there a
+            // panic in `serve` ends the process before this is reached.
             Err(_) => Err("host transport panicked"),
             Ok(None) => Err("host returned NULL"),
-            Ok(Some(raw)) => match transport::classify(&raw) {
+            Ok(Some(raw)) => match transport::classify(&raw, method) {
                 transport::HostAnswer::Served(v) => Ok(v),
                 transport::HostAnswer::CantServe(reason) => Err(reason),
             },
@@ -546,6 +652,52 @@ impl ChainClient {
         word.copy_from_slice(&out[0..32]);
         Ok(word)
     }
+}
+
+/// The HTTP client for the configured RPC URL: bounded connect and
+/// request times, and no redirects (a redirect is an [`RpcError::Body`],
+/// see [`read_json_capped`]), so a request is only ever sent to the URL
+/// the operator configured.
+#[cfg(feature = "chain-rpc")]
+fn http_client(connect: std::time::Duration, request: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("ant-chain/1")
+        .connect_timeout(connect)
+        .timeout(request)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client")
+}
+
+/// `response`'s body as JSON, read no further than `limit` bytes. A
+/// redirect, a bigger body, or one that isn't JSON is an
+/// [`RpcError::Body`] (a transport-class error, see
+/// [`RpcError::is_transport`]); other non-2xx statuses are parsed like a
+/// 200, since JSON-RPC servers put their `error` in such bodies too.
+#[cfg(feature = "chain-rpc")]
+async fn read_json_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<serde_json::Value, RpcError> {
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(RpcError::Body(format!(
+            "the RPC answered a redirect ({status}); redirects are not followed"
+        )));
+    }
+    let too_large = || RpcError::Body(format!("the RPC's answer is larger than {limit} bytes"));
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| RpcError::Body(format!("the RPC's answer ({status}) is not JSON: {e}")))
 }
 
 /// 4-byte ABI function selector = first 4 bytes of `keccak256(sig)`.
@@ -917,5 +1069,170 @@ mod transport_seam_tests {
             ],
         );
         assert_eq!(stub.hits(), 0);
+    }
+
+    /// A stub that answers every request with the raw HTTP `head`
+    /// followed by `body_len` bytes of `{}`-padded JSON whitespace, and
+    /// counts the requests. `body_len` of `None` sends `head` only.
+    async fn spawn_raw(head: String, body_len: Option<usize>) -> StubRpc {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v2/SECRET-KEY", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let head = head.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    if let Some(len) = body_len {
+                        // Valid JSON of any size: whitespace, then `{}`.
+                        let pad = vec![b' '; 64 * 1024];
+                        let mut left = len.saturating_sub(2);
+                        while left > 0 {
+                            let n = left.min(pad.len());
+                            if sock.write_all(&pad[..n]).await.is_err() {
+                                return;
+                            }
+                            left -= n;
+                        }
+                        let _ = sock.write_all(b"{}").await;
+                    }
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        StubRpc { url, hits }
+    }
+
+    /// Issue #296: a 307 from the configured URL is not followed — the
+    /// request is never re-sent to the redirect target — and is a
+    /// transport-class error (a receipt wait polls on through it).
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let target = spawn_stub(STUB_BLOCK).await;
+        let redirect = spawn_raw(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n",
+                target.url
+            ),
+            None,
+        )
+        .await;
+        let err = ChainClient::new(&redirect.url)
+            .eth_block_number()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Body(_)), "{err}");
+        assert!(err.to_string().contains("redirect"), "{err}");
+        assert!(err.is_transport());
+        assert_eq!(redirect.hits(), 1);
+        assert_eq!(target.hits(), 0, "the redirect target must not be asked");
+    }
+
+    /// A body over [`RPC_MAX_RESPONSE_BYTES`] is an error, whether its
+    /// `content-length` says so up front or it just keeps coming.
+    #[tokio::test]
+    async fn an_oversized_body_is_an_error() {
+        let len = RPC_MAX_RESPONSE_BYTES + 1;
+        for head in [
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {len}\r\nconnection: close\r\n\r\n"
+            ),
+            // No length: read to the end of the connection.
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             connection: close\r\n\r\n"
+                .to_string(),
+        ] {
+            let stub = spawn_raw(head, Some(len)).await;
+            let err = ChainClient::new(&stub.url)
+                .eth_block_number()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RpcError::Body(_)), "{err}");
+            assert!(err.to_string().contains("larger than"), "{err}");
+        }
+        // Exactly at the cap is fine (and is valid JSON with no result).
+        let stub = spawn_raw(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string(),
+            Some(RPC_MAX_RESPONSE_BYTES),
+        )
+        .await;
+        let err = ChainClient::new(&stub.url)
+            .eth_block_number()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Rpc(_)), "{err}");
+    }
+
+    /// A body that isn't JSON (a load balancer's HTML error page) is a
+    /// transport-class error, as `reqwest`'s own decode error was.
+    #[tokio::test]
+    async fn a_non_json_body_is_a_transport_error() {
+        let page = "<html>502 Bad Gateway</html>";
+        let stub = spawn_raw(
+            format!(
+                "HTTP/1.1 502 Bad Gateway\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{page}",
+                page.len()
+            ),
+            None,
+        )
+        .await;
+        let err = ChainClient::new(&stub.url)
+            .eth_block_number()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Body(_)), "{err}");
+        assert!(err.is_transport());
+    }
+
+    /// MY-06: a host's `-32000` on `eth_sendRawTransaction` ("nonce too
+    /// low") is surfaced as is; the signed transaction never goes to the
+    /// fallback URL.
+    #[tokio::test]
+    async fn a_minus_32000_on_a_send_leaves_the_fallback_untouched() {
+        let stub = spawn_stub(r#"{"jsonrpc":"2.0","id":1,"result":"0x01"}"#).await;
+        let host = Host::new(Some(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#,
+        ));
+        let client = ChainClient::new(&stub.url).with_transport(Some(host.clone()));
+        let err = client
+            .eth_send_raw_transaction(&[0u8; 8])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonce too low"), "{err}");
+        assert_eq!(host.calls(), 1);
+        assert_eq!(stub.hits(), 0, "the send must not reach the fallback URL");
+    }
+
+    /// MY-16: `RpcError::Http` displays without the RPC URL, which
+    /// often carries an API key.
+    #[tokio::test]
+    async fn an_http_error_displays_without_the_url() {
+        // Nothing listens on port 1: a refused connect.
+        let err = ChainClient::new("http://127.0.0.1:1/v2/SECRET-KEY")
+            .eth_block_number()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Http(_)), "{err}");
+        let shown = format!("{err} / {err:?}");
+        assert!(!shown.contains("SECRET-KEY"), "{shown}");
+        assert!(!shown.contains("/v2/"), "{shown}");
+        // The cause is still there to diagnose.
+        assert!(err.to_string().contains("onnect"), "{err}");
+    }
+
+    #[test]
+    fn without_urls_scrubs_rpc_urls() {
+        assert_eq!(
+            without_urls("http: error sending request for url (https://rpc.example/v2/KEY)"),
+            "http: error sending request for url (<url>)"
+        );
+        assert_eq!(without_urls("no RPC quorum"), "no RPC quorum");
     }
 }
